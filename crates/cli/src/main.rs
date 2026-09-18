@@ -1,3 +1,5 @@
+mod schedule;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
@@ -67,6 +69,24 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
+    },
+    /// Observe-only: walk `root`s and write the growth store, no
+    /// rendering. This is what a scheduled LaunchAgent run executes.
+    Observe {
+        #[arg(required = true)]
+        roots: Vec<PathBuf>,
+    },
+    /// Install, report on, or remove the opt-in per-user LaunchAgent that
+    /// runs `observe` on a fixed interval (#31).
+    Schedule {
+        /// Install (or replace) the schedule with this interval, e.g.
+        /// "30m", "1h", "12h", "1d".
+        #[arg(long)]
+        every: Option<String>,
+        /// Remove the schedule.
+        #[arg(long)]
+        off: bool,
+        roots: Vec<PathBuf>,
     },
 }
 
@@ -143,6 +163,12 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", render_overview(&r, all, verify_du, docker));
             }
+        }
+        Command::Observe { roots } => {
+            schedule::cmd_observe(slop_livin_dir(), roots)?;
+        }
+        Command::Schedule { every, off, roots } => {
+            schedule::cmd_schedule(slop_livin_dir(), every, off, roots)?;
         }
     }
     Ok(())

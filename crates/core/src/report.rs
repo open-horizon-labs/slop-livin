@@ -234,6 +234,12 @@ pub struct Report {
     /// R4c: per-worktree large-file rows, same opt-in as `dirs_by_worktree`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_by_worktree: Option<std::collections::HashMap<String, Vec<FileRow>>>,
+    /// Scheduled-observation status line for the report header (item 5 of
+    /// #31): "last scheduled run 12m ago (full, 4.2 s)" when a schedule
+    /// exists, or a "no schedule (...)" suggestion when it does not. Only
+    /// populated when a store directory was supplied.
+    #[serde(default)]
+    pub schedule_line: Option<String>,
 }
 
 /// R2 discovers projects (checkouts and linked worktrees) under `root`
@@ -529,6 +535,7 @@ pub fn report_full(
     // descendant without needing the walk itself to wait on children.
     aggregate_dir_totals(&mut dirs);
 
+    let mut schedule_line = None;
     if let Some(dir) = store_dir {
         let volume_id = std::fs::metadata(root)
             .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
@@ -589,6 +596,7 @@ pub fn report_full(
                 since_secs,
             )?;
         }
+        schedule_line = Some(crate::schedule::header_line(dir, root, observed_at));
     }
 
     let (dirs_by_worktree, files_by_worktree) = if include_dirs {
@@ -623,6 +631,7 @@ pub fn report_full(
         notes,
         dirs_by_worktree,
         files_by_worktree,
+        schedule_line,
     })
 }
 
@@ -1003,6 +1012,35 @@ fn join_docker_facts(
     }
 
     result
+}
+
+/// One root's outcome from an observe-only pass: walk + growth-store
+/// write, no rendering. See [`observe_only`].
+#[derive(Debug, Clone)]
+pub struct ObserveSummary {
+    pub observed_at: u64,
+    pub walked_total: u64,
+    pub projects: usize,
+    /// Always "full" until incremental walks (#29) land; the seam this
+    /// field exists for.
+    pub mode: &'static str,
+}
+
+/// Observe-only entry point for `slop-livin observe`: walks `root`,
+/// writes the growth store under `store_dir`, and returns the summary
+/// facts the caller prints/logs. Never renders a report.
+pub fn observe_only(
+    root: &Path,
+    store_dir: &Path,
+    since_override: Option<&str>,
+) -> Result<ObserveSummary> {
+    let r = report_with_observe(root, None, false, Some(store_dir), since_override, true)?;
+    Ok(ObserveSummary {
+        observed_at: r.observed_at,
+        walked_total: r.reconciliation.walked_total,
+        projects: r.projects.len(),
+        mode: "full",
+    })
 }
 
 pub fn to_json(report: &Report) -> Result<String> {
