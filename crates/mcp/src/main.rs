@@ -32,7 +32,7 @@ fn kind_label(kind: &ArtifactKind) -> &'static str {
         ArtifactKind::Cache => "cache",
         ArtifactKind::Source => "source",
         ArtifactKind::DockerImage => "docker-image",
-        ArtifactKind::DockerCache => "docker-cache",
+        ArtifactKind::DockerBuildCache => "docker-cache",
         ArtifactKind::DockerVolume => "docker-volume",
         ArtifactKind::Loose => "loose",
         ArtifactKind::Unknown => "unknown",
@@ -47,6 +47,7 @@ fn reason_label(reason: &UnownedReason) -> &'static str {
         UnownedReason::NoContainingRepo => "no-containing-repo",
         UnownedReason::SharedCache => "shared-cache",
         UnownedReason::PermissionDenied => "permission-denied",
+        UnownedReason::DockerNoJoin => "docker-no-join",
     }
 }
 

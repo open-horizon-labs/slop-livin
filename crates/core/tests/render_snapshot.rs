@@ -22,6 +22,7 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         observed_at: 1_000_000,
         confidence: Confidence::High,
         source: Source::new("test"),
+        note: None,
     }
 }
 
@@ -99,26 +100,35 @@ fn fixture_report() -> Report {
                 }],
             },
         ],
+        notes: vec![],
         unowned: vec![
             UnownedRow {
                 path_or_object: "old-project/build".to_string(),
                 bytes: 300_000_000,
                 reason: UnownedReason::NoContainingRepo,
+                shared_bytes: None,
+                note: None,
             },
             UnownedRow {
                 path_or_object: "old-project/tmp".to_string(),
                 bytes: 100_000_000,
                 reason: UnownedReason::NoContainingRepo,
+                shared_bytes: None,
+                note: None,
             },
             UnownedRow {
                 path_or_object: "restricted/vault".to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
+                shared_bytes: None,
+                note: None,
             },
             UnownedRow {
                 path_or_object: "/Users/x/.cache".to_string(),
                 bytes: 4_000_000_000,
                 reason: UnownedReason::SharedCache,
+                shared_bytes: None,
+                note: None,
             },
         ],
         reconciliation: Reconciliation {
@@ -126,6 +136,8 @@ fn fixture_report() -> Report {
             unowned: 4_400_000_000,
             walked_total: 10_600_000_000,
             du_total: None,
+            docker_attributed: 0,
+            docker_unowned: 0,
         },
     }
 }
