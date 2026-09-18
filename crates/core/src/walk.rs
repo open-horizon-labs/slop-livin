@@ -19,7 +19,7 @@
 //! collapse that distinction; the two are kept as independent parallel
 //! passes here to preserve it exactly.
 
-use crate::attribution::{AttributionResult, allocated_bytes, classify, is_shared_cache_name};
+use crate::attribution::{AttributionResult, allocated_bytes, classify_at, is_shared_cache_name};
 use crate::entities::{Confidence, id_for};
 use crate::git::{DiscoveredWorktree, classify_git_file, classify_main_checkout};
 use crate::report::{
@@ -518,7 +518,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             dir_dir_count += 1;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(kind) = classify(&name) {
+            if let Some(kind) = classify_at(&path, &name) {
                 let worktree = nearest_worktree(known, &child_path).map(str::to_string);
                 let group = Arc::new(SizeGroup {
                     root_path: child_path.clone(),

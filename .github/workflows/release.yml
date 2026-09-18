@@ -1,0 +1,100 @@
+name: Release
+
+# Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
+# or `gh release create`, which pushes the tag). One job: an optimized
+# aarch64-apple-darwin build of the CLI/TUI binary and the MCP server,
+# packaged as a tarball with a checksum, attached to the GitHub release.
+#
+# Runner: the org's local Apple-silicon builder when LOCAL_MACOS_CI_ENABLED
+# is set (same toggle unified-hifi-control uses), otherwise GitHub's hosted
+# macOS runner. sccache fronts rustc either way.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    name: macOS arm64
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64"]') || 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-arm64
+
+      - name: Version
+        id: v
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (release, aarch64-apple-darwin)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: cargo build --release --locked --target aarch64-apple-darwin -p slop-livin -p slop-livin-mcp
+
+      - name: Test
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: cargo test --workspace --locked
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          v="${{ steps.v.outputs.version }}"
+          out="slop-livin-${v}-aarch64-apple-darwin"
+          mkdir -p "dist/${out}"
+          cp target/aarch64-apple-darwin/release/slop-livin target/aarch64-apple-darwin/release/slop-livin-mcp "dist/${out}/"
+          cp README.md "dist/${out}/"
+          tar -C dist -czf "dist/${out}.tar.gz" "${out}"
+          (cd dist && shasum -a 256 "${out}.tar.gz" > "${out}.tar.gz.sha256")
+          echo "tarball=dist/${out}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=dist/${out}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          ./target/aarch64-apple-darwin/release/slop-livin --help | head -3
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/slop-livin-mcp | grep -q '"report"'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slop-livin-macos-arm64
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.sha }}
+          generate_release_notes: true

@@ -16,26 +16,149 @@ use std::path::Path;
 /// One basename -> kind entry. Data-driven so a later slice (R7) can
 /// attach a recovery contract per row without touching the walk.
 const ARTIFACT_KINDS: &[(&str, ArtifactKind)] = &[
+    // JavaScript / TypeScript
     ("node_modules", ArtifactKind::DependencyTree),
-    ("target", ArtifactKind::BuildOutput),
-    ("build", ArtifactKind::BuildOutput),
-    ("dist", ArtifactKind::BuildOutput),
-    ("out", ArtifactKind::BuildOutput),
+    (".angular", ArtifactKind::Cache),
     (".next", ArtifactKind::BuildOutput),
     (".nuxt", ArtifactKind::BuildOutput),
+    (".turbo", ArtifactKind::Cache),
+    (".parcel-cache", ArtifactKind::Cache),
+    (".expo", ArtifactKind::Cache),
+    (".metro", ArtifactKind::Cache),
+    (".svelte-kit", ArtifactKind::BuildOutput),
+    (".output", ArtifactKind::BuildOutput),
+    ("dist", ArtifactKind::BuildOutput),
+    ("out", ArtifactKind::BuildOutput),
+    ("coverage", ArtifactKind::BuildOutput),
+    // Rust
+    ("target", ArtifactKind::BuildOutput),
+    (".xwin-cache", ArtifactKind::Cache),
+    // Python
     (".venv", ArtifactKind::DependencyTree),
     ("venv", ArtifactKind::DependencyTree),
     ("__pycache__", ArtifactKind::BuildOutput),
-    (".git", ArtifactKind::Git),
+    ("__pypackages__", ArtifactKind::DependencyTree),
+    (".mypy_cache", ArtifactKind::Cache),
+    (".pytest_cache", ArtifactKind::Cache),
+    (".ruff_cache", ArtifactKind::Cache),
+    (".tox", ArtifactKind::Cache),
+    (".nox", ArtifactKind::Cache),
+    (".pixi", ArtifactKind::DependencyTree),
+    (".ipynb_checkpoints", ArtifactKind::Cache),
+    // JVM
+    ("build", ArtifactKind::BuildOutput),
+    (".gradle", ArtifactKind::Cache),
+    // Apple
     ("Pods", ArtifactKind::DependencyTree),
     ("DerivedData", ArtifactKind::BuildOutput),
-    (".gradle", ArtifactKind::DependencyTree),
-    (".cache", ArtifactKind::Cache),
-    (".turbo", ArtifactKind::BuildOutput),
-    (".parcel-cache", ArtifactKind::Cache),
-    ("coverage", ArtifactKind::BuildOutput),
+    (".build", ArtifactKind::BuildOutput),
+    (".swiftpm", ArtifactKind::Cache),
+    // Haskell
+    (".stack-work", ArtifactKind::BuildOutput),
+    ("dist-newstyle", ArtifactKind::BuildOutput),
+    // Elixir
+    ("_build", ArtifactKind::BuildOutput),
+    (".elixir-tools", ArtifactKind::Cache),
+    (".elixir_ls", ArtifactKind::Cache),
+    (".lexical", ArtifactKind::Cache),
+    // Dart / Flutter
+    (".dart_tool", ArtifactKind::Cache),
+    // Zig
+    ("zig-cache", ArtifactKind::Cache),
+    (".zig-cache", ArtifactKind::Cache),
+    ("zig-out", ArtifactKind::BuildOutput),
+    // C / C++
+    ("cmake-build-debug", ArtifactKind::BuildOutput),
+    ("cmake-build-release", ArtifactKind::BuildOutput),
+    // PHP / Ruby / Go (also Deno's vendored deps)
     ("vendor", ArtifactKind::DependencyTree),
+    // Terraform
+    (".terraform", ArtifactKind::DependencyTree),
+    // Generic
+    (".cache", ArtifactKind::Cache),
+    (".git", ArtifactKind::Git),
 ];
+
+/// Names that are artifacts only next to a project marker, because the
+/// bare name is ordinary source elsewhere (`bin/` and `obj/` in a .NET
+/// project are build output; `bin/` in a shell repo is scripts). Salvaged
+/// from kondo's per-project-type tables: the marker is a sibling in the
+/// same directory.
+const MARKED_ARTIFACT_KINDS: &[(&str, ArtifactKind, &[&str])] = &[
+    // .NET: any *.csproj / *.fsproj / *.sln sibling (checked by extension below)
+    (
+        "bin",
+        ArtifactKind::BuildOutput,
+        &["*.csproj", "*.fsproj", "*.sln", "*.vbproj"],
+    ),
+    (
+        "obj",
+        ArtifactKind::BuildOutput,
+        &["*.csproj", "*.fsproj", "*.sln", "*.vbproj"],
+    ),
+    // Unity
+    (
+        "Library",
+        ArtifactKind::Cache,
+        &["ProjectSettings", "Assets"],
+    ),
+    ("Temp", ArtifactKind::Cache, &["ProjectSettings", "Assets"]),
+    (
+        "Obj",
+        ArtifactKind::BuildOutput,
+        &["ProjectSettings", "Assets"],
+    ),
+    ("Logs", ArtifactKind::Cache, &["ProjectSettings", "Assets"]),
+    (
+        "MemoryCaptures",
+        ArtifactKind::Cache,
+        &["ProjectSettings", "Assets"],
+    ),
+    (
+        "Build",
+        ArtifactKind::BuildOutput,
+        &["ProjectSettings", "Assets", "*.uproject"],
+    ),
+    (
+        "Builds",
+        ArtifactKind::BuildOutput,
+        &["ProjectSettings", "Assets"],
+    ),
+    // Unreal
+    ("Binaries", ArtifactKind::BuildOutput, &["*.uproject"]),
+    ("Intermediate", ArtifactKind::BuildOutput, &["*.uproject"]),
+    ("Saved", ArtifactKind::Cache, &["*.uproject"]),
+    ("DerivedDataCache", ArtifactKind::Cache, &["*.uproject"]),
+];
+
+fn has_marker(parent: &Path, markers: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Any one marker present is enough: a `.uproject` file, a `.csproj`,
+    // or Unity's `ProjectSettings` directory.
+    markers.iter().any(|m| match m.strip_prefix("*.") {
+        Some(ext) => names.iter().any(|n| n.ends_with(&format!(".{ext}"))),
+        None => names.iter().any(|n| n == m),
+    })
+}
+
+/// Classification with the parent directory available, so marker-gated
+/// names (`bin`, `obj`, Unity's `Library`, Unreal's `Intermediate`) count
+/// only inside the project type that generates them.
+pub(crate) fn classify_at(parent: &Path, name: &str) -> Option<ArtifactKind> {
+    if let Some(k) = classify(name) {
+        return Some(k);
+    }
+    MARKED_ARTIFACT_KINDS
+        .iter()
+        .find(|(n, _, markers)| *n == name && has_marker(parent, markers))
+        .map(|(_, k, _)| k.clone())
+}
 
 /// Basenames that, when found *outside* every checkout/worktree, are a
 /// shared cache rather than an ordinary unowned path.
@@ -390,6 +513,56 @@ pub fn du_total(root: &Path) -> Option<u64> {
     let text = String::from_utf8_lossy(&out.stdout);
     let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
     Some(kib * 1024)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn marker_gated_names_classify_only_next_to_their_project_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotnet = tmp.path().join("app");
+        std::fs::create_dir_all(dotnet.join("bin")).unwrap();
+        std::fs::write(dotnet.join("App.csproj"), "<Project/>").unwrap();
+        assert_eq!(classify_at(&dotnet, "bin"), Some(ArtifactKind::BuildOutput));
+        assert_eq!(classify_at(&dotnet, "obj"), Some(ArtifactKind::BuildOutput));
+
+        let shell = tmp.path().join("scripts");
+        std::fs::create_dir_all(shell.join("bin")).unwrap();
+        assert_eq!(
+            classify_at(&shell, "bin"),
+            None,
+            "bin/ in a shell repo is source"
+        );
+
+        let unity = tmp.path().join("game");
+        std::fs::create_dir_all(unity.join("ProjectSettings")).unwrap();
+        assert_eq!(classify_at(&unity, "Library"), Some(ArtifactKind::Cache));
+        assert_eq!(classify_at(&shell, "Library"), None);
+
+        let unreal = tmp.path().join("ue");
+        std::fs::create_dir_all(&unreal).unwrap();
+        std::fs::write(unreal.join("Game.uproject"), "{}").unwrap();
+        assert_eq!(
+            classify_at(&unreal, "Intermediate"),
+            Some(ArtifactKind::BuildOutput)
+        );
+
+        // Unconditional names still classify anywhere.
+        assert_eq!(
+            classify_at(&shell, "node_modules"),
+            Some(ArtifactKind::DependencyTree)
+        );
+        assert_eq!(
+            classify_at(&shell, ".stack-work"),
+            Some(ArtifactKind::BuildOutput)
+        );
+        assert_eq!(
+            classify_at(&shell, "zig-out"),
+            Some(ArtifactKind::BuildOutput)
+        );
+    }
 }
 
 #[cfg(test)]

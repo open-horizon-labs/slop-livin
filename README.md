@@ -142,7 +142,7 @@ There is no MCP tool that writes a grant. That is the design, not an omission.
 
 | | slop-livin | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [clean-dev-dirs](https://github.com/clean-dev-dirs/clean-dev-dirs) | [cargo-sweep](https://github.com/holmgr/cargo-sweep) | [Mole](https://github.com/tw93/Mole) | StorageRadar | DaisyDisk |
 |---|---|---|---|---|---|---|---|---|
-| Finds build/deps artifacts | ✓ | ✓ 20+ types | node_modules | ✓ 16 ecosystems | Cargo `target/` | ✓ (purge) | | |
+| Finds build/deps artifacts | ✓ ~50 names, 20+ ecosystems, marker-gated where the name is ambiguous | ✓ 20+ types | node_modules | ✓ 16 ecosystems | Cargo `target/` | ✓ (purge) | | |
 | Growth over time | ✓ persistent, any window | | | | | | manual snapshots | |
 | Project → worktree → artifact model | ✓ | project | | project | | | directories | directories |
 | Git status per row (tracked/ignored/untracked) | ✓ | | | | | | | |
