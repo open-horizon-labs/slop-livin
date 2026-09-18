@@ -1,5 +1,5 @@
-"/Users/dev/src · observed just now · since 1w · 2 projects · 9.9GB attributed · "
-"filter: growth > 900GB in 7d                                                    "
+"/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed ·"
+"view: projects · filter: growth > 900GB in 7d                                   "
 "no rows match — Backspace to widen, 0 to clear                                  "
 "                                                                                "
 "                                                                                "

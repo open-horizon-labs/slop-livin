@@ -40,20 +40,19 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
 }
 
 /// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
-pub fn handle_key_mod(app: &mut App, code: KeyCode, shift: bool) {
+pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     if let Some(p) = app.picker.as_mut() {
         match code {
             KeyCode::Up => p.up(),
             KeyCode::Down => p.down(),
-            KeyCode::Right if shift => p.cycle_secondary(1),
-            KeyCode::Left if shift => p.cycle_secondary(-1),
+            KeyCode::Char(' ') => p.flip_op(),
             KeyCode::Right => p.cycle(1),
             KeyCode::Left => p.cycle(-1),
             KeyCode::Backspace => p.backspace(),
             KeyCode::Enter => app.apply_picker(),
             KeyCode::Esc => app.picker = None,
-            KeyCode::Char('e') if p.field != 2 => app.picker_to_raw_edit(),
-            KeyCode::Char(c) if p.field == 2 => p.type_char(c),
+            KeyCode::Char('e') if p.field != 3 => app.picker_to_raw_edit(),
+            KeyCode::Char(c) if p.field == 3 => p.type_char(c),
             KeyCode::Char('0') => {
                 app.picker = None;
                 app.clear_filter();
@@ -86,7 +85,13 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, shift: bool) {
         KeyCode::Right => app.toggle_expand(),
         KeyCode::Left => app.toggle_expand(),
         KeyCode::Enter => app.drill_into_selected(),
-        KeyCode::Esc => app.cancel_confirm(),
+        KeyCode::Esc => {
+            if app.confirm_open {
+                app.cancel_confirm();
+            } else if app.view != app::ViewKind::Projects {
+                app.set_view(app::ViewKind::Projects);
+            }
+        }
         KeyCode::Backspace => app.mark_selected(),
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),
@@ -149,7 +154,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                 Some(&store),
                 None,
                 !no_observe,
-                false,
+                true, // include_dirs: Source rows expand into their own directories
                 false,
                 false,
             )?;
@@ -157,6 +162,11 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         }
     };
     app.pending = Some(rx);
+    app.store_dir = Some(store.clone());
+    if let Some(saved) = app::load_saved_filter(&store) {
+        app.filter_text = saved;
+        app.commit_filter();
+    }
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -269,6 +279,7 @@ mod tests {
         let mut app = App::new(empty_report(), "/root".into());
         handle_key(&mut app, KeyCode::Char('/'));
         assert!(app.picker.is_some());
+        handle_key(&mut app, KeyCode::Down); // window
         handle_key(&mut app, KeyCode::Down); // kind
         handle_key(&mut app, KeyCode::Right); // build
         handle_key(&mut app, KeyCode::Enter);

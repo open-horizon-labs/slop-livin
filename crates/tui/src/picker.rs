@@ -31,7 +31,15 @@ pub struct Picker {
     pub projects: Vec<String>,
 }
 
-pub const FIELDS: &[&str] = &["growth", "kind", "project", "idle", "merge-complete", "pr"];
+pub const FIELDS: &[&str] = &[
+    "growth",
+    "window",
+    "kind",
+    "project",
+    "idle",
+    "merge-complete",
+    "pr",
+];
 
 impl Picker {
     /// Seeds the form from the report (project names) and, when it parses,
@@ -161,35 +169,29 @@ impl Picker {
             ((ix as i32 + delta).rem_euclid(len as i32)) as usize
         }
         match self.field {
-            0 => {
-                // growth: cycle size; when size is off the op/window are moot
-                self.size_ix = step(self.size_ix, SIZES.len(), delta);
-            }
-            1 => self.kind_ix = step(self.kind_ix, KINDS.len(), delta),
-            2 => {
+            0 => self.size_ix = step(self.size_ix, SIZES.len(), delta),
+            1 => self.window_ix = step(self.window_ix, WINDOWS.len(), delta),
+            2 => self.kind_ix = step(self.kind_ix, KINDS.len(), delta),
+            3 => {
                 let n = self.project_choices().len();
                 self.project_ix = step(self.project_ix, n, delta);
             }
-            3 => self.idle_ix = step(self.idle_ix, IDLES.len(), delta),
-            4 => self.merge_complete = !self.merge_complete,
-            5 => self.pr_ix = step(self.pr_ix, PRS.len(), delta),
+            4 => self.idle_ix = step(self.idle_ix, IDLES.len(), delta),
+            5 => self.merge_complete = !self.merge_complete,
+            6 => self.pr_ix = step(self.pr_ix, PRS.len(), delta),
             _ => {}
         }
     }
 
-    /// Secondary cycle on the growth field: op (>/<) and window.
-    pub fn cycle_secondary(&mut self, delta: i32) {
+    /// Space on the growth field flips grew (>) / shrank (<).
+    pub fn flip_op(&mut self) {
         if self.field == 0 {
-            if delta > 0 {
-                self.window_ix = (self.window_ix + 1) % WINDOWS.len();
-            } else {
-                self.growth_gt = !self.growth_gt;
-            }
+            self.growth_gt = !self.growth_gt;
         }
     }
 
     pub fn type_char(&mut self, c: char) {
-        if self.field == 2 {
+        if self.field == 3 {
             self.project_query.push(c);
             self.project_ix = if self.project_choices().len() > 1 {
                 1
@@ -199,7 +201,7 @@ impl Picker {
         }
     }
     pub fn backspace(&mut self) {
-        if self.field == 2 {
+        if self.field == 3 {
             self.project_query.pop();
             self.project_ix = 0;
         }
@@ -254,12 +256,16 @@ impl Picker {
             "off".to_string()
         } else {
             format!(
-                "{} {} in {}   (←→ size · ⇧→ window · ⇧← flip)",
-                if self.growth_gt { ">" } else { "<" },
-                SIZES[self.size_ix],
-                WINDOWS[self.window_ix]
+                "{} {}   (Space: grew/shrank)",
+                if self.growth_gt {
+                    "grew more than"
+                } else {
+                    "shrank more than"
+                },
+                SIZES[self.size_ix]
             )
         };
+        let window = format!("last {}", WINDOWS[self.window_ix]);
         let choices = self.project_choices();
         let project = if self.project_query.is_empty() {
             choices
@@ -280,15 +286,16 @@ impl Picker {
         };
         vec![
             ("growth".into(), growth, self.field == 0),
-            ("kind".into(), KINDS[self.kind_ix].into(), self.field == 1),
-            ("project".into(), project, self.field == 2),
-            ("idle".into(), IDLES[self.idle_ix].into(), self.field == 3),
+            ("window".into(), window, self.field == 1),
+            ("kind".into(), KINDS[self.kind_ix].into(), self.field == 2),
+            ("project".into(), project, self.field == 3),
+            ("idle".into(), IDLES[self.idle_ix].into(), self.field == 4),
             (
                 "merge-complete".into(),
                 if self.merge_complete { "on" } else { "off" }.into(),
-                self.field == 4,
+                self.field == 5,
             ),
-            ("pr".into(), PRS[self.pr_ix].into(), self.field == 5),
+            ("pr".into(), PRS[self.pr_ix].into(), self.field == 6),
         ]
     }
 }

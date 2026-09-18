@@ -16,6 +16,7 @@ pub mod git;
 pub mod github;
 pub mod grants;
 pub mod growth;
+pub mod ignore;
 pub mod ledger;
 pub mod measurement;
 pub mod occupancy;

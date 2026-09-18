@@ -6,30 +6,12 @@ use crate::units::UnitId;
 use slop_livin_core::report::{ArtifactKind, Report, UnownedReason};
 use std::collections::BTreeMap;
 
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes}B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
-    }
-}
+/// Byte formatting is defined once, in core, so the TUI and the CLI can
+/// never disagree about what "1.8GB" means (they did: one divided by 1024
+/// under a decimal label while the other divided by 1000).
+pub use slop_livin_core::render::human_bytes_pub as human_bytes;
 
-/// Signed growth. Zero is a fact and reads `0B`; the em dash is reserved
-/// for "no prior observation" (a `None`), rendered by the caller.
-pub fn human_signed_bytes(delta: i64) -> String {
-    if delta == 0 {
-        return "0B".to_string();
-    }
-    let sign = if delta > 0 { "+" } else { "-" };
-    format!("{sign}{}", human_bytes(delta.unsigned_abs()))
-}
+pub use slop_livin_core::render::human_bytes_signed as human_signed_bytes;
 
 /// Truncates `s` to `width` chars, keeping the tail: `foo…bar` rather
 /// than `foo…`, per DESIGN.md ("truncated with `…` in the middle,
@@ -78,6 +60,18 @@ pub enum Sort {
 /// single artifact that Backspace can act on (whether or not it is
 /// currently markable — refusal is decided at mark time so the reason is
 /// specific).
+/// Facts a worktree row carries for the mark/remove decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeMark {
+    pub path: std::path::PathBuf,
+    pub linked: bool,
+    pub dirty: Option<bool>,
+    pub unpushed: Option<u32>,
+    pub locked: Option<bool>,
+    pub merge_complete: bool,
+    pub pr: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Row {
     pub depth: usize,
@@ -94,6 +88,13 @@ pub struct Row {
     pub signals: Vec<String>,
     pub unit: Option<UnitId>,
     pub kind: Option<ArtifactKind>,
+    /// Set on a worktree row: what Backspace needs to decide whether this
+    /// worktree may be marked for removal, and the terms to record.
+    pub worktree: Option<WorktreeMark>,
+    /// git tracking status of this path, when known: tracked / ignored /
+    /// untracked. Untracked bytes are in no version control and covered by
+    /// no ignore rule — the fact that most changes what a human decides.
+    pub track: Option<slop_livin_core::ignore::TrackState>,
     /// Present for a worktree row: how many artifact children are hidden
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
@@ -111,6 +112,8 @@ impl Row {
             signals: Vec::new(),
             unit: None,
             kind: None,
+            worktree: None,
+            track: None,
             collapsed_children: None,
             expandable: false,
         }
@@ -198,12 +201,18 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         out.push(Row {
             depth: 0,
             rail: String::new(),
-            label: format!("{} ({} worktrees)", p.name, p.worktrees.len()),
+            label: if p.worktrees.len() > 1 {
+                format!("{}  · {} worktrees", p.name, p.worktrees.len())
+            } else {
+                p.name.clone()
+            },
             bytes,
             growth,
             signals: Vec::new(),
             unit: None,
             kind: None,
+            worktree: None,
+            track: None,
             collapsed_children: None,
             expandable: true,
         });
@@ -223,6 +232,7 @@ pub fn tree_rows(
     project_name: &str,
     filter: &Filter,
     collapsed: &std::collections::HashSet<String>,
+    track: &std::collections::HashMap<std::path::PathBuf, slop_livin_core::ignore::TrackState>,
 ) -> Vec<Row> {
     let mut out = Vec::new();
     let Some(p) = report.projects.iter().find(|p| p.name == project_name) else {
@@ -246,15 +256,42 @@ pub fn tree_rows(
         let signals: Vec<String> = wt.signals.iter().map(|s| s.value.clone()).collect();
         let wt_connector = if wt_last { "└─ " } else { "├─ " };
         let expand_glyph = if is_collapsed { "▸" } else { "▾" };
+        let raw = source_wt.raw_signals();
+        let mark = WorktreeMark {
+            path: source_wt.path.clone(),
+            linked: matches!(wt.kind, slop_livin_core::report::WorktreeKind::Linked),
+            dirty: raw.0,
+            unpushed: raw.1,
+            locked: raw.2,
+            merge_complete: source_wt
+                .merge_complete
+                .as_ref()
+                .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes),
+            pr: source_wt
+                .github
+                .as_ref()
+                .and_then(|g| match &g.pull_request {
+                    slop_livin_core::github::PrStatus::Some(pr) => {
+                        Some(format!("PR #{} {:?}", pr.number, pr.state).to_lowercase())
+                    }
+                    _ => None,
+                }),
+        };
         out.push(Row {
             depth: 1,
             rail: format!("{wt_connector}{expand_glyph} "),
-            label: format!("{:?} {}", wt.kind, source_wt.path.display()),
+            label: format!(
+                "{} {}",
+                format!("{:?}", wt.kind).to_lowercase(),
+                source_wt.path.display()
+            ),
             bytes: wt.bytes,
             growth: wt.growth_bytes,
             signals,
-            unit: None,
+            unit: Some(UnitId::for_artifact(&source_wt.path)),
             kind: None,
+            worktree: Some(mark),
+            track: None,
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
         });
@@ -282,18 +319,90 @@ pub fn tree_rows(
             } else {
                 format!("{} {}", row.kind_label, row.rel_path)
             };
+            let abs = source_wt.path.join(&row.rel_path);
+            let is_source = row.kind_label == "source";
+            let source_key = format!("source:{}", source_wt.path.display());
+            let source_collapsed = collapsed.contains(&source_key);
+            let children: Vec<&slop_livin_core::report::DirRollup> = if is_source {
+                source_children(report, &source_wt.worktree_id)
+            } else {
+                Vec::new()
+            };
             let mut out_row = Row::leaf(2, label, row.bytes, row.growth_bytes);
-            out_row.rail = format!("{child_prefix}{connector}");
+            out_row.rail = format!(
+                "{child_prefix}{connector}{}",
+                if is_source && !children.is_empty() {
+                    if source_collapsed { "▸ " } else { "▾ " }
+                } else {
+                    ""
+                }
+            );
             out_row.kind = row.kind.clone();
+            // `.git` is git's own store, not content it tracks: annotating
+            // it "untracked" is noise, so it carries no status.
+            out_row.track = (row.kind_label != "git")
+                .then(|| track.get(&abs).copied())
+                .flatten();
+            out_row.expandable = is_source && !children.is_empty();
+            out_row.collapsed_children = (is_source && source_collapsed).then_some(children.len());
             // A folded group of several artifacts has no single owning
             // path to mark; only an unfolded row is markable.
             if row.folded_count == 1 {
-                out_row.unit = Some(UnitId::for_artifact(&source_wt.path.join(&row.rel_path)));
+                out_row.unit = Some(UnitId::for_artifact(&abs));
             }
             out.push(out_row);
+            // A Source tree is one row only because nothing inside it is a
+            // classified artifact -- which is exactly when its contents are
+            // worth seeing. Expanded, it lists its own top-level
+            // directories with their git tracking status.
+            if is_source && !source_collapsed {
+                let shown = children.len().min(8);
+                for (ci, d) in children.iter().take(shown).enumerate() {
+                    let c_last = ci + 1 == shown && children.len() <= shown;
+                    let c_connector = if c_last { "└─ " } else { "├─ " };
+                    let dir_abs = source_wt.path.join(&d.rel_path);
+                    let mut child =
+                        Row::leaf(3, format!("dir {}", d.rel_path), d.allocated_total, None);
+                    child.rail = format!("{child_prefix}   {c_connector}");
+                    child.track = track.get(&dir_abs).copied();
+                    out.push(child);
+                }
+                if children.len() > shown {
+                    let rest: u64 = children.iter().skip(shown).map(|d| d.allocated_total).sum();
+                    let mut more = Row::leaf(
+                        3,
+                        format!("… and {} more directories", children.len() - shown),
+                        rest,
+                        None,
+                    );
+                    more.rail = format!("{child_prefix}   └─ ");
+                    out.push(more);
+                }
+            }
         }
     }
     out
+}
+
+/// Top-level directories of a worktree's Source tree, biggest first.
+/// Empty when the report was built without directory rollups.
+fn source_children<'a>(
+    report: &'a Report,
+    worktree_id: &str,
+) -> Vec<&'a slop_livin_core::report::DirRollup> {
+    let Some(dirs) = report
+        .dirs_by_worktree
+        .as_ref()
+        .and_then(|m| m.get(worktree_id))
+    else {
+        return Vec::new();
+    };
+    let mut top: Vec<&slop_livin_core::report::DirRollup> = dirs
+        .iter()
+        .filter(|d| !d.rel_path.is_empty() && d.rel_path != "." && !d.rel_path.contains('/'))
+        .collect();
+    top.sort_by(|a, b| b.allocated_total.cmp(&a.allocated_total));
+    top
 }
 
 /// Kinds view: bytes/count per artifact kind across the whole root.
@@ -321,6 +430,8 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             signals: Vec::new(),
             unit: None,
             kind: None,
+            worktree: None,
+            track: None,
             collapsed_children: None,
             expandable: false,
         })
@@ -444,21 +555,66 @@ fn worktree_passes(filter: &Filter, wt: &slop_livin_core::report::WorktreeRow) -
     filter::worktree_passes(filter, wt.idle_secs, merge_complete, pr_state)
 }
 
+/// Parses the rendered worktree signals back into facts for the mark
+/// decision: (dirty, unpushed, locked). `None` = unknown.
+trait RawWorktreeSignals {
+    fn raw_signals(&self) -> (Option<bool>, Option<u32>, Option<bool>);
+}
+impl RawWorktreeSignals for slop_livin_core::report::WorktreeRow {
+    fn raw_signals(&self) -> (Option<bool>, Option<u32>, Option<bool>) {
+        let mut dirty = None;
+        let mut unpushed = None;
+        let mut locked = None;
+        for s in &self.signals {
+            match s.name.as_str() {
+                "dirty" => {
+                    dirty = match s.value.as_str() {
+                        "dirty" => Some(true),
+                        "clean" => Some(false),
+                        _ => None,
+                    }
+                }
+                "unpushed" => {
+                    unpushed = s
+                        .value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<u32>().ok());
+                }
+                "locked" => {
+                    locked = match s.value.as_str() {
+                        "locked" => Some(true),
+                        "unlocked" => Some(false),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+        (dirty, unpushed, locked)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn human_bytes_formats_units() {
+        // Decimal, matching the SI labels the product prints (a GB is
+        // 1_000_000_000 bytes, not a GiB under a GB label).
         assert_eq!(human_bytes(500), "500B");
         assert_eq!(human_bytes(1536), "1.5KB");
-        assert_eq!(human_bytes(1_288_490_188), "1.2GB");
+        assert_eq!(human_bytes(1_288_490_188), "1.3GB");
+        assert_eq!(human_bytes(1_000_000_000), "1.0GB");
+        // The exact figure behind the reported arithmetic bug.
+        assert_eq!(human_bytes(1_951_580_160), "2.0GB");
     }
 
     #[test]
     fn signed_bytes_show_sign_and_dash() {
         assert_eq!(human_signed_bytes(0), "0B");
-        assert_eq!(human_signed_bytes(184_320_000), "+175.8MB");
+        assert_eq!(human_signed_bytes(184_320_000), "+184.3MB");
         assert_eq!(human_signed_bytes(-1024), "-1.0KB");
     }
 
@@ -593,7 +749,13 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
         };
-        let rows = tree_rows(&report, "proj", &Filter::default(), &Default::default());
+        let rows = tree_rows(
+            &report,
+            "proj",
+            &Filter::default(),
+            &Default::default(),
+            &Default::default(),
+        );
         // First worktree is not last -> ├─; second worktree is last -> └─.
         assert!(rows[0].rail.starts_with("├─"));
         assert!(rows[3].rail.starts_with("└─"));

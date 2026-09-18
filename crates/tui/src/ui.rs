@@ -138,7 +138,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
     let w = area.width.min(78);
-    let h = area.height.min(14);
+    let h = area.height.min(15);
     let popup = Rect {
         x: (area.width.saturating_sub(w)) / 2,
         y: (area.height.saturating_sub(h)) / 2,
@@ -180,7 +180,13 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
         };
         format!("filter › {}▏  {hint}", app.filter_text)
     } else {
-        format!("filter: {}", app.filter_text)
+        let scope = match (app.view, app.selected_project.as_deref()) {
+            (crate::app::ViewKind::Projects, _) => "projects".to_string(),
+            (crate::app::ViewKind::Tree, Some(p)) => format!("tree of {p}  (Esc back)"),
+            (v, Some(p)) => format!("{} of {p}  (Esc back)", v.label()),
+            (v, None) => format!("{}  (Esc back)", v.label()),
+        };
+        format!("view: {scope} · filter: {}", app.filter_text)
     };
     frame.render_widget(Paragraph::new(text), area);
     if let Some(err) = &app.filter_error {
@@ -218,8 +224,21 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let max_abs = max_abs_growth(rows.iter());
-    let narrow = area.width < 160;
-    let bar_width: usize = if narrow { 8 } else { 24 };
+    // Columns scale with the terminal: fixed bytes (10) + growth (10) +
+    // bar; the rest is split between the name and the signals so a wide
+    // terminal shows whole paths and spelled-out signals instead of the
+    // 80-column layout centered in empty space.
+    let width = area.width as usize;
+    let narrow = width < 120;
+    let bar_width: usize = ((width.saturating_sub(90)) / 5).clamp(8, 32);
+    let fixed = 10 + 1 + 10 + 1 + bar_width + 2 + 1;
+    let flexible = width.saturating_sub(fixed).max(40);
+    let signals_width: usize = if narrow {
+        flexible / 4
+    } else {
+        (flexible * 2 / 5).min(70)
+    };
+    let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let marked = row
@@ -227,8 +246,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             .as_ref()
             .is_some_and(|u| app.marked.contains_key(&u.0));
         let mark_prefix = if marked { "✗ " } else { "" };
-        let name_width: usize = if narrow { 38 } else { 60 };
-        let raw_name = format!("{}{mark_prefix}{}", row.rail, row.label);
+        let track = match row.track {
+            Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
+            _ => String::new(),
+        };
+        let raw_name = format!("{}{mark_prefix}{}{track}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
         let bytes = format!("{:>10}", human_bytes(row.bytes));
         let growth = format!(
@@ -251,13 +273,24 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         // uses width up to 200 ... signals spell out."
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
-        let signals_text = if row.signals.is_empty() {
+        let mut signals_text = if row.signals.is_empty() {
             String::new()
         } else if narrow {
             pick_signals(&row.signals, 2).join(" · ")
         } else {
             row.signals.join(" · ")
         };
+        if signals_text.chars().count() > signals_width {
+            // Never overflow the row: prefer the loud signals, then cut.
+            signals_text = pick_signals(&row.signals, 3).join(" · ");
+            if signals_text.chars().count() > signals_width {
+                signals_text = signals_text
+                    .chars()
+                    .take(signals_width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+            }
+        }
 
         let name_style = if marked {
             Style::default().fg(Color::Yellow)
@@ -290,7 +323,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.min(70);
-    let h = area.height.min(14);
+    let h = area.height.min(15);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {

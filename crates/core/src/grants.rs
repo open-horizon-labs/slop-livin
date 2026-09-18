@@ -9,6 +9,11 @@ pub enum Verb {
     Delete,
     Archive,
     BypassTrash,
+    /// Remove a linked git worktree (directory to Trash, then
+    /// `git worktree prune`). Its own bar: never Main/Clone checkouts, and
+    /// only when the worktree is clean, has nothing unpushed, is unlocked
+    /// and unoccupied at the sink.
+    RemoveWorktree,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,7 +20,8 @@ const DEFAULT_TOP_N: usize = 25;
 /// decimal ("GB") label, so the *same* observation could read "51.3GB"
 /// from one surface (the raw integer) and "47.9GB" from this one -- a
 /// 1024-vs-1000 unit mismatch masquerading as stale/re-read data.
-/// Public alias of `human_bytes` for callers outside this module.
+/// The one byte formatter in this product (decimal, SI-labelled). The TUI
+/// re-exports it; a second implementation is a defect (source audit).
 pub fn human_bytes_pub(bytes: u64) -> String {
     human_bytes(bytes)
 }

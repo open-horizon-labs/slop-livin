@@ -99,6 +99,23 @@ pub struct App {
     pub quit: bool,
     /// Terminal width at the last draw; the header fits its clauses to it.
     pub width: u16,
+    /// git tracking status per absolute path, filled when a project is
+    /// opened (one exclude stack per worktree, reused for its rows).
+    pub track: std::collections::HashMap<PathBuf, slop_livin_core::ignore::TrackState>,
+    /// Store dir, when known: the applied filter is persisted there so it
+    /// survives relaunch (`ui_filter.txt`).
+    pub store_dir: Option<PathBuf>,
+}
+
+fn saved_filter_path(store: &std::path::Path) -> PathBuf {
+    store.join("ui_filter.txt")
+}
+
+/// The filter text saved by the last session, if any.
+pub fn load_saved_filter(store: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(saved_filter_path(store)).ok()?;
+    let t = t.trim().to_string();
+    (!t.is_empty()).then_some(t)
 }
 
 impl App {
@@ -131,7 +148,42 @@ impl App {
             sort: Sort::None,
             quit: false,
             width: 0,
+            store_dir: None,
+            track: std::collections::HashMap::new(),
         }
+    }
+
+    /// Annotates every row of one project with its git tracking status:
+    /// one exclude stack per worktree, one lookup per displayed path.
+    pub fn annotate_project(&mut self, project_name: &str) {
+        let Some(p) = self.report.projects.iter().find(|p| p.name == project_name) else {
+            return;
+        };
+        let mut found = std::collections::HashMap::new();
+        for wt in &p.worktrees {
+            let Some(lens) = slop_livin_core::ignore::IgnoreLens::open(&wt.path) else {
+                continue;
+            };
+            for a in &wt.artifacts {
+                let rel = a
+                    .path
+                    .strip_prefix(&wt.path)
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_default();
+                found.insert(a.path.clone(), lens.status(&rel, true));
+            }
+            if let Some(dirs) = self
+                .report
+                .dirs_by_worktree
+                .as_ref()
+                .and_then(|m| m.get(&wt.worktree_id))
+            {
+                for d in dirs.iter().filter(|d| !d.rel_path.contains('/')) {
+                    found.insert(wt.path.join(&d.rel_path), lens.status(&d.rel_path, true));
+                }
+            }
+        }
+        self.track.extend(found);
     }
 
     /// Swap in a fresh report (background observation finished). Rows are
@@ -157,7 +209,13 @@ impl App {
                     .clone()
                     .or_else(|| self.report.projects.first().map(|p| p.name.clone()));
                 return match name {
-                    Some(n) => model::tree_rows(&self.report, &n, &self.filter, &self.collapsed),
+                    Some(n) => model::tree_rows(
+                        &self.report,
+                        &n,
+                        &self.filter,
+                        &self.collapsed,
+                        &self.track,
+                    ),
                     None => Vec::new(),
                 };
             }
@@ -281,6 +339,7 @@ impl App {
             Ok(f) => {
                 self.filter = f;
                 self.filter_error = None;
+                self.persist_filter();
             }
             Err(e) => {
                 self.filter_error = Some(e);
@@ -295,6 +354,14 @@ impl App {
         self.filter = Filter::default();
         self.filter_error = None;
         self.selected = 0;
+        self.persist_filter();
+    }
+
+    fn persist_filter(&self) {
+        if let Some(store) = &self.store_dir {
+            let _ = std::fs::create_dir_all(store);
+            let _ = std::fs::write(saved_filter_path(store), &self.filter_text);
+        }
     }
 
     fn selected_row(&self) -> Option<Row> {
@@ -336,6 +403,16 @@ impl App {
                         } else {
                             self.collapsed.insert(key);
                         }
+                    } else if sel.depth == 2
+                        && let Some(wt) = p.worktrees.get(idx)
+                    {
+                        // A Source row: expand it into its own directories.
+                        let key = format!("source:{}", wt.path.display());
+                        if self.collapsed.contains(&key) {
+                            self.collapsed.remove(&key);
+                        } else {
+                            self.collapsed.insert(key);
+                        }
                     }
                 }
             }
@@ -351,7 +428,22 @@ impl App {
         if self.view == ViewKind::Projects
             && let Some(row) = self.selected_row()
         {
-            let name = row.label.split(" (").next().unwrap_or("").to_string();
+            let name = row
+                .label
+                .split("  · ")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // Source rows start collapsed; the human opens the one they
+            // care about with →.
+            if let Some(p) = self.report.projects.iter().find(|p| p.name == name) {
+                for wt in &p.worktrees {
+                    self.collapsed
+                        .insert(format!("source:{}", wt.path.display()));
+                }
+            }
+            self.annotate_project(&name);
             self.selected_project = Some(name);
             self.set_view(ViewKind::Tree);
         }
@@ -363,10 +455,56 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
+        self.mark_row(&row);
+    }
+
+    /// The mark decision for one row (testable without a selection).
+    pub fn mark_row(&mut self, row: &Row) {
         let Some(unit_id) = row.unit.clone() else {
             self.set_refusal("not a unit: nothing here can be marked");
             return;
         };
+        if let Some(wt) = row.worktree.clone() {
+            // A worktree has its own bar: only a linked worktree, and only
+            // with the facts in its favor. Each refusal names the fact.
+            if !wt.linked {
+                self.set_refusal("main checkout — not removable as a worktree");
+                return;
+            }
+            match wt.dirty {
+                Some(true) => return self.set_refusal("dirty: uncommitted changes"),
+                None => return self.set_refusal("dirty state unknown"),
+                Some(false) => {}
+            }
+            match wt.unpushed {
+                Some(0) => {}
+                Some(n) => {
+                    return self.set_refusal(&format!(
+                        "{n} unpushed commit{}",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                None => return self.set_refusal("unpushed count unknown (no upstream)"),
+            }
+            if wt.locked != Some(false) {
+                return self.set_refusal("worktree is locked");
+            }
+            if self.marked.remove(&unit_id.0).is_none() {
+                self.marked.insert(
+                    unit_id.0.clone(),
+                    MarkedUnit {
+                        path: wt.path.clone(),
+                        bytes: row.bytes,
+                        observed_at: self.report.observed_at,
+                        worktree: Some(crate::actions::WorktreeTerms {
+                            merge_complete: wt.merge_complete,
+                            pr: wt.pr.clone(),
+                        }),
+                    },
+                );
+            }
+            return;
+        }
         let Some(kind) = row.kind.clone() else {
             self.set_refusal("not a unit: nothing here can be marked");
             return;
@@ -395,6 +533,7 @@ impl App {
                             path: PathBuf::from(&unit_id.0),
                             bytes: row.bytes,
                             observed_at: self.report.observed_at,
+                            worktree: None,
                         },
                     );
                 }
@@ -617,7 +756,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         app.open_confirm();
         assert!(app.confirm_open);
-        assert!(app.confirm_summary().contains("delete 1 unit"));
+        assert!(app.confirm_summary().contains("delete 1 artifact"));
     }
 
     #[test]

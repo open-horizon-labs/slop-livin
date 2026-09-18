@@ -287,6 +287,7 @@ fn picker_frame() {
     app.width = 200;
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('/'));
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Right);
     let got = capture(&app, 200, 60);
     assert!(got.contains("▸ kind"), "kind field selected:\n{got}");
@@ -295,4 +296,117 @@ fn picker_frame() {
         "composed filter shown:\n{got}"
     );
     check("picker_200x60", &got);
+}
+
+#[test]
+fn drill_shows_view_scope_and_esc_returns_to_projects() {
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 200;
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
+    let before = capture(&app, 200, 60);
+    assert!(before.contains("view: projects · filter: 0"), "{before}");
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.view, ViewKind::Tree);
+    let tree = capture(&app, 200, 60);
+    assert!(
+        tree.contains("view: tree of "),
+        "second line must name the scope:\n{tree}"
+    );
+    assert!(tree.contains("(Esc back)"), "{tree}");
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(app.view, ViewKind::Projects);
+    let back = capture(&app, 200, 60);
+    assert!(back.contains("view: projects"), "{back}");
+}
+
+#[test]
+fn linked_worktree_is_markable_but_main_checkout_and_dirty_are_refused() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 200;
+    slop_livin_tui::handle_key(&mut app, KeyCode::Char('0'));
+    slop_livin_tui::handle_key(&mut app, KeyCode::Enter); // drill into first project
+    assert_eq!(app.view, ViewKind::Tree);
+    // Row 0 is the Main checkout: refused with the fact.
+    slop_livin_tui::handle_key(&mut app, KeyCode::Backspace);
+    let f = capture(&app, 200, 60);
+    assert!(
+        f.contains("main checkout"),
+        "main checkout refusal expected:\n{f}"
+    );
+    assert!(app.marked.is_empty());
+}
+
+#[test]
+fn worktree_mark_rules() {
+    use slop_livin_tui::model::{Row, WorktreeMark};
+    let mark = |linked: bool, dirty: Option<bool>, unpushed: Option<u32>, locked: Option<bool>| {
+        WorktreeMark {
+            path: "/x/wt".into(),
+            linked,
+            dirty,
+            unpushed,
+            locked,
+            merge_complete: false,
+            pr: None,
+        }
+    };
+    let row = |m: WorktreeMark| Row {
+        depth: 1,
+        rail: String::new(),
+        label: "linked /x/wt".into(),
+        bytes: 1,
+        growth: None,
+        signals: vec![],
+        unit: Some(slop_livin_tui::units::UnitId::for_artifact(
+            std::path::Path::new("/x/wt"),
+        )),
+        kind: None,
+        worktree: Some(m),
+        track: None,
+        collapsed_children: None,
+        expandable: false,
+    };
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    for (m, expect_marked, cause) in [
+        (
+            mark(false, Some(false), Some(0), Some(false)),
+            false,
+            "main checkout",
+        ),
+        (mark(true, Some(true), Some(0), Some(false)), false, "dirty"),
+        (
+            mark(true, Some(false), Some(3), Some(false)),
+            false,
+            "3 unpushed",
+        ),
+        (
+            mark(true, Some(false), Some(0), Some(true)),
+            false,
+            "locked",
+        ),
+        (
+            mark(true, Some(false), None, Some(false)),
+            false,
+            "unpushed count unknown",
+        ),
+        (mark(true, Some(false), Some(0), Some(false)), true, ""),
+    ] {
+        app.marked.clear();
+        app.refusal = None;
+        app.mark_row(&row(m));
+        assert_eq!(
+            !app.marked.is_empty(),
+            expect_marked,
+            "cause {cause}: {:?}",
+            app.refusal
+        );
+        if !expect_marked {
+            assert!(
+                app.refusal.as_ref().is_some_and(|r| r.0.contains(cause)),
+                "{cause}: {:?}",
+                app.refusal
+            );
+        }
+    }
 }

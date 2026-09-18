@@ -38,6 +38,25 @@ fn main() {
         grants.contains("created_outside_index"),
         "grants need non-index provenance"
     );
+    // One byte formatter in the product: the TUI once divided by 1024
+    // under a decimal "GB" label while core divided by 1000, so the same
+    // number read 1.8GB in one surface and 2.0GB in the other and rows
+    // visibly failed to sum to their total. The TUI re-exports core's.
+    let tui_model = fs::read_to_string(root.join("tui/src/model.rs")).unwrap();
+    assert!(
+        !tui_model.contains("fn human_bytes(bytes: u64) -> String"),
+        "the TUI must re-export core's byte formatter, never define a second one"
+    );
+    assert!(
+        tui_model.contains("pub use slop_livin_core::render::human_bytes_pub as human_bytes"),
+        "the TUI must re-export core's byte formatter"
+    );
+    let render = fs::read_to_string(root.join("core/src/render.rs")).unwrap();
+    assert!(
+        render.contains("while value >= 1000.0"),
+        "byte units are decimal, matching their SI labels"
+    );
+
     let mut audit = Audit { names: vec![] };
     audit.visit_file(&syn::parse_file(&scan).unwrap());
     assert!(

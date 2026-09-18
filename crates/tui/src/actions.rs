@@ -22,6 +22,15 @@ pub struct MarkedUnit {
     pub path: PathBuf,
     pub bytes: u64,
     pub observed_at: u64,
+    /// Set when the unit is a linked worktree rather than an artifact dir.
+    pub worktree: Option<WorktreeTerms>,
+}
+
+/// The terms a worktree removal was authorized on; recorded in the ledger.
+#[derive(Debug, Clone)]
+pub struct WorktreeTerms {
+    pub merge_complete: bool,
+    pub pr: Option<String>,
 }
 
 /// Human pressing Enter at the confirm summary is the authorization for
@@ -32,7 +41,11 @@ pub fn authorize(units: &[MarkedUnit], actor: &str) -> (slop_livin_core::grants:
         .iter()
         .map(|u| slop_livin_core::grants::PlanUnit {
             artifact_id: id_for(&u.path.display().to_string()),
-            verb: Verb::Delete,
+            verb: if u.worktree.is_some() {
+                Verb::RemoveWorktree
+            } else {
+                Verb::Delete
+            },
             expected_bytes: u.bytes,
             evidence_observed_at: u.observed_at,
             undo_cost: "trash".into(),
@@ -75,6 +88,13 @@ fn execute_one(
     trash_root: &Path,
     actor: &str,
 ) -> UnitResult {
+    if let Some(terms) = &unit.worktree {
+        return UnitResult {
+            path: unit.path.clone(),
+            outcome: remove_worktree(unit, terms, grant, ledger, trash_root, actor)
+                .map_err(|e| e.to_string()),
+        };
+    }
     let artifact = slop_livin_core::entities::Artifact {
         id: plan_unit.artifact_id.clone(),
         project_id: None,
@@ -98,6 +118,103 @@ fn execute_one(
         path: unit.path.clone(),
         outcome,
     }
+}
+
+/// Removes a linked worktree: re-derives the terms at the sink (still a
+/// linked worktree, clean, nothing unpushed, unlocked, unoccupied), moves
+/// the directory to Trash, then `git worktree prune` in the main repo so
+/// git forgets the now-missing checkout. Recoverable: move the directory
+/// back and run `git worktree repair`.
+fn remove_worktree(
+    unit: &MarkedUnit,
+    terms: &WorktreeTerms,
+    grant: &Grant,
+    ledger: &Ledger,
+    trash_root: &Path,
+    actor: &str,
+) -> Result<Outcome> {
+    let path = &unit.path;
+    let gitfile = path.join(".git");
+    let meta = std::fs::symlink_metadata(&gitfile)
+        .map_err(|_| anyhow::anyhow!("not a worktree: no .git here"))?;
+    if !meta.is_file() {
+        anyhow::bail!("main checkout — not removable as a worktree");
+    }
+    let gitdir_line = std::fs::read_to_string(&gitfile)?;
+    let gitdir = gitdir_line
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(|s| PathBuf::from(s.trim()))
+        .ok_or_else(|| anyhow::anyhow!("unreadable .git file"))?;
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        path.join(gitdir)
+    };
+    let common = std::fs::read_to_string(gitdir.join("commondir"))
+        .map(|c| {
+            let c = PathBuf::from(c.trim());
+            if c.is_absolute() { c } else { gitdir.join(c) }
+        })
+        .map_err(|_| anyhow::anyhow!("not a linked worktree (no commondir)"))?;
+    // Sink re-derivation of the terms, live.
+    let (_, raw) = slop_livin_core::signals::compute_signals_raw(path, now());
+    match raw.dirty {
+        Some(false) => {}
+        Some(true) => anyhow::bail!("dirty: uncommitted changes"),
+        None => anyhow::bail!("could not determine dirty state"),
+    }
+    match raw.unpushed {
+        Some(0) => {}
+        Some(n) => anyhow::bail!("{n} unpushed commit{}", if n == 1 { "" } else { "s" }),
+        None => anyhow::bail!("unpushed count unknown (no upstream)"),
+    }
+    if raw.locked != Some(false) {
+        anyhow::bail!("worktree is locked");
+    }
+    if slop_livin_core::occupancy::occupied(path) {
+        anyhow::bail!("occupied: a process holds files under this worktree");
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
+    let dest = trash_root.join(format!("worktree-{name}-{}", now()));
+    std::fs::create_dir_all(trash_root)?;
+    std::fs::rename(path, &dest)?;
+    let prune = std::process::Command::new("git")
+        .arg("-C")
+        .arg(common.parent().unwrap_or(&common))
+        .args(["worktree", "prune"])
+        .output();
+    let pruned = prune.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    ledger.append(&slop_livin_core::ledger::ActionRecord {
+        id: slop_livin_core::entities::new_id(),
+        verb: Verb::RemoveWorktree,
+        entity_id: id_for(&path.display().to_string()),
+        evidence: serde_json::json!({
+            "bytes": unit.bytes,
+            "observed_at": unit.observed_at,
+            "terms": {"clean": true, "unpushed": 0, "unlocked": true,
+                       "merge_complete": terms.merge_complete, "pr": terms.pr},
+            "git_worktree_prune": pruned,
+            "recover": format!("mv {} {} && git -C {} worktree repair", dest.display(), path.display(), common.display()),
+        }),
+        grant_id: grant.id.clone(),
+        actor: actor.into(),
+        outcome: "completed".into(),
+        recovery_location: Some(dest.clone()),
+        measured_free_space_delta: None,
+        observed_path_state: Some("trashed".into()),
+        recorded_at: now(),
+    })?;
+    Ok(Outcome {
+        unit_id: id_for(&path.display().to_string()),
+        status: "completed".into(),
+        reason: None,
+        intended_bytes: unit.bytes,
+        observed_free_space_delta: None,
+    })
 }
 
 /// Executes every unit in the plan in order, returning one result per
@@ -153,10 +270,24 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
 /// -> Trash · Enter confirm · Esc cancel`.
 pub fn confirm_summary(units: &[MarkedUnit]) -> String {
     let total: u64 = units.iter().map(|u| u.bytes).sum();
+    let wts = units.iter().filter(|u| u.worktree.is_some()).count();
+    let arts = units.len() - wts;
+    let mut what = Vec::new();
+    if arts > 0 {
+        what.push(format!(
+            "delete {arts} artifact{}",
+            if arts == 1 { "" } else { "s" }
+        ));
+    }
+    if wts > 0 {
+        what.push(format!(
+            "remove {wts} worktree{}",
+            if wts == 1 { "" } else { "s" }
+        ));
+    }
     format!(
-        "delete {} unit{} · {} → Trash · Enter confirm · Esc cancel",
-        units.len(),
-        if units.len() == 1 { "" } else { "s" },
+        "{} · {} → Trash · Enter confirm · Esc cancel",
+        what.join(" + "),
         human_bytes(total)
     )
 }
@@ -178,6 +309,7 @@ mod tests {
             path: target.clone(),
             bytes,
             observed_at: now(),
+            worktree: None,
         };
         let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
         let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
@@ -202,10 +334,11 @@ mod tests {
             path: "/tmp/a".into(),
             bytes: 2 * 1024 * 1024 * 1024,
             observed_at: 0,
+            worktree: None,
         };
         assert_eq!(
             confirm_summary(&[u.clone(), u]),
-            "delete 2 units · 4.0GB → Trash · Enter confirm · Esc cancel"
+            "delete 2 artifacts · 4.3GB → Trash · Enter confirm · Esc cancel"
         );
     }
 }
