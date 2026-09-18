@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
     measurement::preregister,
+    report::{render_text, report, to_json},
     scan::{ScanOptions, observation},
     store::Store,
     volume::truth,
@@ -50,6 +51,15 @@ enum Command {
         #[arg(long)]
         reported: u64,
     },
+    /// Project x worktree x artifact growth report (R2: discovery only).
+    Report {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        docker_facts: Option<PathBuf>,
+    },
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -92,6 +102,18 @@ fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&truth(attributed, reported, vec![]))?
         ),
+        Command::Report {
+            root,
+            json,
+            docker_facts,
+        } => {
+            let r = report(&root, docker_facts.as_deref())?;
+            if json {
+                println!("{}", to_json(&r)?);
+            } else {
+                print!("{}", render_text(&r));
+            }
+        }
     }
     Ok(())
 }

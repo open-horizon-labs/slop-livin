@@ -5,9 +5,10 @@
 //! stub entry point that returns an empty report so the golden test can
 //! exercise the real contract shape before any discovery logic exists.
 
-use crate::entities::Confidence;
+use crate::entities::{Confidence, id_for};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -106,14 +107,42 @@ pub struct Report {
     pub reconciliation: Reconciliation,
 }
 
-/// Stub entry point (R1): returns an empty report shape. Later slices
-/// (R2 discovery, R3 attribution, R4 growth, R5 Docker join) replace this
-/// body; the contract in this file does not change to accommodate them.
+/// R2: discovers projects (checkouts and linked worktrees) under `root`
+/// and fills `ProjectRow`/`WorktreeRow`. Artifact rows, unowned rows, and
+/// reconciliation are later slices (R3-R5) and remain empty/zero here; the
+/// contract in this file does not change to accommodate them.
 pub fn report(root: &Path, _docker_facts: Option<&Path>) -> Result<Report> {
+    let discovered = crate::git::discover(root)?;
+
+    // Group discovered checkouts/worktrees by project (object-store)
+    // identity. A project's display name comes from its main checkout
+    // when one was found under this root; otherwise it falls back to the
+    // first worktree's own name (e.g. only a linked worktree was in scope).
+    let mut projects: BTreeMap<String, ProjectRow> = BTreeMap::new();
+    for dw in discovered {
+        let entry = projects
+            .entry(dw.project_id.clone())
+            .or_insert_with(|| ProjectRow {
+                project_id: dw.project_id.clone(),
+                name: dw.project_name.clone(),
+                worktrees: Vec::new(),
+            });
+        if dw.kind == WorktreeKind::Main {
+            entry.name = dw.project_name.clone();
+        }
+        entry.worktrees.push(WorktreeRow {
+            worktree_id: id_for(&dw.path.display().to_string()),
+            path: dw.path,
+            kind: dw.kind,
+            artifacts: Vec::new(),
+            signals: Vec::new(),
+        });
+    }
+
     Ok(Report {
         observed_at: crate::entities::now(),
         root: root.to_path_buf(),
-        projects: Vec::new(),
+        projects: projects.into_values().collect(),
         unowned: Vec::new(),
         reconciliation: Reconciliation {
             attributed: 0,
@@ -133,6 +162,10 @@ pub fn render_text(report: &Report) -> String {
     let _ = writeln!(out, "root: {}", report.root.display());
     let _ = writeln!(out, "observed_at: {}", report.observed_at);
     let _ = writeln!(out);
+    if report.projects.is_empty() {
+        let _ = writeln!(out, "0 projects discovered under {}", report.root.display());
+        return out;
+    }
     let _ = writeln!(
         out,
         "{:<12} {:<10} {:<10} {:<8} {:<40} {:>12} {:>12} {:>8}",
