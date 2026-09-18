@@ -8,6 +8,14 @@ name: Release
 # Runner: the org's local Apple-silicon builder when LOCAL_MACOS_CI_ENABLED
 # is set (same toggle unified-hifi-control uses), otherwise GitHub's hosted
 # macOS runner. sccache fronts rustc either way.
+#
+# The fleet runner is a persistent VM: target/ and ~/.cargo already survive
+# between jobs on its own disk (see docs/artium-enrollment.md upstream in
+# homelab-infra), so round-tripping either cache through GitHub's actions-cache
+# backend there is pure waste, and a large enough one to stall the upload
+# outright. Both caches route through GitHub's backend only on the ephemeral
+# macos-latest fallback, where that round trip is the only way to keep
+# anything between jobs at all.
 
 on:
   push:
@@ -37,6 +45,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cargo cache
+        if: vars.LOCAL_MACOS_CI_ENABLED != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-macos-arm64
@@ -53,7 +62,7 @@ jobs:
 
       - name: Build (release, aarch64-apple-darwin)
         env:
-          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
         run: cargo build --release --locked --target aarch64-apple-darwin -p slop-livin -p slop-livin-mcp
 
@@ -63,7 +72,7 @@ jobs:
       # A plain `cargo test` here recompiled the whole workspace in debug.
       - name: Test (release, aarch64-apple-darwin)
         env:
-          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
         run: cargo test --workspace --locked --release --target aarch64-apple-darwin
 
