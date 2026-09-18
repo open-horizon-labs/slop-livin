@@ -129,6 +129,9 @@ fn header(report: &Report, verify_du: bool) -> String {
         );
     }
     let _ = writeln!(out);
+    if let Some(line) = &report.schedule_line {
+        let _ = writeln!(out, "{line}");
+    }
     out
 }
 

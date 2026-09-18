@@ -19,6 +19,7 @@ pub mod occupancy;
 pub mod render;
 pub mod report;
 pub mod scan;
+pub mod schedule;
 pub mod signals;
 pub mod store;
 pub mod volume;

@@ -41,6 +41,8 @@ use std::sync::Arc;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SINCE: &str = "24h";
+/// Default watchdog budget for one `observe` invocation.
+pub const DEFAULT_OBSERVE_TIMEOUT_SEC: u64 = crate::schedule::DEFAULT_OBSERVE_TIMEOUT_SECS;
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
@@ -48,6 +50,8 @@ const COMPACTION_THRESHOLD: usize = 20;
 pub struct GrowthConfig {
     pub retention_days: u64,
     pub since: String,
+    /// Watchdog budget for one `observe` invocation (item 3 of #31).
+    pub observe_timeout_sec: u64,
 }
 
 impl Default for GrowthConfig {
@@ -55,14 +59,16 @@ impl Default for GrowthConfig {
         Self {
             retention_days: DEFAULT_RETENTION_DAYS,
             since: DEFAULT_SINCE.to_string(),
+            observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
         }
     }
 }
 
 /// Reads `<slop_livin_dir>/config.toml` (`retention_days = 30`,
-/// `since = "24h"`). A missing file, or keys it does not recognize, fall
-/// back to defaults; this is a tiny hand-rolled reader so the crate does
-/// not need a full TOML dependency for two scalar settings.
+/// `since = "24h"`, `observe_timeout_sec = 1800`). A missing file, or keys
+/// it does not recognize, fall back to defaults; this is a tiny
+/// hand-rolled reader so the crate does not need a full TOML dependency
+/// for a handful of scalar settings.
 pub fn load_config(slop_livin_dir: &Path) -> GrowthConfig {
     let mut cfg = GrowthConfig::default();
     let Ok(text) = fs::read_to_string(slop_livin_dir.join("config.toml")) else {
@@ -82,6 +88,11 @@ pub fn load_config(slop_livin_dir: &Path) -> GrowthConfig {
                 }
             }
             "since" => cfg.since = value.to_string(),
+            "observe_timeout_sec" => {
+                if let Ok(n) = value.parse() {
+                    cfg.observe_timeout_sec = n;
+                }
+            }
             _ => {}
         }
     }

@@ -104,6 +104,7 @@ fn fixture_report() -> Report {
             },
         ],
         notes: vec![],
+        schedule_line: None,
         unowned: vec![
             UnownedRow {
                 path_or_object: "old-project/build".to_string(),

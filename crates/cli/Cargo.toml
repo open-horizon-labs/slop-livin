@@ -8,3 +8,6 @@ anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 slop-livin-core = { path = "../core" }
+
+[dev-dependencies]
+tempfile.workspace = true
