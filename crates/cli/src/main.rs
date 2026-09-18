@@ -56,7 +56,7 @@ impl From<SortArg> for OverviewSort {
 }
 
 #[derive(Parser)]
-#[command(name = "slop-livin")]
+#[command(name = "slop-livin", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

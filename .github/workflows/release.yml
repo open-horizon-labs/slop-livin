@@ -86,6 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           ./target/aarch64-apple-darwin/release/slop-livin --help | head -3
+          # The binary must report the version being released.
+          test "$(./target/aarch64-apple-darwin/release/slop-livin --version)" = "slop-livin ${{ steps.v.outputs.version }}"
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/slop-livin-mcp | grep -q '"report"'
 
       - name: Upload artifact
