@@ -177,7 +177,109 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
         }
     }
 
+    if let Some(entries) = value.get("ImageInspect").and_then(|v| v.as_array()) {
+        merge_image_inspect(&mut facts.images, entries);
+    }
+
     facts
+}
+
+/// `docker system df -v --format json` image rows carry no `Labels` at
+/// all (confirmed against a live daemon: its image objects have exactly
+/// `[Containers, CreatedAt, CreatedSince, Digest, ID, Repository,
+/// SharedSize, Size, Tag, UniqueSize]`). Labels only exist in `docker
+/// image inspect` output, under `Config.Labels`. This merges an
+/// `ImageInspect`-shaped array (`[{"Id"|"ID", "RepoTags", "Config":
+/// {"Labels": {...}}}, ...]`, the same shape `docker image inspect
+/// --format json` returns) into the df-sourced image facts, matching by
+/// image ID first and falling back to a shared repo:tag.
+fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_json::Value]) {
+    for entry in inspect_entries {
+        let id = entry
+            .get("Id")
+            .or_else(|| entry.get("ID"))
+            .map(value_str)
+            .unwrap_or_default();
+        let labels: HashMap<String, String> = entry
+            .get("Config")
+            .and_then(|c| c.get("Labels"))
+            .and_then(|l| l.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if labels.is_empty() {
+            continue;
+        }
+        let inspect_tags: Vec<String> = entry
+            .get("RepoTags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for image in images.iter_mut() {
+            let matches = (!id.is_empty() && image.id == id)
+                || image.repo_tags.iter().any(|t| inspect_tags.contains(t));
+            if matches {
+                image.labels.extend(labels.clone());
+            }
+        }
+    }
+}
+
+/// Runs a `docker` subcommand and returns its parsed JSON stdout, bounded
+/// by `timeout`. Returns `Err(reason)` on any failure (missing binary,
+/// non-zero exit, timeout, bad JSON) -- the caller decides whether that
+/// failure is fatal to the whole report or just means "no enrichment".
+fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
+    let mut child = Command::new("docker")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker: unavailable ({e})"))?;
+
+    let (tx, rx) = mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stdout.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let Some(status) = status else {
+        return Err("docker: unavailable (timed out)".to_string());
+    };
+    if !status.success() {
+        return Err("docker: unavailable (daemon not responding)".to_string());
+    }
+    let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("docker: unavailable (bad output: {e})"))
 }
 
 /// Loads Docker facts either from a mocked facts file (tests, or the
@@ -211,67 +313,54 @@ fn load_from_file(path: &Path) -> DockerFacts {
     }
 }
 
+/// `docker system df -v` never carries image labels (verified against a
+/// live daemon), so a live load is two calls: the df call for object
+/// identity/sizes, then a batched `docker image inspect <ids> --format
+/// json` for the labels df doesn't have. Volume labels *are* present in
+/// `docker system df -v` output already (also verified live), so no
+/// separate `docker volume inspect` call is needed for them. Build-cache
+/// entries have no label source at all and stay `DockerNoJoin`.
+///
+/// The inspect call is best-effort: if it fails or times out, images
+/// simply keep whatever (empty) labels df gave them -- join falls
+/// through to `DockerNoJoin` for those, which is the honest answer, not
+/// a fatal error for the whole report.
 fn load_live() -> DockerFacts {
-    let mut child = match Command::new("docker")
-        .args(["system", "df", "-v", "--format", "json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return DockerFacts {
-                unavailable: Some(format!("docker: unavailable ({e})")),
-                ..Default::default()
-            };
-        }
-    };
-
-    let (tx, rx) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
-            let _ = tx.send(buf);
-        });
-    }
-
-    let deadline = std::time::Instant::now() + DOCKER_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
+    let df_value =
+        match run_docker_json(&["system", "df", "-v", "--format", "json"], DOCKER_TIMEOUT) {
+            Ok(v) => v,
+            Err(reason) => {
+                return DockerFacts {
+                    unavailable: Some(reason),
+                    ..Default::default()
+                };
             }
-            Err(_) => break None,
-        }
-    };
+        };
+    let mut facts = parse_value(&df_value);
 
-    let Some(status) = status else {
-        return DockerFacts {
-            unavailable: Some("docker: unavailable (timed out)".to_string()),
-            ..Default::default()
-        };
-    };
-    if !status.success() {
-        return DockerFacts {
-            unavailable: Some("docker: unavailable (daemon not responding)".to_string()),
-            ..Default::default()
-        };
+    let ids: Vec<&str> = facts
+        .images
+        .iter()
+        .map(|i| i.id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if !ids.is_empty() {
+        let mut args: Vec<&str> = vec!["image", "inspect"];
+        args.extend(ids);
+        args.extend(["--format", "json"]);
+        if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
+            && let Some(entries) = inspect_value.as_array()
+        {
+            merge_image_inspect(&mut facts.images, entries);
+        }
+        // A failed/timed-out inspect call is not surfaced as
+        // `unavailable`: the df call (object identity, sizes) already
+        // succeeded, so the report still reconciles; the affected images
+        // just carry no labels and land as `DockerNoJoin`, same as any
+        // other image with no join evidence.
     }
-    let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(v) => parse_value(&v),
-        Err(e) => DockerFacts {
-            unavailable: Some(format!("docker: unavailable (bad output: {e})")),
-            ..Default::default()
-        },
-    }
+
+    facts
 }
 
 #[cfg(test)]

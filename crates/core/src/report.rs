@@ -351,13 +351,26 @@ enum JoinOutcome {
 
 /// Applies the R5 join rules, explicit evidence only:
 /// 1. `com.docker.compose.project` label == a discovered project name:
-///    join that project's main worktree, High confidence.
+///    join that project's main worktree, High confidence. A compose
+///    project name frequently differs from the repo name (e.g.
+///    `hiphi-staging` for a `hiphi-relay`/`hiphi-authorizer` checkout),
+///    so when the label is present but matches no discovered project, it
+///    is recorded as a `compose_project=<name>` note instead of being
+///    silently dropped -- a later slice can group by it even when this
+///    slice can't attribute it.
 /// 2. Any label whose value is an absolute path inside a discovered
-///    worktree: join that worktree, High confidence.
+///    worktree (this covers `com.docker.compose.project.working_dir` as
+///    well as any other path-shaped label): join that worktree, High
+///    confidence.
 /// 3. `org.opencontainers.image.source`, normalized, matches a project's
 ///    normalized git remote: join that project's main worktree, Medium
-///    confidence. A non-matching source is recorded as a note, never
-///    used to attribute.
+///    confidence. A non-matching source is recorded as a
+///    `base_image_source=<url>` note, never used to attribute -- this is
+///    the base-image trap: an image can be named exactly like a project
+///    (or even be that project's own published image) while its
+///    `image.source` legitimately points at an upstream base image
+///    (e.g. `linuxcontainers/alpine`) it was built FROM, not the project
+///    that built it.
 /// 4. Otherwise: unowned, reason `DockerNoJoin`. Name similarity to a
 ///    project is never evidence for any of these rules.
 fn join_one(
@@ -375,14 +388,22 @@ fn join_one(
             .map(|w| w.worktree_id.clone())
     }
 
-    if let Some(project_label) = candidate.labels.get("com.docker.compose.project")
-        && let Some(project) = projects.iter().find(|p| &p.name == project_label)
-        && let Some(worktree_id) = main_worktree_id(project)
-    {
-        return JoinOutcome::Joined {
-            worktree_id,
-            confidence: Confidence::High,
-        };
+    let mut notes: Vec<String> = Vec::new();
+
+    if let Some(project_label) = candidate.labels.get("com.docker.compose.project") {
+        match projects
+            .iter()
+            .find(|p| &p.name == project_label)
+            .and_then(|p| main_worktree_id(p).map(|id| (p, id)))
+        {
+            Some((_, worktree_id)) => {
+                return JoinOutcome::Joined {
+                    worktree_id,
+                    confidence: Confidence::High,
+                };
+            }
+            None => notes.push(format!("compose_project={project_label}")),
+        }
     }
 
     for value in candidate.labels.values() {
@@ -403,26 +424,30 @@ fn join_one(
     }
 
     if let Some(source) = candidate.labels.get("org.opencontainers.image.source") {
-        if let Some(normalized) = normalize_remote(source) {
-            if let Some((project_id, _)) = project_remotes.iter().find(|(_, r)| **r == normalized)
-                && let Some(project) = projects.iter().find(|p| &p.project_id == project_id)
-                && let Some(worktree_id) = main_worktree_id(project)
-            {
+        let joined = normalize_remote(source).and_then(|normalized| {
+            project_remotes
+                .iter()
+                .find(|(_, r)| **r == normalized)
+                .and_then(|(project_id, _)| projects.iter().find(|p| &p.project_id == project_id))
+                .and_then(main_worktree_id)
+        });
+        match joined {
+            Some(worktree_id) => {
                 return JoinOutcome::Joined {
                     worktree_id,
                     confidence: Confidence::Medium,
                 };
             }
-            return JoinOutcome::Unowned {
-                note: Some(format!("base_image_source={source}")),
-            };
+            None => notes.push(format!("base_image_source={source}")),
         }
-        return JoinOutcome::Unowned {
-            note: Some(format!("base_image_source={source}")),
-        };
     }
 
-    JoinOutcome::Unowned { note: None }
+    let note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(", "))
+    };
+    JoinOutcome::Unowned { note }
 }
 
 fn join_docker_facts(
