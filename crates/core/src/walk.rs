@@ -40,47 +40,72 @@ use std::sync::{Arc, Condvar, Mutex};
 /// not an implementation detail to import.
 const STOP_DIRS: &[&str] = &["node_modules", "target", "dist", "build"];
 
-/// A generic bounded job queue: `outstanding` counts every job pushed but
-/// not yet finished (including one still being processed by a worker),
-/// so the pool is done exactly when the queue is empty and `outstanding`
-/// is zero.
+/// A generic bounded job queue. `outstanding` counts every job pushed but
+/// not yet finished (including one still being processed by a worker), so
+/// the pool is done exactly when the queue is empty and `outstanding` is
+/// zero.
+///
+/// The counter lives under the same mutex as the queue on purpose: an
+/// earlier version kept it in an atomic and decremented/notified without
+/// the lock, which allowed a lost wakeup — a waiter that had just read
+/// `outstanding == 1` and was entering `wait` missed the `notify_all`
+/// fired between those two steps and slept forever (#36). Every
+/// transition and every notify now happens with the lock held, and the
+/// wait is bounded so a waiter re-checks even if a notify is ever missed.
 struct Pool<J> {
-    queue: Mutex<VecDeque<J>>,
+    state: Mutex<PoolState<J>>,
     cv: Condvar,
-    outstanding: AtomicUsize,
+}
+
+struct PoolState<J> {
+    queue: VecDeque<J>,
+    outstanding: usize,
 }
 
 impl<J: Send> Pool<J> {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            state: Mutex::new(PoolState {
+                queue: VecDeque::new(),
+                outstanding: 0,
+            }),
             cv: Condvar::new(),
-            outstanding: AtomicUsize::new(0),
         }
     }
 
     fn push(&self, job: J) {
-        self.outstanding.fetch_add(1, Ordering::SeqCst);
-        self.queue.lock().unwrap().push_back(job);
+        let mut st = self.state.lock().unwrap();
+        st.outstanding += 1;
+        st.queue.push_back(job);
         self.cv.notify_one();
     }
 
     fn finish_one(&self) {
-        if self.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let mut st = self.state.lock().unwrap();
+        debug_assert!(st.outstanding > 0, "finish_one without a matching push");
+        st.outstanding -= 1;
+        if st.outstanding == 0 {
+            debug_assert!(st.queue.is_empty(), "outstanding == 0 with queued jobs");
             self.cv.notify_all();
         }
     }
 
     fn next(&self) -> Option<J> {
-        let mut q = self.queue.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         loop {
-            if let Some(job) = q.pop_front() {
+            if let Some(job) = st.queue.pop_front() {
                 return Some(job);
             }
-            if self.outstanding.load(Ordering::SeqCst) == 0 {
+            if st.outstanding == 0 {
                 return None;
             }
-            q = self.cv.wait(q).unwrap();
+            // Bounded wait: correctness no longer depends on never missing
+            // a notify, only on re-checking the shared state.
+            st = self
+                .cv
+                .wait_timeout(st, std::time::Duration::from_millis(50))
+                .unwrap()
+                .0;
         }
     }
 
@@ -277,6 +302,10 @@ struct SizeGroup {
     kind: ArtifactKind,
     worktree: Option<String>,
     total: AtomicU64,
+    /// Per-row hardlink dedup (see `ArtifactRow::local_bytes`): only
+    /// inodes with nlink > 1 are recorded, so the set stays tiny.
+    local_total: AtomicU64,
+    local_seen: Mutex<HashSet<(u64, u64)>>,
     remaining: AtomicUsize,
 }
 
@@ -291,10 +320,16 @@ enum AttrJob {
     },
 }
 
+/// Per-row local byte total plus the nlink>1 inodes already counted into it.
+type LocalAcc = (u64, HashSet<(u64, u64)>);
+
 struct AttrShared {
     seen_inodes: ShardedInodeSet,
     artifacts_by_worktree: Mutex<HashMap<String, Vec<ArtifactRow>>>,
     source_bytes: Mutex<HashMap<String, u64>>,
+    /// Per-worktree Source-row local bytes and the nlink>1 inodes already
+    /// counted into it (see `ArtifactRow::local_bytes`).
+    source_local: Mutex<HashMap<String, LocalAcc>>,
     unowned: Mutex<Vec<UnownedRow>>,
     walked_total: AtomicU64,
     attributed_total: AtomicU64,
@@ -336,6 +371,7 @@ pub fn attribute_parallel(
         seen_inodes: ShardedInodeSet::new(),
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
+        source_local: Mutex::new(HashMap::new()),
         unowned: Mutex::new(Vec::new()),
         walked_total: AtomicU64::new(0),
         attributed_total: AtomicU64::new(0),
@@ -357,8 +393,10 @@ pub fn attribute_parallel(
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
     let mut artifacts_by_worktree = shared.artifacts_by_worktree.into_inner().unwrap();
     let source_bytes = shared.source_bytes.into_inner().unwrap();
+    let source_local = shared.source_local.into_inner().unwrap();
 
     for (worktree_id, bytes) in source_bytes {
+        let local_bytes = source_local.get(&worktree_id).map(|e| e.0).unwrap_or(bytes);
         if bytes == 0 {
             continue;
         }
@@ -374,6 +412,7 @@ pub fn attribute_parallel(
                 kind: ArtifactKind::Source,
                 path,
                 bytes,
+                local_bytes,
                 growth_bytes: None,
                 regrowth_count: 0,
                 observed_at,
@@ -485,6 +524,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                     kind,
                     worktree,
                     total: AtomicU64::new(0),
+                    local_total: AtomicU64::new(0),
+                    local_seen: Mutex::new(HashSet::new()),
                     remaining: AtomicUsize::new(1),
                 });
                 pool.push(AttrJob::Size {
@@ -572,6 +613,15 @@ fn record_file(
     shared: &AttrShared,
 ) -> (i64, Option<u64>) {
     let mtime = meta.mtime();
+    // Per-row local figure first: independent of which row the global
+    // dedup below happens to charge.
+    if let Some(worktree_id) = nearest_worktree(known, path) {
+        let mut local = shared.source_local.lock().unwrap();
+        let entry = local.entry(worktree_id.to_string()).or_default();
+        if meta.nlink() <= 1 || entry.1.insert((meta.dev(), meta.ino())) {
+            entry.0 += allocated_bytes(meta);
+        }
+    }
     if !shared.seen_inodes.insert_first((meta.dev(), meta.ino())) {
         return (mtime, None);
     }
@@ -648,7 +698,13 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
-            if !shared.seen_inodes.insert_first((meta.dev(), meta.ino())) {
+            let key = (meta.dev(), meta.ino());
+            if meta.nlink() <= 1 || group.local_seen.lock().unwrap().insert(key) {
+                group
+                    .local_total
+                    .fetch_add(allocated_bytes(&meta), Ordering::Relaxed);
+            }
+            if !shared.seen_inodes.insert_first(key) {
                 continue;
             }
             let bytes = allocated_bytes(&meta);
@@ -681,6 +737,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     kind: group.kind.clone(),
                     path: group.root_path.clone(),
                     bytes,
+                    local_bytes: group.local_total.load(Ordering::Acquire),
                     growth_bytes: None,
                     regrowth_count: 0,
                     observed_at: shared.observed_at,
@@ -721,6 +778,110 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 }
 
 // ---------------------------------------------------------------------
+// R4b: incremental re-walk primitives. `growth::observe_tracked` uses
+// these two entry points to re-walk only what FSEvents implicated,
+// carrying every other row forward untouched. Both give exactly the same
+// per-directory/per-file classification and sizing rules as
+// `attribute_parallel` above -- they simply start the same machinery at a
+// narrower root than the whole scan root.
+// ---------------------------------------------------------------------
+
+/// Re-walks exactly one worktree, matching `discover_and_attribute`'s
+/// per-worktree slice of `attribute_parallel` but seeded at
+/// `worktree_root` instead of the whole scan root. This is the fallback
+/// granularity for a changed directory that lands in a worktree's Source
+/// tree (not inside an already-classified artifact directory): re-walking
+/// the one worktree is far cheaper than re-walking the whole root.
+///
+/// `all_worktrees` must be the *complete* known worktree list (every
+/// worktree, not just this one), exactly as `discover_and_attribute`
+/// passes to `attribute_parallel`. A linked worktree frequently lives
+/// **inside** its main checkout's directory tree (e.g. `.worktrees/<name>`
+/// under the project root), so walking `worktree_root` with only this one
+/// worktree in the known list would mean `nearest_worktree` matches every
+/// path under it -- including a nested linked worktree's own
+/// `target`/`node_modules`/Source bytes -- to *this* worktree_id, double
+/// counting them on top of that nested worktree's own carried-forward
+/// rows. Passing the full list keeps nested-worktree boundaries exactly
+/// as a full walk would; only the entry keyed by `worktree_id` in the
+/// result is meant to be merged back in by the caller, since every other
+/// worktree's rows are untouched by construction and already carried
+/// forward from the store.
+///
+/// Hardlink dedup is scoped to this call: a file already counted in this
+/// worktree during a broader walk could in principle be seen as "new"
+/// here. This only matters for the rare cross-worktree hardlink, and
+/// losing that dedup precision on an incremental pass (never on a full
+/// walk) is an accepted, documented trade for not having to carry the
+/// whole tree's inode set forward between observations.
+pub fn attribute_one_worktree(
+    worktree_root: &Path,
+    all_worktrees: &[(&Path, &str)],
+    observed_at: u64,
+    large_file_min_bytes: u64,
+) -> AttributionResult {
+    attribute_parallel(
+        worktree_root,
+        all_worktrees,
+        observed_at,
+        large_file_min_bytes,
+    )
+}
+
+/// Re-sizes exactly one already-classified artifact directory as a unit,
+/// matching `process_size`'s fold semantics (regular files, hardlink
+/// deduped within this call, symlinks and unreadable entries skipped).
+/// This is the common incremental case named in #29's acceptance test:
+/// FSEvents implicates a directory inside an existing artifact root (e.g.
+/// `node_modules/some-pkg`), so only that one row needs re-sizing and
+/// every other artifact/Source row in the worktree carries forward with
+/// its previously observed bytes untouched.
+pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -> ArtifactRow {
+    let mut seen = HashSet::new();
+    let bytes = size_dir_recursive(root_path, &mut seen);
+    ArtifactRow {
+        kind,
+        path: root_path.to_path_buf(),
+        bytes,
+        local_bytes: bytes,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at,
+        confidence: Confidence::High,
+        source: Source::new("filesystem.fsevents"),
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+    }
+}
+
+fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total += size_dir_recursive(&entry.path(), seen);
+        } else if ft.is_file() {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() && seen.insert((meta.dev(), meta.ino())) {
+                total += allocated_bytes(&meta);
+            }
+        }
+    }
+    total
+}
+
+// ---------------------------------------------------------------------
 // Combined entry point used by `report::report_with`.
 // ---------------------------------------------------------------------
 
@@ -753,4 +914,62 @@ pub fn discover_and_attribute(
         eprintln!("[trace] walk::attribute_parallel: {:?}", t1.elapsed());
     }
     Ok((discovered, attribution))
+}
+
+#[cfg(test)]
+mod pool_stress {
+    use super::Pool;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Regression for #36: run many small pools to completion while every
+    /// core is saturated by busy threads. Before the fix this deadlocked
+    /// within a few hundred iterations on a loaded machine.
+    #[test]
+    fn pool_drains_under_cpu_contention() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let burners: Vec<_> = (0..cores)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut x: u64 = 1;
+                    while !stop.load(Ordering::Relaxed) {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    }
+                    x
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for round in 0..400 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pool stress exceeded 60 s at round {round}"
+            );
+            let pool = Arc::new(Pool::<u32>::new());
+            let done = Arc::new(AtomicUsize::new(0));
+            for j in 0..64u32 {
+                pool.push(j);
+            }
+            let done2 = Arc::clone(&done);
+            let pool2 = Arc::clone(&pool);
+            pool.drain(cores * 2, move |j| {
+                // fan out two children per job for the first two levels,
+                // mirroring directory recursion
+                if j < 64 {
+                    pool2.push(1000 + j);
+                    pool2.push(2000 + j);
+                }
+                done2.fetch_add(1, Ordering::SeqCst);
+            });
+            assert_eq!(done.load(Ordering::SeqCst), 64 * 3, "round {round}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for b in burners {
+            let _ = b.join();
+        }
+    }
 }

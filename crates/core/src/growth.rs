@@ -24,7 +24,12 @@
 //! A no-change observation (no row's bytes/presence changed) appends no
 //! delta file at all.
 
-use crate::report::ProjectRow;
+use crate::entities::Confidence;
+use crate::fs_events::{FsEventsRequest, FsEventsState};
+use crate::git::DiscoveredWorktree;
+use crate::report::{
+    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedRow,
+};
 use anyhow::{Context, Result};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
@@ -34,8 +39,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -144,6 +151,7 @@ struct StoredRow {
     kind: String,
     rel_path: String,
     bytes: u64,
+    local_bytes: u64,
     present: bool,
     observed_at: u64,
     regrowth_count: u32,
@@ -159,6 +167,7 @@ fn schema() -> Arc<Schema> {
         Field::new("present", DataType::Boolean, false),
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("regrowth_count", DataType::UInt32, false),
+        Field::new("local_bytes", DataType::UInt64, false),
     ]))
 }
 
@@ -172,6 +181,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
     let present: Vec<bool> = rows.iter().map(|r| r.present).collect();
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
     let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
+    let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -184,6 +194,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(BooleanArray::from(present)),
             Arc::new(UInt64Array::from(observed_at)),
             Arc::new(UInt32Array::from(regrowth)),
+            Arc::new(UInt64Array::from(local_bytes)),
         ],
     )?;
     if let Some(parent) = path.parent() {
@@ -217,6 +228,9 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         let present = downcast_bool(&batch, "present")?;
         let observed_at = downcast_u64(&batch, "observed_at")?;
         let regrowth = downcast_u32(&batch, "regrowth_count")?;
+        // Stores written before #29 have no local_bytes column: fall back
+        // to `bytes` so incremental deltas degrade to the old behavior.
+        let local_bytes = downcast_u64(&batch, "local_bytes").ok();
         for i in 0..batch.num_rows() {
             rows.push(StoredRow {
                 project_id: project_id.value(i).to_string(),
@@ -224,6 +238,11 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
                 kind: kind.value(i).to_string(),
                 rel_path: rel_path.value(i).to_string(),
                 bytes: bytes.value(i),
+                local_bytes: local_bytes
+                    .as_ref()
+                    .map(|c| c.value(i))
+                    .filter(|v| *v != 0)
+                    .unwrap_or_else(|| bytes.value(i)),
                 present: present.value(i),
                 observed_at: observed_at.value(i),
                 regrowth_count: regrowth.value(i),
@@ -307,6 +326,7 @@ struct Observed {
     kind: String,
     rel_path: String,
     bytes: u64,
+    local_bytes: u64,
 }
 
 fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
@@ -333,6 +353,11 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     kind,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
+                    local_bytes: if artifact.local_bytes == 0 {
+                        artifact.bytes
+                    } else {
+                        artifact.local_bytes
+                    },
                 });
             }
         }
@@ -462,11 +487,13 @@ pub fn observe_and_annotate(
                         kind: prev.kind.clone(),
                         rel_path: prev.rel_path.clone(),
                         bytes: prev.bytes,
+                        local_bytes: prev.local_bytes,
                         present: prev.present,
                         observed_at: prev.observed_at,
                         regrowth_count: prev.regrowth_count,
                     });
                     prev.bytes = obs.bytes;
+                    prev.local_bytes = obs.local_bytes;
                     prev.present = true;
                     prev.observed_at = observed_at;
                     prev.regrowth_count = regrowth_count;
@@ -489,6 +516,7 @@ pub fn observe_and_annotate(
                         kind: obs.kind.clone(),
                         rel_path: obs.rel_path.clone(),
                         bytes: obs.bytes,
+                        local_bytes: obs.local_bytes,
                         present: true,
                         observed_at,
                         regrowth_count: 0,
@@ -509,6 +537,7 @@ pub fn observe_and_annotate(
                 kind: row.kind.clone(),
                 rel_path: row.rel_path.clone(),
                 bytes: row.bytes,
+                local_bytes: row.local_bytes,
                 present: row.present,
                 observed_at: row.observed_at,
                 regrowth_count: row.regrowth_count,
@@ -1290,6 +1319,762 @@ fn compact_file_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> R
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// R4b: FSEvents-driven incremental observation.
+//
+// Two more sidecars live in the volume dir alongside the parquet files
+// above, both small JSON, both rewritten in full on every observation:
+//
+// - `fsevents.json`: the last observed FSEvents event id + device, so
+//   the next observation knows where to replay from (`fs_events.rs`).
+// - `topology.json`: the discovered checkout/worktree list (path,
+//   kind, project identity) as of the last observation. Artifact/dir/
+//   file *bytes* already live in the parquet files above; this sidecar
+//   is the structural piece (which worktrees exist, at which paths)
+//   that the parquet rows alone cannot reconstruct, since `rel_path` is
+//   always relative and never carries its worktree's root back.
+//
+// Together they let an incremental observation skip discovery and
+// attribution entirely for everything FSEvents does not implicate,
+// re-walking only what changed and carrying every other row forward
+// with its previously observed value untouched.
+// ---------------------------------------------------------------------
+
+/// The structural half of one discovered checkout/worktree, persisted so
+/// the next observation can carry it forward without re-running
+/// discovery. Bytes are never stored here; those live in the parquet
+/// current-state files, keyed by `worktree_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredWorktree {
+    worktree_id: String,
+    project_id: String,
+    project_name: String,
+    path: PathBuf,
+    kind: crate::report::WorktreeKind,
+    remote_url: Option<String>,
+}
+
+fn fsevents_state_path(dir: &Path) -> PathBuf {
+    dir.join("fsevents.json")
+}
+fn topology_path(dir: &Path) -> PathBuf {
+    dir.join("topology.json")
+}
+fn unowned_path(dir: &Path) -> PathBuf {
+    dir.join("unowned.json")
+}
+
+fn read_fsevents_state(dir: &Path) -> FsEventsState {
+    fs::read_to_string(fsevents_state_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_fsevents_state(dir: &Path, state: &FsEventsState) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(fsevents_state_path(dir), serde_json::to_string(state)?)
+        .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+}
+
+fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
+    let text = fs::read_to_string(topology_path(dir)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_topology(dir: &Path, worktrees: &[StoredWorktree]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(topology_path(dir), serde_json::to_string(worktrees)?)
+        .with_context(|| format!("write {}", topology_path(dir).display()))
+}
+
+fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
+    fs::read_to_string(unowned_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(unowned_path(dir), serde_json::to_string(unowned)?)
+        .with_context(|| format!("write {}", unowned_path(dir).display()))
+}
+
+fn parse_artifact_kind(s: &str) -> ArtifactKind {
+    match s {
+        "BuildOutput" => ArtifactKind::BuildOutput,
+        "DependencyTree" => ArtifactKind::DependencyTree,
+        "Git" => ArtifactKind::Git,
+        "Cache" => ArtifactKind::Cache,
+        "Source" => ArtifactKind::Source,
+        "DockerImage" => ArtifactKind::DockerImage,
+        "DockerBuildCache" => ArtifactKind::DockerBuildCache,
+        "DockerVolume" => ArtifactKind::DockerVolume,
+        "Loose" => ArtifactKind::Loose,
+        _ => ArtifactKind::Unknown,
+    }
+}
+
+/// Reconstructs a full [`crate::attribution::AttributionResult`] from the
+/// growth store's current-state files: every artifact/dir/file row this
+/// volume has ever observed and is still present, plus the last-known
+/// unowned rows carried forward verbatim (unowned rows are only
+/// refreshed by a full walk; see module docs).
+///
+/// Every `ArtifactRow::path` here is still **relative** (the raw
+/// `rel_path` from storage); the caller re-joins it against each
+/// worktree's root once the topology is loaded, since this function has
+/// no access to worktree roots on its own.
+fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::AttributionResult> {
+    let current_rows = read_rows(&current_path(dir))?;
+    let mut artifacts_by_worktree: HashMap<String, Vec<ArtifactRow>> = HashMap::new();
+    let mut attributed_total = 0u64;
+    // Docker rows are persisted for growth history but are NOT part of the
+    // filesystem walk: the report re-derives them from daemon facts every
+    // time and keeps them out of `walked_total`/`attributed`. Carrying
+    // them into the reconstructed attribution both double-listed them and
+    // inflated the incremental totals by their unique bytes (#29 live).
+    let is_docker_kind = |k: &str| matches!(k, "DockerImage" | "DockerBuildCache" | "DockerVolume");
+    for row in current_rows
+        .iter()
+        .filter(|r| r.present && !is_docker_kind(&r.kind))
+    {
+        attributed_total += row.bytes;
+        artifacts_by_worktree
+            .entry(row.worktree_id.clone())
+            .or_default()
+            .push(ArtifactRow {
+                kind: parse_artifact_kind(&row.kind),
+                path: PathBuf::from(&row.rel_path),
+                bytes: row.bytes,
+                local_bytes: row.local_bytes,
+                growth_bytes: None,
+                regrowth_count: row.regrowth_count,
+                observed_at: row.observed_at,
+                confidence: Confidence::High,
+                source: Source::new("filesystem.walk"),
+                note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
+            });
+    }
+
+    let dirs: Vec<DirRollup> = read_dir_rows(&dirs_current_path(dir))?
+        .into_iter()
+        .map(|r| DirRollup {
+            worktree_id: r.worktree_id,
+            rel_path: r.rel_path,
+            parent_rel_path: r.parent_rel_path,
+            allocated_total: r.allocated_total,
+            own_allocated: r.own_allocated,
+            file_count: r.file_count,
+            entry_count: r.entry_count,
+            symlink_count: r.symlink_count,
+            mod_time_min: r.mod_time_min,
+            complete: r.complete,
+            growth_bytes: None,
+        })
+        .collect();
+    let files: Vec<FileRow> = read_file_rows(&files_current_path(dir))?
+        .into_iter()
+        .map(|r| FileRow {
+            worktree_id: r.worktree_id,
+            rel_path: r.rel_path,
+            allocated: r.allocated,
+            mod_time_min: r.mod_time_min,
+            growth_bytes: None,
+        })
+        .collect();
+
+    let unowned = read_unowned(dir);
+    let unowned_total = unowned.iter().map(|u| u.bytes).sum();
+    // `attributed_total` already sums every stored artifact row,
+    // including each worktree's own `Source` row (whose bytes equal that
+    // worktree's root `DirRollup.allocated_total`), so it is not summed a
+    // second time from `dirs`.
+    let walked_total = attributed_total + unowned_total;
+
+    Ok(crate::attribution::AttributionResult {
+        artifacts_by_worktree,
+        unowned,
+        walked_total,
+        attributed_total,
+        unowned_total,
+        dirs,
+        files,
+    })
+}
+
+/// One tracked walk's outcome: the same `(discovered, attribution)` shape
+/// [`crate::walk::discover_and_attribute`] returns, plus the mode/reason
+/// a caller reports in the coverage block and the `observe` log line.
+pub struct TrackedWalk {
+    pub discovered: Vec<DiscoveredWorktree>,
+    pub attribution: crate::attribution::AttributionResult,
+    /// `"incremental"` or `"full"`.
+    pub mode: &'static str,
+    /// `"incremental"` on success; otherwise the refusal reason (see
+    /// [`crate::fs_events::RefreshRefusal::as_str`]), or `"no_stored_event_id"`
+    /// / `"full_forced"` for the two non-FSEvents reasons a walk is full.
+    pub reason: &'static str,
+    pub changed_dirs: usize,
+}
+
+/// Threshold past which re-walking piecemeal costs more than a full
+/// walk: more than this fraction of previously known directories
+/// implicated by one replay.
+const TOO_MANY_CHANGES_FRACTION: f64 = 0.20;
+
+/// The [`RefreshRefusal::TooSoon`] floor, in seconds. Overridable via
+/// `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so a test driving a canned
+/// [`crate::fs_events::FsEventsSource`] -- which has no real FSEvents
+/// log-persistence lag to protect against -- can set it to `0` and reach
+/// the incremental path without a real `sleep`.
+fn min_interval_secs() -> u64 {
+    std::env::var("SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+/// Entry point for `report::report_full`: replaces a plain call to
+/// `walk::discover_and_attribute` with one that tries FSEvents first and
+/// falls back to a full walk on any refusal, `force_full`, or a missing
+/// store. Always re-anchors the stored FSEvents id/topology/unowned
+/// snapshot before returning, on both the incremental and full paths, so
+/// the next call has a baseline to replay from regardless of which path
+/// this one took.
+pub fn observe_tracked(
+    slop_livin_dir: &Path,
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    force_full: bool,
+    observe: bool,
+) -> Result<TrackedWalk> {
+    observe_tracked_with_source(
+        slop_livin_dir,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        force_full,
+        observe,
+        crate::fs_events::platform_source().as_ref(),
+    )
+}
+
+/// Same as [`observe_tracked`], with the [`crate::fs_events::FsEventsSource`]
+/// supplied explicitly rather than resolved via [`crate::fs_events::platform_source`].
+/// This is the seam integration tests use to exercise every refusal
+/// reason and the incremental merge deterministically, with canned event
+/// batches, so no test depends on the live `fseventsd`.
+///
+/// `observe` mirrors `growth::observe_and_annotate` vs `annotate_readonly`:
+/// the walk itself (full or incremental) always happens, so the caller
+/// gets a report of the tree's current state either way, but the
+/// FSEvents/topology/unowned sidecars are only rewritten when `observe`
+/// is true. A `--no-observe` read must not silently advance the stored
+/// event id, or the next real observation would replay from a point it
+/// never actually walked from.
+#[allow(clippy::too_many_arguments)]
+pub fn observe_tracked_with_source(
+    slop_livin_dir: &Path,
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    force_full: bool,
+    observe: bool,
+    source: &dyn crate::fs_events::FsEventsSource,
+) -> Result<TrackedWalk> {
+    let volume_id = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    fs::create_dir_all(&dir)?;
+
+    // FSEvents always answers in canonical paths (ask about `/tmp/x` on
+    // macOS and it replies about `/private/tmp/x`); everything else this
+    // module stores or matches against (topology, artifact/dir/file
+    // rows) is expressed in whatever form the caller's `root` already
+    // was, unchanged from every walk before this feature existed. Rather
+    // than canonicalize the whole walk (which would change every path
+    // this crate has ever returned whenever the caller's root sits under
+    // a symlink -- macOS's own default temp dir is exactly this shape),
+    // [`rebase_from_canonical`] translates each `changed_dirs` entry back
+    // into the caller's original root form immediately after the
+    // replay, so every path downstream of this point stays in the one
+    // form the rest of the crate already assumes.
+    let prev_state = read_fsevents_state(&dir);
+
+    // `force_full` (`--full`, and every pre-#29 caller: `report_full`,
+    // `report_with*`, the MCP surface, every test that predates this
+    // feature) must never touch the FSEvents source at all -- not the
+    // real one (this crate runs alongside dozens of other concurrent
+    // test/CLI processes on a shared machine, where `fseventsd` itself
+    // can become the bottleneck under combined load; a `source.replay`
+    // call that is merely slow under contention still burns wall time
+    // this path has promised never to pay), and not even a canned one in
+    // tests (there is nothing to answer). Skipping the call entirely,
+    // rather than calling it and discarding the answer, is what actually
+    // keeps this path load-free instead of just "load but ignore".
+    if force_full {
+        let result = full_walk(root, observed_at, large_file_min_bytes, "full_forced")?;
+        if observe {
+            write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
+            write_unowned(&dir, &result.attribution.unowned)?;
+            // The stored FSEvents id/device is deliberately left as-is: a
+            // forced full walk has nothing new to report there (no
+            // replay ran), and an older stored id just means the next
+            // real incremental attempt replays a larger, still-correct
+            // window rather than a wrong one.
+        }
+        return Ok(result);
+    }
+
+    // FSEvents always answers in canonical paths (ask about `/tmp/x` on
+    // macOS and it replies about `/private/tmp/x`); everything else this
+    // module stores or matches against (topology, artifact/dir/file
+    // rows) is expressed in whatever form the caller's `root` already
+    // was, unchanged from every walk before this feature existed. Rather
+    // than canonicalize the whole walk (which would change every path
+    // this crate has ever returned whenever the caller's root sits under
+    // a symlink -- macOS's own default temp dir is exactly this shape),
+    // [`rebase_from_canonical`] translates each `changed_dirs` entry back
+    // into the caller's original root form immediately after the
+    // replay, so every path downstream of this point stays in the one
+    // form the rest of the crate already assumes.
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // FSEvents' own persisted log can lag a write by longer than the
+    // growth store's whole-second timestamp granularity, so a replay
+    // requested this soon after the baseline cannot yet distinguish
+    // "nothing changed" from "the change has not been logged yet" --
+    // most visibly when two observations happen back-to-back (tests;
+    // a scripted double-run), where a live FSEvents source can
+    // legitimately report zero changes for a write that already
+    // happened. Below this floor, skip straight to a full walk rather
+    // than trust an answer FSEvents itself cannot yet vouch for.
+    // Overridable via `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so tests
+    // that use a canned source (which has no real log-lag to protect
+    // against) can set it to `0` and skip real sleeps entirely.
+    let too_soon = prev_state
+        .last_observed_at
+        .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
+    let mut plan = source.replay(&FsEventsRequest {
+        root: canonical_root.clone(),
+        since: prev_state,
+    });
+    plan.changed_dirs = plan
+        .changed_dirs
+        .iter()
+        .map(|p| rebase_from_canonical(&canonical_root, root, p))
+        .collect();
+
+    let prev_topology = read_topology(&dir);
+
+    let result = if too_soon {
+        full_walk(
+            root,
+            observed_at,
+            large_file_min_bytes,
+            crate::fs_events::RefreshRefusal::TooSoon.as_str(),
+        )?
+    } else if !plan.incremental {
+        full_walk(root, observed_at, large_file_min_bytes, plan.reason_str())?
+    } else {
+        match prev_topology {
+            None => full_walk(
+                root,
+                observed_at,
+                large_file_min_bytes,
+                "no_stored_event_id",
+            )?,
+            Some(ref topo) => {
+                // Floored at a minimum so a tiny tree (a handful of
+                // Source directories) doesn't trip the "too many
+                // changes" guard on the very first touched file --
+                // the guard exists to protect large trees, where a
+                // fraction is the meaningful signal.
+                let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
+                if plan.changed_dirs.len() as f64 > TOO_MANY_CHANGES_FRACTION * known_dirs as f64 {
+                    full_walk(root, observed_at, large_file_min_bytes, "too_many_changes")?
+                } else {
+                    apply_incremental(
+                        topo,
+                        &plan.changed_dirs,
+                        observed_at,
+                        large_file_min_bytes,
+                        &dir,
+                    )?
+                }
+            }
+        }
+    };
+
+    if observe {
+        // Re-anchor for the next call regardless of which path was taken.
+        write_fsevents_state(
+            &dir,
+            &FsEventsState {
+                event_id: Some(plan.current_event_id),
+                device: plan.device,
+                last_observed_at: Some(observed_at),
+            },
+        )?;
+        write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
+        write_unowned(&dir, &result.attribution.unowned)?;
+    }
+
+    Ok(result)
+}
+
+/// Translates a canonical path (as FSEvents reports it) back into the
+/// caller's original root form, so every path this module compares
+/// against `changed_dirs` afterward is in the same non-canonical form
+/// every other walk in this crate already uses. A path outside
+/// `canonical_root` (should not happen -- the replay was scoped to that
+/// root) is left as-is rather than dropped, matching this module's
+/// general rule of keeping an uncertain path rather than silently
+/// discarding it.
+fn rebase_from_canonical(canonical_root: &Path, original_root: &Path, p: &Path) -> PathBuf {
+    match p.strip_prefix(canonical_root) {
+        Ok(rel) => original_root.join(rel),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+fn to_stored_worktrees(discovered: &[DiscoveredWorktree]) -> Vec<StoredWorktree> {
+    discovered
+        .iter()
+        .map(|dw| StoredWorktree {
+            worktree_id: crate::entities::id_for(&dw.path.display().to_string()),
+            project_id: dw.project_id.clone(),
+            project_name: dw.project_name.clone(),
+            path: dw.path.clone(),
+            kind: dw.kind.clone(),
+            remote_url: dw.remote_url.clone(),
+        })
+        .collect()
+}
+
+fn full_walk(
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    reason: &'static str,
+) -> Result<TrackedWalk> {
+    let (discovered, attribution) =
+        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?;
+    Ok(TrackedWalk {
+        discovered,
+        attribution,
+        mode: "full",
+        reason,
+        changed_dirs: 0,
+    })
+}
+
+/// The incremental path: re-walks only the worktrees/artifact roots
+/// FSEvents implicated, carrying every other row forward from the store
+/// unchanged (see [`reconstruct_attribution`]).
+fn apply_incremental(
+    prev: &[StoredWorktree],
+    changed_dirs: &[PathBuf],
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    dir: &Path,
+) -> Result<TrackedWalk> {
+    let mut attribution = reconstruct_attribution(dir)?;
+    let worktree_root: HashMap<String, PathBuf> = prev
+        .iter()
+        .map(|w| (w.worktree_id.clone(), w.path.clone()))
+        .collect();
+    // Rows reconstructed above carry a bare relative path; re-join it
+    // against the worktree's root now that we know it.
+    for (worktree_id, rows) in attribution.artifacts_by_worktree.iter_mut() {
+        let Some(root) = worktree_root.get(worktree_id) else {
+            continue;
+        };
+        for row in rows.iter_mut() {
+            row.path = if row.path.as_os_str().is_empty() {
+                root.clone()
+            } else {
+                root.join(&row.path)
+            };
+        }
+    }
+
+    let mut discovered: Vec<DiscoveredWorktree> = prev
+        .iter()
+        .map(|w| DiscoveredWorktree {
+            project_id: w.project_id.clone(),
+            project_name: w.project_name.clone(),
+            path: w.path.clone(),
+            kind: w.kind.clone(),
+            remote_url: w.remote_url.clone(),
+        })
+        .collect();
+
+    let mut worktrees_to_rewalk: HashSet<String> = HashSet::new();
+    let mut artifact_roots_to_resize: HashMap<PathBuf, (String, ArtifactKind)> = HashMap::new();
+    let mut discovery_scan_roots: Vec<PathBuf> = Vec::new();
+
+    for changed in changed_dirs {
+        let nearest = prev
+            .iter()
+            .filter(|w| changed.starts_with(&w.path))
+            .max_by_key(|w| w.path.as_os_str().len());
+        let Some(wt) = nearest else {
+            // Outside every known worktree: might be a brand-new project
+            // appearing under the root. Scan from here; if nothing is
+            // found, this change is simply not reflected until the next
+            // full walk (documented limitation of the incremental path).
+            discovery_scan_roots.push(changed.clone());
+            continue;
+        };
+        let artifact_hit = attribution
+            .artifacts_by_worktree
+            .get(&wt.worktree_id)
+            .and_then(|rows| {
+                rows.iter()
+                    .filter(|r| {
+                        r.kind != ArtifactKind::Source
+                            && (changed == &r.path || changed.starts_with(&r.path))
+                    })
+                    .max_by_key(|r| r.path.as_os_str().len())
+            });
+        if let Some(row) = artifact_hit {
+            artifact_roots_to_resize
+                .insert(row.path.clone(), (wt.worktree_id.clone(), row.kind.clone()));
+        } else {
+            worktrees_to_rewalk.insert(wt.worktree_id.clone());
+            // A changed directory that gained (or lost) a `.git` inside
+            // an already-known worktree's tree is a nested checkout; the
+            // worktree-level rewalk below re-sizes but does not itself
+            // run project discovery, so scan explicitly too.
+            if changed.join(".git").exists() {
+                discovery_scan_roots.push(changed.clone());
+            }
+        }
+    }
+
+    // New checkouts/worktrees discovered under any scan root.
+    for scan_root in &discovery_scan_roots {
+        if let Ok(found) = crate::walk::discover_parallel(scan_root) {
+            for dw in found {
+                if discovered.iter().any(|w| w.path == dw.path) {
+                    continue;
+                }
+                let worktree_id = crate::entities::id_for(&dw.path.display().to_string());
+                worktrees_to_rewalk.insert(worktree_id.clone());
+                discovered.push(dw);
+            }
+        }
+    }
+    // Rebuild the root lookup now that new worktrees may have been added.
+    let worktree_root: HashMap<String, PathBuf> = discovered
+        .iter()
+        .map(|dw| {
+            (
+                crate::entities::id_for(&dw.path.display().to_string()),
+                dw.path.clone(),
+            )
+        })
+        .collect();
+
+    // Drop worktrees whose root has disappeared entirely: their rows are
+    // simply not carried into this result, which tombstones them the next
+    // time `growth::observe_and_annotate*` runs (a present row this
+    // observation no longer emits is marked absent automatically).
+    discovered.retain(|dw| dw.path.exists());
+    let discovered_ids: HashSet<String> = discovered
+        .iter()
+        .map(|dw| crate::entities::id_for(&dw.path.display().to_string()))
+        .collect();
+    attribution
+        .artifacts_by_worktree
+        .retain(|id, _| discovered_ids.contains(id));
+    attribution
+        .dirs
+        .retain(|d| discovered_ids.contains(&d.worktree_id));
+    attribution
+        .files
+        .retain(|f| discovered_ids.contains(&f.worktree_id));
+
+    let mut total_delta: i64 = 0;
+
+    // Resize individual artifact roots.
+    for (root_path, (worktree_id, kind)) in &artifact_roots_to_resize {
+        if worktrees_to_rewalk.contains(worktree_id) {
+            continue; // superseded by the full worktree rewalk below.
+        }
+        if !root_path.exists() {
+            // The artifact directory itself was removed: drop the row
+            // entirely rather than leaving a phantom zero-byte entry a
+            // full walk would never have produced. A later change that
+            // recreates this path finds no artifact_hit for it next
+            // time (the row is gone), so it correctly falls through to
+            // a worktree rewalk instead of a resize.
+            if let Some(rows) = attribution.artifacts_by_worktree.get_mut(worktree_id)
+                && let Some(pos) = rows.iter().position(|r| &r.path == root_path)
+            {
+                total_delta -= rows.remove(pos).bytes as i64;
+            }
+            continue;
+        }
+        let new_row = crate::walk::resize_artifact(root_path, kind.clone(), observed_at);
+        if let Some(rows) = attribution.artifacts_by_worktree.get_mut(worktree_id) {
+            if let Some(existing) = rows.iter_mut().find(|r| &r.path == root_path) {
+                // Hardlink-safe: the full walk charged shared inodes to
+                // whichever row saw them first, so compare per-row local
+                // figures and apply that delta to the globally-deduped
+                // `bytes` instead of replacing it with a re-count (#29).
+                let old_local = if existing.local_bytes == 0 {
+                    existing.bytes
+                } else {
+                    existing.local_bytes
+                };
+                let delta = new_row.local_bytes as i64 - old_local as i64;
+                let mut merged = new_row;
+                merged.bytes = (existing.bytes as i64 + delta).max(0) as u64;
+                total_delta += delta;
+                *existing = merged;
+            } else {
+                total_delta += new_row.bytes as i64;
+                rows.push(new_row);
+            }
+        }
+    }
+
+    // Rewalk whole worktrees whose Source tree (or newly discovered
+    // subtree) was implicated. `all_worktree_refs` is the *complete*
+    // known worktree list (every worktree, not just the one being
+    // rewalked): a linked worktree frequently lives inside its main
+    // checkout's own directory tree (e.g. `.worktrees/<name>`), so
+    // walking with only one worktree in the known list would let
+    // `nearest_worktree` fold a nested worktree's own bytes into this
+    // one -- on top of that nested worktree's unrelated, still-correct
+    // carried-forward rows, double counting them. Passing the full list
+    // keeps nested-worktree boundaries exactly as a full walk would;
+    // only the entries keyed by *this* `worktree_id` are taken out of
+    // the result below, since every other worktree here (including any
+    // nested one this walk happened to pass through) keeps its
+    // carried-forward rows untouched.
+    let worktree_ids: Vec<String> = discovered
+        .iter()
+        .map(|dw| crate::entities::id_for(&dw.path.display().to_string()))
+        .collect();
+    let all_worktree_refs: Vec<(&Path, &str)> = discovered
+        .iter()
+        .zip(worktree_ids.iter())
+        .map(|(dw, id)| (dw.path.as_path(), id.as_str()))
+        .collect();
+
+    for worktree_id in &worktrees_to_rewalk {
+        let Some(root) = worktree_root.get(worktree_id) else {
+            continue;
+        };
+        let fresh = crate::walk::attribute_one_worktree(
+            root,
+            &all_worktree_refs,
+            observed_at,
+            large_file_min_bytes,
+        );
+        // Merge per row by (kind, path): a row present before and after
+        // keeps its globally-deduped `bytes` adjusted by the change in its
+        // own per-row local figure; a brand-new row starts from its local
+        // figure; a vanished row is subtracted in full (#29 hardlinks).
+        let old_rows = attribution
+            .artifacts_by_worktree
+            .remove(worktree_id)
+            .unwrap_or_default();
+        let mut merged: Vec<ArtifactRow> = Vec::new();
+        let fresh_rows = fresh
+            .artifacts_by_worktree
+            .get(worktree_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut matched = vec![false; old_rows.len()];
+        for mut nr in fresh_rows {
+            let pos = old_rows
+                .iter()
+                .position(|o| o.kind == nr.kind && o.path == nr.path);
+            match pos {
+                Some(i) => {
+                    matched[i] = true;
+                    let o = &old_rows[i];
+                    let old_local = if o.local_bytes == 0 {
+                        o.bytes
+                    } else {
+                        o.local_bytes
+                    };
+                    let new_local = if nr.local_bytes == 0 {
+                        nr.bytes
+                    } else {
+                        nr.local_bytes
+                    };
+                    let delta = new_local as i64 - old_local as i64;
+                    nr.bytes = (o.bytes as i64 + delta).max(0) as u64;
+                    nr.regrowth_count = o.regrowth_count;
+                    total_delta += delta;
+                }
+                None => {
+                    let local = if nr.local_bytes == 0 {
+                        nr.bytes
+                    } else {
+                        nr.local_bytes
+                    };
+                    nr.bytes = local;
+                    total_delta += local as i64;
+                }
+            }
+            merged.push(nr);
+        }
+        for (i, o) in old_rows.iter().enumerate() {
+            if !matched[i] {
+                total_delta -= o.bytes as i64;
+            }
+        }
+        if merged.is_empty() {
+            attribution.artifacts_by_worktree.remove(worktree_id);
+        } else {
+            attribution
+                .artifacts_by_worktree
+                .insert(worktree_id.clone(), merged);
+        }
+        // Only this worktree's own dir/file rows come out of `fresh`;
+        // any nested worktree's rows the walk happened to also produce
+        // are discarded here (that worktree's carried-forward rows are
+        // already correct and were not queued for rewalk).
+        attribution.dirs.retain(|d| &d.worktree_id != worktree_id);
+        attribution.dirs.extend(
+            fresh
+                .dirs
+                .into_iter()
+                .filter(|d| &d.worktree_id == worktree_id),
+        );
+        attribution.files.retain(|f| &f.worktree_id != worktree_id);
+        attribution.files.extend(
+            fresh
+                .files
+                .into_iter()
+                .filter(|f| &f.worktree_id == worktree_id),
+        );
+    }
+
+    attribution.attributed_total =
+        (attribution.attributed_total as i64 + total_delta).max(0) as u64;
+    attribution.walked_total = (attribution.walked_total as i64 + total_delta).max(0) as u64;
+
+    Ok(TrackedWalk {
+        discovered,
+        attribution,
+        mode: "incremental",
+        reason: "incremental",
+        changed_dirs: changed_dirs.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,6 +2128,7 @@ mod tests {
                     kind: ArtifactKind::DependencyTree,
                     path: worktree_root.join("node_modules"),
                     bytes,
+                    local_bytes: 0,
                     growth_bytes: None,
                     regrowth_count: 0,
                     observed_at: 0,

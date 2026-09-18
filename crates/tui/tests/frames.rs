@@ -22,6 +22,7 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
         kind,
         path: PathBuf::from(path),
         bytes,
+        local_bytes: 0,
         growth_bytes: growth,
         regrowth_count: 0,
         observed_at: 1_726_000_000,
