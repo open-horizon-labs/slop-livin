@@ -9,7 +9,7 @@ use slop_livin_core::{
         render_view_docker, render_view_reconciliation, render_view_unowned,
         render_worktree_signals, render_worktrees,
     },
-    report::{Report, report_full, to_json},
+    report::{Report, report_full_mode, to_json},
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -124,6 +124,10 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
+        /// Skip the FSEvents-driven incremental attempt and force a full
+        /// walk (also re-anchors the stored event id for next time).
+        #[arg(long)]
+        full: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment live for every GitHub-remote worktree found
@@ -134,6 +138,10 @@ enum Command {
     Observe {
         #[arg(required = true)]
         roots: Vec<PathBuf>,
+        /// Skip the FSEvents-driven incremental attempt and force a full
+        /// walk (also re-anchors the stored event id for next time).
+        #[arg(long)]
+        full: bool,
     },
     /// Install, report on, or remove the opt-in per-user LaunchAgent that
     /// runs `observe` on a fixed interval (#31).
@@ -194,6 +202,7 @@ fn main() -> Result<()> {
             docker,
             dirs,
             depth,
+            full,
         } => {
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
@@ -214,7 +223,7 @@ fn main() -> Result<()> {
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = slop_livin_dir();
-            let r = report_full(
+            let r = report_full_mode(
                 &root,
                 docker_facts.as_deref(),
                 verify_du,
@@ -223,6 +232,7 @@ fn main() -> Result<()> {
                 !no_observe,
                 dirs,
                 enrich,
+                full,
             )?;
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
                 Some(Ok(f)) => Some(f),
@@ -286,8 +296,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Observe { roots } => {
-            schedule::cmd_observe(slop_livin_dir(), roots)?;
+        Command::Observe { roots, full } => {
+            schedule::cmd_observe(slop_livin_dir(), roots, full)?;
         }
         Command::Schedule { every, off, roots } => {
             schedule::cmd_schedule(slop_livin_dir(), every, off, roots)?;

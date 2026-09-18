@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// "another observation is running" skip, and even on a timeout/error --
 /// only in-process misuse (e.g. no roots given) is a hard error, since a
 /// launchd-triggered run should never wedge into a retry storm.
-pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>) -> Result<()> {
+pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) -> Result<()> {
     if roots.is_empty() {
         bail!("observe needs at least one root");
     }
@@ -44,7 +44,7 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>) -> Result<()> {
         let mut summaries = Vec::new();
         let mut failure: Option<String> = None;
         for root in &work_roots {
-            match observe_only(root, &work_dir, None) {
+            match observe_only(root, &work_dir, None, force_full) {
                 Ok(summary) => summaries.push((root.clone(), summary)),
                 Err(e) => {
                     failure = Some(e.to_string());
@@ -80,13 +80,13 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>) -> Result<()> {
 
             for (root, summary) in &summaries {
                 println!(
-                    "root={} observed_at={} wall_ms={} walked_total={} projects={} mode={}",
+                    "root={} observed_at={} wall_ms={} walked_total={} projects={} {}",
                     root.display(),
                     summary.observed_at,
                     wall_ms,
                     summary.walked_total,
                     summary.projects,
-                    summary.mode
+                    summary.fsevents_line
                 );
                 println!(
                     "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
@@ -98,12 +98,21 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>) -> Result<()> {
 
             let walked_total: u64 = summaries.iter().map(|(_, s)| s.walked_total).sum();
             let projects: usize = summaries.iter().map(|(_, s)| s.projects).sum();
+            // When several roots were observed, the run's overall mode is
+            // "incremental" only if every one of them was; one full walk
+            // in the batch means the whole run's cost is dominated by it.
+            let mode = if summaries.iter().all(|(_, s)| s.mode == "incremental") {
+                "incremental"
+            } else {
+                "full"
+            }
+            .to_string();
             let outcome = RunOutcome {
                 observed_at: now,
                 wall_ms,
                 walked_total,
                 projects,
-                mode: "full".to_string(),
+                mode,
                 outcome: "ok".to_string(),
             };
             append_log(&log_file(), &outcome)?;

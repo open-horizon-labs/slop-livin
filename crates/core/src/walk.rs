@@ -721,6 +721,96 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 }
 
 // ---------------------------------------------------------------------
+// R4b: incremental re-walk primitives. `growth::observe_tracked` uses
+// these two entry points to re-walk only what FSEvents implicated,
+// carrying every other row forward untouched. Both give exactly the same
+// per-directory/per-file classification and sizing rules as
+// `attribute_parallel` above -- they simply start the same machinery at a
+// narrower root than the whole scan root.
+// ---------------------------------------------------------------------
+
+/// Re-walks exactly one worktree, matching `discover_and_attribute`'s
+/// per-worktree slice of `attribute_parallel` but seeded at
+/// `worktree_root` instead of the whole scan root. This is the fallback
+/// granularity for a changed directory that lands in a worktree's Source
+/// tree (not inside an already-classified artifact directory): re-walking
+/// the one worktree is far cheaper than re-walking the whole root, and
+/// every other worktree's rows are untouched by construction (this call
+/// never looks outside `worktree_root`).
+///
+/// Hardlink dedup is scoped to this call: a file already counted in this
+/// worktree during a broader walk could in principle be seen as "new"
+/// here. This only matters for the rare cross-worktree hardlink, and
+/// losing that dedup precision on an incremental pass (never on a full
+/// walk) is an accepted, documented trade for not having to carry the
+/// whole tree's inode set forward between observations.
+pub fn attribute_one_worktree(
+    worktree_root: &Path,
+    worktree_id: &str,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+) -> AttributionResult {
+    attribute_parallel(
+        worktree_root,
+        &[(worktree_root, worktree_id)],
+        observed_at,
+        large_file_min_bytes,
+    )
+}
+
+/// Re-sizes exactly one already-classified artifact directory as a unit,
+/// matching `process_size`'s fold semantics (regular files, hardlink
+/// deduped within this call, symlinks and unreadable entries skipped).
+/// This is the common incremental case named in #29's acceptance test:
+/// FSEvents implicates a directory inside an existing artifact root (e.g.
+/// `node_modules/some-pkg`), so only that one row needs re-sizing and
+/// every other artifact/Source row in the worktree carries forward with
+/// its previously observed bytes untouched.
+pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -> ArtifactRow {
+    let mut seen = HashSet::new();
+    let bytes = size_dir_recursive(root_path, &mut seen);
+    ArtifactRow {
+        kind,
+        path: root_path.to_path_buf(),
+        bytes,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at,
+        confidence: Confidence::High,
+        source: Source::new("filesystem.fsevents"),
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+    }
+}
+
+fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total += size_dir_recursive(&entry.path(), seen);
+        } else if ft.is_file() {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() && seen.insert((meta.dev(), meta.ino())) {
+                total += allocated_bytes(&meta);
+            }
+        }
+    }
+    total
+}
+
+// ---------------------------------------------------------------------
 // Combined entry point used by `report::report_with`.
 // ---------------------------------------------------------------------
 

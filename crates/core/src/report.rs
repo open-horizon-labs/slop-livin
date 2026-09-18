@@ -442,6 +442,9 @@ pub fn report_with_enrich(
 /// than the other four's convenience wrapper shape) because the CLI's
 /// `--dirs`/`--no-observe`/`--enrich` are independent flags and a caller
 /// may need more than one at once.
+///
+/// Always takes the full-walk path (never tries FSEvents); see
+/// [`report_full_mode`] for the `--full`-aware entry point R4b (#29) adds.
 #[allow(clippy::too_many_arguments)]
 pub fn report_full(
     root: &Path,
@@ -452,6 +455,69 @@ pub fn report_full(
     observe: bool,
     include_dirs: bool,
     enrich: bool,
+) -> Result<Report> {
+    report_full_mode(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        false,
+    )
+}
+
+/// Same as [`report_full`], with one more knob: `force_full` (`--full`)
+/// skips the FSEvents-driven incremental attempt entirely, same as a
+/// refusal would, and still re-anchors the stored event id for the next
+/// call. When `store_dir` is `None` this is identical to `report_full`
+/// (no store, no FSEvents replay, no incremental path is possible).
+#[allow(clippy::too_many_arguments)]
+pub fn report_full_mode(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+) -> Result<Report> {
+    report_full_mode_with_source(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        crate::fs_events::platform_source().as_ref(),
+    )
+}
+
+/// Same as [`report_full_mode`], with the [`crate::fs_events::FsEventsSource`]
+/// supplied explicitly. Exposed so integration tests can exercise the
+/// FSEvents-driven incremental path end to end (full `Report`, docker
+/// join, signals, and all) with canned event batches instead of the live
+/// `fseventsd`; production callers use [`report_full_mode`], which
+/// resolves the real platform source.
+#[allow(clippy::too_many_arguments)]
+pub fn report_full_mode_with_source(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<Report> {
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let observed_at = crate::entities::now();
@@ -465,9 +531,35 @@ pub fn report_full(
     // bounded thread pool instead of one directory at a time per pass.
     // See its module docs for why the two walks are kept separate rather
     // than fused into one (they stop recursion on different directories).
+    //
+    // R4b (#29): when a growth store is available, try an FSEvents-driven
+    // incremental re-walk first (`growth::observe_tracked_with_source`);
+    // it falls back to the same `discover_and_attribute` full walk on any
+    // refusal. The mode/reason it reports lands in `notes` as
+    // `"fsevents: mode=.. reason=.. changed_dirs=.."`, which is both this
+    // report's coverage line and (parsed back out by `observe_only`) the
+    // `observe` log line's `mode=`/`reason=` fields.
     let t0 = std::time::Instant::now();
-    let (discovered, mut attribution) =
-        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?;
+    let mut notes: Vec<String> = Vec::new();
+    let (discovered, mut attribution) = if let Some(dir) = store_dir {
+        let tracked = crate::growth::observe_tracked_with_source(
+            dir,
+            root,
+            observed_at,
+            large_file_min_bytes,
+            force_full,
+            observe,
+            fs_events_source,
+        )?;
+        notes.push(format!(
+            "fsevents: mode={} reason={} changed_dirs={}",
+            tracked.mode, tracked.reason, tracked.changed_dirs
+        ));
+        (tracked.discovered, tracked.attribution)
+    } else {
+        notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
+        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?
+    };
     if trace {
         eprintln!("[trace] discover_and_attribute: {:?}", t0.elapsed());
     }
@@ -742,7 +834,6 @@ pub fn report_full(
     }
 
     let mut unowned = attribution.unowned;
-    let mut notes: Vec<String> = Vec::new();
     notes.extend(github_notes);
     let facts = crate::docker::load(docker_facts);
     if let Some(reason) = &facts.unavailable {
@@ -1386,9 +1477,13 @@ pub struct ObserveSummary {
     pub observed_at: u64,
     pub walked_total: u64,
     pub projects: usize,
-    /// Always "full" until incremental walks (#29) land; the seam this
-    /// field exists for.
-    pub mode: &'static str,
+    /// "full" or "incremental" (#29): read straight off the
+    /// `"fsevents: mode=.. reason=.. changed_dirs=.."` note this same
+    /// pass records.
+    pub mode: String,
+    /// The `mode=.. reason=.. changed_dirs=..` line for the `observe` log
+    /// (`schedule::RunOutcome`) and stdout, straight from that note.
+    pub fsevents_line: String,
     /// Live GitHub enrichment stats for this same pass (#35): `observe`
     /// refreshes both the growth store and `enrich.parquet` in one walk,
     /// since it already has every worktree's path/branch/tip in hand.
@@ -1400,25 +1495,42 @@ pub struct ObserveSummary {
 /// enrichment live for every GitHub-remote worktree found (concurrent,
 /// coalesced per repo -- see `github::observe_all`), and returns the
 /// summary facts the caller prints/logs. Never renders a report.
+/// `force_full` (`--full`) skips the FSEvents-driven incremental attempt.
 pub fn observe_only(
     root: &Path,
     store_dir: &Path,
     since_override: Option<&str>,
+    force_full: bool,
 ) -> Result<ObserveSummary> {
-    let r = report_with_enrich(
+    let r = report_full_mode_with_source(
         root,
         None,
         false,
         Some(store_dir),
         since_override,
         true,
+        false,
         true,
+        force_full,
+        crate::fs_events::platform_source().as_ref(),
     )?;
+    let fsevents_line = r
+        .notes
+        .iter()
+        .find_map(|n| n.strip_prefix("fsevents: "))
+        .map(str::to_string)
+        .unwrap_or_else(|| "mode=full reason=no_store changed_dirs=0".to_string());
+    let mode = fsevents_line
+        .strip_prefix("mode=")
+        .and_then(|s| s.split(' ').next())
+        .unwrap_or("full")
+        .to_string();
     Ok(ObserveSummary {
         observed_at: r.observed_at,
         walked_total: r.reconciliation.walked_total,
         projects: r.projects.len(),
-        mode: "full",
+        mode,
+        fsevents_line,
         github: r.github_enrichment.unwrap_or_default(),
     })
 }
