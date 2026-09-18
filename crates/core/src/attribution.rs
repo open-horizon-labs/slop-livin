@@ -184,6 +184,8 @@ impl<'a> Ctx<'a> {
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,
+                    shared_bytes: None,
+                    note: None,
                 });
             }
         }
@@ -194,6 +196,8 @@ impl<'a> Ctx<'a> {
             path_or_object: path.display().to_string(),
             bytes: 0,
             reason: UnownedReason::PermissionDenied,
+            shared_bytes: None,
+            note: None,
         });
     }
 
@@ -226,6 +230,8 @@ impl<'a> Ctx<'a> {
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,
+                    shared_bytes: None,
+                    note: None,
                 });
             }
         }

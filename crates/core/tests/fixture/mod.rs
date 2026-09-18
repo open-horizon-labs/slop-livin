@@ -18,6 +18,10 @@ pub struct Fixture {
     pub root: PathBuf,
     pub checkout: PathBuf,
     pub checkout_name: String,
+    /// Only read by `report_golden.rs` (the image.source join case); other
+    /// fixture consumers don't need it, so it's allowed to go unused there.
+    #[allow(dead_code)]
+    pub checkout_remote: String,
     pub linked_worktree: PathBuf,
     pub node_modules: PathBuf,
     pub node_modules_bytes: u64,
@@ -105,6 +109,8 @@ pub fn build(tmp: &Path) -> Fixture {
         .and_then(|n| n.to_str())
         .expect("checkout has a name")
         .to_string();
+    let checkout_remote = "https://example.com/fixture-org/checkout.git";
+    run_git(&checkout, &["remote", "add", "origin", checkout_remote]);
 
     // node_modules/: ~3 MB across several files
     let node_modules = checkout.join("node_modules");
@@ -161,8 +167,50 @@ pub fn build(tmp: &Path) -> Fixture {
     let loose_file_bytes = 4096u64;
     write_pattern(&loose_file, loose_file_bytes);
 
-    // --- mocked `docker system df -v` JSON ---
+    // --- mocked `docker system df -v` + `docker image inspect` JSON ---
+    // This mirrors the real two-source shape: `docker system df -v
+    // --format json` image rows carry NO `Labels` field at all (verified
+    // live -- its image objects have exactly `[Containers, CreatedAt,
+    // CreatedSince, Digest, ID, Repository, SharedSize, Size, Tag,
+    // UniqueSize]`); labels only exist in `docker image inspect` output
+    // under `Config.Labels`. "Images" below is the df shape (no Labels);
+    // "ImageInspect" is the inspect shape, merged in by ID. Volume labels
+    // *are* present directly in `docker system df -v` (also verified
+    // live), so volumes keep their `Labels` field inline.
+    //
+    // Seven images exercise every R5 join rule and the base-image trap:
+    //   aaaa - compose-project label matches the checkout -> joined, High.
+    //   bbbb - unlabeled, named exactly like the project -> unowned;
+    //          name similarity is never evidence.
+    //   cccc - image.source matches the checkout's git remote -> joined, Medium.
+    //   dddd - image.source points elsewhere, name unrelated -> unowned,
+    //          with a base_image_source note, never attributed.
+    //   eeee - THE BASE-IMAGE TRAP: named exactly like the project (like
+    //          real-world `muness/unified-hifi-control` -> its own repo
+    //          name) but its image.source points at the upstream base
+    //          image it was built FROM (like real-world
+    //          `linuxcontainers/alpine`), not the project itself -> must
+    //          land unowned with a base_image_source note, never
+    //          attributed to the project despite the name match.
+    //   ffff - compose-project label matches NO discovered project (a
+    //          real compose project name frequently differs from the
+    //          repo name, e.g. `hiphi-staging` for `hiphi-relay`/
+    //          `hiphi-authorizer`), but working_dir is a path inside the
+    //          linked worktree -> joined, High, to the linked worktree,
+    //          and the unmatched compose label never surfaces as a
+    //          `compose_project` note because rule 2 already joined it.
+    //   gggg - compose-project label matches no discovered project and
+    //          carries no other evidence -> unowned, with a
+    //          `compose_project=<name>` note so a later slice can still
+    //          group it, even though this slice can't attribute it.
+    //   a build-cache entry with no labels -> unowned (no evidence; no
+    //          label source exists for build cache at all).
+    //   a volume with a compose-project label matching the checkout ->
+    //          joined, High (volumes get their labels straight from df -v).
     let docker_facts = tmp.join("docker_system_df_v.json");
+    let elsewhere_source = "https://example.com/some-other-org/unrelated.git";
+    let base_image_source = "https://github.com/example-org/some-upstream-base-image";
+    let unmatched_compose_project = "fixture-compose-project-with-no-checkout";
     let docker_json = serde_json::json!({
         "Images": [
             {
@@ -172,16 +220,102 @@ pub fn build(tmp: &Path) -> Fixture {
                 "Size": "10485760",
                 "SharedSize": "2097152",
                 "UniqueSize": "8388608",
-                "Labels": format!("com.docker.compose.project={checkout_name}"),
             },
             {
                 "ID": "sha256:bbbb000000000000000000000000000000000000000000000000000000bb",
-                "Repository": "fixture/no-join",
+                "Repository": checkout_name.clone(),
                 "Tag": "latest",
                 "Size": "5242880",
                 "SharedSize": "1048576",
                 "UniqueSize": "4194304",
-                "Labels": "",
+            },
+            {
+                "ID": "sha256:cccc000000000000000000000000000000000000000000000000000000cc",
+                "Repository": "fixture/source-match",
+                "Tag": "latest",
+                "Size": "3145728",
+                "SharedSize": "1048576",
+                "UniqueSize": "2097152",
+            },
+            {
+                "ID": "sha256:dddd000000000000000000000000000000000000000000000000000000dd",
+                "Repository": "fixture/source-elsewhere",
+                "Tag": "latest",
+                "Size": "2097152",
+                "SharedSize": "524288",
+                "UniqueSize": "1572864",
+            },
+            {
+                "ID": "sha256:eeee000000000000000000000000000000000000000000000000000000ee",
+                "Repository": checkout_name.clone(),
+                "Tag": "base-image-trap",
+                "Size": "1572864",
+                "SharedSize": "262144",
+                "UniqueSize": "1310720",
+            },
+            {
+                "ID": "sha256:ffff000000000000000000000000000000000000000000000000000000ff",
+                "Repository": "fixture/working-dir-join",
+                "Tag": "latest",
+                "Size": "1048576",
+                "SharedSize": "131072",
+                "UniqueSize": "917504",
+            },
+            {
+                "ID": "sha256:aaaa111111111111111111111111111111111111111111111111111111aa",
+                "Repository": "fixture/unmatched-compose-project",
+                "Tag": "latest",
+                "Size": "786432",
+                "SharedSize": "65536",
+                "UniqueSize": "720896",
+            }
+        ],
+        "ImageInspect": [
+            {
+                "Id": "sha256:aaaa000000000000000000000000000000000000000000000000000000aa",
+                "RepoTags": ["fixture/with-project:latest"],
+                "Config": { "Labels": { "com.docker.compose.project": checkout_name.clone() } },
+            },
+            {
+                "Id": "sha256:cccc000000000000000000000000000000000000000000000000000000cc",
+                "RepoTags": ["fixture/source-match:latest"],
+                "Config": { "Labels": { "org.opencontainers.image.source": checkout_remote } },
+            },
+            {
+                "Id": "sha256:dddd000000000000000000000000000000000000000000000000000000dd",
+                "RepoTags": ["fixture/source-elsewhere:latest"],
+                "Config": { "Labels": { "org.opencontainers.image.source": elsewhere_source } },
+            },
+            {
+                "Id": "sha256:eeee000000000000000000000000000000000000000000000000000000ee",
+                "RepoTags": [format!("{checkout_name}:base-image-trap")],
+                "Config": { "Labels": { "org.opencontainers.image.source": base_image_source } },
+            },
+            {
+                "Id": "sha256:ffff000000000000000000000000000000000000000000000000000000ff",
+                "RepoTags": ["fixture/working-dir-join:latest"],
+                "Config": { "Labels": {
+                    "com.docker.compose.project": unmatched_compose_project,
+                    "com.docker.compose.project.working_dir": linked_worktree.to_string_lossy(),
+                } },
+            },
+            {
+                "Id": "sha256:aaaa111111111111111111111111111111111111111111111111111111aa",
+                "RepoTags": ["fixture/unmatched-compose-project:latest"],
+                "Config": { "Labels": { "com.docker.compose.project": unmatched_compose_project } },
+            }
+        ],
+        "BuildCache": [
+            {
+                "ID": "buildcache-no-evidence-0001",
+                "Size": "1048576",
+            }
+        ],
+        "Volumes": [
+            {
+                "Name": "fixture-project-volume",
+                "Labels": format!("com.docker.compose.project={checkout_name}"),
+                "Size": "262144",
             }
         ]
     });
@@ -195,6 +329,7 @@ pub fn build(tmp: &Path) -> Fixture {
         root: tmp.to_path_buf(),
         checkout,
         checkout_name,
+        checkout_remote: checkout_remote.to_string(),
         linked_worktree,
         node_modules,
         node_modules_bytes,
