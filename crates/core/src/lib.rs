@@ -11,6 +11,7 @@ pub mod extractor;
 pub mod fs_events;
 pub mod git;
 pub mod grants;
+pub mod growth;
 pub mod ledger;
 pub mod measurement;
 pub mod occupancy;
