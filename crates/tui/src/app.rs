@@ -86,6 +86,10 @@ pub struct App {
     pub marked: BTreeMap<String, MarkedUnit>,
     pub confirm_open: bool,
     pub help_open: bool,
+    /// The filter picker form, when open.
+    pub picker: Option<crate::picker::Picker>,
+    /// Tab-completion candidates shown under the raw filter line.
+    pub completions: Vec<String>,
     pub refusal: Option<(String, Instant)>,
     pub observing: Option<(u32, u32)>,
     pub last_result: Option<String>,
@@ -117,6 +121,8 @@ impl App {
             marked: BTreeMap::new(),
             confirm_open: false,
             help_open: false,
+            picker: None,
+            completions: Vec::new(),
             refusal: None,
             observing: None,
             last_result: None,
@@ -203,13 +209,65 @@ impl App {
         self.filter_error = None;
     }
 
+    pub fn open_picker(&mut self) {
+        self.picker = Some(crate::picker::Picker::from_report(
+            &self.report,
+            &self.filter_text,
+        ));
+    }
+
+    pub fn apply_picker(&mut self) {
+        if let Some(p) = self.picker.take() {
+            self.filter_text = p.compose();
+            self.editing_filter = false;
+            self.commit_filter();
+        }
+    }
+
+    /// `e` in the picker: carry its composed text into the raw line.
+    pub fn picker_to_raw_edit(&mut self) {
+        if let Some(p) = self.picker.take() {
+            self.filter_before_edit = self.filter_text.clone();
+            self.filter_text = p.compose();
+            if self.filter_text == "0" {
+                self.filter_text.clear();
+            }
+            self.editing_filter = true;
+            self.filter_error = None;
+        }
+    }
+
+    pub fn filter_tab_complete(&mut self) {
+        let projects: Vec<String> = self
+            .report
+            .projects
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let (text, cands) = crate::picker::apply_completion(&self.filter_text, &projects);
+        self.filter_text = text;
+        self.completions = if cands.len() > 1 { cands } else { Vec::new() };
+    }
+
     pub fn cancel_filter_edit(&mut self) {
+        self.completions.clear();
         self.filter_text = std::mem::take(&mut self.filter_before_edit);
         self.editing_filter = false;
     }
 
     pub fn filter_input(&mut self, c: char) {
         self.filter_text.push(c);
+        self.completions.clear();
+    }
+
+    /// Rows the current filter would show — for the picker's live count.
+    pub fn match_count_for(&self, text: &str) -> Option<usize> {
+        let f = crate::filter::parse(text).ok()?;
+        let mut probe = App::new(self.report.clone(), self.root.clone());
+        probe.view = self.view;
+        probe.selected_project = self.selected_project.clone();
+        probe.filter = f;
+        Some(probe.rows().len())
     }
 
     pub fn filter_backspace(&mut self) {
@@ -218,6 +276,7 @@ impl App {
 
     pub fn commit_filter(&mut self) {
         self.editing_filter = false;
+        self.completions.clear();
         match filter::parse(&self.filter_text) {
             Ok(f) => {
                 self.filter = f;

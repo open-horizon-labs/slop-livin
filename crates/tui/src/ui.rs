@@ -131,11 +131,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.help_open {
         draw_help(frame, size);
     }
+    if let Some(p) = &app.picker {
+        draw_picker(frame, app, p, size);
+    }
+}
+
+fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
+    let w = area.width.min(78);
+    let h = area.height.min(14);
+    let popup = Rect {
+        x: (area.width.saturating_sub(w)) / 2,
+        y: (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let composed = p.compose();
+    let count = app
+        .match_count_for(&composed)
+        .map(|n| format!("{n} row{}", if n == 1 { "" } else { "s" }))
+        .unwrap_or_else(|| "—".into());
+    let mut lines: Vec<Line> = Vec::new();
+    for (name, value, selected) in p.lines() {
+        let marker = if selected { "▸ " } else { "  " };
+        let l = Line::from(format!("{marker}{name:<15}{value}"));
+        lines.push(if selected {
+            l.style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED))
+        } else {
+            l
+        });
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("  filter: {composed}    → {count}")));
+    lines.push(Line::from("  ↑↓ field · ←→ value · type to narrow project"));
+    lines.push(Line::from(
+        "  Enter apply · Esc cancel · e edit as text · 0 clear",
+    ));
+    let block = Block::default().borders(Borders::ALL).title(" filter ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.editing_filter {
-        format!("filter › {}▏  (Enter apply · Esc cancel)", app.filter_text)
+        let hint = if app.completions.is_empty() {
+            "(Tab complete · Enter apply · Esc cancel)".to_string()
+        } else {
+            format!("(Tab: {})", app.completions.join("  "))
+        };
+        format!("filter › {}▏  {hint}", app.filter_text)
     } else {
         format!("filter: {}", app.filter_text)
     };
@@ -259,7 +302,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  →/←       expand / collapse"),
         Line::from("  Enter     open project / confirm delete"),
         Line::from("  Backspace mark selected unit for delete"),
-        Line::from("  /         edit filter, Enter to apply"),
+        Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from("  v, 1-5    switch view"),
         Line::from("  g / s     sort by growth / size"),

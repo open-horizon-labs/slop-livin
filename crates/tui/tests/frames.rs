@@ -280,3 +280,19 @@ fn help_overlay_state() {
         check(&format!("help_{w}x{h}"), &capture(&app, w, h));
     }
 }
+
+#[test]
+fn picker_frame() {
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 200;
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('/'));
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
+    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Right);
+    let got = capture(&app, 200, 60);
+    assert!(got.contains("▸ kind"), "kind field selected:\n{got}");
+    assert!(
+        got.contains("kind:BuildOutput"),
+        "composed filter shown:\n{got}"
+    );
+    check("picker_200x60", &got);
+}

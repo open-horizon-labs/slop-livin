@@ -9,7 +9,7 @@
 "     │  →/←       expand / collapse                                       │     "
 "     │  Enter     open project / confirm delete                           │     "
 "     │  Backspace mark selected unit for delete                           │     "
-"     │  /         edit filter, Enter to apply                             │     "
+"     │  /         filter picker (form) · : edit filter as text, Tab comple│     "
 "     │  0         clear filter                                            │     "
 "     │  v, 1-5    switch view                                             │     "
 "     │  g / s     sort by growth / size                                   │     "

@@ -7,6 +7,7 @@ pub mod actions;
 pub mod app;
 pub mod filter;
 pub mod model;
+pub mod picker;
 pub mod ui;
 pub mod units;
 
@@ -35,11 +36,38 @@ pub fn ledger_path() -> PathBuf {
 /// Dispatches one key event against the app state. Kept separate from
 /// the terminal event loop so it is directly unit-testable.
 pub fn handle_key(app: &mut App, code: KeyCode) {
+    handle_key_mod(app, code, false)
+}
+
+/// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
+pub fn handle_key_mod(app: &mut App, code: KeyCode, shift: bool) {
+    if let Some(p) = app.picker.as_mut() {
+        match code {
+            KeyCode::Up => p.up(),
+            KeyCode::Down => p.down(),
+            KeyCode::Right if shift => p.cycle_secondary(1),
+            KeyCode::Left if shift => p.cycle_secondary(-1),
+            KeyCode::Right => p.cycle(1),
+            KeyCode::Left => p.cycle(-1),
+            KeyCode::Backspace => p.backspace(),
+            KeyCode::Enter => app.apply_picker(),
+            KeyCode::Esc => app.picker = None,
+            KeyCode::Char('e') if p.field != 2 => app.picker_to_raw_edit(),
+            KeyCode::Char(c) if p.field == 2 => p.type_char(c),
+            KeyCode::Char('0') => {
+                app.picker = None;
+                app.clear_filter();
+            }
+            _ => {}
+        }
+        return;
+    }
     if app.editing_filter {
         match code {
             KeyCode::Enter => app.commit_filter(),
             KeyCode::Esc => app.cancel_filter_edit(),
             KeyCode::Backspace => app.filter_backspace(),
+            KeyCode::Tab => app.filter_tab_complete(),
             KeyCode::Char(c) => app.filter_input(c),
             _ => {}
         }
@@ -60,7 +88,8 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Enter => app.drill_into_selected(),
         KeyCode::Esc => app.cancel_confirm(),
         KeyCode::Backspace => app.mark_selected(),
-        KeyCode::Char('/') => app.start_filter_edit(),
+        KeyCode::Char('/') => app.open_picker(),
+        KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
         KeyCode::Char('v') => app.set_view(app.view.next()),
         KeyCode::Char(d @ '1'..='5') => {
@@ -170,7 +199,12 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(app, key.code);
+            handle_key_mod(
+                app,
+                key.code,
+                key.modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT),
+            );
         }
     }
 }
@@ -207,7 +241,7 @@ mod tests {
     fn slash_edits_existing_filter_text_and_esc_restores_it() {
         let mut app = App::new(empty_report(), "/root".into());
         let before = app.filter_text.clone();
-        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char(':'));
         assert!(app.editing_filter);
         assert_eq!(app.filter_text, before, "existing text stays editable");
         for _ in 0..before.len() {
@@ -220,7 +254,7 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc);
         assert!(!app.editing_filter);
         assert_eq!(app.filter_text, before, "Esc restores the previous filter");
-        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char(':'));
         for c in " idle > 48h".chars() {
             handle_key(&mut app, KeyCode::Char(c));
         }
@@ -228,6 +262,26 @@ mod tests {
         assert!(!app.editing_filter);
         assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
         assert!(app.filter_text.ends_with("idle > 48h"));
+    }
+
+    #[test]
+    fn slash_opens_picker_and_enter_applies_its_filter() {
+        let mut app = App::new(empty_report(), "/root".into());
+        handle_key(&mut app, KeyCode::Char('/'));
+        assert!(app.picker.is_some());
+        handle_key(&mut app, KeyCode::Down); // kind
+        handle_key(&mut app, KeyCode::Right); // build
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(app.filter_text, "growth > 100MB in 7d kind:BuildOutput");
+        assert!(app.filter_error.is_none());
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert_eq!(
+            app.filter_text, "growth > 100MB in 7d kind:BuildOutput",
+            "Esc keeps the applied filter"
+        );
     }
 
     #[test]

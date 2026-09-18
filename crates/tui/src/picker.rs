@@ -1,0 +1,507 @@
+//! The filter picker: a small form that composes a filter line without the
+//! human having to know the grammar. Each field cycles through values
+//! (←/→), ↑/↓ moves between fields, Enter applies, Esc cancels, `e` drops
+//! to the raw line for anyone who prefers typing. The composed text is the
+//! same string `filter::parse` accepts, so the two paths cannot diverge.
+
+use slop_livin_core::report::Report;
+
+pub const SIZES: &[&str] = &[
+    "off", "1MB", "10MB", "50MB", "100MB", "500MB", "1GB", "5GB", "20GB",
+];
+pub const WINDOWS: &[&str] = &["24h", "7d", "30d", "90d", "1y"];
+pub const IDLES: &[&str] = &["off", "24h", "48h", "7d", "30d", "90d"];
+pub const KINDS: &[&str] = &["any", "build", "deps", "cache", "git", "source", "docker"];
+pub const PRS: &[&str] = &["any", "open", "merged", "closed", "none"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub field: usize,
+    pub growth_gt: bool,
+    pub size_ix: usize,
+    pub window_ix: usize,
+    pub kind_ix: usize,
+    /// Index into `projects`; 0 = any.
+    pub project_ix: usize,
+    /// Type-to-narrow buffer for the project field.
+    pub project_query: String,
+    pub idle_ix: usize,
+    pub merge_complete: bool,
+    pub pr_ix: usize,
+    pub projects: Vec<String>,
+}
+
+pub const FIELDS: &[&str] = &["growth", "kind", "project", "idle", "merge-complete", "pr"];
+
+impl Picker {
+    /// Seeds the form from the report (project names) and, when it parses,
+    /// the current filter text so opening the picker shows what is applied.
+    pub fn from_report(report: &Report, current: &str) -> Self {
+        let mut projects: Vec<String> = report.projects.iter().map(|p| p.name.clone()).collect();
+        projects.sort();
+        projects.dedup();
+        let mut p = Picker {
+            field: 0,
+            growth_gt: true,
+            size_ix: 4,   // 100MB
+            window_ix: 1, // 7d
+            kind_ix: 0,
+            project_ix: 0,
+            project_query: String::new(),
+            idle_ix: 0,
+            merge_complete: false,
+            pr_ix: 0,
+            projects,
+        };
+        p.seed_from_text(current);
+        p
+    }
+
+    fn seed_from_text(&mut self, text: &str) {
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        let mut i = 0;
+        if text.trim() == "0" || text.trim().is_empty() {
+            self.size_ix = 0;
+            return;
+        }
+        let mut saw_growth = false;
+        while i < toks.len() {
+            match toks[i] {
+                "growth" if i + 4 < toks.len() + 1 && i + 2 < toks.len() => {
+                    saw_growth = true;
+                    self.growth_gt = toks[i + 1] == ">";
+                    if let Some(ix) = SIZES
+                        .iter()
+                        .position(|s| s.eq_ignore_ascii_case(toks[i + 2]))
+                    {
+                        self.size_ix = ix;
+                    }
+                    if i + 4 < toks.len()
+                        && let Some(ix) = WINDOWS
+                            .iter()
+                            .position(|w| w.eq_ignore_ascii_case(toks[i + 4]))
+                    {
+                        self.window_ix = ix;
+                    }
+                    i += 5;
+                }
+                "idle" if i + 2 < toks.len() => {
+                    if let Some(ix) = IDLES
+                        .iter()
+                        .position(|d| d.eq_ignore_ascii_case(toks[i + 2]))
+                    {
+                        self.idle_ix = ix;
+                    }
+                    i += 3;
+                }
+                "merge-complete" => {
+                    self.merge_complete = true;
+                    i += 1;
+                }
+                t if t.starts_with("kind:") => {
+                    let k = &t[5..];
+                    self.kind_ix = KINDS
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(k))
+                        .unwrap_or_else(|| match k.to_ascii_lowercase().as_str() {
+                            "buildoutput" => 1,
+                            "dependencytree" => 2,
+                            _ => 0,
+                        });
+                    i += 1;
+                }
+                t if t.starts_with("project:") => {
+                    let n = &t[8..];
+                    self.project_ix = self
+                        .projects
+                        .iter()
+                        .position(|p| p.eq_ignore_ascii_case(n))
+                        .map(|ix| ix + 1)
+                        .unwrap_or(0);
+                    i += 1;
+                }
+                t if t.starts_with("pr:") => {
+                    self.pr_ix = PRS
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(&t[3..]))
+                        .unwrap_or(0);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        if !saw_growth {
+            self.size_ix = 0;
+        }
+    }
+
+    pub fn up(&mut self) {
+        self.field = self.field.saturating_sub(1);
+    }
+    pub fn down(&mut self) {
+        self.field = (self.field + 1).min(FIELDS.len() - 1);
+    }
+
+    /// The project choices narrowed by the type-to-narrow buffer; index 0
+    /// is always "any".
+    pub fn project_choices(&self) -> Vec<String> {
+        let q = self.project_query.to_ascii_lowercase();
+        let mut v = vec!["any".to_string()];
+        v.extend(
+            self.projects
+                .iter()
+                .filter(|p| q.is_empty() || p.to_ascii_lowercase().contains(&q))
+                .cloned(),
+        );
+        v
+    }
+
+    pub fn cycle(&mut self, delta: i32) {
+        fn step(ix: usize, len: usize, delta: i32) -> usize {
+            ((ix as i32 + delta).rem_euclid(len as i32)) as usize
+        }
+        match self.field {
+            0 => {
+                // growth: cycle size; when size is off the op/window are moot
+                self.size_ix = step(self.size_ix, SIZES.len(), delta);
+            }
+            1 => self.kind_ix = step(self.kind_ix, KINDS.len(), delta),
+            2 => {
+                let n = self.project_choices().len();
+                self.project_ix = step(self.project_ix, n, delta);
+            }
+            3 => self.idle_ix = step(self.idle_ix, IDLES.len(), delta),
+            4 => self.merge_complete = !self.merge_complete,
+            5 => self.pr_ix = step(self.pr_ix, PRS.len(), delta),
+            _ => {}
+        }
+    }
+
+    /// Secondary cycle on the growth field: op (>/<) and window.
+    pub fn cycle_secondary(&mut self, delta: i32) {
+        if self.field == 0 {
+            if delta > 0 {
+                self.window_ix = (self.window_ix + 1) % WINDOWS.len();
+            } else {
+                self.growth_gt = !self.growth_gt;
+            }
+        }
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        if self.field == 2 {
+            self.project_query.push(c);
+            self.project_ix = if self.project_choices().len() > 1 {
+                1
+            } else {
+                0
+            };
+        }
+    }
+    pub fn backspace(&mut self) {
+        if self.field == 2 {
+            self.project_query.pop();
+            self.project_ix = 0;
+        }
+    }
+
+    /// The filter line this form composes. `0` when everything is off.
+    pub fn compose(&self) -> String {
+        let mut parts = Vec::new();
+        if self.size_ix > 0 {
+            parts.push(format!(
+                "growth {} {} in {}",
+                if self.growth_gt { ">" } else { "<" },
+                SIZES[self.size_ix],
+                WINDOWS[self.window_ix]
+            ));
+        }
+        if self.kind_ix > 0 {
+            let k = match KINDS[self.kind_ix] {
+                "build" => "BuildOutput",
+                "deps" => "DependencyTree",
+                "cache" => "Cache",
+                "git" => "Git",
+                "source" => "Source",
+                "docker" => "DockerImage",
+                other => other,
+            };
+            parts.push(format!("kind:{k}"));
+        }
+        let choices = self.project_choices();
+        if self.project_ix > 0 && self.project_ix < choices.len() {
+            parts.push(format!("project:{}", choices[self.project_ix]));
+        }
+        if self.idle_ix > 0 {
+            parts.push(format!("idle > {}", IDLES[self.idle_ix]));
+        }
+        if self.merge_complete {
+            parts.push("merge-complete".into());
+        }
+        if self.pr_ix > 0 {
+            parts.push(format!("pr:{}", PRS[self.pr_ix]));
+        }
+        if parts.is_empty() {
+            "0".into()
+        } else {
+            parts.join(" ")
+        }
+    }
+
+    /// Rendered field lines for the form.
+    pub fn lines(&self) -> Vec<(String, String, bool)> {
+        let growth = if self.size_ix == 0 {
+            "off".to_string()
+        } else {
+            format!(
+                "{} {} in {}   (←→ size · ⇧→ window · ⇧← flip)",
+                if self.growth_gt { ">" } else { "<" },
+                SIZES[self.size_ix],
+                WINDOWS[self.window_ix]
+            )
+        };
+        let choices = self.project_choices();
+        let project = if self.project_query.is_empty() {
+            choices
+                .get(self.project_ix)
+                .cloned()
+                .unwrap_or_else(|| "any".into())
+        } else {
+            format!(
+                "{}   (typing: {}▏ {} match{})",
+                choices
+                    .get(self.project_ix)
+                    .cloned()
+                    .unwrap_or_else(|| "any".into()),
+                self.project_query,
+                choices.len().saturating_sub(1),
+                if choices.len() == 2 { "" } else { "es" }
+            )
+        };
+        vec![
+            ("growth".into(), growth, self.field == 0),
+            ("kind".into(), KINDS[self.kind_ix].into(), self.field == 1),
+            ("project".into(), project, self.field == 2),
+            ("idle".into(), IDLES[self.idle_ix].into(), self.field == 3),
+            (
+                "merge-complete".into(),
+                if self.merge_complete { "on" } else { "off" }.into(),
+                self.field == 4,
+            ),
+            ("pr".into(), PRS[self.pr_ix].into(), self.field == 5),
+        ]
+    }
+}
+
+/// Tab completion for the raw filter line: completes the last token
+/// against keywords, kinds, project names, sizes and durations.
+pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
+    let trimmed = text.trim_end();
+    let ends_space = text.ends_with(' ') || text.is_empty();
+    let last = if ends_space {
+        ""
+    } else {
+        trimmed.rsplit(' ').next().unwrap_or("")
+    };
+    let mut cands: Vec<String> = Vec::new();
+    if let Some(k) = last.strip_prefix("kind:") {
+        cands.extend(
+            [
+                "BuildOutput",
+                "DependencyTree",
+                "Cache",
+                "Git",
+                "Source",
+                "DockerImage",
+                "DockerBuildCache",
+                "DockerVolume",
+            ]
+            .iter()
+            .filter(|x| x.to_ascii_lowercase().starts_with(&k.to_ascii_lowercase()))
+            .map(|x| format!("kind:{x}")),
+        );
+    } else if let Some(p) = last.strip_prefix("project:") {
+        cands.extend(
+            projects
+                .iter()
+                .filter(|x| x.to_ascii_lowercase().starts_with(&p.to_ascii_lowercase()))
+                .map(|x| format!("project:{x}")),
+        );
+    } else if let Some(p) = last.strip_prefix("pr:") {
+        cands.extend(
+            PRS[1..]
+                .iter()
+                .filter(|x| x.starts_with(p))
+                .map(|x| format!("pr:{x}")),
+        );
+    } else {
+        // Context is the tokens *before* the partial one being completed.
+        let mut prev: Vec<&str> = trimmed.split_whitespace().collect();
+        if !ends_space {
+            prev.pop();
+        }
+        let after = |n: usize| prev.len() >= n;
+        // contextual: after "growth >" expect a size; after "in" or "idle >" a duration
+        if after(2) && prev[prev.len() - 1] == "in"
+            || (after(2) && prev[prev.len() - 2] == "idle" && prev[prev.len() - 1] == ">")
+        {
+            cands.extend(
+                WINDOWS
+                    .iter()
+                    .chain(IDLES[1..].iter())
+                    .filter(|x| x.starts_with(last))
+                    .map(|x| x.to_string()),
+            );
+        } else if after(2)
+            && prev[prev.len() - 2] == "growth"
+            && (prev[prev.len() - 1] == ">" || prev[prev.len() - 1] == "<")
+        {
+            cands.extend(
+                SIZES[1..]
+                    .iter()
+                    .filter(|x| {
+                        x.to_ascii_lowercase()
+                            .starts_with(&last.to_ascii_lowercase())
+                    })
+                    .map(|x| x.to_string()),
+            );
+        } else {
+            cands.extend(
+                [
+                    "growth > ",
+                    "kind:",
+                    "project:",
+                    "idle > ",
+                    "merge-complete",
+                    "pr:",
+                ]
+                .iter()
+                .filter(|x| x.starts_with(last))
+                .map(|x| x.to_string()),
+            );
+        }
+    }
+    cands.sort();
+    cands.dedup();
+    cands
+}
+
+/// Applies the single completion (or the shared prefix of several) to the
+/// text's last token. Returns the new text and the remaining candidates.
+pub fn apply_completion(text: &str, projects: &[String]) -> (String, Vec<String>) {
+    let cands = complete(text, projects);
+    if cands.is_empty() {
+        return (text.to_string(), cands);
+    }
+    let ends_space = text.ends_with(' ') || text.is_empty();
+    let head = if ends_space {
+        text.to_string()
+    } else {
+        match text.rfind(' ') {
+            Some(i) => text[..=i].to_string(),
+            None => String::new(),
+        }
+    };
+    let fill = if cands.len() == 1 {
+        cands[0].clone()
+    } else {
+        // longest common prefix
+        let mut pre = cands[0].clone();
+        for c in &cands[1..] {
+            while !c.starts_with(&pre) {
+                pre.pop();
+            }
+        }
+        pre
+    };
+    (format!("{head}{fill}"), cands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_round_trips_through_the_core_parser() {
+        let mut p = Picker {
+            field: 0,
+            growth_gt: true,
+            size_ix: 4,
+            window_ix: 1,
+            kind_ix: 1,
+            project_ix: 1,
+            project_query: String::new(),
+            idle_ix: 2,
+            merge_complete: true,
+            pr_ix: 1,
+            projects: vec!["mole".into(), "roon-knob".into()],
+        };
+        let text = p.compose();
+        assert_eq!(
+            text,
+            "growth > 100MB in 7d kind:BuildOutput project:mole idle > 48h merge-complete pr:open"
+        );
+        assert!(slop_livin_core::filter::parse(&text).is_ok());
+        p.size_ix = 0;
+        p.kind_ix = 0;
+        p.project_ix = 0;
+        p.idle_ix = 0;
+        p.merge_complete = false;
+        p.pr_ix = 0;
+        assert_eq!(p.compose(), "0");
+    }
+
+    #[test]
+    fn seeds_from_current_text() {
+        let report = slop_livin_core::Report {
+            observed_at: 0,
+            root: "/r".into(),
+            projects: vec![],
+            unowned: vec![],
+            reconciliation: slop_livin_core::report::Reconciliation {
+                attributed: 0,
+                unowned: 0,
+                walked_total: 0,
+                du_total: None,
+                docker_attributed: 0,
+                docker_unowned: 0,
+            },
+            notes: vec![],
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+            github_enrichment: None,
+        };
+        let p = Picker::from_report(&report, "growth < 1GB in 30d idle > 7d merge-complete");
+        assert!(!p.growth_gt);
+        assert_eq!(SIZES[p.size_ix], "1GB");
+        assert_eq!(WINDOWS[p.window_ix], "30d");
+        assert_eq!(IDLES[p.idle_ix], "7d");
+        assert!(p.merge_complete);
+        let p0 = Picker::from_report(&report, "0");
+        assert_eq!(p0.compose(), "0");
+    }
+
+    #[test]
+    fn tab_completion_is_contextual() {
+        let projects = vec![
+            "mole".to_string(),
+            "memex".to_string(),
+            "hiphi-cloud".to_string(),
+        ];
+        let (t, c) = apply_completion("gr", &projects);
+        assert_eq!(t, "growth > ");
+        assert_eq!(c.len(), 1);
+        let (t, _) = apply_completion("growth > 1", &projects);
+        assert!(t.starts_with("growth > 1"));
+        let (t, c) = apply_completion("project:m", &projects);
+        assert_eq!(c.len(), 2);
+        assert_eq!(t, "project:m");
+        let (t, _) = apply_completion("project:mo", &projects);
+        assert_eq!(t, "project:mole");
+        let (t, _) = apply_completion("growth > 100MB in ", &projects);
+        assert_eq!(t, "growth > 100MB in ");
+        let (_, c) = apply_completion("growth > 100MB in 7", &projects);
+        assert!(c.contains(&"7d".to_string()));
+    }
+}
