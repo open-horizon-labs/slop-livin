@@ -13,12 +13,18 @@ use std::time::{Duration, Instant};
 
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 
+/// Same view set the CLI's `--view` exposes at root (`worktrees` there
+/// is `Projects` here: one row per project, same aggregation), plus
+/// `Tree`, the per-project drill-down `--project` renders (#33). `v`
+/// cycles this exact order on both surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewKind {
     Projects,
     Tree,
-    Kinds,
+    Builds,
+    Deps,
     Docker,
+    Kinds,
     Unowned,
 }
 
@@ -27,18 +33,22 @@ impl ViewKind {
         Some(match d {
             '1' => ViewKind::Projects,
             '2' => ViewKind::Tree,
-            '3' => ViewKind::Kinds,
-            '4' => ViewKind::Docker,
-            '5' => ViewKind::Unowned,
+            '3' => ViewKind::Builds,
+            '4' => ViewKind::Deps,
+            '5' => ViewKind::Docker,
+            '6' => ViewKind::Kinds,
+            '7' => ViewKind::Unowned,
             _ => return None,
         })
     }
     pub fn next(self) -> Self {
         match self {
             ViewKind::Projects => ViewKind::Tree,
-            ViewKind::Tree => ViewKind::Kinds,
-            ViewKind::Kinds => ViewKind::Docker,
-            ViewKind::Docker => ViewKind::Unowned,
+            ViewKind::Tree => ViewKind::Builds,
+            ViewKind::Builds => ViewKind::Deps,
+            ViewKind::Deps => ViewKind::Docker,
+            ViewKind::Docker => ViewKind::Kinds,
+            ViewKind::Kinds => ViewKind::Unowned,
             ViewKind::Unowned => ViewKind::Projects,
         }
     }
@@ -46,6 +56,8 @@ impl ViewKind {
         match self {
             ViewKind::Projects => "projects",
             ViewKind::Tree => "tree",
+            ViewKind::Builds => "builds",
+            ViewKind::Deps => "deps",
             ViewKind::Kinds => "kinds",
             ViewKind::Docker => "docker",
             ViewKind::Unowned => "unowned",
@@ -123,6 +135,8 @@ impl App {
                     None => Vec::new(),
                 };
             }
+            ViewKind::Builds => model::builds_rows(&self.report),
+            ViewKind::Deps => model::deps_rows(&self.report),
             ViewKind::Kinds => model::kinds_rows(&self.report, &self.filter),
             ViewKind::Docker => model::docker_rows(&self.report),
             ViewKind::Unowned => model::unowned_rows(&self.report),
@@ -263,6 +277,21 @@ impl App {
             self.set_refusal("not a unit: nothing here can be marked");
             return;
         };
+        // Docker rows are markable in principle (folded units, same as a
+        // dependency tree or build output), but there is no daemon-side
+        // sink recheck yet to safely re-verify a Docker object right
+        // before deletion the way the filesystem action layer does for a
+        // path. Refuse with a specific, honest reason instead of
+        // pretending the mark will do anything (#33).
+        if matches!(
+            kind,
+            slop_livin_core::report::ArtifactKind::DockerImage
+                | slop_livin_core::report::ArtifactKind::DockerBuildCache
+                | slop_livin_core::report::ArtifactKind::DockerVolume
+        ) {
+            self.set_refusal("docker removal not available yet");
+            return;
+        }
         match markable(&kind) {
             Ok(()) => {
                 if self.marked.remove(&unit_id.0).is_none() {
@@ -426,6 +455,10 @@ mod tests {
                             confidence: Confidence::High,
                             source: Source::new("test"),
                             note: None,
+                            created_at: None,
+                            containers: Vec::new(),
+                            shared_with: Vec::new(),
+                            dangling: false,
                         },
                         ArtifactRow {
                             kind: ArtifactKind::Source,
@@ -437,6 +470,10 @@ mod tests {
                             confidence: Confidence::High,
                             source: Source::new("test"),
                             note: None,
+                            created_at: None,
+                            containers: Vec::new(),
+                            shared_with: Vec::new(),
+                            dangling: false,
                         },
                     ],
                     signals: vec![],
@@ -520,7 +557,15 @@ mod tests {
     #[test]
     fn view_cycles_and_digit_keys() {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
-        assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Kinds));
+        assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Builds));
+        assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
         assert_eq!(ViewKind::from_digit('9'), None);
+        // Full cycle returns to Projects, matching the CLI's view order:
+        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned.
+        let mut v = ViewKind::Projects;
+        for _ in 0..7 {
+            v = v.next();
+        }
+        assert_eq!(v, ViewKind::Projects);
     }
 }

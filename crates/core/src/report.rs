@@ -102,6 +102,16 @@ pub struct ArtifactRow {
     /// contain a compose file naming the same project.
     #[serde(default)]
     pub note: Option<String>,
+    /// Docker detail (#33), set only for a joined Docker row. See the
+    /// matching fields on [`UnownedRow`].
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub containers: Vec<String>,
+    #[serde(default)]
+    pub shared_with: Vec<String>,
+    #[serde(default)]
+    pub dangling: bool,
 }
 
 /// R4c: one directory's rollup inside a worktree's `Source` tree.
@@ -216,6 +226,22 @@ pub struct UnownedRow {
     /// hundreds of unjoined build-cache entries).
     #[serde(default)]
     pub docker_kind: Option<String>,
+    /// Docker detail (#33), set only for a Docker row: creation
+    /// timestamp (image `CreatedAt`/volume inspect `CreatedAt`).
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Containers referencing this image/volume, formatted `"name
+    /// (state[, finished <finished_at>])"`. Facts only, never a verdict
+    /// about whether the object is safe to remove.
+    #[serde(default)]
+    pub containers: Vec<String>,
+    /// Other image references sharing >=1 layer digest with this image;
+    /// empty for volumes/build-cache.
+    #[serde(default)]
+    pub shared_with: Vec<String>,
+    /// True for an image with no `RepoTags` at all.
+    #[serde(default)]
+    pub dangling: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -980,6 +1006,10 @@ struct JoinCandidate {
     unique_bytes: u64,
     shared_bytes: u64,
     kind: ArtifactKind,
+    created_at: Option<String>,
+    containers: Vec<String>,
+    shared_with: Vec<String>,
+    dangling: bool,
 }
 
 enum JoinOutcome {
@@ -1200,6 +1230,16 @@ fn join_docker_facts(
         unowned_bytes: 0,
     };
 
+    let mut cache_notes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    fn format_container(c: &crate::docker::ContainerRef) -> String {
+        match &c.finished_at {
+            Some(finished) => format!("{} ({}, finished {finished})", c.name, c.state),
+            None => format!("{} ({})", c.name, c.state),
+        }
+    }
+
     let mut candidates: Vec<JoinCandidate> = Vec::new();
     for image in &facts.images {
         candidates.push(JoinCandidate {
@@ -1212,16 +1252,38 @@ fn join_docker_facts(
             unique_bytes: image.unique_bytes,
             shared_bytes: image.shared_bytes,
             kind: ArtifactKind::DockerImage,
+            created_at: image.created_at.clone(),
+            containers: image.containers.iter().map(format_container).collect(),
+            shared_with: image.shared_with.clone(),
+            dangling: image.dangling,
         });
     }
     for cache in &facts.build_cache {
+        let mut cache_note_bits = Vec::new();
+        if let Some(last_used) = &cache.last_used {
+            cache_note_bits.push(format!("last_used={last_used}"));
+        }
+        if let Some(count) = cache.usage_count {
+            cache_note_bits.push(format!("usage_count={count}"));
+        }
+        cache_note_bits.push(format!("in_use={}", cache.in_use));
+        cache_note_bits.push(format!("shared={}", cache.shared));
         candidates.push(JoinCandidate {
             reference: cache.id.clone(),
             labels: std::collections::HashMap::new(),
             unique_bytes: cache.bytes,
             shared_bytes: 0,
             kind: ArtifactKind::DockerBuildCache,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
         });
+        // Build-cache detail has no per-object join label to carry it on,
+        // so it rides along as a note on the candidate's eventual row
+        // instead of a dedicated field -- see the push sites below, which
+        // attach `cache_note_bits` via a side table keyed by reference.
+        cache_notes.insert(cache.id.clone(), cache_note_bits.join(", "));
     }
     for volume in &facts.volumes {
         candidates.push(JoinCandidate {
@@ -1230,6 +1292,10 @@ fn join_docker_facts(
             unique_bytes: volume.bytes,
             shared_bytes: 0,
             kind: ArtifactKind::DockerVolume,
+            created_at: volume.created_at.clone(),
+            containers: volume.containers.iter().map(format_container).collect(),
+            shared_with: Vec::new(),
+            dangling: false,
         });
     }
 
@@ -1254,6 +1320,12 @@ fn join_docker_facts(
                 } else {
                     Source::new("docker.system_df")
                 };
+                let note = match (note, cache_notes.get(&candidate.reference)) {
+                    (Some(n), Some(cache_note)) => Some(format!("{n}, {cache_note}")),
+                    (Some(n), None) => Some(n),
+                    (None, Some(cache_note)) => Some(cache_note.clone()),
+                    (None, None) => None,
+                };
                 result
                     .rows_by_worktree
                     .entry(worktree_id)
@@ -1268,6 +1340,10 @@ fn join_docker_facts(
                         confidence,
                         source,
                         note,
+                        created_at: candidate.created_at,
+                        containers: candidate.containers,
+                        shared_with: candidate.shared_with,
+                        dangling: candidate.dangling,
                     });
             }
             JoinOutcome::Unowned { note } => {
@@ -1277,6 +1353,12 @@ fn join_docker_facts(
                     ArtifactKind::DockerVolume => "volume",
                     _ => "unknown",
                 };
+                let note = match (note, cache_notes.get(&candidate.reference)) {
+                    (Some(n), Some(cache_note)) => Some(format!("{n}, {cache_note}")),
+                    (Some(n), None) => Some(n),
+                    (None, Some(cache_note)) => Some(cache_note.clone()),
+                    (None, None) => None,
+                };
                 result.unowned_bytes += candidate.unique_bytes;
                 result.unowned.push(UnownedRow {
                     path_or_object: candidate.reference,
@@ -1285,6 +1367,10 @@ fn join_docker_facts(
                     shared_bytes: Some(candidate.shared_bytes),
                     note,
                     docker_kind: Some(docker_kind.to_string()),
+                    created_at: candidate.created_at,
+                    containers: candidate.containers,
+                    shared_with: candidate.shared_with,
+                    dangling: candidate.dangling,
                 });
             }
         }

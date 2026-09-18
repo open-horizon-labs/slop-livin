@@ -4,6 +4,18 @@
 //! daemon. The daemon is never allowed to hang or fail the report: an
 //! unreachable/slow/erroring daemon becomes `DockerFacts::unavailable`,
 //! never an `Err`.
+//!
+//! Beyond object identity/sizes, this module extracts the per-object
+//! detail #33 asks for: `created_at`, compose service (read straight off
+//! the object's own labels, no separate field needed), layer digests ->
+//! `shared_with` (other images sharing >=1 layer), containers
+//! referencing an image/volume (name, state, finished_at) from `docker
+//! ps -a --format json` plus a batched `docker inspect` for the
+//! container detail `ps` doesn't carry, a dangling flag, and build-cache
+//! `last_used`/`usage_count`/`in_use`/`shared`. Every additional call
+//! uses the same bounded timeout and best-effort-only failure policy as
+//! the existing image-inspect call: a failure there degrades that one
+//! piece of detail, never the whole report.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -14,6 +26,17 @@ use std::time::Duration;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One container's reference to an image or volume, as shown on that
+/// object's row. Never a verdict: "state" and "finished_at" are facts
+/// ("exited"/"running"/... and a timestamp or `None`), not a judgment
+/// about whether the object is safe to remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerRef {
+    pub name: String,
+    pub state: String,
+    pub finished_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DockerImageFact {
     pub id: String,
@@ -21,12 +44,29 @@ pub struct DockerImageFact {
     pub labels: HashMap<String, String>,
     pub shared_bytes: u64,
     pub unique_bytes: u64,
+    pub created_at: Option<String>,
+    /// `RootFS.Layers` digests from `docker image inspect`; empty when
+    /// inspect failed/timed out or the image has none recorded.
+    pub layers: Vec<String>,
+    /// Other images' references (repo:tag, or id when untagged) sharing
+    /// at least one layer digest with this one. Computed once every
+    /// image's layers are known; never includes this image itself.
+    pub shared_with: Vec<String>,
+    pub containers: Vec<ContainerRef>,
+    /// No `RepoTags` at all (a build stage's intermediate image, or the
+    /// previous image behind a moved tag) -- a fact read straight off
+    /// the object, not an inference.
+    pub dangling: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DockerCacheFact {
     pub id: String,
     pub bytes: u64,
+    pub last_used: Option<String>,
+    pub usage_count: Option<u64>,
+    pub in_use: bool,
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -34,6 +74,9 @@ pub struct DockerVolumeFact {
     pub name: String,
     pub labels: HashMap<String, String>,
     pub bytes: u64,
+    pub created_at: Option<String>,
+    pub driver: Option<String>,
+    pub containers: Vec<ContainerRef>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,8 +89,30 @@ pub struct DockerFacts {
     pub unavailable: Option<String>,
 }
 
+/// One container as read from `docker ps -a --format json` plus a
+/// best-effort `docker inspect` for the fields `ps` doesn't carry
+/// (precise `FinishedAt`, volume mount names). Not part of the public
+/// `DockerFacts` shape -- it exists only to drive `containers` on the
+/// image/volume facts above.
+#[derive(Debug, Clone, Default)]
+struct ContainerFact {
+    name: String,
+    /// The `Image` field from `ps`: usually `repo:tag`, sometimes a bare
+    /// image id -- matched against both on the image side.
+    image_ref: String,
+    state: String,
+    finished_at: Option<String>,
+    /// Volume names this container mounts (from `docker inspect`'s
+    /// `Mounts[].Name`, `Type == "volume"` only).
+    volume_names: Vec<String>,
+}
+
 fn value_str(v: &serde_json::Value) -> String {
     v.as_str().map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn opt_value_str(v: &serde_json::Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
 /// Parses a comma-joined `k=v,k=v` label string, the shape both the
@@ -109,8 +174,8 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
             } else {
                 let repo = image.get("Repository").map(value_str).unwrap_or_default();
                 let tag = image.get("Tag").map(value_str).unwrap_or_default();
-                if !repo.is_empty() {
-                    repo_tags.push(if tag.is_empty() {
+                if !repo.is_empty() && repo != "<none>" {
+                    repo_tags.push(if tag.is_empty() || tag == "<none>" {
                         repo
                     } else {
                         format!("{repo}:{tag}")
@@ -134,12 +199,19 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
                         .map(|s| parse_size(&s))
                         .unwrap_or(0)
                 });
+            let created_at = image.get("CreatedAt").and_then(opt_value_str);
+            let dangling = repo_tags.is_empty();
             facts.images.push(DockerImageFact {
                 id,
                 repo_tags,
                 labels,
                 shared_bytes,
                 unique_bytes,
+                created_at,
+                layers: Vec::new(),
+                shared_with: Vec::new(),
+                containers: Vec::new(),
+                dangling,
             });
         }
     }
@@ -152,7 +224,27 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
                 .map(value_str)
                 .map(|s| parse_size(&s))
                 .unwrap_or(0);
-            facts.build_cache.push(DockerCacheFact { id, bytes });
+            let last_used = entry.get("LastUsedAt").and_then(opt_value_str);
+            let usage_count = entry.get("UsageCount").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            });
+            let in_use = entry
+                .get("InUse")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let shared = entry
+                .get("Shared")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            facts.build_cache.push(DockerCacheFact {
+                id,
+                bytes,
+                last_used,
+                usage_count,
+                in_use,
+                shared,
+            });
         }
     }
 
@@ -169,10 +261,15 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
                 .map(value_str)
                 .map(|s| parse_size(&s))
                 .unwrap_or(0);
+            let driver = entry.get("Driver").and_then(opt_value_str);
+            let created_at = entry.get("CreatedAt").and_then(opt_value_str);
             facts.volumes.push(DockerVolumeFact {
                 name,
                 labels,
                 bytes,
+                created_at,
+                driver,
+                containers: Vec::new(),
             });
         }
     }
@@ -181,6 +278,17 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
         merge_image_inspect(&mut facts.images, entries);
     }
 
+    if let Some(entries) = value.get("VolumeInspect").and_then(|v| v.as_array()) {
+        merge_volume_inspect(&mut facts.volumes, entries);
+    }
+
+    if let Some(entries) = value.get("Containers").and_then(|v| v.as_array()) {
+        let containers: Vec<ContainerFact> = entries.iter().map(parse_container_inspect).collect();
+        join_containers(&mut facts, &containers);
+    }
+
+    compute_shared_with(&mut facts.images);
+
     facts
 }
 
@@ -188,9 +296,10 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
 /// all (confirmed against a live daemon: its image objects have exactly
 /// `[Containers, CreatedAt, CreatedSince, Digest, ID, Repository,
 /// SharedSize, Size, Tag, UniqueSize]`). Labels only exist in `docker
-/// image inspect` output, under `Config.Labels`. This merges an
-/// `ImageInspect`-shaped array (`[{"Id"|"ID", "RepoTags", "Config":
-/// {"Labels": {...}}}, ...]`, the same shape `docker image inspect
+/// image inspect` output, under `Config.Labels`; layer digests live
+/// under `RootFS.Layers`. This merges an `ImageInspect`-shaped array
+/// (`[{"Id"|"ID", "RepoTags", "Config": {"Labels": {...}}, "RootFS":
+/// {"Layers": [...]}}, ...]`, the same shape `docker image inspect
 /// --format json` returns) into the df-sourced image facts, matching by
 /// image ID first and falling back to a shared repo:tag.
 fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_json::Value]) {
@@ -210,9 +319,17 @@ fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_
                     .collect()
             })
             .unwrap_or_default();
-        if labels.is_empty() {
-            continue;
-        }
+        let layers: Vec<String> = entry
+            .get("RootFS")
+            .and_then(|r| r.get("Layers"))
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| d.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         let inspect_tags: Vec<String> = entry
             .get("RepoTags")
             .and_then(|v| v.as_array())
@@ -224,13 +341,155 @@ fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_
             })
             .unwrap_or_default();
 
+        if labels.is_empty() && layers.is_empty() {
+            continue;
+        }
+
         for image in images.iter_mut() {
             let matches = (!id.is_empty() && image.id == id)
                 || image.repo_tags.iter().any(|t| inspect_tags.contains(t));
             if matches {
                 image.labels.extend(labels.clone());
+                if image.layers.is_empty() {
+                    image.layers = layers.clone();
+                }
             }
         }
+    }
+}
+
+/// Merges `docker volume inspect --format json` output (`[{"Name",
+/// "CreatedAt", "Driver"}, ...]`) into the df-sourced volume facts, by
+/// name.
+fn merge_volume_inspect(volumes: &mut [DockerVolumeFact], inspect_entries: &[serde_json::Value]) {
+    for entry in inspect_entries {
+        let name = entry.get("Name").map(value_str).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let created_at = entry.get("CreatedAt").and_then(opt_value_str);
+        let driver = entry.get("Driver").and_then(opt_value_str);
+        for volume in volumes.iter_mut() {
+            if volume.name == name {
+                if volume.created_at.is_none() {
+                    volume.created_at = created_at.clone();
+                }
+                if volume.driver.is_none() {
+                    volume.driver = driver.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Parses one `docker inspect` entry that is a container (has a `State`
+/// object): name (leading `/` stripped, matching `docker ps`'s bare
+/// name), image reference, state, precise `FinishedAt` (empty/zero-value
+/// == never finished / still running, normalized to `None`), and the
+/// volume names among its mounts.
+fn parse_container_inspect(entry: &serde_json::Value) -> ContainerFact {
+    let name = entry
+        .get("Name")
+        .map(value_str)
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let image_ref = entry
+        .get("Config")
+        .and_then(|c| c.get("Image"))
+        .map(value_str)
+        .or_else(|| entry.get("Image").map(value_str))
+        .unwrap_or_default();
+    let state = entry
+        .get("State")
+        .and_then(|s| s.get("Status"))
+        .map(value_str)
+        .unwrap_or_default();
+    let finished_at = entry
+        .get("State")
+        .and_then(|s| s.get("FinishedAt"))
+        .and_then(opt_value_str)
+        .filter(|s| !s.starts_with("0001-01-01"));
+    let volume_names: Vec<String> = entry
+        .get("Mounts")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| m.get("Type").and_then(|t| t.as_str()) == Some("volume"))
+                .filter_map(|m| m.get("Name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    ContainerFact {
+        name,
+        image_ref,
+        state,
+        finished_at,
+        volume_names,
+    }
+}
+
+/// Attaches each container as a [`ContainerRef`] to every image and
+/// volume it references. An image match is by repo:tag or bare id
+/// (docker ps's `Image` field is inconsistently one or the other
+/// depending on whether the tag still exists); a volume match is by
+/// name.
+fn join_containers(facts: &mut DockerFacts, containers: &[ContainerFact]) {
+    for c in containers {
+        let container_ref = ContainerRef {
+            name: c.name.clone(),
+            state: c.state.clone(),
+            finished_at: c.finished_at.clone(),
+        };
+        for image in facts.images.iter_mut() {
+            let matches = image.repo_tags.iter().any(|t| t == &c.image_ref)
+                || image.id == c.image_ref
+                || image
+                    .id
+                    .trim_start_matches("sha256:")
+                    .starts_with(&c.image_ref);
+            if matches {
+                image.containers.push(container_ref.clone());
+            }
+        }
+        for vol_name in &c.volume_names {
+            for volume in facts.volumes.iter_mut() {
+                if &volume.name == vol_name {
+                    volume.containers.push(container_ref.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Fills `shared_with` on every image whose layer set overlaps another
+/// image's: an O(n^2) comparison over layer digest sets, fine at the
+/// scale a single machine's `docker system df` returns (low hundreds of
+/// images at most).
+fn compute_shared_with(images: &mut [DockerImageFact]) {
+    let refs: Vec<(String, std::collections::HashSet<String>)> = images
+        .iter()
+        .map(|i| {
+            let name = i.repo_tags.first().cloned().unwrap_or_else(|| i.id.clone());
+            (name, i.layers.iter().cloned().collect())
+        })
+        .collect();
+    for (idx, image) in images.iter_mut().enumerate() {
+        if image.layers.is_empty() {
+            continue;
+        }
+        let own_layers: std::collections::HashSet<String> = image.layers.iter().cloned().collect();
+        let mut shared_with = Vec::new();
+        for (other_idx, (other_name, other_layers)) in refs.iter().enumerate() {
+            if other_idx == idx || other_layers.is_empty() {
+                continue;
+            }
+            if own_layers.intersection(other_layers).next().is_some() {
+                shared_with.push(other_name.clone());
+            }
+        }
+        shared_with.sort();
+        image.shared_with = shared_with;
     }
 }
 
@@ -238,6 +497,10 @@ fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_
 /// by `timeout`. Returns `Err(reason)` on any failure (missing binary,
 /// non-zero exit, timeout, bad JSON) -- the caller decides whether that
 /// failure is fatal to the whole report or just means "no enrichment".
+/// Docker's `--format json` on a list subcommand (`ps`, sometimes
+/// others) emits newline-delimited JSON objects rather than one array,
+/// so on a whole-output parse failure this also retries as NDJSON,
+/// wrapping the parsed lines in a `Value::Array`.
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
     let mut child = Command::new("docker")
         .args(args)
@@ -278,8 +541,18 @@ fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value
         return Err("docker: unavailable (daemon not responding)".to_string());
     }
     let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    serde_json::from_str::<serde_json::Value>(&stdout)
-        .map_err(|e| format!("docker: unavailable (bad output: {e})"))
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        return Ok(v);
+    }
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if !lines.is_empty() {
+        return Ok(serde_json::Value::Array(lines));
+    }
+    Err("docker: unavailable (bad output)".to_string())
 }
 
 /// Loads Docker facts either from a mocked facts file (tests, or the
@@ -313,18 +586,23 @@ fn load_from_file(path: &Path) -> DockerFacts {
     }
 }
 
-/// `docker system df -v` never carries image labels (verified against a
-/// live daemon), so a live load is two calls: the df call for object
-/// identity/sizes, then a batched `docker image inspect <ids> --format
-/// json` for the labels df doesn't have. Volume labels *are* present in
-/// `docker system df -v` output already (also verified live), so no
-/// separate `docker volume inspect` call is needed for them. Build-cache
-/// entries have no label source at all and stay `DockerNoJoin`.
+/// `docker system df -v` never carries image labels or layer digests
+/// (verified against a live daemon), so a live load layers three more
+/// best-effort calls on top of the df call for object identity/sizes:
 ///
-/// The inspect call is best-effort: if it fails or times out, images
-/// simply keep whatever (empty) labels df gave them -- join falls
-/// through to `DockerNoJoin` for those, which is the honest answer, not
-/// a fatal error for the whole report.
+/// 1. a batched `docker image inspect <ids> --format json` for labels
+///    and `RootFS.Layers` (used for `shared_with`);
+/// 2. a batched `docker volume inspect <names> --format json` for
+///    volume `CreatedAt` (df's `Driver` is already enough on its own,
+///    but `CreatedAt` is inspect-only);
+/// 3. `docker ps -a --format json` for the container list, then a
+///    batched `docker inspect <container ids> --format json` for the
+///    precise `FinishedAt` and volume mount names `ps` doesn't carry.
+///
+/// Each of these is best-effort: a failure or timeout leaves that one
+/// piece of detail unset rather than failing the whole report -- df's
+/// object identity/sizes already succeeded, so the report still
+/// reconciles.
 fn load_live() -> DockerFacts {
     let df_value =
         match run_docker_json(&["system", "df", "-v", "--format", "json"], DOCKER_TIMEOUT) {
@@ -353,12 +631,43 @@ fn load_live() -> DockerFacts {
         {
             merge_image_inspect(&mut facts.images, entries);
         }
-        // A failed/timed-out inspect call is not surfaced as
-        // `unavailable`: the df call (object identity, sizes) already
-        // succeeded, so the report still reconciles; the affected images
-        // just carry no labels and land as `DockerNoJoin`, same as any
-        // other image with no join evidence.
     }
+
+    let volume_names: Vec<&str> = facts.volumes.iter().map(|v| v.name.as_str()).collect();
+    if !volume_names.is_empty() {
+        let mut args: Vec<&str> = vec!["volume", "inspect"];
+        args.extend(volume_names);
+        args.extend(["--format", "json"]);
+        if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
+            && let Some(entries) = inspect_value.as_array()
+        {
+            merge_volume_inspect(&mut facts.volumes, entries);
+        }
+    }
+
+    if let Ok(ps_value) = run_docker_json(&["ps", "-a", "--format", "json"], DOCKER_TIMEOUT)
+        && let Some(rows) = ps_value.as_array()
+    {
+        let container_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("ID").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        if !container_ids.is_empty() {
+            let id_refs: Vec<&str> = container_ids.iter().map(String::as_str).collect();
+            let mut args: Vec<&str> = vec!["inspect"];
+            args.extend(id_refs);
+            args.extend(["--format", "json"]);
+            if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
+                && let Some(entries) = inspect_value.as_array()
+            {
+                let containers: Vec<ContainerFact> =
+                    entries.iter().map(parse_container_inspect).collect();
+                join_containers(&mut facts, &containers);
+            }
+        }
+    }
+
+    compute_shared_with(&mut facts.images);
 
     facts
 }
@@ -380,5 +689,84 @@ mod tests {
         let facts = load_from_file(Path::new("/nonexistent/does-not-exist.json"));
         assert!(facts.unavailable.is_some());
         assert!(facts.images.is_empty());
+    }
+
+    #[test]
+    fn dangling_image_has_no_repo_tags() {
+        let value = serde_json::json!({
+            "Images": [
+                {"ID": "sha256:abc", "Repository": "<none>", "Tag": "<none>", "Size": "10"},
+                {"ID": "sha256:def", "Repository": "named", "Tag": "latest", "Size": "10"},
+            ]
+        });
+        let facts = parse_value(&value);
+        assert!(facts.images[0].dangling);
+        assert!(!facts.images[1].dangling);
+    }
+
+    #[test]
+    fn shared_with_lists_other_images_sharing_a_layer() {
+        let value = serde_json::json!({
+            "Images": [
+                {"ID": "sha256:a", "Repository": "img-a", "Tag": "latest", "Size": "10"},
+                {"ID": "sha256:b", "Repository": "img-b", "Tag": "latest", "Size": "10"},
+                {"ID": "sha256:c", "Repository": "img-c", "Tag": "latest", "Size": "10"},
+            ],
+            "ImageInspect": [
+                {"Id": "sha256:a", "RepoTags": ["img-a:latest"], "RootFS": {"Layers": ["L1", "L2"]}},
+                {"Id": "sha256:b", "RepoTags": ["img-b:latest"], "RootFS": {"Layers": ["L1", "L3"]}},
+                {"Id": "sha256:c", "RepoTags": ["img-c:latest"], "RootFS": {"Layers": ["L9"]}},
+            ]
+        });
+        let facts = parse_value(&value);
+        let a = facts.images.iter().find(|i| i.id == "sha256:a").unwrap();
+        assert_eq!(a.shared_with, vec!["img-b:latest".to_string()]);
+        let c = facts.images.iter().find(|i| i.id == "sha256:c").unwrap();
+        assert!(c.shared_with.is_empty());
+    }
+
+    #[test]
+    fn container_join_attaches_state_and_finished_at_to_its_image() {
+        let value = serde_json::json!({
+            "Images": [
+                {"ID": "sha256:aaa", "Repository": "hiphi-relay", "Tag": "staging", "Size": "10"},
+            ],
+            "Containers": [
+                {
+                    "Id": "c1",
+                    "Name": "/hiphi-staging-relay-1",
+                    "Config": {"Image": "hiphi-relay:staging"},
+                    "State": {"Status": "exited", "FinishedAt": "2026-09-10T12:00:00Z"},
+                    "Mounts": [],
+                }
+            ]
+        });
+        let facts = parse_value(&value);
+        let image = &facts.images[0];
+        assert_eq!(image.containers.len(), 1);
+        assert_eq!(image.containers[0].name, "hiphi-staging-relay-1");
+        assert_eq!(image.containers[0].state, "exited");
+        assert_eq!(
+            image.containers[0].finished_at.as_deref(),
+            Some("2026-09-10T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn container_never_finished_normalizes_to_none() {
+        let value = serde_json::json!({
+            "Images": [{"ID": "sha256:aaa", "Repository": "running-img", "Tag": "latest", "Size": "10"}],
+            "Containers": [
+                {
+                    "Id": "c1",
+                    "Name": "/still-running",
+                    "Config": {"Image": "running-img:latest"},
+                    "State": {"Status": "running", "FinishedAt": "0001-01-01T00:00:00Z"},
+                    "Mounts": [],
+                }
+            ]
+        });
+        let facts = parse_value(&value);
+        assert_eq!(facts.images[0].containers[0].finished_at, None);
     }
 }

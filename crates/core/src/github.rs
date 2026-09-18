@@ -1591,10 +1591,18 @@ pub fn merge_complete(
             }
         )
     };
+    // `unpushed` renders its actual commit count (`unpushed=0`,
+    // `unpushed=3`), not the yes/no/unknown every other term uses --
+    // "how many" is the fact a human reading this line wants, and
+    // `unpushed=0` already carries whether the tri-state term was Yes.
+    let unpushed_str = match unpushed {
+        Some(n) => format!("unpushed={n}"),
+        None => "unpushed=unknown".to_string(),
+    };
     let mut terms = vec![
         term_str("merged", merged_term),
         term_str("clean", clean_term),
-        term_str("unpushed", unpushed_term),
+        unpushed_str,
         term_str("tip_reachable", tip_reachable_term),
     ];
     if let MergedStatus::Yes {
@@ -1648,5 +1656,26 @@ mod merge_complete_tests {
         };
         let mc2 = merge_complete(None, Some(0), &merged_yes);
         assert_eq!(mc2.verdict, TriState::Unknown);
+    }
+
+    /// The `unpushed` term renders its actual commit count
+    /// (`unpushed=0`, `unpushed=3`), never the yes/no every other term
+    /// uses -- "how many" is the fact a human wants here.
+    #[test]
+    fn unpushed_term_renders_the_count_not_yes_no() {
+        let merged = MergedStatus::Yes {
+            merged_at: None,
+            pr_number: None,
+        };
+        let zero = merge_complete(Some(false), Some(0), &merged);
+        assert!(zero.terms.iter().any(|t| t == "unpushed=0"));
+        assert!(!zero.terms.iter().any(|t| t == "unpushed=yes"));
+
+        let three = merge_complete(Some(false), Some(3), &merged);
+        assert!(three.terms.iter().any(|t| t == "unpushed=3"));
+        assert!(!three.terms.iter().any(|t| t == "unpushed=no"));
+
+        let unknown = merge_complete(Some(false), None, &merged);
+        assert!(unknown.terms.iter().any(|t| t == "unpushed=unknown"));
     }
 }

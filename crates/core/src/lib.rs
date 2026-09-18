@@ -24,6 +24,7 @@ pub mod scan;
 pub mod schedule;
 pub mod signals;
 pub mod store;
+pub mod tree;
 pub mod volume;
 pub mod walk;
 
