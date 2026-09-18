@@ -138,13 +138,26 @@ pub struct Report {
 /// matches a discovered project name", which lands as an `UnownedRow`
 /// with reason `OwnedByNothing` rather than being attributed anywhere.
 pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
-    report_with(root, docker_facts, false)
+    report_with(root, docker_facts, false, None, None)
 }
 
 /// Same as [`report`], optionally running `du -skPx` on the root as an
-/// independent oracle for `reconciliation.du_total`. `du` costs as much as
-/// the walk itself on a large tree, so it is off unless asked for.
-pub fn report_with(root: &Path, docker_facts: Option<&Path>, verify_du: bool) -> Result<Report> {
+/// independent oracle for `reconciliation.du_total`, and optionally
+/// observing into the reverse-delta growth store (`growth.rs`).
+///
+/// `store_dir` is the top-level `${SLOP_LIVIN_DIR}`-style directory; when
+/// `None`, nothing is persisted and every `growth_bytes`/`regrowth_count`
+/// stays at the R3 default (`None`/`0`) -- a read-only report, which is
+/// what the golden test and `--no-observe` want. `since_override`
+/// overrides the store's configured `since` setting for this call only
+/// (`--since`).
+pub fn report_with(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+) -> Result<Report> {
     let discovered = crate::git::discover(root)?;
     let observed_at = crate::entities::now();
 
@@ -204,6 +217,25 @@ pub fn report_with(root: &Path, docker_facts: Option<&Path>, verify_du: bool) ->
     } else {
         None
     };
+
+    if let Some(dir) = store_dir {
+        let volume_id = std::fs::metadata(root)
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+            .unwrap_or(0);
+        let config = crate::growth::load_config(dir);
+        let since_secs = since_override
+            .and_then(crate::growth::parse_duration_secs)
+            .or_else(|| crate::growth::parse_duration_secs(&config.since))
+            .unwrap_or(24 * 3600);
+        crate::growth::observe_and_annotate(
+            dir,
+            volume_id,
+            &mut projects,
+            observed_at,
+            config.retention_days,
+            since_secs,
+        )?;
+    }
 
     Ok(Report {
         observed_at,

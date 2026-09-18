@@ -51,7 +51,7 @@ enum Command {
         #[arg(long)]
         reported: u64,
     },
-    /// Project x worktree x artifact growth report (R2: discovery only).
+    /// Project x worktree x artifact growth report.
     Report {
         #[arg(default_value = ".")]
         root: PathBuf,
@@ -62,7 +62,24 @@ enum Command {
         /// Also run `du -skPx` on the root as an independent total (slow).
         #[arg(long)]
         verify_du: bool,
+        /// How far back to look for the growth baseline (e.g. "24h",
+        /// "30m", "7d"). Overrides the `since` setting in config.toml.
+        #[arg(long)]
+        since: Option<String>,
+        /// Skip persisting this observation into the growth store; the
+        /// report is read-only and growth/regrowth stay unset.
+        #[arg(long)]
+        no_observe: bool,
     },
+}
+
+/// `${SLOP_LIVIN_DIR}`, defaulting to `~/.local/share/slop-livin`.
+fn slop_livin_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".local/share/slop-livin")
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -110,8 +127,21 @@ fn main() -> Result<()> {
             json,
             docker_facts,
             verify_du,
+            since,
+            no_observe,
         } => {
-            let r = report_with(&root, docker_facts.as_deref(), verify_du)?;
+            let store_dir = if no_observe {
+                None
+            } else {
+                Some(slop_livin_dir())
+            };
+            let r = report_with(
+                &root,
+                docker_facts.as_deref(),
+                verify_du,
+                store_dir.as_deref(),
+                since.as_deref(),
+            )?;
             if json {
                 println!("{}", to_json(&r)?);
             } else {
