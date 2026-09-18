@@ -500,6 +500,7 @@ pub fn validate_grant_predicate(expr: &str) -> Result<Filter> {
         match p {
             Predicate::Kind(_)
             | Predicate::Project(_)
+            | Predicate::Type(_)
             | Predicate::IdleGreaterThan(_)
             | Predicate::MergeComplete => {}
             Predicate::Growth { .. } => bail!(
@@ -613,6 +614,7 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
     f.predicates.iter().all(|p| match p {
         Predicate::Kind(k) => format!("{:?}", unit.kind).eq_ignore_ascii_case(k),
         Predicate::Project(name) => unit.project.eq_ignore_ascii_case(name),
+        Predicate::Type(_) => true, // not carried on a unit; scope by project: instead
         Predicate::IdleGreaterThan(secs) => unit.idle_secs.is_some_and(|i| i > *secs),
         Predicate::MergeComplete => unit.merge_complete,
         Predicate::Growth { .. } | Predicate::Pr(_) => false,

@@ -857,6 +857,7 @@ mod tests {
                 project_id: "p1".to_string(),
                 name: "hiphi-relay".to_string(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt1".to_string(),
                     path: PathBuf::from("/src/hiphi-relay"),
@@ -925,6 +926,7 @@ mod tests {
             project_id: "p2".to_string(),
             name: "other".to_string(),
             remote: None,
+            ecosystems: Vec::new(),
             worktrees: vec![],
         });
         let payload = view_payload(&report, "worktrees", Some("hiphi-relay"));

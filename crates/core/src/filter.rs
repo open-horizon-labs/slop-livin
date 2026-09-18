@@ -33,6 +33,9 @@ pub enum Predicate {
     },
     Kind(String),
     Project(String),
+    /// Ecosystem tag on the project (`type:rust`, `type:js`), see
+    /// `ecosystem::ECOSYSTEMS`; the human names accepted too.
+    Type(String),
     Pr(PrFilter),
 }
 
@@ -149,6 +152,12 @@ pub fn parse(input: &str) -> Result<Filter> {
             }
             predicates.push(Predicate::Kind(k.to_string()));
             i += 1;
+        } else if let Some(t) = tok.strip_prefix("type:") {
+            if t.is_empty() {
+                return Err(anyhow!("filter: 'type:' needs a value, e.g. type:rust"));
+            }
+            predicates.push(Predicate::Type(t.to_string()));
+            i += 1;
         } else if let Some(p) = tok.strip_prefix("project:") {
             if p.is_empty() {
                 return Err(anyhow!("filter: 'project:' needs a value"));
@@ -174,6 +183,20 @@ pub fn parse(input: &str) -> Result<Filter> {
         }
     }
     Ok(Filter { predicates })
+}
+
+/// `type:rs`, `type:rust`, `type:Rust` all match a Rust project.
+fn project_has_type(project: &ProjectRow, want: &str) -> bool {
+    project.ecosystems.iter().any(|tag| {
+        tag.eq_ignore_ascii_case(want)
+            || crate::ecosystem::name_for(tag).is_some_and(|n| {
+                n.eq_ignore_ascii_case(want)
+                    || n.split('/').any(|part| part.eq_ignore_ascii_case(want))
+                    || (want.eq_ignore_ascii_case("node") && *tag == "js")
+                    || (want.eq_ignore_ascii_case("javascript") && *tag == "js")
+                    || (want.eq_ignore_ascii_case("dotnet") && *tag == "net")
+            })
+    })
 }
 
 fn kind_matches(kind: &ArtifactKind, name: &str) -> bool {
@@ -212,6 +235,7 @@ impl Filter {
                 .iter()
                 .any(|a| kind_matches(&a.kind, name)),
             Predicate::Project(name) => project.name.eq_ignore_ascii_case(name),
+            Predicate::Type(t) => project_has_type(project, t),
             Predicate::Pr(want) => match (want, facts.pr) {
                 (PrFilter::None, PrStatus::None) => true,
                 (PrFilter::Open, PrStatus::Some(pr)) => {
@@ -254,6 +278,7 @@ impl Filter {
             },
             Predicate::Kind(name) => kind_matches(&artifact.kind, name),
             Predicate::Project(name) => project.name.eq_ignore_ascii_case(name),
+            Predicate::Type(t) => project_has_type(project, t),
         })
     }
 }

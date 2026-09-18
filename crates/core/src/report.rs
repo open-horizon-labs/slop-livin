@@ -212,6 +212,10 @@ pub struct ProjectRow {
     pub project_id: String,
     pub name: String,
     pub worktrees: Vec<WorktreeRow>,
+    /// Ecosystem tags detected at the main checkout root (`rs`, `js`,
+    /// `py`, …), see `ecosystem::ECOSYSTEMS`. A project can be several.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ecosystems: Vec<String>,
     /// Normalized `origin` remote URL shared by this project's
     /// checkouts, when at least one of them has one configured. `None`
     /// when no discovered checkout/worktree of this project has an
@@ -287,10 +291,10 @@ pub struct Report {
     /// equal buckets, keyed by `growth::series_key`. Read from the
     /// reverse-delta store; empty when there is no store.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub series_by_key: std::collections::HashMap<String, Vec<u64>>,
+    pub series_by_key: std::collections::HashMap<String, Vec<Option<u64>>>,
     /// Sum of every row's series per bucket: the whole root over time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub total_series: Vec<u64>,
+    pub total_series: Vec<Option<u64>>,
     /// Seconds each series spans (the effective growth window).
     #[serde(default)]
     pub series_window_secs: u64,
@@ -672,6 +676,7 @@ pub fn report_full_mode_with_source(
             name: name.unwrap_or_default(),
             worktrees,
             remote,
+            ecosystems: Vec::new(),
         });
     }
     // Keep prior output ordering stable (by name) now that projects is a
@@ -1061,6 +1066,17 @@ pub fn annotate_tracking(
 ) {
     let mut dirs = dirs;
     for p in projects.iter_mut() {
+        if p.ecosystems.is_empty() {
+            let root = p
+                .worktrees
+                .iter()
+                .find(|w| w.kind == WorktreeKind::Main)
+                .or(p.worktrees.first())
+                .map(|w| w.path.clone());
+            if let Some(root) = root {
+                p.ecosystems = crate::ecosystem::detect(&root);
+            }
+        }
         for wt in p.worktrees.iter_mut() {
             let Some(lens) = crate::ignore::IgnoreLens::open(&wt.path) else {
                 continue;

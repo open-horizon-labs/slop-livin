@@ -44,6 +44,7 @@ fn fixture_report() -> Report {
                 project_id: "p-big".to_string(),
                 name: "big-grower".to_string(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-big".to_string(),
                     path: PathBuf::from("/src/big-grower"),
@@ -90,6 +91,7 @@ fn fixture_report() -> Report {
                 project_id: "p-empty".to_string(),
                 name: "no-artifacts".to_string(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-empty".to_string(),
                     path: PathBuf::from("/src/no-artifacts"),
@@ -106,6 +108,7 @@ fn fixture_report() -> Report {
                 project_id: "p-small".to_string(),
                 name: "small-static".to_string(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-small".to_string(),
                     path: PathBuf::from("/src/small-static"),

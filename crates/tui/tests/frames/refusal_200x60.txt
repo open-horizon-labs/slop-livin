@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                               "
-"view: tree of mole  (Esc back) · filter: 0                                                                                                                                                              "
+"view: tree of mole  (Esc back) · filter: none                                                                                                                                                           "
 "└─ ▾ main /Users/dev/src/mole                                                           2.6GB     +1.3GB ▕██████████████████████▏              clean                                                    "
 "   ├─ build target                                                                      2.1GB     +1.1GB ▕██████████████████▊   ▏                                                                       "
 "   ├─ deps node_modules                                                               440.4MB   +188.7MB ▕███▎                  ▏                                                                       "
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit                                                                             "
+"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n sort  ? help  q quit                                                                                             "

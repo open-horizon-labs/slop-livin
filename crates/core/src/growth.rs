@@ -703,18 +703,24 @@ pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
 
 /// `history_span_secs` for the volume `root` lives on (the store is keyed
 /// by device id), so every surface bounds its growth windows identically.
+/// One bucketed byte history: `None` before the first observation.
+pub type Series = Vec<Option<u64>>;
+
 /// Byte history per artifact row as a step series sampled at `buckets`
 /// evenly spaced times over the last `window_secs`, read straight from
 /// the reverse-delta log: the current row gives the latest value, each
-/// delta row the value that held until the next observation. Also
-/// returns the total over all present rows per bucket. This is what a
-/// sparkline draws — no rescan, just the store.
+/// delta row the value that held until the next observation. A bucket
+/// before the row's first observation is `None` (not yet observed — not
+/// zero); a row recorded absent (`present == false`) is `Some(0)`. Also
+/// returns the total over all rows per bucket, `None` where nothing at
+/// all had been observed yet. This is what a sparkline draws — no
+/// rescan, just the store.
 pub fn history_series(
     dir: &Path,
     window_secs: u64,
     buckets: usize,
     now: u64,
-) -> (HashMap<String, Vec<u64>>, Vec<u64>) {
+) -> (HashMap<String, Series>, Series) {
     let buckets = buckets.max(2);
     let mut points: HashMap<String, Vec<(u64, u64)>> = HashMap::new(); // key -> (observed_at, bytes)
     let mut push = |rows: Vec<StoredRow>| {
@@ -737,20 +743,17 @@ pub fn history_series(
     let times: Vec<u64> = (0..buckets)
         .map(|i| start + (i as f64 * step).round() as u64)
         .collect();
-    let mut series: HashMap<String, Vec<u64>> = HashMap::with_capacity(points.len());
-    let mut total = vec![0u64; buckets];
+    let mut series: HashMap<String, Series> = HashMap::with_capacity(points.len());
+    let mut total: Series = vec![None; buckets];
     for (key, mut pts) in points {
         pts.sort_by_key(|(t, _)| *t);
         let mut out = Vec::with_capacity(buckets);
         for (i, t) in times.iter().enumerate() {
-            let v = pts
-                .iter()
-                .rev()
-                .find(|(pt, _)| pt <= t)
-                .map(|(_, b)| *b)
-                .unwrap_or(0);
+            let v = pts.iter().rev().find(|(pt, _)| pt <= t).map(|(_, b)| *b);
             out.push(v);
-            total[i] += v;
+            if let Some(v) = v {
+                total[i] = Some(total[i].unwrap_or(0) + v);
+            }
         }
         series.insert(key, out);
     }
@@ -2221,6 +2224,7 @@ mod tests {
             project_id: "proj-1".to_string(),
             name: "proj".to_string(),
             remote: None,
+            ecosystems: Vec::new(),
             worktrees: vec![WorktreeRow {
                 worktree_id: "wt-1".to_string(),
                 path: worktree_root.to_path_buf(),
@@ -2317,6 +2321,7 @@ mod tests {
             project_id: "proj-1".to_string(),
             name: "proj".to_string(),
             remote: None,
+            ecosystems: Vec::new(),
             worktrees: vec![WorktreeRow {
                 worktree_id: "wt-1".to_string(),
                 path: root.clone(),

@@ -7,6 +7,7 @@ pub mod actions;
 pub mod attribution;
 pub mod compose;
 pub mod docker;
+pub mod ecosystem;
 pub mod entities;
 pub mod execution;
 pub mod extractor;

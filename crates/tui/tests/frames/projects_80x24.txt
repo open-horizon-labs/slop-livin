@@ -1,4 +1,4 @@
-"/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed ·"
+"/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
 "view: projects · filter: growth > 100MB in 7d                                   "
 "mole                                    2.6GB     +1.3GB ▕███▉    ▏             "
 "slop-livin                              8.1GB     +2.6GB ▕████████▏             "

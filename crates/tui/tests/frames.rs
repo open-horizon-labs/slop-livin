@@ -46,6 +46,7 @@ fn fixture_report() -> Report {
                 project_id: "p-mole".into(),
                 name: "mole".into(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "w-mole".into(),
                     path: PathBuf::from("/Users/dev/src/mole"),
@@ -84,6 +85,7 @@ fn fixture_report() -> Report {
                 project_id: "p-slop".into(),
                 name: "slop-livin".into(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "w-slop".into(),
                     path: PathBuf::from("/Users/dev/src/slop-livin"),
@@ -309,7 +311,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     app.width = 200;
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
-    assert!(before.contains("view: projects · filter: 0"), "{before}");
+    assert!(before.contains("view: projects · filter: none"), "{before}");
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);

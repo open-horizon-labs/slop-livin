@@ -388,7 +388,15 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
         trimmed.rsplit(' ').next().unwrap_or("")
     };
     let mut cands: Vec<String> = Vec::new();
-    if let Some(k) = last.strip_prefix("kind:") {
+    if let Some(t) = last.strip_prefix("type:") {
+        cands.extend(
+            slop_livin_core::ecosystem::ECOSYSTEMS
+                .iter()
+                .map(|(tag, _, _)| *tag)
+                .filter(|x| x.starts_with(&t.to_ascii_lowercase()))
+                .map(|x| format!("type:{x}")),
+        );
+    } else if let Some(k) = last.strip_prefix("kind:") {
         cands.extend(
             [
                 "BuildOutput",
@@ -459,6 +467,7 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
                     "idle > ",
                     "merge-complete",
                     "pr:",
+                    "type:",
                 ]
                 .iter()
                 .filter(|x| x.starts_with(last))

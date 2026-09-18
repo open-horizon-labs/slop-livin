@@ -109,3 +109,33 @@ pub fn has_worktree_predicates(f: &Filter) -> bool {
         )
     })
 }
+
+/// Every `type:` predicate against the project's ecosystem tags.
+pub fn type_passes(f: &Filter, project: &slop_livin_core::report::ProjectRow) -> bool {
+    f.predicates.iter().all(|p| match p {
+        Predicate::Type(t) => {
+            let dummy = slop_livin_core::report::ArtifactRow {
+                kind: slop_livin_core::report::ArtifactKind::Source,
+                path: Default::default(),
+                bytes: 0,
+                local_bytes: 0,
+                track: None,
+                growth_bytes: None,
+                regrowth_count: 0,
+                observed_at: 0,
+                confidence: slop_livin_core::entities::Confidence::High,
+                source: slop_livin_core::report::Source::new("filter"),
+                note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
+            };
+            Filter {
+                predicates: vec![Predicate::Type(t.clone())],
+            }
+            .matches_artifact(project, &dummy)
+        }
+        _ => true,
+    })
+}

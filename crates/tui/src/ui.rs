@@ -4,15 +4,46 @@
 
 use crate::app::{App, ViewKind};
 use crate::model::{
-    growth_bar, human_bytes, human_signed_bytes, max_abs_growth, sparkline, trend, truncate_middle,
+    growth_bar, human_bytes, human_signed_bytes, is_flat, max_abs_growth, net_change, spark_points,
+    trend, truncate_middle,
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Sparkline},
 };
+
+/// Width of every history sparkline, header and rows alike.
+const SPARK_WIDTH: u16 = 12;
+
+/// Draws a byte series with ratatui's `Sparkline`, scaled from zero to
+/// the row's own max so a step reads as the size of the step. Buckets
+/// before the first observation render as a dim `·`; a row observed
+/// gone renders as empty (it is zero). Colour carries the trend.
+fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect, reversed: bool) {
+    let pts = spark_points(series, area.width as usize);
+    let color = match trend(series) {
+        1 => Color::Green,
+        -1 => Color::Red,
+        _ => Color::DarkGray,
+    };
+    let mut style = Style::default().fg(color);
+    if reversed {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    let max = pts.iter().filter_map(|v| *v).max().unwrap_or(0);
+    frame.render_widget(
+        Sparkline::default()
+            .data(pts)
+            .max(max.max(1))
+            .style(style)
+            .absent_value_symbol("·")
+            .absent_value_style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
 
 /// The growth window the header reports. When the asked-for window is
 /// longer than the observations the store holds, the effective window is
@@ -43,7 +74,7 @@ fn human_duration(secs: u64) -> String {
     }
 }
 
-fn header_line(app: &App) -> String {
+fn header_line(app: &App, width: usize) -> String {
     let projects = app.report.projects.len();
     let attributed: u64 = app
         .report
@@ -71,28 +102,15 @@ fn header_line(app: &App) -> String {
         .unwrap_or_default();
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
-    // The whole root over the window as a sparkline with its net change.
-    let spark = if app.report.total_series.len() >= 2 {
-        let first = *app.report.total_series.first().unwrap_or(&0) as i64;
-        let last = *app.report.total_series.last().unwrap_or(&0) as i64;
-        format!(
-            "{} {}",
-            sparkline(&app.report.total_series, 12),
-            human_signed_bytes(last - first)
-        )
-    } else {
-        String::new()
-    };
     let clauses = vec![
         app.root.display().to_string(),
         format!("{obs}{since}"),
-        spark,
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),
         format!("docker {} unowned", human_bytes(docker_unowned)),
     ];
-    fit_clauses(&clauses, app.width as usize)
+    fit_clauses(&clauses, width)
 }
 
 /// Joins clauses with " · " while the result fits in `width`; always keeps
@@ -114,7 +132,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 }
 
 fn footer_line() -> &'static str {
-    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit"
+    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n sort  ? help  q quit"
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -130,10 +148,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(size);
 
-    frame.render_widget(
-        Paragraph::new(header_line(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        chunks[0],
-    );
+    draw_header(frame, app, chunks[0]);
 
     draw_filter_line(frame, app, chunks[1]);
     draw_body(frame, app, chunks[2]);
@@ -209,6 +224,50 @@ fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Re
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// Header: facts on the left, the whole root's history on the right as a
+/// sparkline with its net change over the window (first observed to last).
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let total = &app.report.total_series;
+    let net = net_change(total);
+    let right_width: u16 = match net {
+        Some(d) if area.width >= 80 => SPARK_WIDTH + 1 + human_signed_bytes(d).len() as u16,
+        _ => 0,
+    };
+    let left = Rect {
+        width: area.width.saturating_sub(right_width + 2),
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(header_line(app, left.width as usize))
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        left,
+    );
+    if let Some(d) = net.filter(|_| right_width > 0) {
+        let x = area.x + area.width - right_width;
+        draw_spark(
+            frame,
+            total,
+            Rect {
+                x,
+                y: area.y,
+                width: SPARK_WIDTH,
+                height: 1,
+            },
+            false,
+        );
+        frame.render_widget(
+            Paragraph::new(human_signed_bytes(d))
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            Rect {
+                x: x + SPARK_WIDTH + 1,
+                y: area.y,
+                width: right_width - SPARK_WIDTH - 1,
+                height: 1,
+            },
+        );
+    }
+}
+
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.editing_filter {
         let hint = if app.completions.is_empty() {
@@ -227,9 +286,15 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
         let sort = match app.sort {
             crate::model::Sort::Growth => " · sort: growth",
             crate::model::Sort::Size => " · sort: size",
+            crate::model::Sort::Name => " · sort: name",
             crate::model::Sort::None => "",
         };
-        format!("view: {scope} · filter: {}{sort}", app.filter_text)
+        let filter = if app.filter_text == "0" {
+            "none".to_string()
+        } else {
+            app.filter_text.clone()
+        };
+        format!("view: {scope} · filter: {filter}{sort}")
     };
     frame.render_widget(Paragraph::new(text), area);
     if let Some(err) = &app.filter_error {
@@ -274,7 +339,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let narrow = width < 120;
     let bar_width: usize = ((width.saturating_sub(90)) / 5).clamp(8, 32);
-    let spark_width: usize = if width >= 120 { 12 } else { 0 };
+    let spark_width: usize = if width >= 120 {
+        SPARK_WIDTH as usize
+    } else {
+        0
+    };
     let fixed =
         10 + 1 + 10 + 1 + bar_width + 2 + 1 + if spark_width > 0 { spark_width + 1 } else { 0 };
     let flexible = width.saturating_sub(fixed).max(40);
@@ -284,6 +353,10 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         (flexible * 2 / 5).min(70)
     };
     let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
+    // Sparklines are widgets, drawn over the text after the paragraph:
+    // (row index, series) for every row that has a non-flat history.
+    let spark_x = area.x + (name_width + 10 + 1 + 10 + 2 + bar_width + 1 + 1) as u16;
+    let mut sparks: Vec<(usize, &Vec<Option<u64>>)> = Vec::new();
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let marked = row
@@ -351,21 +424,17 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::raw("▏"),
             {
-                // History sparkline: the row's own shape over the window,
-                // coloured by its trend.
-                let (text, color) = match (&row.series, spark_width) {
-                    (Some(s), w) if w > 0 && s.len() >= 2 => (
-                        format!(" {}", sparkline(s, w)),
-                        match trend(s) {
-                            1 => Color::Green,
-                            -1 => Color::Red,
-                            _ => Color::DarkGray,
-                        },
-                    ),
-                    (_, w) if w > 0 => (" ".repeat(w + 1), Color::DarkGray),
-                    _ => (String::new(), Color::DarkGray),
-                };
-                Span::styled(text, Style::default().fg(color))
+                // History column: blank in the text; a flat history stays
+                // blank (nothing happened), anything else gets a Sparkline
+                // widget drawn over this slot below.
+                if let Some(s) = row
+                    .series
+                    .as_ref()
+                    .filter(|s| spark_width > 0 && !is_flat(s))
+                {
+                    sparks.push((i, s));
+                }
+                Span::raw(" ".repeat(if spark_width > 0 { spark_width + 1 } else { 0 }))
             },
             Span::styled(
                 format!(" {signals_text}"),
@@ -381,6 +450,22 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
     frame.render_widget(Paragraph::new(lines), area);
+    for (i, series) in sparks {
+        if i as u16 >= area.height {
+            break;
+        }
+        draw_spark(
+            frame,
+            series,
+            Rect {
+                x: spark_x,
+                y: area.y + i as u16,
+                width: spark_width as u16,
+                height: 1,
+            },
+            i == app.selected,
+        );
+    }
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
@@ -409,7 +494,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "  v, 1-7    switch view (projects · tree · builds · deps · docker · kinds · unowned)",
         ),
-        Line::from("  g / s     sort by growth / size (remembered, like the filter)"),
+        Line::from("  g / s / n sort by growth / size / name (remembered, like the filter)"),
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),
@@ -418,7 +503,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("Filter grammar"),
         Line::from("  growth [><] <size> in <duration>   (window capped at stored history)"),
-        Line::from("  kind:<k>   project:<name>   pr:open|merged|closed|none"),
+        Line::from("  kind:<k>   project:<name>   type:rs|js|py|go|…   pr:open|merged|closed|none"),
         Line::from("  idle > <duration>   merge-complete"),
     ];
     let block = Block::default()

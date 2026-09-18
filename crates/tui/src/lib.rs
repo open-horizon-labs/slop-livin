@@ -105,6 +105,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         KeyCode::Char('g') => app.set_sort(Sort::Growth),
         KeyCode::Char('s') => app.set_sort(Sort::Size),
+        KeyCode::Char('n') => app.set_sort(Sort::Name),
         KeyCode::Char('?') => app.toggle_help(),
         _ => {}
     }

@@ -90,6 +90,35 @@ jobs:
           name: slop-livin-macos-arm64
           path: dist/*
 
+      # Release notes are written by a human in CHANGELOG.md under
+      # `## vX.Y.Z`; the release fails if the tag has no entry. Generated
+      # notes are a commit list and have already misdescribed this project
+      # once (they listed the abandoned first attempt's PRs).
+      - name: Release notes from CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF#refs/tags/}"
+          awk -v tag="$v" '
+            $0 ~ "^## " tag "([[:space:]]|$)" { on=1; next }
+            /^## / && on { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "CHANGELOG.md has no section '## $v' — write the release notes before tagging." >&2
+            exit 1
+          fi
+          {
+            echo
+            echo "### Install (macOS, Apple silicon)"
+            echo '```bash'
+            echo "curl -fsSL -o slop-livin.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/slop-livin-${v#v}-aarch64-apple-darwin.tar.gz"
+            echo "tar -xzf slop-livin.tar.gz && cp slop-livin-${v#v}-aarch64-apple-darwin/slop-livin* ~/.local/bin/"
+            echo "xattr -d com.apple.quarantine ~/.local/bin/slop-livin ~/.local/bin/slop-livin-mcp 2>/dev/null || true"
+            echo '```'
+            echo "The binaries are not code-signed; the \`xattr\` line clears Gatekeeper's quarantine flag. Verify with the \`.sha256\` file."
+          } >> release-notes.md
+
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -97,4 +126,4 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.sha }}
-          generate_release_notes: true
+          body_path: release-notes.md

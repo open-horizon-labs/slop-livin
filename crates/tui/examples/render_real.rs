@@ -48,6 +48,7 @@ fn main() {
             'r' => handle_key(&mut app, KeyCode::Right),
             'u' => handle_key(&mut app, KeyCode::Up),
             'b' => handle_key(&mut app, KeyCode::Backspace),
+            'E' => handle_key(&mut app, KeyCode::Enter),
             c => handle_key(&mut app, KeyCode::Char(c)),
         }
     }

@@ -54,6 +54,7 @@ pub enum Sort {
     None,
     Growth,
     Size,
+    Name,
 }
 
 /// One renderable line: a diffstat row. `unit` is set when this row is a
@@ -99,7 +100,7 @@ pub struct Row {
     /// no ignore rule — the fact that most changes what a human decides.
     pub track: Option<slop_livin_core::ignore::TrackState>,
     /// Byte history over the growth window, from the store (sparkline).
-    pub series: Option<Vec<u64>>,
+    pub series: Option<Vec<Option<u64>>>,
     /// Present for a worktree row: how many artifact children are hidden
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
@@ -153,43 +154,53 @@ pub fn growth_bar(growth: Option<i64>, max_abs: i64, width: usize) -> String {
     s
 }
 
-/// A sparkline of a byte series, normalised to its own range so the
-/// shape reads even when every row is a different order of magnitude.
-/// A flat series renders as a flat low line, not as noise.
-pub fn sparkline(series: &[u64], width: usize) -> String {
-    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Downsample a bucketed series to `width` points for drawing. Each point
+/// is the max of its bin, so a spike survives; a bin with no observation
+/// stays `None`. Drawn by ratatui's `Sparkline`, never by hand.
+pub fn spark_points(series: &[Option<u64>], width: usize) -> Vec<Option<u64>> {
     if series.is_empty() || width == 0 {
-        return String::new();
+        return Vec::new();
     }
-    let pts: Vec<u64> = (0..width)
+    if series.len() <= width {
+        return series.to_vec();
+    }
+    (0..width)
         .map(|i| {
-            let idx = if width == 1 {
-                0
-            } else {
-                i * (series.len() - 1) / (width - 1)
-            };
-            series[idx.min(series.len() - 1)]
-        })
-        .collect();
-    let lo = *pts.iter().min().unwrap();
-    let hi = *pts.iter().max().unwrap();
-    pts.iter()
-        .map(|&v| {
-            if hi == lo {
-                GLYPHS[0]
-            } else {
-                let f = (v - lo) as f64 / (hi - lo) as f64;
-                GLYPHS[((f * 7.0).round() as usize).min(7)]
-            }
+            let lo = i * series.len() / width;
+            let hi = ((i + 1) * series.len() / width).max(lo + 1);
+            series[lo..hi.min(series.len())]
+                .iter()
+                .filter_map(|v| *v)
+                .max()
         })
         .collect()
 }
 
-/// Trend of a series: +1 rising, -1 falling, 0 flat (first vs last).
-pub fn trend(series: &[u64]) -> i8 {
-    match (series.first(), series.last()) {
-        (Some(a), Some(b)) if b > a => 1,
-        (Some(a), Some(b)) if b < a => -1,
+/// A series is flat when every observed value sits within 1% of its max:
+/// nothing worth a glyph. (Per-row min/max normalisation turned a 0.02%
+/// wobble on a 5 GB row into a cliff; that was the mess.)
+pub fn is_flat(series: &[Option<u64>]) -> bool {
+    let vals: Vec<u64> = series.iter().filter_map(|v| *v).collect();
+    let (Some(&lo), Some(&hi)) = (vals.iter().min(), vals.iter().max()) else {
+        return true;
+    };
+    hi == lo || (hi - lo) * 100 < hi
+}
+
+/// Net change over the observed part of a series: last minus first
+/// observed value. `None` with fewer than two observations.
+pub fn net_change(series: &[Option<u64>]) -> Option<i64> {
+    let mut it = series.iter().filter_map(|v| *v);
+    let first = it.next()? as i64;
+    let last = it.next_back()? as i64;
+    Some(last - first)
+}
+
+/// Trend of a series: +1 rising, -1 falling, 0 flat (first vs last observed).
+pub fn trend(series: &[Option<u64>]) -> i8 {
+    match net_change(series) {
+        Some(d) if d > 0 => 1,
+        Some(d) if d < 0 => -1,
         _ => 0,
     }
 }
@@ -215,6 +226,12 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort) {
             });
         }
         Sort::Size => rows.sort_by(|a, b| b.bytes.cmp(&a.bytes)),
+        Sort::Name => rows.sort_by(|a, b| {
+            // Labels may carry ecosystem tags ("[rs][js] owner/repo");
+            // sort on the name after the last tag so tags don't cluster rows.
+            let key = |l: &str| l.rsplit("] ").next().unwrap_or(l).to_lowercase();
+            key(&a.label).cmp(&key(&b.label))
+        }),
     }
 }
 
@@ -228,6 +245,10 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
                 .to_ascii_lowercase()
                 .contains(&name.to_ascii_lowercase())
         {
+            continue;
+        }
+        // `type:` predicates are facts about the project.
+        if !filter::type_passes(filter, p) {
             continue;
         }
         // Worktree-level predicates (idle, merge-complete, pr) hold for a
@@ -274,7 +295,12 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             depth: 0,
             rail: String::new(),
             label: {
-                let name = project_display_name(p);
+                let tags = slop_livin_core::ecosystem::tags(&p.ecosystems);
+                let name = if tags.is_empty() {
+                    project_display_name(p)
+                } else {
+                    format!("{tags} {}", project_display_name(p))
+                };
                 if p.worktrees.len() > 1 {
                     format!("{name}  · {} worktrees", p.worktrees.len())
                 } else {
@@ -652,14 +678,18 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
 }
 
 /// Element-wise sum of several equal-length series; `None` if none.
-fn sum_series<'a>(it: impl Iterator<Item = &'a Vec<u64>>) -> Option<Vec<u64>> {
-    let mut acc: Option<Vec<u64>> = None;
+/// Elementwise sum of child series. A bucket is `None` only when no child
+/// had been observed yet at that time.
+fn sum_series<'a>(it: impl Iterator<Item = &'a Vec<Option<u64>>>) -> Option<Vec<Option<u64>>> {
+    let mut acc: Option<Vec<Option<u64>>> = None;
     for s in it {
         match acc.as_mut() {
             None => acc = Some(s.clone()),
             Some(a) => {
                 for (x, y) in a.iter_mut().zip(s.iter()) {
-                    *x += *y;
+                    if let Some(y) = y {
+                        *x = Some(x.unwrap_or(0) + y);
+                    }
                 }
             }
         }
@@ -765,14 +795,28 @@ mod tests {
     }
 
     #[test]
-    fn sparkline_normalises_per_row_and_flat_is_low() {
-        assert_eq!(sparkline(&[1, 1, 1, 1], 4), "▁▁▁▁");
-        let s = sparkline(&[0, 50, 100], 3);
-        assert_eq!(s, "▁▅█");
-        assert_eq!(trend(&[1, 2]), 1);
-        assert_eq!(trend(&[2, 1]), -1);
-        assert_eq!(trend(&[3, 3]), 0);
-        assert_eq!(sparkline(&[], 5), "");
+    fn spark_points_keep_spikes_and_absence() {
+        let s: Vec<Option<u64>> = vec![None, None, Some(1), Some(9), Some(2), Some(2)];
+        assert_eq!(spark_points(&s, 3), vec![None, Some(9), Some(2)]);
+        assert_eq!(spark_points(&s, 6), s);
+        assert!(spark_points(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn flatness_is_one_percent_of_max_not_any_wobble() {
+        assert!(is_flat(&[Some(5_186_904_064), Some(5_185_728_512)]));
+        assert!(is_flat(&[None, None]));
+        assert!(!is_flat(&[Some(100), Some(90)]));
+        assert!(!is_flat(&[None, Some(0), Some(50)]));
+    }
+
+    #[test]
+    fn trend_and_net_ignore_unobserved_buckets() {
+        assert_eq!(trend(&[None, Some(1), Some(2)]), 1);
+        assert_eq!(trend(&[Some(2), Some(1)]), -1);
+        assert_eq!(trend(&[Some(3), None, Some(3)]), 0);
+        assert_eq!(net_change(&[None, Some(10), Some(4)]), Some(-6));
+        assert_eq!(net_change(&[None, Some(10)]), None);
     }
 
     #[test]
@@ -850,6 +894,7 @@ mod tests {
                 project_id: "p".into(),
                 name: "proj".into(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![
                     slop_livin_core::report::WorktreeRow {
                         worktree_id: "w1".into(),

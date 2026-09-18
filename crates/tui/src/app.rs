@@ -135,6 +135,7 @@ pub fn sort_from_str(s: &str) -> Sort {
     match s {
         "growth" => Sort::Growth,
         "size" => Sort::Size,
+        "name" => Sort::Name,
         _ => Sort::None,
     }
 }
@@ -143,6 +144,7 @@ pub fn sort_to_str(s: Sort) -> &'static str {
     match s {
         Sort::Growth => "growth",
         Sort::Size => "size",
+        Sort::Name => "name",
         Sort::None => "none",
     }
 }
@@ -470,11 +472,12 @@ impl App {
         if self.view == ViewKind::Projects
             && let Some(row) = self.selected_row()
         {
-            let shown = row
-                .label
-                .split("  · ")
+            // Strip the worktree count and the `[rs][js]` ecosystem tags.
+            let shown = row.label.split("  · ").next().unwrap_or("").trim();
+            let shown = shown
+                .rsplit("] ")
                 .next()
-                .unwrap_or("")
+                .unwrap_or(shown)
                 .trim()
                 .to_string();
             // The row shows `owner/repo`; the report keys on the project's
@@ -732,6 +735,7 @@ mod tests {
                 project_id: "p1".into(),
                 name: "mole".into(),
                 remote: None,
+                ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "w1".into(),
                     path: "/root/mole".into(),
