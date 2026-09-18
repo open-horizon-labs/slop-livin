@@ -213,3 +213,65 @@ fn mod_time_min_round_trips_as_i32_minutes() {
         root_row.mod_time_min
     );
 }
+
+/// A directory whose direct entries are all subdirectories (no direct
+/// files or symlinks of its own) must still report its own st_mtime,
+/// never fall back to epoch. Before the fix, `dir_mtime_max` started at
+/// `i64::MIN` and only files/symlinks moved it, so a directory shaped
+/// like this got `mod_time_min: 0` -- rendered as a ~56-year-old
+/// "changed Nd" in the CLI.
+#[test]
+fn directory_with_only_subdirs_reports_its_own_mtime_not_epoch() {
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+
+    // "only-dirs" itself has no direct file/symlink child -- only "leaf",
+    // a subdirectory containing the one file.
+    let only_dirs = fx.checkout.join("only-dirs");
+    fs::create_dir_all(only_dirs.join("leaf")).expect("mkdir only-dirs/leaf");
+    fs::write(only_dirs.join("leaf/file.txt"), b"x").expect("write leaf file");
+
+    let report = report_with_dirs(&fx.root, None, false, None, None, true).expect("report");
+    let worktree_id = report
+        .projects
+        .iter()
+        .find(|p| p.name == fx.checkout_name)
+        .and_then(|p| p.worktrees.iter().find(|w| w.path == fx.checkout))
+        .map(|w| w.worktree_id.clone())
+        .expect("main worktree");
+    let dirs = report
+        .dirs_by_worktree
+        .as_ref()
+        .unwrap()
+        .get(&worktree_id)
+        .unwrap();
+
+    let row = dirs
+        .iter()
+        .find(|d| d.rel_path == "only-dirs")
+        .expect("DirRollup for only-dirs exists");
+    assert_eq!(
+        row.entry_count, 1,
+        "only-dirs has exactly one direct entry (the leaf subdirectory)"
+    );
+    assert_eq!(
+        row.file_count, 0,
+        "only-dirs has no direct files of its own"
+    );
+
+    let now_minutes = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 60) as i32;
+    // Epoch (Jan 1970) is more than 20,000 days before now; a fix that
+    // still falls back to epoch would fail this by many orders of
+    // magnitude, not by a rounding error.
+    let age_days = (now_minutes - row.mod_time_min) / (60 * 24);
+    assert!(
+        (0..=1).contains(&age_days),
+        "only-dirs's mod_time_min ({}) must be its own recent st_mtime, not epoch \
+         (would-be age: {age_days} days)",
+        row.mod_time_min
+    );
+}

@@ -439,7 +439,11 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     let mut dir_file_count: u32 = 0;
     let mut dir_dir_count: u32 = 0;
     let mut dir_symlink_count: u32 = 0;
-    let mut dir_mtime_max: i64 = i64::MIN;
+    // Floor at this directory's own mtime (already lstat'd above as
+    // `meta`), never epoch: a directory whose direct entries are all
+    // subdirectories still has its own st_mtime as real evidence, and
+    // that must win over a fabricated zero.
+    let mut dir_mtime_max: i64 = meta.mtime();
 
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -490,11 +494,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     {
         let rel_path = rel_path_string(root, &path);
         let parent_rel_path = parent_rel_path_of(&rel_path);
-        let mod_time_min = if dir_mtime_max == i64::MIN {
-            0
-        } else {
-            (dir_mtime_max / 60) as i32
-        };
+        let mod_time_min = (dir_mtime_max / 60) as i32;
         shared.dirs.lock().unwrap().insert(
             (worktree_id.clone(), rel_path.clone()),
             DirRollup {
