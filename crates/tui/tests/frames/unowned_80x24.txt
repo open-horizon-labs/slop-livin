@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"↑↓ move  →/← expand  Enter open/confirm  ⌫ mark delete  / filter  v view  g grow"
+"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view "

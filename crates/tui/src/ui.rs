@@ -99,7 +99,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 }
 
 fn footer_line() -> &'static str {
-    "↑↓ move  →/← expand  Enter open/confirm  ⌫ mark delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit"
+    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit"
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -351,7 +351,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  ↑↓        move selection"),
         Line::from("  →/←       expand / collapse"),
         Line::from("  Enter     open project / confirm delete"),
-        Line::from("  Backspace mark selected unit for delete"),
+        Line::from(
+            "  Space     mark / unmark the row
+  Backspace delete what is under the cursor (or the marks), asks once",
+        ),
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from("  v, 1-5    switch view"),

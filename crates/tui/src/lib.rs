@@ -92,7 +92,8 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 app.set_view(app::ViewKind::Projects);
             }
         }
-        KeyCode::Backspace => app.mark_selected(),
+        KeyCode::Char(' ') => app.mark_selected(),
+        KeyCode::Backspace => app.delete_here(),
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),

@@ -321,23 +321,28 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
 }
 
 #[test]
-fn checkout_without_a_remote_is_refused_and_the_cause_is_shown() {
+fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
     use crossterm::event::KeyCode;
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
     slop_livin_tui::handle_key(&mut app, KeyCode::Char('0'));
     slop_livin_tui::handle_key(&mut app, KeyCode::Enter); // drill into first project
     assert_eq!(app.view, ViewKind::Tree);
-    // The fixture's project has no remote, so its checkout cannot be
-    // archived: there would be nothing to restore it from.
+    // The fixture's project has no remote: Backspace still marks it and
+    // asks once, with that fact on the confirm line.
     slop_livin_tui::handle_key(&mut app, KeyCode::Backspace);
     let f = capture(&app, 200, 60);
-    assert!(f.contains("no remote"), "refusal expected:\n{f}");
-    assert!(app.marked.is_empty());
+    assert_eq!(app.marked.len(), 1);
+    assert!(app.confirm_open);
+    assert!(
+        f.contains("no remote to restore from"),
+        "warning expected:\n{f}"
+    );
+    assert!(f.contains("Enter yes"), "{f}");
 }
 
 #[test]
-fn worktree_mark_rules() {
+fn worktree_rows_always_mark_and_carry_their_warnings() {
     use slop_livin_tui::model::{Row, WorktreeMark};
     let mark = |linked: bool, dirty: Option<bool>, unpushed: Option<u32>, locked: Option<bool>| {
         WorktreeMark {
@@ -368,51 +373,38 @@ fn worktree_mark_rules() {
         expandable: false,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
-    for (m, expect_marked, cause) in [
-        // A whole checkout with a remote is markable (the archive verb);
-        // its remaining terms are re-derived live at the sink.
-        (mark(false, Some(false), Some(0), Some(false)), true, ""),
-        // ...but not without a remote to restore it from.
+    for (m, expect_warning) in [
+        (mark(true, Some(false), Some(0), Some(false)), ""),
+        (mark(true, Some(true), Some(0), Some(false)), "dirty"),
+        (mark(true, Some(false), Some(3), Some(false)), "3 unpushed"),
+        (mark(true, Some(false), Some(0), Some(true)), "locked"),
+        (
+            mark(true, Some(false), None, Some(false)),
+            "unpushed unknown",
+        ),
         (
             WorktreeMark {
                 remote: None,
                 ..mark(false, Some(false), Some(0), Some(false))
             },
-            false,
             "no remote",
         ),
-        (mark(true, Some(true), Some(0), Some(false)), false, "dirty"),
-        (
-            mark(true, Some(false), Some(3), Some(false)),
-            false,
-            "3 unpushed",
-        ),
-        (
-            mark(true, Some(false), Some(0), Some(true)),
-            false,
-            "locked",
-        ),
-        (
-            mark(true, Some(false), None, Some(false)),
-            false,
-            "unpushed count unknown",
-        ),
-        (mark(true, Some(false), Some(0), Some(false)), true, ""),
     ] {
         app.marked.clear();
-        app.refusal = None;
         app.mark_row(&row(m));
         assert_eq!(
-            !app.marked.is_empty(),
-            expect_marked,
-            "cause {cause}: {:?}",
-            app.refusal
+            app.marked.len(),
+            1,
+            "every worktree row marks; the bar is the human"
         );
-        if !expect_marked {
+        let unit = app.marked.values().next().unwrap();
+        if expect_warning.is_empty() {
+            assert!(unit.warnings.is_empty(), "{:?}", unit.warnings);
+        } else {
             assert!(
-                app.refusal.as_ref().is_some_and(|r| r.0.contains(cause)),
-                "{cause}: {:?}",
-                app.refusal
+                unit.warnings.iter().any(|w| w.contains(expect_warning)),
+                "expected {expect_warning:?} in {:?}",
+                unit.warnings
             );
         }
     }
@@ -422,7 +414,7 @@ fn worktree_mark_rules() {
 /// checkout is archived to Trash; the same checkout with one untracked
 /// file is refused, because nothing would bring that file back.
 #[test]
-fn archiving_a_checkout_refuses_untracked_content_and_otherwise_trashes_it() {
+fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     use slop_livin_tui::actions::{MarkedUnit, WorktreeTerms, authorize, execute_plan};
     use std::process::Command;
 
@@ -478,6 +470,8 @@ fn archiving_a_checkout_refuses_untracked_content_and_otherwise_trashes_it() {
         path: path.to_path_buf(),
         bytes: 4096,
         observed_at: slop_livin_core::entities::now(),
+        label: String::new(),
+        warnings: Vec::new(),
         worktree: Some(WorktreeTerms {
             merge_complete: false,
             pr: None,
@@ -487,28 +481,12 @@ fn archiving_a_checkout_refuses_untracked_content_and_otherwise_trashes_it() {
     };
     let ledger = slop_livin_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
 
-    // Untracked content present: refused, naming the file and its size.
+    // Untracked content present: no longer a bar — the human saw it on
+    // the confirm line. The sink moves the checkout and the ledger keeps
+    // the warnings that were shown.
     std::fs::write(work.join("secrets.env"), vec![b'k'; 2048]).unwrap();
-    let u = unit(&work);
-    let (plan, grant) = authorize(std::slice::from_ref(&u), "human");
-    let res = execute_plan(
-        std::slice::from_ref(&u),
-        &plan,
-        &grant,
-        &ledger,
-        &trash,
-        "human",
-    );
-    let err = res[0].outcome.as_ref().unwrap_err();
-    assert!(
-        err.contains("secrets.env") && err.contains("untracked"),
-        "{err}"
-    );
-    assert!(work.exists(), "nothing may be moved while a term fails");
-
-    // Ignored content alone does not block: build/ is disposable.
-    std::fs::remove_file(work.join("secrets.env")).unwrap();
-    let u = unit(&work);
+    let mut u = unit(&work);
+    u.warnings = vec!["secrets.env untracked 2.0KB".into()];
     let (plan, grant) = authorize(std::slice::from_ref(&u), "human");
     let res = execute_plan(
         std::slice::from_ref(&u),
@@ -527,6 +505,10 @@ fn archiving_a_checkout_refuses_untracked_content_and_otherwise_trashes_it() {
         last.evidence["recover"]
             .as_str()
             .unwrap()
-            .starts_with("git clone ")
+            .contains("git clone")
+    );
+    assert_eq!(
+        last.evidence["warnings_shown"][0], "secrets.env untracked 2.0KB",
+        "the confirm-line facts travel into the ledger"
     );
 }

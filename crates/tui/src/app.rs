@@ -5,7 +5,6 @@
 use crate::actions::{self, MarkedUnit};
 use crate::filter::{self, Filter};
 use crate::model::{self, Row, Sort};
-use crate::units::markable;
 use slop_livin_core::report::Report;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -511,93 +510,84 @@ impl App {
     }
 
     /// The mark decision for one row (testable without a selection).
+    ///
+    /// Anything with a path can be marked: an artifact, a Source
+    /// directory, a linked worktree, a whole checkout. There is no bar —
+    /// the human decides. What the tool owes them is the facts, so each
+    /// unit carries its warnings and the confirm line states them before
+    /// Enter. Docker objects are the one exception: there is no
+    /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
         let Some(unit_id) = row.unit.clone() else {
-            self.set_refusal("not a unit: nothing here can be marked");
+            self.set_refusal("nothing to delete on this row");
             return;
         };
-        if let Some(wt) = row.worktree.clone() {
-            // A worktree has its own bar: only a linked worktree, and only
-            // with the facts in its favor. Each refusal names the fact.
-            // A whole checkout is the `archive` verb, with a higher bar
-            // than a linked worktree: it needs a remote to restore from
-            // and no untracked content (checked live at the sink).
-            let whole_checkout = !wt.linked;
-            if whole_checkout && wt.remote.is_none() {
-                self.set_refusal("no remote: nothing to restore this checkout from");
-                return;
-            }
-            match wt.dirty {
-                Some(true) => return self.set_refusal("dirty: uncommitted changes"),
-                None => return self.set_refusal("dirty state unknown"),
-                Some(false) => {}
-            }
-            match wt.unpushed {
-                Some(0) => {}
-                Some(n) => {
-                    return self.set_refusal(&format!(
-                        "{n} unpushed commit{}",
-                        if n == 1 { "" } else { "s" }
-                    ));
-                }
-                None => return self.set_refusal("unpushed count unknown (no upstream)"),
-            }
-            if wt.locked != Some(false) {
-                return self.set_refusal("worktree is locked");
-            }
-            if self.marked.remove(&unit_id.0).is_none() {
-                self.marked.insert(
-                    unit_id.0.clone(),
-                    MarkedUnit {
-                        path: wt.path.clone(),
-                        bytes: row.bytes,
-                        observed_at: self.report.observed_at,
-                        worktree: Some(crate::actions::WorktreeTerms {
-                            merge_complete: wt.merge_complete,
-                            pr: wt.pr.clone(),
-                            whole_checkout,
-                            remote: wt.remote.clone(),
-                        }),
-                    },
-                );
-            }
-            return;
-        }
-        let Some(kind) = row.kind.clone() else {
-            self.set_refusal("not a unit: nothing here can be marked");
-            return;
-        };
-        // Docker rows are markable in principle (folded units, same as a
-        // dependency tree or build output), but there is no daemon-side
-        // sink recheck yet to safely re-verify a Docker object right
-        // before deletion the way the filesystem action layer does for a
-        // path. Refuse with a specific, honest reason instead of
-        // pretending the mark will do anything (#33).
         if matches!(
-            kind,
-            slop_livin_core::report::ArtifactKind::DockerImage
-                | slop_livin_core::report::ArtifactKind::DockerBuildCache
-                | slop_livin_core::report::ArtifactKind::DockerVolume
+            row.kind,
+            Some(slop_livin_core::report::ArtifactKind::DockerImage)
+                | Some(slop_livin_core::report::ArtifactKind::DockerBuildCache)
+                | Some(slop_livin_core::report::ArtifactKind::DockerVolume)
         ) {
             self.set_refusal("docker removal not available yet");
             return;
         }
-        match markable(&kind) {
-            Ok(()) => {
-                if self.marked.remove(&unit_id.0).is_none() {
-                    self.marked.insert(
-                        unit_id.0.clone(),
-                        MarkedUnit {
-                            path: PathBuf::from(&unit_id.0),
-                            bytes: row.bytes,
-                            observed_at: self.report.observed_at,
-                            worktree: None,
-                        },
-                    );
+        if self.marked.remove(&unit_id.0).is_some() {
+            return; // toggle off
+        }
+        let mut warnings: Vec<String> = Vec::new();
+        let worktree = row.worktree.clone().map(|wt| {
+            let whole_checkout = !wt.linked;
+            if whole_checkout && wt.remote.is_none() {
+                warnings.push("no remote to restore from".into());
+            }
+            if wt.dirty == Some(true) {
+                warnings.push("dirty".into());
+            }
+            match wt.unpushed {
+                Some(n) if n > 0 => warnings.push(format!("{n} unpushed")),
+                None => warnings.push("unpushed unknown".into()),
+                _ => {}
+            }
+            if wt.locked == Some(true) {
+                warnings.push("locked".into());
+            }
+            if whole_checkout {
+                for (p, b) in slop_livin_core::ignore::untracked_content(&wt.path, 3, 100_000) {
+                    let rel = p.strip_prefix(&wt.path).unwrap_or(&p).display().to_string();
+                    warnings.push(format!("{rel} untracked {}", model::human_bytes(b)));
                 }
             }
-            Err(reason) => self.set_refusal(reason),
+            crate::actions::WorktreeTerms {
+                merge_complete: wt.merge_complete,
+                pr: wt.pr.clone(),
+                whole_checkout,
+                remote: wt.remote.clone(),
+            }
+        });
+        match row.track {
+            Some(slop_livin_core::ignore::TrackState::Untracked) => {
+                warnings.push("untracked: in no version control".into())
+            }
+            Some(slop_livin_core::ignore::TrackState::Tracked) if row.worktree.is_none() => {
+                warnings.push("tracked source".into())
+            }
+            _ => {}
         }
+        if row.kind == Some(slop_livin_core::report::ArtifactKind::Git) {
+            warnings.push("git object store: history goes with it".into());
+        }
+        let label = row.label.trim().to_string();
+        self.marked.insert(
+            unit_id.0.clone(),
+            MarkedUnit {
+                path: PathBuf::from(&unit_id.0),
+                bytes: row.bytes,
+                observed_at: self.report.observed_at,
+                worktree,
+                label,
+                warnings,
+            },
+        );
     }
 
     fn set_refusal(&mut self, msg: &str) {
@@ -618,6 +608,17 @@ impl App {
         if !self.marked.is_empty() {
             self.confirm_open = true;
         }
+    }
+
+    /// Backspace: delete what is under the cursor. If nothing is marked,
+    /// mark the current row; then ask once.
+    pub fn delete_here(&mut self) {
+        if self.marked.is_empty()
+            && let Some(row) = self.selected_row()
+        {
+            self.mark_row(&row);
+        }
+        self.open_confirm();
     }
 
     pub fn cancel_confirm(&mut self) {
@@ -794,15 +795,30 @@ mod tests {
     }
 
     #[test]
-    fn mark_refuses_non_artifact_kinds() {
+    fn source_rows_mark_with_a_warning_instead_of_a_refusal() {
         let mut app = App::new(fixture_report(), "/root".into());
         app.clear_filter();
         app.set_view(ViewKind::Tree);
-        // row 0 = worktree, row 1 = node_modules (markable), row 2 = src (not markable)
+        // row 0 = worktree, row 1 = node_modules, row 2 = src (a Source row)
         app.selected = 2;
         app.mark_selected();
+        assert_eq!(app.marked.len(), 1, "anything with a path can be marked");
+        assert!(app.refusal_active().is_none());
+        // Space toggles it off again.
+        app.mark_selected();
         assert!(app.marked.is_empty());
-        assert!(app.refusal_active().unwrap().contains("source trees"));
+    }
+
+    #[test]
+    fn backspace_marks_the_current_row_and_asks_once() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Tree);
+        app.selected = 1; // node_modules
+        app.delete_here();
+        assert_eq!(app.marked.len(), 1);
+        assert!(app.confirm_open, "one 'are you sure', with the facts on it");
+        assert!(app.confirm_summary().contains("node_modules"));
+        assert!(app.confirm_summary().contains("Enter yes"));
     }
 
     #[test]
@@ -814,7 +830,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         app.open_confirm();
         assert!(app.confirm_open);
-        assert!(app.confirm_summary().contains("delete 1 artifact"));
+        assert!(app.confirm_summary().contains("delete node_modules"));
     }
 
     #[test]

@@ -4,10 +4,8 @@
 //! nothing there is widened.
 
 use anyhow::Result;
-use slop_livin_core::entities::{
-    ArtifactKind as EntityKind, Confidence, FactMeta, RecoveryContract, id_for, now,
-};
-use slop_livin_core::execution::{Outcome, execute_delete};
+use slop_livin_core::entities::{id_for, now};
+use slop_livin_core::execution::Outcome;
 use slop_livin_core::grants::{Grant, Predicate, Verb, plan};
 use slop_livin_core::ledger::Ledger;
 use std::path::{Path, PathBuf};
@@ -24,6 +22,11 @@ pub struct MarkedUnit {
     pub observed_at: u64,
     /// Set when the unit is a linked worktree rather than an artifact dir.
     pub worktree: Option<WorktreeTerms>,
+    /// The row's label, for the confirm line.
+    pub label: String,
+    /// Facts the human should see before confirming (dirty, unpushed,
+    /// untracked content, no remote…). Shown, never enforced.
+    pub warnings: Vec<String>,
 }
 
 /// The terms a worktree removal was authorized on; recorded in the ledger.
@@ -86,7 +89,7 @@ pub struct UnitResult {
 /// the per-unit result.
 fn execute_one(
     unit: &MarkedUnit,
-    plan_unit: &slop_livin_core::grants::PlanUnit,
+    _plan_unit: &slop_livin_core::grants::PlanUnit,
     grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
@@ -99,24 +102,7 @@ fn execute_one(
                 .map_err(|e| e.to_string()),
         };
     }
-    let artifact = slop_livin_core::entities::Artifact {
-        id: plan_unit.artifact_id.clone(),
-        project_id: None,
-        kind: EntityKind::Unknown,
-        path: unit.path.clone(),
-        relative_path: None,
-        bytes: unit.bytes,
-        recovery: RecoveryContract::LocalRebuild,
-        present: true,
-        regrowth_count: 0,
-        meta: FactMeta {
-            observed_at: unit.observed_at,
-            source: "tui".into(),
-            confidence: Confidence::High,
-            horizon_exceeded: false,
-        },
-    };
-    let outcome = execute_delete(&artifact, plan_unit, grant, ledger, trash_root, actor)
+    let outcome = trash_path(unit, Verb::Delete, grant, ledger, trash_root, actor, None)
         .map_err(|e| e.to_string());
     UnitResult {
         path: unit.path.clone(),
@@ -124,11 +110,65 @@ fn execute_one(
     }
 }
 
-/// Removes a linked worktree: re-derives the terms at the sink (still a
-/// linked worktree, clean, nothing unpushed, unlocked, unoccupied), moves
-/// the directory to Trash, then `git worktree prune` in the main repo so
-/// git forgets the now-missing checkout. Recoverable: move the directory
-/// back and run `git worktree repair`.
+/// Moves one path to Trash and records it. The only refusal is a path
+/// that no longer exists: the human already confirmed with the warnings
+/// in front of them, and Trash keeps the move reversible.
+fn trash_path(
+    unit: &MarkedUnit,
+    verb: Verb,
+    grant: &Grant,
+    ledger: &Ledger,
+    trash_root: &Path,
+    actor: &str,
+    extra: Option<serde_json::Value>,
+) -> Result<Outcome> {
+    let path = &unit.path;
+    if std::fs::symlink_metadata(path).is_err() {
+        anyhow::bail!("path no longer exists");
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+    let dest = trash_root.join(format!("{name}-{}", now()));
+    std::fs::create_dir_all(trash_root)?;
+    std::fs::rename(path, &dest)?;
+    let mut evidence = serde_json::json!({
+        "label": unit.label,
+        "bytes": unit.bytes,
+        "observed_at": unit.observed_at,
+        "warnings_shown": unit.warnings,
+    });
+    if let Some(extra) = extra
+        && let (Some(map), Some(more)) = (evidence.as_object_mut(), extra.as_object())
+    {
+        for (k, v) in more {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    ledger.append(&slop_livin_core::ledger::ActionRecord {
+        id: slop_livin_core::entities::new_id(),
+        verb,
+        entity_id: id_for(&path.display().to_string()),
+        evidence,
+        grant_id: grant.id.clone(),
+        actor: actor.into(),
+        outcome: "completed".into(),
+        recovery_location: Some(dest.clone()),
+        measured_free_space_delta: None,
+        observed_path_state: Some("trashed".into()),
+        recorded_at: now(),
+    })?;
+    Ok(Outcome {
+        unit_id: id_for(&path.display().to_string()),
+        status: "completed".into(),
+        reason: None,
+        intended_bytes: unit.bytes,
+        observed_free_space_delta: None,
+    })
+}
+
+/// Removes a linked worktree (directory to Trash, then `git worktree
+/// prune`) or a whole checkout (`archive`). No bar: the warnings were on
+/// the confirm line. Recoverable: move the directory back (and `git
+/// worktree repair` for a linked worktree).
 fn remove_worktree(
     unit: &MarkedUnit,
     terms: &WorktreeTerms,
@@ -137,180 +177,58 @@ fn remove_worktree(
     trash_root: &Path,
     actor: &str,
 ) -> Result<Outcome> {
-    if terms.whole_checkout {
-        return remove_checkout(unit, terms, grant, ledger, trash_root, actor);
-    }
     let path = &unit.path;
     let gitfile = path.join(".git");
-    let meta = std::fs::symlink_metadata(&gitfile)
-        .map_err(|_| anyhow::anyhow!("not a worktree: no .git here"))?;
-    if !meta.is_file() {
-        anyhow::bail!("main checkout — not removable as a worktree");
-    }
-    let gitdir_line = std::fs::read_to_string(&gitfile)?;
-    let gitdir = gitdir_line
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(|s| PathBuf::from(s.trim()))
-        .ok_or_else(|| anyhow::anyhow!("unreadable .git file"))?;
-    let gitdir = if gitdir.is_absolute() {
-        gitdir
-    } else {
-        path.join(gitdir)
-    };
-    let common = std::fs::read_to_string(gitdir.join("commondir"))
-        .map(|c| {
-            let c = PathBuf::from(c.trim());
-            if c.is_absolute() { c } else { gitdir.join(c) }
-        })
-        .map_err(|_| anyhow::anyhow!("not a linked worktree (no commondir)"))?;
-    // Sink re-derivation of the terms, live.
-    let (_, raw) = slop_livin_core::signals::compute_signals_raw(path, now());
-    match raw.dirty {
-        Some(false) => {}
-        Some(true) => anyhow::bail!("dirty: uncommitted changes"),
-        None => anyhow::bail!("could not determine dirty state"),
-    }
-    match raw.unpushed {
-        Some(0) => {}
-        Some(n) => anyhow::bail!("{n} unpushed commit{}", if n == 1 { "" } else { "s" }),
-        None => anyhow::bail!("unpushed count unknown (no upstream)"),
-    }
-    if raw.locked != Some(false) {
-        anyhow::bail!("worktree is locked");
-    }
-    if slop_livin_core::occupancy::occupied(path) {
-        anyhow::bail!("occupied: a process holds files under this worktree");
-    }
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("worktree");
-    let dest = trash_root.join(format!("worktree-{name}-{}", now()));
-    std::fs::create_dir_all(trash_root)?;
-    std::fs::rename(path, &dest)?;
-    let prune = std::process::Command::new("git")
-        .arg("-C")
-        .arg(common.parent().unwrap_or(&common))
-        .args(["worktree", "prune"])
-        .output();
-    let pruned = prune.as_ref().map(|o| o.status.success()).unwrap_or(false);
-    ledger.append(&slop_livin_core::ledger::ActionRecord {
-        id: slop_livin_core::entities::new_id(),
-        verb: Verb::RemoveWorktree,
-        entity_id: id_for(&path.display().to_string()),
-        evidence: serde_json::json!({
-            "bytes": unit.bytes,
-            "observed_at": unit.observed_at,
-            "terms": {"clean": true, "unpushed": 0, "unlocked": true,
-                       "merge_complete": terms.merge_complete, "pr": terms.pr},
-            "git_worktree_prune": pruned,
-            "recover": format!("mv {} {} && git -C {} worktree repair", dest.display(), path.display(), common.display()),
-        }),
-        grant_id: grant.id.clone(),
-        actor: actor.into(),
-        outcome: "completed".into(),
-        recovery_location: Some(dest.clone()),
-        measured_free_space_delta: None,
-        observed_path_state: Some("trashed".into()),
-        recorded_at: now(),
-    })?;
-    Ok(Outcome {
-        unit_id: id_for(&path.display().to_string()),
-        status: "completed".into(),
-        reason: None,
-        intended_bytes: unit.bytes,
-        observed_free_space_delta: None,
-    })
-}
-
-/// Removes a whole checkout (the `archive` verb): the highest bar here,
-/// because it takes the working copy with it. Every term is re-derived
-/// live at the sink — a remote to restore from, clean, nothing unpushed,
-/// unlocked, unoccupied, and **no untracked content**, since content git
-/// neither tracks nor ignores exists only here and no clone brings it
-/// back. Each refusal names the fact that refused it.
-fn remove_checkout(
-    unit: &MarkedUnit,
-    terms: &WorktreeTerms,
-    grant: &Grant,
-    ledger: &Ledger,
-    trash_root: &Path,
-    actor: &str,
-) -> Result<Outcome> {
-    let path = &unit.path;
-    if !path.join(".git").is_dir() {
-        anyhow::bail!("not a main checkout (its .git is not a directory)");
-    }
-    let Some(remote) = terms.remote.clone() else {
-        anyhow::bail!("no remote: nothing to restore this checkout from");
-    };
-    // Untracked content first: it is the most specific fact and names the
-    // exact file. (The `dirty` signal counts untracked files too, so
-    // checking it first would refuse with a vaguer cause.)
-    let untracked = slop_livin_core::ignore::untracked_content(path, 3, 200_000);
-    if let Some((first, bytes)) = untracked.first() {
-        let rel = first.strip_prefix(path).unwrap_or(first).display();
-        anyhow::bail!(
-            "{rel} is untracked ({}) — in no version control and covered by no ignore rule, so a clone would not bring it back{}",
-            human_bytes(*bytes),
-            if untracked.len() > 1 {
-                format!(" (+{} more)", untracked.len() - 1)
+    let common: Option<PathBuf> = if !terms.whole_checkout && gitfile.is_file() {
+        std::fs::read_to_string(&gitfile).ok().and_then(|line| {
+            let gitdir = PathBuf::from(line.trim().strip_prefix("gitdir:")?.trim());
+            let gitdir = if gitdir.is_absolute() {
+                gitdir
             } else {
-                String::new()
-            }
-        );
+                path.join(gitdir)
+            };
+            let c = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+            let c = PathBuf::from(c.trim());
+            Some(if c.is_absolute() { c } else { gitdir.join(c) })
+        })
+    } else {
+        None
+    };
+    let verb = if terms.whole_checkout {
+        Verb::Archive
+    } else {
+        Verb::RemoveWorktree
+    };
+    let recover = match (&terms.remote, &common) {
+        (_, Some(c)) => format!(
+            "move the directory back, then git -C {} worktree repair",
+            c.display()
+        ),
+        (Some(r), None) => format!("move the directory back, or git clone {r}"),
+        (None, None) => "move the directory back from Trash".to_string(),
+    };
+    let outcome = trash_path(
+        unit,
+        verb,
+        grant,
+        ledger,
+        trash_root,
+        actor,
+        Some(serde_json::json!({
+            "merge_complete": terms.merge_complete,
+            "pr": terms.pr,
+            "remote": terms.remote,
+            "recover": recover,
+        })),
+    )?;
+    if let Some(c) = common {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(c.parent().unwrap_or(&c))
+            .args(["worktree", "prune"])
+            .output();
     }
-    let (_, raw) = slop_livin_core::signals::compute_signals_raw(path, now());
-    match raw.dirty {
-        Some(false) => {}
-        Some(true) => anyhow::bail!("dirty: uncommitted changes"),
-        None => anyhow::bail!("could not determine dirty state"),
-    }
-    match raw.unpushed {
-        Some(0) => {}
-        Some(n) => anyhow::bail!("{n} unpushed commit{}", if n == 1 { "" } else { "s" }),
-        None => anyhow::bail!("unpushed count unknown (no upstream)"),
-    }
-    if raw.locked != Some(false) {
-        anyhow::bail!("worktree is locked");
-    }
-    if slop_livin_core::occupancy::occupied(path) {
-        anyhow::bail!("occupied: a process holds files under this checkout");
-    }
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("checkout");
-    let dest = trash_root.join(format!("checkout-{name}-{}", now()));
-    std::fs::create_dir_all(trash_root)?;
-    std::fs::rename(path, &dest)?;
-    ledger.append(&slop_livin_core::ledger::ActionRecord {
-        id: slop_livin_core::entities::new_id(),
-        verb: Verb::Archive,
-        entity_id: id_for(&path.display().to_string()),
-        evidence: serde_json::json!({
-            "bytes": unit.bytes,
-            "observed_at": unit.observed_at,
-            "terms": {"clean": true, "unpushed": 0, "unlocked": true, "untracked_content": 0,
-                       "remote": remote, "merge_complete": terms.merge_complete, "pr": terms.pr},
-            "recover": format!("git clone {remote} {}", path.display()),
-        }),
-        grant_id: grant.id.clone(),
-        actor: actor.into(),
-        outcome: "completed".into(),
-        recovery_location: Some(dest.clone()),
-        measured_free_space_delta: None,
-        observed_path_state: Some("trashed".into()),
-        recorded_at: now(),
-    })?;
-    Ok(Outcome {
-        unit_id: id_for(&path.display().to_string()),
-        status: "completed".into(),
-        reason: None,
-        intended_bytes: unit.bytes,
-        observed_free_space_delta: None,
-    })
+    Ok(outcome)
 }
 
 /// Executes every unit in the plan in order, returning one result per
@@ -366,24 +284,31 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
 /// -> Trash · Enter confirm · Esc cancel`.
 pub fn confirm_summary(units: &[MarkedUnit]) -> String {
     let total: u64 = units.iter().map(|u| u.bytes).sum();
-    let wts = units.iter().filter(|u| u.worktree.is_some()).count();
-    let arts = units.len() - wts;
-    let mut what = Vec::new();
-    if arts > 0 {
-        what.push(format!(
-            "delete {arts} artifact{}",
-            if arts == 1 { "" } else { "s" }
-        ));
-    }
-    if wts > 0 {
-        what.push(format!(
-            "remove {wts} worktree{}",
-            if wts == 1 { "" } else { "s" }
-        ));
-    }
+    let what: Vec<String> = units
+        .iter()
+        .take(3)
+        .map(|u| {
+            let name = u
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&u.label)
+                .to_string();
+            if u.warnings.is_empty() {
+                name
+            } else {
+                format!("{name} ⚠ {}", u.warnings.join(" · "))
+            }
+        })
+        .collect();
+    let more = if units.len() > 3 {
+        format!(" +{} more", units.len() - 3)
+    } else {
+        String::new()
+    };
     format!(
-        "{} · {} → Trash · Enter confirm · Esc cancel",
-        what.join(" + "),
+        "delete {} ({}) → Trash{more}?  Enter yes · Esc no",
+        what.join(", "),
         human_bytes(total)
     )
 }
@@ -405,6 +330,8 @@ mod tests {
             path: target.clone(),
             bytes,
             observed_at: now(),
+            label: String::new(),
+            warnings: Vec::new(),
             worktree: None,
         };
         let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
@@ -425,16 +352,27 @@ mod tests {
     }
 
     #[test]
-    fn confirm_summary_pluralizes() {
-        let u = MarkedUnit {
-            path: "/tmp/a".into(),
+    fn confirm_summary_names_units_and_states_their_warnings() {
+        let clean = MarkedUnit {
+            path: "/tmp/target".into(),
             bytes: 2 * 1024 * 1024 * 1024,
             observed_at: 0,
+            label: "build target".into(),
+            warnings: Vec::new(),
             worktree: None,
         };
+        let risky = MarkedUnit {
+            path: "/tmp/raw".into(),
+            bytes: 1_100_000_000,
+            observed_at: 0,
+            label: "dir raw".into(),
+            warnings: vec!["untracked: in no version control".into()],
+            worktree: None,
+        };
+        let s = confirm_summary(&[clean, risky]);
         assert_eq!(
-            confirm_summary(&[u.clone(), u]),
-            "delete 2 artifacts · 4.3GB → Trash · Enter confirm · Esc cancel"
+            s,
+            "delete target, raw ⚠ untracked: in no version control (3.2GB) → Trash?  Enter yes · Esc no"
         );
     }
 }

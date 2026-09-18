@@ -372,6 +372,8 @@ pub fn tree_rows(
                         Row::leaf(3, format!("dir {}", d.rel_path), d.allocated_total, None);
                     child.rail = format!("{child_prefix}   {c_connector}");
                     child.track = track.get(&dir_abs).copied();
+                    child.unit = Some(UnitId::for_artifact(&dir_abs));
+                    child.kind = Some(slop_livin_core::report::ArtifactKind::Unknown);
                     out.push(child);
                 }
                 if children.len() > shown {

@@ -20,5 +20,5 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"delete 1 artifact · 440.4MB → Trash · Enter confirm · Esc cancel                "
-"↑↓ move  →/← expand  Enter open/confirm  ⌫ mark delete  / filter  v view  g grow"
+"delete node_modules (440.4MB) → Trash?  Enter yes · Esc no                      "
+"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view "

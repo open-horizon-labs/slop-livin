@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ move  →/← expand  Enter open/confirm  ⌫ mark delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit                                                                                    "
+"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit                                                                             "
