@@ -115,16 +115,102 @@ fn report_matches_fixture_and_reconciles() {
         .expect("loose file unowned row");
     assert_eq!(loose_row.bytes, fx.loose_file_bytes);
 
-    // the docker image with no compose-project join must not be attributed.
-    let docker_unjoined = r
+    // aaaa: compose-project label matches the checkout name -> joined,
+    // High confidence, under the checkout's main worktree.
+    let aaaa_row = main_worktree
+        .artifacts
+        .iter()
+        .find(|a| a.path.to_string_lossy().contains("fixture/with-project"))
+        .expect("compose-label-joined docker image row");
+    assert_eq!(
+        aaaa_row.kind,
+        slop_livin_core::report::ArtifactKind::DockerImage
+    );
+    assert_eq!(
+        aaaa_row.confidence,
+        slop_livin_core::entities::Confidence::High
+    );
+    assert_eq!(aaaa_row.bytes, 8_388_608);
+
+    // bbbb: unlabeled, named exactly like the project -> unowned. Name
+    // similarity is never evidence.
+    let bbbb_row = r
         .unowned
         .iter()
-        .find(|u| u.path_or_object.contains("bbbb"))
-        .expect("unjoined docker image unowned row");
+        .find(|u| u.path_or_object == format!("{}:latest", fx.checkout_name))
+        .expect("unlabeled same-name-as-project docker image unowned row");
     assert_eq!(
-        docker_unjoined.reason,
-        slop_livin_core::report::UnownedReason::OwnedByNothing
+        bbbb_row.reason,
+        slop_livin_core::report::UnownedReason::DockerNoJoin
     );
+    assert!(
+        !main_worktree.artifacts.iter().any(|a| {
+            a.kind == slop_livin_core::report::ArtifactKind::DockerImage
+                && a.path.to_string_lossy().contains(&fx.checkout_name)
+                && !a.path.to_string_lossy().contains("fixture/")
+        }),
+        "name similarity alone must never attribute a docker object to a project"
+    );
+
+    // cccc: org.opencontainers.image.source matches the checkout's git
+    // remote -> joined, Medium confidence.
+    let cccc_row = main_worktree
+        .artifacts
+        .iter()
+        .find(|a| a.path.to_string_lossy().contains("fixture/source-match"))
+        .expect("image.source-joined docker image row");
+    assert_eq!(
+        cccc_row.confidence,
+        slop_livin_core::entities::Confidence::Medium
+    );
+    assert!(
+        !fx.checkout_remote.is_empty(),
+        "fixture must configure a checkout remote for the image.source join to match"
+    );
+
+    // dddd: org.opencontainers.image.source points elsewhere -> unowned,
+    // with a base_image_source note, never attributed to any project.
+    let dddd_row = r
+        .unowned
+        .iter()
+        .find(|u| u.path_or_object.contains("fixture/source-elsewhere"))
+        .expect("elsewhere-sourced docker image unowned row");
+    assert_eq!(
+        dddd_row.reason,
+        slop_livin_core::report::UnownedReason::DockerNoJoin
+    );
+    assert!(
+        dddd_row
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("base_image_source")),
+        "elsewhere-sourced image must carry a base_image_source note: {dddd_row:?}"
+    );
+
+    // build-cache entry and volume with no join evidence stay unowned.
+    let build_cache_row = r
+        .unowned
+        .iter()
+        .find(|u| u.path_or_object.contains("buildcache-no-evidence"))
+        .expect("unowned build cache row");
+    assert_eq!(
+        build_cache_row.reason,
+        slop_livin_core::report::UnownedReason::DockerNoJoin
+    );
+    let volume_row = r
+        .unowned
+        .iter()
+        .find(|u| u.path_or_object == "fixture-unowned-volume")
+        .expect("unowned volume row");
+    assert_eq!(
+        volume_row.reason,
+        slop_livin_core::report::UnownedReason::DockerNoJoin
+    );
+
+    // Docker bytes are tracked separately, never folded into the
+    // filesystem walk's reconciliation.
+    assert!(r.reconciliation.docker_attributed > 0);
+    assert!(r.reconciliation.docker_unowned > 0);
 
     // (c) totals reconcile.
     assert_eq!(

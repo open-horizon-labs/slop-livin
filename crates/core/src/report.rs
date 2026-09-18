@@ -40,7 +40,7 @@ pub enum ArtifactKind {
     /// `Source` row per worktree.
     Source,
     DockerImage,
-    DockerCache,
+    DockerBuildCache,
     DockerVolume,
     Loose,
     Unknown,
@@ -69,6 +69,12 @@ pub enum UnownedReason {
     /// recorded as 0; the row exists so the count is visible instead of
     /// silently dropped.
     PermissionDenied,
+    /// A Docker object (image/build-cache/volume) with no explicit join
+    /// evidence: no matching compose-project label, no label whose value
+    /// is a path inside a discovered worktree, and no
+    /// `org.opencontainers.image.source` matching a project's git remote.
+    /// Name similarity to a project is never evidence.
+    DockerNoJoin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +116,16 @@ pub struct UnownedRow {
     pub path_or_object: String,
     pub bytes: u64,
     pub reason: UnownedReason,
+    /// Set for a `DockerNoJoin` image/volume: the object's `SharedSize`,
+    /// shown alongside `bytes` (its `UniqueSize`) so the row's total
+    /// footprint is visible even though only the unique bytes count.
+    #[serde(default)]
+    pub shared_bytes: Option<u64>,
+    /// Set when an `org.opencontainers.image.source` label was read but
+    /// matched no discovered project's git remote: the base image's
+    /// source repo, recorded for visibility, never used to attribute.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +134,14 @@ pub struct Reconciliation {
     pub unowned: u64,
     pub walked_total: u64,
     pub du_total: Option<u64>,
+    /// Bytes of Docker objects joined to a project/worktree. Tracked
+    /// separately from `attributed`/`walked_total`: Docker objects are
+    /// not on the walked filesystem.
+    pub docker_attributed: u64,
+    /// Bytes of Docker objects with no join evidence (`DockerNoJoin`).
+    /// Tracked separately from `unowned`/`walked_total` for the same
+    /// reason.
+    pub docker_unowned: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +151,10 @@ pub struct Report {
     pub projects: Vec<ProjectRow>,
     pub unowned: Vec<UnownedRow>,
     pub reconciliation: Reconciliation,
+    /// Coverage notes that are not per-row facts, e.g. "docker:
+    /// unavailable (...)" when the daemon could not be reached.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// R2 discovers projects (checkouts and linked worktrees) under `root`
@@ -167,9 +195,17 @@ pub fn report_with(
     // first worktree's own name (e.g. only a linked worktree was in scope).
     let mut projects: BTreeMap<String, ProjectRow> = BTreeMap::new();
     let mut worktree_paths: Vec<(PathBuf, String)> = Vec::new();
+    // project_id -> normalized remote URL, first one seen for that project.
+    let mut project_remotes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for dw in discovered {
         let worktree_id = id_for(&dw.path.display().to_string());
         worktree_paths.push((dw.path.clone(), worktree_id.clone()));
+        if let Some(remote) = dw.remote_url.as_deref().and_then(normalize_remote) {
+            project_remotes
+                .entry(dw.project_id.clone())
+                .or_insert(remote);
+        }
         let entry = projects
             .entry(dw.project_id.clone())
             .or_insert_with(|| ProjectRow {
@@ -203,14 +239,25 @@ pub fn report_with(
     }
 
     let mut unowned = attribution.unowned;
-    let mut docker_unowned_bytes = 0u64;
-    if let Some(facts_path) = docker_facts {
-        let project_names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
-        let (docker_unowned, bytes) = docker_unjoined_images(facts_path, &project_names);
-        docker_unowned_bytes += bytes;
-        unowned.extend(docker_unowned);
+    let mut notes: Vec<String> = Vec::new();
+    let facts = crate::docker::load(docker_facts);
+    if let Some(reason) = &facts.unavailable {
+        notes.push(reason.clone());
     }
-    let _ = docker_unowned_bytes; // excluded from reconciliation: not part of the fs walk.
+    let join = join_docker_facts(&facts, &projects, &worktree_paths, &project_remotes);
+    for (worktree_id, mut rows) in join.rows_by_worktree {
+        for project in &mut projects {
+            for worktree in &mut project.worktrees {
+                if worktree.worktree_id == worktree_id {
+                    worktree.artifacts.append(&mut rows);
+                    break;
+                }
+            }
+        }
+    }
+    unowned.extend(join.unowned);
+    let docker_attributed_bytes = join.attributed_bytes;
+    let docker_unowned_bytes = join.unowned_bytes;
 
     let du = if verify_du {
         crate::attribution::du_total(root)
@@ -247,53 +294,220 @@ pub fn report_with(
             unowned: attribution.unowned_total,
             walked_total: attribution.walked_total,
             du_total: du,
+            docker_attributed: docker_attributed_bytes,
+            docker_unowned: docker_unowned_bytes,
         },
+        notes,
     })
 }
 
-/// Minimal Docker-facts read for the one join R3's golden test pins:
-/// an image whose `com.docker.compose.project` label does not match any
-/// discovered project name is unowned, reason `OwnedByNothing`. Images
-/// that *do* join a project, cache/volume rows, and growth accounting
-/// are full Docker-join work for a later slice (R4/R5 per the epic) and
-/// are intentionally left alone here.
-fn docker_unjoined_images(facts_path: &Path, project_names: &[&str]) -> (Vec<UnownedRow>, u64) {
-    let Ok(text) = std::fs::read_to_string(facts_path) else {
-        return (Vec::new(), 0);
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (Vec::new(), 0);
-    };
-    let mut rows = Vec::new();
-    let mut bytes_total = 0u64;
-    if let Some(images) = value.get("Images").and_then(|v| v.as_array()) {
-        for image in images {
-            let labels = image.get("Labels").and_then(|v| v.as_str()).unwrap_or("");
-            let joined = project_names
-                .iter()
-                .any(|name| labels.contains(&format!("com.docker.compose.project={name}")));
-            if joined {
-                continue;
-            }
-            let id = image
-                .get("ID")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown-image")
-                .to_string();
-            let bytes = image
-                .get("Size")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            bytes_total += bytes;
-            rows.push(UnownedRow {
-                path_or_object: id,
-                bytes,
-                reason: UnownedReason::OwnedByNothing,
-            });
+/// Normalizes a git remote URL for comparison: strips a trailing `.git`,
+/// collapses the `git@host:path` scp-like ssh form and any `scheme://`
+/// form down to `host/path`, and lowercases the result.
+fn normalize_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let stripped = url.strip_suffix(".git").unwrap_or(url);
+    if let Some(rest) = stripped.strip_prefix("git@") {
+        return Some(rest.replacen(':', "/", 1).to_lowercase());
+    }
+    if let Some(idx) = stripped.find("://") {
+        let rest = &stripped[idx + 3..];
+        let rest = rest.rsplit('@').next().unwrap_or(rest);
+        return Some(rest.to_lowercase());
+    }
+    Some(stripped.to_lowercase())
+}
+
+/// Result of joining Docker facts to discovered projects/worktrees.
+struct DockerJoinResult {
+    rows_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>>,
+    unowned: Vec<UnownedRow>,
+    attributed_bytes: u64,
+    unowned_bytes: u64,
+}
+
+/// One candidate Docker object (image, build-cache entry, or volume)
+/// being joined, in a shape common to all three.
+struct JoinCandidate {
+    reference: String,
+    labels: std::collections::HashMap<String, String>,
+    unique_bytes: u64,
+    shared_bytes: u64,
+    kind: ArtifactKind,
+}
+
+enum JoinOutcome {
+    Joined {
+        worktree_id: String,
+        confidence: Confidence,
+    },
+    Unowned {
+        note: Option<String>,
+    },
+}
+
+/// Applies the R5 join rules, explicit evidence only:
+/// 1. `com.docker.compose.project` label == a discovered project name:
+///    join that project's main worktree, High confidence.
+/// 2. Any label whose value is an absolute path inside a discovered
+///    worktree: join that worktree, High confidence.
+/// 3. `org.opencontainers.image.source`, normalized, matches a project's
+///    normalized git remote: join that project's main worktree, Medium
+///    confidence. A non-matching source is recorded as a note, never
+///    used to attribute.
+/// 4. Otherwise: unowned, reason `DockerNoJoin`. Name similarity to a
+///    project is never evidence for any of these rules.
+fn join_one(
+    candidate: &JoinCandidate,
+    projects: &[ProjectRow],
+    worktree_paths: &[(PathBuf, String)],
+    project_remotes: &std::collections::HashMap<String, String>,
+) -> JoinOutcome {
+    fn main_worktree_id(project: &ProjectRow) -> Option<String> {
+        project
+            .worktrees
+            .iter()
+            .find(|w| w.kind == WorktreeKind::Main)
+            .or_else(|| project.worktrees.first())
+            .map(|w| w.worktree_id.clone())
+    }
+
+    if let Some(project_label) = candidate.labels.get("com.docker.compose.project")
+        && let Some(project) = projects.iter().find(|p| &p.name == project_label)
+        && let Some(worktree_id) = main_worktree_id(project)
+    {
+        return JoinOutcome::Joined {
+            worktree_id,
+            confidence: Confidence::High,
+        };
+    }
+
+    for value in candidate.labels.values() {
+        if !value.starts_with('/') {
+            continue;
+        }
+        let value_path = Path::new(value);
+        if let Some((_, worktree_id)) = worktree_paths
+            .iter()
+            .filter(|(p, _)| value_path.starts_with(p))
+            .max_by_key(|(p, _)| p.as_os_str().len())
+        {
+            return JoinOutcome::Joined {
+                worktree_id: worktree_id.clone(),
+                confidence: Confidence::High,
+            };
         }
     }
-    (rows, bytes_total)
+
+    if let Some(source) = candidate.labels.get("org.opencontainers.image.source") {
+        if let Some(normalized) = normalize_remote(source) {
+            if let Some((project_id, _)) = project_remotes.iter().find(|(_, r)| **r == normalized)
+                && let Some(project) = projects.iter().find(|p| &p.project_id == project_id)
+                && let Some(worktree_id) = main_worktree_id(project)
+            {
+                return JoinOutcome::Joined {
+                    worktree_id,
+                    confidence: Confidence::Medium,
+                };
+            }
+            return JoinOutcome::Unowned {
+                note: Some(format!("base_image_source={source}")),
+            };
+        }
+        return JoinOutcome::Unowned {
+            note: Some(format!("base_image_source={source}")),
+        };
+    }
+
+    JoinOutcome::Unowned { note: None }
+}
+
+fn join_docker_facts(
+    facts: &crate::docker::DockerFacts,
+    projects: &[ProjectRow],
+    worktree_paths: &[(PathBuf, String)],
+    project_remotes: &std::collections::HashMap<String, String>,
+) -> DockerJoinResult {
+    let mut result = DockerJoinResult {
+        rows_by_worktree: std::collections::HashMap::new(),
+        unowned: Vec::new(),
+        attributed_bytes: 0,
+        unowned_bytes: 0,
+    };
+
+    let mut candidates: Vec<JoinCandidate> = Vec::new();
+    for image in &facts.images {
+        candidates.push(JoinCandidate {
+            reference: image
+                .repo_tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| image.id.clone()),
+            labels: image.labels.clone(),
+            unique_bytes: image.unique_bytes,
+            shared_bytes: image.shared_bytes,
+            kind: ArtifactKind::DockerImage,
+        });
+    }
+    for cache in &facts.build_cache {
+        candidates.push(JoinCandidate {
+            reference: cache.id.clone(),
+            labels: std::collections::HashMap::new(),
+            unique_bytes: cache.bytes,
+            shared_bytes: 0,
+            kind: ArtifactKind::DockerBuildCache,
+        });
+    }
+    for volume in &facts.volumes {
+        candidates.push(JoinCandidate {
+            reference: volume.name.clone(),
+            labels: volume.labels.clone(),
+            unique_bytes: volume.bytes,
+            shared_bytes: 0,
+            kind: ArtifactKind::DockerVolume,
+        });
+    }
+
+    let observed_at = crate::entities::now();
+    for candidate in candidates {
+        match join_one(&candidate, projects, worktree_paths, project_remotes) {
+            JoinOutcome::Joined {
+                worktree_id,
+                confidence,
+            } => {
+                result.attributed_bytes += candidate.unique_bytes;
+                result
+                    .rows_by_worktree
+                    .entry(worktree_id)
+                    .or_default()
+                    .push(ArtifactRow {
+                        kind: candidate.kind,
+                        path: PathBuf::from(candidate.reference),
+                        bytes: candidate.unique_bytes,
+                        growth_bytes: None,
+                        regrowth_count: 0,
+                        observed_at,
+                        confidence,
+                        source: Source::new("docker.system_df"),
+                    });
+            }
+            JoinOutcome::Unowned { note } => {
+                result.unowned_bytes += candidate.unique_bytes;
+                result.unowned.push(UnownedRow {
+                    path_or_object: candidate.reference,
+                    bytes: candidate.unique_bytes,
+                    reason: UnownedReason::DockerNoJoin,
+                    shared_bytes: Some(candidate.shared_bytes),
+                    note,
+                });
+            }
+        }
+    }
+
+    result
 }
 
 pub fn to_json(report: &Report) -> Result<String> {

@@ -33,6 +33,37 @@ pub struct DiscoveredWorktree {
     /// Where this checkout/worktree lives on disk. An attribute, not identity.
     pub path: PathBuf,
     pub kind: WorktreeKind,
+    /// The project's `origin` remote URL, read from the shared object
+    /// store's `config` file (a linked worktree and a submodule both read
+    /// their own common/gitdir's `config`). `None` when there is no
+    /// `[remote "origin"]` section, e.g. a checkout with no remote set.
+    pub remote_url: Option<String>,
+}
+
+/// Reads `[remote "origin"] url = ...` out of a git `config` file living in
+/// `git_dir` (a `.git` directory, or a linked worktree's resolved gitdir's
+/// common dir). Returns `None` if the file is missing, unreadable, or has
+/// no origin remote configured.
+fn read_origin_url(git_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(git_dir.join("config")).ok()?;
+    let mut in_origin_remote = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_origin_remote = trimmed.eq_ignore_ascii_case(r#"[remote "origin"]"#);
+            continue;
+        }
+        if in_origin_remote
+            && let Some(rest) = trimmed.strip_prefix("url")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Recurses under `root` for `.git` directories/files and returns one
@@ -118,11 +149,13 @@ fn checkout_name(dir: &Path) -> String {
 fn classify_main_checkout(dir: &Path, git_dir: &Path) -> Option<DiscoveredWorktree> {
     let common = fs::canonicalize(git_dir).ok()?;
     let project_id = id_for(&common.display().to_string());
+    let remote_url = read_origin_url(&common);
     Some(DiscoveredWorktree {
         project_id,
         project_name: checkout_name(dir),
         path: dir.to_path_buf(),
         kind: WorktreeKind::Main,
+        remote_url,
     })
 }
 
@@ -148,19 +181,23 @@ fn classify_git_file(worktree_dir: &Path, git_file: &Path) -> Option<DiscoveredW
             .parent()
             .map(checkout_name)
             .unwrap_or_else(|| checkout_name(worktree_dir));
+        let remote_url = read_origin_url(&common);
         Some(DiscoveredWorktree {
             project_id,
             project_name,
             path: worktree_dir.to_path_buf(),
             kind: WorktreeKind::Linked,
+            remote_url,
         })
     } else {
         let project_id = id_for(&gitdir_path.display().to_string());
+        let remote_url = read_origin_url(&gitdir_path);
         Some(DiscoveredWorktree {
             project_id,
             project_name: checkout_name(worktree_dir),
             path: worktree_dir.to_path_buf(),
             kind: WorktreeKind::Main,
+            remote_url,
         })
     }
 }

@@ -18,6 +18,10 @@ pub struct Fixture {
     pub root: PathBuf,
     pub checkout: PathBuf,
     pub checkout_name: String,
+    /// Only read by `report_golden.rs` (the image.source join case); other
+    /// fixture consumers don't need it, so it's allowed to go unused there.
+    #[allow(dead_code)]
+    pub checkout_remote: String,
     pub linked_worktree: PathBuf,
     pub node_modules: PathBuf,
     pub node_modules_bytes: u64,
@@ -105,6 +109,8 @@ pub fn build(tmp: &Path) -> Fixture {
         .and_then(|n| n.to_str())
         .expect("checkout has a name")
         .to_string();
+    let checkout_remote = "https://example.com/fixture-org/checkout.git";
+    run_git(&checkout, &["remote", "add", "origin", checkout_remote]);
 
     // node_modules/: ~3 MB across several files
     let node_modules = checkout.join("node_modules");
@@ -162,7 +168,17 @@ pub fn build(tmp: &Path) -> Fixture {
     write_pattern(&loose_file, loose_file_bytes);
 
     // --- mocked `docker system df -v` JSON ---
+    // Six Docker objects exercise every R5 join rule:
+    //   aaaa - compose-project label matches the checkout -> joined, High.
+    //   bbbb - unlabeled, named exactly like the project -> unowned;
+    //          name similarity is never evidence.
+    //   cccc - image.source matches the checkout's git remote -> joined, Medium.
+    //   dddd - image.source points elsewhere -> unowned, with a
+    //          base_image_source note, never attributed.
+    //   a build-cache entry with no labels -> unowned (no evidence).
+    //   a volume with no labels -> unowned (no evidence).
     let docker_facts = tmp.join("docker_system_df_v.json");
+    let elsewhere_source = "https://example.com/some-other-org/unrelated.git";
     let docker_json = serde_json::json!({
         "Images": [
             {
@@ -176,12 +192,43 @@ pub fn build(tmp: &Path) -> Fixture {
             },
             {
                 "ID": "sha256:bbbb000000000000000000000000000000000000000000000000000000bb",
-                "Repository": "fixture/no-join",
+                "Repository": checkout_name.clone(),
                 "Tag": "latest",
                 "Size": "5242880",
                 "SharedSize": "1048576",
                 "UniqueSize": "4194304",
                 "Labels": "",
+            },
+            {
+                "ID": "sha256:cccc000000000000000000000000000000000000000000000000000000cc",
+                "Repository": "fixture/source-match",
+                "Tag": "latest",
+                "Size": "3145728",
+                "SharedSize": "1048576",
+                "UniqueSize": "2097152",
+                "Labels": format!("org.opencontainers.image.source={checkout_remote}"),
+            },
+            {
+                "ID": "sha256:dddd000000000000000000000000000000000000000000000000000000dd",
+                "Repository": "fixture/source-elsewhere",
+                "Tag": "latest",
+                "Size": "2097152",
+                "SharedSize": "524288",
+                "UniqueSize": "1572864",
+                "Labels": format!("org.opencontainers.image.source={elsewhere_source}"),
+            }
+        ],
+        "BuildCache": [
+            {
+                "ID": "buildcache-no-evidence-0001",
+                "Size": "1048576",
+            }
+        ],
+        "Volumes": [
+            {
+                "Name": "fixture-unowned-volume",
+                "Labels": "",
+                "Size": "262144",
             }
         ]
     });
@@ -195,6 +242,7 @@ pub fn build(tmp: &Path) -> Fixture {
         root: tmp.to_path_buf(),
         checkout,
         checkout_name,
+        checkout_remote: checkout_remote.to_string(),
         linked_worktree,
         node_modules,
         node_modules_bytes,
