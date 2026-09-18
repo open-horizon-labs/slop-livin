@@ -4,7 +4,7 @@
 #[path = "fixture/mod.rs"]
 mod fixture;
 
-use slop_livin_core::report::{ArtifactKind, report_with};
+use slop_livin_core::report::{ArtifactKind, report_with, report_with_observe};
 use std::fs;
 
 #[test]
@@ -232,4 +232,78 @@ fn golden_report_without_observe_flag_stays_read_only() {
             }
         }
     }
+}
+
+#[test]
+fn no_observe_still_reports_growth_from_an_existing_store() {
+    // Issue #32 item 5: growth must come from the store regardless of
+    // whether *this* call observed. Two real (`observe: true`)
+    // observations establish a store with history, then a read-only
+    // (`observe: false`, i.e. `--no-observe`) call over the grown state
+    // must still show the growth -- not `None`/`-` -- and must not have
+    // written a third observation into the store.
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+
+    report_with_observe(&fx.root, None, false, Some(store.path()), Some("1h"), true)
+        .expect("first observation");
+
+    let grow_bytes = 3 * 1024 * 1024;
+    fs::write(
+        fx.node_modules.join("no-observe-probe"),
+        vec![b'g'; grow_bytes],
+    )
+    .expect("write growth probe");
+
+    report_with_observe(&fx.root, None, false, Some(store.path()), Some("1h"), true)
+        .expect("second observation");
+
+    let volume_dir_count_before = fs::read_dir(store.path())
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+
+    // Grow again, but this time call read-only.
+    let grow_more = 1024 * 1024;
+    fs::write(
+        fx.node_modules.join("no-observe-probe-2"),
+        vec![b'h'; grow_more],
+    )
+    .expect("write second growth probe");
+
+    let readonly =
+        report_with_observe(&fx.root, None, false, Some(store.path()), Some("1h"), false)
+            .expect("read-only report");
+
+    let checkout = readonly
+        .projects
+        .iter()
+        .find(|p| p.name == fx.checkout_name)
+        .expect("checkout project");
+    let main = checkout
+        .worktrees
+        .iter()
+        .find(|w| w.path == fx.checkout)
+        .expect("main worktree");
+    let node_modules_row = main
+        .artifacts
+        .iter()
+        .find(|a| a.path == fx.node_modules)
+        .expect("node_modules row");
+    assert!(
+        node_modules_row.growth_bytes.is_some(),
+        "no-observe report must still show growth from the store's existing history: {node_modules_row:?}"
+    );
+    assert!(
+        node_modules_row.growth_bytes.unwrap() > 0,
+        "growth must be positive after two real growth events: {node_modules_row:?}"
+    );
+
+    let volume_dir_count_after = fs::read_dir(store.path())
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        volume_dir_count_before, volume_dir_count_after,
+        "a read-only (--no-observe) call must not persist a new observation"
+    );
 }

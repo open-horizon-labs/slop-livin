@@ -320,6 +320,69 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
     out
 }
 
+/// Read-only counterpart to [`observe_and_annotate`]: annotates each
+/// artifact row in `projects` with `growth_bytes`/`regrowth_count` from
+/// whatever history the store already has, without writing a new
+/// observation (no `current.parquet` update, no delta file). This is
+/// what `--no-observe` and any other read-only report call use: growth
+/// is a property of the store's existing observations, not of whether
+/// *this* call is the one adding a new one. A row with no prior
+/// observation in the store keeps `growth_bytes: None`, same as the
+/// first-ever `observe_and_annotate` call would leave it.
+pub fn annotate_readonly(
+    slop_livin_dir: &Path,
+    volume_id: u64,
+    projects: &mut [ProjectRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    let current_file = current_path(&dir);
+    if !current_file.exists() {
+        // Store has never been observed for this volume; nothing to
+        // annotate from.
+        return Ok(());
+    }
+    let current_rows = read_rows(&current_file)?;
+    let current_by_key: HashMap<String, &StoredRow> = current_rows
+        .iter()
+        .map(|r| {
+            (
+                row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path),
+                r,
+            )
+        })
+        .collect();
+
+    let target_time = observed_at.saturating_sub(since_secs);
+    for project in projects.iter_mut() {
+        for worktree in project.worktrees.iter_mut() {
+            for artifact in worktree.artifacts.iter_mut() {
+                let rel_path = artifact
+                    .path
+                    .strip_prefix(&worktree.path)
+                    .unwrap_or(&artifact.path)
+                    .to_path_buf();
+                let kind = format!("{:?}", artifact.kind);
+                let key = row_key(
+                    &project.project_id,
+                    &worktree.worktree_id,
+                    &kind,
+                    &rel_path.display().to_string(),
+                );
+                let history = load_history(&dir, &key, retention_days, observed_at)?;
+                artifact.growth_bytes = growth_since(&history, artifact.bytes, target_time);
+                artifact.regrowth_count = current_by_key
+                    .get(&key)
+                    .map(|r| r.regrowth_count)
+                    .unwrap_or(0);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Persists this observation's rows (current-state + delta) and
 /// annotates each artifact row in `projects` with `growth_bytes` (since
 /// `since_secs` ago) and `regrowth_count`.
@@ -620,6 +683,7 @@ mod tests {
         ProjectRow {
             project_id: "proj-1".to_string(),
             name: "proj".to_string(),
+            remote: None,
             worktrees: vec![WorktreeRow {
                 worktree_id: "wt-1".to_string(),
                 path: worktree_root.to_path_buf(),
@@ -705,6 +769,7 @@ mod tests {
         let mut absent: Vec<ProjectRow> = vec![ProjectRow {
             project_id: "proj-1".to_string(),
             name: "proj".to_string(),
+            remote: None,
             worktrees: vec![WorktreeRow {
                 worktree_id: "wt-1".to_string(),
                 path: root.clone(),

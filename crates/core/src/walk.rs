@@ -383,6 +383,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 reason: UnownedReason::PermissionDenied,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             });
             return;
         }
@@ -468,6 +469,7 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
         reason,
         shared_bytes: None,
         note: None,
+        docker_kind: None,
     });
 }
 
@@ -558,6 +560,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 reason,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             });
         }
     }

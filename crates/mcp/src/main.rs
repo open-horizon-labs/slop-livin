@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::{Value, json};
+use slop_livin_core::growth::{DEFAULT_SINCE, load_config, parse_duration_secs};
 use slop_livin_core::report::{ArtifactKind, Report, UnownedReason, report_with};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -22,6 +23,25 @@ fn run_report(root: &str, since: Option<&str>) -> Result<Report> {
         Some(&slop_livin_dir()),
         since,
     )
+}
+
+/// The `since` window this call actually used: the caller's explicit
+/// value if it parses, else the store's configured default, else the
+/// hard-coded default -- the same resolution order `report_with` applies
+/// internally. Every MCP result echoes this back (never just the raw,
+/// possibly-absent argument) so a caller can see what window its numbers
+/// actually reflect.
+fn effective_since(since: Option<&str>) -> String {
+    if let Some(s) = since
+        && parse_duration_secs(s).is_some()
+    {
+        return s.to_string();
+    }
+    let config = load_config(&slop_livin_dir());
+    if parse_duration_secs(&config.since).is_some() {
+        return config.since;
+    }
+    DEFAULT_SINCE.to_string()
 }
 
 fn kind_label(kind: &ArtifactKind) -> &'static str {
@@ -67,7 +87,9 @@ fn tool_report(params: &Value) -> Result<Value> {
         .map(String::from);
 
     let r = run_report(&root, since.as_deref())?;
-    let value = serde_json::to_value(&r)?;
+    let mut value = serde_json::to_value(&r)?;
+    value["since"] = json!(effective_since(since.as_deref()));
+    value["index_refreshed"] = json!(true);
     if let Some(name) = project {
         let projects = value
             .get("projects")
@@ -78,12 +100,81 @@ fn tool_report(params: &Value) -> Result<Value> {
             .into_iter()
             .filter(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()))
             .collect();
-        let mut scoped = value.clone();
-        scoped["projects"] = json!(filtered);
-        Ok(scoped)
-    } else {
-        Ok(value)
+        value["projects"] = json!(filtered);
     }
+    Ok(value)
+}
+
+/// `list_projects` tool: name, id, total bytes, growth, checkout+worktree
+/// count, and remote for every discovered project, ranked by growth then
+/// bytes desc -- the same ordering `render_overview` uses -- so an agent
+/// can get the ranked project list in one call instead of walking the
+/// full `report` tree itself.
+fn tool_list_projects(params: &Value) -> Result<Value> {
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or(".")
+        .to_string();
+    let since = args.get("since").and_then(Value::as_str).map(String::from);
+
+    let r = run_report(&root, since.as_deref())?;
+
+    let mut rows: Vec<Value> = r
+        .projects
+        .iter()
+        .map(|p| {
+            let checkout_count = p
+                .worktrees
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        w.kind,
+                        slop_livin_core::report::WorktreeKind::Main
+                            | slop_livin_core::report::WorktreeKind::Clone
+                    )
+                })
+                .count();
+            let worktree_count = p.worktrees.len();
+            let mut bytes = 0u64;
+            let mut growth: Option<i64> = None;
+            for wt in &p.worktrees {
+                for a in &wt.artifacts {
+                    bytes += a.bytes;
+                    if let Some(g) = a.growth_bytes {
+                        growth = Some(growth.unwrap_or(0) + g);
+                    }
+                }
+            }
+            json!({
+                "name": p.name,
+                "project_id": p.project_id,
+                "bytes": bytes,
+                "growth_bytes": growth,
+                "checkout_count": checkout_count,
+                "worktree_count": worktree_count,
+                "remote": p.remote,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ga = a["growth_bytes"].as_i64().unwrap_or(i64::MIN);
+        let gb = b["growth_bytes"].as_i64().unwrap_or(i64::MIN);
+        gb.cmp(&ga).then_with(|| {
+            b["bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["bytes"].as_u64().unwrap_or(0))
+        })
+    });
+
+    Ok(json!({
+        "projects": rows,
+        "observed_at": r.observed_at,
+        "since": effective_since(since.as_deref()),
+        "index_refreshed": true,
+    }))
 }
 
 /// `what_grew` tool: rows with growth > 0 across every project/worktree/
@@ -92,12 +183,28 @@ fn tool_report(params: &Value) -> Result<Value> {
 /// this call refreshed the growth index).
 fn tool_what_grew(params: &Value) -> Result<Value> {
     let args = params.get("arguments").cloned().unwrap_or_default();
-    let root = args
-        .get("root")
-        .and_then(Value::as_str)
-        .unwrap_or(".")
-        .to_string();
-    let since = args.get("since").and_then(Value::as_str).map(String::from);
+    // `root` and `since` are declared `required` in this tool's schema
+    // (unlike `report`, which defaults both), but a schema is advisory
+    // to the *client*: nothing on this side previously enforced it, so a
+    // caller that omitted `root` silently got a report scanned against
+    // the MCP server's own working directory instead of an error --
+    // which reads as "growth exists but `what_grew` returned an empty
+    // `grown: []`" (issue #32 item 4) rather than the missing-argument
+    // mistake it actually is. Refusing here turns that into a visible,
+    // actionable error instead of a silent wrong-root scan.
+    let root = match args.get("root").and_then(Value::as_str) {
+        Some(root) if !root.is_empty() => root.to_string(),
+        _ => {
+            return Ok(json!({"state":"error","cause":"missing required argument \"root\""}));
+        }
+    };
+    let since = match args.get("since").and_then(Value::as_str) {
+        Some(since) if !since.is_empty() => since.to_string(),
+        _ => {
+            return Ok(json!({"state":"error","cause":"missing required argument \"since\""}));
+        }
+    };
+    let since = Some(since);
 
     let r = run_report(&root, since.as_deref())?;
 
@@ -150,6 +257,7 @@ fn tool_what_grew(params: &Value) -> Result<Value> {
             "attributed_total": r.reconciliation.attributed,
             "permission_denied_count": permission_denied_count,
             "observed_at": r.observed_at,
+            "since": effective_since(since.as_deref()),
             "index_refreshed": true,
         },
     }))
@@ -183,6 +291,14 @@ fn main() -> Result<()> {
                             "root":{"type":"string","description":"Root directory to report on"},
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"}
                         }}
+                    },
+                    {
+                        "name":"list_projects",
+                        "description":"Ranked list of every discovered project: name, id, total bytes, growth, checkout+worktree count, and remote. One call instead of walking the full report tree.",
+                        "inputSchema":{"type":"object","properties":{
+                            "root":{"type":"string","description":"Root directory to report on (default: '.')"},
+                            "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"}
+                        }}
                     }
                 ]})
             }
@@ -193,6 +309,8 @@ fn main() -> Result<()> {
                     "report" => tool_report(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     "what_grew" => tool_what_grew(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "list_projects" => tool_list_projects(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     _ => json!({"state":"unsupported","cause":"unknown tool"}),
                 };
