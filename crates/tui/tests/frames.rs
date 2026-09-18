@@ -135,6 +135,9 @@ fn fixture_report() -> Report {
             docker_unowned: 0,
         },
         notes: vec![],
+        series_by_key: Default::default(),
+        total_series: Vec::new(),
+        series_window_secs: 0,
     }
 }
 
@@ -370,6 +373,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         kind: None,
         worktree: Some(m),
         track: None,
+        series: None,
         collapsed_children: None,
         expandable: false,
     };

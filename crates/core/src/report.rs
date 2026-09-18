@@ -283,6 +283,17 @@ pub struct Report {
     pub projects: Vec<ProjectRow>,
     pub unowned: Vec<UnownedRow>,
     pub reconciliation: Reconciliation,
+    /// Byte history per artifact row over the growth window, sampled into
+    /// equal buckets, keyed by `growth::series_key`. Read from the
+    /// reverse-delta store; empty when there is no store.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub series_by_key: std::collections::HashMap<String, Vec<u64>>,
+    /// Sum of every row's series per bucket: the whole root over time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub total_series: Vec<u64>,
+    /// Seconds each series spans (the effective growth window).
+    #[serde(default)]
+    pub series_window_secs: u64,
     /// Coverage notes that are not per-row facts, e.g. "docker:
     /// unavailable (...)" when the daemon could not be reached.
     #[serde(default)]
@@ -989,11 +1000,33 @@ pub fn report_full_mode_with_source(
     if trace {
         eprintln!("[trace] annotate_tracking: {:?}", t_track.elapsed());
     }
+    // History for sparklines, from the store's current + reverse deltas.
+    // Window: the effective growth window (asked, or the whole history).
+    let (series_by_key, total_series, series_window_secs) = match store_dir {
+        Some(dir) => {
+            let vol = crate::growth::volume_store_dir(dir, root);
+            let now_s = crate::entities::now();
+            let asked = since_override
+                .and_then(crate::growth::parse_duration_secs)
+                .unwrap_or_else(|| {
+                    crate::growth::parse_duration_secs(&crate::growth::load_config(dir).since)
+                        .unwrap_or(86_400)
+                });
+            let hist = crate::growth::history_span_secs(&vol, now_s).unwrap_or(asked);
+            let window = asked.min(hist).max(60);
+            let (s, t) = crate::growth::history_series(&vol, window, 24, now_s);
+            (s, t, window)
+        }
+        None => (Default::default(), Vec::new(), 0),
+    };
     let report = Report {
         observed_at,
         root: root.to_path_buf(),
         projects,
         unowned,
+        series_by_key,
+        total_series,
+        series_window_secs,
         reconciliation: Reconciliation {
             attributed: attribution.attributed_total,
             unowned: attribution.unowned_total,

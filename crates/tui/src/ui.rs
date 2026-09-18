@@ -3,7 +3,9 @@
 //! DESIGN.md.
 
 use crate::app::{App, ViewKind};
-use crate::model::{growth_bar, human_bytes, human_signed_bytes, max_abs_growth, truncate_middle};
+use crate::model::{
+    growth_bar, human_bytes, human_signed_bytes, max_abs_growth, sparkline, trend, truncate_middle,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -69,9 +71,22 @@ fn header_line(app: &App) -> String {
         .unwrap_or_default();
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
+    // The whole root over the window as a sparkline with its net change.
+    let spark = if app.report.total_series.len() >= 2 {
+        let first = *app.report.total_series.first().unwrap_or(&0) as i64;
+        let last = *app.report.total_series.last().unwrap_or(&0) as i64;
+        format!(
+            "{} {}",
+            sparkline(&app.report.total_series, 12),
+            human_signed_bytes(last - first)
+        )
+    } else {
+        String::new()
+    };
     let clauses = vec![
         app.root.display().to_string(),
         format!("{obs}{since}"),
+        spark,
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),
@@ -84,7 +99,7 @@ fn header_line(app: &App) -> String {
 /// the first clause.
 pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     let mut out = String::new();
-    for (i, c) in clauses.iter().enumerate() {
+    for (i, c) in clauses.iter().filter(|c| !c.is_empty()).enumerate() {
         let candidate = if i == 0 {
             c.clone()
         } else {
@@ -124,11 +139,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, app, chunks[2]);
 
     if app.confirm_open {
-        frame.render_widget(Paragraph::new(app.confirm_summary()), chunks[3]);
+        frame.render_widget(
+            Paragraph::new(app.confirm_summary()).style(Style::default().fg(Color::Yellow)),
+            chunks[3],
+        );
     }
 
+    // The footer is the key legend for the state you are actually in.
     let footer_text = if let Some(msg) = app.refusal_active() {
         msg.to_string()
+    } else if app.confirm_open {
+        "Enter yes · Esc no".to_string()
+    } else if app.picker.is_some() {
+        "↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear".to_string()
+    } else if app.editing_filter {
+        "Tab complete · Enter apply · Esc cancel".to_string()
     } else if let Some(r) = &app.last_result {
         r.clone()
     } else {
@@ -199,7 +224,12 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
             (v, Some(p)) => format!("{} of {p}  (Esc back)", v.label()),
             (v, None) => format!("{}  (Esc back)", v.label()),
         };
-        format!("view: {scope} · filter: {}", app.filter_text)
+        let sort = match app.sort {
+            crate::model::Sort::Growth => " · sort: growth",
+            crate::model::Sort::Size => " · sort: size",
+            crate::model::Sort::None => "",
+        };
+        format!("view: {scope} · filter: {}{sort}", app.filter_text)
     };
     frame.render_widget(Paragraph::new(text), area);
     if let Some(err) = &app.filter_error {
@@ -231,7 +261,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.rows();
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("no rows match — Backspace to widen, 0 to clear"),
+            Paragraph::new("no rows match — / to change the filter, 0 to clear"),
             area,
         );
         return;
@@ -244,7 +274,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let narrow = width < 120;
     let bar_width: usize = ((width.saturating_sub(90)) / 5).clamp(8, 32);
-    let fixed = 10 + 1 + 10 + 1 + bar_width + 2 + 1;
+    let spark_width: usize = if width >= 120 { 12 } else { 0 };
+    let fixed =
+        10 + 1 + 10 + 1 + bar_width + 2 + 1 + if spark_width > 0 { spark_width + 1 } else { 0 };
     let flexible = width.saturating_sub(fixed).max(40);
     let signals_width: usize = if narrow {
         flexible / 4
@@ -280,7 +312,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         };
         let hidden = row
             .collapsed_children
-            .map(|n| format!("  ({n} hidden)"))
+            .map(|n| format!("  ▸ {n} more"))
             .unwrap_or_default();
         // DESIGN.md: "80x24 ... signals drop to a single glyph column;
         // uses width up to 200 ... signals spell out."
@@ -318,6 +350,23 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" ▕"),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::raw("▏"),
+            {
+                // History sparkline: the row's own shape over the window,
+                // coloured by its trend.
+                let (text, color) = match (&row.series, spark_width) {
+                    (Some(s), w) if w > 0 && s.len() >= 2 => (
+                        format!(" {}", sparkline(s, w)),
+                        match trend(s) {
+                            1 => Color::Green,
+                            -1 => Color::Red,
+                            _ => Color::DarkGray,
+                        },
+                    ),
+                    (_, w) if w > 0 => (" ".repeat(w + 1), Color::DarkGray),
+                    _ => (String::new(), Color::DarkGray),
+                };
+                Span::styled(text, Style::default().fg(color))
+            },
             Span::styled(
                 format!(" {signals_text}"),
                 Style::default().add_modifier(Modifier::DIM),
@@ -335,8 +384,8 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let w = area.width.min(70);
-    let h = area.height.min(15);
+    let w = area.width.min(90);
+    let h = area.height.min(22);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -357,14 +406,19 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
-        Line::from("  v, 1-5    switch view"),
-        Line::from("  g / s     sort by growth / size"),
+        Line::from(
+            "  v, 1-7    switch view (projects · tree · builds · deps · docker · kinds · unowned)",
+        ),
+        Line::from("  g / s     sort by growth / size (remembered, like the filter)"),
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),
+        Line::from("Columns: bytes · growth in window · growth bar · history sparkline · facts"),
+        Line::from("  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere"),
+        Line::from(""),
         Line::from("Filter grammar"),
-        Line::from("  growth [><] <size> in <duration>"),
-        Line::from("  kind:<k>   project:<name>"),
+        Line::from("  growth [><] <size> in <duration>   (window capped at stored history)"),
+        Line::from("  kind:<k>   project:<name>   pr:open|merged|closed|none"),
         Line::from("  idle > <duration>   merge-complete"),
     ];
     let block = Block::default()

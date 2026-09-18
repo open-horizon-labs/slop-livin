@@ -703,6 +703,72 @@ pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
 
 /// `history_span_secs` for the volume `root` lives on (the store is keyed
 /// by device id), so every surface bounds its growth windows identically.
+/// Byte history per artifact row as a step series sampled at `buckets`
+/// evenly spaced times over the last `window_secs`, read straight from
+/// the reverse-delta log: the current row gives the latest value, each
+/// delta row the value that held until the next observation. Also
+/// returns the total over all present rows per bucket. This is what a
+/// sparkline draws — no rescan, just the store.
+pub fn history_series(
+    dir: &Path,
+    window_secs: u64,
+    buckets: usize,
+    now: u64,
+) -> (HashMap<String, Vec<u64>>, Vec<u64>) {
+    let buckets = buckets.max(2);
+    let mut points: HashMap<String, Vec<(u64, u64)>> = HashMap::new(); // key -> (observed_at, bytes)
+    let mut push = |rows: Vec<StoredRow>| {
+        for r in rows {
+            let key = row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path);
+            let bytes = if r.present { r.bytes } else { 0 };
+            points.entry(key).or_default().push((r.observed_at, bytes));
+        }
+    };
+    if let Ok(rows) = read_rows(&current_path(dir)) {
+        push(rows);
+    }
+    for f in list_delta_files(dir) {
+        if let Ok(rows) = read_rows(&f) {
+            push(rows);
+        }
+    }
+    let start = now.saturating_sub(window_secs);
+    let step = (window_secs.max(1) as f64) / ((buckets - 1) as f64);
+    let times: Vec<u64> = (0..buckets)
+        .map(|i| start + (i as f64 * step).round() as u64)
+        .collect();
+    let mut series: HashMap<String, Vec<u64>> = HashMap::with_capacity(points.len());
+    let mut total = vec![0u64; buckets];
+    for (key, mut pts) in points {
+        pts.sort_by_key(|(t, _)| *t);
+        let mut out = Vec::with_capacity(buckets);
+        for (i, t) in times.iter().enumerate() {
+            let v = pts
+                .iter()
+                .rev()
+                .find(|(pt, _)| pt <= t)
+                .map(|(_, b)| *b)
+                .unwrap_or(0);
+            out.push(v);
+            total[i] += v;
+        }
+        series.insert(key, out);
+    }
+    (series, total)
+}
+
+/// The store key for a report row, so surfaces can look up its series.
+pub fn series_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &str) -> String {
+    row_key(project_id, worktree_id, kind, rel_path)
+}
+
+/// The volume-keyed store directory for the volume `root` lives on.
+pub fn volume_store_dir(slop_livin_dir: &Path, root: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let dev = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
+    volume_dir(slop_livin_dir, dev)
+}
+
 pub fn history_span_for_root(store: &Path, root: &Path, now: u64) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     let dev = fs::metadata(root).ok()?.dev();

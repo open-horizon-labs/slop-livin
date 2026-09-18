@@ -98,6 +98,8 @@ pub struct Row {
     /// untracked. Untracked bytes are in no version control and covered by
     /// no ignore rule — the fact that most changes what a human decides.
     pub track: Option<slop_livin_core::ignore::TrackState>,
+    /// Byte history over the growth window, from the store (sparkline).
+    pub series: Option<Vec<u64>>,
     /// Present for a worktree row: how many artifact children are hidden
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
@@ -117,6 +119,7 @@ impl Row {
             kind: None,
             worktree: None,
             track: None,
+            series: None,
             collapsed_children: None,
             expandable: false,
         }
@@ -130,16 +133,65 @@ fn passes_filter(growth: Option<i64>, filter: &Filter) -> bool {
 /// Scale a growth delta to a bar of `+`/`-` characters, `width` wide,
 /// relative to the largest |growth| in the visible set (never to size).
 pub fn growth_bar(growth: Option<i64>, max_abs: i64, width: usize) -> String {
+    // Eight sub-cell steps per column, so small growth shows as a sliver
+    // instead of rounding to nothing or to a whole cell.
+    const STEPS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
     let g = growth.unwrap_or(0);
     if max_abs <= 0 || g == 0 || width == 0 {
         return " ".repeat(width);
     }
-    let filled = (((g.unsigned_abs() as f64 / max_abs as f64) * width as f64).round() as usize)
-        .clamp(1, width);
-    let ch = if g > 0 { '+' } else { '-' };
-    let mut s = ch.to_string().repeat(filled);
-    s.push_str(&" ".repeat(width - filled));
+    let frac = (g.unsigned_abs() as f64 / max_abs as f64).clamp(0.0, 1.0);
+    let eighths = ((frac * width as f64) * 8.0).round().max(1.0) as usize;
+    let full = eighths / 8;
+    let rem = eighths % 8;
+    let mut s = "█".repeat(full.min(width));
+    if full < width && rem > 0 {
+        s.push(STEPS[rem - 1]);
+    }
+    let used = s.chars().count();
+    s.push_str(&" ".repeat(width.saturating_sub(used)));
     s
+}
+
+/// A sparkline of a byte series, normalised to its own range so the
+/// shape reads even when every row is a different order of magnitude.
+/// A flat series renders as a flat low line, not as noise.
+pub fn sparkline(series: &[u64], width: usize) -> String {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if series.is_empty() || width == 0 {
+        return String::new();
+    }
+    let pts: Vec<u64> = (0..width)
+        .map(|i| {
+            let idx = if width == 1 {
+                0
+            } else {
+                i * (series.len() - 1) / (width - 1)
+            };
+            series[idx.min(series.len() - 1)]
+        })
+        .collect();
+    let lo = *pts.iter().min().unwrap();
+    let hi = *pts.iter().max().unwrap();
+    pts.iter()
+        .map(|&v| {
+            if hi == lo {
+                GLYPHS[0]
+            } else {
+                let f = (v - lo) as f64 / (hi - lo) as f64;
+                GLYPHS[((f * 7.0).round() as usize).min(7)]
+            }
+        })
+        .collect()
+}
+
+/// Trend of a series: +1 rising, -1 falling, 0 flat (first vs last).
+pub fn trend(series: &[u64]) -> i8 {
+    match (series.first(), series.last()) {
+        (Some(a), Some(b)) if b > a => 1,
+        (Some(a), Some(b)) if b < a => -1,
+        _ => 0,
+    }
 }
 
 pub fn max_abs_growth<'a>(rows: impl Iterator<Item = &'a Row>) -> i64 {
@@ -201,6 +253,23 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         if !passes_filter(growth, filter) {
             continue;
         }
+        let series = sum_series(p.worktrees.iter().flat_map(|wt| {
+            wt.artifacts.iter().filter_map(move |a| {
+                let rel = a
+                    .path
+                    .strip_prefix(&wt.path)
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_default();
+                report
+                    .series_by_key
+                    .get(&slop_livin_core::growth::series_key(
+                        &p.project_id,
+                        &wt.worktree_id,
+                        &format!("{:?}", a.kind),
+                        &rel,
+                    ))
+            })
+        }));
         out.push(Row {
             depth: 0,
             rail: String::new(),
@@ -219,6 +288,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             kind: None,
             worktree: None,
             track: None,
+            series,
             collapsed_children: None,
             expandable: true,
         });
@@ -284,6 +354,21 @@ pub fn tree_rows(
                     _ => None,
                 }),
         };
+        let wt_series = sum_series(source_wt.artifacts.iter().filter_map(|a| {
+            let rel = a
+                .path
+                .strip_prefix(&source_wt.path)
+                .map(|r| r.display().to_string())
+                .unwrap_or_default();
+            report
+                .series_by_key
+                .get(&slop_livin_core::growth::series_key(
+                    &p.project_id,
+                    &source_wt.worktree_id,
+                    &format!("{:?}", a.kind),
+                    &rel,
+                ))
+        }));
         out.push(Row {
             depth: 1,
             rail: format!("{wt_connector}{expand_glyph} "),
@@ -299,6 +384,7 @@ pub fn tree_rows(
             kind: None,
             worktree: Some(mark),
             track: None,
+            series: wt_series,
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
         });
@@ -327,6 +413,16 @@ pub fn tree_rows(
                 format!("{} {}", row.kind_label, row.rel_path)
             };
             let abs = source_wt.path.join(&row.rel_path);
+            let series_key = slop_livin_core::growth::series_key(
+                &p.project_id,
+                &source_wt.worktree_id,
+                &row.kind
+                    .as_ref()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or_default(),
+                &row.rel_path,
+            );
+            let series = report.series_by_key.get(&series_key).cloned();
             let is_source = row.kind_label == "source";
             let source_key = format!("source:{}", source_wt.path.display());
             let source_collapsed = collapsed.contains(&source_key);
@@ -345,6 +441,7 @@ pub fn tree_rows(
                 }
             );
             out_row.kind = row.kind.clone();
+            out_row.series = series;
             // `.git` is git's own store, not content it tracks: annotating
             // it "untracked" is noise, so it carries no status.
             out_row.track = (row.kind_label != "git")
@@ -443,6 +540,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             kind: None,
             worktree: None,
             track: None,
+            series: None,
             collapsed_children: None,
             expandable: false,
         })
@@ -553,6 +651,22 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .collect()
 }
 
+/// Element-wise sum of several equal-length series; `None` if none.
+fn sum_series<'a>(it: impl Iterator<Item = &'a Vec<u64>>) -> Option<Vec<u64>> {
+    let mut acc: Option<Vec<u64>> = None;
+    for s in it {
+        match acc.as_mut() {
+            None => acc = Some(s.clone()),
+            Some(a) => {
+                for (x, y) in a.iter_mut().zip(s.iter()) {
+                    *x += *y;
+                }
+            }
+        }
+    }
+    acc
+}
+
 /// Worktree-level predicates against a report row's facts.
 fn worktree_passes(filter: &Filter, wt: &slop_livin_core::report::WorktreeRow) -> bool {
     let merge_complete = wt
@@ -638,9 +752,27 @@ mod tests {
     }
 
     #[test]
-    fn growth_bar_uses_plus_for_growth_minus_for_shrink() {
-        assert!(growth_bar(Some(10), 10, 4).starts_with('+'));
-        assert!(growth_bar(Some(-10), 10, 4).starts_with('-'));
+    fn growth_bar_uses_block_glyphs_with_sub_cell_resolution() {
+        // Full scale fills the column; a small fraction is still visible as
+        // a sliver rather than rounding away; the sign is carried by the
+        // signed number and the bar colour, not by the glyph.
+        assert_eq!(growth_bar(Some(10), 10, 4), "████");
+        assert_eq!(growth_bar(Some(-10), 10, 4), "████");
+        let sliver = growth_bar(Some(1), 1000, 8);
+        assert!(sliver.starts_with('▏'), "{sliver:?}");
+        assert_eq!(sliver.chars().count(), 8);
+        assert_eq!(growth_bar(Some(5), 10, 4), "██  ");
+    }
+
+    #[test]
+    fn sparkline_normalises_per_row_and_flat_is_low() {
+        assert_eq!(sparkline(&[1, 1, 1, 1], 4), "▁▁▁▁");
+        let s = sparkline(&[0, 50, 100], 3);
+        assert_eq!(s, "▁▅█");
+        assert_eq!(trend(&[1, 2]), 1);
+        assert_eq!(trend(&[2, 1]), -1);
+        assert_eq!(trend(&[3, 3]), 0);
+        assert_eq!(sparkline(&[], 5), "");
     }
 
     #[test]
@@ -756,6 +888,9 @@ mod tests {
                 docker_unowned: 0,
             },
             notes: vec![],
+            series_by_key: Default::default(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
@@ -818,6 +953,9 @@ mod tests {
                 docker_unowned: 0,
             },
             notes: vec![],
+            series_by_key: Default::default(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,

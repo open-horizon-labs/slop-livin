@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
 "view: projects · filter: growth > 900GB in 7d                                                                                                                                                           "
-"no rows match — Backspace to widen, 0 to clear                                                                                                                                                          "
+"no rows match — / to change the filter, 0 to clear                                                                                                                                                      "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
