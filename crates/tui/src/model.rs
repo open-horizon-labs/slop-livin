@@ -1,7 +1,7 @@
 //! Flattens a [`Report`] into displayable rows per view. Pure functions:
 //! no I/O, no ratatui types, so this is unit-testable on its own.
 
-use crate::filter::{Filter, Op};
+use crate::filter::{self, Filter};
 use crate::units::UnitId;
 use slop_livin_core::report::{ArtifactKind, Report, UnownedReason};
 use std::collections::BTreeMap;
@@ -114,23 +114,7 @@ impl Row {
 }
 
 fn passes_filter(growth: Option<i64>, filter: &Filter) -> bool {
-    match filter {
-        Filter::None => true,
-        Filter::Growth {
-            op,
-            bytes: threshold,
-            within_secs: _,
-        } => {
-            let g = growth.unwrap_or(0).unsigned_abs();
-            let grew = growth.unwrap_or(0) > 0;
-            match op {
-                Op::Gt => grew && g > *threshold,
-                Op::Lt => growth.unwrap_or(0) < 0 && g > *threshold,
-            }
-        }
-        Filter::Kind(_) | Filter::Project(_) => true, // applied at build time
-        Filter::NoDataYet(_) => false,
-    }
+    filter::growth_passes(filter, growth)
 }
 
 /// Scale a growth delta to a bar of `+`/`-` characters, `width` wide,
@@ -176,8 +160,18 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort) {
 pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
     let mut out = Vec::new();
     for p in &report.projects {
-        if let Filter::Project(name) = filter
-            && !p.name.contains(name.as_str())
+        if let Some(name) = filter::project_name(filter)
+            && !p
+                .name
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        {
+            continue;
+        }
+        // Worktree-level predicates (idle, merge-complete, pr) hold for a
+        // project when at least one of its worktrees satisfies them.
+        if filter::has_worktree_predicates(filter)
+            && !p.worktrees.iter().any(|wt| worktree_passes(filter, wt))
         {
             continue;
         }
@@ -239,6 +233,9 @@ pub fn tree_rows(
         let Some(source_wt) = p.worktrees.iter().find(|w| w.worktree_id == wt.worktree_id) else {
             continue;
         };
+        if !worktree_passes(filter, source_wt) {
+            continue;
+        }
         let wt_last = wi + 1 == wt_count;
         let wt_key = source_wt.path.display().to_string();
         let is_collapsed = collapsed.contains(&wt_key);
@@ -265,12 +262,8 @@ pub fn tree_rows(
             .rows
             .iter()
             .filter(|row| {
-                if let Filter::Kind(k) = filter
-                    && row.kind_label != k
-                {
-                    return false;
-                }
-                passes_filter(row.growth_bytes, filter)
+                filter::kind_passes(filter, row.kind_label, row.kind.as_ref())
+                    && passes_filter(row.growth_bytes, filter)
             })
             .collect();
         let n = visible.len();
@@ -314,7 +307,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
     }
     totals
         .into_iter()
-        .filter(|(k, _)| !matches!(filter, Filter::Kind(f) if f != k))
+        .filter(|(k, _)| filter::kind_passes(filter, k, None))
         .map(|(k, (bytes, growth, count))| Row {
             depth: 0,
             rail: String::new(),
@@ -432,6 +425,19 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
             )
         })
         .collect()
+}
+
+/// Worktree-level predicates against a report row's facts.
+fn worktree_passes(filter: &Filter, wt: &slop_livin_core::report::WorktreeRow) -> bool {
+    let merge_complete = wt
+        .merge_complete
+        .as_ref()
+        .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes);
+    let pr_state = wt.github.as_ref().and_then(|g| match &g.pull_request {
+        slop_livin_core::github::PrStatus::Some(pr) => Some(&pr.state),
+        _ => None,
+    });
+    filter::worktree_passes(filter, wt.idle_secs, merge_complete, pr_state)
 }
 
 #[cfg(test)]
@@ -583,7 +589,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
         };
-        let rows = tree_rows(&report, "proj", &Filter::None, &Default::default());
+        let rows = tree_rows(&report, "proj", &Filter::default(), &Default::default());
         // First worktree is not last -> ├─; second worktree is last -> └─.
         assert!(rows[0].rail.starts_with("├─"));
         assert!(rows[3].rail.starts_with("└─"));

@@ -976,7 +976,7 @@ pub fn report_full_mode_with_source(
         (None, None)
     };
 
-    Ok(Report {
+    let report = Report {
         observed_at,
         root: root.to_path_buf(),
         projects,
@@ -994,7 +994,42 @@ pub fn report_full_mode_with_source(
         files_by_worktree,
         schedule_line,
         github_enrichment,
-    })
+    };
+    // Cache the rendered report so a surface can paint the last known
+    // truth instantly (the TUI opens in milliseconds, then refreshes in
+    // the background) instead of blocking on a walk. Written only when
+    // this call observed, so the cache never runs ahead of the store.
+    if observe && let Some(dir) = store_dir {
+        let _ = write_last_report(dir, &report);
+    }
+    Ok(report)
+}
+
+fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
+    store_dir.join(format!(
+        "last_report-{}.json",
+        &crate::entities::id_for(&root.display().to_string())[..16]
+    ))
+}
+
+fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
+    std::fs::create_dir_all(store_dir)?;
+    let path = last_report_path(store_dir, &report.root);
+    let tmp = path.with_extension("json.tmp");
+    let mut slim = report.clone();
+    slim.dirs_by_worktree = None;
+    slim.files_by_worktree = None;
+    std::fs::write(&tmp, serde_json::to_vec(&slim)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The last report written for `root` by any observation (CLI, scheduled
+/// run, TUI), without walking anything. `None` when no observation of
+/// this root has been cached yet.
+pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
+    let text = std::fs::read_to_string(last_report_path(store_dir, root)).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Rolls `own_allocated` up into `allocated_total` bottom-up: deepest

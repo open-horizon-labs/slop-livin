@@ -391,6 +391,18 @@ pub fn read_last_run(store_dir: &Path) -> Option<RunOutcome> {
     serde_json::from_str(&text).ok()
 }
 
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
 fn format_ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
     if secs < 60 {
@@ -471,7 +483,7 @@ pub fn status(store_dir: &Path) -> Result<String> {
                 let next = run.observed_at + s;
                 let now = crate::entities::now();
                 if next > now {
-                    out.push_str(&format!("  Next run: in {}\n", format_ago(next, now)));
+                    out.push_str(&format!("  Next run: in {}\n", format_duration(next - now)));
                 } else {
                     out.push_str("  Next run: due\n");
                 }

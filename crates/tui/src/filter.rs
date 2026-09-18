@@ -1,196 +1,111 @@
-//! Filter grammar: `growth [><] <size> in <duration>`, `kind:<k>`,
-//! `project:<name>`, `idle > <dur>`, `merge-complete`.
+//! The TUI's filter line speaks the same grammar as `--filter` on the CLI
+//! and the MCP tools — it *is* `slop_livin_core::filter`. This module only
+//! adds the TUI's conveniences: the default line, the `0` = no filter
+//! shorthand, and small accessors the row builders need.
 //!
-//! `idle` and `merge-complete` parse today but have no data source until
-//! the github enricher (#35) lands; applying them yields
-//! [`Filter::NoDataYet`] rather than filtering anything out.
+//! Grammar (whitespace-conjunction): `growth [><] <size> in <duration>`,
+//! `kind:<k>`, `project:<name>`, `idle > <dur>`, `merge-complete`,
+//! `pr:open|merged|closed|none`.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Op {
-    Gt,
-    Lt,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Filter {
-    /// No filter text at all (`0` was pressed, or the line is empty).
-    None,
-    Growth {
-        op: Op,
-        bytes: u64,
-        within_secs: u64,
-    },
-    Kind(String),
-    Project(String),
-    /// Parses, but has no data source yet (#35).
-    NoDataYet(String),
-}
+pub use slop_livin_core::filter::Filter;
+use slop_livin_core::filter::Predicate;
+use slop_livin_core::report::ArtifactKind;
 
 /// The filter shown on open, per DESIGN.md.
-pub fn default_filter() -> Filter {
-    Filter::Growth {
-        op: Op::Gt,
-        bytes: 100 * 1024 * 1024,
-        within_secs: 7 * 86_400,
-    }
-}
-
 pub fn default_filter_text() -> &'static str {
     "growth > 100MB in 7d"
 }
 
-fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let idx = s.find(|c: char| c.is_alphabetic())?;
-    let (num, unit) = s.split_at(idx);
-    let num: f64 = num.trim().parse().ok()?;
-    let mult: f64 = match unit.trim().to_ascii_uppercase().as_str() {
-        "B" => 1.0,
-        "KB" => 1024.0,
-        "MB" => 1024.0 * 1024.0,
-        "GB" => 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    Some((num * mult) as u64)
+pub fn default_filter() -> Filter {
+    slop_livin_core::filter::parse(default_filter_text()).expect("default filter parses")
 }
 
-fn parse_duration(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let idx = s.find(|c: char| c.is_alphabetic())?;
-    let (num, unit) = s.split_at(idx);
-    let num: f64 = num.trim().parse().ok()?;
-    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
-        "s" => 1.0,
-        "m" => 60.0,
-        "h" => 3600.0,
-        "d" => 86_400.0,
-        "w" => 7.0 * 86_400.0,
-        _ => return None,
-    };
-    Some((num * mult) as u64)
-}
-
-/// Parses one filter line. Returns `Err(message)` on a grammar error; the
-/// caller keeps the previous filter applied and shows the message inline.
+/// Parses one filter line. `0` or an empty line means "no filter".
+/// Returns `Err(message)` on a grammar error; the caller keeps the
+/// previous filter applied and shows the message inline.
 pub fn parse(input: &str) -> Result<Filter, String> {
     let raw = input.trim();
     if raw.is_empty() || raw == "0" {
-        return Ok(Filter::None);
+        return Ok(Filter::default());
     }
-    if raw == "merge-complete" {
-        return Ok(Filter::NoDataYet(raw.to_string()));
-    }
-    if let Some(rest) = raw.strip_prefix("kind:") {
-        if rest.trim().is_empty() {
-            return Err("kind: needs a value".to_string());
-        }
-        return Ok(Filter::Kind(rest.trim().to_string()));
-    }
-    if let Some(rest) = raw.strip_prefix("project:") {
-        if rest.trim().is_empty() {
-            return Err("project: needs a value".to_string());
-        }
-        return Ok(Filter::Project(rest.trim().to_string()));
-    }
-    if let Some(rest) = raw.strip_prefix("idle") {
-        let rest = rest.trim();
-        let rest = rest
-            .strip_prefix('>')
-            .ok_or_else(|| "idle needs > <duration>".to_string())?;
-        parse_duration(rest.trim()).ok_or_else(|| format!("bad duration: {rest:?}"))?;
-        return Ok(Filter::NoDataYet(raw.to_string()));
-    }
-    if let Some(rest) = raw.strip_prefix("growth") {
-        let rest = rest.trim();
-        let (op, rest) = if let Some(r) = rest.strip_prefix('>') {
-            (Op::Gt, r)
-        } else if let Some(r) = rest.strip_prefix('<') {
-            (Op::Lt, r)
-        } else {
-            return Err("growth needs > or <".to_string());
-        };
-        let rest = rest.trim();
-        let parts: Vec<&str> = rest.splitn(2, " in ").collect();
-        let size_part = parts[0].trim();
-        let bytes = parse_size(size_part).ok_or_else(|| format!("bad size: {size_part:?}"))?;
-        let within_secs = if parts.len() == 2 {
-            let dur_part = parts[1].trim();
-            parse_duration(dur_part).ok_or_else(|| format!("bad duration: {dur_part:?}"))?
-        } else {
-            u64::MAX
-        };
-        return Ok(Filter::Growth {
-            op,
-            bytes,
-            within_secs,
-        });
-    }
-    Err(format!("unrecognized filter: {raw:?}"))
+    slop_livin_core::filter::parse(raw).map_err(|e| e.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The growth window named by the filter, for the header's `since`.
+pub fn growth_window_secs(f: &Filter) -> Option<u64> {
+    f.predicates.iter().find_map(|p| match p {
+        Predicate::Growth { within_secs, .. } if *within_secs != u64::MAX => Some(*within_secs),
+        _ => None,
+    })
+}
 
-    #[test]
-    fn parses_default_filter() {
-        assert_eq!(parse(default_filter_text()).unwrap(), default_filter());
-    }
+pub fn project_name(f: &Filter) -> Option<&str> {
+    f.predicates.iter().find_map(|p| match p {
+        Predicate::Project(n) => Some(n.as_str()),
+        _ => None,
+    })
+}
 
-    #[test]
-    fn zero_clears() {
-        assert_eq!(parse("0").unwrap(), Filter::None);
-        assert_eq!(parse("").unwrap(), Filter::None);
-    }
+/// Does a row of this kind pass every `kind:` predicate? Accepts the
+/// enum's Debug name (`BuildOutput`) or the rendered label (`build`),
+/// case-insensitively.
+pub fn kind_passes(f: &Filter, label: &str, kind: Option<&ArtifactKind>) -> bool {
+    f.predicates.iter().all(|p| match p {
+        Predicate::Kind(k) => {
+            label.eq_ignore_ascii_case(k)
+                || kind.is_some_and(|kk| format!("{kk:?}").eq_ignore_ascii_case(k))
+        }
+        _ => true,
+    })
+}
 
-    #[test]
-    fn parses_kind_and_project() {
-        assert_eq!(parse("kind:cache").unwrap(), Filter::Kind("cache".into()));
-        assert_eq!(
-            parse("project:mole").unwrap(),
-            Filter::Project("mole".into())
-        );
-    }
-
-    #[test]
-    fn kind_needs_value() {
-        assert!(parse("kind:").is_err());
-    }
-
-    #[test]
-    fn idle_and_merge_complete_parse_as_no_data_yet() {
-        assert!(matches!(parse("idle > 3d").unwrap(), Filter::NoDataYet(_)));
-        assert!(matches!(
-            parse("merge-complete").unwrap(),
-            Filter::NoDataYet(_)
-        ));
-    }
-
-    #[test]
-    fn idle_rejects_bad_duration() {
-        assert!(parse("idle > banana").is_err());
-    }
-
-    #[test]
-    fn growth_lt_without_duration() {
-        let f = parse("growth < 50MB").unwrap();
-        assert_eq!(
-            f,
-            Filter::Growth {
-                op: Op::Lt,
-                bytes: 50 * 1024 * 1024,
-                within_secs: u64::MAX
+/// Every `growth` predicate against this row's growth figure.
+pub fn growth_passes(f: &Filter, growth: Option<i64>) -> bool {
+    f.predicates.iter().all(|p| match p {
+        Predicate::Growth { greater, bytes, .. } => {
+            let g = growth.unwrap_or(0);
+            if *greater {
+                g > 0 && g.unsigned_abs() > *bytes
+            } else {
+                g < 0 && g.unsigned_abs() > *bytes
             }
-        );
-    }
+        }
+        _ => true,
+    })
+}
 
-    #[test]
-    fn garbage_is_an_error() {
-        assert!(parse("bananas").is_err());
-    }
+/// Every worktree-level predicate (`idle >`, `merge-complete`, `pr:`)
+/// against this worktree's facts. `pr:` needs the GitHub facts; without
+/// them only `pr:none` matches.
+pub fn worktree_passes(
+    f: &Filter,
+    idle_secs: Option<u64>,
+    merge_complete: bool,
+    pr_state: Option<&slop_livin_core::github::PrState>,
+) -> bool {
+    use slop_livin_core::filter::PrFilter;
+    use slop_livin_core::github::PrState;
+    f.predicates.iter().all(|p| match p {
+        Predicate::IdleGreaterThan(secs) => idle_secs.is_some_and(|i| i > *secs),
+        Predicate::MergeComplete => merge_complete,
+        Predicate::Pr(want) => matches!(
+            (want, pr_state),
+            (PrFilter::None, None)
+                | (PrFilter::Open, Some(PrState::Open))
+                | (PrFilter::Merged, Some(PrState::Merged))
+                | (PrFilter::Closed, Some(PrState::Closed))
+        ),
+        _ => true,
+    })
+}
 
-    #[test]
-    fn bad_size_unit_is_an_error() {
-        assert!(parse("growth > 100XB in 7d").is_err());
-    }
+/// True when the filter has any worktree-level predicate, so a projects
+/// view (which has no per-worktree rows) must evaluate them per worktree.
+pub fn has_worktree_predicates(f: &Filter) -> bool {
+    f.predicates.iter().any(|p| {
+        matches!(
+            p,
+            Predicate::IdleGreaterThan(_) | Predicate::MergeComplete | Predicate::Pr(_)
+        )
+    })
 }

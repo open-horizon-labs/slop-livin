@@ -73,6 +73,12 @@ pub struct App {
     pub filter: Filter,
     pub filter_error: Option<String>,
     pub editing_filter: bool,
+    /// Filter text as it was when editing began; restored on Esc.
+    pub filter_before_edit: String,
+    /// Background observation result, when one is in flight.
+    pub pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Report>>>,
+    /// One-line status shown in the footer slot (errors, notices).
+    pub status: Option<String>,
     pub selected: usize,
     pub selected_project: Option<String>,
     pub collapsed: HashSet<String>,
@@ -87,6 +93,8 @@ pub struct App {
     pub actor: String,
     pub sort: Sort,
     pub quit: bool,
+    /// Terminal width at the last draw; the header fits its clauses to it.
+    pub width: u16,
 }
 
 impl App {
@@ -100,6 +108,9 @@ impl App {
             filter,
             filter_error: None,
             editing_filter: false,
+            filter_before_edit: String::new(),
+            pending: None,
+            status: None,
             selected: 0,
             selected_project: None,
             collapsed: HashSet::new(),
@@ -113,7 +124,16 @@ impl App {
             actor: "human".to_string(),
             sort: Sort::None,
             quit: false,
+            width: 0,
         }
+    }
+
+    /// Swap in a fresh report (background observation finished). Rows are
+    /// derived from `report` on demand, so nothing else needs rebuilding;
+    /// the selection is clamped by `rows()` consumers.
+    pub fn replace_report(&mut self, report: Report) {
+        self.report = report;
+        self.selected = 0;
     }
 
     /// Rows for the current view, honoring the active filter and, for
@@ -150,8 +170,10 @@ impl App {
     }
 
     /// Whether the active filter is one that has no data source yet.
+    /// Kept for the UI: every predicate now has a data source, so a
+    /// filter never lands in a "no data yet" state.
     pub fn filter_has_no_data(&self) -> bool {
-        matches!(self.filter, Filter::NoDataYet(_))
+        false
     }
 
     pub fn set_view(&mut self, v: ViewKind) {
@@ -169,8 +191,21 @@ impl App {
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
     }
 
+    /// Enter filter editing with the current text kept, so the human edits
+    /// what is there (Backspace to trim, type to extend) rather than
+    /// starting from an empty line behind a `/`.
     pub fn start_filter_edit(&mut self) {
+        self.filter_before_edit = self.filter_text.clone();
+        if self.filter_text == "0" {
+            self.filter_text.clear();
+        }
         self.editing_filter = true;
+        self.filter_error = None;
+    }
+
+    pub fn cancel_filter_edit(&mut self) {
+        self.filter_text = std::mem::take(&mut self.filter_before_edit);
+        self.editing_filter = false;
     }
 
     pub fn filter_input(&mut self, c: char) {
@@ -198,7 +233,7 @@ impl App {
 
     pub fn clear_filter(&mut self) {
         self.filter_text = "0".to_string();
-        self.filter = Filter::None;
+        self.filter = Filter::default();
         self.filter_error = None;
         self.selected = 0;
     }
@@ -542,7 +577,7 @@ mod tests {
     fn clear_filter_shows_zero_and_none() {
         let mut app = App::new(fixture_report(), "/root".into());
         app.clear_filter();
-        assert_eq!(app.filter, Filter::None);
+        assert_eq!(app.filter, Filter::default());
         assert_eq!(app.filter_text, "0");
     }
 

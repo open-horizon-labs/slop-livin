@@ -13,12 +13,7 @@ use ratatui::{
 };
 
 fn since_label(app: &App) -> Option<String> {
-    if let crate::filter::Filter::Growth { within_secs, .. } = &app.filter
-        && *within_secs != u64::MAX
-    {
-        return Some(human_duration(*within_secs));
-    }
-    None
+    crate::filter::growth_window_secs(&app.filter).map(human_duration)
 }
 
 fn human_duration(secs: u64) -> String {
@@ -59,15 +54,35 @@ fn header_line(app: &App) -> String {
     let since = since_label(app)
         .map(|s| format!(" · since {s}"))
         .unwrap_or_default();
-    format!(
-        "{} · {}{since} · {} projects · {} attributed · {} unowned · docker {} unowned",
-        app.root.display(),
-        obs,
-        projects,
-        human_bytes(attributed),
-        human_bytes(unowned),
-        human_bytes(docker_unowned)
-    )
+    // Clauses in priority order; the renderer drops trailing clauses that
+    // do not fit the terminal width rather than truncating mid-word.
+    let clauses = vec![
+        app.root.display().to_string(),
+        format!("{obs}{since}"),
+        format!("{projects} projects"),
+        format!("{} attributed", human_bytes(attributed)),
+        format!("{} unowned", human_bytes(unowned)),
+        format!("docker {} unowned", human_bytes(docker_unowned)),
+    ];
+    fit_clauses(&clauses, app.width as usize)
+}
+
+/// Joins clauses with " · " while the result fits in `width`; always keeps
+/// the first clause.
+pub fn fit_clauses(clauses: &[String], width: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in clauses.iter().enumerate() {
+        let candidate = if i == 0 {
+            c.clone()
+        } else {
+            format!("{out} · {c}")
+        };
+        if i > 0 && width > 0 && candidate.chars().count() > width {
+            break;
+        }
+        out = candidate;
+    }
+    out
 }
 
 fn footer_line() -> &'static str {
@@ -119,8 +134,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
-    let prefix = if app.editing_filter { "/" } else { "filter: " };
-    let text = format!("{prefix}{}", app.filter_text);
+    let text = if app.editing_filter {
+        format!("filter › {}▏  (Enter apply · Esc cancel)", app.filter_text)
+    } else {
+        format!("filter: {}", app.filter_text)
+    };
     frame.render_widget(Paragraph::new(text), area);
     if let Some(err) = &app.filter_error {
         // Parse errors show inline in red under the line; with only one
