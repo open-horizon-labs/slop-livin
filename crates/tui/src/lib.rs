@@ -112,6 +112,19 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
 /// Runs the interactive UI against `root`. `no_observe` skips persisting
 /// a new observation (read-only report, same as `slop-livin report
 /// --no-observe`).
+/// How far back the store can answer for `root`'s volume. Growth windows
+/// are bounded by it: a 7d window over 4h of observations would report a
+/// week of growth that was never observed.
+fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
+    let now = slop_livin_core::entities::now();
+    let dev = std::fs::metadata(root).ok().map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        m.dev()
+    })?;
+    let dir = store.join(dev.to_string());
+    slop_livin_core::growth::history_span_secs(&dir, now)
+}
+
 fn store_dir() -> PathBuf {
     if let Ok(d) = std::env::var("SLOP_LIVIN_DIR") {
         return PathBuf::from(d);
@@ -163,9 +176,14 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     };
     app.pending = Some(rx);
     app.store_dir = Some(store.clone());
-    if let Some(saved) = app::load_saved_filter(&store) {
-        app.filter_text = saved;
+    app.history_secs = history_span(&store, &root);
+    let saved = app::load_ui_state(&store);
+    if !saved.filter.is_empty() {
+        app.filter_text = saved.filter;
         app.commit_filter();
+    }
+    if !saved.sort.is_empty() {
+        app.sort = app::sort_from_str(&saved.sort);
     }
 
     crossterm::terminal::enable_raw_mode()?;
@@ -277,6 +295,7 @@ mod tests {
     #[test]
     fn slash_opens_picker_and_enter_applies_its_filter() {
         let mut app = App::new(empty_report(), "/root".into());
+        app.history_secs = Some(30 * 86_400);
         handle_key(&mut app, KeyCode::Char('/'));
         assert!(app.picker.is_some());
         handle_key(&mut app, KeyCode::Down); // window

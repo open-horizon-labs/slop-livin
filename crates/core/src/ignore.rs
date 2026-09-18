@@ -106,6 +106,74 @@ impl IgnoreLens {
     }
 }
 
+/// The first few paths under `root` that git neither tracks nor ignores,
+/// with their sizes: content that exists **only here**. Removing a whole
+/// checkout destroys these, and nothing (remote, rebuild) brings them
+/// back — so they are the bar a whole-checkout removal has to clear.
+///
+/// Bounded: stops after `limit` findings or `max_entries` directory
+/// entries, and never descends into an ignored directory.
+pub fn untracked_content(
+    root: &Path,
+    limit: usize,
+    max_entries: usize,
+) -> Vec<(std::path::PathBuf, u64)> {
+    let Some(lens) = IgnoreLens::open(root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        if found.len() >= limit || seen > max_entries {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            seen += 1;
+            if found.len() >= limit || seen > max_entries {
+                break;
+            }
+            let path = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.display().to_string();
+            if rel == ".git" {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            match lens.status(&rel, is_dir) {
+                TrackState::Ignored => {}
+                TrackState::Untracked => {
+                    let bytes = if is_dir {
+                        crate::walk::resize_artifact(&path, crate::report::ArtifactKind::Unknown, 0)
+                            .bytes
+                    } else {
+                        meta.len()
+                    };
+                    found.push((path.clone(), bytes));
+                }
+                TrackState::Tracked | TrackState::Unknown => {
+                    if is_dir {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| b.1.cmp(&a.1));
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

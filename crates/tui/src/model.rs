@@ -65,6 +65,9 @@ pub enum Sort {
 pub struct WorktreeMark {
     pub path: std::path::PathBuf,
     pub linked: bool,
+    /// The project's remote, when it has one: a whole checkout may only be
+    /// archived if there is somewhere to restore it from.
+    pub remote: Option<String>,
     pub dirty: Option<bool>,
     pub unpushed: Option<u32>,
     pub locked: Option<bool>,
@@ -201,10 +204,13 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         out.push(Row {
             depth: 0,
             rail: String::new(),
-            label: if p.worktrees.len() > 1 {
-                format!("{}  · {} worktrees", p.name, p.worktrees.len())
-            } else {
-                p.name.clone()
+            label: {
+                let name = project_display_name(p);
+                if p.worktrees.len() > 1 {
+                    format!("{name}  · {} worktrees", p.worktrees.len())
+                } else {
+                    name
+                }
             },
             bytes,
             growth,
@@ -260,6 +266,7 @@ pub fn tree_rows(
         let mark = WorktreeMark {
             path: source_wt.path.clone(),
             linked: matches!(wt.kind, slop_livin_core::report::WorktreeKind::Linked),
+            remote: p.remote.clone(),
             dirty: raw.0,
             unpushed: raw.1,
             locked: raw.2,
@@ -382,6 +389,22 @@ pub fn tree_rows(
         }
     }
     out
+}
+
+/// A project's display name: `owner/repo` when its remote names one, so
+/// two clones of different repos with the same basename are telling
+/// apart on sight (the reason project identity moved to the remote).
+pub fn project_display_name(p: &slop_livin_core::report::ProjectRow) -> String {
+    match p.remote.as_deref().and_then(owner_repo) {
+        Some(or) if or.to_lowercase().ends_with(&p.name.to_lowercase()) => or,
+        _ => p.name.clone(),
+    }
+}
+
+/// `github.com/open-horizon-labs/roon-knob` -> `open-horizon-labs/roon-knob`.
+pub fn owner_repo(remote: &str) -> Option<String> {
+    let parts: Vec<&str> = remote.trim_end_matches('/').split('/').collect();
+    (parts.len() >= 3).then(|| format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]))
 }
 
 /// Top-level directories of a worktree's Source tree, biggest first.

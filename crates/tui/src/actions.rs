@@ -31,6 +31,10 @@ pub struct MarkedUnit {
 pub struct WorktreeTerms {
     pub merge_complete: bool,
     pub pr: Option<String>,
+    /// True when the unit is a whole checkout (the `archive` verb), not a
+    /// linked worktree: a higher bar, since it takes the working copy.
+    pub whole_checkout: bool,
+    pub remote: Option<String>,
 }
 
 /// Human pressing Enter at the confirm summary is the authorization for
@@ -41,10 +45,10 @@ pub fn authorize(units: &[MarkedUnit], actor: &str) -> (slop_livin_core::grants:
         .iter()
         .map(|u| slop_livin_core::grants::PlanUnit {
             artifact_id: id_for(&u.path.display().to_string()),
-            verb: if u.worktree.is_some() {
-                Verb::RemoveWorktree
-            } else {
-                Verb::Delete
+            verb: match &u.worktree {
+                Some(t) if t.whole_checkout => Verb::Archive,
+                Some(_) => Verb::RemoveWorktree,
+                None => Verb::Delete,
             },
             expected_bytes: u.bytes,
             evidence_observed_at: u.observed_at,
@@ -133,6 +137,9 @@ fn remove_worktree(
     trash_root: &Path,
     actor: &str,
 ) -> Result<Outcome> {
+    if terms.whole_checkout {
+        return remove_checkout(unit, terms, grant, ledger, trash_root, actor);
+    }
     let path = &unit.path;
     let gitfile = path.join(".git");
     let meta = std::fs::symlink_metadata(&gitfile)
@@ -199,6 +206,95 @@ fn remove_worktree(
                        "merge_complete": terms.merge_complete, "pr": terms.pr},
             "git_worktree_prune": pruned,
             "recover": format!("mv {} {} && git -C {} worktree repair", dest.display(), path.display(), common.display()),
+        }),
+        grant_id: grant.id.clone(),
+        actor: actor.into(),
+        outcome: "completed".into(),
+        recovery_location: Some(dest.clone()),
+        measured_free_space_delta: None,
+        observed_path_state: Some("trashed".into()),
+        recorded_at: now(),
+    })?;
+    Ok(Outcome {
+        unit_id: id_for(&path.display().to_string()),
+        status: "completed".into(),
+        reason: None,
+        intended_bytes: unit.bytes,
+        observed_free_space_delta: None,
+    })
+}
+
+/// Removes a whole checkout (the `archive` verb): the highest bar here,
+/// because it takes the working copy with it. Every term is re-derived
+/// live at the sink — a remote to restore from, clean, nothing unpushed,
+/// unlocked, unoccupied, and **no untracked content**, since content git
+/// neither tracks nor ignores exists only here and no clone brings it
+/// back. Each refusal names the fact that refused it.
+fn remove_checkout(
+    unit: &MarkedUnit,
+    terms: &WorktreeTerms,
+    grant: &Grant,
+    ledger: &Ledger,
+    trash_root: &Path,
+    actor: &str,
+) -> Result<Outcome> {
+    let path = &unit.path;
+    if !path.join(".git").is_dir() {
+        anyhow::bail!("not a main checkout (its .git is not a directory)");
+    }
+    let Some(remote) = terms.remote.clone() else {
+        anyhow::bail!("no remote: nothing to restore this checkout from");
+    };
+    // Untracked content first: it is the most specific fact and names the
+    // exact file. (The `dirty` signal counts untracked files too, so
+    // checking it first would refuse with a vaguer cause.)
+    let untracked = slop_livin_core::ignore::untracked_content(path, 3, 200_000);
+    if let Some((first, bytes)) = untracked.first() {
+        let rel = first.strip_prefix(path).unwrap_or(first).display();
+        anyhow::bail!(
+            "{rel} is untracked ({}) — in no version control and covered by no ignore rule, so a clone would not bring it back{}",
+            human_bytes(*bytes),
+            if untracked.len() > 1 {
+                format!(" (+{} more)", untracked.len() - 1)
+            } else {
+                String::new()
+            }
+        );
+    }
+    let (_, raw) = slop_livin_core::signals::compute_signals_raw(path, now());
+    match raw.dirty {
+        Some(false) => {}
+        Some(true) => anyhow::bail!("dirty: uncommitted changes"),
+        None => anyhow::bail!("could not determine dirty state"),
+    }
+    match raw.unpushed {
+        Some(0) => {}
+        Some(n) => anyhow::bail!("{n} unpushed commit{}", if n == 1 { "" } else { "s" }),
+        None => anyhow::bail!("unpushed count unknown (no upstream)"),
+    }
+    if raw.locked != Some(false) {
+        anyhow::bail!("worktree is locked");
+    }
+    if slop_livin_core::occupancy::occupied(path) {
+        anyhow::bail!("occupied: a process holds files under this checkout");
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("checkout");
+    let dest = trash_root.join(format!("checkout-{name}-{}", now()));
+    std::fs::create_dir_all(trash_root)?;
+    std::fs::rename(path, &dest)?;
+    ledger.append(&slop_livin_core::ledger::ActionRecord {
+        id: slop_livin_core::entities::new_id(),
+        verb: Verb::Archive,
+        entity_id: id_for(&path.display().to_string()),
+        evidence: serde_json::json!({
+            "bytes": unit.bytes,
+            "observed_at": unit.observed_at,
+            "terms": {"clean": true, "unpushed": 0, "unlocked": true, "untracked_content": 0,
+                       "remote": remote, "merge_complete": terms.merge_complete, "pr": terms.pr},
+            "recover": format!("git clone {remote} {}", path.display()),
         }),
         grant_id: grant.id.clone(),
         actor: actor.into(),

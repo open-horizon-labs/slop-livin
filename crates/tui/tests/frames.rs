@@ -285,6 +285,7 @@ fn help_overlay_state() {
 fn picker_frame() {
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
+    app.history_secs = Some(30 * 86_400);
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('/'));
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
     slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
@@ -320,20 +321,18 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
 }
 
 #[test]
-fn linked_worktree_is_markable_but_main_checkout_and_dirty_are_refused() {
+fn checkout_without_a_remote_is_refused_and_the_cause_is_shown() {
     use crossterm::event::KeyCode;
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
     slop_livin_tui::handle_key(&mut app, KeyCode::Char('0'));
     slop_livin_tui::handle_key(&mut app, KeyCode::Enter); // drill into first project
     assert_eq!(app.view, ViewKind::Tree);
-    // Row 0 is the Main checkout: refused with the fact.
+    // The fixture's project has no remote, so its checkout cannot be
+    // archived: there would be nothing to restore it from.
     slop_livin_tui::handle_key(&mut app, KeyCode::Backspace);
     let f = capture(&app, 200, 60);
-    assert!(
-        f.contains("main checkout"),
-        "main checkout refusal expected:\n{f}"
-    );
+    assert!(f.contains("no remote"), "refusal expected:\n{f}");
     assert!(app.marked.is_empty());
 }
 
@@ -344,6 +343,7 @@ fn worktree_mark_rules() {
         WorktreeMark {
             path: "/x/wt".into(),
             linked,
+            remote: Some("github.com/o/r".to_string()),
             dirty,
             unpushed,
             locked,
@@ -369,10 +369,17 @@ fn worktree_mark_rules() {
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_marked, cause) in [
+        // A whole checkout with a remote is markable (the archive verb);
+        // its remaining terms are re-derived live at the sink.
+        (mark(false, Some(false), Some(0), Some(false)), true, ""),
+        // ...but not without a remote to restore it from.
         (
-            mark(false, Some(false), Some(0), Some(false)),
+            WorktreeMark {
+                remote: None,
+                ..mark(false, Some(false), Some(0), Some(false))
+            },
             false,
-            "main checkout",
+            "no remote",
         ),
         (mark(true, Some(true), Some(0), Some(false)), false, "dirty"),
         (
@@ -409,4 +416,117 @@ fn worktree_mark_rules() {
             );
         }
     }
+}
+
+/// The archive bar, end to end against real git: a clean, fully pushed
+/// checkout is archived to Trash; the same checkout with one untracked
+/// file is refused, because nothing would bring that file back.
+#[test]
+fn archiving_a_checkout_refuses_untracked_content_and_otherwise_trashes_it() {
+    use slop_livin_tui::actions::{MarkedUnit, WorktreeTerms, authorize, execute_plan};
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let work = tmp.path().join("work");
+    let trash = tmp.path().join("trash");
+    std::fs::create_dir_all(&trash).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&origin)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&work)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    git(&work, &["config", "user.email", "t@e"]);
+    git(&work, &["config", "user.name", "t"]);
+    std::fs::write(work.join("README.md"), "hi").unwrap();
+    std::fs::write(work.join(".gitignore"), "build/\n").unwrap();
+    std::fs::create_dir_all(work.join("build")).unwrap();
+    std::fs::write(work.join("build/out.bin"), vec![b'x'; 4096]).unwrap();
+    git(&work, &["add", "README.md", ".gitignore"]);
+    git(&work, &["commit", "-qm", "init"]);
+    git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
+
+    let unit = |path: &std::path::Path| MarkedUnit {
+        path: path.to_path_buf(),
+        bytes: 4096,
+        observed_at: slop_livin_core::entities::now(),
+        worktree: Some(WorktreeTerms {
+            merge_complete: false,
+            pr: None,
+            whole_checkout: true,
+            remote: Some("github.com/o/r".into()),
+        }),
+    };
+    let ledger = slop_livin_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
+
+    // Untracked content present: refused, naming the file and its size.
+    std::fs::write(work.join("secrets.env"), vec![b'k'; 2048]).unwrap();
+    let u = unit(&work);
+    let (plan, grant) = authorize(std::slice::from_ref(&u), "human");
+    let res = execute_plan(
+        std::slice::from_ref(&u),
+        &plan,
+        &grant,
+        &ledger,
+        &trash,
+        "human",
+    );
+    let err = res[0].outcome.as_ref().unwrap_err();
+    assert!(
+        err.contains("secrets.env") && err.contains("untracked"),
+        "{err}"
+    );
+    assert!(work.exists(), "nothing may be moved while a term fails");
+
+    // Ignored content alone does not block: build/ is disposable.
+    std::fs::remove_file(work.join("secrets.env")).unwrap();
+    let u = unit(&work);
+    let (plan, grant) = authorize(std::slice::from_ref(&u), "human");
+    let res = execute_plan(
+        std::slice::from_ref(&u),
+        &plan,
+        &grant,
+        &ledger,
+        &trash,
+        "human",
+    );
+    assert!(res[0].outcome.is_ok(), "{:?}", res[0].outcome);
+    assert!(!work.exists(), "checkout moved to Trash");
+    let recs = ledger.all().unwrap();
+    let last = recs.last().unwrap();
+    assert!(matches!(last.verb, slop_livin_core::grants::Verb::Archive));
+    assert!(
+        last.evidence["recover"]
+            .as_str()
+            .unwrap()
+            .starts_with("git clone ")
+    );
 }

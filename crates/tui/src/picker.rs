@@ -9,7 +9,66 @@ use slop_livin_core::report::Report;
 pub const SIZES: &[&str] = &[
     "off", "1MB", "10MB", "50MB", "100MB", "500MB", "1GB", "5GB", "20GB",
 ];
-pub const WINDOWS: &[&str] = &["24h", "7d", "30d", "90d", "1y"];
+/// The ladder a growth window is chosen from. Only rungs the store can
+/// actually answer are offered (see [`windows_for`]).
+pub const WINDOW_LADDER: &[(&str, u64)] = &[
+    ("1h", 3_600),
+    ("6h", 21_600),
+    ("24h", 86_400),
+    ("7d", 604_800),
+    ("30d", 2_592_000),
+    ("90d", 7_776_000),
+    ("1y", 31_536_000),
+];
+
+/// Windows the store can honor given `history_secs` of observations.
+/// Offering `1y` against four hours of history would report a year of
+/// growth the tool never observed.
+pub fn windows_for(history_secs: Option<u64>) -> Vec<String> {
+    let Some(span) = history_secs else {
+        return vec!["all history".to_string()];
+    };
+    let mut out: Vec<String> = WINDOW_LADDER
+        .iter()
+        .filter(|(_, secs)| *secs <= span)
+        .map(|(label, _)| label.to_string())
+        .collect();
+    if !WINDOW_LADDER.iter().any(|(_, secs)| *secs == span) {
+        out.push(format!("all history ({})", human_span(span)));
+    }
+    out
+}
+
+/// The duration a window label means, resolving "all history".
+pub fn window_secs(label: &str, history_secs: Option<u64>) -> u64 {
+    if label.starts_with("all history") {
+        return history_secs.unwrap_or(0);
+    }
+    WINDOW_LADDER
+        .iter()
+        .find(|(l, _)| *l == label)
+        .map(|(_, s)| *s)
+        .unwrap_or(0)
+}
+
+/// A window label as the filter grammar spells it (`4h`, `7d`).
+pub fn window_filter_text(label: &str, history_secs: Option<u64>) -> String {
+    if label.starts_with("all history") {
+        human_span(history_secs.unwrap_or(0))
+    } else {
+        label.to_string()
+    }
+}
+
+pub fn human_span(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}m", (secs / 60).max(1))
+    }
+}
 pub const IDLES: &[&str] = &["off", "24h", "48h", "7d", "30d", "90d"];
 pub const KINDS: &[&str] = &["any", "build", "deps", "cache", "git", "source", "docker"];
 pub const PRS: &[&str] = &["any", "open", "merged", "closed", "none"];
@@ -29,6 +88,9 @@ pub struct Picker {
     pub merge_complete: bool,
     pub pr_ix: usize,
     pub projects: Vec<String>,
+    /// Seconds of observation history the store holds; bounds `windows`.
+    pub history_secs: Option<u64>,
+    pub windows: Vec<String>,
 }
 
 pub const FIELDS: &[&str] = &[
@@ -44,15 +106,16 @@ pub const FIELDS: &[&str] = &[
 impl Picker {
     /// Seeds the form from the report (project names) and, when it parses,
     /// the current filter text so opening the picker shows what is applied.
-    pub fn from_report(report: &Report, current: &str) -> Self {
+    pub fn from_report(report: &Report, current: &str, history_secs: Option<u64>) -> Self {
         let mut projects: Vec<String> = report.projects.iter().map(|p| p.name.clone()).collect();
         projects.sort();
         projects.dedup();
+        let windows = windows_for(history_secs);
         let mut p = Picker {
             field: 0,
             growth_gt: true,
-            size_ix: 4,   // 100MB
-            window_ix: 1, // 7d
+            size_ix: 4, // 100MB
+            window_ix: windows.len().saturating_sub(1),
             kind_ix: 0,
             project_ix: 0,
             project_query: String::new(),
@@ -60,6 +123,8 @@ impl Picker {
             merge_complete: false,
             pr_ix: 0,
             projects,
+            history_secs,
+            windows,
         };
         p.seed_from_text(current);
         p
@@ -85,7 +150,8 @@ impl Picker {
                         self.size_ix = ix;
                     }
                     if i + 4 < toks.len()
-                        && let Some(ix) = WINDOWS
+                        && let Some(ix) = self
+                            .windows
                             .iter()
                             .position(|w| w.eq_ignore_ascii_case(toks[i + 4]))
                     {
@@ -170,7 +236,7 @@ impl Picker {
         }
         match self.field {
             0 => self.size_ix = step(self.size_ix, SIZES.len(), delta),
-            1 => self.window_ix = step(self.window_ix, WINDOWS.len(), delta),
+            1 => self.window_ix = step(self.window_ix, self.windows.len(), delta),
             2 => self.kind_ix = step(self.kind_ix, KINDS.len(), delta),
             3 => {
                 let n = self.project_choices().len();
@@ -210,12 +276,14 @@ impl Picker {
     /// The filter line this form composes. `0` when everything is off.
     pub fn compose(&self) -> String {
         let mut parts = Vec::new();
-        if self.size_ix > 0 {
+        // With no observations there is nothing to compare against, so a
+        // growth predicate cannot be honored and is not composed.
+        if self.size_ix > 0 && self.history_secs.is_some() {
             parts.push(format!(
                 "growth {} {} in {}",
                 if self.growth_gt { ">" } else { "<" },
                 SIZES[self.size_ix],
-                WINDOWS[self.window_ix]
+                window_filter_text(&self.windows[self.window_ix], self.history_secs)
             ));
         }
         if self.kind_ix > 0 {
@@ -252,7 +320,9 @@ impl Picker {
 
     /// Rendered field lines for the form.
     pub fn lines(&self) -> Vec<(String, String, bool)> {
-        let growth = if self.size_ix == 0 {
+        let growth = if self.history_secs.is_none() {
+            "off — no observations yet".to_string()
+        } else if self.size_ix == 0 {
             "off".to_string()
         } else {
             format!(
@@ -265,7 +335,14 @@ impl Picker {
                 SIZES[self.size_ix]
             )
         };
-        let window = format!("last {}", WINDOWS[self.window_ix]);
+        let window = match self.history_secs {
+            Some(span) => format!(
+                "last {}   (history: {})",
+                self.windows[self.window_ix],
+                human_span(span)
+            ),
+            None => "last —   (no observations yet)".to_string(),
+        };
         let choices = self.project_choices();
         let project = if self.project_query.is_empty() {
             choices
@@ -353,9 +430,10 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
             || (after(2) && prev[prev.len() - 2] == "idle" && prev[prev.len() - 1] == ">")
         {
             cands.extend(
-                WINDOWS
+                WINDOW_LADDER
                     .iter()
-                    .chain(IDLES[1..].iter())
+                    .map(|(l, _)| *l)
+                    .chain(IDLES[1..].iter().copied())
                     .filter(|x| x.starts_with(last))
                     .map(|x| x.to_string()),
             );
@@ -442,7 +520,14 @@ mod tests {
             merge_complete: true,
             pr_ix: 1,
             projects: vec!["mole".into(), "roon-knob".into()],
+            history_secs: Some(30 * 86_400),
+            windows: windows_for(Some(30 * 86_400)),
         };
+        p.window_ix = p
+            .windows
+            .iter()
+            .position(|w| w == "7d")
+            .expect("7d offered");
         let text = p.compose();
         assert_eq!(
             text,
@@ -479,13 +564,17 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
         };
-        let p = Picker::from_report(&report, "growth < 1GB in 30d idle > 7d merge-complete");
+        let p = Picker::from_report(
+            &report,
+            "growth < 1GB in 30d idle > 7d merge-complete",
+            Some(90 * 86_400),
+        );
         assert!(!p.growth_gt);
         assert_eq!(SIZES[p.size_ix], "1GB");
-        assert_eq!(WINDOWS[p.window_ix], "30d");
+        assert_eq!(p.windows[p.window_ix], "30d");
         assert_eq!(IDLES[p.idle_ix], "7d");
         assert!(p.merge_complete);
-        let p0 = Picker::from_report(&report, "0");
+        let p0 = Picker::from_report(&report, "0", Some(90 * 86_400));
         assert_eq!(p0.compose(), "0");
     }
 
@@ -510,5 +599,33 @@ mod tests {
         assert_eq!(t, "growth > 100MB in ");
         let (_, c) = apply_completion("growth > 100MB in 7", &projects);
         assert!(c.contains(&"7d".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn windows_never_exceed_the_history_the_store_holds() {
+        // Four hours of observations: a week-long window would report
+        // growth the tool never observed.
+        let w = windows_for(Some(4 * 3_600 + 600));
+        assert_eq!(w, vec!["1h".to_string(), "all history (4h)".to_string()]);
+        assert!(!w.iter().any(|x| x == "7d" || x == "1y"));
+        assert_eq!(window_secs("all history (4h)", Some(15_000)), 15_000);
+        assert_eq!(window_filter_text("all history (4h)", Some(15_000)), "4h");
+
+        // Exactly on a rung: no synthetic entry.
+        let w = windows_for(Some(7 * 86_400));
+        assert_eq!(w.last().unwrap(), "7d");
+
+        // A month of history offers the whole ladder up to 30d.
+        let w = windows_for(Some(30 * 86_400));
+        assert!(w.contains(&"24h".to_string()) && w.contains(&"30d".to_string()));
+        assert!(!w.contains(&"90d".to_string()));
+
+        // No observations at all.
+        assert_eq!(windows_for(None), vec!["all history".to_string()]);
     }
 }

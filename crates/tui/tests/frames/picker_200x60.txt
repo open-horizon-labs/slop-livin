@@ -22,7 +22,7 @@
 "                                                                                                                                                                                                        "
 "                                                             ┌ filter ────────────────────────────────────────────────────────────────────┐                                                             "
 "                                                             │  growth         grew more than 100MB   (Space: grew/shrank)                │                                                             "
-"                                                             │  window         last 7d                                                    │                                                             "
+"                                                             │  window         last 7d   (history: 30d)                                   │                                                             "
 "                                                             │▸ kind           build                                                      │                                                             "
 "                                                             │  project        any                                                        │                                                             "
 "                                                             │  idle           off                                                        │                                                             "

@@ -99,6 +99,9 @@ pub struct App {
     pub quit: bool,
     /// Terminal width at the last draw; the header fits its clauses to it.
     pub width: u16,
+    /// Seconds of observation history the store holds; bounds the growth
+    /// windows a human may pick (the store cannot answer beyond it).
+    pub history_secs: Option<u64>,
     /// git tracking status per absolute path, filled when a project is
     /// opened (one exclude stack per worktree, reused for its rows).
     pub track: std::collections::HashMap<PathBuf, slop_livin_core::ignore::TrackState>,
@@ -107,15 +110,42 @@ pub struct App {
     pub store_dir: Option<PathBuf>,
 }
 
-fn saved_filter_path(store: &std::path::Path) -> PathBuf {
-    store.join("ui_filter.txt")
+fn ui_state_path(store: &std::path::Path) -> PathBuf {
+    store.join("ui_state.json")
 }
 
-/// The filter text saved by the last session, if any.
-pub fn load_saved_filter(store: &std::path::Path) -> Option<String> {
-    let t = std::fs::read_to_string(saved_filter_path(store)).ok()?;
-    let t = t.trim().to_string();
-    (!t.is_empty()).then_some(t)
+/// What the TUI remembers between sessions: the applied filter and the
+/// sort. Both are choices a human made about how to look at their own
+/// machine; asking again every launch is the tool forgetting on purpose.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UiState {
+    #[serde(default)]
+    pub filter: String,
+    #[serde(default)]
+    pub sort: String,
+}
+
+pub fn load_ui_state(store: &std::path::Path) -> UiState {
+    std::fs::read_to_string(ui_state_path(store))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn sort_from_str(s: &str) -> Sort {
+    match s {
+        "growth" => Sort::Growth,
+        "size" => Sort::Size,
+        _ => Sort::None,
+    }
+}
+
+pub fn sort_to_str(s: Sort) -> &'static str {
+    match s {
+        Sort::Growth => "growth",
+        Sort::Size => "size",
+        Sort::None => "none",
+    }
 }
 
 impl App {
@@ -150,6 +180,7 @@ impl App {
             width: 0,
             store_dir: None,
             track: std::collections::HashMap::new(),
+            history_secs: None,
         }
     }
 
@@ -231,6 +262,7 @@ impl App {
 
     pub fn set_sort(&mut self, sort: Sort) {
         self.sort = if self.sort == sort { Sort::None } else { sort };
+        self.persist_ui_state();
     }
 
     /// Whether the active filter is one that has no data source yet.
@@ -271,6 +303,7 @@ impl App {
         self.picker = Some(crate::picker::Picker::from_report(
             &self.report,
             &self.filter_text,
+            self.history_secs,
         ));
     }
 
@@ -358,9 +391,19 @@ impl App {
     }
 
     fn persist_filter(&self) {
+        self.persist_ui_state();
+    }
+
+    fn persist_ui_state(&self) {
         if let Some(store) = &self.store_dir {
+            let state = UiState {
+                filter: self.filter_text.clone(),
+                sort: sort_to_str(self.sort).to_string(),
+            };
             let _ = std::fs::create_dir_all(store);
-            let _ = std::fs::write(saved_filter_path(store), &self.filter_text);
+            if let Ok(text) = serde_json::to_string_pretty(&state) {
+                let _ = std::fs::write(ui_state_path(store), text);
+            }
         }
     }
 
@@ -428,13 +471,22 @@ impl App {
         if self.view == ViewKind::Projects
             && let Some(row) = self.selected_row()
         {
-            let name = row
+            let shown = row
                 .label
                 .split("  · ")
                 .next()
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            // The row shows `owner/repo`; the report keys on the project's
+            // own name, so map back rather than searching for the label.
+            let name = self
+                .report
+                .projects
+                .iter()
+                .find(|p| model::project_display_name(p) == shown)
+                .map(|p| p.name.clone())
+                .unwrap_or(shown);
             // Source rows start collapsed; the human opens the one they
             // care about with →.
             if let Some(p) = self.report.projects.iter().find(|p| p.name == name) {
@@ -467,8 +519,12 @@ impl App {
         if let Some(wt) = row.worktree.clone() {
             // A worktree has its own bar: only a linked worktree, and only
             // with the facts in its favor. Each refusal names the fact.
-            if !wt.linked {
-                self.set_refusal("main checkout — not removable as a worktree");
+            // A whole checkout is the `archive` verb, with a higher bar
+            // than a linked worktree: it needs a remote to restore from
+            // and no untracked content (checked live at the sink).
+            let whole_checkout = !wt.linked;
+            if whole_checkout && wt.remote.is_none() {
+                self.set_refusal("no remote: nothing to restore this checkout from");
                 return;
             }
             match wt.dirty {
@@ -499,6 +555,8 @@ impl App {
                         worktree: Some(crate::actions::WorktreeTerms {
                             merge_complete: wt.merge_complete,
                             pr: wt.pr.clone(),
+                            whole_checkout,
+                            remote: wt.remote.clone(),
                         }),
                     },
                 );

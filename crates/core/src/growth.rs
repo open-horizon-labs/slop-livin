@@ -676,6 +676,31 @@ fn compact_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
 /// without waiting for the compaction threshold. Exposed for callers
 /// (or a future maintenance command) that want retention enforced on
 /// every observation regardless of file count.
+/// The oldest observation the store can still answer from, in seconds
+/// before `now`: the earliest `observed_at` across the delta log and the
+/// current state. `None` when the store holds no observation.
+///
+/// A growth window longer than this span cannot be honored — the tool
+/// would be reporting "growth over a year" from three days of history —
+/// so surfaces clamp their offered windows to it and say what they have.
+pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
+    let mut oldest: Option<u64> = None;
+    let mut consider = |rows: Vec<StoredRow>| {
+        for r in rows {
+            oldest = Some(oldest.map_or(r.observed_at, |o: u64| o.min(r.observed_at)));
+        }
+    };
+    if let Ok(rows) = read_rows(&current_path(dir)) {
+        consider(rows);
+    }
+    for f in list_delta_files(dir) {
+        if let Ok(rows) = read_rows(&f) {
+            consider(rows);
+        }
+    }
+    oldest.map(|o| now.saturating_sub(o))
+}
+
 pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let retention_secs = retention_days.saturating_mul(86400);
     let horizon = now.saturating_sub(retention_secs);
