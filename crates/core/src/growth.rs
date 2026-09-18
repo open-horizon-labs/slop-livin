@@ -1430,7 +1430,16 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
     let current_rows = read_rows(&current_path(dir))?;
     let mut artifacts_by_worktree: HashMap<String, Vec<ArtifactRow>> = HashMap::new();
     let mut attributed_total = 0u64;
-    for row in current_rows.iter().filter(|r| r.present) {
+    // Docker rows are persisted for growth history but are NOT part of the
+    // filesystem walk: the report re-derives them from daemon facts every
+    // time and keeps them out of `walked_total`/`attributed`. Carrying
+    // them into the reconstructed attribution both double-listed them and
+    // inflated the incremental totals by their unique bytes (#29 live).
+    let is_docker_kind = |k: &str| matches!(k, "DockerImage" | "DockerBuildCache" | "DockerVolume");
+    for row in current_rows
+        .iter()
+        .filter(|r| r.present && !is_docker_kind(&r.kind))
+    {
         attributed_total += row.bytes;
         artifacts_by_worktree
             .entry(row.worktree_id.clone())

@@ -746,3 +746,122 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
         "every other row must match a full walk"
     );
 }
+
+/// Live #29 finding: with Docker facts joined, the incremental path
+/// inflated `walked_total` by the Docker rows' unique bytes (they are
+/// persisted for growth history but are not filesystem bytes) and listed
+/// them twice. With facts present, incremental must equal a full walk and
+/// Docker rows must appear exactly once.
+#[test]
+fn docker_rows_stay_out_of_walked_total_and_are_not_duplicated_on_incremental() {
+    disable_too_soon_floor();
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+    let facts = Some(fx.docker_facts.as_path());
+
+    let first = report_full_mode_with_source(
+        &fx.root,
+        facts,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("first (full) report");
+    let docker_rows = |r: &slop_livin_core::Report| -> Vec<String> {
+        let mut v: Vec<String> = r
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .flat_map(|w| w.artifacts.iter())
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    slop_livin_core::report::ArtifactKind::DockerImage
+                        | slop_livin_core::report::ArtifactKind::DockerBuildCache
+                        | slop_livin_core::report::ArtifactKind::DockerVolume
+                )
+            })
+            .map(|a| a.path.display().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let first_docker = docker_rows(&first);
+    assert!(
+        !first_docker.is_empty(),
+        "fixture must join at least one Docker object"
+    );
+
+    fs::write(fx.node_modules.join("touched.bin"), vec![b't'; 4096]).expect("touch");
+    let source = CannedSource(incremental_plan(vec![fx.node_modules.clone()], 1));
+    let second = report_full_mode_with_source(
+        &fx.root,
+        facts,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    )
+    .expect("incremental report");
+    assert!(
+        second
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        second.notes
+    );
+
+    let full = report_full_mode_with_source(
+        &fx.root,
+        facts,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        false,
+        false,
+        false,
+        true,
+        &no_op_source(),
+    )
+    .expect("forced full report");
+
+    assert_eq!(
+        second.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
+    assert_eq!(
+        second.reconciliation.attributed,
+        full.reconciliation.attributed
+    );
+    assert_eq!(
+        second.reconciliation.docker_attributed,
+        full.reconciliation.docker_attributed
+    );
+    assert_eq!(
+        full.reconciliation.walked_total,
+        first.reconciliation.walked_total + 4096
+    );
+    let second_docker = docker_rows(&second);
+    assert_eq!(
+        second_docker, first_docker,
+        "docker rows must appear exactly once, unchanged"
+    );
+    let mut dedup = second_docker.clone();
+    dedup.dedup();
+    assert_eq!(
+        dedup.len(),
+        second_docker.len(),
+        "no duplicated docker rows"
+    );
+}
