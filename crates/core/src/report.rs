@@ -160,6 +160,25 @@ pub struct WorktreeRow {
     pub kind: WorktreeKind,
     pub artifacts: Vec<ArtifactRow>,
     pub signals: Vec<Signal>,
+    /// Current branch (`None` for a detached HEAD). Used for GitHub
+    /// enrichment and shown in the `--view worktrees` printer.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// GitHub facts for `branch`, when the remote is on github.com and
+    /// enrichment ran. `None` when the remote isn't GitHub (never
+    /// queried; not the same as `Unknown`, which means GitHub was asked
+    /// and couldn't answer).
+    #[serde(default)]
+    pub github: Option<crate::github::GithubFacts>,
+    /// Composite `merge-complete` fact -- always emitted with its terms.
+    /// `None` when `github` is `None` (nothing to compose from).
+    #[serde(default)]
+    pub merge_complete: Option<crate::github::MergeComplete>,
+    /// `now - max(last commit time, newest mtime observed in Source)`,
+    /// in seconds. `None` when neither could be established (no commits
+    /// and nothing readable under the worktree).
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +259,23 @@ pub struct Report {
     /// populated when a store directory was supplied.
     #[serde(default)]
     pub schedule_line: Option<String>,
+    /// Set only when this call ran live GitHub enrichment (`enrich:
+    /// true` -- `slop-livin observe`'s full walk, or `report --enrich`).
+    /// `None` for a plain `report` call, which reads `enrich.parquet`
+    /// as-is and never shells out to `gh`.
+    #[serde(default)]
+    pub github_enrichment: Option<GithubEnrichmentSummary>,
+}
+
+/// Live GitHub enrichment stats for one `report_full(.., enrich: true)`
+/// call: how many `gh api graphql` calls it made (one per `(owner,
+/// repo)` that needed a refresh) and how long that took, independent of
+/// the rest of the report's wall time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GithubEnrichmentSummary {
+    pub calls_made: u32,
+    pub worktrees_enriched: u32,
+    pub elapsed_secs: f64,
 }
 
 /// R2 discovers projects (checkouts and linked worktrees) under `root`
@@ -281,6 +317,7 @@ pub fn report_with(
         since_override,
         true,
         false,
+        false,
     )
 }
 
@@ -310,6 +347,7 @@ pub fn report_with_observe(
         since_override,
         observe,
         false,
+        false,
     )
 }
 
@@ -336,16 +374,49 @@ pub fn report_with_dirs(
         since_override,
         true,
         include_dirs,
+        false,
+    )
+}
+
+/// Same as [`report_with`], with an explicit `enrich` flag: when `true`
+/// (`report --enrich`), GitHub facts are refreshed live (same
+/// concurrent, coalesced `observe_all` path `slop-livin observe` uses)
+/// before being read back. When `false` (the default for every other
+/// caller, including `report_with`), GitHub facts come **only** from
+/// `enrich.parquet` -- this call never shells out to `gh`. See the
+/// module doc on `github.rs` for why report and observe are split.
+pub fn report_with_enrich(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    enrich: bool,
+) -> Result<Report> {
+    report_full(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        false,
+        enrich,
     )
 }
 
 /// The actual implementation behind [`report_with`], [`report_with_observe`],
-/// and [`report_with_dirs`]: `observe` controls whether this call persists
-/// a new observation into the growth store or only reads it, `include_dirs`
-/// (R4c) controls whether `dirs_by_worktree`/`files_by_worktree` are
-/// populated on the returned report. `pub` (rather than the other three's
-/// convenience wrapper shape) because the CLI's `--dirs` and `--no-observe`
-/// are independent flags and a caller may need both knobs at once.
+/// [`report_with_dirs`], and [`report_with_enrich`]: `observe` controls
+/// whether this call persists a new observation into the growth store or
+/// only reads it, `include_dirs` (R4c) controls whether
+/// `dirs_by_worktree`/`files_by_worktree` are populated on the returned
+/// report, and `enrich` (#35) controls whether GitHub facts are
+/// refreshed live or read as-is from `enrich.parquet`. `pub` (rather
+/// than the other four's convenience wrapper shape) because the CLI's
+/// `--dirs`/`--no-observe`/`--enrich` are independent flags and a caller
+/// may need more than one at once.
+#[allow(clippy::too_many_arguments)]
 pub fn report_full(
     root: &Path,
     docker_facts: Option<&Path>,
@@ -354,6 +425,7 @@ pub fn report_full(
     since_override: Option<&str>,
     observe: bool,
     include_dirs: bool,
+    enrich: bool,
 ) -> Result<Report> {
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let observed_at = crate::entities::now();
@@ -404,6 +476,10 @@ pub fn report_full(
     // project_id -> normalized remote URL, first one seen for that project.
     let mut project_remotes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // worktree_id -> raw remote URL, this worktree's own (never
+    // normalized: github_owner_repo parses either form).
+    let mut worktree_remotes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (group_key, mut members) in groups {
         members.sort_by(|a, b| a.path.cmp(&b.path));
         let project_id = id_for(&group_key);
@@ -413,6 +489,9 @@ pub fn report_full(
         for dw in members {
             let worktree_id = id_for(&dw.path.display().to_string());
             worktree_paths.push((dw.path.clone(), worktree_id.clone()));
+            if let Some(remote) = &dw.remote_url {
+                worktree_remotes.insert(worktree_id.clone(), remote.clone());
+            }
             if let Some(remote) = dw.remote_url.as_deref().and_then(normalize_remote) {
                 project_remotes.entry(project_id.clone()).or_insert(remote);
             }
@@ -436,6 +515,10 @@ pub fn report_full(
                 kind,
                 artifacts: Vec::new(),
                 signals: Vec::new(),
+                branch: None,
+                github: None,
+                merge_complete: None,
+                idle_secs: None,
             });
         }
         let remote = project_remotes.get(&project_id).cloned();
@@ -460,16 +543,37 @@ pub fn report_full(
         }
     }
 
+    // worktree_id -> raw signal values, kept alongside the rendered
+    // `Signal` rows so the merge_complete composite and `filter.rs`'s
+    // `idle >` predicate can use them without re-parsing rendered
+    // strings.
+    let mut raw_by_worktree: std::collections::HashMap<String, crate::signals::RawSignals> =
+        std::collections::HashMap::new();
     let t_signals = std::time::Instant::now();
     let signal_paths: Vec<PathBuf> = projects
         .iter()
         .flat_map(|p| p.worktrees.iter().map(|w| w.path.clone()))
         .collect();
     let mut signals =
-        crate::signals::compute_signals_parallel(&signal_paths, observed_at).into_iter();
+        crate::signals::compute_signals_raw_parallel(&signal_paths, observed_at).into_iter();
     for project in &mut projects {
         for worktree in &mut project.worktrees {
-            worktree.signals = signals.next().unwrap_or_default();
+            let (rows, raw) = signals.next().unwrap_or_else(|| {
+                (
+                    Vec::new(),
+                    crate::signals::RawSignals {
+                        last_commit_age_secs: None,
+                        dirty: None,
+                        unpushed: None,
+                        locked: None,
+                        idle_for_secs: None,
+                    },
+                )
+            });
+            worktree.signals = rows;
+            worktree.branch = crate::github::current_branch(&worktree.path);
+            worktree.idle_secs = raw.idle_for_secs;
+            raw_by_worktree.insert(worktree.worktree_id.clone(), raw);
         }
     }
     if trace {
@@ -480,8 +584,140 @@ pub fn report_full(
         );
     }
 
+    // GitHub enrichment: only for worktrees whose remote is on
+    // github.com. Cached in enrich.parquet under a volume-keyed
+    // directory: `store_dir` when given (same directory `growth.rs`
+    // uses), otherwise the same default `${SLOP_LIVIN_DIR}` the CLI/MCP
+    // resolve on their own.
+    //
+    // `enrich` (distinct from `observe`, which only controls the growth
+    // store) decides whether this call makes live `gh` calls at all:
+    // `false` (plain `report`/`--view worktrees`) reads `enrich.parquet`
+    // as-is via `github::read_cached` and never shells out; `true`
+    // (`slop-livin observe`'s full walk, or `report --enrich`) refreshes
+    // it live via `github::observe_all` (concurrent, coalesced per
+    // repo) before reading it back. See `github.rs`'s module doc for the
+    // full rationale.
+    let mut github_notes: Vec<String> = Vec::new();
+    let mut github_enrichment: Option<GithubEnrichmentSummary> = None;
+    let github_dir_owned = store_dir
+        .map(PathBuf::from)
+        .or_else(default_github_cache_dir);
+    if let Some(dir) = github_dir_owned.as_deref() {
+        let volume_id = std::fs::metadata(root)
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+            .unwrap_or(0);
+
+        // (worktree_id, owner, repo, branch, tip_sha) for every worktree
+        // whose remote resolves to a github.com owner/repo.
+        let mut owned: Vec<(String, String, String, Option<String>, String)> = Vec::new();
+        for project in &projects {
+            for worktree in &project.worktrees {
+                let Some(remote) = worktree_remotes.get(&worktree.worktree_id) else {
+                    continue;
+                };
+                let Some((owner, repo)) = crate::github::github_owner_repo(remote) else {
+                    continue;
+                };
+                let tip_sha = crate::signals::tip_sha(&worktree.path).unwrap_or_default();
+                owned.push((
+                    worktree.worktree_id.clone(),
+                    owner,
+                    repo,
+                    worktree.branch.clone(),
+                    tip_sha,
+                ));
+            }
+        }
+        let inputs: Vec<crate::github::EnrichInput> = owned
+            .iter()
+            .map(
+                |(worktree_id, owner, repo, branch, tip_sha)| crate::github::EnrichInput {
+                    worktree_id,
+                    tip_sha,
+                    branch: branch.as_deref(),
+                    owner,
+                    repo,
+                },
+            )
+            .collect();
+
+        let t_github = std::time::Instant::now();
+        let (facts_by_worktree, gh_notes) = if enrich {
+            let responder = crate::github::GhCliResponder;
+            let summary = crate::github::observe_all(
+                &responder,
+                dir,
+                volume_id,
+                &inputs,
+                observed_at,
+                crate::github::DEFAULT_GITHUB_TTL_SECS,
+                crate::github::DEFAULT_RUN_BUDGET_SECS,
+                crate::github::DEFAULT_CONCURRENCY,
+            );
+            let (facts, mut read_notes) = crate::github::read_cached(
+                dir,
+                volume_id,
+                &inputs,
+                observed_at,
+                crate::github::DEFAULT_GITHUB_TTL_SECS,
+            );
+            read_notes.retain(|n| !n.contains("not enriched") && !n.contains("stale cached"));
+            read_notes.extend(summary.notes);
+            github_enrichment = Some(GithubEnrichmentSummary {
+                calls_made: summary.calls_made,
+                worktrees_enriched: summary.worktrees_enriched,
+                elapsed_secs: t_github.elapsed().as_secs_f64(),
+            });
+            (facts, read_notes)
+        } else {
+            // Never shells out: reads whatever `enrich.parquet` already
+            // has, marking stale/missing entries `Unknown` with a note
+            // pointing at `slop-livin observe`.
+            crate::github::read_cached(
+                dir,
+                volume_id,
+                &inputs,
+                observed_at,
+                crate::github::DEFAULT_GITHUB_TTL_SECS,
+            )
+        };
+        for project in &mut projects {
+            for worktree in &mut project.worktrees {
+                if let Some(facts) = facts_by_worktree.get(&worktree.worktree_id) {
+                    let raw = raw_by_worktree.get(&worktree.worktree_id);
+                    let mc = crate::github::merge_complete(
+                        raw.and_then(|r| r.dirty),
+                        raw.and_then(|r| r.unpushed),
+                        &facts.merged,
+                    );
+                    worktree.signals.push(Signal {
+                        name: "merge_complete".to_string(),
+                        value: format!(
+                            "{} ({})",
+                            match mc.verdict {
+                                crate::github::TriState::Yes => "yes",
+                                crate::github::TriState::No => "no",
+                                crate::github::TriState::Unknown => "unknown",
+                            },
+                            mc.terms.join(", ")
+                        ),
+                    });
+                    worktree.signals.push(Signal {
+                        name: "pull_request".to_string(),
+                        value: render_pr_status(&facts.pull_request),
+                    });
+                    worktree.merge_complete = Some(mc);
+                    worktree.github = Some(facts.clone());
+                }
+            }
+        }
+        github_notes = gh_notes;
+    }
+
     let mut unowned = attribution.unowned;
     let mut notes: Vec<String> = Vec::new();
+    notes.extend(github_notes);
     let facts = crate::docker::load(docker_facts);
     if let Some(reason) = &facts.unavailable {
         notes.push(reason.clone());
@@ -632,6 +868,7 @@ pub fn report_full(
         dirs_by_worktree,
         files_by_worktree,
         schedule_line,
+        github_enrichment,
     })
 }
 
@@ -662,6 +899,48 @@ fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
     for d in dirs.iter_mut() {
         let key = (d.worktree_id.clone(), d.rel_path.clone());
         d.allocated_total = *totals.get(&key).unwrap_or(&d.own_allocated);
+    }
+}
+
+/// `${SLOP_LIVIN_DIR}` (or `~/.local/share/slop-livin`): the same
+/// resolution the CLI and MCP server use on their own, duplicated here
+/// only as a fallback for GitHub enrichment's cache when no `store_dir`
+/// was supplied (see the call site in `report_with`).
+fn default_github_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".local/share/slop-livin"))
+}
+
+/// Renders a `PrStatus` for the `pull_request` signal row and the
+/// `--view worktrees` printer, e.g. `PR #123 open (approved)`,
+/// `PR #98 merged`, `no PR`, `unknown`.
+fn render_pr_status(status: &crate::github::PrStatus) -> String {
+    use crate::github::{PrState, PrStatus, ReviewDecision};
+    match status {
+        PrStatus::None => "no PR".to_string(),
+        PrStatus::Unknown => "unknown".to_string(),
+        PrStatus::Some(pr) => {
+            let state = match pr.state {
+                PrState::Open => "open",
+                PrState::Closed => "closed",
+                PrState::Merged => "merged",
+            };
+            let decision = match pr.review_decision {
+                ReviewDecision::Approved => Some("approved"),
+                ReviewDecision::ChangesRequested => Some("changes requested"),
+                ReviewDecision::ReviewRequired => Some("review required"),
+                ReviewDecision::None | ReviewDecision::Unknown => None,
+            };
+            let draft = if pr.draft { " draft" } else { "" };
+            match decision {
+                Some(d) => format!("PR #{}{draft} {state} ({d})", pr.number),
+                None => format!("PR #{}{draft} {state}", pr.number),
+            }
+        }
     }
 }
 
@@ -1024,22 +1303,37 @@ pub struct ObserveSummary {
     /// Always "full" until incremental walks (#29) land; the seam this
     /// field exists for.
     pub mode: &'static str,
+    /// Live GitHub enrichment stats for this same pass (#35): `observe`
+    /// refreshes both the growth store and `enrich.parquet` in one walk,
+    /// since it already has every worktree's path/branch/tip in hand.
+    pub github: GithubEnrichmentSummary,
 }
 
 /// Observe-only entry point for `slop-livin observe`: walks `root`,
-/// writes the growth store under `store_dir`, and returns the summary
-/// facts the caller prints/logs. Never renders a report.
+/// writes the growth store under `store_dir`, refreshes GitHub
+/// enrichment live for every GitHub-remote worktree found (concurrent,
+/// coalesced per repo -- see `github::observe_all`), and returns the
+/// summary facts the caller prints/logs. Never renders a report.
 pub fn observe_only(
     root: &Path,
     store_dir: &Path,
     since_override: Option<&str>,
 ) -> Result<ObserveSummary> {
-    let r = report_with_observe(root, None, false, Some(store_dir), since_override, true)?;
+    let r = report_with_enrich(
+        root,
+        None,
+        false,
+        Some(store_dir),
+        since_override,
+        true,
+        true,
+    )?;
     Ok(ObserveSummary {
         observed_at: r.observed_at,
         walked_total: r.reconciliation.walked_total,
         projects: r.projects.len(),
         mode: "full",
+        github: r.github_enrichment.unwrap_or_default(),
     })
 }
 

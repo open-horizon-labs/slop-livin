@@ -146,6 +146,7 @@ mod tests {
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
+            github_enrichment: None,
         }
     }
 

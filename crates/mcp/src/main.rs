@@ -1,5 +1,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
+use slop_livin_core::filter;
+use slop_livin_core::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
 use slop_livin_core::growth::{DEFAULT_SINCE, load_config, parse_duration_secs};
 use slop_livin_core::report::{ArtifactKind, Report, UnownedReason, report_with};
 use std::io::{self, BufRead, Write};
@@ -263,6 +265,97 @@ fn tool_what_grew(params: &Value) -> Result<Value> {
     }))
 }
 
+fn render_pr_json(pr: &PrStatus) -> Value {
+    match pr {
+        PrStatus::None => json!("none"),
+        PrStatus::Unknown => json!("unknown"),
+        PrStatus::Some(pr) => json!({
+            "number": pr.number,
+            "state": format!("{:?}", pr.state).to_lowercase(),
+            "draft": pr.draft,
+            "url": pr.url,
+            "title": pr.title,
+            "review_decision": format!("{:?}", pr.review_decision).to_lowercase(),
+            "updated_at": pr.updated_at,
+        }),
+    }
+}
+
+/// `list_worktrees` tool: one entry per worktree (optionally scoped by
+/// `filter`, same grammar as the CLI's `--filter`), with branch, idle,
+/// the `merge_complete` composite fact and its terms, and PR status.
+/// Never a verdict, never an action -- the `remove_command` field is
+/// text for a human to run, not something this tool executes.
+fn tool_list_worktrees(params: &Value) -> Result<Value> {
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or(".")
+        .to_string();
+    let since = args.get("since").and_then(Value::as_str).map(String::from);
+    let filter_expr = args.get("filter").and_then(Value::as_str);
+    let parsed_filter = match filter_expr {
+        Some(expr) => filter::parse(expr)?,
+        None => filter::Filter::default(),
+    };
+
+    let r = run_report(&root, since.as_deref())?;
+    let mut rows: Vec<Value> = Vec::new();
+    for project in &r.projects {
+        for wt in &project.worktrees {
+            let empty_pr = PrStatus::Unknown;
+            let (pr, verdict, merge_complete_terms, merged) = match (&wt.github, &wt.merge_complete)
+            {
+                (
+                    Some(GithubFacts {
+                        pull_request,
+                        merged,
+                        ..
+                    }),
+                    Some(MergeComplete { verdict, terms }),
+                ) => (pull_request, *verdict, Some(terms.clone()), merged),
+                (
+                    Some(GithubFacts {
+                        pull_request,
+                        merged,
+                        ..
+                    }),
+                    None,
+                ) => (pull_request, TriState::Unknown, None, merged),
+                (None, _) => (&empty_pr, TriState::Unknown, None, &MergedStatus::Unknown),
+            };
+            let facts = filter::WorktreeFacts {
+                merge_complete: verdict == TriState::Yes,
+                idle_secs: wt.idle_secs,
+                pr,
+                merged,
+            };
+            if !parsed_filter.matches_worktree(project, wt, &facts) {
+                continue;
+            }
+            let verdict_str = match verdict {
+                TriState::Yes => "yes",
+                TriState::No => "no",
+                TriState::Unknown => "unknown",
+            };
+            rows.push(json!({
+                "project": project.name,
+                "path": wt.path,
+                "branch": wt.branch,
+                "idle_secs": wt.idle_secs,
+                "merge_complete": merge_complete_terms.map(|terms| json!({
+                    "verdict": verdict_str,
+                    "terms": terms,
+                })),
+                "pull_request": render_pr_json(pr),
+                "remove_command": format!("git worktree remove {}", wt.path.display()),
+            }));
+        }
+    }
+    Ok(json!({ "worktrees": rows }))
+}
+
 fn main() -> Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -299,6 +392,15 @@ fn main() -> Result<()> {
                             "root":{"type":"string","description":"Root directory to report on (default: '.')"},
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"}
                         }}
+                    },
+                    {
+                        "name":"list_worktrees",
+                        "description":"Worktree merge-complete semantics: branch, idle time, the merge_complete composite fact with its terms, and GitHub PR status. Never a verdict -- always reported with the terms that fed it. remove_command is text for a human to run, never executed by this tool.",
+                        "inputSchema":{"type":"object","properties":{
+                            "root":{"type":"string","description":"Root directory to report on (default: '.')"},
+                            "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"},
+                            "filter":{"type":"string","description":"Filter expression, e.g. 'merge-complete idle > 48h pr:merged'"}
+                        }}
                     }
                 ]})
             }
@@ -311,6 +413,8 @@ fn main() -> Result<()> {
                     "what_grew" => tool_what_grew(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     "list_projects" => tool_list_projects(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "list_worktrees" => tool_list_worktrees(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     _ => json!({"state":"unsupported","cause":"unknown tool"}),
                 };

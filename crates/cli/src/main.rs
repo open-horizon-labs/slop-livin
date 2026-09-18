@@ -3,7 +3,8 @@ mod schedule;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
-    render::{render_kinds, render_overview, render_project},
+    filter,
+    render::{render_kinds, render_overview, render_project, render_worktrees},
     report::{Report, report_full, to_json},
     scan::{ScanOptions, observation},
     store::Store,
@@ -78,9 +79,30 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
+        /// Alternate text view. Currently only "worktrees": one line per
+        /// worktree with branch, idle, merge-complete (with terms), and
+        /// PR status, plus the literal `git worktree remove <path>`
+        /// command -- never executed by this tool.
+        #[arg(long)]
+        view: Option<String>,
+        /// Filter worktrees/artifacts, e.g. "merge-complete idle > 48h".
+        /// See `slop_livin_core::filter` for the grammar.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Refresh GitHub enrichment live before reading it, instead of
+        /// reading `enrich.parquet` as-is. By default `report` never
+        /// shells out to `gh` -- run `slop-livin observe` (or wait for
+        /// the schedule) to keep the cache warm, and reach for this flag
+        /// only when you're fine waiting on live calls right now.
+        #[arg(long)]
+        enrich: bool,
     },
-    /// Observe-only: walk `root`s and write the growth store, no
-    /// rendering. This is what a scheduled LaunchAgent run executes.
+    /// Observe-only: walk `root`s, write the growth store, and refresh
+    /// GitHub enrichment live for every GitHub-remote worktree found
+    /// (concurrent, coalesced per repo -- see `github::observe_all`). No
+    /// rendering. This is what a scheduled LaunchAgent run executes, and
+    /// the only `slop-livin` command that calls `gh` on your behalf by
+    /// default; `report` reads whatever this last wrote.
     Observe {
         #[arg(required = true)]
         roots: Vec<PathBuf>,
@@ -140,11 +162,16 @@ fn main() -> Result<()> {
             docker,
             dirs,
             depth,
+            view,
+            filter: filter_expr,
+            enrich,
         } => {
             // The growth store is always consulted, even under
             // `--no-observe`: growth is read from whatever prior
             // observations already exist there (item 5), and only the
-            // *write* of a new observation is skipped.
+            // *write* of a new observation is skipped. GitHub enrichment
+            // is a separate opt-in (`--enrich`): plain `report` never
+            // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = slop_livin_dir();
             let r = report_full(
                 &root,
@@ -154,7 +181,16 @@ fn main() -> Result<()> {
                 since.as_deref(),
                 !no_observe,
                 dirs,
+                enrich,
             )?;
+            let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
+                Some(Ok(f)) => Some(f),
+                Some(Err(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                None => None,
+            };
             if json {
                 println!("{}", to_json(&r)?);
             } else if dirs {
@@ -165,6 +201,11 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 }
+            } else if view.as_deref() == Some("worktrees") {
+                print!(
+                    "{}",
+                    render_worktrees(&r, &parsed_filter.unwrap_or_default())
+                );
             } else if let Some(name) = project {
                 match render_project(&r, &name) {
                     Some(text) => print!("{text}"),

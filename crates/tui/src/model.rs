@@ -497,6 +497,10 @@ mod tests {
                             art(ArtifactKind::DependencyTree, "/r/proj/node_modules", 20),
                         ],
                         signals: vec![],
+                        branch: None,
+                        github: None,
+                        merge_complete: None,
+                        idle_secs: None,
                     },
                     slop_livin_core::report::WorktreeRow {
                         worktree_id: "w2".into(),
@@ -504,6 +508,10 @@ mod tests {
                         kind: slop_livin_core::report::WorktreeKind::Linked,
                         artifacts: vec![],
                         signals: vec![],
+                        branch: None,
+                        github: None,
+                        merge_complete: None,
+                        idle_secs: None,
                     },
                 ],
             }],
@@ -520,6 +528,7 @@ mod tests {
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
+            github_enrichment: None,
         };
         let rows = tree_rows(&report, "proj", &Filter::None, &Default::default());
         // First worktree is not last -> ├─; second worktree is last -> └─.
@@ -567,6 +576,7 @@ mod tests {
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
+            github_enrichment: None,
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
     }

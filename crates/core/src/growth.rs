@@ -1351,6 +1351,10 @@ mod tests {
                     note: None,
                 }],
                 signals: vec![],
+                branch: None,
+                github: None,
+                merge_complete: None,
+                idle_secs: None,
             }],
         }
     }
@@ -1427,6 +1431,10 @@ mod tests {
                 kind: WorktreeKind::Main,
                 artifacts: vec![],
                 signals: vec![],
+                branch: None,
+                github: None,
+                merge_complete: None,
+                idle_secs: None,
             }],
         }];
         observe_and_annotate(tmp.path(), 1, &mut absent, 2_000, 30, 3600).unwrap();

@@ -88,6 +88,12 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>) -> Result<()> {
                     summary.projects,
                     summary.mode
                 );
+                println!(
+                    "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
+                    summary.github.calls_made,
+                    summary.github.worktrees_enriched,
+                    summary.github.elapsed_secs
+                );
             }
 
             let walked_total: u64 = summaries.iter().map(|(_, s)| s.walked_total).sum();
