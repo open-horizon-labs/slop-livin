@@ -37,6 +37,12 @@ pub struct Fixture {
     pub loose_file: PathBuf,
     pub loose_file_bytes: u64,
     pub docker_facts: PathBuf,
+    /// Only read by `report_golden.rs` (the compose-file-name join case);
+    /// other fixture consumers don't need them.
+    #[allow(dead_code)]
+    pub compose_file: PathBuf,
+    #[allow(dead_code)]
+    pub compose_project_name: String,
 }
 
 /// Writes `size` bytes of a deterministic repeating pattern to `path`,
@@ -140,6 +146,17 @@ pub fn build(tmp: &Path) -> Fixture {
         ],
     );
 
+    // --- compose file at the checkout root, naming a project that does
+    // NOT match the checkout's own directory name (mirrors the real
+    // `hiphi-staging` case #28 fixes) ---
+    let compose_project_name = "fixture-stack".to_string();
+    let compose_file = checkout.join("compose.yaml");
+    fs::write(
+        &compose_file,
+        format!("name: {compose_project_name}\nservices:\n  web:\n    image: fixture/web\n"),
+    )
+    .expect("write compose fixture");
+
     // --- nested second repo, with its own build/ ---
     let nested_repo = checkout.join("nested-repo");
     fs::create_dir_all(&nested_repo).expect("mkdir nested repo");
@@ -207,6 +224,12 @@ pub fn build(tmp: &Path) -> Fixture {
     //          label source exists for build cache at all).
     //   a volume with a compose-project label matching the checkout ->
     //          joined, High (volumes get their labels straight from df -v).
+    //   9999 (#28) - compose-project label matches no discovered
+    //          project's own name, but the checkout root has a
+    //          `compose.yaml` with `name: fixture-stack` -> joined, High,
+    //          rule `compose_file_name`, to the checkout's main worktree.
+    //          A second volume with the same label exercises the same
+    //          rule for volumes.
     let docker_facts = tmp.join("docker_system_df_v.json");
     let elsewhere_source = "https://example.com/some-other-org/unrelated.git";
     let base_image_source = "https://github.com/example-org/some-upstream-base-image";
@@ -268,6 +291,14 @@ pub fn build(tmp: &Path) -> Fixture {
                 "Size": "786432",
                 "SharedSize": "65536",
                 "UniqueSize": "720896",
+            },
+            {
+                "ID": "sha256:9999000000000000000000000000000000000000000000000000000099",
+                "Repository": "fixture/compose-file-name-join",
+                "Tag": "latest",
+                "Size": "655360",
+                "SharedSize": "65536",
+                "UniqueSize": "589824",
             }
         ],
         "ImageInspect": [
@@ -303,6 +334,11 @@ pub fn build(tmp: &Path) -> Fixture {
                 "Id": "sha256:aaaa111111111111111111111111111111111111111111111111111111aa",
                 "RepoTags": ["fixture/unmatched-compose-project:latest"],
                 "Config": { "Labels": { "com.docker.compose.project": unmatched_compose_project } },
+            },
+            {
+                "Id": "sha256:9999000000000000000000000000000000000000000000000000000099",
+                "RepoTags": ["fixture/compose-file-name-join:latest"],
+                "Config": { "Labels": { "com.docker.compose.project": compose_project_name.clone() } },
             }
         ],
         "BuildCache": [
@@ -316,6 +352,11 @@ pub fn build(tmp: &Path) -> Fixture {
                 "Name": "fixture-project-volume",
                 "Labels": format!("com.docker.compose.project={checkout_name}"),
                 "Size": "262144",
+            },
+            {
+                "Name": "fixture-stack-compose-name-volume",
+                "Labels": format!("com.docker.compose.project={compose_project_name}"),
+                "Size": "131072",
             }
         ]
     });
@@ -345,5 +386,7 @@ pub fn build(tmp: &Path) -> Fixture {
         loose_file,
         loose_file_bytes,
         docker_facts,
+        compose_file,
+        compose_project_name,
     }
 }

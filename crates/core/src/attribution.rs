@@ -167,6 +167,7 @@ impl<'a> Ctx<'a> {
                         observed_at: self.observed_at,
                         confidence: crate::entities::Confidence::High,
                         source: Source::new("filesystem.walk"),
+                        note: None,
                     });
             }
             None => {
@@ -318,6 +319,7 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
                 observed_at: ctx.observed_at,
                 confidence: crate::entities::Confidence::High,
                 source: Source::new("filesystem.walk"),
+                note: None,
             });
     }
 
