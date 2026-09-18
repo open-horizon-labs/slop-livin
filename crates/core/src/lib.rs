@@ -3,6 +3,7 @@
 //! The index is evidence. Grants are authorization. The sink is the final
 //! authority and must re-observe every predicate before changing the filesystem.
 
+pub mod actions;
 pub mod attribution;
 pub mod compose;
 pub mod docker;
