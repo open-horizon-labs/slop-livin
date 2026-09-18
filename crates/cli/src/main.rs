@@ -155,6 +155,122 @@ enum Command {
         off: bool,
         roots: Vec<PathBuf>,
     },
+    /// Propose a plan from the report: folded artifact rows only, each
+    /// with project, worktree, kind, bytes, growth, recovery contract and
+    /// signals. Nothing is deleted. Prints the plan id and the approve
+    /// command (R7, #26).
+    Propose {
+        root: PathBuf,
+        /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
+        #[arg(long)]
+        filter: Option<String>,
+        /// Restrict to these exact artifact paths.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Human authorization for ONE plan: writes a one-shot grant scoped to
+    /// that plan id. Only a human at this keyboard should run this.
+    Approve { plan_id: String },
+    /// Execute an approved plan: sink re-derivation, Trash, ledger,
+    /// measured free space. Refuses per unit with the fact that refused it.
+    Execute {
+        plan_id: String,
+        #[arg(long, default_value = "human:cli")]
+        actor: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List plans (newest first).
+    Plans {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Standing grants: `grant add '<predicate>' --budget 5GB --expires 7d`,
+    /// `grant list`, `grant revoke <id>`. Predicates: kind:, project:,
+    /// idle > <dur>, merge-complete. Only a human at this keyboard should
+    /// add grants; MCP has no tool that can.
+    Grant {
+        #[command(subcommand)]
+        cmd: GrantCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GrantCmd {
+    Add {
+        predicate: String,
+        /// Total bytes this grant may ever authorize, e.g. 5GB.
+        #[arg(long)]
+        budget: String,
+        /// Lifetime, e.g. 7d.
+        #[arg(long)]
+        expires: String,
+        /// Maximum number of units this grant may authorize.
+        #[arg(long)]
+        max_units: Option<u32>,
+    },
+    List,
+    Revoke {
+        grant_id: String,
+    },
+}
+
+fn parse_size_arg(s: &str) -> Result<u64> {
+    let t = s.trim().to_uppercase();
+    let (num, mult) = if let Some(n) = t.strip_suffix("TB") {
+        (n, 1_000_000_000_000u64)
+    } else if let Some(n) = t.strip_suffix("GB") {
+        (n, 1_000_000_000)
+    } else if let Some(n) = t.strip_suffix("MB") {
+        (n, 1_000_000)
+    } else if let Some(n) = t.strip_suffix("KB") {
+        (n, 1_000)
+    } else if let Some(n) = t.strip_suffix('B') {
+        (n, 1)
+    } else {
+        (t.as_str(), 1)
+    };
+    let v: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
+    Ok((v * mult as f64) as u64)
+}
+
+fn print_plan(plan: &slop_livin_core::actions::Plan) {
+    println!(
+        "plan {}  {} units  {}  expires in {}s",
+        plan.id,
+        plan.units.len(),
+        slop_livin_core::render::human_bytes_pub(plan.planned_bytes()),
+        plan.expires_at
+            .saturating_sub(slop_livin_core::entities::now())
+    );
+    for u in &plan.units {
+        println!(
+            "  {:<14} {:>10}  {:>+10}  {}  {}  [{}]  {}",
+            format!("{:?}", u.kind).to_lowercase(),
+            slop_livin_core::render::human_bytes_pub(u.bytes),
+            u.growth_bytes
+                .map(slop_livin_core::render::human_bytes_signed)
+                .unwrap_or_else(|| "—".into()),
+            u.project,
+            u.path.display(),
+            u.recovery,
+            u.signals.join(" · ")
+        );
+    }
+    for r in &plan.refused {
+        println!("  refused  {}  — {}", r.path.display(), r.cause);
+    }
+    println!(
+        "authorize (human only): {}",
+        slop_livin_core::actions::approve_command(&plan.id)
+    );
 }
 
 /// `${SLOP_LIVIN_DIR}`, defaulting to `~/.local/share/slop-livin`.
@@ -293,6 +409,166 @@ fn main() -> Result<()> {
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                     None => print!("{}", render_overview(&r, all, verify_du, docker)),
+                }
+            }
+        }
+        Command::Propose {
+            root,
+            filter,
+            paths,
+            since,
+            json,
+        } => {
+            let store_dir = slop_livin_dir();
+            let r = report_full_mode(
+                &root,
+                None,
+                false,
+                Some(&store_dir),
+                since.as_deref(),
+                true,
+                false,
+                false,
+                false,
+            )?;
+            let parsed = match filter.as_deref().map(filter::parse) {
+                Some(Ok(f)) => Some(f),
+                Some(Err(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                None => None,
+            };
+            let plan = slop_livin_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
+            slop_livin_core::actions::save_plan(&store_dir, &plan)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_plan(&plan);
+            }
+        }
+        Command::Approve { plan_id } => {
+            let g = slop_livin_core::actions::approve(&slop_livin_dir(), &plan_id, "human:cli")?;
+            println!(
+                "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
+                plan_id,
+                g.id,
+                slop_livin_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+                g.max_units.unwrap_or(0),
+                g.expires_at
+            );
+            println!("execute with: slop-livin execute {plan_id}");
+        }
+        Command::Execute {
+            plan_id,
+            actor,
+            json,
+        } => {
+            let res = slop_livin_core::actions::execute(&slop_livin_dir(), &plan_id, &actor)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!("plan {}: {}", res.plan_id, res.state);
+                for o in &res.outcomes {
+                    println!(
+                        "  {:<9} {:>10}  {}{}",
+                        o.status,
+                        slop_livin_core::render::human_bytes_pub(o.planned_bytes),
+                        o.path.display(),
+                        o.cause
+                            .as_ref()
+                            .map(|c| format!("  — {c}"))
+                            .unwrap_or_default()
+                    );
+                }
+                println!(
+                    "planned {} · trashed {} · free space measured {}",
+                    slop_livin_core::render::human_bytes_pub(res.planned_bytes),
+                    slop_livin_core::render::human_bytes_pub(res.trashed_bytes),
+                    res.freed_measured
+                        .map(slop_livin_core::render::human_bytes_signed)
+                        .unwrap_or_else(|| "n/a".into())
+                );
+                if let Some(n) = &res.next_step {
+                    println!("next: {n}");
+                }
+            }
+        }
+        Command::Plans { json } => {
+            let plans = slop_livin_core::actions::list_plans(&slop_livin_dir())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plans)?);
+            } else if plans.is_empty() {
+                println!("no plans");
+            } else {
+                for p in plans {
+                    println!(
+                        "{}  {:?}  {} units  {}  created {}  expires {}",
+                        p.id,
+                        p.status,
+                        p.units.len(),
+                        slop_livin_core::render::human_bytes_pub(p.planned_bytes()),
+                        p.created_at,
+                        p.expires_at
+                    );
+                }
+            }
+        }
+        Command::Grant { cmd } => {
+            let dir = slop_livin_dir();
+            match cmd {
+                GrantCmd::Add {
+                    predicate,
+                    budget,
+                    expires,
+                    max_units,
+                } => {
+                    let budget_bytes = parse_size_arg(&budget)?;
+                    let expires_secs = slop_livin_core::growth::parse_duration_secs(&expires)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)")
+                        })?;
+                    let g = slop_livin_core::actions::add_standing_grant(
+                        &dir,
+                        &predicate,
+                        budget_bytes,
+                        max_units,
+                        expires_secs,
+                        "human:cli",
+                    )?;
+                    println!(
+                        "grant {} added: delete where {} · budget {} · expires {}",
+                        g.id, g.predicate, budget, expires
+                    );
+                }
+                GrantCmd::List => {
+                    let gs = slop_livin_core::actions::list_grants(&dir)?;
+                    if gs.is_empty() {
+                        println!("no grants");
+                    }
+                    for g in gs {
+                        println!(
+                            "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
+                            g.id,
+                            if g.revoked { "revoked" } else { "live" },
+                            g.plan_id
+                                .as_ref()
+                                .map(|p| format!("plan {p}"))
+                                .unwrap_or_else(|| format!("where {}", g.predicate)),
+                            slop_livin_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+                            slop_livin_core::render::human_bytes_pub(g.spent_bytes),
+                            g.used_units,
+                            g.max_units
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| "∞".into()),
+                            g.expires_at,
+                            g.actor
+                        );
+                    }
+                }
+                GrantCmd::Revoke { grant_id } => {
+                    slop_livin_core::actions::revoke_grant(&dir, &grant_id)?;
+                    println!("grant {grant_id} revoked");
                 }
             }
         }

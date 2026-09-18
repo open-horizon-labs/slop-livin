@@ -1,9 +1,9 @@
 //! Spawns the real `slop-livin-mcp` binary and asserts its `tools/list`
 //! response is exactly `docker_objects` (added by #33), `list_projects`,
 //! `list_worktrees` (added by #35), `report`, and `what_grew` --
-//! everything else R6 removes (`pressure`, `truth`, `candidates`,
-//! `measure`, and any grant/ledger/execution tool) must not be reachable
-//! from this surface.
+//! plus the R7 action tools `propose`, `execute`, `plans`, `grants` (#26).
+//! No tool that *writes* a grant may ever appear here: authorization is
+//! human-at-CLI only (`slop-livin approve`, `slop-livin grant add`).
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -43,8 +43,12 @@ fn tools_list_is_exactly_report_what_grew_list_projects_list_worktrees_and_docke
         names,
         vec![
             "docker_objects",
+            "execute",
+            "grants",
             "list_projects",
             "list_worktrees",
+            "plans",
+            "propose",
             "report",
             "what_grew"
         ]

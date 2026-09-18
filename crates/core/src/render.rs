@@ -20,6 +20,20 @@ const DEFAULT_TOP_N: usize = 25;
 /// decimal ("GB") label, so the *same* observation could read "51.3GB"
 /// from one surface (the raw integer) and "47.9GB" from this one -- a
 /// 1024-vs-1000 unit mismatch masquerading as stale/re-read data.
+/// Public alias of `human_bytes` for callers outside this module.
+pub fn human_bytes_pub(bytes: u64) -> String {
+    human_bytes(bytes)
+}
+
+/// Signed human units for growth/delta figures: `+1.2GB`, `-300.0MB`, `0B`.
+pub fn human_bytes_signed(delta: i64) -> String {
+    if delta == 0 {
+        return "0B".into();
+    }
+    let sign = if delta < 0 { "-" } else { "+" };
+    format!("{sign}{}", human_bytes(delta.unsigned_abs()))
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;

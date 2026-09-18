@@ -574,6 +574,66 @@ fn tool_list_worktrees(params: &Value) -> Result<Value> {
     Ok(json!({ "worktrees": rows }))
 }
 
+fn tool_propose(params: &Value) -> Result<Value> {
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("root is required"))?;
+    let since = args.get("since").and_then(Value::as_str).map(String::from);
+    let filter = match args.get("filter").and_then(Value::as_str) {
+        Some(f) if !f.trim().is_empty() => Some(slop_livin_core::filter::parse(f)?),
+        _ => None,
+    };
+    let paths: Vec<PathBuf> = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let r = run_report(root, since.as_deref())?;
+    let plan = slop_livin_core::actions::propose(&r, filter.as_ref(), &paths, "agent:mcp")?;
+    slop_livin_core::actions::save_plan(&slop_livin_dir(), &plan)?;
+    let mut v = serde_json::to_value(&plan)?;
+    v["state"] = json!("awaiting-authorization");
+    v["planned_bytes"] = json!(plan.planned_bytes());
+    v["next_step"] = json!(format!(
+        "a human authorizes with `{}` (this plan) or a standing `slop-livin grant add ...`; then call execute with plan_id. This tool cannot authorize.",
+        slop_livin_core::actions::approve_command(&plan.id)
+    ));
+    v["observed_at"] = json!(r.observed_at);
+    Ok(v)
+}
+
+fn tool_execute(params: &Value) -> Result<Value> {
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let plan_id = args
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("plan_id is required"))?;
+    let res = slop_livin_core::actions::execute(&slop_livin_dir(), plan_id, "agent:mcp")?;
+    Ok(serde_json::to_value(&res)?)
+}
+
+fn tool_plans(_params: &Value) -> Result<Value> {
+    let plans = slop_livin_core::actions::list_plans(&slop_livin_dir())?;
+    Ok(json!({"plans": plans}))
+}
+
+fn tool_grants(_params: &Value) -> Result<Value> {
+    // Read-only by construction: there is no MCP tool that writes a grant.
+    let grants = slop_livin_core::actions::list_grants(&slop_livin_dir())?;
+    Ok(
+        json!({"grants": grants, "note": "grants are written only by a human at the CLI (slop-livin approve / grant add); this server cannot mint authorization"}),
+    )
+}
+
 fn main() -> Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -622,6 +682,33 @@ fn main() -> Result<()> {
                         }}
                     },
                     {
+                        "name":"propose",
+                        "description":"Build a plan from report rows: folded artifact rows only (build outputs, dependency trees, caches), each with project, worktree, kind, bytes, growth, regrowth, recovery contract and signals. Deletes nothing. Returns state awaiting-authorization and the exact command a human runs to authorize. Checkouts, worktrees, .git, Source trees, unowned paths and Docker objects cannot be planned.",
+                        "inputSchema":{"type":"object","required":["root"],"properties":{
+                            "root":{"type":"string","description":"Root directory the plan is scoped to"},
+                            "since":{"type":"string","description":"Growth baseline window used for the evidence, e.g. '7d'"},
+                            "filter":{"type":"string","description":"Narrow rows, e.g. 'kind:BuildOutput idle > 30d project:foo'"},
+                            "paths":{"type":"array","items":{"type":"string"},"description":"Exact artifact paths to plan (from report rows)"}
+                        }}
+                    },
+                    {
+                        "name":"execute",
+                        "description":"Execute a plan that a human has authorized (slop-livin approve <plan_id> or a standing grant). Every unit is re-derived at the sink (still an artifact dir, no activity since the plan, not occupied) and moved to Trash; per-unit outcomes name the fact behind any refusal; the ledger records actor=agent:mcp. Returns awaiting-authorization with the approve command when no grant covers the plan. This tool cannot authorize anything.",
+                        "inputSchema":{"type":"object","required":["plan_id"],"properties":{
+                            "plan_id":{"type":"string"}
+                        }}
+                    },
+                    {
+                        "name":"plans",
+                        "description":"List proposed and executed plans, newest first.",
+                        "inputSchema":{"type":"object","properties":{}}
+                    },
+                    {
+                        "name":"grants",
+                        "description":"Read-only list of the human's standing and one-shot grants (id, predicate or plan, budget spent/total, expiry). There is no tool to write one.",
+                        "inputSchema":{"type":"object","properties":{}}
+                    },
+                    {
                         "name":"docker_objects",
                         "description":"Every Docker object (image/build-cache/volume) with full detail -- created_at, layer-derived shared_with, referencing containers, dangling -- sorted by unique bytes desc. Unowned objects are labelled, never attributed by name similarity.",
                         "inputSchema":{"type":"object","properties":{
@@ -645,6 +732,14 @@ fn main() -> Result<()> {
                     "list_worktrees" => tool_list_worktrees(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     "docker_objects" => tool_docker_objects(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "propose" => tool_propose(&params)
+                        .unwrap_or_else(|e| json!({"state":"refused","cause":e.to_string()})),
+                    "execute" => tool_execute(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "plans" => tool_plans(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "grants" => tool_grants(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     _ => json!({"state":"unsupported","cause":"unknown tool"}),
                 };
