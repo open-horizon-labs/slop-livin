@@ -387,6 +387,124 @@ pub fn render_kinds(report: &Report) -> String {
     out
 }
 
+/// `--view worktrees [--filter '...']`: one line per matching worktree,
+/// with the literal human command to remove it. Never executed by this
+/// tool -- the text is printed for a person to run themselves.
+pub fn render_worktrees(report: &Report, filter: &crate::filter::Filter) -> String {
+    use crate::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
+    let mut out = String::new();
+    let mut shown = 0usize;
+    let empty_pr = PrStatus::Unknown;
+    for project in &report.projects {
+        for wt in &project.worktrees {
+            let (pr, verdict, merge_complete_terms, merged) = match (&wt.github, &wt.merge_complete)
+            {
+                (
+                    Some(GithubFacts {
+                        pull_request,
+                        merged,
+                        ..
+                    }),
+                    Some(MergeComplete { verdict, terms }),
+                ) => (pull_request, *verdict, Some(terms.clone()), merged),
+                (
+                    Some(GithubFacts {
+                        pull_request,
+                        merged,
+                        ..
+                    }),
+                    None,
+                ) => (pull_request, TriState::Unknown, None, merged),
+                (None, _) => (&empty_pr, TriState::Unknown, None, &MergedStatus::Unknown),
+            };
+
+            let facts = crate::filter::WorktreeFacts {
+                merge_complete: verdict == TriState::Yes,
+                idle_secs: wt.idle_secs,
+                pr,
+                merged,
+            };
+            if !filter.matches_worktree(project, wt, &facts) {
+                continue;
+            }
+            shown += 1;
+
+            let branch = wt
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string());
+            let idle_str = wt
+                .idle_secs
+                .map(|s| format!("idle {}", human_duration(s)))
+                .unwrap_or_else(|| "idle unknown".to_string());
+            let verdict_str = match verdict {
+                TriState::Yes => "yes",
+                TriState::No => "no",
+                TriState::Unknown => "unknown",
+            };
+            let mc_str = match merge_complete_terms {
+                Some(terms) => format!("merge-complete: {verdict_str} ({})", terms.join(", ")),
+                None => "merge-complete: unknown (no GitHub remote)".to_string(),
+            };
+            let pr_str = render_pr(pr);
+
+            let _ = writeln!(
+                out,
+                "{}  {}  branch={}  {}  {}  {}",
+                project.name,
+                wt.path.display(),
+                branch,
+                idle_str,
+                mc_str,
+                pr_str,
+            );
+            let _ = writeln!(out, "  git worktree remove {}", wt.path.display());
+        }
+    }
+    if shown == 0 {
+        let _ = writeln!(out, "0 worktrees match");
+    }
+    out
+}
+
+/// Bare duration ("3d", "4h", "12m", "45s"), no prefix.
+fn human_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn render_pr(pr: &crate::github::PrStatus) -> String {
+    use crate::github::{PrState, PrStatus, ReviewDecision};
+    match pr {
+        PrStatus::None => "no PR".to_string(),
+        PrStatus::Unknown => "PR unknown".to_string(),
+        PrStatus::Some(pr) => {
+            let state = match pr.state {
+                PrState::Open => "open",
+                PrState::Closed => "closed",
+                PrState::Merged => "merged",
+            };
+            let decision = match pr.review_decision {
+                ReviewDecision::Approved => Some("approved"),
+                ReviewDecision::ChangesRequested => Some("changes requested"),
+                ReviewDecision::ReviewRequired => Some("review required"),
+                ReviewDecision::None | ReviewDecision::Unknown => None,
+            };
+            match decision {
+                Some(d) => format!("PR #{} {state} ({d})", pr.number),
+                None => format!("PR #{} {state}", pr.number),
+            }
+        }
+    }
+}
+
 /// Legacy flat renderer kept for the golden test's exact-format
 /// expectations (R2-R5 fixture output); the CLI's default surface is
 /// [`render_overview`].

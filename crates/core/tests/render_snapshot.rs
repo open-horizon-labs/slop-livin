@@ -71,6 +71,10 @@ fn fixture_report() -> Report {
                             value: "unlocked".to_string(),
                         },
                     ],
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
                 }],
             },
             ProjectRow {
@@ -83,6 +87,10 @@ fn fixture_report() -> Report {
                     kind: WorktreeKind::Main,
                     artifacts: vec![],
                     signals: vec![],
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
                 }],
             },
             ProjectRow {
@@ -100,6 +108,10 @@ fn fixture_report() -> Report {
                         None,
                     )],
                     signals: vec![],
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
                 }],
             },
         ],
@@ -107,6 +119,7 @@ fn fixture_report() -> Report {
         dirs_by_worktree: None,
         files_by_worktree: None,
         schedule_line: None,
+        github_enrichment: None,
         unowned: vec![
             UnownedRow {
                 path_or_object: "old-project/build".to_string(),

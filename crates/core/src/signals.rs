@@ -4,7 +4,9 @@
 //!
 //! Computed with `gix` (gitoxide) directly against the on-disk object
 //! store during discovery, in the same thread pool as the rest of the
-//! walk (see `walk.rs`). No `git` subprocess is spawned here.
+//! walk (see `walk.rs`). No `git` subprocess is spawned here, except for
+//! `idle_for`'s newest-mtime scan, which is plain filesystem I/O with no
+//! git object access at all.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -25,6 +27,7 @@ pub enum SignalValue {
     UnpushedCount(u32),
     UnpushedUnknownNoUpstream,
     Locked(bool),
+    IdleForSecs(u64),
     Unknown,
 }
 
@@ -38,6 +41,7 @@ impl SignalValue {
             SignalValue::UnpushedUnknownNoUpstream => "unknown (no upstream)".to_string(),
             SignalValue::Locked(true) => "locked".to_string(),
             SignalValue::Locked(false) => "unlocked".to_string(),
+            SignalValue::IdleForSecs(secs) => format!("idle {}", human_duration(*secs)),
             SignalValue::Unknown => "unknown".to_string(),
         }
     }
@@ -50,6 +54,21 @@ fn human_age(secs: u64) -> String {
         format!("last commit {}h", secs / 3600)
     } else {
         format!("last commit {}d", secs / 86_400)
+    }
+}
+
+/// Renders a bare duration ("3d", "4h", "12m", "45s") with no "last
+/// commit"/other prefix -- `idle_for`'s own render adds the "idle "
+/// prefix itself.
+fn human_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
 }
 
@@ -168,50 +187,195 @@ fn locked(repo: &gix::Repository) -> SignalValue {
     }
 }
 
+/// Directories never descended into while looking for the newest mtime
+/// under a worktree's source: `.git` itself, plus the same artifact stop
+/// list `git.rs` discovery uses. Artifact churn (a build writing new
+/// object files) is not "the human touched this project"; only source
+/// content should move the idle clock.
+const IDLE_STOP_DIRS: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
+/// Bound on the whole newest-mtime walk. A large worktree degrades to
+/// "whatever was found before the budget ran out" rather than blocking
+/// the report.
+const IDLE_WALK_BUDGET: Duration = Duration::from_millis(300);
+
+/// Newest mtime found under `dir` (excluding [`IDLE_STOP_DIRS`]),
+/// time-bounded by [`IDLE_WALK_BUDGET`]. `None` only when nothing at all
+/// could be read (e.g. permission denied on the root itself). Plain
+/// filesystem I/O -- no git object access, so it works even when `gix`
+/// failed to open the repo.
+fn newest_mtime_secs(dir: &Path) -> Option<u64> {
+    let deadline = Instant::now() + IDLE_WALK_BUDGET;
+    let mut best: Option<u64> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                let secs = dur.as_secs();
+                best = Some(best.map_or(secs, |b: u64| b.max(secs)));
+            }
+            if file_type.is_dir() && !IDLE_STOP_DIRS.contains(&name.as_ref()) {
+                stack.push(entry.path());
+            }
+        }
+    }
+    best
+}
+
+/// `idle_for` = now - max(last commit time, newest mtime observed under
+/// the worktree's source). A worktree with no commits and no readable
+/// files is `Unknown`, never zero by default.
+fn idle_for(dir: &Path, observed_at: u64, last_commit_secs: Option<u64>) -> SignalValue {
+    let mtime_epoch = newest_mtime_secs(dir);
+    match last_commit_secs.into_iter().chain(mtime_epoch).max() {
+        Some(newest) if newest <= observed_at => SignalValue::IdleForSecs(observed_at - newest),
+        Some(_) => SignalValue::IdleForSecs(0),
+        None => SignalValue::Unknown,
+    }
+}
+
+/// Raw (unrendered) signal values for one worktree, used by the
+/// composite `merge_complete` fact and by `filter.rs`'s `idle >`
+/// predicate, in addition to the human-rendered `Signal` rows this
+/// module has always produced.
+pub struct RawSignals {
+    pub last_commit_age_secs: Option<u64>,
+    pub dirty: Option<bool>,
+    pub unpushed: Option<u32>,
+    pub locked: Option<bool>,
+    pub idle_for_secs: Option<u64>,
+}
+
 /// Computes all git activity signals for one worktree at `dir`, bounded
 /// and side-effect free. `observed_at` is the report's single observation
 /// timestamp so every worktree's ages are measured from the same instant.
 pub fn compute_signals(dir: &Path, observed_at: u64) -> Vec<Signal> {
+    compute_signals_raw(dir, observed_at).0
+}
+
+/// Same as [`compute_signals`], but also returns the raw (unrendered)
+/// values the `merge_complete` composite and `filter.rs`'s `idle >`
+/// predicate need, so neither has to re-parse a rendered string.
+pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSignals) {
     let Ok(repo) = gix::open(dir) else {
         let unknown = SignalValue::Unknown.render();
-        return vec![
-            Signal {
-                name: "last_commit".to_string(),
-                value: unknown.clone(),
+        let idle_v = idle_for(dir, observed_at, None);
+        return (
+            vec![
+                Signal {
+                    name: "last_commit".to_string(),
+                    value: unknown.clone(),
+                },
+                Signal {
+                    name: "dirty".to_string(),
+                    value: unknown.clone(),
+                },
+                Signal {
+                    name: "unpushed".to_string(),
+                    value: unknown,
+                },
+                Signal {
+                    name: "locked".to_string(),
+                    value: SignalValue::Locked(false).render(),
+                },
+                Signal {
+                    name: "idle_for".to_string(),
+                    value: idle_v.render(),
+                },
+            ],
+            RawSignals {
+                last_commit_age_secs: None,
+                dirty: None,
+                unpushed: None,
+                locked: Some(false),
+                idle_for_secs: match idle_v {
+                    SignalValue::IdleForSecs(s) => Some(s),
+                    _ => None,
+                },
             },
-            Signal {
-                name: "dirty".to_string(),
-                value: unknown.clone(),
-            },
-            Signal {
-                name: "unpushed".to_string(),
-                value: unknown,
-            },
-            Signal {
-                name: "locked".to_string(),
-                value: SignalValue::Locked(false).render(),
-            },
-        ];
+        );
     };
 
-    vec![
+    let last_commit = last_commit_age(&repo, observed_at);
+    let dirty_v = dirty(&repo);
+    let unpushed_v = unpushed(&repo);
+    let locked_v = locked(&repo);
+    let last_commit_secs = match &last_commit {
+        SignalValue::LastCommitAgeSecs(s) => Some(observed_at.saturating_sub(*s)),
+        _ => None,
+    };
+    let idle_v = idle_for(dir, observed_at, last_commit_secs);
+
+    let rows = vec![
         Signal {
             name: "last_commit".to_string(),
-            value: last_commit_age(&repo, observed_at).render(),
+            value: last_commit.render(),
         },
         Signal {
             name: "dirty".to_string(),
-            value: dirty(&repo).render(),
+            value: dirty_v.render(),
         },
         Signal {
             name: "unpushed".to_string(),
-            value: unpushed(&repo).render(),
+            value: unpushed_v.render(),
         },
         Signal {
             name: "locked".to_string(),
-            value: locked(&repo).render(),
+            value: locked_v.render(),
         },
-    ]
+        Signal {
+            name: "idle_for".to_string(),
+            value: idle_v.render(),
+        },
+    ];
+    let raw = RawSignals {
+        last_commit_age_secs: match last_commit {
+            SignalValue::LastCommitAgeSecs(s) => Some(s),
+            _ => None,
+        },
+        dirty: match dirty_v {
+            SignalValue::Dirty(d) => Some(d),
+            _ => None,
+        },
+        unpushed: match unpushed_v {
+            SignalValue::UnpushedCount(n) => Some(n),
+            _ => None,
+        },
+        locked: match locked_v {
+            SignalValue::Locked(l) => Some(l),
+            _ => None,
+        },
+        idle_for_secs: match idle_v {
+            SignalValue::IdleForSecs(s) => Some(s),
+            _ => None,
+        },
+    };
+    (rows, raw)
+}
+
+/// The worktree's current commit hash, used as the cache-invalidation
+/// key for GitHub enrichment (`github.rs`). `None` on any failure
+/// (unborn HEAD, corrupt object, `gix` couldn't open the repo).
+pub fn tip_sha(dir: &Path) -> Option<String> {
+    let repo = gix::open(dir).ok()?;
+    let id = repo.head_id().ok()?;
+    Some(id.to_string())
 }
 
 /// Parallel equivalent of calling [`compute_signals`] once per path,
@@ -256,6 +420,55 @@ pub fn compute_signals_parallel(
     results
         .into_iter()
         .map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
+/// Parallel equivalent of [`compute_signals_raw`], preserving input
+/// order. Used by `report.rs` so the merge_complete composite and
+/// `idle_secs` field get the raw values without a second per-worktree
+/// pass.
+type SignalsRawResult = (Vec<Signal>, RawSignals);
+
+pub fn compute_signals_raw_parallel(
+    paths: &[std::path::PathBuf],
+    observed_at: u64,
+) -> Vec<SignalsRawResult> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+        .min(n)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<SignalsRawResult>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            let results = &results;
+            let paths = &paths;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i >= n {
+                        break;
+                    }
+                    let sigs = compute_signals_raw(&paths[i], observed_at);
+                    *results[i].lock().unwrap() = Some(sigs);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .expect("every index visited exactly once")
+        })
         .collect()
 }
 
@@ -375,5 +588,38 @@ mod tests {
         let signals = compute_signals(&linked, now());
         let locked = signals.iter().find(|s| s.name == "locked").unwrap();
         assert_eq!(locked.value, "locked");
+    }
+
+    #[test]
+    fn idle_for_uses_commit_time_when_newer_than_filesystem() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+
+        let (_, raw) = compute_signals_raw(dir.path(), now());
+        assert!(raw.idle_for_secs.is_some());
+    }
+
+    #[test]
+    fn tip_sha_matches_head() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+
+        let out = PCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let expected = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(tip_sha(dir.path()), Some(expected));
     }
 }
