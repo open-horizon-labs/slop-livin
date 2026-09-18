@@ -5,7 +5,10 @@
 //! by top-level directory/reason with shared caches split out.
 
 use slop_livin_core::entities::Confidence;
-use slop_livin_core::render::{render_kinds, render_overview, render_project};
+use slop_livin_core::render::{
+    render_kinds, render_overview, render_project, render_project_tree, render_view_builds,
+    render_view_docker,
+};
 use slop_livin_core::report::{
     ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Report, Signal, Source, UnownedReason,
     UnownedRow, WorktreeKind, WorktreeRow,
@@ -256,4 +259,109 @@ fn drill_shows_worktree_kind_path_bytes_growth_regrowth_signals() {
     assert!(text.contains("target"));
     assert!(text.contains("dirty"));
     assert!(text.contains("2 unpushed"));
+}
+
+fn tree_fixture_report() -> Report {
+    let mut report = fixture_report();
+    // Main checkout with a nested, small, deep artifact that must fold,
+    // plus a linked worktree, so the tree exercises checkouts + worktrees
+    // + folding + relative paths + un-doubled signals in one fixture.
+    report.projects[0].worktrees[0].artifacts.push(artifact(
+        ArtifactKind::Cache,
+        "/src/big-grower/managed_components/foo/test/target",
+        44_000,
+        None,
+    ));
+    report.projects[0].worktrees[0].artifacts.push(artifact(
+        ArtifactKind::Cache,
+        "/src/big-grower/managed_components/foo/test/build",
+        12_000,
+        None,
+    ));
+    report.projects[0].worktrees.push(WorktreeRow {
+        worktree_id: "wt-linked".to_string(),
+        path: PathBuf::from("/src/big-grower/.worktrees/store"),
+        kind: WorktreeKind::Linked,
+        artifacts: vec![artifact(
+            ArtifactKind::Source,
+            "/src/big-grower/.worktrees/store",
+            54_000_000,
+            None,
+        )],
+        signals: vec![Signal {
+            name: "last_commit".to_string(),
+            value: "last commit 10h".to_string(),
+        }],
+    });
+    report
+}
+
+#[test]
+fn tree_paths_are_relative_never_absolute() {
+    let report = tree_fixture_report();
+    let text = render_project_tree(&report, "big-grower").expect("project found");
+    assert!(
+        !text.contains("/src/"),
+        "tree drill leaked an absolute path: {text}"
+    );
+    assert!(text.contains("target"));
+    assert!(text.contains(".worktrees/store"));
+}
+
+#[test]
+fn tree_signals_print_value_only_never_doubled() {
+    let report = tree_fixture_report();
+    let text = render_project_tree(&report, "big-grower").expect("project found");
+    // "dirty" must appear as the bare value, never "dirty: dirty".
+    assert!(!text.contains("dirty: dirty"));
+    assert!(!text.contains("last_commit: last commit"));
+    assert!(text.contains("last commit 10h"));
+}
+
+#[test]
+fn tree_folds_deep_small_artifacts_with_a_count() {
+    let report = tree_fixture_report();
+    let text = render_project_tree(&report, "big-grower").expect("project found");
+    // The 44 KB nested managed_components/foo/test/target row folds into
+    // its parent (managed_components/foo) rather than getting its own
+    // line, with a count so the human still sees it happened.
+    assert!(
+        text.contains("managed_components/foo (x2)"),
+        "expected a folded row with a count of 2, got: {text}"
+    );
+    assert!(!text.contains("managed_components/foo/test/target"));
+}
+
+#[test]
+fn tree_lists_checkouts_before_linked_worktrees() {
+    let report = tree_fixture_report();
+    let text = render_project_tree(&report, "big-grower").expect("project found");
+    let main = text.find("main").unwrap();
+    let linked = text.find("linked").unwrap();
+    assert!(main < linked);
+}
+
+#[test]
+fn view_builds_lists_build_and_cache_rows_sorted_by_bytes() {
+    let report = fixture_report();
+    let text = render_view_builds(&report, None);
+    let big = text.find("target").unwrap();
+    let small = text.find(".cache").unwrap();
+    assert!(big < small);
+}
+
+#[test]
+fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
+    let mut report = fixture_report();
+    report.unowned.push(UnownedRow {
+        path_or_object: "big-grower-staging:latest".to_string(),
+        bytes: 500_000_000,
+        reason: UnownedReason::DockerNoJoin,
+        shared_bytes: Some(100_000_000),
+        note: None,
+        docker_kind: Some("image".to_string()),
+    });
+    let text = render_view_docker(&report, Some("big-grower"));
+    assert!(text.contains("unowned, name-alike"));
+    assert!(text.contains("big-grower-staging:latest"));
 }

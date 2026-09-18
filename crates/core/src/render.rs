@@ -581,3 +581,265 @@ pub fn render_text(report: &Report) -> String {
     );
     out
 }
+
+/// `--project <name>` (or `--project <name> --view worktrees`, the
+/// default view): the project's tree, checkouts/worktrees down to
+/// (folded) artifact rows, per #33. Replaces the old flat
+/// `render_project` drill; paths on every row are relative (never
+/// absolute, which the flat drill used to leak), and a signal is
+/// printed as its value only, never `name: name: value`.
+pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
+    let project = report.projects.iter().find(|p| p.name == name)?;
+    let tree = crate::tree::build_project_tree(project, &report.root);
+    let mut out = String::new();
+    let growth_str = tree
+        .growth_bytes
+        .map(|g| format!(" (+{}/24h)", human_signed_bytes(g).trim_start_matches('+')))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "{}  {}{}",
+        tree.name,
+        human_bytes(tree.bytes),
+        growth_str
+    );
+    if tree.worktrees.is_empty() {
+        let _ = writeln!(out, "  (no worktrees)");
+        return Some(out);
+    }
+    let last_idx = tree.worktrees.len() - 1;
+    for (i, wt) in tree.worktrees.iter().enumerate() {
+        let branch = if i == last_idx { "└─" } else { "├─" };
+        let child_prefix = if i == last_idx { "   " } else { "│  " };
+        let kind = worktree_kind_label(&wt.kind);
+        let growth = wt
+            .growth_bytes
+            .map(human_signed_bytes)
+            .unwrap_or_else(|| "—".to_string());
+        let signals = if wt.signals.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "   {}",
+                wt.signals
+                    .iter()
+                    .map(|s| s.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            )
+        };
+        let _ = writeln!(
+            out,
+            "{branch} {:<8} {:<28} {:>10}  ({growth})   {signals}",
+            kind,
+            wt.rel_path,
+            human_bytes(wt.bytes),
+        );
+        let row_last = wt.rows.len().checked_sub(1);
+        for (j, row) in wt.rows.iter().enumerate() {
+            let row_branch = if Some(j) == row_last {
+                "└─"
+            } else {
+                "├─"
+            };
+            let growth = row
+                .growth_bytes
+                .map(human_signed_bytes)
+                .unwrap_or_else(|| "—".to_string());
+            let label = if row.folded_count > 1 {
+                format!("{} (x{})", row.rel_path, row.folded_count)
+            } else {
+                row.rel_path.clone()
+            };
+            let _ = writeln!(
+                out,
+                "{child_prefix}{row_branch} {:<10} {:<30} {:>10}  ({growth})",
+                row.kind_label,
+                label,
+                human_bytes(row.bytes),
+            );
+        }
+    }
+    Some(out)
+}
+
+/// `--view builds`: every `BuildOutput`/`Cache` row across the project
+/// (or the whole root when `only_project` is `None`), sorted by bytes
+/// desc.
+pub fn render_view_builds(report: &Report, only_project: Option<&str>) -> String {
+    render_kind_view(
+        report,
+        only_project,
+        &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
+    )
+}
+
+/// `--view deps`: every `DependencyTree` row across the project (or
+/// root), sorted by bytes desc. Shared dependency caches that touch this
+/// project surface as ordinary `DependencyTree` rows already joined at
+/// discovery time; this view does not re-derive that join.
+pub fn render_view_deps(report: &Report, only_project: Option<&str>) -> String {
+    render_kind_view(report, only_project, &[ArtifactKind::DependencyTree])
+}
+
+fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<20} {:<10} {:<40} {:>10} {:>10}",
+        "project", "kind", "path", "bytes", "growth"
+    );
+    let mut rows: Vec<(String, &'static str, String, u64, Option<i64>)> = Vec::new();
+    for project in &report.projects {
+        if let Some(name) = only_project
+            && project.name != name
+        {
+            continue;
+        }
+        for wt in &project.worktrees {
+            for a in &wt.artifacts {
+                if !kinds.contains(&a.kind) {
+                    continue;
+                }
+                let rel = a
+                    .path
+                    .strip_prefix(&wt.path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| a.path.display().to_string());
+                rows.push((
+                    project.name.clone(),
+                    kind_label(&a.kind),
+                    rel,
+                    a.bytes,
+                    a.growth_bytes,
+                ));
+            }
+        }
+    }
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    if rows.is_empty() {
+        let _ = writeln!(out, "0");
+        return out;
+    }
+    for (project, kind, path, bytes, growth) in rows {
+        let growth_str = growth
+            .map(human_signed_bytes)
+            .unwrap_or_else(|| "—".to_string());
+        let _ = writeln!(
+            out,
+            "{:<20} {:<10} {:<40} {:>10} {:>10}",
+            project,
+            kind,
+            path,
+            human_bytes(bytes),
+            growth_str
+        );
+    }
+    out
+}
+
+/// `--view docker`: every Docker object joined to the project (or, at
+/// root, every joined Docker object across every project) plus, when
+/// `only_project` is set, unowned Docker objects whose name family
+/// resembles the project -- shown clearly labelled as unowned and never
+/// attributed, per #33/#19 (no verdict words, name similarity is never
+/// evidence). Sorted by bytes (unique bytes) desc.
+pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<24} {:<20} {:<14} {:>10} {:>10}  detail",
+        "project", "object", "kind", "bytes", "shared"
+    );
+    let mut rows: Vec<(String, String, String, u64, u64, Option<String>)> = Vec::new();
+    for project in &report.projects {
+        if let Some(name) = only_project
+            && project.name != name
+        {
+            continue;
+        }
+        for wt in &project.worktrees {
+            for a in &wt.artifacts {
+                if !matches!(
+                    a.kind,
+                    ArtifactKind::DockerImage
+                        | ArtifactKind::DockerBuildCache
+                        | ArtifactKind::DockerVolume
+                ) {
+                    continue;
+                }
+                rows.push((
+                    project.name.clone(),
+                    a.path.display().to_string(),
+                    kind_label(&a.kind).to_string(),
+                    a.bytes,
+                    0,
+                    a.note.clone(),
+                ));
+            }
+        }
+    }
+    for row in &report.unowned {
+        if row.reason != UnownedReason::DockerNoJoin {
+            continue;
+        }
+        // At root (no project filter): list every unowned object too, so
+        // `--view docker` at root is a complete listing per the issue.
+        // With `--project`: only include a candidate whose reference
+        // string contains the project name -- shown as unowned, never
+        // attributed.
+        let project_label = match only_project {
+            None => String::new(),
+            Some(name) => {
+                if row
+                    .path_or_object
+                    .to_lowercase()
+                    .contains(&name.to_lowercase())
+                {
+                    format!("{name} (unowned, name-alike)")
+                } else {
+                    continue;
+                }
+            }
+        };
+        rows.push((
+            project_label,
+            row.path_or_object.clone(),
+            row.docker_kind.as_deref().unwrap_or("unknown").to_string(),
+            row.bytes,
+            row.shared_bytes.unwrap_or(0),
+            row.note.clone(),
+        ));
+    }
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    if rows.is_empty() {
+        let _ = writeln!(out, "0");
+        return out;
+    }
+    for (project, object, kind, bytes, shared, note) in rows {
+        let _ = writeln!(
+            out,
+            "{:<24} {:<20} {:<14} {:>10} {:>10}  {}",
+            project,
+            object,
+            kind,
+            human_bytes(bytes),
+            if shared > 0 {
+                human_bytes(shared)
+            } else {
+                "—".to_string()
+            },
+            note.unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// `--view unowned` at root: the same aggregation `render_overview`
+/// prints below the project table, standalone so it is one command
+/// rather than a post-processed slice of the overview.
+pub fn render_view_unowned(report: &Report) -> String {
+    let mut out = String::new();
+    render_unowned_summary(report, &mut out, true);
+    out
+}

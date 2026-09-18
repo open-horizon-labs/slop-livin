@@ -4,12 +4,32 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
     filter,
-    render::{render_kinds, render_overview, render_project, render_worktrees},
+    render::{
+        render_kinds, render_overview, render_project_tree, render_view_builds, render_view_deps,
+        render_view_docker, render_view_reconciliation, render_view_unowned, render_worktrees,
+        render_worktree_signals,
+    },
     report::{Report, report_full, to_json},
     scan::{ScanOptions, observation},
     store::Store,
 };
 use std::path::PathBuf;
+
+/// `--view` at root or with `--project`. `--kinds`/`--docker` remain as
+/// aliases for `--view kinds`/`--view docker` (#33). `Worktrees` at root
+/// is #35's git-enriched one-line-per-worktree listing
+/// (`render_worktrees`); with `--project` it is the tree drill (#33),
+/// also the default when `--project` is given with no `--view`.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum View {
+    Worktrees,
+    Builds,
+    Deps,
+    Docker,
+    Kinds,
+    Unowned,
+    Reconciliation,
+}
 
 #[derive(Parser)]
 #[command(name = "slop-livin")]
@@ -57,9 +77,34 @@ enum Command {
         /// growth -> regrowth -> signals. Text output only.
         #[arg(long)]
         project: Option<String>,
-        /// Bytes and count per artifact kind across the root. Text output only.
+        /// Bytes and count per artifact kind across the root. Text output
+        /// only. Deprecated alias for `--view kinds`.
         #[arg(long)]
         kinds: bool,
+        /// Named view, at root or narrowed with `--project`: worktrees
+        /// (git-enriched one-line-per-worktree listing at root, the tree
+        /// drill with `--project`), builds, deps, docker, kinds, unowned,
+        /// reconciliation. Every question the issue lists is exactly one
+        /// command through this flag. Text output only.
+        #[arg(long, value_enum)]
+        view: Option<View>,
+        /// Signals for one worktree (matched by exact or root-relative
+        /// path), the one-command surface for a question the maintainer
+        /// rule comment lists explicitly. Text output only.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+        /// Filter worktrees/artifacts, e.g. "merge-complete idle > 48h".
+        /// See `slop_livin_core::filter` for the grammar. Only consulted
+        /// by `--view worktrees` at root.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Refresh GitHub enrichment live before reading it, instead of
+        /// reading `enrich.parquet` as-is. By default `report` never
+        /// shells out to `gh` -- run `slop-livin observe` (or wait for
+        /// the schedule) to keep the cache warm, and reach for this flag
+        /// only when you're fine waiting on live calls right now.
+        #[arg(long)]
+        enrich: bool,
         /// Show every project row instead of the default top-N. Text
         /// output only.
         #[arg(long)]
@@ -79,23 +124,6 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
-        /// Alternate text view. Currently only "worktrees": one line per
-        /// worktree with branch, idle, merge-complete (with terms), and
-        /// PR status, plus the literal `git worktree remove <path>`
-        /// command -- never executed by this tool.
-        #[arg(long)]
-        view: Option<String>,
-        /// Filter worktrees/artifacts, e.g. "merge-complete idle > 48h".
-        /// See `slop_livin_core::filter` for the grammar.
-        #[arg(long)]
-        filter: Option<String>,
-        /// Refresh GitHub enrichment live before reading it, instead of
-        /// reading `enrich.parquet` as-is. By default `report` never
-        /// shells out to `gh` -- run `slop-livin observe` (or wait for
-        /// the schedule) to keep the cache warm, and reach for this flag
-        /// only when you're fine waiting on live calls right now.
-        #[arg(long)]
-        enrich: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment live for every GitHub-remote worktree found
@@ -158,14 +186,27 @@ fn main() -> Result<()> {
             no_observe,
             project,
             kinds,
+            view,
+            worktree,
+            filter: filter_expr,
+            enrich,
             all,
             docker,
             dirs,
             depth,
-            view,
-            filter: filter_expr,
-            enrich,
         } => {
+            // `--kinds`/`--docker` are deprecated aliases folded under
+            // `--view` (#33); an explicit `--view` wins if somehow both
+            // are given.
+            let view = view.or_else(|| {
+                if kinds {
+                    Some(View::Kinds)
+                } else if docker && project.is_none() {
+                    Some(View::Docker)
+                } else {
+                    None
+                }
+            });
             // The growth store is always consulted, even under
             // `--no-observe`: growth is read from whatever prior
             // observations already exist there (item 5), and only the
@@ -193,6 +234,18 @@ fn main() -> Result<()> {
             };
             if json {
                 println!("{}", to_json(&r)?);
+            } else if let Some(wt_path) = worktree {
+                match render_worktree_signals(&r, &wt_path) {
+                    Some(text) => print!("{text}"),
+                    None => {
+                        eprintln!(
+                            "no worktree at {} found under {}",
+                            wt_path.display(),
+                            root.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
             } else if dirs {
                 match render_dirs(&r, project.as_deref(), depth) {
                     Ok(text) => print!("{text}"),
@@ -201,23 +254,36 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 }
-            } else if view.as_deref() == Some("worktrees") {
-                print!(
-                    "{}",
-                    render_worktrees(&r, &parsed_filter.unwrap_or_default())
-                );
             } else if let Some(name) = project {
-                match render_project(&r, &name) {
-                    Some(text) => print!("{text}"),
-                    None => {
-                        eprintln!("no project named {name:?} found under {}", root.display());
-                        std::process::exit(1);
-                    }
+                match view {
+                    None | Some(View::Worktrees) => match render_project_tree(&r, &name) {
+                        Some(text) => print!("{text}"),
+                        None => {
+                            eprintln!("no project named {name:?} found under {}", root.display());
+                            std::process::exit(1);
+                        }
+                    },
+                    Some(View::Builds) => print!("{}", render_view_builds(&r, Some(&name))),
+                    Some(View::Deps) => print!("{}", render_view_deps(&r, Some(&name))),
+                    Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
+                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
+                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                 }
-            } else if kinds {
-                print!("{}", render_kinds(&r));
             } else {
-                print!("{}", render_overview(&r, all, verify_du, docker));
+                match view {
+                    Some(View::Worktrees) => print!(
+                        "{}",
+                        render_worktrees(&r, &parsed_filter.unwrap_or_default())
+                    ),
+                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
+                    Some(View::Builds) => print!("{}", render_view_builds(&r, None)),
+                    Some(View::Deps) => print!("{}", render_view_deps(&r, None)),
+                    Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
+                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    None => print!("{}", render_overview(&r, all, verify_du, docker)),
+                }
             }
         }
         Command::Observe { roots } => {
@@ -238,7 +304,7 @@ fn main() -> Result<()> {
 /// renderer's contract.
 ///
 /// Returns `Err(name)` when `only_project` names a project not present
-/// in the report, mirroring `render_project`'s `None` case.
+/// in the report, mirroring `render_project_tree`'s `None` case.
 fn render_dirs(
     report: &Report,
     only_project: Option<&str>,
