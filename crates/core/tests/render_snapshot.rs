@@ -34,6 +34,7 @@ fn fixture_report() -> Report {
             ProjectRow {
                 project_id: "p-big".to_string(),
                 name: "big-grower".to_string(),
+                remote: None,
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-big".to_string(),
                     path: PathBuf::from("/src/big-grower"),
@@ -75,6 +76,7 @@ fn fixture_report() -> Report {
             ProjectRow {
                 project_id: "p-empty".to_string(),
                 name: "no-artifacts".to_string(),
+                remote: None,
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-empty".to_string(),
                     path: PathBuf::from("/src/no-artifacts"),
@@ -86,6 +88,7 @@ fn fixture_report() -> Report {
             ProjectRow {
                 project_id: "p-small".to_string(),
                 name: "small-static".to_string(),
+                remote: None,
                 worktrees: vec![WorktreeRow {
                     worktree_id: "wt-small".to_string(),
                     path: PathBuf::from("/src/small-static"),
@@ -108,6 +111,7 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::NoContainingRepo,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             },
             UnownedRow {
                 path_or_object: "old-project/tmp".to_string(),
@@ -115,6 +119,7 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::NoContainingRepo,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             },
             UnownedRow {
                 path_or_object: "restricted/vault".to_string(),
@@ -122,6 +127,7 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::PermissionDenied,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             },
             UnownedRow {
                 path_or_object: "/Users/x/.cache".to_string(),
@@ -129,6 +135,7 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::SharedCache,
                 shared_bytes: None,
                 note: None,
+                docker_kind: None,
             },
         ],
         reconciliation: Reconciliation {
@@ -145,7 +152,7 @@ fn fixture_report() -> Report {
 #[test]
 fn overview_matches_snapshot() {
     let report = fixture_report();
-    let text = render_overview(&report, false, false);
+    let text = render_overview(&report, false, false, false);
     let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/overview.txt");
     let expected = std::fs::read_to_string(golden_path).unwrap_or_default();
     if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
@@ -161,7 +168,7 @@ fn overview_matches_snapshot() {
 #[test]
 fn sorted_by_growth_desc_then_bytes_desc() {
     let report = fixture_report();
-    let text = render_overview(&report, false, false);
+    let text = render_overview(&report, false, false, false);
     let big = text.find("big-grower").unwrap();
     let small = text.find("small-static").unwrap();
     let empty = text.find("no-artifacts").unwrap();
@@ -175,7 +182,7 @@ fn sorted_by_growth_desc_then_bytes_desc() {
 #[test]
 fn zero_artifact_project_renders_zero_never_panics() {
     let report = fixture_report();
-    let text = render_overview(&report, false, false);
+    let text = render_overview(&report, false, false, false);
     let line = text
         .lines()
         .find(|l| l.contains("no-artifacts"))
@@ -196,7 +203,7 @@ fn zero_artifact_project_renders_zero_never_panics() {
 #[test]
 fn unowned_aggregated_by_top_level_dir_and_reason_shared_caches_separate() {
     let report = fixture_report();
-    let text = render_overview(&report, false, false);
+    let text = render_overview(&report, false, false, false);
     // Aggregated: one "old-project" row (300MB + 100MB), never two
     // per-file rows.
     let old_project_lines: Vec<&str> = text

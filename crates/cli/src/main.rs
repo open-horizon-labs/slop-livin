@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
     render::{render_kinds, render_overview, render_project},
-    report::{report_with, to_json},
+    report::{report_with_observe, to_json},
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -52,6 +52,10 @@ enum Command {
         /// output only.
         #[arg(long)]
         all: bool,
+        /// List every unjoined Docker object individually instead of the
+        /// default one-line-per-kind summary. Text output only.
+        #[arg(long)]
+        docker: bool,
     },
 }
 
@@ -87,18 +91,20 @@ fn main() -> Result<()> {
             project,
             kinds,
             all,
+            docker,
         } => {
-            let store_dir = if no_observe {
-                None
-            } else {
-                Some(slop_livin_dir())
-            };
-            let r = report_with(
+            // The growth store is always consulted, even under
+            // `--no-observe`: growth is read from whatever prior
+            // observations already exist there (item 5), and only the
+            // *write* of a new observation is skipped.
+            let store_dir = slop_livin_dir();
+            let r = report_with_observe(
                 &root,
                 docker_facts.as_deref(),
                 verify_du,
-                store_dir.as_deref(),
+                Some(&store_dir),
                 since.as_deref(),
+                !no_observe,
             )?;
             if json {
                 println!("{}", to_json(&r)?);
@@ -113,7 +119,7 @@ fn main() -> Result<()> {
             } else if kinds {
                 print!("{}", render_kinds(&r));
             } else {
-                print!("{}", render_overview(&r, all, verify_du));
+                print!("{}", render_overview(&r, all, verify_du, docker));
             }
         }
     }

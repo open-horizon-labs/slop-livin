@@ -7,6 +7,7 @@
 use crate::report::{ArtifactKind, Report, UnownedReason, WorktreeKind};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 /// Default number of project rows shown in the overview before folding
 /// the rest into a "… and N more" footer.
@@ -134,7 +135,12 @@ fn header(report: &Report, verify_du: bool) -> String {
 /// The zero-flag, one-screen overview: header, then one line per project
 /// sorted by growth desc then bytes desc, capped at `top_n` rows (0 means
 /// no cap) with a "… and N more" footer.
-pub fn render_overview(report: &Report, show_all: bool, verify_du: bool) -> String {
+pub fn render_overview(
+    report: &Report,
+    show_all: bool,
+    verify_du: bool,
+    show_docker: bool,
+) -> String {
     let mut out = header(report, verify_du);
     let _ = writeln!(out);
 
@@ -186,30 +192,53 @@ pub fn render_overview(report: &Report, show_all: bool, verify_du: bool) -> Stri
         let _ = writeln!(out, "… and {} more (use --all)", total - limit);
     }
     let _ = writeln!(out);
-    render_unowned_summary(report, &mut out);
+    render_unowned_summary(report, &mut out, show_docker);
     out
 }
 
-fn render_unowned_summary(report: &Report, out: &mut String) {
-    // Aggregate by top-level directory under root and by reason; shared
-    // caches are listed separately. Never per-file rows.
+/// `--docker` shows every unjoined Docker object individually; by default
+/// they fold into one line per object kind (a real multi-project `~/src`
+/// scan can have hundreds of unjoined build-cache entries, which used to
+/// print one row each here).
+fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) {
+    // Aggregate filesystem rows by their top-level directory *relative to
+    // root* (never an absolute-path segment like `Users`, which every row
+    // shares and which says nothing about where the bytes live) and by
+    // reason; shared caches are listed separately. Docker objects are not
+    // filesystem paths at all and are aggregated by kind instead. Never
+    // per-file/per-object rows in the default summary.
     let mut by_dir: BTreeMap<String, u64> = BTreeMap::new();
     let mut by_reason: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut shared_caches_bytes = 0u64;
     let mut shared_caches_count = 0u64;
+    let mut docker_by_kind: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut docker_rows: Vec<&crate::report::UnownedRow> = Vec::new();
+
     for row in &report.unowned {
+        if row.reason == UnownedReason::DockerNoJoin {
+            let kind = row
+                .docker_kind
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let entry = docker_by_kind.entry(kind).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += row.bytes;
+            docker_rows.push(row);
+            continue;
+        }
         if row.reason == UnownedReason::SharedCache {
             shared_caches_bytes += row.bytes;
             shared_caches_count += 1;
             continue;
         }
-        let top_dir = row
-            .path_or_object
-            .trim_start_matches('/')
-            .split('/')
+        let rel = Path::new(&row.path_or_object)
+            .strip_prefix(&report.root)
+            .unwrap_or_else(|_| Path::new(&row.path_or_object));
+        let top_dir = rel
+            .components()
             .next()
-            .unwrap_or(&row.path_or_object)
-            .to_string();
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_else(|| row.path_or_object.clone());
         *by_dir.entry(top_dir).or_insert(0) += row.bytes;
         *by_reason.entry(reason_label(&row.reason)).or_insert(0) += row.bytes;
     }
@@ -237,10 +266,50 @@ fn render_unowned_summary(report: &Report, out: &mut String) {
             shared_caches_count
         );
     }
+    if !docker_by_kind.is_empty() {
+        let _ = writeln!(out, "docker unowned:");
+        for (kind, (count, bytes)) in &docker_by_kind {
+            let _ = writeln!(
+                out,
+                "  {:<30} {:>10} ({} items)",
+                kind,
+                human_bytes(*bytes),
+                count
+            );
+        }
+        if !show_docker {
+            let _ = writeln!(out, "  (use --docker to list each object)");
+        }
+    }
+    if show_docker {
+        for row in docker_rows {
+            let _ = writeln!(
+                out,
+                "  {:<40} {:>10}",
+                row.path_or_object,
+                human_bytes(row.bytes)
+            );
+        }
+    }
+}
+
+fn worktree_kind_label(kind: &WorktreeKind) -> &'static str {
+    match kind {
+        WorktreeKind::Main => "main",
+        WorktreeKind::Linked => "linked",
+        WorktreeKind::Clone => "clone",
+    }
 }
 
 /// `--project <name>` drill: worktree → kind → path → bytes → growth →
 /// regrowth → signals.
+///
+/// Worktree identity is shown as its path relative to the report root
+/// plus a short 8-char id (the full 64-hex `worktree_id` is noise on a
+/// terminal screen and never needed to tell rows apart here); a
+/// duplicate relative path -- two truly distinct identities that happen
+/// to render the same, which the 8-char id then disambiguates -- keeps
+/// the full path as a fallback suffix.
 pub fn render_project(report: &Report, name: &str) -> Option<String> {
     let project = report.projects.iter().find(|p| p.name == name)?;
     let mut out = String::new();
@@ -250,17 +319,14 @@ pub fn render_project(report: &Report, name: &str) -> Option<String> {
         return Some(out);
     }
     for wt in &project.worktrees {
-        let kind = match wt.kind {
-            WorktreeKind::Main => "main",
-            WorktreeKind::Linked => "linked",
-        };
-        let _ = writeln!(
-            out,
-            "worktree: {} [{}] {}",
-            wt.worktree_id,
-            kind,
-            wt.path.display()
-        );
+        let kind = worktree_kind_label(&wt.kind);
+        let rel = wt
+            .path
+            .strip_prefix(&report.root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| wt.path.display().to_string());
+        let short_id = &wt.worktree_id[..wt.worktree_id.len().min(8)];
+        let _ = writeln!(out, "worktree: {rel} ({short_id}) [{kind}]");
         if wt.artifacts.is_empty() {
             let _ = writeln!(out, "  0");
         }
@@ -283,7 +349,7 @@ pub fn render_project(report: &Report, name: &str) -> Option<String> {
             let signals = wt
                 .signals
                 .iter()
-                .map(|s| s.value.clone())
+                .map(|s| format!("{}: {}", s.name, s.value))
                 .collect::<Vec<_>>()
                 .join(" · ");
             let _ = writeln!(out, "  signals: {signals}");
@@ -337,10 +403,7 @@ pub fn render_text(report: &Report) -> String {
     );
     for project in &report.projects {
         for worktree in &project.worktrees {
-            let kind = match worktree.kind {
-                WorktreeKind::Main => "main",
-                WorktreeKind::Linked => "linked",
-            };
+            let kind = worktree_kind_label(&worktree.kind);
             for artifact in &worktree.artifacts {
                 let _ = writeln!(
                     out,

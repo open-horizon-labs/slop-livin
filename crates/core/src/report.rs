@@ -53,6 +53,13 @@ pub enum ArtifactKind {
 pub enum WorktreeKind {
     Main,
     Linked,
+    /// A main checkout that is not the first-seen main checkout of its
+    /// project: another clone of the same remote, discovered under this
+    /// root. Grouped into the same [`ProjectRow`] as every other
+    /// checkout/worktree of that project (via normalized remote URL when
+    /// one is known), listed alongside `Main` and `Linked` rows rather
+    /// than becoming a second project.
+    Clone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +124,12 @@ pub struct ProjectRow {
     pub project_id: String,
     pub name: String,
     pub worktrees: Vec<WorktreeRow>,
+    /// Normalized `origin` remote URL shared by this project's
+    /// checkouts, when at least one of them has one configured. `None`
+    /// when no discovered checkout/worktree of this project has an
+    /// `origin` remote (identity then falls back to object-store id).
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +147,13 @@ pub struct UnownedRow {
     /// source repo, recorded for visibility, never used to attribute.
     #[serde(default)]
     pub note: Option<String>,
+    /// Set for a `DockerNoJoin` row: which Docker object kind it is
+    /// (`"image"`, `"build-cache"`, `"volume"`), so the renderer can
+    /// fold every unjoined Docker object into one summary line per kind
+    /// instead of one line per object (a real `~/src` scan can have
+    /// hundreds of unjoined build-cache entries).
+    #[serde(default)]
+    pub docker_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +214,34 @@ pub fn report_with(
     store_dir: Option<&Path>,
     since_override: Option<&str>,
 ) -> Result<Report> {
+    report_with_observe(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        true,
+    )
+}
+
+/// Same as [`report_with`], with explicit control over whether this call
+/// *persists* a new observation into the growth store (`observe = true`,
+/// the CLI/MCP default) or only *reads* it (`observe = false`, `--no-observe`).
+///
+/// A read-only call still computes `growth_bytes`/`regrowth_count` from
+/// whatever history the store already has for each row: growth is a
+/// property of the store, not of whether this particular call wrote to
+/// it. Only a store with no prior observation of a row leaves that row's
+/// growth at `None`, exactly as it would immediately after `observe:
+/// true`'s own first-ever observation.
+pub fn report_with_observe(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+) -> Result<Report> {
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let observed_at = crate::entities::now();
 
@@ -208,48 +256,108 @@ pub fn report_with(
         eprintln!("[trace] discover_and_attribute: {:?}", t0.elapsed());
     }
 
-    // Group discovered checkouts/worktrees by project (object-store)
-    // identity. A project's display name comes from its main checkout
-    // when one was found under this root; otherwise it falls back to the
-    // first worktree's own name (e.g. only a linked worktree was in scope).
-    let mut projects: BTreeMap<String, ProjectRow> = BTreeMap::new();
+    // Group discovered checkouts/worktrees by project identity. When a
+    // checkout's `origin` remote is known, identity is the normalized
+    // remote URL: two separate clones of the same repo (each its own
+    // object store, its own `git::discover`-assigned `project_id`) are
+    // the same project, and every main checkout after the first-seen one
+    // (by path order, for determinism across the parallel walk) is
+    // demoted from `Main` to `Clone` rather than starting a second
+    // project row. A checkout with no remote configured falls back to
+    // its object-store identity, exactly as before -- unrelated
+    // checkouts never collide just because their remote is empty.
+    //
+    // `group_key` -> discovered rows sharing it, sorted by path so the
+    // first-seen main checkout is deterministic across the parallel walk.
+    let mut groups: BTreeMap<String, Vec<crate::git::DiscoveredWorktree>> = BTreeMap::new();
+    // group_key -> (display name, is a Main row seen).
+    for dw in discovered {
+        let group_key = match dw.remote_url.as_deref().and_then(normalize_remote) {
+            Some(remote) => format!("remote:{remote}"),
+            None => format!("store:{}", dw.project_id),
+        };
+        groups.entry(group_key).or_default().push(dw);
+    }
+
+    let mut projects: Vec<ProjectRow> = Vec::new();
     let mut worktree_paths: Vec<(PathBuf, String)> = Vec::new();
     // project_id -> normalized remote URL, first one seen for that project.
     let mut project_remotes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for dw in discovered {
-        let worktree_id = id_for(&dw.path.display().to_string());
-        worktree_paths.push((dw.path.clone(), worktree_id.clone()));
-        if let Some(remote) = dw.remote_url.as_deref().and_then(normalize_remote) {
-            project_remotes
-                .entry(dw.project_id.clone())
-                .or_insert(remote);
-        }
-        let entry = projects
-            .entry(dw.project_id.clone())
-            .or_insert_with(|| ProjectRow {
-                project_id: dw.project_id.clone(),
-                name: dw.project_name.clone(),
-                worktrees: Vec::new(),
+    for (group_key, mut members) in groups {
+        members.sort_by(|a, b| a.path.cmp(&b.path));
+        let project_id = id_for(&group_key);
+        let mut name: Option<String> = None;
+        let mut worktrees: Vec<WorktreeRow> = Vec::new();
+        let mut main_assigned = false;
+        for dw in members {
+            let worktree_id = id_for(&dw.path.display().to_string());
+            worktree_paths.push((dw.path.clone(), worktree_id.clone()));
+            if let Some(remote) = dw.remote_url.as_deref().and_then(normalize_remote) {
+                project_remotes.entry(project_id.clone()).or_insert(remote);
+            }
+            let kind = match dw.kind {
+                WorktreeKind::Linked => WorktreeKind::Linked,
+                WorktreeKind::Main | WorktreeKind::Clone => {
+                    if main_assigned {
+                        WorktreeKind::Clone
+                    } else {
+                        main_assigned = true;
+                        WorktreeKind::Main
+                    }
+                }
+            };
+            if kind == WorktreeKind::Main || name.is_none() {
+                name = Some(dw.project_name.clone());
+            }
+            worktrees.push(WorktreeRow {
+                worktree_id,
+                path: dw.path,
+                kind,
+                artifacts: Vec::new(),
+                signals: Vec::new(),
             });
-        if dw.kind == WorktreeKind::Main {
-            entry.name = dw.project_name.clone();
         }
-        entry.worktrees.push(WorktreeRow {
-            worktree_id,
-            path: dw.path,
-            kind: dw.kind,
-            artifacts: Vec::new(),
-            signals: Vec::new(),
+        let remote = project_remotes.get(&project_id).cloned();
+        projects.push(ProjectRow {
+            project_id,
+            name: name.unwrap_or_default(),
+            worktrees,
+            remote,
         });
     }
+    // Keep prior output ordering stable (by name) now that projects is a
+    // plain Vec instead of a BTreeMap keyed by the old per-checkout id.
+    projects.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
 
-    let mut projects: Vec<ProjectRow> = projects.into_values().collect();
     for project in &mut projects {
         for worktree in &mut project.worktrees {
             crate::attribution::apply_to_worktree(worktree, &mut attribution);
-            worktree.signals = crate::signals::compute_signals(&worktree.path, observed_at);
         }
+    }
+
+    let t_signals = std::time::Instant::now();
+    let signal_paths: Vec<PathBuf> = projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter().map(|w| w.path.clone()))
+        .collect();
+    let mut signals =
+        crate::signals::compute_signals_parallel(&signal_paths, observed_at).into_iter();
+    for project in &mut projects {
+        for worktree in &mut project.worktrees {
+            worktree.signals = signals.next().unwrap_or_default();
+        }
+    }
+    if trace {
+        eprintln!(
+            "[trace] signals ({} worktrees): {:?}",
+            signal_paths.len(),
+            t_signals.elapsed()
+        );
     }
 
     let mut unowned = attribution.unowned;
@@ -310,14 +418,25 @@ pub fn report_with(
             .and_then(crate::growth::parse_duration_secs)
             .or_else(|| crate::growth::parse_duration_secs(&config.since))
             .unwrap_or(24 * 3600);
-        crate::growth::observe_and_annotate(
-            dir,
-            volume_id,
-            &mut projects,
-            observed_at,
-            config.retention_days,
-            since_secs,
-        )?;
+        if observe {
+            crate::growth::observe_and_annotate(
+                dir,
+                volume_id,
+                &mut projects,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
+        } else {
+            crate::growth::annotate_readonly(
+                dir,
+                volume_id,
+                &mut projects,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
+        }
     }
 
     Ok(Report {
@@ -664,6 +783,12 @@ fn join_docker_facts(
                     });
             }
             JoinOutcome::Unowned { note } => {
+                let docker_kind = match candidate.kind {
+                    ArtifactKind::DockerImage => "image",
+                    ArtifactKind::DockerBuildCache => "build-cache",
+                    ArtifactKind::DockerVolume => "volume",
+                    _ => "unknown",
+                };
                 result.unowned_bytes += candidate.unique_bytes;
                 result.unowned.push(UnownedRow {
                     path_or_object: candidate.reference,
@@ -671,6 +796,7 @@ fn join_docker_facts(
                     reason: UnownedReason::DockerNoJoin,
                     shared_bytes: Some(candidate.shared_bytes),
                     note,
+                    docker_kind: Some(docker_kind.to_string()),
                 });
             }
         }

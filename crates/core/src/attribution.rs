@@ -187,6 +187,7 @@ impl<'a> Ctx<'a> {
                     reason,
                     shared_bytes: None,
                     note: None,
+                    docker_kind: None,
                 });
             }
         }
@@ -199,6 +200,7 @@ impl<'a> Ctx<'a> {
             reason: UnownedReason::PermissionDenied,
             shared_bytes: None,
             note: None,
+            docker_kind: None,
         });
     }
 
@@ -233,6 +235,7 @@ impl<'a> Ctx<'a> {
                     reason,
                     shared_bytes: None,
                     note: None,
+                    docker_kind: None,
                 });
             }
         }
