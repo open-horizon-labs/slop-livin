@@ -27,12 +27,12 @@
 use crate::report::ProjectRow;
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -41,6 +41,8 @@ use std::sync::Arc;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SINCE: &str = "24h";
+/// R4c default threshold for a standalone large-file row: 1 MiB.
+pub const DEFAULT_LARGE_FILE_MIN_BYTES: u64 = 1024 * 1024;
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
@@ -48,6 +50,7 @@ const COMPACTION_THRESHOLD: usize = 20;
 pub struct GrowthConfig {
     pub retention_days: u64,
     pub since: String,
+    pub large_file_min_bytes: u64,
 }
 
 impl Default for GrowthConfig {
@@ -55,6 +58,7 @@ impl Default for GrowthConfig {
         Self {
             retention_days: DEFAULT_RETENTION_DAYS,
             since: DEFAULT_SINCE.to_string(),
+            large_file_min_bytes: DEFAULT_LARGE_FILE_MIN_BYTES,
         }
     }
 }
@@ -82,6 +86,11 @@ pub fn load_config(slop_livin_dir: &Path) -> GrowthConfig {
                 }
             }
             "since" => cfg.since = value.to_string(),
+            "large_file_min_bytes" => {
+                if let Ok(n) = value.parse() {
+                    cfg.large_file_min_bytes = n;
+                }
+            }
             _ => {}
         }
     }
@@ -635,6 +644,637 @@ pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
         if rows.iter().all(|r| r.observed_at < horizon) {
             fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// R4c: dirs.parquet / files.parquet -- same current + reverse-delta
+// layout as the artifact rows above, keyed by (worktree_id, rel_path)
+// instead of (project_id, worktree_id, kind, rel_path). The current file
+// is written zstd-9 (it is read on every observation and rewritten in
+// full); delta files are written zstd-3 (cheap to append, most are
+// pruned well before compaction).
+// ---------------------------------------------------------------------
+
+const DIR_BASE_ZSTD_LEVEL: i32 = 9;
+const DIR_DELTA_ZSTD_LEVEL: i32 = 3;
+
+fn list_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    files.sort();
+    files
+}
+
+fn next_seq_path(dir: &Path, prefix: &str) -> PathBuf {
+    let existing = list_files_in(dir);
+    let next_seq = existing
+        .iter()
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix(prefix))
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(0);
+    dir.join(format!("{prefix}{next_seq:012}.parquet"))
+}
+
+fn zstd_properties(level: i32) -> WriterProperties {
+    let level = ZstdLevel::try_new(level).unwrap_or_default();
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(level))
+        .set_writer_version(WriterVersion::PARQUET_2_0)
+        .build()
+}
+
+// --- dirs.parquet ---
+
+#[derive(Debug, Clone)]
+struct StoredDirRow {
+    worktree_id: String,
+    rel_path: String,
+    parent_rel_path: Option<String>,
+    allocated_total: u64,
+    own_allocated: u64,
+    file_count: u32,
+    entry_count: u32,
+    symlink_count: u32,
+    mod_time_min: i32,
+    complete: bool,
+    observed_at: u64,
+}
+
+fn dir_row_key(worktree_id: &str, rel_path: &str) -> String {
+    format!("{worktree_id}\u{1}{rel_path}")
+}
+
+fn dirs_current_path(dir: &Path) -> PathBuf {
+    dir.join("dirs.parquet")
+}
+fn dirs_deltas_dir(dir: &Path) -> PathBuf {
+    dir.join("dirs_deltas")
+}
+
+fn dirs_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("rel_path", DataType::Utf8, false),
+        Field::new("parent_rel_path", DataType::Utf8, true),
+        Field::new("allocated_total", DataType::UInt64, false),
+        Field::new("own_allocated", DataType::UInt64, false),
+        Field::new("file_count", DataType::UInt32, false),
+        Field::new("entry_count", DataType::UInt32, false),
+        Field::new("symlink_count", DataType::UInt32, false),
+        Field::new("mod_time_min", DataType::Int32, false),
+        Field::new("complete", DataType::Boolean, false),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+fn write_dir_rows(path: &Path, rows: &[StoredDirRow], zstd_level: i32) -> Result<()> {
+    let schema = dirs_schema();
+    let worktree_ids: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
+    let rel_paths: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+    let parent_rel_paths: Vec<Option<&str>> =
+        rows.iter().map(|r| r.parent_rel_path.as_deref()).collect();
+    let allocated_total: Vec<u64> = rows.iter().map(|r| r.allocated_total).collect();
+    let own_allocated: Vec<u64> = rows.iter().map(|r| r.own_allocated).collect();
+    let file_count: Vec<u32> = rows.iter().map(|r| r.file_count).collect();
+    let entry_count: Vec<u32> = rows.iter().map(|r| r.entry_count).collect();
+    let symlink_count: Vec<u32> = rows.iter().map(|r| r.symlink_count).collect();
+    let mod_time_min: Vec<i32> = rows.iter().map(|r| r.mod_time_min).collect();
+    let complete: Vec<bool> = rows.iter().map(|r| r.complete).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(worktree_ids)) as ArrayRef,
+            Arc::new(StringArray::from(rel_paths)),
+            Arc::new(StringArray::from(parent_rel_paths)),
+            Arc::new(UInt64Array::from(allocated_total)),
+            Arc::new(UInt64Array::from(own_allocated)),
+            Arc::new(UInt32Array::from(file_count)),
+            Arc::new(UInt32Array::from(entry_count)),
+            Arc::new(UInt32Array::from(symlink_count)),
+            Arc::new(Int32Array::from(mod_time_min)),
+            Arc::new(BooleanArray::from(complete)),
+            Arc::new(UInt64Array::from(observed_at)),
+        ],
+    )?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(zstd_properties(zstd_level)))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn read_dir_rows(path: &Path) -> Result<Vec<StoredDirRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let rel_path = downcast_str(&batch, "rel_path")?;
+        let parent_rel_path = batch
+            .column_by_name("parent_rel_path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column parent_rel_path is not Utf8")?;
+        let allocated_total = downcast_u64(&batch, "allocated_total")?;
+        let own_allocated = downcast_u64(&batch, "own_allocated")?;
+        let file_count = downcast_u32(&batch, "file_count")?;
+        let entry_count = downcast_u32(&batch, "entry_count")?;
+        let symlink_count = downcast_u32(&batch, "symlink_count")?;
+        let mod_time_min = batch
+            .column_by_name("mod_time_min")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .context("column mod_time_min is not Int32")?;
+        let complete = downcast_bool(&batch, "complete")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredDirRow {
+                worktree_id: worktree_id.value(i).to_string(),
+                rel_path: rel_path.value(i).to_string(),
+                parent_rel_path: if parent_rel_path.is_null(i) {
+                    None
+                } else {
+                    Some(parent_rel_path.value(i).to_string())
+                },
+                allocated_total: allocated_total.value(i),
+                own_allocated: own_allocated.value(i),
+                file_count: file_count.value(i),
+                entry_count: entry_count.value(i),
+                symlink_count: symlink_count.value(i),
+                mod_time_min: mod_time_min.value(i),
+                complete: complete.value(i),
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Builds a `key -> [(observed_at, value)]` index over every dir row's
+/// history in one pass (current file + every delta file read exactly
+/// once), instead of the naive per-row approach of re-reading every file
+/// on disk for every single directory. On a tree with tens of thousands
+/// of directories, re-reading is the difference between a few file reads
+/// and tens of thousands: this index is what keeps a second observation
+/// close to the first observation's wall time.
+fn build_dir_history_index(
+    dir: &Path,
+    current: &HashMap<String, StoredDirRow>,
+    retention_days: u64,
+    now: u64,
+) -> Result<HashMap<String, Vec<(u64, u64)>>> {
+    let retention_secs = retention_days.saturating_mul(86400);
+    let horizon = now.saturating_sub(retention_secs);
+    let mut index: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+    for (key, row) in current {
+        index
+            .entry(key.clone())
+            .or_default()
+            .push((row.observed_at, row.allocated_total));
+    }
+    for delta_path in list_files_in(&dirs_deltas_dir(dir)) {
+        for row in read_dir_rows(&delta_path)? {
+            if row.observed_at < horizon {
+                continue;
+            }
+            let key = dir_row_key(&row.worktree_id, &row.rel_path);
+            index
+                .entry(key)
+                .or_default()
+                .push((row.observed_at, row.allocated_total));
+        }
+    }
+    for values in index.values_mut() {
+        values.sort_by_key(|(t, _)| *t);
+    }
+    Ok(index)
+}
+
+fn growth_since_u64(history: &[(u64, u64)], now_val: u64, target_time: u64) -> Option<i64> {
+    let closest = history
+        .iter()
+        .min_by_key(|(t, _)| t.abs_diff(target_time))?;
+    Some(now_val as i64 - closest.1 as i64)
+}
+
+/// Read-only counterpart to [`observe_and_annotate_dirs`], mirroring
+/// [`annotate_readonly`] for artifacts: annotates `growth_bytes` from
+/// whatever the store already has, without writing a new observation.
+pub fn annotate_readonly_dirs(
+    slop_livin_dir: &Path,
+    volume_id: u64,
+    dirs: &mut [crate::report::DirRollup],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    let current_file = dirs_current_path(&dir);
+    if !current_file.exists() {
+        return Ok(());
+    }
+    let current: HashMap<String, StoredDirRow> = read_dir_rows(&current_file)?
+        .into_iter()
+        .map(|r| (dir_row_key(&r.worktree_id, &r.rel_path), r))
+        .collect();
+    let history_index = build_dir_history_index(&dir, &current, retention_days, observed_at)?;
+    let empty_history: Vec<(u64, u64)> = Vec::new();
+    let target_time = observed_at.saturating_sub(since_secs);
+    for row in dirs.iter_mut() {
+        let key = dir_row_key(&row.worktree_id, &row.rel_path);
+        let history = history_index.get(&key).unwrap_or(&empty_history);
+        row.growth_bytes = growth_since_u64(history, row.allocated_total, target_time);
+    }
+    Ok(())
+}
+
+/// Persists this observation's dir rows (current + reverse-delta) and
+/// annotates each `DirRollup` with `growth_bytes` (since `since_secs`
+/// ago), the same shape as [`observe_and_annotate`] for artifacts. A
+/// no-change row appends no delta, matching the artifact store's
+/// contract.
+pub fn observe_and_annotate_dirs(
+    slop_livin_dir: &Path,
+    volume_id: u64,
+    dirs: &mut [crate::report::DirRollup],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    fs::create_dir_all(&dir)?;
+    let current_file = dirs_current_path(&dir);
+
+    let mut current: HashMap<String, StoredDirRow> = read_dir_rows(&current_file)?
+        .into_iter()
+        .map(|r| (dir_row_key(&r.worktree_id, &r.rel_path), r))
+        .collect();
+
+    let history_index = build_dir_history_index(&dir, &current, retention_days, observed_at)?;
+    let empty_history: Vec<(u64, u64)> = Vec::new();
+
+    let mut delta_rows: Vec<StoredDirRow> = Vec::new();
+    let target_time = observed_at.saturating_sub(since_secs);
+
+    for row in dirs.iter_mut() {
+        let key = dir_row_key(&row.worktree_id, &row.rel_path);
+        let history = history_index.get(&key).unwrap_or(&empty_history);
+        row.growth_bytes = growth_since_u64(history, row.allocated_total, target_time);
+
+        match current.get_mut(&key) {
+            Some(prev) => {
+                let changed = prev.allocated_total != row.allocated_total
+                    || prev.own_allocated != row.own_allocated
+                    || prev.file_count != row.file_count
+                    || prev.entry_count != row.entry_count
+                    || prev.symlink_count != row.symlink_count
+                    || prev.mod_time_min != row.mod_time_min
+                    || prev.complete != row.complete;
+                if changed {
+                    delta_rows.push(prev.clone());
+                    prev.allocated_total = row.allocated_total;
+                    prev.own_allocated = row.own_allocated;
+                    prev.file_count = row.file_count;
+                    prev.entry_count = row.entry_count;
+                    prev.symlink_count = row.symlink_count;
+                    prev.mod_time_min = row.mod_time_min;
+                    prev.complete = row.complete;
+                    prev.observed_at = observed_at;
+                }
+            }
+            None => {
+                current.insert(
+                    key,
+                    StoredDirRow {
+                        worktree_id: row.worktree_id.clone(),
+                        rel_path: row.rel_path.clone(),
+                        parent_rel_path: row.parent_rel_path.clone(),
+                        allocated_total: row.allocated_total,
+                        own_allocated: row.own_allocated,
+                        file_count: row.file_count,
+                        entry_count: row.entry_count,
+                        symlink_count: row.symlink_count,
+                        mod_time_min: row.mod_time_min,
+                        complete: row.complete,
+                        observed_at,
+                    },
+                );
+            }
+        }
+    }
+
+    if !delta_rows.is_empty() {
+        let delta_path = next_seq_path(&dirs_deltas_dir(&dir), "delta-");
+        write_dir_rows(&delta_path, &delta_rows, DIR_DELTA_ZSTD_LEVEL)?;
+    }
+
+    let mut current_rows: Vec<StoredDirRow> = current.into_values().collect();
+    current_rows.sort_by(|a, b| (&a.worktree_id, &a.rel_path).cmp(&(&b.worktree_id, &b.rel_path)));
+    write_dir_rows(&current_file, &current_rows, DIR_BASE_ZSTD_LEVEL)?;
+
+    compact_dir_deltas_if_needed(&dir, retention_days, observed_at)?;
+    Ok(())
+}
+
+fn compact_dir_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
+    let deltas_dir_path = dirs_deltas_dir(dir);
+    let files = list_files_in(&deltas_dir_path);
+    if files.len() <= COMPACTION_THRESHOLD {
+        return Ok(());
+    }
+    let retention_secs = retention_days.saturating_mul(86400);
+    let horizon = now.saturating_sub(retention_secs);
+    let mut merged = Vec::new();
+    for path in &files {
+        for row in read_dir_rows(path)? {
+            if row.observed_at >= horizon {
+                merged.push(row);
+            }
+        }
+    }
+    for path in &files {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    if !merged.is_empty() {
+        merged.sort_by_key(|r| r.observed_at);
+        write_dir_rows(
+            &next_seq_path(&deltas_dir_path, "delta-"),
+            &merged,
+            DIR_DELTA_ZSTD_LEVEL,
+        )?;
+    }
+    Ok(())
+}
+
+// --- files.parquet ---
+
+#[derive(Debug, Clone)]
+struct StoredFileRow {
+    worktree_id: String,
+    rel_path: String,
+    allocated: u64,
+    mod_time_min: i32,
+    observed_at: u64,
+}
+
+fn file_row_key(worktree_id: &str, rel_path: &str) -> String {
+    format!("{worktree_id}\u{1}{rel_path}")
+}
+
+fn files_current_path(dir: &Path) -> PathBuf {
+    dir.join("files.parquet")
+}
+fn files_deltas_dir(dir: &Path) -> PathBuf {
+    dir.join("files_deltas")
+}
+
+fn files_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("rel_path", DataType::Utf8, false),
+        Field::new("allocated", DataType::UInt64, false),
+        Field::new("mod_time_min", DataType::Int32, false),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+fn write_file_rows(path: &Path, rows: &[StoredFileRow], zstd_level: i32) -> Result<()> {
+    let schema = files_schema();
+    let worktree_ids: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
+    let rel_paths: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+    let allocated: Vec<u64> = rows.iter().map(|r| r.allocated).collect();
+    let mod_time_min: Vec<i32> = rows.iter().map(|r| r.mod_time_min).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(worktree_ids)) as ArrayRef,
+            Arc::new(StringArray::from(rel_paths)),
+            Arc::new(UInt64Array::from(allocated)),
+            Arc::new(Int32Array::from(mod_time_min)),
+            Arc::new(UInt64Array::from(observed_at)),
+        ],
+    )?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(zstd_properties(zstd_level)))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn read_file_rows(path: &Path) -> Result<Vec<StoredFileRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let rel_path = downcast_str(&batch, "rel_path")?;
+        let allocated = downcast_u64(&batch, "allocated")?;
+        let mod_time_min = batch
+            .column_by_name("mod_time_min")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .context("column mod_time_min is not Int32")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredFileRow {
+                worktree_id: worktree_id.value(i).to_string(),
+                rel_path: rel_path.value(i).to_string(),
+                allocated: allocated.value(i),
+                mod_time_min: mod_time_min.value(i),
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Same one-pass approach as [`build_dir_history_index`], for file rows.
+fn build_file_history_index(
+    dir: &Path,
+    current: &HashMap<String, StoredFileRow>,
+    retention_days: u64,
+    now: u64,
+) -> Result<HashMap<String, Vec<(u64, u64)>>> {
+    let retention_secs = retention_days.saturating_mul(86400);
+    let horizon = now.saturating_sub(retention_secs);
+    let mut index: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+    for (key, row) in current {
+        index
+            .entry(key.clone())
+            .or_default()
+            .push((row.observed_at, row.allocated));
+    }
+    for delta_path in list_files_in(&files_deltas_dir(dir)) {
+        for row in read_file_rows(&delta_path)? {
+            if row.observed_at < horizon {
+                continue;
+            }
+            let key = file_row_key(&row.worktree_id, &row.rel_path);
+            index
+                .entry(key)
+                .or_default()
+                .push((row.observed_at, row.allocated));
+        }
+    }
+    for values in index.values_mut() {
+        values.sort_by_key(|(t, _)| *t);
+    }
+    Ok(index)
+}
+
+/// Read-only counterpart to [`observe_and_annotate_files`], mirroring
+/// [`annotate_readonly_dirs`] for large-file rows.
+pub fn annotate_readonly_files(
+    slop_livin_dir: &Path,
+    volume_id: u64,
+    files: &mut [crate::report::FileRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    let current_file = files_current_path(&dir);
+    if !current_file.exists() {
+        return Ok(());
+    }
+    let current: HashMap<String, StoredFileRow> = read_file_rows(&current_file)?
+        .into_iter()
+        .map(|r| (file_row_key(&r.worktree_id, &r.rel_path), r))
+        .collect();
+    let history_index = build_file_history_index(&dir, &current, retention_days, observed_at)?;
+    let empty_history: Vec<(u64, u64)> = Vec::new();
+    let target_time = observed_at.saturating_sub(since_secs);
+    for row in files.iter_mut() {
+        let key = file_row_key(&row.worktree_id, &row.rel_path);
+        let history = history_index.get(&key).unwrap_or(&empty_history);
+        row.growth_bytes = growth_since_u64(history, row.allocated, target_time);
+    }
+    Ok(())
+}
+
+/// Same shape as [`observe_and_annotate_dirs`], for large-file rows.
+pub fn observe_and_annotate_files(
+    slop_livin_dir: &Path,
+    volume_id: u64,
+    files: &mut [crate::report::FileRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    let dir = volume_dir(slop_livin_dir, volume_id);
+    fs::create_dir_all(&dir)?;
+    let current_file = files_current_path(&dir);
+
+    let mut current: HashMap<String, StoredFileRow> = read_file_rows(&current_file)?
+        .into_iter()
+        .map(|r| (file_row_key(&r.worktree_id, &r.rel_path), r))
+        .collect();
+
+    let history_index = build_file_history_index(&dir, &current, retention_days, observed_at)?;
+    let empty_history: Vec<(u64, u64)> = Vec::new();
+
+    let mut delta_rows: Vec<StoredFileRow> = Vec::new();
+    let target_time = observed_at.saturating_sub(since_secs);
+
+    for row in files.iter_mut() {
+        let key = file_row_key(&row.worktree_id, &row.rel_path);
+        let history = history_index.get(&key).unwrap_or(&empty_history);
+        row.growth_bytes = growth_since_u64(history, row.allocated, target_time);
+
+        match current.get_mut(&key) {
+            Some(prev) => {
+                let changed =
+                    prev.allocated != row.allocated || prev.mod_time_min != row.mod_time_min;
+                if changed {
+                    delta_rows.push(prev.clone());
+                    prev.allocated = row.allocated;
+                    prev.mod_time_min = row.mod_time_min;
+                    prev.observed_at = observed_at;
+                }
+            }
+            None => {
+                current.insert(
+                    key,
+                    StoredFileRow {
+                        worktree_id: row.worktree_id.clone(),
+                        rel_path: row.rel_path.clone(),
+                        allocated: row.allocated,
+                        mod_time_min: row.mod_time_min,
+                        observed_at,
+                    },
+                );
+            }
+        }
+    }
+
+    if !delta_rows.is_empty() {
+        let delta_path = next_seq_path(&files_deltas_dir(&dir), "delta-");
+        write_file_rows(&delta_path, &delta_rows, DIR_DELTA_ZSTD_LEVEL)?;
+    }
+
+    let mut current_rows: Vec<StoredFileRow> = current.into_values().collect();
+    current_rows.sort_by(|a, b| (&a.worktree_id, &a.rel_path).cmp(&(&b.worktree_id, &b.rel_path)));
+    write_file_rows(&current_file, &current_rows, DIR_BASE_ZSTD_LEVEL)?;
+
+    compact_file_deltas_if_needed(&dir, retention_days, observed_at)?;
+    Ok(())
+}
+
+fn compact_file_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
+    let deltas_dir_path = files_deltas_dir(dir);
+    let files = list_files_in(&deltas_dir_path);
+    if files.len() <= COMPACTION_THRESHOLD {
+        return Ok(());
+    }
+    let retention_secs = retention_days.saturating_mul(86400);
+    let horizon = now.saturating_sub(retention_secs);
+    let mut merged = Vec::new();
+    for path in &files {
+        for row in read_file_rows(path)? {
+            if row.observed_at >= horizon {
+                merged.push(row);
+            }
+        }
+    }
+    for path in &files {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    if !merged.is_empty() {
+        merged.sort_by_key(|r| r.observed_at);
+        write_file_rows(
+            &next_seq_path(&deltas_dir_path, "delta-"),
+            &merged,
+            DIR_DELTA_ZSTD_LEVEL,
+        )?;
     }
     Ok(())
 }

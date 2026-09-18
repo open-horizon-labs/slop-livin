@@ -91,6 +91,14 @@ pub struct AttributionResult {
     /// (excludes anything added later from an out-of-band source such as
     /// Docker facts, which never appear in `walked_total` either).
     pub unowned_total: u64,
+    /// R4c: per-directory rollups under each worktree's Source tree.
+    /// Empty from this serial reference walk (`attribute`, kept for its
+    /// existing unit tests); only the parallel walk
+    /// (`walk::attribute_parallel`) populates this.
+    pub dirs: Vec<crate::report::DirRollup>,
+    /// R4c: large-file rows (>= the configured threshold) found under
+    /// each worktree's Source tree.
+    pub files: Vec<crate::report::FileRow>,
 }
 
 struct Ctx<'a> {
@@ -332,6 +340,8 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
         walked_total: ctx.walked_total,
         attributed_total: ctx.attributed_total,
         unowned_total: ctx.unowned_total,
+        dirs: Vec::new(),
+        files: Vec::new(),
     }
 }
 

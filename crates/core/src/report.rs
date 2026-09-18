@@ -104,6 +104,49 @@ pub struct ArtifactRow {
     pub note: Option<String>,
 }
 
+/// R4c: one directory's rollup inside a worktree's `Source` tree.
+/// Produced only for directories not inside a folded artifact (see
+/// `ArtifactKind`) and not `.git` -- both are already excluded because
+/// `walk::attribute_parallel` folds them into one `ArtifactRow` before
+/// ever recursing, so no `DirRollup` is ever emitted underneath them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirRollup {
+    pub worktree_id: String,
+    /// Relative to the worktree root. The worktree root itself is `""`.
+    pub rel_path: String,
+    /// `None` only for the worktree root's own row.
+    pub parent_rel_path: Option<String>,
+    /// This directory's own files plus every descendant Source
+    /// directory's `allocated_total` (bottom-up sum). Does not include
+    /// bytes folded into an artifact row directly beneath it.
+    pub allocated_total: u64,
+    /// Allocated bytes of the files directly inside this directory only.
+    pub own_allocated: u64,
+    pub file_count: u32,
+    /// Files + subdirectories + symlinks directly inside this directory.
+    pub entry_count: u32,
+    pub symlink_count: u32,
+    /// Newest mtime among this directory's own direct entries, in
+    /// minutes since the Unix epoch.
+    pub mod_time_min: i32,
+    pub complete: bool,
+    #[serde(default)]
+    pub growth_bytes: Option<i64>,
+}
+
+/// R4c: one large file (>= `large_file_min_bytes`) found under a
+/// worktree's `Source` tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRow {
+    pub worktree_id: String,
+    /// Relative to the worktree root.
+    pub rel_path: String,
+    pub allocated: u64,
+    pub mod_time_min: i32,
+    #[serde(default)]
+    pub growth_bytes: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub name: String,
@@ -183,6 +226,14 @@ pub struct Report {
     /// unavailable (...)" when the daemon could not be reached.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// R4c: per-worktree directory drill-down, populated only when the
+    /// caller asked for it (`report_with(.., include_dirs: true)`) so the
+    /// default report payload stays small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirs_by_worktree: Option<std::collections::HashMap<String, Vec<DirRollup>>>,
+    /// R4c: per-worktree large-file rows, same opt-in as `dirs_by_worktree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_by_worktree: Option<std::collections::HashMap<String, Vec<FileRow>>>,
 }
 
 /// R2 discovers projects (checkouts and linked worktrees) under `root`
@@ -206,7 +257,9 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 /// stays at the R3 default (`None`/`0`) -- a read-only report, which is
 /// what the golden test and `--no-observe` want. `since_override`
 /// overrides the store's configured `since` setting for this call only
-/// (`--since`).
+/// (`--since`). Kept at its existing 5-argument shape so callers outside
+/// this slice (the MCP surface) do not need to change; use
+/// [`report_with_dirs`] for the R4c `--dirs` opt-in.
 pub fn report_with(
     root: &Path,
     docker_facts: Option<&Path>,
@@ -214,13 +267,14 @@ pub fn report_with(
     store_dir: Option<&Path>,
     since_override: Option<&str>,
 ) -> Result<Report> {
-    report_with_observe(
+    report_full(
         root,
         docker_facts,
         verify_du,
         store_dir,
         since_override,
         true,
+        false,
     )
 }
 
@@ -242,8 +296,65 @@ pub fn report_with_observe(
     since_override: Option<&str>,
     observe: bool,
 ) -> Result<Report> {
+    report_full(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        false,
+    )
+}
+
+/// Same as [`report_with`], with `include_dirs` (R4c) additionally
+/// populating `dirs_by_worktree` / `files_by_worktree` on the returned
+/// report when `true`. When `false` they stay `None` so the default
+/// report payload stays small. Always observes (persists), like
+/// `report_with`; combine with [`report_with_observe`]'s `observe: bool`
+/// through [`report_full`] directly if a caller ever needs both knobs at
+/// once (none currently does).
+pub fn report_with_dirs(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    include_dirs: bool,
+) -> Result<Report> {
+    report_full(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        true,
+        include_dirs,
+    )
+}
+
+/// The actual implementation behind [`report_with`], [`report_with_observe`],
+/// and [`report_with_dirs`]: `observe` controls whether this call persists
+/// a new observation into the growth store or only reads it, `include_dirs`
+/// (R4c) controls whether `dirs_by_worktree`/`files_by_worktree` are
+/// populated on the returned report. `pub` (rather than the other three's
+/// convenience wrapper shape) because the CLI's `--dirs` and `--no-observe`
+/// are independent flags and a caller may need both knobs at once.
+pub fn report_full(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+) -> Result<Report> {
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let observed_at = crate::entities::now();
+
+    let large_file_min_bytes = store_dir
+        .map(|dir| crate::growth::load_config(dir).large_file_min_bytes)
+        .unwrap_or(crate::growth::DEFAULT_LARGE_FILE_MIN_BYTES);
 
     // Discovery and attribution are each still their own recursive pass
     // over the tree; `walk::discover_and_attribute` runs both over a
@@ -251,10 +362,13 @@ pub fn report_with_observe(
     // See its module docs for why the two walks are kept separate rather
     // than fused into one (they stop recursion on different directories).
     let t0 = std::time::Instant::now();
-    let (discovered, mut attribution) = crate::walk::discover_and_attribute(root, observed_at)?;
+    let (discovered, mut attribution) =
+        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?;
     if trace {
         eprintln!("[trace] discover_and_attribute: {:?}", t0.elapsed());
     }
+    let mut dirs = std::mem::take(&mut attribution.dirs);
+    let mut files = std::mem::take(&mut attribution.files);
 
     // Group discovered checkouts/worktrees by project identity. When a
     // checkout's `origin` remote is known, identity is the normalized
@@ -409,6 +523,12 @@ pub fn report_with_observe(
         None
     };
 
+    // R4c: `own_allocated` is set by the walk; roll it up into
+    // `allocated_total` bottom-up (deepest directories first) before
+    // persisting/annotating, so a parent's total reflects every Source
+    // descendant without needing the walk itself to wait on children.
+    aggregate_dir_totals(&mut dirs);
+
     if let Some(dir) = store_dir {
         let volume_id = std::fs::metadata(root)
             .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
@@ -427,6 +547,22 @@ pub fn report_with_observe(
                 config.retention_days,
                 since_secs,
             )?;
+            crate::growth::observe_and_annotate_dirs(
+                dir,
+                volume_id,
+                &mut dirs,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
+            crate::growth::observe_and_annotate_files(
+                dir,
+                volume_id,
+                &mut files,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
         } else {
             crate::growth::annotate_readonly(
                 dir,
@@ -436,8 +572,40 @@ pub fn report_with_observe(
                 config.retention_days,
                 since_secs,
             )?;
+            crate::growth::annotate_readonly_dirs(
+                dir,
+                volume_id,
+                &mut dirs,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
+            crate::growth::annotate_readonly_files(
+                dir,
+                volume_id,
+                &mut files,
+                observed_at,
+                config.retention_days,
+                since_secs,
+            )?;
         }
     }
+
+    let (dirs_by_worktree, files_by_worktree) = if include_dirs {
+        let mut by_dir: std::collections::HashMap<String, Vec<DirRollup>> =
+            std::collections::HashMap::new();
+        for d in dirs {
+            by_dir.entry(d.worktree_id.clone()).or_default().push(d);
+        }
+        let mut by_file: std::collections::HashMap<String, Vec<FileRow>> =
+            std::collections::HashMap::new();
+        for f in files {
+            by_file.entry(f.worktree_id.clone()).or_default().push(f);
+        }
+        (Some(by_dir), Some(by_file))
+    } else {
+        (None, None)
+    };
 
     Ok(Report {
         observed_at,
@@ -453,7 +621,39 @@ pub fn report_with_observe(
             docker_unowned: docker_unowned_bytes,
         },
         notes,
+        dirs_by_worktree,
+        files_by_worktree,
     })
+}
+
+/// Rolls `own_allocated` up into `allocated_total` bottom-up: deepest
+/// directories (most path separators) are folded into their parent's
+/// running total first, so a parent's `allocated_total` always includes
+/// every descendant Source directory's total by the time it is visited.
+/// Deliberately excludes bytes folded into a classified artifact row
+/// directly beneath a directory -- those stay one `ArtifactRow`, never
+/// decomposed into `DirRollup`s, per the folding contract this issue
+/// requires.
+fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
+    let mut totals: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for d in dirs.iter() {
+        totals.insert((d.worktree_id.clone(), d.rel_path.clone()), d.own_allocated);
+    }
+    let mut order: Vec<usize> = (0..dirs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(dirs[i].rel_path.matches('/').count()));
+    for &i in &order {
+        let key = (dirs[i].worktree_id.clone(), dirs[i].rel_path.clone());
+        let value = *totals.get(&key).unwrap_or(&0);
+        if let Some(parent_rel) = dirs[i].parent_rel_path.clone() {
+            let pkey = (dirs[i].worktree_id.clone(), parent_rel);
+            *totals.entry(pkey).or_insert(0) += value;
+        }
+    }
+    for d in dirs.iter_mut() {
+        let key = (d.worktree_id.clone(), d.rel_path.clone());
+        d.allocated_total = *totals.get(&key).unwrap_or(&d.own_allocated);
+    }
 }
 
 /// Normalizes a git remote URL for comparison: strips a trailing `.git`,
