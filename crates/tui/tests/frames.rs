@@ -28,6 +28,10 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
         confidence: Confidence::High,
         source: Source::new("fixture"),
         note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
     }
 }
 
@@ -111,6 +115,10 @@ fn fixture_report() -> Report {
             docker_kind: None,
             shared_bytes: None,
             note: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
         }],
         dirs_by_worktree: None,
         files_by_worktree: None,
@@ -198,7 +206,10 @@ fn marked_rows_state() {
         app.clear_filter();
         app.set_view(ViewKind::Tree);
         app.selected_project = Some("mole".into());
-        app.selected = 1; // node_modules
+        // Rows sort by growth desc within the worktree now (tree.rs):
+        // build (index 1, +1.0GB) before deps/node_modules (index 2,
+        // +180.0MB) before source (index 3).
+        app.selected = 2; // node_modules (deps)
         app.mark_selected();
         check(&format!("marked_{w}x{h}"), &capture(&app, w, h));
     }
@@ -211,7 +222,7 @@ fn confirm_summary_state() {
         app.clear_filter();
         app.set_view(ViewKind::Tree);
         app.selected_project = Some("mole".into());
-        app.selected = 1;
+        app.selected = 2; // node_modules (deps); see marked_rows_state.
         app.mark_selected();
         app.open_confirm();
         check(&format!("confirm_{w}x{h}"), &capture(&app, w, h));
@@ -225,9 +236,28 @@ fn refusal_footer_state() {
         app.clear_filter();
         app.set_view(ViewKind::Tree);
         app.selected_project = Some("mole".into());
-        app.selected = 3; // src, not markable
+        app.selected = 3; // source/src, not markable (last after the
+        // growth-desc sort: build, deps, then source).
         app.mark_selected();
         check(&format!("refusal_{w}x{h}"), &capture(&app, w, h));
+    }
+}
+
+#[test]
+fn docker_mark_refusal_state() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Tree);
+        app.selected_project = Some("slop-livin".into());
+        // slop-livin's worktree has one build row (higher growth) then
+        // one Docker image row; select the Docker row.
+        app.selected = 2;
+        app.mark_selected();
+        check(
+            &format!("docker_mark_refusal_{w}x{h}"),
+            &capture(&app, w, h),
+        );
     }
 }
 

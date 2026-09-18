@@ -26,6 +26,10 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         confidence: Confidence::High,
         source: Source::new("test"),
         note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
     }
 }
 
@@ -130,6 +134,10 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::NoContainingRepo,
                 shared_bytes: None,
                 note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
                 docker_kind: None,
             },
             UnownedRow {
@@ -138,6 +146,10 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::NoContainingRepo,
                 shared_bytes: None,
                 note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
                 docker_kind: None,
             },
             UnownedRow {
@@ -146,6 +158,10 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::PermissionDenied,
                 shared_bytes: None,
                 note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
                 docker_kind: None,
             },
             UnownedRow {
@@ -154,6 +170,10 @@ fn fixture_report() -> Report {
                 reason: UnownedReason::SharedCache,
                 shared_bytes: None,
                 note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
                 docker_kind: None,
             },
         ],
@@ -359,6 +379,10 @@ fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
         reason: UnownedReason::DockerNoJoin,
         shared_bytes: Some(100_000_000),
         note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
         docker_kind: Some("image".to_string()),
     });
     let text = render_view_docker(&report, Some("big-grower"));

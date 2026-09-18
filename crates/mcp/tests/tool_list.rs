@@ -1,15 +1,16 @@
 //! Spawns the real `slop-livin-mcp` binary and asserts its `tools/list`
-//! response is exactly `report`, `what_grew`, `list_projects`, and
-//! `list_worktrees` (added by #35) -- everything else R6 removes
-//! (`pressure`, `truth`, `candidates`, `measure`, and any grant/ledger/
-//! execution tool) must not be reachable from this surface.
+//! response is exactly `docker_objects` (added by #33), `list_projects`,
+//! `list_worktrees` (added by #35), `report`, and `what_grew` --
+//! everything else R6 removes (`pressure`, `truth`, `candidates`,
+//! `measure`, and any grant/ledger/execution tool) must not be reachable
+//! from this surface.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 #[test]
-fn tools_list_is_exactly_report_what_grew_list_projects_and_list_worktrees() {
+fn tools_list_is_exactly_report_what_grew_list_projects_list_worktrees_and_docker_objects() {
     let exe = env!("CARGO_BIN_EXE_slop-livin-mcp");
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
@@ -40,6 +41,12 @@ fn tools_list_is_exactly_report_what_grew_list_projects_and_list_worktrees() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["list_projects", "list_worktrees", "report", "what_grew"]
+        vec![
+            "docker_objects",
+            "list_projects",
+            "list_worktrees",
+            "report",
+            "what_grew"
+        ]
     );
 }

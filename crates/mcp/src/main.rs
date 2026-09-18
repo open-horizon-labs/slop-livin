@@ -74,7 +74,10 @@ fn reason_label(reason: &UnownedReason) -> &'static str {
 }
 
 /// `report` tool: the full report structure (same shape as the CLI's
-/// `--json`), optionally scoped to one project by name.
+/// `--json`), optionally scoped to one project by name, and optionally
+/// narrowed to one named `view` (#33) -- the same view set the CLI's
+/// `--view` exposes: worktrees (default, the full structure), builds,
+/// deps, docker, kinds, unowned, reconciliation.
 fn tool_report(params: &Value) -> Result<Value> {
     let args = params.get("arguments").cloned().unwrap_or_default();
     let root = args
@@ -87,8 +90,22 @@ fn tool_report(params: &Value) -> Result<Value> {
         .get("project")
         .and_then(Value::as_str)
         .map(String::from);
+    let view = args.get("view").and_then(Value::as_str).map(String::from);
 
     let r = run_report(&root, since.as_deref())?;
+
+    if let Some(view) = view.as_deref() {
+        let payload = view_payload(&r, view, project.as_deref());
+        return Ok(json!({
+            "view": view,
+            "project": project,
+            "result": payload,
+            "observed_at": r.observed_at,
+            "since": effective_since(since.as_deref()),
+            "index_refreshed": true,
+        }));
+    }
+
     let mut value = serde_json::to_value(&r)?;
     value["since"] = json!(effective_since(since.as_deref()));
     value["index_refreshed"] = json!(true);
@@ -105,6 +122,207 @@ fn tool_report(params: &Value) -> Result<Value> {
         value["projects"] = json!(filtered);
     }
     Ok(value)
+}
+
+/// Builds the JSON payload for one named `view` over a report, scoped to
+/// `only_project` when set. Mirrors `render.rs`'s `render_view_*`
+/// functions' selection logic so the CLI and MCP agree on what each view
+/// means, just serialized instead of formatted as text.
+fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value {
+    match view {
+        "kinds" => {
+            let mut agg: std::collections::BTreeMap<&'static str, (u64, u64)> =
+                std::collections::BTreeMap::new();
+            for p in &r.projects {
+                if only_project.is_some_and(|name| name != p.name) {
+                    continue;
+                }
+                for wt in &p.worktrees {
+                    for a in &wt.artifacts {
+                        let entry = agg.entry(kind_label(&a.kind)).or_insert((0, 0));
+                        entry.0 += a.bytes;
+                        entry.1 += 1;
+                    }
+                }
+            }
+            json!(
+                agg.into_iter()
+                    .map(|(kind, (bytes, count))| json!({"kind": kind, "bytes": bytes, "count": count}))
+                    .collect::<Vec<_>>()
+            )
+        }
+        "builds" | "deps" => {
+            let kinds: &[ArtifactKind] = if view == "builds" {
+                &[ArtifactKind::BuildOutput, ArtifactKind::Cache]
+            } else {
+                &[ArtifactKind::DependencyTree]
+            };
+            let mut rows: Vec<Value> = Vec::new();
+            for p in &r.projects {
+                if only_project.is_some_and(|name| name != p.name) {
+                    continue;
+                }
+                for wt in &p.worktrees {
+                    for a in &wt.artifacts {
+                        if !kinds.contains(&a.kind) {
+                            continue;
+                        }
+                        rows.push(json!({
+                            "project": p.name,
+                            "kind": kind_label(&a.kind),
+                            "path": a.path,
+                            "bytes": a.bytes,
+                            "growth_bytes": a.growth_bytes,
+                        }));
+                    }
+                }
+            }
+            rows.sort_by(|a, b| {
+                b["bytes"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .cmp(&a["bytes"].as_u64().unwrap_or(0))
+            });
+            json!(rows)
+        }
+        "docker" => docker_objects_payload(r, false, only_project),
+        "unowned" => {
+            let rows: Vec<Value> = r
+                .unowned
+                .iter()
+                .map(|row| {
+                    json!({
+                        "path_or_object": row.path_or_object,
+                        "bytes": row.bytes,
+                        "reason": reason_label(&row.reason),
+                        "shared_bytes": row.shared_bytes,
+                        "docker_kind": row.docker_kind,
+                        "note": row.note,
+                    })
+                })
+                .collect();
+            json!(rows)
+        }
+        "reconciliation" => json!(r.reconciliation),
+        _ => json!({
+            "projects": r.projects.iter().filter(|p| only_project.is_none_or(|name| name == p.name)).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// Shared by `report`'s `view: "docker"` and the standalone
+/// `docker_objects` tool: every Docker object joined to a project (with
+/// its project name attached) plus every unowned one, sorted by bytes
+/// desc. `unowned_only` restricts to the unowned half; `only_project`
+/// restricts joined rows to that project and unowned rows to
+/// name-alike candidates, mirroring `render_view_docker`.
+fn docker_objects_payload(r: &Report, unowned_only: bool, only_project: Option<&str>) -> Value {
+    let mut rows: Vec<Value> = Vec::new();
+    if !unowned_only {
+        for p in &r.projects {
+            if only_project.is_some_and(|name| name != p.name) {
+                continue;
+            }
+            for wt in &p.worktrees {
+                for a in &wt.artifacts {
+                    if !matches!(
+                        a.kind,
+                        ArtifactKind::DockerImage
+                            | ArtifactKind::DockerBuildCache
+                            | ArtifactKind::DockerVolume
+                    ) {
+                        continue;
+                    }
+                    rows.push(json!({
+                        "project": p.name,
+                        "object": a.path,
+                        "kind": kind_label(&a.kind),
+                        "bytes": a.bytes,
+                        "shared_bytes": null,
+                        "created_at": a.created_at,
+                        "shared_with": a.shared_with,
+                        "containers": a.containers,
+                        "dangling": a.dangling,
+                        "note": a.note,
+                        "unowned": false,
+                    }));
+                }
+            }
+        }
+    }
+    for row in &r.unowned {
+        if row.reason != UnownedReason::DockerNoJoin {
+            continue;
+        }
+        let project_field = match only_project {
+            None => Value::Null,
+            Some(name) => {
+                if row
+                    .path_or_object
+                    .to_lowercase()
+                    .contains(&name.to_lowercase())
+                {
+                    json!(format!("{name} (unowned, name-alike)"))
+                } else {
+                    continue;
+                }
+            }
+        };
+        rows.push(json!({
+            "project": project_field,
+            "object": row.path_or_object,
+            "kind": row.docker_kind,
+            "bytes": row.bytes,
+            "shared_bytes": row.shared_bytes,
+            "created_at": row.created_at,
+            "shared_with": row.shared_with,
+            "containers": row.containers,
+            "dangling": row.dangling,
+            "note": row.note,
+            "unowned": true,
+        }));
+    }
+    rows.sort_by(|a, b| {
+        b["bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["bytes"].as_u64().unwrap_or(0))
+    });
+    json!(rows)
+}
+
+/// `docker_objects` tool: every Docker object with full detail
+/// (created_at, compose service via its own labels, layer-derived
+/// `shared_with`, referencing containers, dangling flag), sorted by
+/// unique bytes desc. `unowned_only` restricts to objects with no join
+/// evidence; `project` restricts joined rows to one project and unowned
+/// rows to name-alike candidates, explicitly labelled and never
+/// attributed.
+fn tool_docker_objects(params: &Value) -> Result<Value> {
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or(".")
+        .to_string();
+    let unowned_only = args
+        .get("unowned_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let project = args
+        .get("project")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    let r = run_report(&root, None)?;
+    let objects = docker_objects_payload(&r, unowned_only, project.as_deref());
+
+    Ok(json!({
+        "objects": objects,
+        "observed_at": r.observed_at,
+        "since": effective_since(None),
+        "index_refreshed": true,
+    }))
 }
 
 /// `list_projects` tool: name, id, total bytes, growth, checkout+worktree
@@ -374,7 +592,8 @@ fn main() -> Result<()> {
                         "inputSchema":{"type":"object","properties":{
                             "root":{"type":"string","description":"Root directory to report on (default: '.')"},
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"},
-                            "project":{"type":"string","description":"Scope the report to one project by name"}
+                            "project":{"type":"string","description":"Scope the report to one project by name"},
+                            "view":{"type":"string","description":"Named view instead of the full structure: worktrees, builds, deps, docker, kinds, unowned, reconciliation"}
                         }}
                     },
                     {
@@ -401,6 +620,15 @@ fn main() -> Result<()> {
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"},
                             "filter":{"type":"string","description":"Filter expression, e.g. 'merge-complete idle > 48h pr:merged'"}
                         }}
+                    },
+                    {
+                        "name":"docker_objects",
+                        "description":"Every Docker object (image/build-cache/volume) with full detail -- created_at, layer-derived shared_with, referencing containers, dangling -- sorted by unique bytes desc. Unowned objects are labelled, never attributed by name similarity.",
+                        "inputSchema":{"type":"object","properties":{
+                            "root":{"type":"string","description":"Root directory to report on (default: '.')"},
+                            "unowned_only":{"type":"boolean","description":"Restrict to objects with no join evidence"},
+                            "project":{"type":"string","description":"Restrict joined rows to one project; unowned rows to name-alike candidates, labelled unowned"}
+                        }}
                     }
                 ]})
             }
@@ -416,6 +644,8 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     "list_worktrees" => tool_list_worktrees(&params)
                         .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
+                    "docker_objects" => tool_docker_objects(&params)
+                        .unwrap_or_else(|e| json!({"state":"error","cause":e.to_string()})),
                     _ => json!({"state":"unsupported","cause":"unknown tool"}),
                 };
                 json!({"content":[{"type":"text","text":serde_json::to_string(&answer)?}]})
@@ -430,4 +660,110 @@ fn main() -> Result<()> {
         io::stdout().flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slop_livin_core::entities::Confidence;
+    use slop_livin_core::report::{
+        ArtifactRow, ProjectRow, Reconciliation, Signal, Source, WorktreeKind, WorktreeRow,
+    };
+    use std::path::PathBuf;
+
+    fn docker_image_row(reference: &str, bytes: u64) -> ArtifactRow {
+        ArtifactRow {
+            kind: ArtifactKind::DockerImage,
+            path: PathBuf::from(reference),
+            bytes,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1,
+            confidence: Confidence::High,
+            source: Source::new("docker.system_df"),
+            note: None,
+            created_at: Some("2026-09-10T12:00:00Z".to_string()),
+            containers: vec![
+                "hiphi-staging-relay-1 (exited, finished 2026-09-10T13:00:00Z)".to_string(),
+            ],
+            shared_with: vec!["hiphi-authorizer:staging".to_string()],
+            dangling: false,
+        }
+    }
+
+    fn fixture_report() -> Report {
+        Report {
+            observed_at: 1_000_000,
+            root: PathBuf::from("/src"),
+            projects: vec![ProjectRow {
+                project_id: "p1".to_string(),
+                name: "hiphi-relay".to_string(),
+                remote: None,
+                worktrees: vec![WorktreeRow {
+                    worktree_id: "wt1".to_string(),
+                    path: PathBuf::from("/src/hiphi-relay"),
+                    kind: WorktreeKind::Main,
+                    artifacts: vec![docker_image_row("hiphi-relay:staging", 500_000_000)],
+                    signals: vec![Signal {
+                        name: "dirty".to_string(),
+                        value: "dirty".to_string(),
+                    }],
+                }],
+            }],
+            unowned: vec![],
+            reconciliation: Reconciliation {
+                attributed: 500_000_000,
+                unowned: 0,
+                walked_total: 500_000_000,
+                du_total: None,
+                docker_attributed: 500_000_000,
+                docker_unowned: 0,
+            },
+            notes: vec![],
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+        }
+    }
+
+    #[test]
+    fn docker_objects_payload_carries_container_and_shared_with_detail() {
+        let report = fixture_report();
+        let payload = docker_objects_payload(&report, false, None);
+        let rows = payload.as_array().expect("array");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["object"], json!("hiphi-relay:staging"));
+        assert_eq!(row["created_at"], json!("2026-09-10T12:00:00Z"));
+        assert!(
+            row["containers"][0]
+                .as_str()
+                .unwrap()
+                .contains("hiphi-staging-relay-1")
+        );
+        assert_eq!(row["shared_with"][0], json!("hiphi-authorizer:staging"));
+    }
+
+    #[test]
+    fn view_payload_reconciliation_matches_report_struct() {
+        let report = fixture_report();
+        let payload = view_payload(&report, "reconciliation", None);
+        assert_eq!(payload["attributed"], json!(500_000_000));
+        assert_eq!(payload["docker_attributed"], json!(500_000_000));
+    }
+
+    #[test]
+    fn view_payload_worktrees_scopes_to_project() {
+        let mut report = fixture_report();
+        report.projects.push(ProjectRow {
+            project_id: "p2".to_string(),
+            name: "other".to_string(),
+            remote: None,
+            worktrees: vec![],
+        });
+        let payload = view_payload(&report, "worktrees", Some("hiphi-relay"));
+        let projects = payload["projects"].as_array().expect("array");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], json!("hiphi-relay"));
+    }
 }

@@ -264,8 +264,10 @@ pub fn view_index(v: ViewKind) -> usize {
     match v {
         ViewKind::Projects => 1,
         ViewKind::Tree => 2,
-        ViewKind::Kinds => 3,
-        ViewKind::Docker => 4,
-        ViewKind::Unowned => 5,
+        ViewKind::Builds => 3,
+        ViewKind::Deps => 4,
+        ViewKind::Docker => 5,
+        ViewKind::Kinds => 6,
+        ViewKind::Unowned => 7,
     }
 }

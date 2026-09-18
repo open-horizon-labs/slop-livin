@@ -751,7 +751,47 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
         "{:<24} {:<20} {:<14} {:>10} {:>10}  detail",
         "project", "object", "kind", "bytes", "shared"
     );
-    let mut rows: Vec<(String, String, String, u64, u64, Option<String>)> = Vec::new();
+
+    /// One `--view docker` row's detail column, assembled from
+    /// created_at / shared_with / containers / dangling / note so every
+    /// object -- joined or unowned -- shows the same fields (#33).
+    fn detail_string(
+        created_at: &Option<String>,
+        shared_with: &[String],
+        containers: &[String],
+        dangling: bool,
+        note: &Option<String>,
+    ) -> String {
+        let mut bits: Vec<String> = Vec::new();
+        if let Some(c) = created_at {
+            bits.push(format!("created {c}"));
+        }
+        if dangling {
+            bits.push("dangling".to_string());
+        }
+        if !shared_with.is_empty() {
+            bits.push(format!("shared_with={}", shared_with.join(",")));
+        }
+        if containers.is_empty() {
+            bits.push("no containers reference it".to_string());
+        } else {
+            bits.push(format!("containers={}", containers.join("; ")));
+        }
+        if let Some(n) = note {
+            bits.push(n.clone());
+        }
+        bits.join(" · ")
+    }
+
+    struct Row {
+        project: String,
+        object: String,
+        kind: String,
+        bytes: u64,
+        shared_bytes: u64,
+        detail: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
     for project in &report.projects {
         if let Some(name) = only_project
             && project.name != name
@@ -768,14 +808,20 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
                 ) {
                     continue;
                 }
-                rows.push((
-                    project.name.clone(),
-                    a.path.display().to_string(),
-                    kind_label(&a.kind).to_string(),
-                    a.bytes,
-                    0,
-                    a.note.clone(),
-                ));
+                rows.push(Row {
+                    project: project.name.clone(),
+                    object: a.path.display().to_string(),
+                    kind: kind_label(&a.kind).to_string(),
+                    bytes: a.bytes,
+                    shared_bytes: 0,
+                    detail: detail_string(
+                        &a.created_at,
+                        &a.shared_with,
+                        &a.containers,
+                        a.dangling,
+                        &a.note,
+                    ),
+                });
             }
         }
     }
@@ -802,37 +848,91 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
                 }
             }
         };
-        rows.push((
-            project_label,
-            row.path_or_object.clone(),
-            row.docker_kind.as_deref().unwrap_or("unknown").to_string(),
-            row.bytes,
-            row.shared_bytes.unwrap_or(0),
-            row.note.clone(),
-        ));
+        rows.push(Row {
+            project: project_label,
+            object: row.path_or_object.clone(),
+            kind: row.docker_kind.as_deref().unwrap_or("unknown").to_string(),
+            bytes: row.bytes,
+            shared_bytes: row.shared_bytes.unwrap_or(0),
+            detail: detail_string(
+                &row.created_at,
+                &row.shared_with,
+                &row.containers,
+                row.dangling,
+                &row.note,
+            ),
+        });
     }
-    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     if rows.is_empty() {
         let _ = writeln!(out, "0");
         return out;
     }
-    for (project, object, kind, bytes, shared, note) in rows {
+    for row in rows {
         let _ = writeln!(
             out,
             "{:<24} {:<20} {:<14} {:>10} {:>10}  {}",
-            project,
-            object,
-            kind,
-            human_bytes(bytes),
-            if shared > 0 {
-                human_bytes(shared)
+            row.project,
+            row.object,
+            row.kind,
+            human_bytes(row.bytes),
+            if row.shared_bytes > 0 {
+                human_bytes(row.shared_bytes)
             } else {
                 "—".to_string()
             },
-            note.unwrap_or_default(),
+            row.detail,
         );
     }
     out
+}
+
+/// `--view reconciliation`: attributed / unowned / walked / du (when
+/// computed) / docker in one line, exactly the "one command" the
+/// maintainer rule comment asks for instead of hand-assembled jq over
+/// separate fields.
+pub fn render_view_reconciliation(report: &Report) -> String {
+    let mut out = String::new();
+    let r = &report.reconciliation;
+    let _ = writeln!(
+        out,
+        "attributed={} unowned={} walked={} du={} docker_attributed={} docker_unowned={}",
+        human_bytes(r.attributed),
+        human_bytes(r.unowned),
+        human_bytes(r.walked_total),
+        r.du_total
+            .map(human_bytes)
+            .unwrap_or_else(|| "n/a".to_string()),
+        human_bytes(r.docker_attributed),
+        human_bytes(r.docker_unowned),
+    );
+    out
+}
+
+/// `--worktree <path>`: signals for one worktree, matched by exact path
+/// or by its relative path under the report root, since a project's
+/// `WorktreeRow.path` is stored absolute. One command, no jq over the
+/// whole report needed to answer "signals for this worktree".
+pub fn render_worktree_signals(report: &Report, path: &Path) -> Option<String> {
+    let worktree = report.projects.iter().find_map(|p| {
+        p.worktrees.iter().find(|w| {
+            w.path == path
+                || w.path
+                    .strip_prefix(&report.root)
+                    .map(|rel| rel == path)
+                    .unwrap_or(false)
+        })
+    })?;
+    let mut out = String::new();
+    let _ = writeln!(out, "worktree: {}", worktree.path.display());
+    if worktree.signals.is_empty() {
+        let _ = writeln!(out, "  (no signals)");
+    } else {
+        for s in &worktree.signals {
+            let _ = writeln!(out, "  {}: {}", s.name, s.value);
+        }
+    }
+    Some(out)
 }
 
 /// `--view unowned` at root: the same aggregation `render_overview`

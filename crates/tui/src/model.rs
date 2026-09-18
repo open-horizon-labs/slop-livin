@@ -213,9 +213,13 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
     out
 }
 
-/// Tree view for one project: checkout/worktree -> artifact leaves, with
-/// a box-drawing rail (`├─`/`└─`/`│`) per DESIGN.md's graph-rail grammar.
-/// `collapsed` names worktree paths (as strings) currently collapsed.
+/// Tree view for one project: checkout/worktree -> (folded) artifact
+/// rows, built from the same [`slop_livin_core::tree::build_project_tree`]
+/// the CLI's `--project` drill uses, so the two never drift apart (#33).
+/// This function only adds the TUI-specific rail glyphs
+/// (`├─`/`└─`/`│`, DESIGN.md's graph-rail grammar), the collapse/expand
+/// state, and unit ids for marking. `collapsed` names worktree paths (as
+/// strings) currently collapsed.
 pub fn tree_rows(
     report: &Report,
     project_name: &str,
@@ -226,61 +230,70 @@ pub fn tree_rows(
     let Some(p) = report.projects.iter().find(|p| p.name == project_name) else {
         return out;
     };
-    let wt_count = p.worktrees.len();
-    for (wi, wt) in p.worktrees.iter().enumerate() {
-        let wt_last = wi + 1 == wt_count;
-        let wt_key = wt.path.display().to_string();
-        let is_collapsed = collapsed.contains(&wt_key);
-        let bytes: u64 = wt.artifacts.iter().map(|a| a.bytes).sum();
-        let growth: Option<i64> = {
-            let vals: Vec<i64> = wt.artifacts.iter().filter_map(|a| a.growth_bytes).collect();
-            (!vals.is_empty()).then(|| vals.iter().sum())
+    let tree = slop_livin_core::tree::build_project_tree(p, &report.root);
+    let wt_count = tree.worktrees.len();
+    for (wi, wt) in tree.worktrees.iter().enumerate() {
+        // Look up the underlying `WorktreeRow` for its absolute path (the
+        // tree model's `rel_path` is relative, but marking/collapse keys
+        // and folded-row unit ids need a real path on disk).
+        let Some(source_wt) = p.worktrees.iter().find(|w| w.worktree_id == wt.worktree_id) else {
+            continue;
         };
+        let wt_last = wi + 1 == wt_count;
+        let wt_key = source_wt.path.display().to_string();
+        let is_collapsed = collapsed.contains(&wt_key);
         let signals: Vec<String> = wt.signals.iter().map(|s| s.value.clone()).collect();
         let wt_connector = if wt_last { "└─ " } else { "├─ " };
         let expand_glyph = if is_collapsed { "▸" } else { "▾" };
         out.push(Row {
             depth: 1,
             rail: format!("{wt_connector}{expand_glyph} "),
-            label: format!("{:?} {}", wt.kind, wt.path.display()),
-            bytes,
-            growth,
+            label: format!("{:?} {}", wt.kind, source_wt.path.display()),
+            bytes: wt.bytes,
+            growth: wt.growth_bytes,
             signals,
             unit: None,
             kind: None,
-            collapsed_children: is_collapsed.then_some(wt.artifacts.len()),
-            expandable: !wt.artifacts.is_empty(),
+            collapsed_children: is_collapsed.then_some(wt.rows.len()),
+            expandable: !wt.rows.is_empty(),
         });
         if is_collapsed {
             continue;
         }
         let child_prefix = if wt_last { "   " } else { "│  " };
-        let visible: Vec<_> = wt
-            .artifacts
+        let visible: Vec<&slop_livin_core::tree::TreeRow> = wt
+            .rows
             .iter()
-            .filter(|a| {
+            .filter(|row| {
                 if let Filter::Kind(k) = filter
-                    && kind_label(&a.kind) != k
+                    && row.kind_label != k
                 {
                     return false;
                 }
-                passes_filter(a.growth_bytes, filter)
+                passes_filter(row.growth_bytes, filter)
             })
             .collect();
         let n = visible.len();
-        for (ai, a) in visible.into_iter().enumerate() {
-            let a_last = ai + 1 == n;
-            let connector = if a_last { "└─ " } else { "├─ " };
-            let mut row = Row::leaf(
-                2,
-                format!("{} {}", kind_label(&a.kind), a.path.display()),
-                a.bytes,
-                a.growth_bytes,
-            );
-            row.rail = format!("{child_prefix}{connector}");
-            row.kind = Some(a.kind.clone());
-            row.unit = Some(UnitId::for_artifact(&a.path));
-            out.push(row);
+        for (ri, row) in visible.into_iter().enumerate() {
+            let r_last = ri + 1 == n;
+            let connector = if r_last { "└─ " } else { "├─ " };
+            let label = if row.folded_count > 1 {
+                format!(
+                    "{} {} (x{})",
+                    row.kind_label, row.rel_path, row.folded_count
+                )
+            } else {
+                format!("{} {}", row.kind_label, row.rel_path)
+            };
+            let mut out_row = Row::leaf(2, label, row.bytes, row.growth_bytes);
+            out_row.rail = format!("{child_prefix}{connector}");
+            out_row.kind = row.kind.clone();
+            // A folded group of several artifacts has no single owning
+            // path to mark; only an unfolded row is markable.
+            if row.folded_count == 1 {
+                out_row.unit = Some(UnitId::for_artifact(&source_wt.path.join(&row.rel_path)));
+            }
+            out.push(out_row);
         }
     }
     out
@@ -365,6 +378,41 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
             u.bytes,
             None,
         ));
+    }
+    out
+}
+
+/// Builds view: every `BuildOutput`/`Cache` row across the whole root,
+/// same kind set as the CLI's `--view builds` (#33).
+pub fn builds_rows(report: &Report) -> Vec<Row> {
+    kind_filtered_rows(report, &[ArtifactKind::BuildOutput, ArtifactKind::Cache])
+}
+
+/// Deps view: every `DependencyTree` row across the whole root, same as
+/// the CLI's `--view deps`.
+pub fn deps_rows(report: &Report) -> Vec<Row> {
+    kind_filtered_rows(report, &[ArtifactKind::DependencyTree])
+}
+
+fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind]) -> Vec<Row> {
+    let mut out = Vec::new();
+    for p in &report.projects {
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if !kinds.contains(&a.kind) {
+                    continue;
+                }
+                let mut row = Row::leaf(
+                    0,
+                    format!("{} · {} {}", p.name, kind_label(&a.kind), a.path.display()),
+                    a.bytes,
+                    a.growth_bytes,
+                );
+                row.kind = Some(a.kind.clone());
+                row.unit = Some(UnitId::for_artifact(&a.path));
+                out.push(row);
+            }
+        }
     }
     out
 }
@@ -475,6 +523,10 @@ mod tests {
             confidence: slop_livin_core::entities::Confidence::High,
             source: slop_livin_core::report::Source::new("t"),
             note: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
         }
     }
 
@@ -554,6 +606,10 @@ mod tests {
                     docker_kind: None,
                     shared_bytes: None,
                     note: None,
+                    created_at: None,
+                    containers: Vec::new(),
+                    shared_with: Vec::new(),
+                    dangling: false,
                 },
                 slop_livin_core::report::UnownedRow {
                     path_or_object: "cache".into(),
@@ -562,6 +618,10 @@ mod tests {
                     docker_kind: None,
                     shared_bytes: None,
                     note: None,
+                    created_at: None,
+                    containers: Vec::new(),
+                    shared_with: Vec::new(),
+                    dangling: false,
                 },
             ],
             reconciliation: slop_livin_core::report::Reconciliation {

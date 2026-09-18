@@ -176,6 +176,10 @@ impl<'a> Ctx<'a> {
                         confidence: crate::entities::Confidence::High,
                         source: Source::new("filesystem.walk"),
                         note: None,
+                        created_at: None,
+                        containers: Vec::new(),
+                        shared_with: Vec::new(),
+                        dangling: false,
                     });
             }
             None => {
@@ -195,6 +199,10 @@ impl<'a> Ctx<'a> {
                     reason,
                     shared_bytes: None,
                     note: None,
+                    created_at: None,
+                    containers: Vec::new(),
+                    shared_with: Vec::new(),
+                    dangling: false,
                     docker_kind: None,
                 });
             }
@@ -208,6 +216,10 @@ impl<'a> Ctx<'a> {
             reason: UnownedReason::PermissionDenied,
             shared_bytes: None,
             note: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
             docker_kind: None,
         });
     }
@@ -243,6 +255,10 @@ impl<'a> Ctx<'a> {
                     reason,
                     shared_bytes: None,
                     note: None,
+                    created_at: None,
+                    containers: Vec::new(),
+                    shared_with: Vec::new(),
+                    dangling: false,
                     docker_kind: None,
                 });
             }
@@ -331,6 +347,10 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
                 confidence: crate::entities::Confidence::High,
                 source: Source::new("filesystem.walk"),
                 note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
             });
     }
 

@@ -29,6 +29,10 @@ pub const FOLD_DEPTH: usize = 2;
 #[derive(Debug, Clone)]
 pub struct TreeRow {
     pub kind_label: &'static str,
+    /// Set only for an unfolded row (`folded_count == 1`): the original
+    /// artifact's kind, so a caller (the TUI) can decide markability or
+    /// spot a Docker row without re-deriving it from `kind_label`.
+    pub kind: Option<ArtifactKind>,
     /// Relative to the worktree root; `"."` for the worktree root itself.
     pub rel_path: String,
     pub bytes: u64,
@@ -124,6 +128,7 @@ fn build_rows(worktree_root: &Path, artifacts: &[ArtifactRow]) -> Vec<TreeRow> {
             let key = prefix_components(&rel, FOLD_DEPTH);
             let entry = folded.entry(key.clone()).or_insert(TreeRow {
                 kind_label: "artifacts",
+                kind: None,
                 rel_path: key,
                 bytes: 0,
                 growth_bytes: None,
@@ -137,6 +142,7 @@ fn build_rows(worktree_root: &Path, artifacts: &[ArtifactRow]) -> Vec<TreeRow> {
         } else {
             kept.push(TreeRow {
                 kind_label: kind_label(&a.kind),
+                kind: Some(a.kind.clone()),
                 rel_path: rel,
                 bytes: a.bytes,
                 growth_bytes: a.growth_bytes,
