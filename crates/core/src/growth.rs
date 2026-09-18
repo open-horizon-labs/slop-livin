@@ -364,6 +364,15 @@ pub fn observe_and_annotate(
                     } else {
                         prev.regrowth_count
                     };
+                    // The delta's timestamp must be when this *old* value
+                    // was itself last confirmed (`prev.observed_at`), not
+                    // this observation's timestamp. Tagging it with the
+                    // current observation instead collides with the new
+                    // `current` row's own timestamp (both would read as
+                    // "true at the same instant"), which makes the two
+                    // conflicting values tie in `growth_since`'s
+                    // nearest-timestamp lookup and lets an arbitrary one
+                    // win.
                     delta_rows.push(StoredRow {
                         project_id: prev.project_id.clone(),
                         worktree_id: prev.worktree_id.clone(),
@@ -371,7 +380,7 @@ pub fn observe_and_annotate(
                         rel_path: prev.rel_path.clone(),
                         bytes: prev.bytes,
                         present: prev.present,
-                        observed_at,
+                        observed_at: prev.observed_at,
                         regrowth_count: prev.regrowth_count,
                     });
                     prev.bytes = obs.bytes;
@@ -381,17 +390,14 @@ pub fn observe_and_annotate(
                 }
             }
             None => {
-                // Newly discovered row: its "previous" state is absent.
-                delta_rows.push(StoredRow {
-                    project_id: obs.project_id.clone(),
-                    worktree_id: obs.worktree_id.clone(),
-                    kind: obs.kind.clone(),
-                    rel_path: obs.rel_path.clone(),
-                    bytes: 0,
-                    present: false,
-                    observed_at,
-                    regrowth_count: 0,
-                });
+                // Newly discovered row: there is no prior observation to
+                // diff against, so this is not a "change" the delta log
+                // needs to record -- it is simply the first known value.
+                // Writing a synthetic "previously absent" delta here would
+                // plant a fabricated (bytes=0, present=false) history
+                // point at this observation's timestamp, which can tie
+                // with (or beat) a real historical value once the row
+                // later changes, corrupting `growth_since` lookups.
                 current.insert(
                     obs.key.clone(),
                     StoredRow {
@@ -421,7 +427,7 @@ pub fn observe_and_annotate(
                 rel_path: row.rel_path.clone(),
                 bytes: row.bytes,
                 present: row.present,
-                observed_at,
+                observed_at: row.observed_at,
                 regrowth_count: row.regrowth_count,
             });
             row.present = false;
@@ -670,7 +676,11 @@ mod tests {
         observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600).unwrap();
         let dir = volume_dir(tmp.path(), 1);
         let after_first = list_delta_files(&dir).len();
-        assert_eq!(after_first, 1, "first observation of a new row is a delta");
+        assert_eq!(
+            after_first, 0,
+            "a brand-new row has no prior state to diff against, so the very \
+             first observation must not fabricate a delta either"
+        );
 
         let mut second = vec![one_artifact_project(&root, 1_000_000)];
         observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600).unwrap();
@@ -709,6 +719,68 @@ mod tests {
         observe_and_annotate(tmp.path(), 1, &mut recreated, 3_000, 30, 3600).unwrap();
 
         assert_eq!(artifact_row(&recreated).regrowth_count, 1);
+    }
+
+    /// Regression for the bug reported against the real `~/src` live run:
+    /// grow a row, then shrink it back to its original size. Growth at
+    /// the 3rd observation, measured against a baseline far enough back
+    /// to predate the very first observation, must be 0 -- the row is
+    /// back to the value it started at. Before the fix, the delta
+    /// written for a *brand-new* row (a synthetic "previously absent,
+    /// bytes=0" entry timestamped at the row's first observation) could
+    /// tie with -- and be preferred over -- the real historical entry
+    /// once the row changed twice, so this returned `bytes_now` (as if
+    /// there were no prior observation at all) instead of `0`.
+    #[test]
+    fn growth_after_grow_then_shrink_back_to_original_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/repo");
+        let original_bytes = 1_000_000;
+
+        let mut obs1 = vec![one_artifact_project(&root, original_bytes)];
+        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 5_000).unwrap();
+
+        let mut obs2 = vec![one_artifact_project(&root, original_bytes + 200_000_000)];
+        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 5_000).unwrap();
+
+        // Shrunk back to exactly the original size.
+        let mut obs3 = vec![one_artifact_project(&root, original_bytes)];
+        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 5_000).unwrap();
+
+        assert_eq!(
+            artifact_row(&obs3).growth_bytes,
+            Some(0),
+            "back to the original size: growth against a far-back baseline must be 0, \
+             not bytes_now as if no prior observation existed"
+        );
+    }
+
+    /// After two consecutive changes, a growth query whose baseline time
+    /// lands on the *first* change must use that change's real recorded
+    /// value, never fall through to treating the row as previously
+    /// absent (bytes=0).
+    #[test]
+    fn growth_after_two_changes_uses_correct_historical_value_not_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/repo");
+
+        let mut obs1 = vec![one_artifact_project(&root, 1_000_000)];
+        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 2_000).unwrap();
+
+        let mut obs2 = vec![one_artifact_project(&root, 2_000_000)];
+        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 2_000).unwrap();
+
+        // since_secs=2_000 at observed_at=3_000 targets time 1_000 --
+        // exactly obs1's timestamp -- so the baseline must be obs1's
+        // 1_000_000 bytes, not 0.
+        let mut obs3 = vec![one_artifact_project(&root, 5_000_000)];
+        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 2_000).unwrap();
+
+        assert_eq!(
+            artifact_row(&obs3).growth_bytes,
+            Some(4_000_000),
+            "baseline must be obs1's real recorded value (1_000_000), not absence (0)"
+        );
     }
 
     #[test]
