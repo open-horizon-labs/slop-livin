@@ -285,6 +285,35 @@ mod tests {
     }
 
     #[test]
+    fn narrow_signals_spell_out_the_loud_ones() {
+        let sig = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ui::pick_signals(
+                &sig(&[
+                    "last commit 1d",
+                    "clean",
+                    "18 unpushed",
+                    "unlocked",
+                    "idle 12h"
+                ]),
+                2
+            ),
+            sig(&["last commit 1d", "18 unpushed"])
+        );
+        assert_eq!(
+            ui::pick_signals(
+                &sig(&["last commit 3h", "clean", "0 unpushed", "unlocked"]),
+                2
+            ),
+            sig(&["last commit 3h"])
+        );
+        assert_eq!(
+            ui::pick_signals(&sig(&["clean", "0 unpushed"]), 2),
+            sig(&["clean"])
+        );
+    }
+
+    #[test]
     fn header_drops_trailing_clauses_to_fit_width() {
         let clauses: Vec<String> = [
             "/root",

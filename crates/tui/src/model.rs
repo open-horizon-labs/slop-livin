@@ -21,9 +21,11 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Signed growth. Zero is a fact and reads `0B`; the em dash is reserved
+/// for "no prior observation" (a `None`), rendered by the caller.
 pub fn human_signed_bytes(delta: i64) -> String {
     if delta == 0 {
-        return "—".to_string();
+        return "0B".to_string();
     }
     let sign = if delta > 0 { "+" } else { "-" };
     format!("{sign}{}", human_bytes(delta.unsigned_abs()))
@@ -37,7 +39,9 @@ pub fn truncate_middle(s: &str, width: usize) -> String {
     if chars.len() <= width || width < 4 {
         return s.to_string();
     }
-    let keep_tail = width * 2 / 3;
+    // Paths are recognised by their tail (`…/hiphi-repos/roon-knob`), so
+    // keep almost all of the budget for it.
+    let keep_tail = width - 1 - (width / 8).min(6);
     let keep_head = width - keep_tail - 1;
     let head: String = chars[..keep_head].iter().collect();
     let tail: String = chars[chars.len() - keep_tail..].iter().collect();
@@ -453,7 +457,7 @@ mod tests {
 
     #[test]
     fn signed_bytes_show_sign_and_dash() {
-        assert_eq!(human_signed_bytes(0), "—");
+        assert_eq!(human_signed_bytes(0), "0B");
         assert_eq!(human_signed_bytes(184_320_000), "+175.8MB");
         assert_eq!(human_signed_bytes(-1024), "-1.0KB");
     }

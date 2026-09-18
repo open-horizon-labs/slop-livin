@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 9.9GB attributed · "
 "filter: growth > 100MB in 7d                                                    "
-"SharedCache …Users/dev/.cache/leftover   200.0MB          — ▕        ▏          "
+"Shar…ache · /Users/dev/.cache/leftover   200.0MB          — ▕        ▏          "
 "                                                                                "
 "                                                                                "
 "                                                                                "

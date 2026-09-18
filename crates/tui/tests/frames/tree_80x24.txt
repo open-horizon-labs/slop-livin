@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 9.9GB attributed · "
 "filter: growth > 100MB in 7d                                                    "
-"└─ ▾ Main /Users/dev/src/mole              2.4GB     +1.2GB ▕++++++++▏ c        "
+"└─ ▾ Main /Users/dev/src/mole              2.4GB     +1.2GB ▕++++++++▏ clean    "
 "   ├─ build target                         2.0GB     +1.0GB ▕+++++++ ▏          "
 "   └─ deps node_modules                  420.0MB   +180.0MB ▕+       ▏          "
 "                                                                                "

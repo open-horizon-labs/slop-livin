@@ -231,7 +231,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         let raw_name = format!("{}{mark_prefix}{}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
         let bytes = format!("{:>10}", human_bytes(row.bytes));
-        let growth = format!("{:>10}", human_signed_bytes(row.growth.unwrap_or(0)));
+        let growth = format!(
+            "{:>10}",
+            row.growth
+                .map(human_signed_bytes)
+                .unwrap_or_else(|| "—".into())
+        );
         let bar = growth_bar(row.growth, max_abs, bar_width);
         let bar_color = match row.growth {
             Some(g) if g > 0 => Color::Green,
@@ -244,15 +249,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_default();
         // DESIGN.md: "80x24 ... signals drop to a single glyph column;
         // uses width up to 200 ... signals spell out."
+        // Narrow terminals show the two most decision-relevant signals
+        // spelled out (never a glyph code); wide ones show them all.
         let signals_text = if row.signals.is_empty() {
             String::new()
         } else if narrow {
-            row.signals
-                .iter()
-                .filter_map(|s| s.chars().next())
-                .collect::<String>()
+            pick_signals(&row.signals, 2).join(" · ")
         } else {
-            row.signals.join(", ")
+            row.signals.join(" · ")
         };
 
         let name_style = if marked {
@@ -331,4 +335,20 @@ pub fn view_index(v: ViewKind) -> usize {
         ViewKind::Kinds => 6,
         ViewKind::Unowned => 7,
     }
+}
+
+/// Chooses up to `n` signals worth a narrow column: anything that is not
+/// the quiet default (`clean`, `0 unpushed`, `unlocked`, `unknown`, `no PR`)
+/// first, then the last-commit age.
+pub fn pick_signals(signals: &[String], n: usize) -> Vec<String> {
+    let quiet = |s: &str| {
+        matches!(s, "clean" | "0 unpushed" | "unlocked" | "unknown" | "no PR")
+            || s.starts_with("unknown (")
+    };
+    let mut out: Vec<String> = signals.iter().filter(|s| !quiet(s)).cloned().collect();
+    if out.is_empty() {
+        out.extend(signals.iter().take(1).cloned());
+    }
+    out.truncate(n);
+    out
 }
