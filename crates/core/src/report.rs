@@ -87,6 +87,11 @@ pub struct ArtifactRow {
     pub observed_at: u64,
     pub confidence: Confidence,
     pub source: Source,
+    /// Set for a joined row whose evidence needed a tie-break, e.g. a
+    /// `compose_ambiguous=<n>` note when several worktrees of one project
+    /// contain a compose file naming the same project.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,7 +254,29 @@ pub fn report_with(
     if let Some(reason) = &facts.unavailable {
         notes.push(reason.clone());
     }
-    let join = join_docker_facts(&facts, &projects, &worktree_paths, &project_remotes);
+    // compose_name -> worktree_ids whose worktree contains a compose file
+    // naming it (via its top-level `name:` or the file's directory
+    // basename). Built once per report so `join_one` can match a
+    // `com.docker.compose.project` label that names the compose project
+    // rather than the discovered project/repo name (#28).
+    let mut compose_index: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (path, worktree_id) in &worktree_paths {
+        for name in crate::compose::discover_candidate_names(path) {
+            compose_index
+                .entry(name)
+                .or_default()
+                .push(worktree_id.clone());
+        }
+    }
+
+    let join = join_docker_facts(
+        &facts,
+        &projects,
+        &worktree_paths,
+        &project_remotes,
+        &compose_index,
+    );
     for (worktree_id, mut rows) in join.rows_by_worktree {
         for project in &mut projects {
             for worktree in &mut project.worktrees {
@@ -348,26 +375,44 @@ enum JoinOutcome {
     Joined {
         worktree_id: String,
         confidence: Confidence,
+        /// The join rule that matched, used as the artifact row's
+        /// `Source.tool` (`docker.<rule>`) so different evidence stays
+        /// distinguishable after the fact.
+        rule: &'static str,
+        /// Set when the rule needed a tie-break, e.g.
+        /// `compose_ambiguous=<n>` when several worktrees of one project
+        /// each contain a compose file naming the same project.
+        note: Option<String>,
     },
     Unowned {
         note: Option<String>,
     },
 }
 
-/// Applies the R5 join rules, explicit evidence only:
+/// Applies the R5 join rules plus the #28 compose-file-name rule,
+/// explicit evidence only:
 /// 1. `com.docker.compose.project` label == a discovered project name:
-///    join that project's main worktree, High confidence. A compose
-///    project name frequently differs from the repo name (e.g.
-///    `hiphi-staging` for a `hiphi-relay`/`hiphi-authorizer` checkout),
-///    so when the label is present but matches no discovered project, it
-///    is recorded as a `compose_project=<name>` note instead of being
-///    silently dropped -- a later slice can group by it even when this
-///    slice can't attribute it.
-/// 2. Any label whose value is an absolute path inside a discovered
+///    join that project's main worktree, High confidence.
+/// 2. Otherwise, `com.docker.compose.project` label == a candidate name
+///    (`name:` value or containing directory basename) read from a
+///    compose file inside a discovered worktree: join that worktree,
+///    High confidence, rule `compose_file_name`. A compose project name
+///    frequently differs from the repo name (e.g. `hiphi-staging` for a
+///    `hiphi-relay`/`hiphi-authorizer` checkout), which is exactly the
+///    case rule 1 misses. If several worktrees of one project each
+///    contain a matching compose file, a `com.docker.compose.project.working_dir`
+///    label pointing at one of them breaks the tie; otherwise the
+///    project's Main worktree is used and a `compose_ambiguous=<n>` note
+///    is attached. If the label matches neither a discovered project
+///    name nor any compose-file candidate, it is recorded as a
+///    `compose_project=<name>` note instead of being silently dropped --
+///    a later slice can group by it even when this slice can't
+///    attribute it.
+/// 3. Any label whose value is an absolute path inside a discovered
 ///    worktree (this covers `com.docker.compose.project.working_dir` as
 ///    well as any other path-shaped label): join that worktree, High
 ///    confidence.
-/// 3. `org.opencontainers.image.source`, normalized, matches a project's
+/// 4. `org.opencontainers.image.source`, normalized, matches a project's
 ///    normalized git remote: join that project's main worktree, Medium
 ///    confidence. A non-matching source is recorded as a
 ///    `base_image_source=<url>` note, never used to attribute -- this is
@@ -376,13 +421,14 @@ enum JoinOutcome {
 ///    `image.source` legitimately points at an upstream base image
 ///    (e.g. `linuxcontainers/alpine`) it was built FROM, not the project
 ///    that built it.
-/// 4. Otherwise: unowned, reason `DockerNoJoin`. Name similarity to a
+/// 5. Otherwise: unowned, reason `DockerNoJoin`. Name similarity to a
 ///    project is never evidence for any of these rules.
 fn join_one(
     candidate: &JoinCandidate,
     projects: &[ProjectRow],
     worktree_paths: &[(PathBuf, String)],
     project_remotes: &std::collections::HashMap<String, String>,
+    compose_index: &std::collections::HashMap<String, Vec<String>>,
 ) -> JoinOutcome {
     fn main_worktree_id(project: &ProjectRow) -> Option<String> {
         project
@@ -393,22 +439,92 @@ fn join_one(
             .map(|w| w.worktree_id.clone())
     }
 
+    fn project_for_worktree<'a>(
+        projects: &'a [ProjectRow],
+        worktree_id: &str,
+    ) -> Option<&'a ProjectRow> {
+        projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| w.worktree_id == worktree_id))
+    }
+
     let mut notes: Vec<String> = Vec::new();
 
     if let Some(project_label) = candidate.labels.get("com.docker.compose.project") {
-        match projects
+        // Rule 1: label matches a discovered project's own name.
+        if let Some(worktree_id) = projects
             .iter()
             .find(|p| &p.name == project_label)
-            .and_then(|p| main_worktree_id(p).map(|id| (p, id)))
+            .and_then(main_worktree_id)
         {
-            Some((_, worktree_id)) => {
+            return JoinOutcome::Joined {
+                worktree_id,
+                confidence: Confidence::High,
+                rule: "compose_project_label",
+                note: None,
+            };
+        }
+
+        // Rule 2 (#28): label matches a compose file's `name:` value or
+        // directory basename found inside a discovered worktree.
+        if let Some(worktree_ids) = compose_index.get(project_label)
+            && !worktree_ids.is_empty()
+        {
+            // The working_dir label is where compose was invoked from
+            // (e.g. a `deploy/` subdirectory), not necessarily the
+            // worktree root itself, so this matches by containment
+            // (deepest worktree root that contains it) rather than exact
+            // equality -- the same rule rule 3 below uses for path-shaped
+            // labels in general.
+            let working_dir = candidate
+                .labels
+                .get("com.docker.compose.project.working_dir")
+                .map(Path::new);
+            let tie_broken = working_dir.and_then(|wd| {
+                worktree_paths
+                    .iter()
+                    .filter(|(p, pid)| wd.starts_with(p) && worktree_ids.contains(pid))
+                    .max_by_key(|(p, _)| p.as_os_str().len())
+                    .map(|(_, pid)| pid)
+            });
+
+            if let Some(worktree_id) = tie_broken {
                 return JoinOutcome::Joined {
-                    worktree_id,
+                    worktree_id: worktree_id.clone(),
                     confidence: Confidence::High,
+                    rule: "compose_file_name",
+                    note: None,
                 };
             }
-            None => notes.push(format!("compose_project={project_label}")),
+
+            let mut unique_ids: Vec<&String> = worktree_ids.iter().collect();
+            unique_ids.sort();
+            unique_ids.dedup();
+
+            if let [only] = unique_ids.as_slice() {
+                return JoinOutcome::Joined {
+                    worktree_id: (*only).clone(),
+                    confidence: Confidence::High,
+                    rule: "compose_file_name",
+                    note: None,
+                };
+            }
+
+            if let Some(main_worktree_id) = unique_ids
+                .first()
+                .and_then(|id| project_for_worktree(projects, id))
+                .and_then(main_worktree_id)
+            {
+                return JoinOutcome::Joined {
+                    worktree_id: main_worktree_id,
+                    confidence: Confidence::High,
+                    rule: "compose_file_name",
+                    note: Some(format!("compose_ambiguous={}", unique_ids.len())),
+                };
+            }
         }
+
+        notes.push(format!("compose_project={project_label}"));
     }
 
     for value in candidate.labels.values() {
@@ -424,6 +540,8 @@ fn join_one(
             return JoinOutcome::Joined {
                 worktree_id: worktree_id.clone(),
                 confidence: Confidence::High,
+                rule: "working_dir_path",
+                note: None,
             };
         }
     }
@@ -441,6 +559,8 @@ fn join_one(
                 return JoinOutcome::Joined {
                     worktree_id,
                     confidence: Confidence::Medium,
+                    rule: "image_source",
+                    note: None,
                 };
             }
             None => notes.push(format!("base_image_source={source}")),
@@ -460,6 +580,7 @@ fn join_docker_facts(
     projects: &[ProjectRow],
     worktree_paths: &[(PathBuf, String)],
     project_remotes: &std::collections::HashMap<String, String>,
+    compose_index: &std::collections::HashMap<String, Vec<String>>,
 ) -> DockerJoinResult {
     let mut result = DockerJoinResult {
         rows_by_worktree: std::collections::HashMap::new(),
@@ -503,12 +624,25 @@ fn join_docker_facts(
 
     let observed_at = crate::entities::now();
     for candidate in candidates {
-        match join_one(&candidate, projects, worktree_paths, project_remotes) {
+        match join_one(
+            &candidate,
+            projects,
+            worktree_paths,
+            project_remotes,
+            compose_index,
+        ) {
             JoinOutcome::Joined {
                 worktree_id,
                 confidence,
+                rule,
+                note,
             } => {
                 result.attributed_bytes += candidate.unique_bytes;
+                let source = if rule == "compose_file_name" {
+                    Source::new(format!("docker.{rule}"))
+                } else {
+                    Source::new("docker.system_df")
+                };
                 result
                     .rows_by_worktree
                     .entry(worktree_id)
@@ -521,7 +655,8 @@ fn join_docker_facts(
                         regrowth_count: 0,
                         observed_at,
                         confidence,
-                        source: Source::new("docker.system_df"),
+                        source,
+                        note,
                     });
             }
             JoinOutcome::Unowned { note } => {

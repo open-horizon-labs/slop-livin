@@ -633,6 +633,7 @@ mod tests {
                     observed_at: 0,
                     confidence: Confidence::High,
                     source: Source::new("test"),
+                    note: None,
                 }],
                 signals: vec![],
             }],

@@ -4,6 +4,7 @@
 //! authority and must re-observe every predicate before changing the filesystem.
 
 pub mod attribution;
+pub mod compose;
 pub mod docker;
 pub mod entities;
 pub mod execution;

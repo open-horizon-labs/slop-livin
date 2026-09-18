@@ -291,6 +291,47 @@ fn report_matches_fixture_and_reconciles() {
         slop_livin_core::entities::Confidence::High
     );
 
+    // 9999 (#28): compose-project label matches no discovered project's
+    // own name, but the checkout root has a `compose.yaml` naming
+    // `fixture-stack` -> joined, High, rule `compose_file_name`, to the
+    // checkout's main worktree.
+    let compose_name_row = main_worktree
+        .artifacts
+        .iter()
+        .find(|a| {
+            a.path
+                .to_string_lossy()
+                .contains("fixture/compose-file-name-join")
+        })
+        .expect("compose-file-name-joined docker image row");
+    assert_eq!(
+        compose_name_row.confidence,
+        slop_livin_core::entities::Confidence::High
+    );
+    assert_eq!(compose_name_row.source.tool, "docker.compose_file_name");
+    assert!(
+        !fx.compose_project_name.is_empty() && fx.compose_file.exists(),
+        "fixture must write a compose.yaml naming the project for this rule to match"
+    );
+
+    let compose_name_volume_row = main_worktree
+        .artifacts
+        .iter()
+        .find(|a| a.path.to_string_lossy() == "fixture-stack-compose-name-volume")
+        .expect("compose-file-name-joined volume row");
+    assert_eq!(
+        compose_name_volume_row.kind,
+        slop_livin_core::report::ArtifactKind::DockerVolume
+    );
+    assert_eq!(
+        compose_name_volume_row.confidence,
+        slop_livin_core::entities::Confidence::High
+    );
+    assert_eq!(
+        compose_name_volume_row.source.tool,
+        "docker.compose_file_name"
+    );
+
     // Docker bytes are tracked separately, never folded into the
     // filesystem walk's reconciliation.
     assert!(r.reconciliation.docker_attributed > 0);
