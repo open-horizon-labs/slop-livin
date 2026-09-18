@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
-    measurement::preregister,
-    report::{render_text, report_with, to_json},
+    render::{render_kinds, render_overview, render_project},
+    report::{report_with, to_json},
     scan::{ScanOptions, observation},
     store::Store,
-    volume::truth,
 };
 use std::path::PathBuf;
 
@@ -22,34 +21,6 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
-    },
-    Pressure {
-        #[arg(long, default_value_t = 10_000_000_000)]
-        floor_bytes: u64,
-    },
-    Candidates {
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
-    ChangedSince {
-        #[arg(long)]
-        seconds: u64,
-    },
-    Measure {
-        #[arg(long, default_value = "first-case-study")]
-        name: String,
-    },
-    Schedule {
-        #[arg(long)]
-        every: Option<u64>,
-        #[arg(long)]
-        off: bool,
-    },
-    Truth {
-        #[arg(long)]
-        attributed: u64,
-        #[arg(long)]
-        reported: u64,
     },
     /// Project x worktree x artifact growth report.
     Report {
@@ -70,6 +41,17 @@ enum Command {
         /// report is read-only and growth/regrowth stay unset.
         #[arg(long)]
         no_observe: bool,
+        /// Drill into one project: worktree -> kind -> path -> bytes ->
+        /// growth -> regrowth -> signals. Text output only.
+        #[arg(long)]
+        project: Option<String>,
+        /// Bytes and count per artifact kind across the root. Text output only.
+        #[arg(long)]
+        kinds: bool,
+        /// Show every project row instead of the default top-N. Text
+        /// output only.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -95,33 +77,6 @@ fn main() -> Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&obs)?);
         }
-        Command::Pressure { floor_bytes } => println!(
-            "{}",
-            serde_json::json!({"tool":"pressure","floor_bytes":floor_bytes,"state":"question","source":"volume"})
-        ),
-        Command::Candidates { root } => println!(
-            "{}",
-            serde_json::json!({"tool":"candidates","root":root,"state":"insufficient-evidence","next_step":"scan"})
-        ),
-        Command::ChangedSince { seconds } => println!(
-            "{}",
-            serde_json::json!({"tool":"changed_since","seconds":seconds,"state":"question"})
-        ),
-        Command::Measure { name } => println!(
-            "{}",
-            serde_json::to_string_pretty(&preregister(name, 30, 10_000_000_000, 1))?
-        ),
-        Command::Schedule { every, off } => println!(
-            "{}",
-            serde_json::json!({"every":every,"off":off,"mode":"refresh-only","state":"explicit"})
-        ),
-        Command::Truth {
-            attributed,
-            reported,
-        } => println!(
-            "{}",
-            serde_json::to_string_pretty(&truth(attributed, reported, vec![]))?
-        ),
         Command::Report {
             root,
             json,
@@ -129,6 +84,9 @@ fn main() -> Result<()> {
             verify_du,
             since,
             no_observe,
+            project,
+            kinds,
+            all,
         } => {
             let store_dir = if no_observe {
                 None
@@ -144,8 +102,18 @@ fn main() -> Result<()> {
             )?;
             if json {
                 println!("{}", to_json(&r)?);
+            } else if let Some(name) = project {
+                match render_project(&r, &name) {
+                    Some(text) => print!("{text}"),
+                    None => {
+                        eprintln!("no project named {name:?} found under {}", root.display());
+                        std::process::exit(1);
+                    }
+                }
+            } else if kinds {
+                print!("{}", render_kinds(&r));
             } else {
-                print!("{}", render_text(&r));
+                print!("{}", render_overview(&r, all, verify_du));
             }
         }
     }

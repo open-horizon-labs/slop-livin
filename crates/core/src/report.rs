@@ -9,8 +9,11 @@ use crate::entities::{Confidence, id_for};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+/// The text renderer lives in `render.rs`; re-exported here so existing
+/// `report::render_text` call sites keep working.
+pub use crate::render::render_text;
 
 /// Where a fact came from (a tool invocation, a filesystem walk, ...).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +202,7 @@ pub fn report_with(
     for project in &mut projects {
         for worktree in &mut project.worktrees {
             crate::attribution::apply_to_worktree(worktree, &mut attribution);
+            worktree.signals = crate::signals::compute_signals(&worktree.path, observed_at);
         }
     }
 
@@ -298,81 +302,4 @@ fn docker_unjoined_images(facts_path: &Path, project_names: &[&str]) -> (Vec<Uno
 
 pub fn to_json(report: &Report) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
-}
-
-pub fn render_text(report: &Report) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "root: {}", report.root.display());
-    let _ = writeln!(out, "observed_at: {}", report.observed_at);
-    let _ = writeln!(out);
-    if report.projects.is_empty() {
-        let _ = writeln!(out, "0 projects discovered under {}", report.root.display());
-        return out;
-    }
-    let _ = writeln!(
-        out,
-        "{:<12} {:<10} {:<10} {:<8} {:<40} {:>12} {:>12} {:>8}",
-        "project", "worktree", "kind", "artifact", "path", "bytes", "growth", "regrowth"
-    );
-    for project in &report.projects {
-        for worktree in &project.worktrees {
-            let kind = match worktree.kind {
-                WorktreeKind::Main => "main",
-                WorktreeKind::Linked => "linked",
-            };
-            for artifact in &worktree.artifacts {
-                let _ = writeln!(
-                    out,
-                    "{:<12} {:<10} {:<10} {:<8} {:<40} {:>12} {:>12} {:>8}",
-                    project.name,
-                    &worktree.worktree_id[..worktree.worktree_id.len().min(10)],
-                    kind,
-                    format!("{:?}", artifact.kind),
-                    artifact.path.display(),
-                    artifact.bytes,
-                    artifact
-                        .growth_bytes
-                        .map(|g| g.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    artifact.regrowth_count,
-                );
-            }
-            if !worktree.signals.is_empty() {
-                let signals = worktree
-                    .signals
-                    .iter()
-                    .map(|s| format!("{}={}", s.name, s.value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(out, "  signals[{}]: {}", worktree.worktree_id, signals);
-            }
-        }
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "{:<40} {:>12} {:<20}",
-        "unowned path/object", "bytes", "reason"
-    );
-    for row in &report.unowned {
-        let _ = writeln!(
-            out,
-            "{:<40} {:>12} {:<20?}",
-            row.path_or_object, row.bytes, row.reason
-        );
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "reconciliation: attributed={} unowned={} walked_total={} du_total={}",
-        report.reconciliation.attributed,
-        report.reconciliation.unowned,
-        report.reconciliation.walked_total,
-        report
-            .reconciliation
-            .du_total
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "n/a".to_string()),
-    );
-    out
 }

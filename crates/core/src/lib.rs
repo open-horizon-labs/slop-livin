@@ -15,8 +15,10 @@ pub mod growth;
 pub mod ledger;
 pub mod measurement;
 pub mod occupancy;
+pub mod render;
 pub mod report;
 pub mod scan;
+pub mod signals;
 pub mod store;
 pub mod volume;
 
