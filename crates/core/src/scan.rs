@@ -43,7 +43,7 @@ pub fn scan(options: &ScanOptions) -> Result<Vec<ScanRow>> {
         let device = fs::metadata(&root)
             .with_context(|| format!("stat {}", root.display()))?
             .dev();
-        walk(&root, device, options, 0, &mut seen, &mut rows)?;
+        walk(&root, device, options, 0, None, &mut seen, &mut rows)?;
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(rows)
@@ -54,6 +54,7 @@ fn walk(
     device: u64,
     options: &ScanOptions,
     depth: usize,
+    inherited_repo: Option<String>,
     seen: &mut HashSet<(u64, u64)>,
     rows: &mut Vec<ScanRow>,
 ) -> Result<u64> {
@@ -71,7 +72,7 @@ fn walk(
     if !meta.is_dir() {
         return Ok(0);
     }
-    let repo = repo_identity(path);
+    let repo = repo_identity(path).or(inherited_repo);
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(_) => {
@@ -99,7 +100,15 @@ fn walk(
     }
     let mut total = 0;
     for entry in entries.flatten() {
-        total += walk(&entry.path(), device, options, depth + 1, seen, rows)?;
+        total += walk(
+            &entry.path(),
+            device,
+            options,
+            depth + 1,
+            repo.clone(),
+            seen,
+            rows,
+        )?;
     }
     rows.push(ScanRow {
         path: path.to_path_buf(),
@@ -139,8 +148,16 @@ pub fn fold_artifacts(rows: &[ScanRow]) -> Vec<Artifact> {
         .into_iter()
         .map(|(path, row)| {
             let kind = classify(&path);
+            let stable_subject = format!(
+                "{}:{:?}:{}",
+                row.repo_root_id.as_deref().unwrap_or("volume"),
+                kind,
+                path.file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("artifact")
+            );
             Artifact {
-                id: id_for(&format!("{}:{:?}", path.display(), kind)),
+                id: id_for(&stable_subject),
                 project_id: row.repo_root_id.clone(),
                 kind: kind.clone(),
                 path: path.clone(),
@@ -215,5 +232,25 @@ mod tests {
         let a = repo_identity(d.path()).unwrap();
         fs::rename(d.path(), d.path().with_extension("moved")).unwrap();
         assert_eq!(a, repo_identity(&d.path().with_extension("moved")).unwrap());
+    }
+
+    #[test]
+    fn nested_rows_carry_repo_identity() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join(".git")).unwrap();
+        fs::create_dir(d.path().join("nested")).unwrap();
+        fs::write(d.path().join("nested/file"), b"x").unwrap();
+        let rows = scan(&ScanOptions {
+            roots: vec![d.path().to_path_buf()],
+            cross_device: false,
+            max_depth: None,
+        })
+        .unwrap();
+        let repo = repo_identity(d.path()).unwrap();
+        assert!(
+            rows.iter()
+                .filter(|r| r.path.starts_with(d.path()))
+                .all(|r| r.repo_root_id.as_deref() == Some(repo.as_str()))
+        );
     }
 }
