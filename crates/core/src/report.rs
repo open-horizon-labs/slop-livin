@@ -92,6 +92,14 @@ pub struct ArtifactRow {
     pub kind: ArtifactKind,
     pub path: PathBuf,
     pub bytes: u64,
+    /// Bytes with hardlinks deduplicated *within this row only* (a
+    /// deterministic per-row figure), unlike `bytes`, where a hardlinked
+    /// inode is charged to whichever row the full walk saw first. The
+    /// incremental path applies `new_local - old_local` to `bytes` so a
+    /// re-sized row never re-charges inodes another row already holds
+    /// (#29). Zero means "not recorded"; readers fall back to `bytes`.
+    #[serde(default)]
+    pub local_bytes: u64,
     pub growth_bytes: Option<i64>,
     pub regrowth_count: u32,
     pub observed_at: u64,
@@ -465,7 +473,7 @@ pub fn report_full(
         observe,
         include_dirs,
         enrich,
-        false,
+        true,
     )
 }
 
@@ -1425,6 +1433,7 @@ fn join_docker_facts(
                         kind: candidate.kind,
                         path: PathBuf::from(candidate.reference),
                         bytes: candidate.unique_bytes,
+                        local_bytes: 0,
                         growth_bytes: None,
                         regrowth_count: 0,
                         observed_at,

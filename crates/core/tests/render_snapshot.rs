@@ -20,6 +20,7 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         kind,
         path: PathBuf::from(path),
         bytes,
+        local_bytes: 0,
         growth_bytes: growth,
         regrowth_count: 0,
         observed_at: 1_000_000,

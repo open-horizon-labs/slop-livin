@@ -676,6 +676,7 @@ mod tests {
             kind: ArtifactKind::DockerImage,
             path: PathBuf::from(reference),
             bytes,
+            local_bytes: 0,
             growth_bytes: None,
             regrowth_count: 0,
             observed_at: 1,

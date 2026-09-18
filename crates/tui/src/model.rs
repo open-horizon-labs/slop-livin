@@ -517,6 +517,7 @@ mod tests {
             kind,
             path: path.into(),
             bytes,
+            local_bytes: 0,
             growth_bytes: None,
             regrowth_count: 0,
             observed_at: 0,

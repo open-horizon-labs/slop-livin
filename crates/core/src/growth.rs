@@ -151,6 +151,7 @@ struct StoredRow {
     kind: String,
     rel_path: String,
     bytes: u64,
+    local_bytes: u64,
     present: bool,
     observed_at: u64,
     regrowth_count: u32,
@@ -166,6 +167,7 @@ fn schema() -> Arc<Schema> {
         Field::new("present", DataType::Boolean, false),
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("regrowth_count", DataType::UInt32, false),
+        Field::new("local_bytes", DataType::UInt64, false),
     ]))
 }
 
@@ -179,6 +181,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
     let present: Vec<bool> = rows.iter().map(|r| r.present).collect();
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
     let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
+    let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -191,6 +194,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(BooleanArray::from(present)),
             Arc::new(UInt64Array::from(observed_at)),
             Arc::new(UInt32Array::from(regrowth)),
+            Arc::new(UInt64Array::from(local_bytes)),
         ],
     )?;
     if let Some(parent) = path.parent() {
@@ -224,6 +228,9 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         let present = downcast_bool(&batch, "present")?;
         let observed_at = downcast_u64(&batch, "observed_at")?;
         let regrowth = downcast_u32(&batch, "regrowth_count")?;
+        // Stores written before #29 have no local_bytes column: fall back
+        // to `bytes` so incremental deltas degrade to the old behavior.
+        let local_bytes = downcast_u64(&batch, "local_bytes").ok();
         for i in 0..batch.num_rows() {
             rows.push(StoredRow {
                 project_id: project_id.value(i).to_string(),
@@ -231,6 +238,11 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
                 kind: kind.value(i).to_string(),
                 rel_path: rel_path.value(i).to_string(),
                 bytes: bytes.value(i),
+                local_bytes: local_bytes
+                    .as_ref()
+                    .map(|c| c.value(i))
+                    .filter(|v| *v != 0)
+                    .unwrap_or_else(|| bytes.value(i)),
                 present: present.value(i),
                 observed_at: observed_at.value(i),
                 regrowth_count: regrowth.value(i),
@@ -314,6 +326,7 @@ struct Observed {
     kind: String,
     rel_path: String,
     bytes: u64,
+    local_bytes: u64,
 }
 
 fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
@@ -340,6 +353,11 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     kind,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
+                    local_bytes: if artifact.local_bytes == 0 {
+                        artifact.bytes
+                    } else {
+                        artifact.local_bytes
+                    },
                 });
             }
         }
@@ -469,11 +487,13 @@ pub fn observe_and_annotate(
                         kind: prev.kind.clone(),
                         rel_path: prev.rel_path.clone(),
                         bytes: prev.bytes,
+                        local_bytes: prev.local_bytes,
                         present: prev.present,
                         observed_at: prev.observed_at,
                         regrowth_count: prev.regrowth_count,
                     });
                     prev.bytes = obs.bytes;
+                    prev.local_bytes = obs.local_bytes;
                     prev.present = true;
                     prev.observed_at = observed_at;
                     prev.regrowth_count = regrowth_count;
@@ -496,6 +516,7 @@ pub fn observe_and_annotate(
                         kind: obs.kind.clone(),
                         rel_path: obs.rel_path.clone(),
                         bytes: obs.bytes,
+                        local_bytes: obs.local_bytes,
                         present: true,
                         observed_at,
                         regrowth_count: 0,
@@ -516,6 +537,7 @@ pub fn observe_and_annotate(
                 kind: row.kind.clone(),
                 rel_path: row.rel_path.clone(),
                 bytes: row.bytes,
+                local_bytes: row.local_bytes,
                 present: row.present,
                 observed_at: row.observed_at,
                 regrowth_count: row.regrowth_count,
@@ -1417,6 +1439,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
                 kind: parse_artifact_kind(&row.kind),
                 path: PathBuf::from(&row.rel_path),
                 bytes: row.bytes,
+                local_bytes: row.local_bytes,
                 growth_bytes: None,
                 regrowth_count: row.regrowth_count,
                 observed_at: row.observed_at,
@@ -1496,6 +1519,18 @@ pub struct TrackedWalk {
 /// implicated by one replay.
 const TOO_MANY_CHANGES_FRACTION: f64 = 0.20;
 
+/// The [`RefreshRefusal::TooSoon`] floor, in seconds. Overridable via
+/// `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so a test driving a canned
+/// [`crate::fs_events::FsEventsSource`] -- which has no real FSEvents
+/// log-persistence lag to protect against -- can set it to `0` and reach
+/// the incremental path without a real `sleep`.
+fn min_interval_secs() -> u64 {
+    std::env::var("SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
 /// Entry point for `report::report_full`: replaces a plain call to
 /// `walk::discover_and_attribute` with one that tries FSEvents first and
 /// falls back to a full walk on any refusal, `force_full`, or a missing
@@ -1561,8 +1596,46 @@ pub fn observe_tracked_with_source(
     // into the caller's original root form immediately after the
     // replay, so every path downstream of this point stays in the one
     // form the rest of the crate already assumes.
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let prev_state = read_fsevents_state(&dir);
+
+    // `force_full` (`--full`, and every pre-#29 caller: `report_full`,
+    // `report_with*`, the MCP surface, every test that predates this
+    // feature) must never touch the FSEvents source at all -- not the
+    // real one (this crate runs alongside dozens of other concurrent
+    // test/CLI processes on a shared machine, where `fseventsd` itself
+    // can become the bottleneck under combined load; a `source.replay`
+    // call that is merely slow under contention still burns wall time
+    // this path has promised never to pay), and not even a canned one in
+    // tests (there is nothing to answer). Skipping the call entirely,
+    // rather than calling it and discarding the answer, is what actually
+    // keeps this path load-free instead of just "load but ignore".
+    if force_full {
+        let result = full_walk(root, observed_at, large_file_min_bytes, "full_forced")?;
+        if observe {
+            write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
+            write_unowned(&dir, &result.attribution.unowned)?;
+            // The stored FSEvents id/device is deliberately left as-is: a
+            // forced full walk has nothing new to report there (no
+            // replay ran), and an older stored id just means the next
+            // real incremental attempt replays a larger, still-correct
+            // window rather than a wrong one.
+        }
+        return Ok(result);
+    }
+
+    // FSEvents always answers in canonical paths (ask about `/tmp/x` on
+    // macOS and it replies about `/private/tmp/x`); everything else this
+    // module stores or matches against (topology, artifact/dir/file
+    // rows) is expressed in whatever form the caller's `root` already
+    // was, unchanged from every walk before this feature existed. Rather
+    // than canonicalize the whole walk (which would change every path
+    // this crate has ever returned whenever the caller's root sits under
+    // a symlink -- macOS's own default temp dir is exactly this shape),
+    // [`rebase_from_canonical`] translates each `changed_dirs` entry back
+    // into the caller's original root form immediately after the
+    // replay, so every path downstream of this point stays in the one
+    // form the rest of the crate already assumes.
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // FSEvents' own persisted log can lag a write by longer than the
     // growth store's whole-second timestamp granularity, so a replay
     // requested this soon after the baseline cannot yet distinguish
@@ -1572,10 +1645,12 @@ pub fn observe_tracked_with_source(
     // legitimately report zero changes for a write that already
     // happened. Below this floor, skip straight to a full walk rather
     // than trust an answer FSEvents itself cannot yet vouch for.
-    const MIN_INTERVAL_SECS: u64 = 3;
+    // Overridable via `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so tests
+    // that use a canned source (which has no real log-lag to protect
+    // against) can set it to `0` and skip real sleeps entirely.
     let too_soon = prev_state
         .last_observed_at
-        .is_some_and(|t| observed_at.saturating_sub(t) < MIN_INTERVAL_SECS);
+        .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
     let mut plan = source.replay(&FsEventsRequest {
         root: canonical_root.clone(),
         since: prev_state,
@@ -1588,9 +1663,7 @@ pub fn observe_tracked_with_source(
 
     let prev_topology = read_topology(&dir);
 
-    let result = if force_full {
-        full_walk(root, observed_at, large_file_min_bytes, "full_forced")?
-    } else if too_soon {
+    let result = if too_soon {
         full_walk(
             root,
             observed_at,
@@ -1843,8 +1916,20 @@ fn apply_incremental(
         let new_row = crate::walk::resize_artifact(root_path, kind.clone(), observed_at);
         if let Some(rows) = attribution.artifacts_by_worktree.get_mut(worktree_id) {
             if let Some(existing) = rows.iter_mut().find(|r| &r.path == root_path) {
-                total_delta += new_row.bytes as i64 - existing.bytes as i64;
-                *existing = new_row;
+                // Hardlink-safe: the full walk charged shared inodes to
+                // whichever row saw them first, so compare per-row local
+                // figures and apply that delta to the globally-deduped
+                // `bytes` instead of replacing it with a re-count (#29).
+                let old_local = if existing.local_bytes == 0 {
+                    existing.bytes
+                } else {
+                    existing.local_bytes
+                };
+                let delta = new_row.local_bytes as i64 - old_local as i64;
+                let mut merged = new_row;
+                merged.bytes = (existing.bytes as i64 + delta).max(0) as u64;
+                total_delta += delta;
+                *existing = merged;
             } else {
                 total_delta += new_row.bytes as i64;
                 rows.push(new_row);
@@ -1880,30 +1965,73 @@ fn apply_incremental(
         let Some(root) = worktree_root.get(worktree_id) else {
             continue;
         };
-        let removed_total: u64 = attribution
-            .artifacts_by_worktree
-            .get(worktree_id)
-            .map(|rows| rows.iter().map(|r| r.bytes).sum())
-            .unwrap_or(0);
         let fresh = crate::walk::attribute_one_worktree(
             root,
             &all_worktree_refs,
             observed_at,
             large_file_min_bytes,
         );
-        let added_total: u64 = fresh
+        // Merge per row by (kind, path): a row present before and after
+        // keeps its globally-deduped `bytes` adjusted by the change in its
+        // own per-row local figure; a brand-new row starts from its local
+        // figure; a vanished row is subtracted in full (#29 hardlinks).
+        let old_rows = attribution
+            .artifacts_by_worktree
+            .remove(worktree_id)
+            .unwrap_or_default();
+        let mut merged: Vec<ArtifactRow> = Vec::new();
+        let fresh_rows = fresh
             .artifacts_by_worktree
             .get(worktree_id)
-            .map(|rows| rows.iter().map(|r| r.bytes).sum())
-            .unwrap_or(0);
-        total_delta += added_total as i64 - removed_total as i64;
-
-        if let Some(rows) = fresh.artifacts_by_worktree.get(worktree_id) {
+            .cloned()
+            .unwrap_or_default();
+        let mut matched = vec![false; old_rows.len()];
+        for mut nr in fresh_rows {
+            let pos = old_rows
+                .iter()
+                .position(|o| o.kind == nr.kind && o.path == nr.path);
+            match pos {
+                Some(i) => {
+                    matched[i] = true;
+                    let o = &old_rows[i];
+                    let old_local = if o.local_bytes == 0 {
+                        o.bytes
+                    } else {
+                        o.local_bytes
+                    };
+                    let new_local = if nr.local_bytes == 0 {
+                        nr.bytes
+                    } else {
+                        nr.local_bytes
+                    };
+                    let delta = new_local as i64 - old_local as i64;
+                    nr.bytes = (o.bytes as i64 + delta).max(0) as u64;
+                    nr.regrowth_count = o.regrowth_count;
+                    total_delta += delta;
+                }
+                None => {
+                    let local = if nr.local_bytes == 0 {
+                        nr.bytes
+                    } else {
+                        nr.local_bytes
+                    };
+                    nr.bytes = local;
+                    total_delta += local as i64;
+                }
+            }
+            merged.push(nr);
+        }
+        for (i, o) in old_rows.iter().enumerate() {
+            if !matched[i] {
+                total_delta -= o.bytes as i64;
+            }
+        }
+        if merged.is_empty() {
+            attribution.artifacts_by_worktree.remove(worktree_id);
+        } else {
             attribution
                 .artifacts_by_worktree
-                .insert(worktree_id.clone(), rows.clone());
-        } else {
-            attribution.artifacts_by_worktree.remove(worktree_id);
+                .insert(worktree_id.clone(), merged);
         }
         // Only this worktree's own dir/file rows come out of `fresh`;
         // any nested worktree's rows the walk happened to also produce
@@ -1991,6 +2119,7 @@ mod tests {
                     kind: ArtifactKind::DependencyTree,
                     path: worktree_root.join("node_modules"),
                     bytes,
+                    local_bytes: 0,
                     growth_bytes: None,
                     regrowth_count: 0,
                     observed_at: 0,
