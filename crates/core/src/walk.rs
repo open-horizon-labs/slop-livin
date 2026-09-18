@@ -413,6 +413,7 @@ pub fn attribute_parallel(
                 path,
                 bytes,
                 local_bytes,
+                track: None,
                 growth_bytes: None,
                 regrowth_count: 0,
                 observed_at,
@@ -548,6 +549,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             (worktree_id.clone(), rel_path.clone()),
             DirRollup {
                 worktree_id,
+                track: None,
                 rel_path,
                 parent_rel_path,
                 // Bottom-up aggregation into `allocated_total` happens
@@ -738,6 +740,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     path: group.root_path.clone(),
                     bytes,
                     local_bytes: group.local_total.load(Ordering::Acquire),
+                    track: None,
                     growth_bytes: None,
                     regrowth_count: 0,
                     observed_at: shared.observed_at,
@@ -844,6 +847,7 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
         path: root_path.to_path_buf(),
         bytes,
         local_bytes: bytes,
+        track: None,
         growth_bytes: None,
         regrowth_count: 0,
         observed_at,

@@ -10,7 +10,7 @@
 use gix::bstr::ByteSlice;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrackState {
     /// At least one path here is in git's index.
     Tracked,

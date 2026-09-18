@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use slop_livin_core::filter;
 use slop_livin_core::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
 use slop_livin_core::growth::{DEFAULT_SINCE, load_config, parse_duration_secs};
-use slop_livin_core::report::{ArtifactKind, Report, UnownedReason, report_with};
+use slop_livin_core::report::{ArtifactKind, Report, UnownedReason};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -18,13 +18,51 @@ fn slop_livin_dir() -> PathBuf {
 }
 
 fn run_report(root: &str, since: Option<&str>) -> Result<Report> {
-    report_with(
+    run_report_dirs(root, since, false)
+}
+
+fn run_report_dirs(root: &str, since: Option<&str>, dirs: bool) -> Result<Report> {
+    slop_livin_core::report::report_full_mode(
         &PathBuf::from(root),
         None,
         false,
         Some(&slop_livin_dir()),
         since,
+        true,
+        dirs,
+        false,
+        false,
     )
+}
+
+/// History the store holds for `root`'s volume, and the growth window this
+/// call can honestly honor: the asked window, or the history if shorter.
+fn history_block(root: &str, since: Option<&str>) -> Value {
+    let now = slop_livin_core::entities::now();
+    let history = slop_livin_core::growth::history_span_for_root(
+        &slop_livin_dir(),
+        &PathBuf::from(root),
+        now,
+    );
+    let asked = since.and_then(slop_livin_core::growth::parse_duration_secs);
+    let effective = match (asked, history) {
+        (Some(a), Some(h)) => Some(a.min(h)),
+        (Some(a), None) => Some(a),
+        (None, h) => h,
+    };
+    json!({
+        "history_secs": history,
+        "asked_window_secs": asked,
+        "effective_window_secs": effective,
+        "note": match (asked, history) {
+            (Some(a), Some(h)) if a > h => Some(format!(
+                "asked for {}s of growth but the store holds {}s of observations; growth is reported over {}s",
+                a, h, h
+            )),
+            (_, None) => Some("no observations yet: growth cannot be reported".to_string()),
+            _ => None,
+        },
+    })
 }
 
 /// The `since` window this call actually used: the caller's explicit
@@ -91,8 +129,9 @@ fn tool_report(params: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .map(String::from);
     let view = args.get("view").and_then(Value::as_str).map(String::from);
+    let dirs = args.get("dirs").and_then(Value::as_bool).unwrap_or(false);
 
-    let r = run_report(&root, since.as_deref())?;
+    let r = run_report_dirs(&root, since.as_deref(), dirs)?;
 
     if let Some(view) = view.as_deref() {
         let payload = view_payload(&r, view, project.as_deref());
@@ -120,6 +159,24 @@ fn tool_report(params: &Value) -> Result<Value> {
             .filter(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()))
             .collect();
         value["projects"] = json!(filtered);
+        // Scope the dir rollups to the same project's worktrees.
+        if let Some(dirs) = value
+            .get("dirs_by_worktree")
+            .and_then(Value::as_object)
+            .cloned()
+        {
+            let keep: std::collections::HashSet<String> = r
+                .projects
+                .iter()
+                .filter(|p| {
+                    p.name == name || slop_livin_core::render::project_display_name(p) == name
+                })
+                .flat_map(|p| p.worktrees.iter().map(|w| w.worktree_id.clone()))
+                .collect();
+            let scoped: serde_json::Map<String, Value> =
+                dirs.into_iter().filter(|(k, _)| keep.contains(k)).collect();
+            value["dirs_by_worktree"] = Value::Object(scoped);
+        }
     }
     Ok(value)
 }
@@ -369,6 +426,7 @@ fn tool_list_projects(params: &Value) -> Result<Value> {
             }
             json!({
                 "name": p.name,
+                "display_name": slop_livin_core::render::project_display_name(p),
                 "project_id": p.project_id,
                 "bytes": bytes,
                 "growth_bytes": growth,
@@ -479,6 +537,7 @@ fn tool_what_grew(params: &Value) -> Result<Value> {
             "observed_at": r.observed_at,
             "since": effective_since(since.as_deref()),
             "index_refreshed": true,
+            "history": history_block(&root, since.as_deref()),
         },
     }))
 }
@@ -596,7 +655,8 @@ fn tool_propose(params: &Value) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
-    let r = run_report(root, since.as_deref())?;
+    // Dir rollups so a Source directory can be planned by path.
+    let r = run_report_dirs(root, since.as_deref(), true)?;
     let plan = slop_livin_core::actions::propose(&r, filter.as_ref(), &paths, "agent:mcp")?;
     slop_livin_core::actions::save_plan(&slop_livin_dir(), &plan)?;
     let mut v = serde_json::to_value(&plan)?;
@@ -653,7 +713,8 @@ fn main() -> Result<()> {
                             "root":{"type":"string","description":"Root directory to report on (default: '.')"},
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"},
                             "project":{"type":"string","description":"Scope the report to one project by name"},
-                            "view":{"type":"string","description":"Named view instead of the full structure: worktrees, builds, deps, docker, kinds, unowned, reconciliation"}
+                            "view":{"type":"string","description":"Named view instead of the full structure: worktrees, builds, deps, docker, kinds, unowned, reconciliation"},
+                            "dirs":{"type":"boolean","description":"Include per-directory rollups under each worktree's Source tree (dirs_by_worktree), each with its git tracking status"}
                         }}
                     },
                     {
@@ -683,7 +744,7 @@ fn main() -> Result<()> {
                     },
                     {
                         "name":"propose",
-                        "description":"Build a plan from report rows: folded artifact rows only (build outputs, dependency trees, caches), each with project, worktree, kind, bytes, growth, regrowth, recovery contract and signals. Deletes nothing. Returns state awaiting-authorization and the exact command a human runs to authorize. Checkouts, worktrees, .git, Source trees, unowned paths and Docker objects cannot be planned.",
+                        "description":"Build a plan from report rows: any path in the report — artifact rows, Source directories (with dirs:true), linked worktrees (verb remove-worktree) and whole checkouts (verb archive). Every unit carries project, worktree, kind, bytes, growth, recovery, signals, git tracking status and warnings (dirty, unpushed, untracked content, no remote, git store) — stated, never enforced. Deletes nothing. Returns awaiting-authorization and the exact command a human runs; the human sees the warnings when approving. Docker objects cannot be planned (no removal exists).",
                         "inputSchema":{"type":"object","required":["root"],"properties":{
                             "root":{"type":"string","description":"Root directory the plan is scoped to"},
                             "since":{"type":"string","description":"Growth baseline window used for the evidence, e.g. '7d'"},
@@ -772,6 +833,7 @@ mod tests {
             path: PathBuf::from(reference),
             bytes,
             local_bytes: 0,
+            track: None,
             growth_bytes: None,
             regrowth_count: 0,
             observed_at: 1,

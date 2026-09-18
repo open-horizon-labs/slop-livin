@@ -63,7 +63,17 @@ pub struct PlanUnit {
     pub merge_complete: bool,
     /// Rendered signal values of the owning worktree at proposal time.
     pub signals: Vec<String>,
+    /// `delete` (artifact or Source directory), `remove-worktree` (linked
+    /// worktree), `archive` (whole checkout).
     pub verb: String,
+    /// git tracking status of the path, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<crate::ignore::TrackState>,
+    /// Facts the human must see before authorizing (dirty, unpushed,
+    /// untracked content, no remote, git store). Stated, never enforced —
+    /// the same line the TUI shows on its confirm prompt.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,17 +146,16 @@ pub fn list_plans(dir: &Path) -> Result<Vec<Plan>> {
     Ok(out)
 }
 
-/// The one rule about what may be acted on: a folded artifact row of a
-/// rebuildable kind. Everything else returns the fact that refuses it.
+/// What may be planned: anything with a path on this filesystem. The
+/// one refusal is a Docker object, for which no removal exists yet —
+/// marking one would be a lie. Everything else is the human's call, made
+/// with the unit's `warnings` in front of them.
 pub fn refusal_for_kind(kind: &ArtifactKind) -> Option<&'static str> {
     match kind {
-        ArtifactKind::BuildOutput | ArtifactKind::DependencyTree | ArtifactKind::Cache => None,
-        ArtifactKind::Git => Some("a .git object store is irrecoverable: leave"),
-        ArtifactKind::Source => Some("a Source tree is not an artifact: not actionable"),
         ArtifactKind::DockerImage | ArtifactKind::DockerBuildCache | ArtifactKind::DockerVolume => {
-            Some("docker removal not available yet (no daemon-side sink recheck)")
+            Some("docker removal not available yet (no implementation)")
         }
-        ArtifactKind::Loose | ArtifactKind::Unknown => Some("unclassified path: not actionable"),
+        _ => None,
     }
 }
 
@@ -154,8 +163,56 @@ fn recovery_for(kind: &ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::DependencyTree => "network_fetch",
         ArtifactKind::BuildOutput | ArtifactKind::Cache => "local_rebuild",
-        _ => "irrecoverable",
+        ArtifactKind::Git => "irrecoverable",
+        ArtifactKind::Source | ArtifactKind::Loose | ArtifactKind::Unknown => "depends: see track",
+        _ => "unknown",
     }
+}
+
+/// The facts a human weighs before authorizing a unit — the same line the
+/// TUI puts on its confirm prompt.
+fn warnings_for(wt: &WorktreeRow, a: &ArtifactRow, whole: Option<&ProjectRow>) -> Vec<String> {
+    let mut w = Vec::new();
+    match a.track {
+        Some(crate::ignore::TrackState::Untracked) => {
+            w.push("untracked: in no version control and under no ignore rule".into())
+        }
+        Some(crate::ignore::TrackState::Tracked) if a.kind == ArtifactKind::Source => {
+            w.push("tracked source".into())
+        }
+        _ => {}
+    }
+    if a.kind == ArtifactKind::Git {
+        w.push("git object store: history goes with it".into());
+    }
+    if let Some(p) = whole {
+        // Whole-worktree/checkout unit: the worktree's own facts apply.
+        for sig in &wt.signals {
+            match (sig.name.as_str(), sig.value.as_str()) {
+                ("dirty", "dirty") => w.push("dirty".into()),
+                ("unpushed", v) if v != "0 unpushed" => w.push(v.to_string()),
+                ("locked", "locked") => w.push("locked".into()),
+                _ => {}
+            }
+        }
+        if wt.kind != crate::report::WorktreeKind::Linked {
+            if p.remote.is_none() {
+                w.push("no remote to restore from".into());
+            }
+            for (path, bytes) in crate::ignore::untracked_content(&wt.path, 3, 100_000) {
+                let rel = path
+                    .strip_prefix(&wt.path)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                w.push(format!(
+                    "{rel} untracked {}",
+                    crate::render::human_bytes_pub(bytes)
+                ));
+            }
+        }
+    }
+    w
 }
 
 fn worktree_merge_complete(wt: &WorktreeRow) -> bool {
@@ -184,10 +241,14 @@ pub fn propose(
     for project in &report.projects {
         for wt in &project.worktrees {
             for a in &wt.artifacts {
+                // A Source row shares its path with the worktree root; when
+                // that exact path is asked for, the human means the whole
+                // worktree/checkout (handled below with its own verb).
+                let is_worktree_root = a.kind == ArtifactKind::Source && a.path == wt.path;
                 let wanted = if paths.is_empty() {
                     filter.is_none_or(|f| f.matches_artifact(project, a))
                 } else {
-                    paths.iter().any(|p| p == &a.path)
+                    !is_worktree_root && paths.iter().any(|p| p == &a.path)
                 };
                 if !wanted {
                     continue;
@@ -205,17 +266,41 @@ pub fn propose(
             }
         }
     }
+    // Paths that name a worktree/checkout root or a Source directory.
     for p in paths {
-        if !units.iter().any(|u| &u.path == p) && !refused.iter().any(|r| &r.path == p) {
+        if units.iter().any(|u| &u.path == p) || refused.iter().any(|r| &r.path == p) {
+            continue;
+        }
+        let mut found = false;
+        'outer: for project in &report.projects {
+            for wt in &project.worktrees {
+                if &wt.path == p {
+                    units.push(unit_from_worktree(project, wt));
+                    found = true;
+                    break 'outer;
+                }
+                if let Some(dirs) = report
+                    .dirs_by_worktree
+                    .as_ref()
+                    .and_then(|m| m.get(&wt.worktree_id))
+                    && let Some(d) = dirs.iter().find(|d| wt.path.join(&d.rel_path) == *p)
+                {
+                    units.push(unit_from_dir(project, wt, d));
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !found {
             refused.push(Refused {
                 path: p.clone(),
-                cause: "not an artifact row in this report (worktrees, unowned paths and Docker objects are not plannable)".into(),
+                cause: "not a path in this report (artifact, Source directory, worktree or checkout); unowned paths and Docker objects are not plannable".into(),
             });
         }
     }
     if units.is_empty() {
         bail!(
-            "nothing to propose: no actionable artifact rows matched{}",
+            "nothing to propose: no plannable rows matched{}",
             if refused.is_empty() {
                 String::new()
             } else {
@@ -268,7 +353,81 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         merge_complete: worktree_merge_complete(wt),
         signals: signal_strings(wt),
         verb: "delete".into(),
+        track: a.track,
+        warnings: warnings_for(wt, a, None),
     }
+}
+
+/// A whole worktree (linked → `remove-worktree`) or checkout (→ `archive`)
+/// as one unit, when a proposer asks for the worktree path itself.
+fn unit_from_worktree(project: &ProjectRow, wt: &WorktreeRow) -> PlanUnit {
+    let bytes: u64 = wt.artifacts.iter().map(|a| a.bytes).sum();
+    let linked = wt.kind == crate::report::WorktreeKind::Linked;
+    let pseudo = ArtifactRow {
+        kind: ArtifactKind::Source,
+        path: wt.path.clone(),
+        bytes,
+        local_bytes: bytes,
+        track: None,
+        growth_bytes: wt
+            .artifacts
+            .iter()
+            .filter_map(|a| a.growth_bytes)
+            .reduce(|x, y| x + y),
+        regrowth_count: 0,
+        observed_at: wt
+            .artifacts
+            .first()
+            .map(|a| a.observed_at)
+            .unwrap_or_else(now),
+        confidence: crate::entities::Confidence::High,
+        source: crate::report::Source::new("filesystem.walk"),
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+    };
+    let mut u = unit_from_row(project, wt, &pseudo);
+    u.rel_path = ".".into();
+    u.verb = if linked { "remove-worktree" } else { "archive" }.into();
+    u.recovery = if linked {
+        "git worktree add again from the same repo".into()
+    } else {
+        project
+            .remote
+            .as_ref()
+            .map(|r| format!("git clone {r}"))
+            .unwrap_or_else(|| "none: no remote".into())
+    };
+    u.warnings = warnings_for(wt, &pseudo, Some(project));
+    u
+}
+
+/// A Source directory (from the dir rollups) as one deletable unit.
+fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirRollup) -> PlanUnit {
+    let pseudo = ArtifactRow {
+        kind: ArtifactKind::Unknown,
+        path: wt.path.join(&d.rel_path),
+        bytes: d.allocated_total,
+        local_bytes: d.allocated_total,
+        track: d.track,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: wt
+            .artifacts
+            .first()
+            .map(|a| a.observed_at)
+            .unwrap_or_else(now),
+        confidence: crate::entities::Confidence::High,
+        source: crate::report::Source::new("filesystem.walk"),
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+    };
+    unit_from_row(project, wt, &pseudo)
 }
 
 // ---------------------------------------------------------------------
@@ -442,11 +601,11 @@ pub fn revoke_grant(dir: &Path, grant_id: &str) -> Result<()> {
 /// Does this grant's predicate cover this unit? (Budget/unit caps are
 /// checked separately at execution, cumulatively.)
 fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
+    if let Some(pid) = &g.plan_id {
+        return pid == &plan.id; // a one-shot approval covers the whole plan
+    }
     if g.verb != unit.verb {
         return false;
-    }
-    if let Some(pid) = &g.plan_id {
-        return pid == &plan.id;
     }
     let Ok(f) = crate::filter::parse(&g.predicate) else {
         return false;
@@ -679,6 +838,26 @@ pub fn execute_with_trash(
             outcomes.push(outcome);
             continue;
         }
+        // A linked worktree's `.git` is a file (gitdir pointer); a checkout's
+        // is a directory. Both are whole-tree units and need `git worktree
+        // prune` afterwards for the linked case.
+        let linked_common: Option<PathBuf> = if unit.verb == "remove-worktree" {
+            fs::read_to_string(unit.path.join(".git"))
+                .ok()
+                .and_then(|line| {
+                    let gitdir = PathBuf::from(line.trim().strip_prefix("gitdir:")?.trim());
+                    let gitdir = if gitdir.is_absolute() {
+                        gitdir
+                    } else {
+                        unit.path.join(gitdir)
+                    };
+                    let c = fs::read_to_string(gitdir.join("commondir")).ok()?;
+                    let c = PathBuf::from(c.trim());
+                    Some(if c.is_absolute() { c } else { gitdir.join(c) })
+                })
+        } else {
+            None
+        };
         match newest_mtime(&unit.path, 2_000_000) {
             None => {
                 outcome.cause = Some("could not re-observe the tree before acting".into());
@@ -695,11 +874,6 @@ pub fn execute_with_trash(
             }
             Some(_) => {}
         }
-        if crate::occupancy::occupied(&unit.path) {
-            outcome.cause = Some("occupied: a process holds files under this path".into());
-            outcomes.push(outcome);
-            continue;
-        }
         let dest = trash.join(format!(
             "{}-{}-{}",
             basename,
@@ -712,6 +886,13 @@ pub fn execute_with_trash(
                 outcome.recovery_location = Some(dest.clone());
                 trashed += unit.bytes;
                 spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
+                if let Some(c) = &linked_common {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(c.parent().unwrap_or(c))
+                        .args(["worktree", "prune"])
+                        .output();
+                }
             }
             Err(e) => {
                 outcome.status = "failed".into();
@@ -720,7 +901,11 @@ pub fn execute_with_trash(
         }
         ledger.append(&ActionRecord {
             id: crate::entities::new_id(),
-            verb: crate::grants::Verb::Delete,
+            verb: match unit.verb.as_str() {
+                "archive" => crate::grants::Verb::Archive,
+                "remove-worktree" => crate::grants::Verb::RemoveWorktree,
+                _ => crate::grants::Verb::Delete,
+            },
             entity_id: crate::entities::id_for(&unit.path.display().to_string()),
             evidence: serde_json::json!({
                 "plan_id": plan.id,
@@ -734,6 +919,9 @@ pub fn execute_with_trash(
                 "recovery": unit.recovery,
                 "idle_secs": unit.idle_secs,
                 "signals": unit.signals,
+                "verb": unit.verb,
+                "track": unit.track,
+                "warnings_shown": unit.warnings,
             }),
             grant_id: g.id.clone(),
             actor: actor.to_string(),

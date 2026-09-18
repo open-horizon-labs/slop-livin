@@ -100,6 +100,11 @@ pub struct ArtifactRow {
     /// (#29). Zero means "not recorded"; readers fall back to `bytes`.
     #[serde(default)]
     pub local_bytes: u64,
+    /// git tracking status of this path: tracked / ignored / untracked.
+    /// Untracked content is in no version control and under no ignore
+    /// rule — it exists only here. Filled by `annotate_tracking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<crate::ignore::TrackState>,
     pub growth_bytes: Option<i64>,
     pub regrowth_count: u32,
     pub observed_at: u64,
@@ -130,6 +135,9 @@ pub struct ArtifactRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirRollup {
     pub worktree_id: String,
+    /// git tracking status of this directory (see `ArtifactRow::track`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<crate::ignore::TrackState>,
     /// Relative to the worktree root. The worktree root itself is `""`.
     pub rel_path: String,
     /// `None` only for the worktree root's own row.
@@ -960,7 +968,7 @@ pub fn report_full_mode_with_source(
         schedule_line = Some(crate::schedule::header_line(dir, root, observed_at));
     }
 
-    let (dirs_by_worktree, files_by_worktree) = if include_dirs {
+    let (mut dirs_by_worktree, files_by_worktree) = if include_dirs {
         let mut by_dir: std::collections::HashMap<String, Vec<DirRollup>> =
             std::collections::HashMap::new();
         for d in dirs {
@@ -976,6 +984,11 @@ pub fn report_full_mode_with_source(
         (None, None)
     };
 
+    let t_track = std::time::Instant::now();
+    annotate_tracking(&mut projects, dirs_by_worktree.as_mut());
+    if trace {
+        eprintln!("[trace] annotate_tracking: {:?}", t_track.elapsed());
+    }
     let report = Report {
         observed_at,
         root: root.to_path_buf(),
@@ -1003,6 +1016,42 @@ pub fn report_full_mode_with_source(
         let _ = write_last_report(dir, &report);
     }
     Ok(report)
+}
+
+/// Fills `track` on every artifact row and top-level Source directory:
+/// one exclude stack per worktree, one lookup per row. `.git` rows carry
+/// no status (git's own store is not content it tracks). Cheap relative
+/// to the walk and needed by every surface, so it runs on every report.
+pub fn annotate_tracking(
+    projects: &mut [ProjectRow],
+    dirs: Option<&mut std::collections::HashMap<String, Vec<DirRollup>>>,
+) {
+    let mut dirs = dirs;
+    for p in projects.iter_mut() {
+        for wt in p.worktrees.iter_mut() {
+            let Some(lens) = crate::ignore::IgnoreLens::open(&wt.path) else {
+                continue;
+            };
+            for a in wt.artifacts.iter_mut() {
+                if a.kind == ArtifactKind::Git || a.source.tool.starts_with("docker") {
+                    continue;
+                }
+                let rel = a
+                    .path
+                    .strip_prefix(&wt.path)
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_default();
+                a.track = Some(lens.status(&rel, true));
+            }
+            if let Some(map) = dirs.as_deref_mut()
+                && let Some(rows) = map.get_mut(&wt.worktree_id)
+            {
+                for d in rows.iter_mut().filter(|d| !d.rel_path.contains('/')) {
+                    d.track = Some(lens.status(&d.rel_path, true));
+                }
+            }
+        }
+    }
 }
 
 fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
@@ -1469,6 +1518,7 @@ fn join_docker_facts(
                         path: PathBuf::from(candidate.reference),
                         bytes: candidate.unique_bytes,
                         local_bytes: 0,
+                        track: None,
                         growth_bytes: None,
                         regrowth_count: 0,
                         observed_at,

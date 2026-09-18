@@ -44,7 +44,7 @@ fn row_path(r: &slop_livin_core::Report, kind: ArtifactKind, ends: &str) -> Path
 }
 
 #[test]
-fn propose_only_plans_folded_artifacts_and_names_evidence() {
+fn propose_plans_any_path_and_names_evidence_and_warnings() {
     let tmp = tempfile::tempdir().unwrap();
     let fx = fixture::build(tmp.path());
     let store = tempfile::tempdir().unwrap();
@@ -54,37 +54,105 @@ fn propose_only_plans_folded_artifacts_and_names_evidence() {
     assert!(!plan.units.is_empty());
     for u in &plan.units {
         assert!(
-            matches!(
+            !matches!(
                 u.kind,
-                ArtifactKind::BuildOutput | ArtifactKind::DependencyTree | ArtifactKind::Cache
+                ArtifactKind::DockerImage
+                    | ArtifactKind::DockerBuildCache
+                    | ArtifactKind::DockerVolume
             ),
-            "only folded rebuildable kinds may be planned, got {:?}",
+            "docker objects are never planned, got {:?}",
             u.kind
         );
         assert!(!u.project.is_empty() && !u.worktree_id.is_empty());
-        assert!(u.recovery == "local_rebuild" || u.recovery == "network_fetch");
+        assert!(!u.recovery.is_empty());
         assert_eq!(u.verb, "delete");
     }
-    // A Source tree, a .git store and a Docker object can be *asked for* but
-    // never planned; the refusal names the fact.
+    // Anything with a path is plannable — a .git store and a Source tree
+    // included — carrying the warning a human weighs instead of a refusal.
     let git = row_path(&r, ArtifactKind::Git, "/.git");
     let source = row_path(&r, ArtifactKind::Source, "/checkout");
-    let asked = vec![
-        git.clone(),
-        source.clone(),
-        PathBuf::from("/nonexistent/prune-docker"),
-    ];
-    let err = propose(&r, None, &asked, "test").expect_err("nothing plannable");
-    let msg = err.to_string();
-    assert!(msg.contains("irrecoverable: leave"), "{msg}");
-    assert!(msg.contains("not an artifact"), "{msg}");
-    assert!(msg.contains("not an artifact row"), "{msg}");
-    // Mixed: one plannable + one refused -> plan with a refused entry.
+    let plan = propose(&r, None, &[git.clone(), source.clone()], "test").unwrap();
+    assert_eq!(plan.units.len(), 2);
+    let git_unit = plan.units.iter().find(|u| u.path == git).unwrap();
+    assert!(
+        git_unit
+            .warnings
+            .iter()
+            .any(|w| w.contains("git object store")),
+        "{:?}",
+        git_unit.warnings
+    );
+    // The checkout root path is the whole checkout: the archive verb, with
+    // the checkout's facts (the fixture has untracked loose files and no
+    // remote) as warnings rather than a refusal.
+    let src_unit = plan.units.iter().find(|u| u.path == source).unwrap();
+    assert_eq!(src_unit.verb, "archive");
+    assert!(
+        src_unit
+            .warnings
+            .iter()
+            .any(|w| w.contains("untracked") || w.contains("no remote")),
+        "{:?}",
+        src_unit.warnings
+    );
+    // A path that is not in the report at all is refused, naming why.
+    let err = propose(
+        &r,
+        None,
+        &[PathBuf::from("/nonexistent/prune-docker")],
+        "test",
+    )
+    .expect_err("no such row");
+    assert!(
+        err.to_string().contains("not a path in this report"),
+        "{err}"
+    );
+    // Mixed: one plannable + one unknown -> plan with a refused entry.
     let nm = row_path(&r, ArtifactKind::DependencyTree, "/node_modules");
-    let plan = propose(&r, None, &[nm.clone(), git.clone()], "test").unwrap();
+    let plan = propose(&r, None, &[nm.clone(), PathBuf::from("/nope")], "test").unwrap();
     assert_eq!(plan.units.len(), 1);
     assert_eq!(plan.refused.len(), 1);
-    assert!(plan.refused[0].cause.contains("leave"));
+}
+
+#[test]
+fn a_worktree_path_plans_as_remove_worktree_and_a_checkout_as_archive_with_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let r = report_for(&fx.root, store.path());
+    let (checkout, linked) = {
+        let p = r
+            .projects
+            .iter()
+            .find(|p| p.worktrees.len() >= 2)
+            .expect("fixture project with a linked worktree");
+        let main = p
+            .worktrees
+            .iter()
+            .find(|w| w.kind == slop_livin_core::report::WorktreeKind::Main)
+            .unwrap();
+        let link = p
+            .worktrees
+            .iter()
+            .find(|w| w.kind == slop_livin_core::report::WorktreeKind::Linked)
+            .unwrap();
+        (main.path.clone(), link.path.clone())
+    };
+    let plan = propose(&r, None, &[checkout.clone(), linked.clone()], "agent").unwrap();
+    let c = plan.units.iter().find(|u| u.path == checkout).unwrap();
+    let l = plan.units.iter().find(|u| u.path == linked).unwrap();
+    assert_eq!(c.verb, "archive");
+    assert_eq!(l.verb, "remove-worktree");
+    assert!(c.bytes > 0 && l.bytes > 0);
+    // The fixture checkout has untracked loose files and a remote: the
+    // warnings say so, and nothing here is a refusal.
+    assert!(
+        c.warnings.iter().any(|w| w.contains("untracked"))
+            || c.warnings.iter().any(|w| w.contains("no remote")),
+        "{:?}",
+        c.warnings
+    );
+    assert!(plan.refused.is_empty());
 }
 
 #[test]

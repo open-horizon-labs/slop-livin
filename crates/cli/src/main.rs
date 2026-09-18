@@ -263,6 +263,15 @@ fn print_plan(plan: &slop_livin_core::actions::Plan) {
             u.recovery,
             u.signals.join(" · ")
         );
+        if let Some(t) = u.track {
+            print!("    [{}]", t.label());
+        }
+        if !u.warnings.is_empty() {
+            print!("  ⚠ {}", u.warnings.join(" · "));
+        }
+        if u.track.is_some() || !u.warnings.is_empty() {
+            println!();
+        }
     }
     for r in &plan.refused {
         println!("  refused  {}  — {}", r.path.display(), r.cause);
@@ -448,6 +457,22 @@ fn main() -> Result<()> {
             }
         }
         Command::Approve { plan_id } => {
+            // The human's confirm line: every unit with the facts on it,
+            // before the grant is written.
+            let plan = slop_livin_core::actions::load_plan(&slop_livin_dir(), &plan_id)?;
+            for u in &plan.units {
+                println!(
+                    "  {:<16} {:>10}  {}{}",
+                    u.verb,
+                    slop_livin_core::render::human_bytes_pub(u.bytes),
+                    u.path.display(),
+                    if u.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ⚠ {}", u.warnings.join(" · "))
+                    }
+                );
+            }
             let g = slop_livin_core::actions::approve(&slop_livin_dir(), &plan_id, "human:cli")?;
             println!(
                 "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
@@ -650,9 +675,13 @@ fn render_dirs(
                     .growth_bytes
                     .map(|g| format!(" ({g:+} bytes)"))
                     .unwrap_or_default();
+                let track = row
+                    .track
+                    .map(|t| format!("  [{}]", t.label()))
+                    .unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "  {label:<40} {:>12} bytes{growth}  changed {}",
+                    "  {label:<40} {:>12} bytes{growth}  changed {}{track}",
                     row.allocated_total,
                     age_from_mod_time_min(row.mod_time_min)
                 );

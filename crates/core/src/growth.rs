@@ -701,6 +701,14 @@ pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
     oldest.map(|o| now.saturating_sub(o))
 }
 
+/// `history_span_secs` for the volume `root` lives on (the store is keyed
+/// by device id), so every surface bounds its growth windows identically.
+pub fn history_span_for_root(store: &Path, root: &Path, now: u64) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = fs::metadata(root).ok()?.dev();
+    history_span_secs(&store.join(dev.to_string()), now)
+}
+
 pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let retention_secs = retention_days.saturating_mul(86400);
     let horizon = now.saturating_sub(retention_secs);
@@ -1474,6 +1482,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
                 path: PathBuf::from(&row.rel_path),
                 bytes: row.bytes,
                 local_bytes: row.local_bytes,
+                track: None,
                 growth_bytes: None,
                 regrowth_count: row.regrowth_count,
                 observed_at: row.observed_at,
@@ -1491,6 +1500,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
         .into_iter()
         .map(|r| DirRollup {
             worktree_id: r.worktree_id,
+            track: None,
             rel_path: r.rel_path,
             parent_rel_path: r.parent_rel_path,
             allocated_total: r.allocated_total,
@@ -2154,6 +2164,7 @@ mod tests {
                     path: worktree_root.join("node_modules"),
                     bytes,
                     local_bytes: 0,
+                    track: None,
                     growth_bytes: None,
                     regrowth_count: 0,
                     observed_at: 0,

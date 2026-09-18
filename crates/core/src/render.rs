@@ -20,6 +20,20 @@ const DEFAULT_TOP_N: usize = 25;
 /// decimal ("GB") label, so the *same* observation could read "51.3GB"
 /// from one surface (the raw integer) and "47.9GB" from this one -- a
 /// 1024-vs-1000 unit mismatch masquerading as stale/re-read data.
+/// A project's display name: `owner/repo` when its remote names one, so
+/// two clones of different repos sharing a basename are told apart on
+/// sight. Shared by the TUI, CLI and MCP.
+pub fn project_display_name(p: &crate::report::ProjectRow) -> String {
+    let owner_repo = p.remote.as_deref().and_then(|r| {
+        let parts: Vec<&str> = r.trim_end_matches('/').split('/').collect();
+        (parts.len() >= 3).then(|| format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]))
+    });
+    match owner_repo {
+        Some(or) if or.to_lowercase().ends_with(&p.name.to_lowercase()) => or,
+        _ => p.name.clone(),
+    }
+}
+
 /// The one byte formatter in this product (decimal, SI-labelled). The TUI
 /// re-exports it; a second implementation is a defect (source audit).
 pub fn human_bytes_pub(bytes: u64) -> String {

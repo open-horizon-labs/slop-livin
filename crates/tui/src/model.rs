@@ -393,21 +393,7 @@ pub fn tree_rows(
     out
 }
 
-/// A project's display name: `owner/repo` when its remote names one, so
-/// two clones of different repos with the same basename are telling
-/// apart on sight (the reason project identity moved to the remote).
-pub fn project_display_name(p: &slop_livin_core::report::ProjectRow) -> String {
-    match p.remote.as_deref().and_then(owner_repo) {
-        Some(or) if or.to_lowercase().ends_with(&p.name.to_lowercase()) => or,
-        _ => p.name.clone(),
-    }
-}
-
-/// `github.com/open-horizon-labs/roon-knob` -> `open-horizon-labs/roon-knob`.
-pub fn owner_repo(remote: &str) -> Option<String> {
-    let parts: Vec<&str> = remote.trim_end_matches('/').split('/').collect();
-    (parts.len() >= 3).then(|| format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]))
-}
+pub use slop_livin_core::render::project_display_name;
 
 /// Top-level directories of a worktree's Source tree, biggest first.
 /// Empty when the report was built without directory rollups.
@@ -709,6 +695,7 @@ mod tests {
             path: path.into(),
             bytes,
             local_bytes: 0,
+            track: None,
             growth_bytes: None,
             regrowth_count: 0,
             observed_at: 0,
