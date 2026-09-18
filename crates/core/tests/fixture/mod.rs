@@ -147,8 +147,13 @@ pub fn build(tmp: &Path) -> Fixture {
     let nested_repo_build_bytes = write_files(&nested_repo_build, 2, 512 * 1024);
 
     // --- shared cache dir outside any repo ---
+    // R3 sizes artifacts as allocated bytes (st_blocks*512), which rounds
+    // up to the filesystem's block size (4096 on APFS). 1 MiB does not
+    // split evenly into 3 files without a non-block-aligned remainder, so
+    // this uses a total that is both divisible by 3 and by 4096, keeping
+    // every file's logical size equal to its allocated size exactly.
     let shared_cache = tmp.join("cache").join(".cargo-registry");
-    let shared_cache_bytes = write_files(&shared_cache, 3, 1024 * 1024);
+    let shared_cache_bytes = write_files(&shared_cache, 3, 3 * 85 * 4096);
 
     // --- loose files outside any repo ---
     let loose_dir = tmp.join("loose");
