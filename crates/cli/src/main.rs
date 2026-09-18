@@ -12,10 +12,19 @@ use std::path::PathBuf;
 #[command(name = "slop-livin")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Diffstat-ledger terminal UI (ratatui). Default when no
+    /// subcommand is given.
+    Ui {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// Skip persisting a new observation; render the last one.
+        #[arg(long)]
+        no_observe: bool,
+    },
     Scan {
         #[arg(default_value = ".")]
         root: PathBuf,
@@ -65,7 +74,13 @@ fn slop_livin_dir() -> PathBuf {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    match cli.command.unwrap_or(Command::Ui {
+        root: PathBuf::from("."),
+        no_observe: false,
+    }) {
+        Command::Ui { root, no_observe } => {
+            slop_livin_tui::run(&root, no_observe)?;
+        }
         Command::Scan { root, store } => {
             let obs = observation(&ScanOptions {
                 roots: vec![root],
