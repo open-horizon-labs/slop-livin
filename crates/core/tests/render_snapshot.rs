@@ -7,7 +7,7 @@
 use slop_livin_core::entities::Confidence;
 use slop_livin_core::render::{
     render_kinds, render_overview, render_project, render_project_tree, render_view_builds,
-    render_view_docker,
+    render_view_docker, render_worktrees,
 };
 use slop_livin_core::report::{
     ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Report, Signal, Source, UnownedReason,
@@ -312,6 +312,10 @@ fn tree_fixture_report() -> Report {
             name: "last_commit".to_string(),
             value: "last commit 10h".to_string(),
         }],
+        branch: None,
+        github: None,
+        merge_complete: None,
+        idle_secs: None,
     });
     report
 }
@@ -388,4 +392,34 @@ fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
     let text = render_view_docker(&report, Some("big-grower"));
     assert!(text.contains("unowned, name-alike"));
     assert!(text.contains("big-grower-staging:latest"));
+}
+
+#[test]
+fn worktrees_view_shows_removal_hint_only_for_linked() {
+    let mut report = fixture_report();
+    // Add a Linked worktree alongside the existing Main one so both
+    // branches of the removal-hint logic run.
+    report.projects[0].worktrees.push(WorktreeRow {
+        worktree_id: "wt-linked".to_string(),
+        path: PathBuf::from("/src/big-grower/.worktrees/store"),
+        kind: WorktreeKind::Linked,
+        artifacts: vec![],
+        signals: vec![],
+        branch: None,
+        github: None,
+        merge_complete: None,
+        idle_secs: None,
+    });
+    let text = render_worktrees(&report, &slop_livin_core::filter::Filter::default());
+    assert!(
+        text.contains("git worktree remove /src/big-grower/.worktrees/store"),
+        "expected removal command for the linked worktree, got: {text}"
+    );
+    assert!(
+        text.contains("main checkout -- not removable as a worktree"),
+        "expected the main-checkout message instead of a removal command, got: {text}"
+    );
+    // The Main checkout's own row must never carry the literal removal
+    // command -- it isn't a worktree `git worktree remove` can act on.
+    assert!(!text.contains("git worktree remove /src/big-grower\n"));
 }

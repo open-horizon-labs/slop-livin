@@ -708,6 +708,10 @@ mod tests {
                         name: "dirty".to_string(),
                         value: "dirty".to_string(),
                     }],
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
                 }],
             }],
             unowned: vec![],
@@ -723,6 +727,7 @@ mod tests {
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
+            github_enrichment: None,
         }
     }
 

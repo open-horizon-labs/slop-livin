@@ -6,8 +6,8 @@ use slop_livin_core::{
     filter,
     render::{
         render_kinds, render_overview, render_project_tree, render_view_builds, render_view_deps,
-        render_view_docker, render_view_reconciliation, render_view_unowned, render_worktrees,
-        render_worktree_signals,
+        render_view_docker, render_view_reconciliation, render_view_unowned,
+        render_worktree_signals, render_worktrees,
     },
     report::{Report, report_full, to_json},
     scan::{ScanOptions, observation},

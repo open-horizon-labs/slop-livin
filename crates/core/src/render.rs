@@ -458,7 +458,14 @@ pub fn render_worktrees(report: &Report, filter: &crate::filter::Filter) -> Stri
                 mc_str,
                 pr_str,
             );
-            let _ = writeln!(out, "  git worktree remove {}", wt.path.display());
+            match wt.kind {
+                WorktreeKind::Linked => {
+                    let _ = writeln!(out, "  git worktree remove {}", wt.path.display());
+                }
+                WorktreeKind::Main | WorktreeKind::Clone => {
+                    let _ = writeln!(out, "  main checkout -- not removable as a worktree");
+                }
+            }
         }
     }
     if shown == 0 {
