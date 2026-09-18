@@ -338,6 +338,7 @@ pub fn attribute_parallel(
                 observed_at,
                 confidence: Confidence::High,
                 source: Source::new("filesystem.walk"),
+                note: None,
             });
     }
 
@@ -380,6 +381,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 path_or_object: path.display().to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
+                shared_bytes: None,
+                note: None,
             });
             return;
         }
@@ -463,6 +466,8 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
         path_or_object: path.display().to_string(),
         bytes,
         reason,
+        shared_bytes: None,
+        note: None,
     });
 }
 
@@ -533,6 +538,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     observed_at: shared.observed_at,
                     confidence: Confidence::High,
                     source: Source::new("filesystem.walk"),
+                    note: None,
                 });
         }
         None => {
@@ -550,6 +556,8 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 path_or_object: group.root_path.display().to_string(),
                 bytes,
                 reason,
+                shared_bytes: None,
+                note: None,
             });
         }
     }
