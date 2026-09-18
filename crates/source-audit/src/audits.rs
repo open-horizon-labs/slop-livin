@@ -178,13 +178,18 @@ fn scheduled_refresh_launchagent(root: &Path) -> Result<(), String> {
 }
 
 fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
+    // 1. The parallel walk folds (builds a Size job) only under a
+    //    classify_at guard, or while already inside a folded unit.
     let w = core(root, "walk.rs")?;
-    let sites = ast::struct_literal_sites(&w.ast, "AttrJob::Size");
+    let sites = ast::guarded_sites(&w.ast, "AttrJob::Size");
     if sites.is_empty() {
         return Err("walk.rs never builds an AttrJob::Size: folding is gone".into());
     }
     for s in sites {
-        let guarded = s.enclosing_if_let_calls.iter().any(|c| c == "classify_at");
+        let guarded = s
+            .enclosing_if_let_inits
+            .iter()
+            .any(|init| init.contains("classify_at"));
         if !guarded && s.func != "process_size" {
             return Err(format!(
                 "walk::{}: builds AttrJob::Size outside an `if let Some(kind) = classify_at(..)`: a directory would be folded without being an artifact",
@@ -192,18 +197,106 @@ fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    // 2. The serial walk records an artifact only under the same guard.
+    let a = core(root, "attribution.rs")?;
+    let sites = ast::guarded_sites(&a.ast, "record_artifact");
+    if sites.is_empty() {
+        return Err("attribution.rs never records an artifact".into());
+    }
+    for s in sites {
+        if !s
+            .enclosing_if_let_inits
+            .iter()
+            .any(|init| init.contains("classify_at"))
+        {
+            return Err(format!(
+                "attribution::{}: record_artifact outside a classify_at guard",
+                s.func
+            ));
+        }
+    }
+    // 3. classify_at is table-driven and refuses by default: its tail is
+    //    `None`, and it constructs no ArtifactKind of its own.
+    let funcs = ast::functions(&a.ast);
+    let ca = ast::function(&funcs, "classify_at")?;
+    let tail = ast::tail_of(ca);
+    let table_driven = tail.trim() == "None"
+        || [
+            "ARTIFACT_KINDS",
+            "MARKED_ARTIFACT_KINDS",
+            "classify_gated",
+            "classify (",
+        ]
+        .iter()
+        .any(|t| tail.contains(t));
+    if !table_driven || tail.contains("Some (ArtifactKind") || tail.contains("or (") {
+        return Err(format!(
+            "attribution::classify_at must end in a table lookup or `None` (unknown names are never folded); tail is `{tail}`"
+        ));
+    }
+    if ca.body.contains("Some (ArtifactKind") || ca.body.contains("Some(ArtifactKind") {
+        return Err(
+            "attribution::classify_at invents a kind instead of consulting the tables".into(),
+        );
+    }
+    for name in ["classify", "classify_marked"] {
+        if let Ok(f) = ast::function(&funcs, name)
+            && (f.body.contains("Some (ArtifactKind") || f.body.contains("Some(ArtifactKind"))
+        {
+            return Err(format!(
+                "attribution::{name} invents a kind instead of consulting the tables"
+            ));
+        }
+    }
+    let e = core(root, "ecosystem.rs")?;
+    let efuncs = ast::functions(&e.ast);
+    let cg = ast::function(&efuncs, "classify_gated")?;
+    if cg.body.contains("Some (ArtifactKind") || cg.body.contains("Some(ArtifactKind") {
+        return Err(
+            "ecosystem::classify_gated invents a kind instead of consulting ECOSYSTEMS".into(),
+        );
+    }
     Ok(())
 }
 
 fn symlinks_never_followed(root: &Path) -> Result<(), String> {
     for name in ["walk.rs", "attribution.rs"] {
         let f = core(root, name)?;
-        for func in ast::functions(&f.ast) {
-            let descends = func.body.contains("read_dir") && func.body.contains("is_dir");
-            if descends && !func.body.contains("is_symlink") {
+        // 1. Nothing in a walker asks the filesystem through a symlink:
+        //    `fs::metadata` follows, `symlink_metadata` does not.
+        for c in ast::call_paths(&f.ast) {
+            if c == "metadata"
+                || c.ends_with("::metadata")
+                || c.ends_with("canonicalize") && !c.contains("dunce")
+            {
+                if c.ends_with("canonicalize") && name == "walk.rs" {
+                    // The root itself may be canonicalized once; children never.
+                    continue;
+                }
                 return Err(format!(
-                    "{name}::{}: lists a directory and descends without checking is_symlink",
-                    func.name
+                    "{name}: calls `{c}`, which follows symlinks; use symlink_metadata"
+                ));
+            }
+        }
+        // 2. No type question on a *path* (`entry.path().is_dir()`,
+        //    `x.join(y).exists()`): those stat through the link.
+        for m in ["is_dir", "is_file", "exists"] {
+            let hits = ast::method_on_receiver_methods(&f.ast, m, &["path", "join"]);
+            if let Some(h) = hits.first() {
+                return Err(format!(
+                    "{name}: `{h}` asks about a path, which follows symlinks; decide on file_type()/symlink_metadata instead"
+                ));
+            }
+        }
+        // 3. In every directory loop that descends, the symlink guard
+        //    comes before the directory branch.
+        for lo in ast::descent_guard_order(&f.ast) {
+            if let Some(d) = lo.descent
+                && lo.guard.is_none_or(|g| g > d)
+            {
+                return Err(format!(
+                    "{name}::{}: a directory loop descends (is_dir) before discarding symlinks (is_symlink)",
+                    lo.func
                 ));
             }
         }

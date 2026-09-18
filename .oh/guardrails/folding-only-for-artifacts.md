@@ -10,4 +10,9 @@ audit: folding_only_for_artifacts
 Folding is what keeps the walk affordable (a node_modules is one stat-tree, one row), and folding anything else would hide source directories from the growth-by-directory view.
 
 ## Detection
-Every `AttrJob::Size` construction in `walk.rs` is inside an `if let Some(kind) = classify_at(..)` or inside `process_size` (recursion within an already-folded unit). AST audit `folding_only_for_artifacts`.
+AST audit `folding_only_for_artifacts`:
+1. every `AttrJob::Size` literal in `walk.rs` sits in the then-branch of an `if let ... = classify_at(..)` (or inside `process_size`, recursion within a folded unit);
+2. every `record_artifact` call in the serial walker sits under the same guard;
+3. `classify_at` ends in a table lookup or `None` and, like `classify` and `classify_gated`, constructs no `ArtifactKind` of its own.
+
+Proven by `scripts/audit-mutants.sh`: folding under a made-up kind, recording without classifying, and making `classify_at` default to `Cache` each fail this audit.
