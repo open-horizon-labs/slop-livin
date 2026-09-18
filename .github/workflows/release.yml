@@ -57,11 +57,15 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo build --release --locked --target aarch64-apple-darwin -p slop-livin -p slop-livin-mcp
 
-      - name: Test
+      # Same profile and target as the build: the library and binary
+      # crates are already compiled above, so only the test harnesses are
+      # new work, and the tests exercise the optimized code that ships.
+      # A plain `cargo test` here recompiled the whole workspace in debug.
+      - name: Test (release, aarch64-apple-darwin)
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --release --target aarch64-apple-darwin
 
       - name: Package
         id: pkg
