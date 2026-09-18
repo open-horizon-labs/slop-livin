@@ -2536,7 +2536,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slop-livin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "slop-livin-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "slop-livin-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2577,14 +2577,14 @@ dependencies = [
 
 [[package]]
 name = "slop-livin-source-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "syn 2.0.119",
 ]
 
 [[package]]
 name = "slop-livin-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2593,6 +2593,7 @@ dependencies = [
  "serde_json",
  "slop-livin-core",
  "tempfile",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

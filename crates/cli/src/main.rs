@@ -5,9 +5,9 @@ use clap::{Parser, Subcommand};
 use slop_livin_core::{
     filter,
     render::{
-        render_kinds, render_overview, render_project_tree, render_view_builds, render_view_deps,
-        render_view_docker, render_view_reconciliation, render_view_unowned,
-        render_worktree_signals, render_worktrees,
+        OverviewSort, render_kinds, render_overview_sorted, render_project_tree, render_types,
+        render_view_builds, render_view_deps, render_view_docker, render_view_reconciliation,
+        render_view_unowned, render_worktree_signals, render_worktrees,
     },
     report::{Report, report_full_mode, to_json},
     scan::{ScanOptions, observation},
@@ -29,6 +29,30 @@ enum View {
     Kinds,
     Unowned,
     Reconciliation,
+    /// Per-ecosystem rollup: projects wearing the tag, artifacts it
+    /// generates, bytes and growth.
+    Types,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SortArg {
+    Growth,
+    Size,
+    Name,
+    Type,
+    Age,
+}
+
+impl From<SortArg> for OverviewSort {
+    fn from(s: SortArg) -> Self {
+        match s {
+            SortArg::Growth => OverviewSort::Growth,
+            SortArg::Size => OverviewSort::Size,
+            SortArg::Name => OverviewSort::Name,
+            SortArg::Type => OverviewSort::Type,
+            SortArg::Age => OverviewSort::Age,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -37,6 +61,13 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
+#[derive(Subcommand)]
+enum ConfigAction {
+    Show,
+    Path,
+    Init,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Diffstat-ledger terminal UI (ratatui). Default when no
@@ -128,6 +159,13 @@ enum Command {
         /// walk (also re-anchors the stored event id for next time).
         #[arg(long)]
         full: bool,
+        /// Order of the overview's project rows: growth (default), size,
+        /// name, type (grouped by ecosystem), age (oldest artifact first).
+        #[arg(long, value_enum, default_value = "growth")]
+        sort: SortArg,
+        /// Reverse the sort order (smallest first, newest first, …).
+        #[arg(long)]
+        reverse: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment live for every GitHub-remote worktree found
@@ -183,6 +221,18 @@ enum Command {
         actor: String,
         #[arg(long)]
         json: bool,
+        /// Before trashing a build directory, copy compiled outputs to
+        /// `<worktree>/bin/`: Rust `target/{release,debug}` executables,
+        /// Python `dist/*.whl` and `build/**/*.so`. Other kinds: no-op.
+        #[arg(long, short = 'k')]
+        keep_executables: bool,
+    },
+    /// The configuration file: `config show` prints effective values,
+    /// `config path` where it lives, `config init` writes one with every
+    /// key and its meaning (never overwrites an existing file).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// List plans (newest first).
     Plans {
@@ -328,6 +378,8 @@ fn main() -> Result<()> {
             dirs,
             depth,
             full,
+            sort,
+            reverse,
         } => {
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
@@ -348,6 +400,8 @@ fn main() -> Result<()> {
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = slop_livin_dir();
+            let progress =
+                spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
             let r = report_full_mode(
                 &root,
                 docker_facts.as_deref(),
@@ -358,7 +412,9 @@ fn main() -> Result<()> {
                 dirs,
                 enrich,
                 full,
-            )?;
+            );
+            progress.stop();
+            let r = r?;
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
                 Some(Ok(f)) => Some(f),
                 Some(Err(e)) => {
@@ -402,6 +458,7 @@ fn main() -> Result<()> {
                     Some(View::Deps) => print!("{}", render_view_deps(&r, Some(&name))),
                     Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
                     Some(View::Kinds) => print!("{}", render_kinds(&r)),
+                    Some(View::Types) => print!("{}", render_types(&r)),
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                 }
@@ -415,9 +472,13 @@ fn main() -> Result<()> {
                     Some(View::Builds) => print!("{}", render_view_builds(&r, None)),
                     Some(View::Deps) => print!("{}", render_view_deps(&r, None)),
                     Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
+                    Some(View::Types) => print!("{}", render_types(&r)),
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
-                    None => print!("{}", render_overview(&r, all, verify_du, docker)),
+                    None => print!(
+                        "{}",
+                        render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
+                    ),
                 }
             }
         }
@@ -484,12 +545,49 @@ fn main() -> Result<()> {
             );
             println!("execute with: slop-livin execute {plan_id}");
         }
+        Command::Config { action } => {
+            let dir = slop_livin_dir();
+            let path = dir.join("config.toml");
+            match action {
+                ConfigAction::Path => println!("{}", path.display()),
+                ConfigAction::Show => {
+                    print!("{}", slop_livin_core::growth::load_config(&dir).to_toml());
+                    if !path.exists() {
+                        eprintln!(
+                            "(defaults; no file at {} — `slop-livin config init` writes one)",
+                            path.display()
+                        );
+                    }
+                }
+                ConfigAction::Init => {
+                    if path.exists() {
+                        eprintln!("{} already exists; not overwriting", path.display());
+                        std::process::exit(1);
+                    }
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(
+                        &path,
+                        slop_livin_core::growth::GrowthConfig::default().to_toml(),
+                    )?;
+                    println!("wrote {}", path.display());
+                }
+            }
+        }
         Command::Execute {
             plan_id,
             actor,
             json,
+            keep_executables,
         } => {
-            let res = slop_livin_core::actions::execute(&slop_livin_dir(), &plan_id, &actor)?;
+            let res = if keep_executables {
+                slop_livin_core::actions::execute_keeping_executables(
+                    &slop_livin_dir(),
+                    &plan_id,
+                    &actor,
+                )?
+            } else {
+                slop_livin_core::actions::execute(&slop_livin_dir(), &plan_id, &actor)?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else {
@@ -505,6 +603,9 @@ fn main() -> Result<()> {
                             .map(|c| format!("  — {c}"))
                             .unwrap_or_default()
                     );
+                    for kept in &o.preserved {
+                        println!("            kept {}", kept.display());
+                    }
                 }
                 println!(
                     "planned {} · trashed {} · free space measured {}",
@@ -728,5 +829,55 @@ fn age_from_mod_time_min(mod_time_min: i32) -> String {
         format!("{}h", age_min / 60)
     } else {
         format!("{}d", age_min / (60 * 24))
+    }
+}
+
+/// A one-line stderr progress readout while a walk runs: bytes and
+/// directories seen so far from `walk::progress`, redrawn in place ten
+/// times a second, erased when done. Off when stderr is not a terminal or
+/// the caller wants machine output.
+struct ProgressLine {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressLine {
+    fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn spawn_progress_line(enabled: bool) -> ProgressLine {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if !enabled {
+        return ProgressLine { stop, handle: None };
+    }
+    let flag = stop.clone();
+    let handle = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut drew = false;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let (bytes, dirs, active) = slop_livin_core::walk::progress::snapshot();
+            if active {
+                let _ = write!(
+                    std::io::stderr(),
+                    "\r\x1b[2Kobserving… {} · {dirs} dirs",
+                    slop_livin_core::render::human_bytes_pub(bytes)
+                );
+                drew = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if drew {
+            let _ = write!(std::io::stderr(), "\r\x1b[2K");
+        }
+        let _ = std::io::stderr().flush();
+    });
+    ProgressLine {
+        stop,
+        handle: Some(handle),
     }
 }

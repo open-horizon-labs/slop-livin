@@ -27,9 +27,6 @@ const ARTIFACT_KINDS: &[(&str, ArtifactKind)] = &[
     (".metro", ArtifactKind::Cache),
     (".svelte-kit", ArtifactKind::BuildOutput),
     (".output", ArtifactKind::BuildOutput),
-    ("dist", ArtifactKind::BuildOutput),
-    ("out", ArtifactKind::BuildOutput),
-    ("coverage", ArtifactKind::BuildOutput),
     // Rust
     ("target", ArtifactKind::BuildOutput),
     (".xwin-cache", ArtifactKind::Cache),
@@ -46,7 +43,6 @@ const ARTIFACT_KINDS: &[(&str, ArtifactKind)] = &[
     (".pixi", ArtifactKind::DependencyTree),
     (".ipynb_checkpoints", ArtifactKind::Cache),
     // JVM
-    ("build", ArtifactKind::BuildOutput),
     (".gradle", ArtifactKind::Cache),
     // Apple
     ("Pods", ArtifactKind::DependencyTree),
@@ -71,7 +67,6 @@ const ARTIFACT_KINDS: &[(&str, ArtifactKind)] = &[
     ("cmake-build-debug", ArtifactKind::BuildOutput),
     ("cmake-build-release", ArtifactKind::BuildOutput),
     // PHP / Ruby / Go (also Deno's vendored deps)
-    ("vendor", ArtifactKind::DependencyTree),
     // Terraform
     (".terraform", ArtifactKind::DependencyTree),
     // Generic
@@ -152,6 +147,12 @@ fn has_marker(parent: &Path, markers: &[&str]) -> bool {
 /// only inside the project type that generates them.
 pub(crate) fn classify_at(parent: &Path, name: &str) -> Option<ArtifactKind> {
     if let Some(k) = classify(name) {
+        return Some(k);
+    }
+    // Names several ecosystems generate (`build`, `dist`, `vendor`, `out`,
+    // `coverage`, `*.egg-info`, …) count only next to a marker of one that
+    // does: clean-dev-dirs' per-language detection, table-driven.
+    if let Some(k) = crate::ecosystem::classify_gated(parent, name) {
         return Some(k);
     }
     MARKED_ARTIFACT_KINDS
@@ -293,6 +294,8 @@ impl<'a> Ctx<'a> {
                         kind,
                         path: path.to_path_buf(),
                         bytes,
+                        mtime_max: 0,
+                        ecosystem: None,
                         local_bytes: 0,
                         track: None,
                         growth_bytes: None,
@@ -409,7 +412,7 @@ impl<'a> Ctx<'a> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        if let Some(kind) = classify(name) {
+        if let Some(kind) = path.parent().and_then(|parent| classify_at(parent, name)) {
             self.record_artifact(path, kind);
             return;
         }
@@ -466,6 +469,8 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
                 kind: ArtifactKind::Source,
                 path,
                 bytes: *bytes,
+                mtime_max: 0,
+                ecosystem: None,
                 local_bytes: 0,
                 track: None,
                 growth_bytes: None,
@@ -609,6 +614,9 @@ mod tests {
         let root = tmp.path();
         let parent = root.join("parent");
         let nested = parent.join("nested");
+        // `build/` is an artifact only next to a marker of an ecosystem
+        // that generates it (clean-dev-dirs' rule); CMake here.
+        touch(&nested.join("CMakeLists.txt"), 16);
         touch(&nested.join("build/out.bin"), 4096);
         touch(&parent.join("README.md"), 4096);
 

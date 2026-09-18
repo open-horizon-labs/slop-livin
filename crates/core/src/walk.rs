@@ -307,6 +307,8 @@ struct SizeGroup {
     local_total: AtomicU64,
     local_seen: Mutex<HashSet<(u64, u64)>>,
     remaining: AtomicUsize,
+    /// Newest mtime (secs) of any file inside the unit: the artifact's age.
+    mtime_max: AtomicU64,
 }
 
 enum AttrJob {
@@ -322,6 +324,34 @@ enum AttrJob {
 
 /// Per-row local byte total plus the nlink>1 inodes already counted into it.
 type LocalAcc = (u64, HashSet<(u64, u64)>);
+
+/// Live progress of the walk in flight, for any frontend to read while a
+/// `report`/`observe` runs on another thread: bytes and directories seen
+/// so far, and whether a walk is running. Relaxed atomics; a few counters
+/// per directory cost nothing next to the stat calls.
+pub mod progress {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static DIRS: AtomicU64 = AtomicU64::new(0);
+    pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    pub fn start() {
+        BYTES.store(0, Ordering::Relaxed);
+        DIRS.store(0, Ordering::Relaxed);
+        ACTIVE.store(true, Ordering::Relaxed);
+    }
+    pub fn finish() {
+        ACTIVE.store(false, Ordering::Relaxed);
+    }
+    /// `(bytes, dirs, active)` right now.
+    pub fn snapshot() -> (u64, u64, bool) {
+        (
+            BYTES.load(Ordering::Relaxed),
+            DIRS.load(Ordering::Relaxed),
+            ACTIVE.load(Ordering::Relaxed),
+        )
+    }
+}
 
 struct AttrShared {
     seen_inodes: ShardedInodeSet,
@@ -353,6 +383,18 @@ struct AttrShared {
 /// while it runs), same hardlink dedup, same one-`Source`-row-per-worktree
 /// fold at the end.
 pub fn attribute_parallel(
+    root: &Path,
+    worktrees: &[(&Path, &str)],
+    observed_at: u64,
+    large_file_min_bytes: u64,
+) -> AttributionResult {
+    progress::start();
+    let result = attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes);
+    progress::finish();
+    result
+}
+
+fn attribute_parallel_inner(
     root: &Path,
     worktrees: &[(&Path, &str)],
     observed_at: u64,
@@ -412,6 +454,8 @@ pub fn attribute_parallel(
                 kind: ArtifactKind::Source,
                 path,
                 bytes,
+                mtime_max: 0,
+                ecosystem: None,
                 local_bytes,
                 track: None,
                 growth_bytes: None,
@@ -516,6 +560,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             }
         } else if ft.is_dir() {
             dir_dir_count += 1;
+            progress::DIRS.fetch_add(1, Ordering::Relaxed);
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(kind) = classify_at(&path, &name) {
@@ -528,6 +573,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                     local_total: AtomicU64::new(0),
                     local_seen: Mutex::new(HashSet::new()),
                     remaining: AtomicUsize::new(1),
+                    mtime_max: AtomicU64::new(0),
                 });
                 pool.push(AttrJob::Size {
                     path: child_path,
@@ -629,6 +675,7 @@ fn record_file(
     }
     let bytes = allocated_bytes(meta);
     shared.walked_total.fetch_add(bytes, Ordering::Relaxed);
+    progress::BYTES.fetch_add(bytes, Ordering::Relaxed);
     match nearest_worktree(known, path) {
         Some(worktree_id) => {
             shared.attributed_total.fetch_add(bytes, Ordering::Relaxed);
@@ -701,6 +748,9 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
                 continue;
             }
             let key = (meta.dev(), meta.ino());
+            group
+                .mtime_max
+                .fetch_max(meta.mtime().max(0) as u64, Ordering::Relaxed);
             if meta.nlink() <= 1 || group.local_seen.lock().unwrap().insert(key) {
                 group
                     .local_total
@@ -712,6 +762,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             let bytes = allocated_bytes(&meta);
             group.total.fetch_add(bytes, Ordering::Relaxed);
             shared.walked_total.fetch_add(bytes, Ordering::Relaxed);
+            progress::BYTES.fetch_add(bytes, Ordering::Relaxed);
             if group.worktree.is_some() {
                 shared.attributed_total.fetch_add(bytes, Ordering::Relaxed);
             } else {
@@ -739,6 +790,8 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     kind: group.kind.clone(),
                     path: group.root_path.clone(),
                     bytes,
+                    mtime_max: group.mtime_max.load(Ordering::Acquire),
+                    ecosystem: None,
                     local_bytes: group.local_total.load(Ordering::Acquire),
                     track: None,
                     growth_bytes: None,
@@ -841,11 +894,14 @@ pub fn attribute_one_worktree(
 /// its previously observed bytes untouched.
 pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -> ArtifactRow {
     let mut seen = HashSet::new();
-    let bytes = size_dir_recursive(root_path, &mut seen);
+    let mut mtime_max = 0u64;
+    let bytes = size_dir_recursive(root_path, &mut seen, &mut mtime_max);
     ArtifactRow {
         kind,
         path: root_path.to_path_buf(),
         bytes,
+        mtime_max,
+        ecosystem: None,
         local_bytes: bytes,
         track: None,
         growth_bytes: None,
@@ -861,7 +917,7 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
     }
 }
 
-fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>, mtime_max: &mut u64) -> u64 {
     let mut total = 0u64;
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
@@ -872,11 +928,12 @@ fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
             continue;
         }
         if ft.is_dir() {
-            total += size_dir_recursive(&entry.path(), seen);
+            total += size_dir_recursive(&entry.path(), seen, mtime_max);
         } else if ft.is_file() {
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
                 continue;
             };
+            *mtime_max = (*mtime_max).max(meta.mtime().max(0) as u64);
             if meta.is_file() && seen.insert((meta.dev(), meta.ino())) {
                 total += allocated_bytes(&meta);
             }

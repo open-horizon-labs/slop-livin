@@ -55,6 +55,10 @@ pub enum Sort {
     Growth,
     Size,
     Name,
+    /// Grouped by ecosystem (tags in table order), then by size.
+    Type,
+    /// Oldest first: time since the unit was last written.
+    Age,
 }
 
 /// One renderable line: a diffstat row. `unit` is set when this row is a
@@ -101,6 +105,14 @@ pub struct Row {
     pub track: Option<slop_livin_core::ignore::TrackState>,
     /// Byte history over the growth window, from the store (sparkline).
     pub series: Option<Vec<Option<u64>>>,
+    /// Glyph badges drawn before the name: ecosystem glyphs, 🐳 when the
+    /// project has Docker objects joined, 🔨 when it holds build output,
+    /// ⎇N for N linked worktrees. Empty for rows without facts to badge.
+    pub badges: String,
+    /// Ecosystem tags, for the type sort.
+    pub ecosystems: Vec<String>,
+    /// Newest mtime inside the unit (0 unknown), for the age sort/filter.
+    pub mtime_max: u64,
     /// Present for a worktree row: how many artifact children are hidden
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
@@ -121,10 +133,63 @@ impl Row {
             worktree: None,
             track: None,
             series: None,
+            badges: String::new(),
+            ecosystems: Vec::new(),
+            mtime_max: 0,
             collapsed_children: None,
             expandable: false,
         }
     }
+}
+
+/// Display width of a string in terminal cells (emoji count as 2), the
+/// only correct way to pad a column that holds glyph badges.
+pub fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Pads or truncates `s` to exactly `width` display cells.
+pub fn pad_display(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        let mut out = String::new();
+        let mut used = 0;
+        for ch in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > width {
+                break;
+            }
+            out.push(ch);
+            used += cw;
+        }
+        out.push_str(&" ".repeat(width - used));
+        return out;
+    }
+    format!("{s}{}", " ".repeat(width - w))
+}
+
+/// The badge string for a set of ecosystem tags plus project facts.
+pub fn badges(
+    ecosystems: &[String],
+    docker: bool,
+    builds: bool,
+    linked_worktrees: usize,
+) -> String {
+    let mut b: String = ecosystems
+        .iter()
+        .take(3)
+        .map(|t| slop_livin_core::ecosystem::glyph_for(t))
+        .collect();
+    if docker && !ecosystems.iter().any(|t| t == "docker") {
+        b.push('🐳');
+    }
+    if builds {
+        b.push('🔨');
+    }
+    if linked_worktrees > 0 {
+        b.push_str(&format!("⎇{linked_worktrees}"));
+    }
+    b
 }
 
 fn passes_filter(growth: Option<i64>, filter: &Filter) -> bool {
@@ -212,9 +277,22 @@ pub fn max_abs_growth<'a>(rows: impl Iterator<Item = &'a Row>) -> i64 {
         .unwrap_or(0)
 }
 
-/// Applies `sort` to a flat (non-hierarchical) row list, most-growth or
-/// most-bytes first. A stable sort keeps report order as the tiebreak.
-pub fn apply_sort(rows: &mut [Row], sort: Sort) {
+/// Applies `sort` to a flat (non-hierarchical) row list. Growth and size
+/// sort largest first, name alphabetical, type grouped by first ecosystem
+/// tag in table order then size, age oldest first (unknown age last). A
+/// stable sort keeps report order as the tiebreak; `reverse` flips the
+/// whole order.
+pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
+    fn type_rank(r: &Row) -> usize {
+        r.ecosystems
+            .first()
+            .and_then(|t| {
+                slop_livin_core::ecosystem::ECOSYSTEMS
+                    .iter()
+                    .position(|e| e.tag == t)
+            })
+            .unwrap_or(usize::MAX)
+    }
     match sort {
         Sort::None => {}
         Sort::Growth => {
@@ -232,6 +310,24 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort) {
             let key = |l: &str| l.rsplit("] ").next().unwrap_or(l).to_lowercase();
             key(&a.label).cmp(&key(&b.label))
         }),
+        Sort::Type => rows.sort_by(|a, b| {
+            type_rank(a)
+                .cmp(&type_rank(b))
+                .then_with(|| b.bytes.cmp(&a.bytes))
+        }),
+        Sort::Age => rows.sort_by(|a, b| {
+            let key = |r: &Row| {
+                if r.mtime_max == 0 {
+                    u64::MAX
+                } else {
+                    r.mtime_max
+                }
+            };
+            key(a).cmp(&key(b))
+        }),
+    }
+    if reverse && sort != Sort::None {
+        rows.reverse();
     }
 }
 
@@ -271,9 +367,47 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             }
         }
         let growth = have_growth.then_some(growth);
-        if !passes_filter(growth, filter) {
+        if !passes_filter(growth, filter) || !filter::size_passes(filter, bytes) {
             continue;
         }
+        let mtime_max = p
+            .worktrees
+            .iter()
+            .flat_map(|wt| wt.artifacts.iter())
+            .map(|a| a.mtime_max)
+            .max()
+            .unwrap_or(0);
+        if filter::has_age_predicate(filter)
+            && !p
+                .worktrees
+                .iter()
+                .flat_map(|wt| wt.artifacts.iter())
+                .any(|a| filter::age_passes(filter, a.mtime_max))
+        {
+            continue;
+        }
+        let docker = p
+            .worktrees
+            .iter()
+            .flat_map(|wt| wt.artifacts.iter())
+            .any(|a| {
+                matches!(
+                    a.kind,
+                    ArtifactKind::DockerImage
+                        | ArtifactKind::DockerBuildCache
+                        | ArtifactKind::DockerVolume
+                )
+            });
+        let builds = p
+            .worktrees
+            .iter()
+            .flat_map(|wt| wt.artifacts.iter())
+            .any(|a| a.kind == ArtifactKind::BuildOutput);
+        let linked = p
+            .worktrees
+            .iter()
+            .filter(|w| w.kind == slop_livin_core::report::WorktreeKind::Linked)
+            .count();
         let series = sum_series(p.worktrees.iter().flat_map(|wt| {
             wt.artifacts.iter().filter_map(move |a| {
                 let rel = a
@@ -294,19 +428,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         out.push(Row {
             depth: 0,
             rail: String::new(),
-            label: {
-                let tags = slop_livin_core::ecosystem::tags(&p.ecosystems);
-                let name = if tags.is_empty() {
-                    project_display_name(p)
-                } else {
-                    format!("{tags} {}", project_display_name(p))
-                };
-                if p.worktrees.len() > 1 {
-                    format!("{name}  · {} worktrees", p.worktrees.len())
-                } else {
-                    name
-                }
-            },
+            label: project_display_name(p),
             bytes,
             growth,
             signals: Vec::new(),
@@ -315,6 +437,9 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             worktree: None,
             track: None,
             series,
+            badges: badges(&p.ecosystems, docker, builds, linked),
+            ecosystems: p.ecosystems.clone(),
+            mtime_max,
             collapsed_children: None,
             expandable: true,
         });
@@ -411,6 +536,9 @@ pub fn tree_rows(
             worktree: Some(mark),
             track: None,
             series: wt_series,
+            badges: String::new(),
+            ecosystems: Vec::new(),
+            mtime_max: 0,
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
         });
@@ -424,6 +552,8 @@ pub fn tree_rows(
             .filter(|row| {
                 filter::kind_passes(filter, row.kind_label, row.kind.as_ref())
                     && passes_filter(row.growth_bytes, filter)
+                    && filter::size_passes(filter, row.bytes)
+                    && (row.kind_label == "source" || filter::age_passes(filter, row.mtime_max))
             })
             .collect();
         let n = visible.len();
@@ -468,6 +598,11 @@ pub fn tree_rows(
             );
             out_row.kind = row.kind.clone();
             out_row.series = series;
+            out_row.mtime_max = row.mtime_max;
+            if let Some(t) = &row.ecosystem {
+                out_row.badges = slop_livin_core::ecosystem::glyph_for(t).to_string();
+                out_row.ecosystems = vec![t.clone()];
+            }
             // `.git` is git's own store, not content it tracks: annotating
             // it "untracked" is noise, so it carries no status.
             out_row.track = (row.kind_label != "git")
@@ -567,6 +702,9 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             worktree: None,
             track: None,
             series: None,
+            badges: String::new(),
+            ecosystems: Vec::new(),
+            mtime_max: 0,
             collapsed_children: None,
             expandable: false,
         })
@@ -627,37 +765,109 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
 
 /// Builds view: every `BuildOutput`/`Cache` row across the whole root,
 /// same kind set as the CLI's `--view builds` (#33).
-pub fn builds_rows(report: &Report) -> Vec<Row> {
-    kind_filtered_rows(report, &[ArtifactKind::BuildOutput, ArtifactKind::Cache])
+pub fn builds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
+    kind_filtered_rows(
+        report,
+        &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
+        filter,
+    )
 }
 
 /// Deps view: every `DependencyTree` row across the whole root, same as
 /// the CLI's `--view deps`.
-pub fn deps_rows(report: &Report) -> Vec<Row> {
-    kind_filtered_rows(report, &[ArtifactKind::DependencyTree])
+pub fn deps_rows(report: &Report, filter: &Filter) -> Vec<Row> {
+    kind_filtered_rows(report, &[ArtifactKind::DependencyTree], filter)
 }
 
-fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind]) -> Vec<Row> {
+fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) -> Vec<Row> {
     let mut out = Vec::new();
     for p in &report.projects {
+        if !filter::type_passes(filter, p) {
+            continue;
+        }
+        if let Some(name) = filter::project_name(filter)
+            && !slop_livin_core::filter::name_matches(name, &p.name)
+        {
+            continue;
+        }
         for wt in &p.worktrees {
             for a in &wt.artifacts {
-                if !kinds.contains(&a.kind) {
+                if !kinds.contains(&a.kind)
+                    || !filter::size_passes(filter, a.bytes)
+                    || !filter::age_passes(filter, a.mtime_max)
+                    || !passes_filter(a.growth_bytes, filter)
+                {
                     continue;
                 }
                 let mut row = Row::leaf(
                     0,
-                    format!("{} · {} {}", p.name, kind_label(&a.kind), a.path.display()),
+                    format!(
+                        "{} · {} {}",
+                        project_display_name(p),
+                        kind_label(&a.kind),
+                        a.path.display()
+                    ),
                     a.bytes,
                     a.growth_bytes,
                 );
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
+                row.mtime_max = a.mtime_max;
+                if let Some(t) = &a.ecosystem {
+                    row.badges = slop_livin_core::ecosystem::glyph_for(t).to_string();
+                    row.ecosystems = vec![t.clone()];
+                }
                 out.push(row);
             }
         }
     }
     out
+}
+
+/// Types view: one row per ecosystem, with the projects wearing the tag
+/// and the bytes/growth of the artifacts it generates (`Report.summary`).
+pub fn types_rows(report: &Report, filter: &Filter) -> Vec<Row> {
+    let mut rows: Vec<Row> = report
+        .summary
+        .by_type
+        .iter()
+        .filter(|(tag, _)| {
+            filter::type_passes(
+                filter,
+                &slop_livin_core::report::ProjectRow {
+                    project_id: String::new(),
+                    name: String::new(),
+                    worktrees: Vec::new(),
+                    ecosystems: vec![(*tag).clone()],
+                    remote: None,
+                },
+            )
+        })
+        .map(|(tag, t)| {
+            let mut row = Row::leaf(
+                0,
+                format!(
+                    "{} · {} project{} · {} artifact{}",
+                    t.name,
+                    t.projects,
+                    if t.projects == 1 { "" } else { "s" },
+                    t.artifacts,
+                    if t.artifacts == 1 { "" } else { "s" }
+                ),
+                t.bytes,
+                t.growth_bytes,
+            );
+            row.badges = if tag == "other" {
+                String::new()
+            } else {
+                slop_livin_core::ecosystem::glyph_for(tag).to_string()
+            };
+            row.ecosystems = vec![tag.clone()];
+            row
+        })
+        .collect();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows
 }
 
 /// Unowned view.
@@ -846,7 +1056,7 @@ mod tests {
             Row::leaf(0, "b".into(), 20, Some(-50)),
             Row::leaf(0, "c".into(), 30, Some(1)),
         ];
-        apply_sort(&mut rows, Sort::Growth);
+        apply_sort(&mut rows, Sort::Growth, false);
         assert_eq!(rows[0].label, "b");
         assert_eq!(rows[1].label, "a");
         assert_eq!(rows[2].label, "c");
@@ -859,7 +1069,7 @@ mod tests {
             Row::leaf(0, "b".into(), 300, None),
             Row::leaf(0, "c".into(), 20, None),
         ];
-        apply_sort(&mut rows, Sort::Size);
+        apply_sort(&mut rows, Sort::Size, false);
         assert_eq!(rows[0].label, "b");
         assert_eq!(rows[1].label, "c");
         assert_eq!(rows[2].label, "a");
@@ -870,6 +1080,8 @@ mod tests {
             kind,
             path: path.into(),
             bytes,
+            mtime_max: 0,
+            ecosystem: None,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
@@ -936,6 +1148,7 @@ mod tests {
             series_by_key: Default::default(),
             total_series: Vec::new(),
             series_window_secs: 0,
+            summary: Default::default(),
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
@@ -1001,6 +1214,7 @@ mod tests {
             series_by_key: Default::default(),
             total_series: Vec::new(),
             series_window_secs: 0,
+            summary: Default::default(),
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,

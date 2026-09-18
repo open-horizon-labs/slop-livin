@@ -98,7 +98,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(d @ '1'..='5') => {
+        KeyCode::Char(d @ '1'..='8') => {
             if let Some(v) = ViewKind::from_digit(d) {
                 app.set_view(v);
             }
@@ -106,6 +106,10 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('g') => app.set_sort(Sort::Growth),
         KeyCode::Char('s') => app.set_sort(Sort::Size),
         KeyCode::Char('n') => app.set_sort(Sort::Name),
+        KeyCode::Char('t') => app.set_sort(Sort::Type),
+        KeyCode::Char('a') => app.set_sort(Sort::Age),
+        KeyCode::Char('r') => app.toggle_reverse(),
+        KeyCode::Char('k') => app.toggle_keep_executables(),
         KeyCode::Char('?') => app.toggle_help(),
         _ => {}
     }
@@ -187,6 +191,8 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     if !saved.sort.is_empty() {
         app.sort = app::sort_from_str(&saved.sort);
     }
+    app.reverse = saved.reverse;
+    app.keep_executables = saved.keep_executables;
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -263,6 +269,7 @@ mod tests {
             series_by_key: Default::default(),
             total_series: Vec::new(),
             series_window_secs: 0,
+            summary: Default::default(),
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,

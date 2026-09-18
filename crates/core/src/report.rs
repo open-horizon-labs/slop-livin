@@ -87,11 +87,80 @@ pub enum UnownedReason {
     DockerNoJoin,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Summary {
+    pub projects: usize,
+    pub worktrees: usize,
+    pub artifacts: usize,
+    /// Keyed by ecosystem tag (`rs`, `js`, …); `other` for artifacts no
+    /// ecosystem claims (`.cache`, `.git`).
+    pub by_type: std::collections::BTreeMap<String, TypeSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TypeSummary {
+    pub name: String,
+    pub projects: usize,
+    pub artifacts: usize,
+    pub bytes: u64,
+    pub growth_bytes: Option<i64>,
+}
+
+/// Builds [`Summary`] from annotated project rows.
+pub fn summarize(projects: &[ProjectRow]) -> Summary {
+    let mut s = Summary {
+        projects: projects.len(),
+        ..Default::default()
+    };
+    for p in projects {
+        for tag in &p.ecosystems {
+            let e = s.by_type.entry(tag.clone()).or_default();
+            e.name = crate::ecosystem::name_for(tag).unwrap_or(tag).to_string();
+            e.projects += 1;
+        }
+        for wt in &p.worktrees {
+            s.worktrees += 1;
+            for a in &wt.artifacts {
+                if matches!(a.kind, ArtifactKind::Source | ArtifactKind::Git) {
+                    continue;
+                }
+                s.artifacts += 1;
+                let key = a.ecosystem.clone().unwrap_or_else(|| "other".into());
+                let e = s.by_type.entry(key.clone()).or_default();
+                if e.name.is_empty() {
+                    e.name = crate::ecosystem::name_for(&key)
+                        .unwrap_or("other")
+                        .to_string();
+                }
+                e.artifacts += 1;
+                e.bytes += a.bytes;
+                if let Some(g) = a.growth_bytes {
+                    e.growth_bytes = Some(e.growth_bytes.unwrap_or(0) + g);
+                }
+            }
+        }
+    }
+    s
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRow {
     pub kind: ArtifactKind,
     pub path: PathBuf,
     pub bytes: u64,
+    /// Newest file mtime inside the unit (secs since epoch): how long ago
+    /// this artifact was last written. Zero when not recorded (Source
+    /// rows, Docker rows, stores written before this field).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mtime_max: u64,
+    /// Ecosystem tag that generates this artifact (`rs` for `target`,
+    /// `js` for `node_modules`), see `ecosystem::artifact_ecosystem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecosystem: Option<String>,
     /// Bytes with hardlinks deduplicated *within this row only* (a
     /// deterministic per-row figure), unlike `bytes`, where a hardlinked
     /// inode is charged to whichever row the full walk saw first. The
@@ -316,6 +385,10 @@ pub struct Report {
     /// populated when a store directory was supplied.
     #[serde(default)]
     pub schedule_line: Option<String>,
+    /// Per-ecosystem rollup across the root: how many projects wear the
+    /// tag, and the bytes/growth of the artifacts that ecosystem generates.
+    #[serde(default)]
+    pub summary: Summary,
     /// Set only when this call ran live GitHub enrichment (`enrich:
     /// true` -- `slop-livin observe`'s full walk, or `report --enrich`).
     /// `None` for a plain `report` call, which reads `enrich.parquet`
@@ -1024,6 +1097,7 @@ pub fn report_full_mode_with_source(
         }
         None => (Default::default(), Vec::new(), 0),
     };
+    let projects_for_summary = projects.clone();
     let report = Report {
         observed_at,
         root: root.to_path_buf(),
@@ -1044,6 +1118,7 @@ pub fn report_full_mode_with_source(
         dirs_by_worktree,
         files_by_worktree,
         schedule_line,
+        summary: summarize(&projects_for_summary),
         github_enrichment,
     };
     // Cache the rendered report so a surface can paint the last known
@@ -1082,6 +1157,18 @@ pub fn annotate_tracking(
                 continue;
             };
             for a in wt.artifacts.iter_mut() {
+                if a.ecosystem.is_none()
+                    && !matches!(a.kind, ArtifactKind::Source | ArtifactKind::Git)
+                    && let Some(name) = a.path.file_name().and_then(|n| n.to_str())
+                {
+                    a.ecosystem = match a.path.parent() {
+                        Some(parent) => {
+                            crate::ecosystem::artifact_ecosystem_at(parent, &p.ecosystems, name)
+                        }
+                        None => crate::ecosystem::artifact_ecosystem(&p.ecosystems, name),
+                    }
+                    .map(String::from);
+                }
                 if a.kind == ArtifactKind::Git || a.source.tool.starts_with("docker") {
                     continue;
                 }
@@ -1566,6 +1653,8 @@ fn join_docker_facts(
                         kind: candidate.kind,
                         path: PathBuf::from(candidate.reference),
                         bytes: candidate.unique_bytes,
+                        mtime_max: 0,
+                        ecosystem: None,
                         local_bytes: 0,
                         track: None,
                         growth_bytes: None,

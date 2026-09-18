@@ -10,6 +10,7 @@ serde_json.workspace = true
 slop-livin-core = { path = "../core" }
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

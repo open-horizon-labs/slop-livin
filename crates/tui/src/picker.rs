@@ -87,7 +87,15 @@ pub struct Picker {
     pub idle_ix: usize,
     pub merge_complete: bool,
     pub pr_ix: usize,
+    /// Index into `types`; 0 = any.
+    pub type_ix: usize,
+    /// Minimum unit size (`size > X`); index into `SIZES`, 0 = off.
+    pub min_size_ix: usize,
+    /// Artifact age (`age > X`); index into `IDLES`, 0 = off.
+    pub age_ix: usize,
     pub projects: Vec<String>,
+    /// `any` then every ecosystem tag the table knows.
+    pub types: Vec<String>,
     /// Seconds of observation history the store holds; bounds `windows`.
     pub history_secs: Option<u64>,
     pub windows: Vec<String>,
@@ -101,6 +109,9 @@ pub const FIELDS: &[&str] = &[
     "idle",
     "merge-complete",
     "pr",
+    "type",
+    "size",
+    "age",
 ];
 
 impl Picker {
@@ -122,7 +133,17 @@ impl Picker {
             idle_ix: 0,
             merge_complete: false,
             pr_ix: 0,
+            type_ix: 0,
+            min_size_ix: 0,
+            age_ix: 0,
             projects,
+            types: std::iter::once("any".to_string())
+                .chain(
+                    slop_livin_core::ecosystem::ECOSYSTEMS
+                        .iter()
+                        .map(|e| e.tag.to_string()),
+                )
+                .collect(),
             history_secs,
             windows,
         };
@@ -167,6 +188,32 @@ impl Picker {
                         self.idle_ix = ix;
                     }
                     i += 3;
+                }
+                "age" if i + 2 < toks.len() => {
+                    if let Some(ix) = IDLES
+                        .iter()
+                        .position(|d| d.eq_ignore_ascii_case(toks[i + 2]))
+                    {
+                        self.age_ix = ix;
+                    }
+                    i += 3;
+                }
+                "size" if i + 2 < toks.len() => {
+                    if let Some(ix) = SIZES
+                        .iter()
+                        .position(|d| d.eq_ignore_ascii_case(toks[i + 2]))
+                    {
+                        self.min_size_ix = ix;
+                    }
+                    i += 3;
+                }
+                t if t.starts_with("type:") => {
+                    self.type_ix = self
+                        .types
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(&t[5..]))
+                        .unwrap_or(0);
+                    i += 1;
                 }
                 "merge-complete" => {
                     self.merge_complete = true;
@@ -245,6 +292,9 @@ impl Picker {
             4 => self.idle_ix = step(self.idle_ix, IDLES.len(), delta),
             5 => self.merge_complete = !self.merge_complete,
             6 => self.pr_ix = step(self.pr_ix, PRS.len(), delta),
+            7 => self.type_ix = step(self.type_ix, self.types.len(), delta),
+            8 => self.min_size_ix = step(self.min_size_ix, SIZES.len(), delta),
+            9 => self.age_ix = step(self.age_ix, IDLES.len(), delta),
             _ => {}
         }
     }
@@ -311,6 +361,15 @@ impl Picker {
         if self.pr_ix > 0 {
             parts.push(format!("pr:{}", PRS[self.pr_ix]));
         }
+        if self.type_ix > 0 && self.type_ix < self.types.len() {
+            parts.push(format!("type:{}", self.types[self.type_ix]));
+        }
+        if self.min_size_ix > 0 {
+            parts.push(format!("size > {}", SIZES[self.min_size_ix]));
+        }
+        if self.age_ix > 0 {
+            parts.push(format!("age > {}", IDLES[self.age_ix]));
+        }
         if parts.is_empty() {
             "0".into()
         } else {
@@ -373,6 +432,37 @@ impl Picker {
                 self.field == 5,
             ),
             ("pr".into(), PRS[self.pr_ix].into(), self.field == 6),
+            (
+                "type".into(),
+                {
+                    let t = self.types.get(self.type_ix).cloned().unwrap_or_default();
+                    match slop_livin_core::ecosystem::name_for(&t) {
+                        Some(n) => {
+                            format!("{} {t} ({n})", slop_livin_core::ecosystem::glyph_for(&t))
+                        }
+                        None => t,
+                    }
+                },
+                self.field == 7,
+            ),
+            (
+                "size".into(),
+                if self.min_size_ix == 0 {
+                    "any".to_string()
+                } else {
+                    format!("larger than {}", SIZES[self.min_size_ix])
+                },
+                self.field == 8,
+            ),
+            (
+                "age".into(),
+                if self.age_ix == 0 {
+                    "any".to_string()
+                } else {
+                    format!("not written for {}", IDLES[self.age_ix])
+                },
+                self.field == 9,
+            ),
         ]
     }
 }
@@ -392,8 +482,8 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
         cands.extend(
             slop_livin_core::ecosystem::ECOSYSTEMS
                 .iter()
-                .map(|(tag, _, _)| *tag)
-                .filter(|x| x.starts_with(&t.to_ascii_lowercase()))
+                .map(|e| e.tag)
+                .filter(|x| x.starts_with(t.to_ascii_lowercase().as_str()))
                 .map(|x| format!("type:{x}")),
         );
     } else if let Some(k) = last.strip_prefix("kind:") {
@@ -435,7 +525,9 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
         let after = |n: usize| prev.len() >= n;
         // contextual: after "growth >" expect a size; after "in" or "idle >" a duration
         if after(2) && prev[prev.len() - 1] == "in"
-            || (after(2) && prev[prev.len() - 2] == "idle" && prev[prev.len() - 1] == ">")
+            || (after(2)
+                && (prev[prev.len() - 2] == "idle" || prev[prev.len() - 2] == "age")
+                && prev[prev.len() - 1] == ">")
         {
             cands.extend(
                 WINDOW_LADDER
@@ -446,7 +538,7 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
                     .map(|x| x.to_string()),
             );
         } else if after(2)
-            && prev[prev.len() - 2] == "growth"
+            && (prev[prev.len() - 2] == "growth" || prev[prev.len() - 2] == "size")
             && (prev[prev.len() - 1] == ">" || prev[prev.len() - 1] == "<")
         {
             cands.extend(
@@ -468,6 +560,8 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
                     "merge-complete",
                     "pr:",
                     "type:",
+                    "size > ",
+                    "age > ",
                 ]
                 .iter()
                 .filter(|x| x.starts_with(last))
@@ -528,7 +622,11 @@ mod tests {
             idle_ix: 2,
             merge_complete: true,
             pr_ix: 1,
+            type_ix: 0,
+            min_size_ix: 0,
+            age_ix: 0,
             projects: vec!["mole".into(), "roon-knob".into()],
+            types: vec!["any".into(), "rs".into()],
             history_secs: Some(30 * 86_400),
             windows: windows_for(Some(30 * 86_400)),
         };
@@ -550,6 +648,11 @@ mod tests {
         p.merge_complete = false;
         p.pr_ix = 0;
         assert_eq!(p.compose(), "0");
+        p.type_ix = 1;
+        p.min_size_ix = 5;
+        p.age_ix = 3;
+        assert_eq!(p.compose(), "type:rs size > 500MB age > 7d");
+        assert!(slop_livin_core::filter::parse(&p.compose()).is_ok());
     }
 
     #[test]
@@ -574,11 +677,12 @@ mod tests {
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
+            summary: Default::default(),
             github_enrichment: None,
         };
         let p = Picker::from_report(
             &report,
-            "growth < 1GB in 30d idle > 7d merge-complete",
+            "growth < 1GB in 30d idle > 7d merge-complete type:py size > 10MB age > 30d",
             Some(90 * 86_400),
         );
         assert!(!p.growth_gt);
@@ -586,6 +690,9 @@ mod tests {
         assert_eq!(p.windows[p.window_ix], "30d");
         assert_eq!(IDLES[p.idle_ix], "7d");
         assert!(p.merge_complete);
+        assert_eq!(p.types[p.type_ix], "py");
+        assert_eq!(SIZES[p.min_size_ix], "10MB");
+        assert_eq!(IDLES[p.age_ix], "30d");
         let p0 = Picker::from_report(&report, "0", Some(90 * 86_400));
         assert_eq!(p0.compose(), "0");
     }

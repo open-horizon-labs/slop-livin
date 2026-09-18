@@ -13,9 +13,16 @@
 //! growth > <size> in <duration>   (e.g. "growth > 10MB in 24h")
 //! growth < <size> in <duration>
 //! kind:<artifact-kind>
-//! project:<name>
+//! project:<name>              (substring, or a glob with * and ?)
+//! type:<ecosystem>            (rs|rust, js|node, py|python, …)
+//! size > <size>               (unit bytes; on a project row its total)
+//! size < <size>
+//! age > <duration>            (time since the artifact was last written)
 //! pr:open|merged|closed|none
 //! ```
+//!
+//! Sizes: `500MB`, `1.5GB` are decimal (×1000, matching the formatter);
+//! `500MiB`, `1.5GiB` are binary (×1024); a bare number is bytes.
 
 use crate::github::{MergedStatus, PrStatus};
 use crate::growth::parse_duration_secs;
@@ -36,6 +43,14 @@ pub enum Predicate {
     /// Ecosystem tag on the project (`type:rust`, `type:js`), see
     /// `ecosystem::ECOSYSTEMS`; the human names accepted too.
     Type(String),
+    /// Bytes of the unit (an artifact, a worktree's total, a project's total).
+    Size {
+        greater: bool,
+        bytes: u64,
+    },
+    /// Seconds since the artifact was last written (`mtime_max`). An
+    /// artifact with no recorded mtime never passes: unknown is not old.
+    AgeGreaterThan(u64),
     Pr(PrFilter),
 }
 
@@ -65,22 +80,54 @@ pub struct WorktreeFacts<'a> {
     pub merged: &'a MergedStatus,
 }
 
-fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
+/// `500MB` / `1.5GB` decimal (×1000, the same base the formatter prints
+/// in), `500MiB` / `1.5GiB` binary (×1024), `KB`/`K` accepted, a bare
+/// number is bytes. Public so the CLI's `--budget` and `--keep-size`-style
+/// flags parse the one way.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().replace(',', "");
     let upper = s.to_uppercase();
-    let (num_part, mult): (&str, u64) = if let Some(n) = upper.strip_suffix("GB") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = upper.strip_suffix("MB") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = upper.strip_suffix("KB") {
-        (n, 1024)
-    } else if let Some(n) = upper.strip_suffix('B') {
-        (n, 1)
-    } else {
-        (upper.as_str(), 1)
-    };
+    const UNITS: &[(&str, u64)] = &[
+        ("TIB", 1 << 40),
+        ("GIB", 1 << 30),
+        ("MIB", 1 << 20),
+        ("KIB", 1 << 10),
+        ("TB", 1_000_000_000_000),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+        ("KB", 1_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("K", 1_000),
+        ("B", 1),
+    ];
+    let (num_part, mult) = UNITS
+        .iter()
+        .find_map(|(u, m)| upper.strip_suffix(u).map(|n| (n, *m)))
+        .unwrap_or((upper.as_str(), 1));
     let n: f64 = num_part.trim().parse().ok()?;
-    Some((n * mult as f64) as u64)
+    (n >= 0.0).then_some((n * mult as f64) as u64)
+}
+
+/// `project:` values are substrings unless they carry `*` or `?`, then
+/// they are globs over the whole name (case-insensitive either way).
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    if !p.contains('*') && !p.contains('?') {
+        return n.contains(&p);
+    }
+    fn glob(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => glob(&p[1..], n) || (!n.is_empty() && glob(p, &n[1..])),
+            (Some(b'?'), Some(_)) => glob(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => glob(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    glob(p.as_bytes(), n.as_bytes())
 }
 
 /// Parses a filter expression into a `Filter`. Tokens are whitespace
@@ -146,6 +193,40 @@ pub fn parse(input: &str) -> Result<Filter> {
                 within_secs,
             });
             i += 5;
+        } else if tok == "size" {
+            let op = tokens
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("filter: 'size' needs an operator, e.g. 'size > 500MB'"))?;
+            let greater = match *op {
+                ">" => true,
+                "<" => false,
+                other => {
+                    return Err(anyhow!(
+                        "filter: 'size' only supports '>'/'<', got {other:?}"
+                    ));
+                }
+            };
+            let size_tok = tokens
+                .get(i + 2)
+                .ok_or_else(|| anyhow!("filter: 'size {op}' needs a size, e.g. '500MB'"))?;
+            let bytes =
+                parse_size(size_tok).ok_or_else(|| anyhow!("filter: invalid size {size_tok:?}"))?;
+            predicates.push(Predicate::Size { greater, bytes });
+            i += 3;
+        } else if tok == "age" {
+            let op = tokens
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("filter: 'age' needs an operator, e.g. 'age > 30d'"))?;
+            if *op != ">" {
+                return Err(anyhow!("filter: 'age' only supports '>', got {op:?}"));
+            }
+            let dur_tok = tokens
+                .get(i + 2)
+                .ok_or_else(|| anyhow!("filter: 'age >' needs a duration, e.g. '30d'"))?;
+            let secs = parse_duration_secs(dur_tok)
+                .ok_or_else(|| anyhow!("filter: invalid duration {dur_tok:?}"))?;
+            predicates.push(Predicate::AgeGreaterThan(secs));
+            i += 3;
         } else if let Some(k) = tok.strip_prefix("kind:") {
             if k.is_empty() {
                 return Err(anyhow!("filter: 'kind:' needs a value"));
@@ -234,8 +315,21 @@ impl Filter {
                 .artifacts
                 .iter()
                 .any(|a| kind_matches(&a.kind, name)),
-            Predicate::Project(name) => project.name.eq_ignore_ascii_case(name),
+            Predicate::Project(name) => name_matches(name, &project.name),
             Predicate::Type(t) => project_has_type(project, t),
+            Predicate::Size { greater, bytes } => {
+                let total: u64 = worktree.artifacts.iter().map(|a| a.bytes).sum();
+                if *greater {
+                    total > *bytes
+                } else {
+                    total < *bytes
+                }
+            }
+            // Age is a fact about an artifact; a worktree passes when any
+            // of its artifacts is that old.
+            Predicate::AgeGreaterThan(secs) => worktree.artifacts.iter().any(|a| {
+                a.mtime_max > 0 && crate::entities::now().saturating_sub(a.mtime_max) > *secs
+            }),
             Predicate::Pr(want) => match (want, facts.pr) {
                 (PrFilter::None, PrStatus::None) => true,
                 (PrFilter::Open, PrStatus::Some(pr)) => {
@@ -277,15 +371,73 @@ impl Filter {
                 None => false,
             },
             Predicate::Kind(name) => kind_matches(&artifact.kind, name),
-            Predicate::Project(name) => project.name.eq_ignore_ascii_case(name),
+            Predicate::Project(name) => name_matches(name, &project.name),
             Predicate::Type(t) => project_has_type(project, t),
+            Predicate::Size { greater, bytes } => {
+                if *greater {
+                    artifact.bytes > *bytes
+                } else {
+                    artifact.bytes < *bytes
+                }
+            }
+            Predicate::AgeGreaterThan(secs) => {
+                artifact.mtime_max > 0
+                    && crate::entities::now().saturating_sub(artifact.mtime_max) > *secs
+            }
         })
     }
+}
+
+/// Whether `bytes` (a rollup: a project's or worktree's total) passes the
+/// filter's `size` predicates. Other predicates are not consulted.
+pub fn size_passes(filter: &Filter, bytes: u64) -> bool {
+    filter.predicates.iter().all(|p| match p {
+        Predicate::Size { greater, bytes: b } => {
+            if *greater {
+                bytes > *b
+            } else {
+                bytes < *b
+            }
+        }
+        _ => true,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_are_decimal_unless_binary_is_asked_for() {
+        assert_eq!(parse_size("500MB"), Some(500_000_000));
+        assert_eq!(parse_size("1.5GB"), Some(1_500_000_000));
+        assert_eq!(parse_size("1GiB"), Some(1 << 30));
+        assert_eq!(parse_size("2KiB"), Some(2048));
+        assert_eq!(parse_size("1,000"), Some(1000));
+        assert_eq!(parse_size("10k"), Some(10_000));
+        assert_eq!(parse_size("x"), None);
+    }
+
+    #[test]
+    fn size_and_age_and_glob_predicates_parse() {
+        let f = parse("size > 500MB age > 30d project:my-app*").unwrap();
+        assert_eq!(
+            f.predicates,
+            vec![
+                Predicate::Size {
+                    greater: true,
+                    bytes: 500_000_000
+                },
+                Predicate::AgeGreaterThan(30 * 86400),
+                Predicate::Project("my-app*".into()),
+            ]
+        );
+        assert!(name_matches("my-app*", "my-app-v2"));
+        assert!(!name_matches("my-app*", "other-my-app"));
+        assert!(name_matches("app", "my-app-v2"));
+        assert!(name_matches("regex?", "REGEXX"));
+        assert!(parse("size >= 1MB").is_err());
+    }
 
     #[test]
     fn round_trips_merge_complete() {
@@ -306,7 +458,7 @@ mod tests {
             f.predicates,
             vec![Predicate::Growth {
                 greater: true,
-                bytes: 10 * 1024 * 1024,
+                bytes: 10_000_000,
                 within_secs: 24 * 3600
             }]
         );

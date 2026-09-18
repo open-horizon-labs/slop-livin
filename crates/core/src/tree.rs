@@ -39,6 +39,10 @@ pub struct TreeRow {
     pub growth_bytes: Option<i64>,
     /// > 1 when this row folds several artifacts sharing a parent dir.
     pub folded_count: u32,
+    /// Newest file mtime inside the unit (0 unknown); max over a fold.
+    pub mtime_max: u64,
+    /// Ecosystem tag that generates this artifact, when one does.
+    pub ecosystem: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,8 +137,11 @@ fn build_rows(worktree_root: &Path, artifacts: &[ArtifactRow]) -> Vec<TreeRow> {
                 bytes: 0,
                 growth_bytes: None,
                 folded_count: 0,
+                mtime_max: 0,
+                ecosystem: None,
             });
             entry.bytes += a.bytes;
+            entry.mtime_max = entry.mtime_max.max(a.mtime_max);
             entry.folded_count += 1;
             if let Some(g) = a.growth_bytes {
                 entry.growth_bytes = Some(entry.growth_bytes.unwrap_or(0) + g);
@@ -147,6 +154,8 @@ fn build_rows(worktree_root: &Path, artifacts: &[ArtifactRow]) -> Vec<TreeRow> {
                 bytes: a.bytes,
                 growth_bytes: a.growth_bytes,
                 folded_count: 1,
+                mtime_max: a.mtime_max,
+                ecosystem: a.ecosystem.clone(),
             });
         }
     }

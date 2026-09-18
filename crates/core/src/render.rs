@@ -174,11 +174,91 @@ fn header(report: &Report, verify_du: bool) -> String {
 /// The zero-flag, one-screen overview: header, then one line per project
 /// sorted by growth desc then bytes desc, capped at `top_n` rows (0 means
 /// no cap) with a "… and N more" footer.
+/// How `render_overview` orders project rows. `Growth` is the default the
+/// tool always had (growth desc, then bytes); the rest mirror the TUI's
+/// `g/s/n/t/a` keys and clean-dev-dirs' `--sort size|age|name|type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverviewSort {
+    #[default]
+    Growth,
+    Size,
+    Name,
+    Type,
+    Age,
+}
+
+impl std::str::FromStr for OverviewSort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "growth" => OverviewSort::Growth,
+            "size" | "bytes" => OverviewSort::Size,
+            "name" => OverviewSort::Name,
+            "type" => OverviewSort::Type,
+            "age" => OverviewSort::Age,
+            other => {
+                return Err(format!(
+                    "unknown sort {other:?}; use growth|size|name|type|age"
+                ));
+            }
+        })
+    }
+}
+
 pub fn render_overview(
     report: &Report,
     show_all: bool,
     verify_du: bool,
     show_docker: bool,
+) -> String {
+    render_overview_sorted(
+        report,
+        show_all,
+        verify_du,
+        show_docker,
+        OverviewSort::Growth,
+        false,
+    )
+}
+
+/// `--view types`: one line per ecosystem from `Report.summary`.
+pub fn render_types(report: &Report) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<6} {:<14} {:>9} {:>10} {:>12} {:>10}",
+        "type", "name", "projects", "artifacts", "bytes", "growth"
+    );
+    let mut rows: Vec<_> = report.summary.by_type.iter().collect();
+    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+    if rows.is_empty() {
+        let _ = writeln!(out, "0");
+        return out;
+    }
+    for (tag, t) in rows {
+        let _ = writeln!(
+            out,
+            "{:<6} {:<14} {:>9} {:>10} {:>12} {:>10}",
+            tag,
+            t.name,
+            t.projects,
+            t.artifacts,
+            human_bytes(t.bytes),
+            t.growth_bytes
+                .map(human_signed_bytes)
+                .unwrap_or_else(|| "—".to_string())
+        );
+    }
+    out
+}
+
+pub fn render_overview_sorted(
+    report: &Report,
+    show_all: bool,
+    verify_du: bool,
+    show_docker: bool,
+    sort: OverviewSort,
+    reverse: bool,
 ) -> String {
     let mut out = header(report, verify_du);
     let _ = writeln!(out);
@@ -193,16 +273,47 @@ pub fn render_overview(
         .iter()
         .map(|p| (p, project_totals(p)))
         .collect();
-    rows.sort_by(|a, b| {
-        let ga = a.1.growth.unwrap_or(i64::MIN);
-        let gb = b.1.growth.unwrap_or(i64::MIN);
-        gb.cmp(&ga).then_with(|| b.1.bytes.cmp(&a.1.bytes))
-    });
+    let type_rank = |p: &crate::report::ProjectRow| {
+        p.ecosystems
+            .first()
+            .and_then(|t| crate::ecosystem::ECOSYSTEMS.iter().position(|e| e.tag == t))
+            .unwrap_or(usize::MAX)
+    };
+    let age_key = |p: &crate::report::ProjectRow| {
+        let m = p
+            .worktrees
+            .iter()
+            .flat_map(|w| w.artifacts.iter())
+            .map(|a| a.mtime_max)
+            .max()
+            .unwrap_or(0);
+        if m == 0 { u64::MAX } else { m }
+    };
+    match sort {
+        OverviewSort::Growth => rows.sort_by(|a, b| {
+            let ga = a.1.growth.unwrap_or(i64::MIN);
+            let gb = b.1.growth.unwrap_or(i64::MIN);
+            gb.cmp(&ga).then_with(|| b.1.bytes.cmp(&a.1.bytes))
+        }),
+        OverviewSort::Size => rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes)),
+        OverviewSort::Name => {
+            rows.sort_by(|a, b| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
+        }
+        OverviewSort::Type => rows.sort_by(|a, b| {
+            type_rank(a.0)
+                .cmp(&type_rank(b.0))
+                .then_with(|| b.1.bytes.cmp(&a.1.bytes))
+        }),
+        OverviewSort::Age => rows.sort_by(|a, b| age_key(a.0).cmp(&age_key(b.0))),
+    }
+    if reverse {
+        rows.reverse();
+    }
 
     let _ = writeln!(
         out,
-        "{:<28} {:>10} {:>10} {:>4} {:<20}",
-        "project", "bytes", "growth", "wts", "top kind"
+        "{:<10} {:<28} {:>10} {:>10} {:>4} {:<20}",
+        "type", "project", "bytes", "growth", "wts", "top kind"
     );
     let total = rows.len();
     let limit = if show_all { total } else { DEFAULT_TOP_N };
@@ -223,8 +334,13 @@ pub fn render_overview(
         };
         let _ = writeln!(
             out,
-            "{:<28} {:>10} {:>10} {:>4} {:<20}",
-            project.name, bytes_str, growth_str, totals.worktrees, top_kind_str
+            "{:<10} {:<28} {:>10} {:>10} {:>4} {:<20}",
+            crate::ecosystem::tags(&project.ecosystems),
+            project.name,
+            bytes_str,
+            growth_str,
+            totals.worktrees,
+            top_kind_str
         );
     }
     if !show_all && total > limit {

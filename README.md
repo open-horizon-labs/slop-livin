@@ -56,10 +56,11 @@ Opens in milliseconds from the last observation and refreshes in the background.
 | `Enter` | open a project (in the projects view); confirm a delete |
 | `Space` | mark / unmark the row |
 | `⌫` | delete what is under the cursor (or the marked rows), after one confirm |
-| `/` | filter form: growth, window, kind, project, idle, merge-complete, PR |
+| `/` | filter form: growth, window, kind, project, idle, merge-complete, PR, type, size, age |
 | `:` | filter as text, with Tab completion |
-| `v` `1`–`7` | views: projects · tree · builds · deps · docker · kinds · unowned |
-| `g` `s` | sort by growth / size |
+| `v` `1`–`8` | views: projects · tree · builds · deps · docker · kinds · unowned · types |
+| `g` `s` `n` `t` `a` | sort by growth / size / name / type / age; `r` reverses |
+| `k` | keep executables: before trashing `target/` copy its `release`/`debug` binaries to `bin/`; `dist/*.whl` and `build/**/*.so` likewise |
 | `Esc` | back to projects |
 | `?` | help |
 
@@ -84,7 +85,16 @@ slop-livin report ~/src --view reconciliation             # attributed + unowned
 slop-livin report ~/src --json
 ```
 
-Filter grammar, shared by the CLI, the TUI and the MCP tools: `growth > 500MB in 30d` · `kind:BuildOutput` · `project:mole` · `idle > 48h` · `merge-complete` · `pr:open|merged|closed|none`.
+Every project row wears its ecosystems as glyphs, from the markers at the checkout root: 🦀 Rust · ⬢ Node · 🦕 Deno · 🐍 Python · 🐹 Go · ☕ JVM · 🔺 Scala · 🔧 C/C++ · 🐦 Swift · 🟣 .NET · 💎 Ruby · 💧 Elixir · 🐘 PHP · λ Haskell · 🎯 Dart · ⚡ Zig · 🌍 Terraform · 🐳 Docker · 🎲 Unity · 🎮 Unreal, plus 🔨 when it holds build output and ⎇N for N linked worktrees. A checkout can be several at once.
+
+```bash
+slop-livin report ~/src --sort size --reverse             # smallest first; also name, type, age
+slop-livin report ~/src --view types                      # per ecosystem: projects, artifacts, bytes, growth
+slop-livin execute <plan> --keep-executables              # copy compiled outputs to bin/ before trashing
+slop-livin config show | path | init                      # the config file, spelled out
+```
+
+Filter grammar, shared by the CLI, the TUI and the MCP tools: `growth > 500MB in 30d` · `size > 500MB` · `age > 30d` · `kind:BuildOutput` · `project:mole` (or a glob, `project:my-app*`) · `type:rust` · `idle > 48h` · `merge-complete` · `pr:open|merged|closed|none`. Sizes are decimal (`500MB` is 500,000,000 bytes, the same base the tool prints in); write `500MiB` for binary. `age` is time since an artifact was last written; `idle` is time since a worktree's last commit or edit.
 
 ### Agent (MCP)
 
@@ -114,6 +124,8 @@ There is no MCP tool that writes a grant. That is the design, not an omission.
 
 **Projects, not paths.** A project is its git object store, unified across clones by remote, so two checkouts of `roon-knob` in different directories are one project with two checkouts and their linked worktrees. Rows are named `owner/repo`.
 
+**Project types from markers, artifacts from types.** `Cargo.toml` makes a checkout Rust, `package.json` Node, `pyproject.toml` Python, and so on for twenty ecosystems; the same table says which directories each one generates. Unambiguous names (`node_modules`, `target`, `.venv`, `.stack-work`) are artifacts anywhere. Names several tools use (`build`, `dist`, `vendor`, `bin`, `obj`, `out`, `*.egg-info`) count only next to a marker of an ecosystem that generates them, so a repo's hand-written `build/` directory is source, and `.NET`'s `bin/` is build output. This is clean-dev-dirs' per-language detection, kept as a table so the CLI, the TUI, the MCP server and the filter all read one truth. A checkout with no remote is named from its manifest (`[package] name`, `"name"`, `module`, `<artifactId>`, …) instead of its directory.
+
 **Artifacts as units.** `node_modules`, `target`, `build`, `dist`, `.venv`, `.cache`, `.git` and friends are folded: sized as one unit, never descended, attributed to the nearest containing checkout. Deleting one is one action. Everything that isn't an artifact is the worktree's `source`, which expands into its own directories.
 
 **Git status on every row.** `tracked`, `ignored`, or `untracked` — from git's own exclude rules via gitoxide, verified against `git check-ignore`. Untracked bytes are the ones no clone brings back.
@@ -142,7 +154,10 @@ There is no MCP tool that writes a grant. That is the design, not an omission.
 
 | | slop-livin | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [clean-dev-dirs](https://github.com/clean-dev-dirs/clean-dev-dirs) | [cargo-sweep](https://github.com/holmgr/cargo-sweep) | [Mole](https://github.com/tw93/Mole) | StorageRadar | DaisyDisk |
 |---|---|---|---|---|---|---|---|---|
-| Finds build/deps artifacts | ✓ ~50 names, 20+ ecosystems, marker-gated where the name is ambiguous | ✓ 20+ types | node_modules | ✓ 16 ecosystems | Cargo `target/` | ✓ (purge) | | |
+| Finds build/deps artifacts | ✓ ~50 names, 20 ecosystems, marker-gated where the name is ambiguous | ✓ 20+ types | node_modules | ✓ 16 ecosystems | Cargo `target/` | ✓ (purge) | | |
+| Project type on every row, filter and sort by it | ✓ glyph badges, `type:` filter, `t` sort, per-type view | ✓ tag | | ✓ tag, `-p`, `--sort type` | | | | |
+| Size / age thresholds | ✓ `size >`, `age >`, in TUI form and filter | | ✓ | ✓ `--keep-size`, `--keep-days` | ✓ `--time` | | | |
+| Keep compiled outputs before deleting | ✓ `k` / `--keep-executables` (Rust, Python) | | | ✓ `-k` (Rust, Python) | | | | |
 | Growth over time | ✓ persistent, any window | | | | | | manual snapshots | |
 | Project → worktree → artifact model | ✓ | project | | project | | | directories | directories |
 | Git status per row (tracked/ignored/untracked) | ✓ | | | | | | | |

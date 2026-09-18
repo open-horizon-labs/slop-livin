@@ -130,8 +130,17 @@ fn tool_report(params: &Value) -> Result<Value> {
         .map(String::from);
     let view = args.get("view").and_then(Value::as_str).map(String::from);
     let dirs = args.get("dirs").and_then(Value::as_bool).unwrap_or(false);
+    let filter = match args.get("filter").and_then(Value::as_str) {
+        Some(f) if !f.trim().is_empty() && f.trim() != "0" => {
+            Some(slop_livin_core::filter::parse(f)?)
+        }
+        _ => None,
+    };
 
-    let r = run_report_dirs(&root, since.as_deref(), dirs)?;
+    let mut r = run_report_dirs(&root, since.as_deref(), dirs)?;
+    if let Some(f) = &filter {
+        apply_filter_to_report(&mut r, f);
+    }
 
     if let Some(view) = view.as_deref() {
         let payload = view_payload(&r, view, project.as_deref());
@@ -185,8 +194,140 @@ fn tool_report(params: &Value) -> Result<Value> {
 /// `only_project` when set. Mirrors `render.rs`'s `render_view_*`
 /// functions' selection logic so the CLI and MCP agree on what each view
 /// means, just serialized instead of formatted as text.
+/// Narrows a report in place to what a filter admits: a project stays
+/// when it passes the project-level predicates (`type:`, `project:`,
+/// `size` on its total) and at least one artifact passes the artifact
+/// predicates (`kind:`, `growth`, `size`, `age`); artifacts that fail are
+/// dropped from the kept projects. Worktree predicates (`idle`,
+/// `merge-complete`, `pr:`) keep a project when any worktree passes.
+fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
+    use slop_livin_core::filter::Predicate;
+    let has_artifact_preds = f.predicates.iter().any(|p| {
+        matches!(
+            p,
+            Predicate::Kind(_)
+                | Predicate::Growth { .. }
+                | Predicate::Size { .. }
+                | Predicate::AgeGreaterThan(_)
+        )
+    });
+    let has_wt_preds = f.predicates.iter().any(|p| {
+        matches!(
+            p,
+            Predicate::IdleGreaterThan(_) | Predicate::MergeComplete | Predicate::Pr(_)
+        )
+    });
+    r.projects.retain_mut(|p| {
+        let project_level = f.predicates.iter().all(|pred| match pred {
+            Predicate::Project(name) => slop_livin_core::filter::name_matches(name, &p.name),
+            Predicate::Type(_) => {
+                let probe = p.clone();
+                slop_livin_core::filter::Filter {
+                    predicates: vec![pred.clone()],
+                }
+                .matches_artifact(&probe, &dummy_artifact())
+            }
+            _ => true,
+        });
+        if !project_level {
+            return false;
+        }
+        if has_wt_preds {
+            let any = p.worktrees.iter().any(|wt| {
+                let merge_complete = wt
+                    .merge_complete
+                    .as_ref()
+                    .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes);
+                let unknown = slop_livin_core::github::PrStatus::Unknown;
+                let none = slop_livin_core::github::MergedStatus::Unknown;
+                let facts = slop_livin_core::filter::WorktreeFacts {
+                    merge_complete,
+                    idle_secs: wt.idle_secs,
+                    pr: wt
+                        .github
+                        .as_ref()
+                        .map(|g| &g.pull_request)
+                        .unwrap_or(&unknown),
+                    merged: wt.github.as_ref().map(|g| &g.merged).unwrap_or(&none),
+                };
+                slop_livin_core::filter::Filter {
+                    predicates: f
+                        .predicates
+                        .iter()
+                        .filter(|q| {
+                            matches!(
+                                q,
+                                Predicate::IdleGreaterThan(_)
+                                    | Predicate::MergeComplete
+                                    | Predicate::Pr(_)
+                            )
+                        })
+                        .cloned()
+                        .collect(),
+                }
+                .matches_worktree(p, wt, &facts)
+            });
+            if !any {
+                return false;
+            }
+        }
+        if has_artifact_preds {
+            let snapshot = p.clone();
+            let mut any = false;
+            for wt in &mut p.worktrees {
+                wt.artifacts.retain(|a| {
+                    let keep = slop_livin_core::filter::Filter {
+                        predicates: f
+                            .predicates
+                            .iter()
+                            .filter(|q| {
+                                matches!(
+                                    q,
+                                    Predicate::Kind(_)
+                                        | Predicate::Growth { .. }
+                                        | Predicate::Size { .. }
+                                        | Predicate::AgeGreaterThan(_)
+                                )
+                            })
+                            .cloned()
+                            .collect(),
+                    }
+                    .matches_artifact(&snapshot, a);
+                    any |= keep;
+                    keep
+                });
+            }
+            return any;
+        }
+        true
+    });
+}
+
+fn dummy_artifact() -> slop_livin_core::report::ArtifactRow {
+    slop_livin_core::report::ArtifactRow {
+        kind: ArtifactKind::Source,
+        path: Default::default(),
+        bytes: 0,
+        mtime_max: 0,
+        ecosystem: None,
+        local_bytes: 0,
+        track: None,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: 0,
+        confidence: slop_livin_core::entities::Confidence::High,
+        source: slop_livin_core::report::Source::new("filter"),
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+    }
+}
+
 fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value {
     match view {
+        "types" => serde_json::to_value(&r.summary.by_type).unwrap_or(Value::Null),
         "kinds" => {
             let mut agg: std::collections::BTreeMap<&'static str, (u64, u64)> =
                 std::collections::BTreeMap::new();
@@ -677,7 +818,19 @@ fn tool_execute(params: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("plan_id is required"))?;
-    let res = slop_livin_core::actions::execute(&slop_livin_dir(), plan_id, "agent:mcp")?;
+    let keep = args
+        .get("keep_executables")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let res = if keep {
+        slop_livin_core::actions::execute_keeping_executables(
+            &slop_livin_dir(),
+            plan_id,
+            "agent:mcp",
+        )?
+    } else {
+        slop_livin_core::actions::execute(&slop_livin_dir(), plan_id, "agent:mcp")?
+    };
     Ok(serde_json::to_value(&res)?)
 }
 
@@ -713,7 +866,8 @@ fn main() -> Result<()> {
                             "root":{"type":"string","description":"Root directory to report on (default: '.')"},
                             "since":{"type":"string","description":"Growth baseline window, e.g. '24h', '7d'"},
                             "project":{"type":"string","description":"Scope the report to one project by name"},
-                            "view":{"type":"string","description":"Named view instead of the full structure: worktrees, builds, deps, docker, kinds, unowned, reconciliation"},
+                            "view":{"type":"string","description":"Named view instead of the full structure: worktrees, builds, deps, docker, kinds, types, unowned, reconciliation"},
+                            "filter":{"type":"string","description":"Filter expression, same grammar as the CLI/TUI: growth > 500MB in 30d · kind:BuildOutput · project:<name|glob*> · type:rs|js|py|… · size > 500MB · age > 30d · idle > 48h · merge-complete · pr:open|merged|closed|none. Applied to list_projects-style rows and to builds/deps/worktrees views"},
                             "dirs":{"type":"boolean","description":"Include per-directory rollups under each worktree's Source tree (dirs_by_worktree), each with its git tracking status"}
                         }}
                     },
@@ -756,7 +910,8 @@ fn main() -> Result<()> {
                         "name":"execute",
                         "description":"Execute a plan that a human has authorized (slop-livin approve <plan_id> or a standing grant). Every unit is re-derived at the sink (still an artifact dir, no activity since the plan, not occupied) and moved to Trash; per-unit outcomes name the fact behind any refusal; the ledger records actor=agent:mcp. Returns awaiting-authorization with the approve command when no grant covers the plan. This tool cannot authorize anything.",
                         "inputSchema":{"type":"object","required":["plan_id"],"properties":{
-                            "plan_id":{"type":"string"}
+                            "plan_id":{"type":"string"},
+                            "keep_executables":{"type":"boolean","description":"Before trashing a build directory, copy compiled outputs to <worktree>/bin/ (Rust target/{release,debug} executables, Python dist/*.whl and build/**/*.so). Outcomes list what was kept under `preserved`"}
                         }}
                     },
                     {
@@ -832,6 +987,8 @@ mod tests {
             kind: ArtifactKind::DockerImage,
             path: PathBuf::from(reference),
             bytes,
+            mtime_max: 0,
+            ecosystem: None,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
@@ -886,6 +1043,7 @@ mod tests {
             series_by_key: Default::default(),
             total_series: Vec::new(),
             series_window_secs: 0,
+            summary: Default::default(),
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,

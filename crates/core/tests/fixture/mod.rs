@@ -130,7 +130,10 @@ pub fn build(tmp: &Path) -> Fixture {
     let target_dir = checkout.join("target");
     let target_bytes = write_files(&target_dir, 4, 2 * 1024 * 1024);
 
-    // dist/: ~1 MB
+    // dist/: ~1 MB. `dist` is an artifact only next to a marker of an
+    // ecosystem that generates it; this checkout is a Node project.
+    fs::write(checkout.join("package.json"), b"{\"name\": \"fixture\"}\n")
+        .expect("write package.json");
     let dist_dir = checkout.join("dist");
     let dist_bytes = write_files(&dist_dir, 2, 1024 * 1024);
 
@@ -170,6 +173,9 @@ pub fn build(tmp: &Path) -> Fixture {
         .expect("write nested README");
     run_git(&nested_repo, &["add", "README.md"]);
     run_git(&nested_repo, &["commit", "-q", "-m", "initial commit"]);
+    // `build/` counts as an artifact next to a CMake marker.
+    fs::write(nested_repo.join("CMakeLists.txt"), b"project(nested)\n")
+        .expect("write CMakeLists.txt");
     let nested_repo_build = nested_repo.join("build");
     let nested_repo_build_bytes = write_files(&nested_repo_build, 2, 512 * 1024);
 

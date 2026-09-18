@@ -75,6 +75,26 @@ impl Default for GrowthConfig {
     }
 }
 
+impl GrowthConfig {
+    /// The file contents that reproduce this configuration, every key
+    /// written out with its meaning, so `config init` leaves something a
+    /// human can edit.
+    pub fn to_toml(&self) -> String {
+        format!(
+            "# slop-livin configuration. Every key is optional; these are the effective values.\n\
+# How far back growth is measured by default (\"24h\", \"7d\"); --since overrides per call.\n\
+since = \"{}\"\n\
+# Days of observation history kept in the store before deltas are pruned.\n\
+retention_days = {}\n\
+# Files at least this large are tracked individually under --dirs.\n\
+large_file_min_bytes = {}\n\
+# Watchdog budget for one `observe` run, in seconds.\n\
+observe_timeout_sec = {}\n",
+            self.since, self.retention_days, self.large_file_min_bytes, self.observe_timeout_sec
+        )
+    }
+}
+
 /// Reads `<slop_livin_dir>/config.toml` (`retention_days = 30`,
 /// `since = "24h"`, `observe_timeout_sec = 1800`). A missing file, or keys
 /// it does not recognize, fall back to defaults; this is a tiny
@@ -152,6 +172,8 @@ struct StoredRow {
     rel_path: String,
     bytes: u64,
     local_bytes: u64,
+    /// Newest file mtime inside the unit; 0 when unknown (older stores).
+    mtime_max: u64,
     present: bool,
     observed_at: u64,
     regrowth_count: u32,
@@ -168,6 +190,7 @@ fn schema() -> Arc<Schema> {
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("regrowth_count", DataType::UInt32, false),
         Field::new("local_bytes", DataType::UInt64, false),
+        Field::new("mtime_max", DataType::UInt64, false),
     ]))
 }
 
@@ -182,6 +205,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
     let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
     let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
+    let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -195,6 +219,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(UInt64Array::from(observed_at)),
             Arc::new(UInt32Array::from(regrowth)),
             Arc::new(UInt64Array::from(local_bytes)),
+            Arc::new(UInt64Array::from(mtime_max)),
         ],
     )?;
     if let Some(parent) = path.parent() {
@@ -231,6 +256,8 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         // Stores written before #29 have no local_bytes column: fall back
         // to `bytes` so incremental deltas degrade to the old behavior.
         let local_bytes = downcast_u64(&batch, "local_bytes").ok();
+        // Likewise stores written before artifact age was recorded.
+        let mtime_max = downcast_u64(&batch, "mtime_max").ok();
         for i in 0..batch.num_rows() {
             rows.push(StoredRow {
                 project_id: project_id.value(i).to_string(),
@@ -243,6 +270,7 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
                     .map(|c| c.value(i))
                     .filter(|v| *v != 0)
                     .unwrap_or_else(|| bytes.value(i)),
+                mtime_max: mtime_max.as_ref().map(|c| c.value(i)).unwrap_or(0),
                 present: present.value(i),
                 observed_at: observed_at.value(i),
                 regrowth_count: regrowth.value(i),
@@ -327,6 +355,7 @@ struct Observed {
     rel_path: String,
     bytes: u64,
     local_bytes: u64,
+    mtime_max: u64,
 }
 
 fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
@@ -351,6 +380,7 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     project_id: project.project_id.clone(),
                     worktree_id: worktree.worktree_id.clone(),
                     kind,
+                    mtime_max: artifact.mtime_max,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
                     local_bytes: if artifact.local_bytes == 0 {
@@ -488,6 +518,7 @@ pub fn observe_and_annotate(
                         rel_path: prev.rel_path.clone(),
                         bytes: prev.bytes,
                         local_bytes: prev.local_bytes,
+                        mtime_max: prev.mtime_max,
                         present: prev.present,
                         observed_at: prev.observed_at,
                         regrowth_count: prev.regrowth_count,
@@ -517,6 +548,7 @@ pub fn observe_and_annotate(
                         rel_path: obs.rel_path.clone(),
                         bytes: obs.bytes,
                         local_bytes: obs.local_bytes,
+                        mtime_max: obs.mtime_max,
                         present: true,
                         observed_at,
                         regrowth_count: 0,
@@ -538,6 +570,7 @@ pub fn observe_and_annotate(
                 rel_path: row.rel_path.clone(),
                 bytes: row.bytes,
                 local_bytes: row.local_bytes,
+                mtime_max: row.mtime_max,
                 present: row.present,
                 observed_at: row.observed_at,
                 regrowth_count: row.regrowth_count,
@@ -1550,6 +1583,8 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
                 kind: parse_artifact_kind(&row.kind),
                 path: PathBuf::from(&row.rel_path),
                 bytes: row.bytes,
+                mtime_max: row.mtime_max,
+                ecosystem: None,
                 local_bytes: row.local_bytes,
                 track: None,
                 growth_bytes: None,
@@ -1722,8 +1757,17 @@ pub fn observe_tracked_with_source(
     // tests (there is nothing to answer). Skipping the call entirely,
     // rather than calling it and discarding the answer, is what actually
     // keeps this path load-free instead of just "load but ignore".
-    if force_full {
-        let result = full_walk(root, observed_at, large_file_min_bytes, "full_forced")?;
+    // Classification rules changed since the store was walked: rows that
+    // no longer count (or newly count) as artifacts only get fixed by a
+    // walk that visits them, so take the one full walk now.
+    let rules_changed = prev_state.rules_version != crate::ecosystem::RULES_VERSION;
+    if force_full || rules_changed {
+        let reason = if force_full {
+            "full_forced"
+        } else {
+            "full_rules_changed"
+        };
+        let result = full_walk(root, observed_at, large_file_min_bytes, reason)?;
         if observe {
             write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
             write_unowned(&dir, &result.attribution.unowned)?;
@@ -1731,7 +1775,17 @@ pub fn observe_tracked_with_source(
             // forced full walk has nothing new to report there (no
             // replay ran), and an older stored id just means the next
             // real incremental attempt replays a larger, still-correct
-            // window rather than a wrong one.
+            // window rather than a wrong one. The rules version is
+            // stamped so the next call goes incremental again.
+            if rules_changed {
+                write_fsevents_state(
+                    &dir,
+                    &FsEventsState {
+                        rules_version: crate::ecosystem::RULES_VERSION,
+                        ..prev_state.clone()
+                    },
+                )?;
+            }
         }
         return Ok(result);
     }
@@ -1823,6 +1877,7 @@ pub fn observe_tracked_with_source(
                 event_id: Some(plan.current_event_id),
                 device: plan.device,
                 last_observed_at: Some(observed_at),
+                rules_version: crate::ecosystem::RULES_VERSION,
             },
         )?;
         write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
@@ -2233,6 +2288,8 @@ mod tests {
                     kind: ArtifactKind::DependencyTree,
                     path: worktree_root.join("node_modules"),
                     bytes,
+                    mtime_max: 0,
+                    ecosystem: None,
                     local_bytes: 0,
                     track: None,
                     growth_bytes: None,

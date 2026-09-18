@@ -20,5 +20,5 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"delete node_modules (440.4MB) → Trash?  Enter yes · Esc no                      "
+"delete node_modules (440.4MB) → Trash?  Enter yes · Esc no · k keep executables "
 "Enter yes · Esc no                                                              "

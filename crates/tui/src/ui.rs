@@ -4,8 +4,8 @@
 
 use crate::app::{App, ViewKind};
 use crate::model::{
-    growth_bar, human_bytes, human_signed_bytes, is_flat, max_abs_growth, net_change, spark_points,
-    trend, truncate_middle,
+    growth_bar, human_bytes, human_signed_bytes, is_flat, max_abs_growth, net_change, pad_display,
+    spark_points, trend, truncate_middle,
 };
 use ratatui::{
     Frame,
@@ -92,8 +92,18 @@ fn header_line(app: &App, width: usize) -> String {
         .map(|u| u.bytes)
         .sum::<u64>()
         .saturating_sub(docker_unowned);
-    let obs = if let Some((n, d)) = app.observing {
-        format!("observing… {}%", if d == 0 { 0 } else { n * 100 / d })
+    let obs = if app.observing.is_some() {
+        // Live counters from the walk thread; percent against the last
+        // observation's walked total (an incremental walk stops early, so
+        // the percent is a floor, never a promise).
+        let (bytes, dirs, _) = slop_livin_core::walk::progress::snapshot();
+        let total = app.report.reconciliation.walked_total;
+        let pct = if total > 0 {
+            format!(" · {}%", (bytes * 100 / total).min(99))
+        } else {
+            String::new()
+        };
+        format!("observing… {} · {dirs} dirs{pct}", human_bytes(bytes))
     } else {
         format!("observed {}", app.observed_label)
     };
@@ -132,7 +142,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 }
 
 fn footer_line() -> &'static str {
-    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n sort  ? help  q quit"
+    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit"
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -191,7 +201,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
     let w = area.width.min(78);
-    let h = area.height.min(15);
+    let h = area.height.min(18);
     let popup = Rect {
         x: (area.width.saturating_sub(w)) / 2,
         y: (area.height.saturating_sub(h)) / 2,
@@ -283,11 +293,18 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
             (v, Some(p)) => format!("{} of {p}  (Esc back)", v.label()),
             (v, None) => format!("{}  (Esc back)", v.label()),
         };
-        let sort = match app.sort {
-            crate::model::Sort::Growth => " · sort: growth",
-            crate::model::Sort::Size => " · sort: size",
-            crate::model::Sort::Name => " · sort: name",
-            crate::model::Sort::None => "",
+        let sort_name = match app.sort {
+            crate::model::Sort::Growth => Some("growth"),
+            crate::model::Sort::Size => Some("size"),
+            crate::model::Sort::Name => Some("name"),
+            crate::model::Sort::Type => Some("type"),
+            crate::model::Sort::Age => Some("age"),
+            crate::model::Sort::None => None,
+        };
+        let sort = match sort_name {
+            Some(n) if app.reverse => format!(" · sort: {n} ↑"),
+            Some(n) => format!(" · sort: {n}"),
+            None => String::new(),
         };
         let filter = if app.filter_text == "0" {
             "none".to_string()
@@ -368,7 +385,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
             _ => String::new(),
         };
-        let raw_name = format!("{}{mark_prefix}{}{track}", row.rail, row.label);
+        let badge = if row.badges.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", row.badges)
+        };
+        let raw_name = format!("{}{mark_prefix}{badge}{}{track}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
         let bytes = format!("{:>10}", human_bytes(row.bytes));
         let growth = format!(
@@ -416,7 +438,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Style::default()
         };
         let spans = vec![
-            Span::styled(format!("{name:<width$}", width = name_width), name_style),
+            Span::styled(pad_display(&name, name_width), name_style),
             Span::raw(bytes),
             Span::raw(" "),
             Span::raw(growth),
@@ -470,7 +492,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.min(90);
-    let h = area.height.min(22);
+    let h = area.height.min(30);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -492,9 +514,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from(
-            "  v, 1-7    switch view (projects · tree · builds · deps · docker · kinds · unowned)",
+            "  v, 1-8    switch view (projects · tree · builds · deps · docker · kinds · unowned · types)",
         ),
-        Line::from("  g / s / n sort by growth / size / name (remembered, like the filter)"),
+        Line::from(
+            "  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered)",
+        ),
+        Line::from(
+            "  k         keep executables: copy target/{release,debug} binaries, dist/*.whl to bin/ before trashing",
+        ),
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),
@@ -503,8 +530,18 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("Filter grammar"),
         Line::from("  growth [><] <size> in <duration>   (window capped at stored history)"),
-        Line::from("  kind:<k>   project:<name>   type:rs|js|py|go|…   pr:open|merged|closed|none"),
-        Line::from("  idle > <duration>   merge-complete"),
+        Line::from(
+            "  kind:<k>   project:<name|glob*>   type:rs|js|py|go|…   pr:open|merged|closed|none",
+        ),
+        Line::from("  idle > <duration>   merge-complete   size > <bytes>   age > <duration>"),
+        Line::from(""),
+        Line::from(
+            "Badges  🦀 rs  ⬢ js  🦕 deno  🐍 py  🐹 go  ☕ java  🔺 scala  🔧 cpp  🐦 swift  🟣 net",
+        ),
+        Line::from(
+            "        💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue",
+        ),
+        Line::from("        🔨 has build output   ⎇N  N linked worktrees"),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -522,6 +559,7 @@ pub fn view_index(v: ViewKind) -> usize {
         ViewKind::Docker => 5,
         ViewKind::Kinds => 6,
         ViewKind::Unowned => 7,
+        ViewKind::Types => 8,
     }
 }
 

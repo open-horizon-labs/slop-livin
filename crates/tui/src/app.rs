@@ -25,6 +25,8 @@ pub enum ViewKind {
     Docker,
     Kinds,
     Unowned,
+    /// Per-ecosystem rollup (`Report.summary`).
+    Types,
 }
 
 impl ViewKind {
@@ -37,6 +39,7 @@ impl ViewKind {
             '5' => ViewKind::Docker,
             '6' => ViewKind::Kinds,
             '7' => ViewKind::Unowned,
+            '8' => ViewKind::Types,
             _ => return None,
         })
     }
@@ -48,7 +51,8 @@ impl ViewKind {
             ViewKind::Deps => ViewKind::Docker,
             ViewKind::Docker => ViewKind::Kinds,
             ViewKind::Kinds => ViewKind::Unowned,
-            ViewKind::Unowned => ViewKind::Projects,
+            ViewKind::Unowned => ViewKind::Types,
+            ViewKind::Types => ViewKind::Projects,
         }
     }
     pub fn label(self) -> &'static str {
@@ -60,6 +64,7 @@ impl ViewKind {
             ViewKind::Kinds => "kinds",
             ViewKind::Docker => "docker",
             ViewKind::Unowned => "unowned",
+            ViewKind::Types => "types",
         }
     }
 }
@@ -95,6 +100,11 @@ pub struct App {
     pub observed_label: String,
     pub actor: String,
     pub sort: Sort,
+    /// Flip the active sort's order (`r`). Persisted with the sort.
+    pub reverse: bool,
+    /// Copy compiled outputs to `<worktree>/bin/` before trashing a build
+    /// directory (`k` on the confirm line). Persisted.
+    pub keep_executables: bool,
     pub quit: bool,
     /// Terminal width at the last draw; the header fits its clauses to it.
     pub width: u16,
@@ -122,6 +132,10 @@ pub struct UiState {
     pub filter: String,
     #[serde(default)]
     pub sort: String,
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub keep_executables: bool,
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
@@ -136,6 +150,8 @@ pub fn sort_from_str(s: &str) -> Sort {
         "growth" => Sort::Growth,
         "size" => Sort::Size,
         "name" => Sort::Name,
+        "type" => Sort::Type,
+        "age" => Sort::Age,
         _ => Sort::None,
     }
 }
@@ -145,6 +161,8 @@ pub fn sort_to_str(s: Sort) -> &'static str {
         Sort::Growth => "growth",
         Sort::Size => "size",
         Sort::Name => "name",
+        Sort::Type => "type",
+        Sort::Age => "age",
         Sort::None => "none",
     }
 }
@@ -177,6 +195,8 @@ impl App {
             observed_label: "just now".to_string(),
             actor: "human".to_string(),
             sort: Sort::None,
+            reverse: false,
+            keep_executables: false,
             quit: false,
             width: 0,
             store_dir: None,
@@ -251,18 +271,31 @@ impl App {
                     None => Vec::new(),
                 };
             }
-            ViewKind::Builds => model::builds_rows(&self.report),
-            ViewKind::Deps => model::deps_rows(&self.report),
+            ViewKind::Builds => model::builds_rows(&self.report, &self.filter),
+            ViewKind::Deps => model::deps_rows(&self.report, &self.filter),
             ViewKind::Kinds => model::kinds_rows(&self.report, &self.filter),
             ViewKind::Docker => model::docker_rows(&self.report),
             ViewKind::Unowned => model::unowned_rows(&self.report),
+            ViewKind::Types => model::types_rows(&self.report, &self.filter),
         };
-        model::apply_sort(&mut rows, self.sort);
+        model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
         self.sort = if self.sort == sort { Sort::None } else { sort };
+        self.persist_ui_state();
+    }
+
+    /// `r`: flip the order of whatever sort is active.
+    pub fn toggle_reverse(&mut self) {
+        self.reverse = !self.reverse;
+        self.persist_ui_state();
+    }
+
+    /// `k`: whether a delete first copies compiled outputs to `bin/`.
+    pub fn toggle_keep_executables(&mut self) {
+        self.keep_executables = !self.keep_executables;
         self.persist_ui_state();
     }
 
@@ -400,6 +433,8 @@ impl App {
             let state = UiState {
                 filter: self.filter_text.clone(),
                 sort: sort_to_str(self.sort).to_string(),
+                reverse: self.reverse,
+                keep_executables: self.keep_executables,
             };
             let _ = std::fs::create_dir_all(store);
             if let Ok(text) = serde_json::to_string_pretty(&state) {
@@ -580,10 +615,28 @@ impl App {
             warnings.push("git object store: history goes with it".into());
         }
         let label = row.label.trim().to_string();
+        let unit_path = PathBuf::from(&unit_id.0);
+        // The worktree this unit lives in: where `bin/` goes when keeping
+        // executables. A worktree row is its own worktree.
+        let worktree_path = self
+            .report
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .filter(|wt| unit_path.starts_with(&wt.path))
+            .max_by_key(|wt| wt.path.as_os_str().len())
+            .map(|wt| wt.path.clone())
+            .unwrap_or_else(|| {
+                unit_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default()
+            });
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
-                path: PathBuf::from(&unit_id.0),
+                path: unit_path,
+                worktree_path,
                 bytes: row.bytes,
                 observed_at: self.report.observed_at,
                 worktree,
@@ -630,7 +683,7 @@ impl App {
 
     pub fn confirm_summary(&self) -> String {
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
-        actions::confirm_summary(&units)
+        actions::confirm_summary(&units, self.keep_executables)
     }
 
     /// Enter on the confirm banner: this keypress at the keyboard is the
@@ -658,7 +711,15 @@ impl App {
                 return;
             }
         };
-        let results = actions::execute_plan(&units, &plan, &grant, &ledger, &trash, &self.actor);
+        let results = actions::execute_plan(
+            &units,
+            &plan,
+            &grant,
+            &ledger,
+            &trash,
+            &self.actor,
+            self.keep_executables,
+        );
         let free_after = actions::free_space_bytes(&trash);
         let measured = match (free_before, free_after) {
             (Some(b), Some(a)) => Some(a as i64 - b as i64),
@@ -815,6 +876,8 @@ mod tests {
                             kind: ArtifactKind::DependencyTree,
                             path: "/root/mole/node_modules".into(),
                             bytes: 200 * 1024 * 1024,
+                            mtime_max: 0,
+                            ecosystem: None,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(150 * 1024 * 1024),
@@ -832,6 +895,8 @@ mod tests {
                             kind: ArtifactKind::Source,
                             path: "/root/mole/src".into(),
                             bytes: 10 * 1024 * 1024,
+                            mtime_max: 0,
+                            ecosystem: None,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(1024),
@@ -866,6 +931,7 @@ mod tests {
             series_by_key: Default::default(),
             total_series: Vec::new(),
             series_window_secs: 0,
+            summary: Default::default(),
             dirs_by_worktree: None,
             files_by_worktree: None,
             schedule_line: None,
@@ -1018,9 +1084,10 @@ mod tests {
         assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
         assert_eq!(ViewKind::from_digit('9'), None);
         // Full cycle returns to Projects, matching the CLI's view order:
-        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned.
+        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/types.
+        assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
         let mut v = ViewKind::Projects;
-        for _ in 0..7 {
+        for _ in 0..8 {
             v = v.next();
         }
         assert_eq!(v, ViewKind::Projects);

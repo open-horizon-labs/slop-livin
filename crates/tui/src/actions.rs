@@ -18,6 +18,8 @@ use crate::model::human_bytes;
 #[derive(Debug, Clone)]
 pub struct MarkedUnit {
     pub path: PathBuf,
+    /// The worktree containing the unit (itself, for a worktree row).
+    pub worktree_path: PathBuf,
     pub bytes: u64,
     pub observed_at: u64,
     /// Set when the unit is a linked worktree rather than an artifact dir.
@@ -94,6 +96,7 @@ fn execute_one(
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
+    keep_executables: bool,
 ) -> UnitResult {
     if let Some(terms) = &unit.worktree {
         return UnitResult {
@@ -102,7 +105,24 @@ fn execute_one(
                 .map_err(|e| e.to_string()),
         };
     }
-    let outcome = trash_path(unit, Verb::Delete, grant, ledger, trash_root, actor, None)
+    // Compiled outputs first, so a failure to copy them refuses the unit
+    // before anything moves.
+    let extra = if keep_executables {
+        match slop_livin_core::actions::preserve_executables(&unit.path, &unit.worktree_path) {
+            Ok(kept) => Some(serde_json::json!({
+                "preserved": kept.iter().map(|k| k.to.display().to_string()).collect::<Vec<_>>()
+            })),
+            Err(e) => {
+                return UnitResult {
+                    path: unit.path.clone(),
+                    outcome: Err(format!("could not preserve executables: {e}")),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let outcome = trash_path(unit, Verb::Delete, grant, ledger, trash_root, actor, extra)
         .map_err(|e| e.to_string());
     UnitResult {
         path: unit.path.clone(),
@@ -241,11 +261,12 @@ pub fn execute_plan(
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
+    keep_executables: bool,
 ) -> Vec<UnitResult> {
     units
         .iter()
         .zip(plan.units.iter())
-        .map(|(u, pu)| execute_one(u, pu, grant, ledger, trash_root, actor))
+        .map(|(u, pu)| execute_one(u, pu, grant, ledger, trash_root, actor, keep_executables))
         .collect()
 }
 
@@ -282,7 +303,7 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
 
 /// Human summary line for the confirm banner: `delete 3 units · 1.9 GB
 /// -> Trash · Enter confirm · Esc cancel`.
-pub fn confirm_summary(units: &[MarkedUnit]) -> String {
+pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
     let total: u64 = units.iter().map(|u| u.bytes).sum();
     let what: Vec<String> = units
         .iter()
@@ -306,8 +327,13 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
     } else {
         String::new()
     };
+    let keep = if keep_executables {
+        " · keep executables → bin/ (k)"
+    } else {
+        " · k keep executables"
+    };
     format!(
-        "delete {} ({}) → Trash{more}?  Enter yes · Esc no",
+        "delete {} ({}) → Trash{more}?  Enter yes · Esc no{keep}",
         what.join(", "),
         human_bytes(total)
     )
@@ -328,6 +354,7 @@ mod tests {
 
         let unit = MarkedUnit {
             path: target.clone(),
+            worktree_path: PathBuf::new(),
             bytes,
             observed_at: now(),
             label: String::new(),
@@ -337,7 +364,7 @@ mod tests {
         let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
         let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
         let trash = workdir.path().join("Trash");
-        let results = execute_plan(&[unit], &plan, &grant, &ledger, &trash, "human");
+        let results = execute_plan(&[unit], &plan, &grant, &ledger, &trash, "human", false);
 
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
@@ -355,6 +382,7 @@ mod tests {
     fn confirm_summary_names_units_and_states_their_warnings() {
         let clean = MarkedUnit {
             path: "/tmp/target".into(),
+            worktree_path: PathBuf::new(),
             bytes: 2 * 1024 * 1024 * 1024,
             observed_at: 0,
             label: "build target".into(),
@@ -363,16 +391,19 @@ mod tests {
         };
         let risky = MarkedUnit {
             path: "/tmp/raw".into(),
+            worktree_path: PathBuf::new(),
             bytes: 1_100_000_000,
             observed_at: 0,
             label: "dir raw".into(),
             warnings: vec!["untracked: in no version control".into()],
             worktree: None,
         };
-        let s = confirm_summary(&[clean, risky]);
+        let s = confirm_summary(&[clean.clone(), risky.clone()], false);
         assert_eq!(
             s,
-            "delete target, raw ⚠ untracked: in no version control (3.2GB) → Trash?  Enter yes · Esc no"
+            "delete target, raw ⚠ untracked: in no version control (3.2GB) → Trash?  Enter yes · Esc no · k keep executables"
         );
+        let s = confirm_summary(&[clean, risky], true);
+        assert!(s.ends_with("· keep executables → bin/ (k)"), "{s}");
     }
 }

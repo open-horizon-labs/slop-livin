@@ -2,6 +2,42 @@
 
 Release notes live here, one section per tag. The release workflow refuses a tag without one.
 
+## v0.2.0
+
+The clean-dev-dirs salvage: everything it does for a human, on top of the history and project model it doesn't have.
+
+**Project types, everywhere**
+
+- Twenty ecosystems detected from checkout-root markers (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `*.csproj`, …). Each project row wears its glyphs (🦀 ⬢ 🐍 🐹 ☕ 🐦 🟣 💎 …), plus 🐳 for Docker objects, 🔨 for build output, ⎇N for linked worktrees. The CLI overview gained a `type` column.
+- **Which artifacts go where.** The same table says which directories each ecosystem generates. Ambiguous names (`build`, `dist`, `vendor`, `bin`, `obj`, `out`, `*.egg-info`) are artifacts only next to a marker of an ecosystem that generates them; a hand-written `build/` in a repo with no build tool is source. Every artifact row carries the ecosystem that produced it.
+- `type:rust` filter (CLI, TUI, MCP, grants), `t` sort grouping by type, a **types view** (`8`, `--view types`, MCP `view: types`) with projects, artifacts, bytes and growth per ecosystem, and `summary.by_type` in the JSON report.
+- A checkout without a remote is named from its manifest (`[package] name`, `"name"`, `module`, `<artifactId>`, `name:`, `app:`, `project(...)`, `*.csproj`).
+
+**Filters, sorts, the form**
+
+- `size > 500MB` / `size < 1GB` and `age > 30d` (time since an artifact was last written; newest mtime is now recorded per artifact and kept in the store). `project:` accepts globs (`my-app*`). Sizes parse decimal (`500MB`) and binary (`500MiB`), matching what the tool prints.
+- Sort by name (`n`), type (`t`), age (`a`); `r` reverses; CLI `--sort growth|size|name|type|age --reverse`. Sort, reverse and the filter persist across sessions.
+- The `/` form gained type, size and age fields; `:` completion knows `size >`, `age >` and every `type:` tag.
+
+**Keep executables**
+
+- `k` in the TUI, `--keep-executables` on `execute`, `keep_executables` on the MCP tool: before a build directory goes to Trash, Rust `target/{release,debug}` executables and Python `dist/*.whl` / `build/**/*.so` are copied to `<worktree>/bin/`. Outcomes list what was kept; the ledger records it.
+
+**Honest progress, honest refresh**
+
+- `observing…` in the TUI header and on the CLI's stderr shows real bytes and directories walked so far, with a percentage against the last observation. It used to say `0%` and mean nothing.
+- Deleting in the TUI removes the row and everything under it at once, adjusts the header totals, and starts an incremental (FSEvents) re-observe in the background. Before, only exact-path artifact rows were dropped and nothing re-observed.
+- A change to the classification rules forces one full walk so rows that no longer count leave the store instead of lingering.
+
+**Charts**
+
+- Sparklines are drawn by ratatui's `Sparkline` widget from honest data: buckets before a row's first observation are `·` (not zero), flat rows draw nothing, and the header shows the whole root's history with its net change.
+
+**Also**
+
+- `slop-livin config show | path | init`: the config file, every key with its meaning.
+- `filter:` parameter on the MCP `report` tool, same grammar as everywhere else.
+
 ## v0.1.0
 
 First release. `slop-livin` answers "what grew on this disk, by project, and what do I do about it" for developers running many coding agents at once — and lets you or your agent act on the answer with the facts in front of you.

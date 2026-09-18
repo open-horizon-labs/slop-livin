@@ -367,6 +367,8 @@ fn unit_from_worktree(project: &ProjectRow, wt: &WorktreeRow) -> PlanUnit {
         kind: ArtifactKind::Source,
         path: wt.path.clone(),
         bytes,
+        mtime_max: 0,
+        ecosystem: None,
         local_bytes: bytes,
         track: None,
         growth_bytes: wt
@@ -410,6 +412,8 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
         kind: ArtifactKind::Unknown,
         path: wt.path.join(&d.rel_path),
         bytes: d.allocated_total,
+        mtime_max: 0,
+        ecosystem: None,
         local_bytes: d.allocated_total,
         track: d.track,
         growth_bytes: None,
@@ -501,6 +505,8 @@ pub fn validate_grant_predicate(expr: &str) -> Result<Filter> {
             Predicate::Kind(_)
             | Predicate::Project(_)
             | Predicate::Type(_)
+            | Predicate::Size { .. }
+            | Predicate::AgeGreaterThan(_)
             | Predicate::IdleGreaterThan(_)
             | Predicate::MergeComplete => {}
             Predicate::Growth { .. } => bail!(
@@ -617,6 +623,17 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
         Predicate::Type(_) => true, // not carried on a unit; scope by project: instead
         Predicate::IdleGreaterThan(secs) => unit.idle_secs.is_some_and(|i| i > *secs),
         Predicate::MergeComplete => unit.merge_complete,
+        Predicate::Size { greater, bytes } => {
+            if *greater {
+                unit.bytes > *bytes
+            } else {
+                unit.bytes < *bytes
+            }
+        }
+        // Age is re-derived at the sink (`newest_mtime`), not trusted from
+        // the plan: the grant covers the unit only if it is still that old.
+        Predicate::AgeGreaterThan(secs) => newest_mtime(&unit.path, 2_000_000)
+            .is_some_and(|m| crate::entities::now().saturating_sub(m) > *secs),
         Predicate::Growth { .. } | Predicate::Pr(_) => false,
     })
 }
@@ -641,6 +658,10 @@ pub struct UnitOutcome {
     pub cause: Option<String>,
     pub grant_id: Option<String>,
     pub recovery_location: Option<PathBuf>,
+    /// Compiled outputs copied to `<worktree>/bin/` before the unit went to
+    /// Trash (`keep_executables`); empty when nothing applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -724,12 +745,129 @@ pub fn execute(dir: &Path, plan_id: &str, actor: &str) -> Result<ExecuteResult> 
     execute_with_trash(dir, plan_id, actor, &trash_root())
 }
 
+/// `execute`, first copying compiled outputs out of each unit into
+/// `<worktree>/bin/` (see [`preserve_executables`]).
+pub fn execute_keeping_executables(
+    dir: &Path,
+    plan_id: &str,
+    actor: &str,
+) -> Result<ExecuteResult> {
+    execute_with_trash_opts(dir, plan_id, actor, &trash_root(), true)
+}
+
+/// A file preserved by `preserve_executables`: where it was, where it went.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Preserved {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+fn is_executable_file(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+}
+
+fn copy_into(from: &Path, dest_dir: &Path, out: &mut Vec<Preserved>) -> Result<()> {
+    fs::create_dir_all(dest_dir)?;
+    let name = from.file_name().context("file has a name")?;
+    let to = dest_dir.join(name);
+    fs::copy(from, &to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+    out.push(Preserved {
+        from: from.to_path_buf(),
+        to,
+    });
+    Ok(())
+}
+
+/// Copies the compiled outputs a build directory holds to
+/// `<worktree>/bin/` before the directory is trashed, the way
+/// clean-dev-dirs' `--keep-executables` does:
+///
+/// - Rust `target/`: executables (mode +x, not `.d`/`.rlib`/`.rmeta`/
+///   `.dylib`/`.so`/`.a`/`.pdb`) directly in `target/release/` and
+///   `target/debug/` go to `bin/release/` and `bin/debug/`.
+/// - Python `dist/`: `*.whl` (and `*.tar.gz`) go to `bin/`; `build/`:
+///   `*.so`/`*.pyd` anywhere inside go to `bin/`.
+/// - Everything else (dependency trees, caches, other build outputs) is a
+///   no-op: nothing in them is an output worth keeping.
+///
+/// Returns what was copied. An empty list is a valid answer, never an error.
+pub fn preserve_executables(unit_path: &Path, worktree: &Path) -> Result<Vec<Preserved>> {
+    let mut out = Vec::new();
+    let base = unit_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let bin = worktree.join("bin");
+    const SKIP_EXT: &[&str] = &["d", "rlib", "rmeta", "a", "so", "dylib", "dll", "pdb"];
+    match base {
+        "target" => {
+            for profile in ["release", "debug"] {
+                let dir = unit_path.join(profile);
+                let Ok(rd) = fs::read_dir(&dir) else { continue };
+                for e in rd.flatten() {
+                    let Ok(meta) = e.metadata() else { continue };
+                    let p = e.path();
+                    let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+                    if is_executable_file(&meta) && !SKIP_EXT.contains(&ext) {
+                        copy_into(&p, &bin.join(profile), &mut out)?;
+                    }
+                }
+            }
+        }
+        "dist" => {
+            let Ok(rd) = fs::read_dir(unit_path) else {
+                return Ok(out);
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.ends_with(".whl") || name.ends_with(".tar.gz") {
+                    copy_into(&p, &bin, &mut out)?;
+                }
+            }
+        }
+        "build" => {
+            let mut stack = vec![unit_path.to_path_buf()];
+            let mut seen = 0usize;
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = fs::read_dir(&d) else { continue };
+                for e in rd.flatten() {
+                    seen += 1;
+                    if seen > 200_000 {
+                        return Ok(out);
+                    }
+                    let p = e.path();
+                    let Ok(ft) = e.file_type() else { continue };
+                    if ft.is_dir() {
+                        stack.push(p);
+                    } else if ft.is_file() {
+                        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+                        if ext == "so" || ext == "pyd" {
+                            copy_into(&p, &bin, &mut out)?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
 /// `execute` with an explicit Trash root (tests; never process-global state).
 pub fn execute_with_trash(
     dir: &Path,
     plan_id: &str,
     actor: &str,
     trash: &Path,
+) -> Result<ExecuteResult> {
+    execute_with_trash_opts(dir, plan_id, actor, trash, false)
+}
+
+pub fn execute_with_trash_opts(
+    dir: &Path,
+    plan_id: &str,
+    actor: &str,
+    trash: &Path,
+    keep_executables: bool,
 ) -> Result<ExecuteResult> {
     let mut plan = load_plan(dir, plan_id)?;
     let at = now();
@@ -790,6 +928,7 @@ pub fn execute_with_trash(
             cause: None,
             grant_id: None,
             recovery_location: None,
+            preserved: Vec::new(),
         };
         let Some(gi) = *choice else {
             outcome.cause = Some(format!(
@@ -875,6 +1014,17 @@ pub fn execute_with_trash(
                 continue;
             }
             Some(_) => {}
+        }
+        if keep_executables && unit.verb == "delete" {
+            match preserve_executables(&unit.path, &unit.worktree_path) {
+                Ok(kept) => outcome.preserved = kept.into_iter().map(|k| k.to).collect(),
+                Err(e) => {
+                    outcome.status = "failed".into();
+                    outcome.cause = Some(format!("could not preserve executables: {e}"));
+                    outcomes.push(outcome);
+                    continue;
+                }
+            }
         }
         let dest = trash.join(format!(
             "{}-{}-{}",

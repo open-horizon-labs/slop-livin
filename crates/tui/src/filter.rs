@@ -99,6 +99,31 @@ pub fn worktree_passes(
     })
 }
 
+/// Every `size` predicate against a rollup's bytes.
+pub fn size_passes(f: &Filter, bytes: u64) -> bool {
+    slop_livin_core::filter::size_passes(f, bytes)
+}
+
+/// Every `age >` predicate against an artifact's newest mtime. Unknown
+/// (0) never passes: a filter for old things must not match things whose
+/// age nobody measured.
+pub fn age_passes(f: &Filter, mtime_max: u64) -> bool {
+    f.predicates.iter().all(|p| match p {
+        Predicate::AgeGreaterThan(secs) => {
+            mtime_max > 0 && slop_livin_core::entities::now().saturating_sub(mtime_max) > *secs
+        }
+        _ => true,
+    })
+}
+
+/// True when the filter has an `age >` predicate, so a rollup row (a
+/// project, a worktree) passes only if one of its artifacts does.
+pub fn has_age_predicate(f: &Filter) -> bool {
+    f.predicates
+        .iter()
+        .any(|p| matches!(p, Predicate::AgeGreaterThan(_)))
+}
+
 /// True when the filter has any worktree-level predicate, so a projects
 /// view (which has no per-worktree rows) must evaluate them per worktree.
 pub fn has_worktree_predicates(f: &Filter) -> bool {
@@ -118,6 +143,8 @@ pub fn type_passes(f: &Filter, project: &slop_livin_core::report::ProjectRow) ->
                 kind: slop_livin_core::report::ArtifactKind::Source,
                 path: Default::default(),
                 bytes: 0,
+                mtime_max: 0,
+                ecosystem: None,
                 local_bytes: 0,
                 track: None,
                 growth_bytes: None,

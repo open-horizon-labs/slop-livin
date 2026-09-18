@@ -22,6 +22,8 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
         kind,
         path: PathBuf::from(path),
         bytes,
+        mtime_max: 0,
+        ecosystem: None,
         local_bytes: 0,
         track: None,
         growth_bytes: growth,
@@ -140,6 +142,7 @@ fn fixture_report() -> Report {
         series_by_key: Default::default(),
         total_series: Vec::new(),
         series_window_secs: 0,
+        summary: Default::default(),
     }
 }
 
@@ -376,6 +379,9 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         worktree: Some(m),
         track: None,
         series: None,
+        badges: String::new(),
+        ecosystems: Vec::new(),
+        mtime_max: 0,
         collapsed_children: None,
         expandable: false,
     };
@@ -475,6 +481,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
 
     let unit = |path: &std::path::Path| MarkedUnit {
         path: path.to_path_buf(),
+        worktree_path: PathBuf::new(),
         bytes: 4096,
         observed_at: slop_livin_core::entities::now(),
         label: String::new(),
@@ -502,6 +509,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
         &ledger,
         &trash,
         "human",
+        false,
     );
     assert!(res[0].outcome.is_ok(), "{:?}", res[0].outcome);
     assert!(!work.exists(), "checkout moved to Trash");

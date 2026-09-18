@@ -94,6 +94,10 @@ pub struct FsEventsState {
     /// `now()` (whole seconds) as of the observation that recorded
     /// `event_id`. See [`RefreshRefusal::TooSoon`].
     pub last_observed_at: Option<u64>,
+    /// `ecosystem::RULES_VERSION` the stored rows were classified under.
+    /// A different current version forces a full walk (missing = 0).
+    #[serde(default)]
+    pub rules_version: u32,
 }
 
 /// One replay request: a canonical root and the state persisted from the
@@ -518,6 +522,7 @@ mod tests {
                 event_id: Some(1),
                 device: Some(1),
                 last_observed_at: Some(1),
+                rules_version: 0,
             },
         });
         assert!(!plan.incremental);
