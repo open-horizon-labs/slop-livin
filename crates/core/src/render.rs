@@ -13,12 +13,19 @@ use std::path::Path;
 /// the rest into a "… and N more" footer.
 const DEFAULT_TOP_N: usize = 25;
 
+/// Decimal (SI, ÷1000) so a "47.9GB" this renderer prints means the same
+/// 47.9 * 10^9 a raw byte count means everywhere else (e.g. `walked_total`
+/// printed verbatim in the `observe` log line, or read out of `report
+/// --json`). Before this fix the divisor was 1024 (binary/GiB) under a
+/// decimal ("GB") label, so the *same* observation could read "51.3GB"
+/// from one surface (the raw integer) and "47.9GB" from this one -- a
+/// 1024-vs-1000 unit mismatch masquerading as stale/re-read data.
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {

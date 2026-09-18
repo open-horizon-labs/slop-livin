@@ -254,10 +254,10 @@ fn unowned_aggregated_by_top_level_dir_and_reason_shared_caches_separate() {
         1,
         "expected one aggregated row, got: {old_project_lines:?}"
     );
-    assert!(old_project_lines[0].contains("381.5MB"));
+    assert!(old_project_lines[0].contains("400.0MB"));
 
     // Shared cache reported separately, not folded into by-dir/by-reason.
-    assert!(text.contains("shared caches: 3.7GB"));
+    assert!(text.contains("shared caches: 4.0GB"));
     assert!(text.contains("no-containing-repo"));
 }
 

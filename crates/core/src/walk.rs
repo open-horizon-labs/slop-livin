@@ -734,9 +734,22 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 /// `worktree_root` instead of the whole scan root. This is the fallback
 /// granularity for a changed directory that lands in a worktree's Source
 /// tree (not inside an already-classified artifact directory): re-walking
-/// the one worktree is far cheaper than re-walking the whole root, and
-/// every other worktree's rows are untouched by construction (this call
-/// never looks outside `worktree_root`).
+/// the one worktree is far cheaper than re-walking the whole root.
+///
+/// `all_worktrees` must be the *complete* known worktree list (every
+/// worktree, not just this one), exactly as `discover_and_attribute`
+/// passes to `attribute_parallel`. A linked worktree frequently lives
+/// **inside** its main checkout's directory tree (e.g. `.worktrees/<name>`
+/// under the project root), so walking `worktree_root` with only this one
+/// worktree in the known list would mean `nearest_worktree` matches every
+/// path under it -- including a nested linked worktree's own
+/// `target`/`node_modules`/Source bytes -- to *this* worktree_id, double
+/// counting them on top of that nested worktree's own carried-forward
+/// rows. Passing the full list keeps nested-worktree boundaries exactly
+/// as a full walk would; only the entry keyed by `worktree_id` in the
+/// result is meant to be merged back in by the caller, since every other
+/// worktree's rows are untouched by construction and already carried
+/// forward from the store.
 ///
 /// Hardlink dedup is scoped to this call: a file already counted in this
 /// worktree during a broader walk could in principle be seen as "new"
@@ -746,13 +759,13 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 /// whole tree's inode set forward between observations.
 pub fn attribute_one_worktree(
     worktree_root: &Path,
-    worktree_id: &str,
+    all_worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
 ) -> AttributionResult {
     attribute_parallel(
         worktree_root,
-        &[(worktree_root, worktree_id)],
+        all_worktrees,
         observed_at,
         large_file_min_bytes,
     )

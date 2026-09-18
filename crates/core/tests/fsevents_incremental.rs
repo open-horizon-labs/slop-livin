@@ -372,3 +372,199 @@ fn stored_event_id_is_recorded_after_an_observation() {
         "fsevents.json must record the observed event id: {text}"
     );
 }
+
+/// Regression for a live-run bug against `~/src`: a project whose linked
+/// worktrees live *inside* the main checkout's own directory tree (e.g.
+/// `.worktrees/<name>`, the real shape `slop-livin` itself uses), each
+/// with its own large `target/` artifact. Touching one file in the main
+/// checkout's `target/` and re-observing incrementally must not fold any
+/// linked worktree's bytes into the main checkout's row: every row in
+/// every worktree must equal a forced full walk, not just the touched
+/// one, and `walked_total`/`attributed`/`unowned` must reconcile exactly.
+///
+/// Before the fix, `attribute_one_worktree` re-walked the rewalked
+/// worktree's directory with *only that one worktree* in the known list,
+/// so `nearest_worktree` matched every path under it -- including a
+/// nested linked worktree's own `target/` -- to the outer worktree,
+/// double-counting it on top of that linked worktree's still-correct
+/// carried-forward row.
+#[test]
+fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk() {
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    fn write_pattern(path: &std::path::Path, size: usize) {
+        fs::create_dir_all(path.parent().unwrap()).expect("mkdir parent");
+        fs::write(path, vec![b'x'; size]).expect("write file");
+    }
+
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).expect("mkdir root");
+    run_git(&root, &["init", "-q", "-b", "main"]);
+    run_git(&root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("README.md"), b"main\n").expect("write README");
+    run_git(&root, &["add", "README.md"]);
+    run_git(&root, &["commit", "-q", "-m", "initial commit"]);
+
+    // Main checkout's own large artifact.
+    write_pattern(&root.join("target").join("main.bin"), 2 * 1024 * 1024);
+
+    // Three linked worktrees living *inside* the main checkout's tree,
+    // each with its own large artifact -- the exact shape that tripped
+    // the bug on the real `slop-livin` repo (13 nested worktrees).
+    let worktrees_dir = root.join(".worktrees");
+    let mut linked_paths = Vec::new();
+    for name in ["a", "b", "c"] {
+        let wt = worktrees_dir.join(name);
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().expect("utf8 path"),
+                "-b",
+                name,
+            ],
+        );
+        write_pattern(
+            &wt.join("target").join(format!("{name}.bin")),
+            3 * 1024 * 1024,
+        );
+        linked_paths.push(wt);
+    }
+
+    let store = tempfile::tempdir().expect("tmp store");
+
+    let first = report_full_mode(
+        &root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect("first (full) report");
+    assert_eq!(
+        first.reconciliation.attributed + first.reconciliation.unowned,
+        first.reconciliation.walked_total,
+        "baseline reconciliation must hold"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(3100));
+
+    // Touch a Source-tree file directly at the MAIN checkout's root --
+    // deliberately *not* inside `target/` (an existing classified
+    // artifact would resolve through `resize_artifact` instead, which
+    // never exercises the buggy code path). A change outside any known
+    // artifact root forces the "rewalk this whole worktree" branch
+    // (`attribute_one_worktree`), which is exactly what folded a nested
+    // linked worktree's bytes into the outer worktree before the fix.
+    fs::write(root.join("touched.txt"), vec![b't'; 4096]).expect("write touch probe");
+
+    let source = CannedSource(incremental_plan(vec![root.clone()], 1));
+    let incremental = report_full_mode_with_source(
+        &root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    )
+    .expect("incremental report");
+    assert!(
+        incremental
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "must take the incremental path: {:?}",
+        incremental.notes
+    );
+
+    let full = report_full_mode(
+        &root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        false, // read-only: don't disturb what the incremental pass just wrote.
+        false,
+        false,
+        true,
+    )
+    .expect("forced full report");
+
+    // Reconciliation must hold exactly on the incremental report -- this
+    // is what catches the double-count directly, without needing to
+    // compare against the full walk at all.
+    assert_eq!(
+        incremental.reconciliation.attributed + incremental.reconciliation.unowned,
+        incremental.reconciliation.walked_total,
+        "incremental reconciliation must still hold exactly: {:?}",
+        incremental.reconciliation
+    );
+
+    // And every row in every worktree (not just the touched one) must be
+    // byte-for-byte identical to a forced full walk.
+    let rows_by_path =
+        |r: &slop_livin_core::report::Report| -> std::collections::HashMap<PathBuf, u64> {
+            r.projects
+                .iter()
+                .flat_map(|p| &p.worktrees)
+                .flat_map(|w| &w.artifacts)
+                .map(|a| (a.path.clone(), a.bytes))
+                .collect()
+        };
+    let inc_rows = rows_by_path(&incremental);
+    let full_rows = rows_by_path(&full);
+    assert_eq!(
+        inc_rows, full_rows,
+        "every artifact row (including every linked worktree's target/) must match a full walk exactly"
+    );
+    assert_eq!(
+        incremental.reconciliation.walked_total, full.reconciliation.walked_total,
+        "walked_total must match a full walk exactly"
+    );
+    assert_eq!(
+        incremental.reconciliation.attributed,
+        full.reconciliation.attributed
+    );
+    assert_eq!(
+        incremental.reconciliation.unowned,
+        full.reconciliation.unowned
+    );
+
+    // Sanity: every linked worktree's own target/ row is present exactly
+    // once and unions to the fixture's real sizes -- if the bug were
+    // still present this would be roughly double.
+    for wt in &linked_paths {
+        let key = wt.join("target");
+        assert!(
+            inc_rows.contains_key(&key),
+            "linked worktree {} must still have its own target/ row",
+            wt.display()
+        );
+    }
+}

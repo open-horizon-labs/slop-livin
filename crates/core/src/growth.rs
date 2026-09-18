@@ -1853,7 +1853,29 @@ fn apply_incremental(
     }
 
     // Rewalk whole worktrees whose Source tree (or newly discovered
-    // subtree) was implicated.
+    // subtree) was implicated. `all_worktree_refs` is the *complete*
+    // known worktree list (every worktree, not just the one being
+    // rewalked): a linked worktree frequently lives inside its main
+    // checkout's own directory tree (e.g. `.worktrees/<name>`), so
+    // walking with only one worktree in the known list would let
+    // `nearest_worktree` fold a nested worktree's own bytes into this
+    // one -- on top of that nested worktree's unrelated, still-correct
+    // carried-forward rows, double counting them. Passing the full list
+    // keeps nested-worktree boundaries exactly as a full walk would;
+    // only the entries keyed by *this* `worktree_id` are taken out of
+    // the result below, since every other worktree here (including any
+    // nested one this walk happened to pass through) keeps its
+    // carried-forward rows untouched.
+    let worktree_ids: Vec<String> = discovered
+        .iter()
+        .map(|dw| crate::entities::id_for(&dw.path.display().to_string()))
+        .collect();
+    let all_worktree_refs: Vec<(&Path, &str)> = discovered
+        .iter()
+        .zip(worktree_ids.iter())
+        .map(|(dw, id)| (dw.path.as_path(), id.as_str()))
+        .collect();
+
     for worktree_id in &worktrees_to_rewalk {
         let Some(root) = worktree_root.get(worktree_id) else {
             continue;
@@ -1865,7 +1887,7 @@ fn apply_incremental(
             .unwrap_or(0);
         let fresh = crate::walk::attribute_one_worktree(
             root,
-            worktree_id,
+            &all_worktree_refs,
             observed_at,
             large_file_min_bytes,
         );
@@ -1883,10 +1905,24 @@ fn apply_incremental(
         } else {
             attribution.artifacts_by_worktree.remove(worktree_id);
         }
+        // Only this worktree's own dir/file rows come out of `fresh`;
+        // any nested worktree's rows the walk happened to also produce
+        // are discarded here (that worktree's carried-forward rows are
+        // already correct and were not queued for rewalk).
         attribution.dirs.retain(|d| &d.worktree_id != worktree_id);
-        attribution.dirs.extend(fresh.dirs);
+        attribution.dirs.extend(
+            fresh
+                .dirs
+                .into_iter()
+                .filter(|d| &d.worktree_id == worktree_id),
+        );
         attribution.files.retain(|f| &f.worktree_id != worktree_id);
-        attribution.files.extend(fresh.files);
+        attribution.files.extend(
+            fresh
+                .files
+                .into_iter()
+                .filter(|f| &f.worktree_id == worktree_id),
+        );
     }
 
     attribution.attributed_total =
