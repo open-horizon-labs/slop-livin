@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
 "view: docker  (Esc back) · filter: growth > 100MB in 7d                                                                                                                                                 "
-"slop-livin · docker-image /Users/dev/src/slop-livin/.docker/img                         1.6GB   -104.9MB ▕██████████████████████▏                                                                       "
+"slop-livin · docker-image /Users/dev/src/slop-livin/.docker/img                          1.6GB   -104.9MB ██████████████████████                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "

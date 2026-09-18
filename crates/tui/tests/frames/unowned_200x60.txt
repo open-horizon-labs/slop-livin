@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
 "view: unowned  (Esc back) · filter: growth > 100MB in 7d                                                                                                                                                "
-"SharedCache · /Users/dev/.cache/leftover                                              209.7MB          — ▕                      ▏                                                                       "
+"SharedCache · /Users/dev/.cache/leftover                                               209.7MB          —                                                                                               "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "

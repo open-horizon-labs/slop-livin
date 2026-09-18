@@ -219,37 +219,47 @@ pub fn growth_bar(growth: Option<i64>, max_abs: i64, width: usize) -> String {
     s
 }
 
-/// Downsample a bucketed series to `width` points for drawing. Each point
-/// is the max of its bin, so a spike survives; a bin with no observation
-/// stays `None`. Drawn by ratatui's `Sparkline`, never by hand.
-pub fn spark_points(series: &[Option<u64>], width: usize) -> Vec<Option<u64>> {
-    if series.is_empty() || width == 0 {
-        return Vec::new();
-    }
-    if series.len() <= width {
-        return series.to_vec();
-    }
-    (0..width)
-        .map(|i| {
-            let lo = i * series.len() / width;
-            let hi = ((i + 1) * series.len() / width).max(lo + 1);
-            series[lo..hi.min(series.len())]
-                .iter()
-                .filter_map(|v| *v)
-                .max()
+/// Per-bucket change of a byte series: `series[i] - series[i-1]`, `None`
+/// where either side was unobserved. This is what a row's sparkline
+/// draws: *when* bytes moved and how much, not how big the tree is (a
+/// 16 GB tree drawn as size is a solid brick that says nothing).
+pub fn deltas(series: &[Option<u64>]) -> Vec<Option<i64>> {
+    series
+        .windows(2)
+        .map(|w| match (w[0], w[1]) {
+            (Some(a), Some(b)) => Some(b as i64 - a as i64),
+            _ => None,
         })
         .collect()
 }
 
-/// A series is flat when every observed value sits within 1% of its max:
-/// nothing worth a glyph. (Per-row min/max normalisation turned a 0.02%
-/// wobble on a 5 GB row into a cliff; that was the mess.)
+/// Downsample deltas to `width` points. Each point is the bin's change
+/// of largest magnitude, sign kept, so a spike survives; a bin with no
+/// observation stays `None`.
+pub fn spark_deltas(series: &[Option<u64>], width: usize) -> Vec<Option<i64>> {
+    let d = deltas(series);
+    if d.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    if d.len() <= width {
+        return d;
+    }
+    (0..width)
+        .map(|i| {
+            let lo = i * d.len() / width;
+            let hi = ((i + 1) * d.len() / width).max(lo + 1);
+            d[lo..hi.min(d.len())]
+                .iter()
+                .filter_map(|v| *v)
+                .max_by_key(|v| v.unsigned_abs())
+        })
+        .collect()
+}
+
+/// A series is flat when nothing moved between any two observations:
+/// nothing worth a glyph.
 pub fn is_flat(series: &[Option<u64>]) -> bool {
-    let vals: Vec<u64> = series.iter().filter_map(|v| *v).collect();
-    let (Some(&lo), Some(&hi)) = (vals.iter().min(), vals.iter().max()) else {
-        return true;
-    };
-    hi == lo || (hi - lo) * 100 < hi
+    deltas(series).iter().all(|d| d.is_none_or(|d| d == 0))
 }
 
 /// Net change over the observed part of a series: last minus first
@@ -1005,18 +1015,29 @@ mod tests {
     }
 
     #[test]
-    fn spark_points_keep_spikes_and_absence() {
-        let s: Vec<Option<u64>> = vec![None, None, Some(1), Some(9), Some(2), Some(2)];
-        assert_eq!(spark_points(&s, 3), vec![None, Some(9), Some(2)]);
-        assert_eq!(spark_points(&s, 6), s);
-        assert!(spark_points(&[], 5).is_empty());
+    fn spark_deltas_keep_the_biggest_move_per_bin_with_its_sign() {
+        let s: Vec<Option<u64>> = vec![
+            None,
+            Some(10),
+            Some(10),
+            Some(19),
+            Some(2),
+            Some(2),
+            Some(3),
+        ];
+        assert_eq!(
+            deltas(&s),
+            vec![None, Some(0), Some(9), Some(-17), Some(0), Some(1)]
+        );
+        assert_eq!(spark_deltas(&s, 3), vec![Some(0), Some(-17), Some(1)]);
+        assert!(spark_deltas(&[], 5).is_empty());
     }
 
     #[test]
-    fn flatness_is_one_percent_of_max_not_any_wobble() {
-        assert!(is_flat(&[Some(5_186_904_064), Some(5_185_728_512)]));
-        assert!(is_flat(&[None, None]));
-        assert!(!is_flat(&[Some(100), Some(90)]));
+    fn flatness_means_nothing_moved() {
+        assert!(is_flat(&[Some(5_186_904_064), Some(5_186_904_064)]));
+        assert!(is_flat(&[None, None, Some(7)]));
+        assert!(!is_flat(&[Some(100), Some(99)]));
         assert!(!is_flat(&[None, Some(0), Some(50)]));
     }
 

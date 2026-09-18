@@ -5,42 +5,57 @@
 use crate::app::{App, ViewKind};
 use crate::model::{
     growth_bar, human_bytes, human_signed_bytes, is_flat, max_abs_growth, net_change, pad_display,
-    spark_points, trend, truncate_middle,
+    spark_deltas, truncate_middle,
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline},
+    widgets::{Block, Borders, Clear, Paragraph, Sparkline, SparklineBar},
 };
+
+/// Growth is the bad news in a disk tool: red when bytes arrive, green
+/// when they leave.
+const GROW: Color = Color::Red;
+const SHRINK: Color = Color::Green;
+/// The selected row: a dark background and bold, never reverse video,
+/// so the growth colours stay readable on the line you are looking at.
+const SELECTED_BG: Color = Color::Indexed(236);
 
 /// Width of every history sparkline, header and rows alike.
 const SPARK_WIDTH: u16 = 12;
 
-/// Draws a byte series with ratatui's `Sparkline`, scaled from zero to
-/// the row's own max so a step reads as the size of the step. Buckets
-/// before the first observation render as a dim `·`; a row observed
-/// gone renders as empty (it is zero). Colour carries the trend.
-fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect, reversed: bool) {
-    let pts = spark_points(series, area.width as usize);
-    let color = match trend(series) {
-        1 => Color::Green,
-        -1 => Color::Red,
-        _ => Color::DarkGray,
-    };
-    let mut style = Style::default().fg(color);
-    if reversed {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    let max = pts.iter().filter_map(|v| *v).max().unwrap_or(0);
+/// Draws a byte series as a timeline of movement with ratatui's
+/// `Sparkline`: each bar is one bucket's change, its height the size of
+/// the change relative to the row's largest, red for bytes arriving and
+/// green for bytes leaving. A bucket where nothing moved is blank; a
+/// bucket before the first observation is a dim `·`.
+fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect, selected: bool) {
+    let d = spark_deltas(series, area.width as usize);
+    let max = d
+        .iter()
+        .filter_map(|v| v.map(i64::unsigned_abs))
+        .max()
+        .unwrap_or(0);
+    let bg = |st: Style| if selected { st.bg(SELECTED_BG) } else { st };
+    let bars: Vec<SparklineBar> = d
+        .iter()
+        .map(|v| match v {
+            None => SparklineBar::from(None::<u64>),
+            Some(0) => SparklineBar::from(Some(0u64)),
+            Some(x) => SparklineBar::from(Some(x.unsigned_abs())).style(Some(bg(
+                Style::default().fg(if *x > 0 { GROW } else { SHRINK })
+            ))),
+        })
+        .collect();
     frame.render_widget(
         Sparkline::default()
-            .data(pts)
+            .data(bars)
             .max(max.max(1))
-            .style(style)
+            .style(bg(Style::default()))
             .absent_value_symbol("·")
-            .absent_value_style(Style::default().fg(Color::DarkGray)),
+            .absent_value_style(bg(Style::default().fg(Color::DarkGray))),
         area,
     );
 }
@@ -361,8 +376,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
+    // name | bytes(10) | sp | growth(10) | sp | bar | sp | spark | sp signals
     let fixed =
-        10 + 1 + 10 + 1 + bar_width + 2 + 1 + if spark_width > 0 { spark_width + 1 } else { 0 };
+        10 + 1 + 10 + 1 + bar_width + 1 + 1 + if spark_width > 0 { spark_width + 1 } else { 0 };
     let flexible = width.saturating_sub(fixed).max(40);
     let signals_width: usize = if narrow {
         flexible / 4
@@ -372,7 +388,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
     // Sparklines are widgets, drawn over the text after the paragraph:
     // (row index, series) for every row that has a non-flat history.
-    let spark_x = area.x + (name_width + 10 + 1 + 10 + 2 + bar_width + 1 + 1) as u16;
+    let spark_x = area.x + (name_width + 10 + 1 + 10 + 1 + bar_width + 1 + 1) as u16;
     let mut sparks: Vec<(usize, &Vec<Option<u64>>)> = Vec::new();
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
@@ -402,8 +418,8 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         );
         let bar = growth_bar(row.growth, max_abs, bar_width);
         let bar_color = match row.growth {
-            Some(g) if g > 0 => Color::Green,
-            Some(g) if g < 0 => Color::Red,
+            Some(g) if g > 0 => GROW,
+            Some(g) if g < 0 => SHRINK,
             _ => Color::DarkGray,
         };
         let hidden = row
@@ -442,10 +458,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(pad_display(&name, name_width), name_style),
             Span::raw(bytes),
             Span::raw(" "),
-            Span::raw(growth),
-            Span::raw(" ▕"),
+            // The signed number and its bar are one diffstat token: same
+            // colour, number flush against the bar it measures.
+            Span::styled(growth, Style::default().fg(bar_color)),
+            Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
-            Span::raw("▏"),
+            Span::raw(" "),
             {
                 // History column: blank in the text; a flat history stays
                 // blank (nothing happened), anything else gets a Sparkline
@@ -468,7 +486,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
         let mut line = Line::from(spans);
         if i == app.selected {
-            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            line = line.style(
+                Style::default()
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            );
         }
         lines.push(line);
     }
@@ -526,7 +548,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),
-        Line::from("Columns: bytes · growth in window · growth bar · history sparkline · facts"),
+        Line::from(
+            "Columns: bytes · growth in window with its bar (red grew, green shrank) · when it moved · facts",
+        ),
         Line::from("  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere"),
         Line::from(""),
         Line::from("Filter grammar"),

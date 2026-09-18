@@ -12,7 +12,7 @@
 "│  ?         toggle this help                                                  │"
 "│  q         quit                                                              │"
 "│                                                                              │"
-"│Columns: bytes · growth in window · growth bar · history sparkline · facts    │"
+"│Columns: bytes · growth in window with its bar (red grew, green shrank) · when│"
 "│  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere │"
 "│                                                                              │"
 "│Filter grammar                                                                │"
