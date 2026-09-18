@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-18T00:00:00Z",
+  "title": "Design System: slop-livin terminal UI (diffstat ledger)",
+  "note": "Terminal (ratatui) surface, not a web app. No CSS/HTML DOM exists; components below are text-art/state snippets captured from committed frame fixtures in crates/tui/tests/frames/*.txt, verified against crates/tui/src/{model,ui,app,filter,units,actions}.rs as of the tui crate build (issue #34).",
+  "extensions": {
+    "colorMeta": {
+      "default-fg": { "role": "neutral", "displayName": "Terminal default foreground", "canonical": "terminal default", "usage": "All text not otherwise styled." },
+      "growth-green": { "role": "signal", "displayName": "Growth green", "canonical": "ratatui Color::Green", "usage": "Bar fill and growth column when a row is net-growing (ui.rs bar_color)." },
+      "shrink-red": { "role": "signal", "displayName": "Shrink red", "canonical": "ratatui Color::Red", "usage": "Bar fill when a row is net-shrinking; also the refusal footer line's text color. Never used as a background." },
+      "unchanged-dim": { "role": "neutral", "displayName": "Unchanged/dim", "canonical": "ratatui Color::DarkGray / Modifier::DIM", "usage": "Bar fill with zero net growth; the header line (whole line is DIM); the signals column text; the hidden-children count; the help overlay body." },
+      "marked-yellow": { "role": "accent", "displayName": "Marked-for-delete yellow", "canonical": "ratatui Color::Yellow", "usage": "The one and only yellow on screen: the row name (including its ✗ prefix) once Backspace marks it. Confirmed against marked_80x24.txt / confirm_80x24.txt fixtures." },
+      "selection-reverse": { "role": "state", "displayName": "Selected row", "canonical": "Modifier::REVERSED", "usage": "Whole-line reverse video on the currently selected row; not a color swap." }
+    },
+    "typographyMeta": {
+      "monospace-body": { "displayName": "Terminal monospace", "purpose": "The only font; every column (name, bytes, growth, bar, signals) is fixed-width and right/left aligned in it. No display/label distinction exists in this surface." }
+    },
+    "glyphs": {
+      "rail-branch": "├─ ",
+      "rail-elbow": "└─ ",
+      "rail-continuation": "│  ",
+      "rail-blank": "   ",
+      "expand-collapsed": "▸",
+      "expand-expanded": "▾",
+      "bar-open": "▕",
+      "bar-close": "▏",
+      "bar-fill-growth": "+",
+      "bar-fill-shrink": "-",
+      "mark-prefix": "✗ ",
+      "no-baseline": "—",
+      "truncate-ellipsis": "…"
+    },
+    "breakpoints": [
+      { "name": "narrow", "value": "width < 160 cols", "effect": "bar_width=8, name_width=38, signals collapse to first-glyph-per-signal (ui.rs draw_body)" },
+      { "name": "wide", "value": "width >= 160 cols", "effect": "bar_width=24, name_width=60, signals join as a comma-separated phrase" }
+    ],
+    "motion": [
+      { "name": "none-decorative", "value": "n/a", "purpose": "No animation exists in the build. Bar and marked-row state update on the next render frame only; observing progress is a re-rendered percentage string in the header, not a spinner." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Diffstat row",
+      "kind": "custom",
+      "refersTo": "model::Row + ui::draw_body",
+      "description": "One line: [rail][mark-prefix]name padded to name_width, bytes right-aligned width 10, growth right-aligned width 10 (human_signed_bytes, em-dash when no baseline), ▕bar▏ scaled to |growth| within the visible set only (never to size), then dim signals text.",
+      "ascii": "mole (1 worktrees)                         2.4GB     +1.2GB ▕++++    ▏          ",
+      "notes": "Verified byte-for-byte against tests/frames/projects_80x24.txt. Selected row applies whole-line REVERSED; marked row applies Yellow to name+prefix only, independent of selection."
+    },
+    {
+      "name": "Tree rail row",
+      "kind": "custom",
+      "refersTo": "model::tree_rows",
+      "description": "Worktree rows get ├─/└─ plus an expand glyph (▸ collapsed / ▾ expanded) computed by sibling position (last sibling gets the elbow). Child artifact rows nest one level under a │ or blank continuation prefix depending on whether their parent worktree was the last sibling.",
+      "ascii": "└─ ▾ Main /Users/dev/src/mole              2.4GB     +1.2GB ▕++++++++▏ c\n   ├─ ✗ deps…dev/src/mole/node_modules   420.0MB   +180.0MB ▕+       ▏\n   ├─ build /Users/dev/src/mole/target     2.0GB     +1.0GB ▕+++++++ ▏\n   └─ source /Users/dev/src/mole/src      12.0MB     +2.0KB ▕+       ▏",
+      "notes": "Verified against confirm_80x24.txt. Sort (g/s) is a no-op in this view on purpose (model.rs comment: reordering would break rail parent/child adjacency)."
+    },
+    {
+      "name": "Header line",
+      "kind": "custom",
+      "refersTo": "ui::header_line",
+      "description": "Single dim line: root path · observed <label> or observing… N% · since <window> (only present when the active filter is a bounded Growth filter) · N projects · attributed bytes · unowned bytes (docker-owned bytes excluded) · docker N unowned (separate figure).",
+      "ascii": "/Users/dev/src · observed just now · since 1w · 2 projects · 9.9GB attributed · 200.0MB unowned · docker 5.0MB unowned",
+      "notes": "The docker-unowned figure is subtracted out of the general unowned figure (ui.rs: unowned.saturating_sub(docker_unowned)), so the two numbers never double-count the same bytes."
+    },
+    {
+      "name": "Filter line",
+      "kind": "input",
+      "refersTo": "app::commit_filter + filter::parse",
+      "description": "Editable line, prefixed '/' while editing or 'filter: ' at rest. On commit, a parse error keeps the previous Filter applied and renders inline in red past the typed text on the same row (no row is stolen from the body).",
+      "ascii": "filter: growth > 100MB in 7d",
+      "notes": "Grammar as actually parsed (filter.rs): `growth [><] <size> in <duration>` (duration clause optional, defaults to unbounded), `kind:<k>`, `project:<name>`, `idle > <duration>`, `merge-complete`, and `0`/empty to clear. `idle` and `merge-complete` parse successfully but yield Filter::NoDataYet — the body then renders literally 'no data yet' — because no enricher backs them yet (#35). This is a real, shipped state, not a placeholder to hide."
+    },
+    {
+      "name": "Confirm banner",
+      "kind": "custom",
+      "refersTo": "app::open_confirm / confirm_summary",
+      "description": "Inline one-line banner above the footer, not a modal: 'delete N unit(s) · <bytes> → Trash · Enter confirm · Esc cancel'. Enter on this banner is the sole human authorization point that drives actions::authorize -> execute_plan -> ledger.",
+      "ascii": "delete 3 units · 1.9 GB → Trash · Enter confirm · Esc cancel",
+      "notes": "Confirmed only reachable with marked.is_empty() == false; Esc/cancel clears confirm_open without touching marks."
+    },
+    {
+      "name": "Refusal footer",
+      "kind": "custom",
+      "refersTo": "app::set_refusal / refusal_active",
+      "description": "Replaces the footer for exactly 4s (REFUSAL_DISPLAY) in red text (never a red background) with 'refused: <reason>'. Refusal reasons are wired from two independent sources: units::markable (kind-level: git/source/loose/unknown are never markable) and the action layer's own sink recheck at execute time (e.g. ledger open failure).",
+      "ascii": "refused: source trees are never a delete target",
+      "notes": "The row stays and the mark clears on a mark-time refusal per DESIGN.md; verified against app.rs mark_refuses_non_artifact_kinds test and refusal_80x24.txt fixture."
+    },
+    {
+      "name": "Empty-result body",
+      "kind": "custom",
+      "refersTo": "ui::draw_body",
+      "description": "When the active filter yields zero rows: single line 'no rows match — Backspace to widen, 0 to clear'. Never a blank pane.",
+      "ascii": "no rows match — Backspace to widen, 0 to clear"
+    },
+    {
+      "name": "Help overlay",
+      "kind": "custom",
+      "refersTo": "ui::draw_help",
+      "description": "The only overlay in the product. Centered bordered box (Borders::ALL), title 'help (? to close)', listing the live key vocabulary and the filter grammar verbatim from the same strings the footer and parser use.",
+      "ascii": "┌help (? to close)───────────────────────────────────────────────────┐\n│Keys                                                                │\n│  ↑↓        move selection                                          │\n│  →/←       expand / collapse                                       │\n│  Enter     open project / confirm delete                           │\n│  Backspace mark selected unit for delete                           │\n│  /         edit filter, Enter to apply                             │\n│  0         clear filter                                            │\n│  v, 1-5    switch view                                             │\n│  g / s     sort by growth / size                                   │\n│  ?         toggle this help                                        │\n│  q         quit                                                    │\n└────────────────────────────────────────────────────────────────────┘"
+    }
+  ],
+  "narrative": {
+    "northStar": "diffstat ledger (unchanged from DESIGN.md; the build confirms rather than revises it)",
+    "overview": "The five views (projects, tree, kinds, docker, unowned) all render one shared Report; nothing is computed only for the screen. The tree view is the one place a real hierarchy exists, so it alone gets the box-drawing rail and is deliberately exempt from g/s sort (reordering would sever the rail's parent/child adjacency). Every other view is a flat ranked list that g/s can reorder.",
+    "keyVocabulary": {
+      "↑ ↓": "move selection (App::move_selection)",
+      "→ / ←": "expand / collapse (App::toggle_expand, tree view only)",
+      "Enter": "drill into a project (projects view) or confirm the pending delete (confirm banner open) — one key, two meanings gated by state (App::drill_into_selected)",
+      "Backspace (⌫)": "mark/unmark the selected row for delete, or refuse inline with a named reason (App::mark_selected)",
+      "/": "edit the filter line; Enter commits, a bad grammar string keeps the previous filter and shows a red inline error",
+      "0": "clear the filter to Filter::None (App::clear_filter)",
+      "v, 1-5": "cycle or jump directly to a view (ViewKind::next / from_digit)",
+      "g": "toggle sort by growth magnitude; pressing again toggles back to Sort::None (App::set_sort) — flat views only",
+      "s": "toggle sort by size; same toggle-back behavior — flat views only",
+      "?": "toggle the help overlay (the only overlay)",
+      "q": "quit"
+    },
+    "filterGrammar": {
+      "growth [><] <size> in <duration>": "duration clause optional (defaults to unbounded window); size units B/KB/MB/GB; duration units s/m/h/d/w",
+      "kind:<k>": "exact match against the kind_label the row already renders (build, deps, git, cache, source, docker-image, docker-cache, docker-volume, loose, unknown)",
+      "project:<name>": "substring match on project name, applied at row-build time",
+      "idle > <duration>": "parses; evaluates to Filter::NoDataYet (no enricher backs it yet, tracked as #35)",
+      "merge-complete": "parses; also Filter::NoDataYet for the same reason",
+      "0 or empty": "clears to Filter::None"
+    },
+    "stateMachine": {
+      "mark": "Backspace on a row with a unit+kind that passes units::markable toggles it into/out of App.marked (keyed by path string). A kind that fails markable() sets a 4s refusal instead and never touches marked.",
+      "confirm": "Enter (when marked is non-empty) opens the inline confirm banner. Esc cancels without clearing marks. Enter again on the open banner is the sole human-authorization keypress: it drives actions::authorize -> execute_plan (per-unit, non-aborting on individual failure) -> ledger append, then clears marked and closes the banner regardless of per-unit outcome, reporting an aggregate 'N deleted[, M refused] · planned X · measured Y' in the footer.",
+      "refusal": "Two independent sources feed the same 4s-red-footer mechanism: mark-time kind refusal (units::markable) and action-layer sink refusal at confirm time (e.g. ledger open failure) — both call App::set_refusal.",
+      "help": "? toggles help_open; it is rendered as an overlay on top of whatever view/state is current, never a separate mode that suspends input elsewhere."
+    },
+    "actionLayerWiring": "actions.rs is a thin driver, not new policy: MarkedUnit (path/bytes/observed_at) is enough to re-derive a slop_livin_core Artifact. authorize() mints a Plan and a Grant together for the same keypress (grant.created_outside_index = true, actor = the confirming human, never an agent or the index). execute_plan() calls slop_livin_core::execution::execute_delete once per unit, which does its own re-symlink_metadata + occupancy recheck immediately before the rename — the TUI does not re-implement sink safety. Every outcome is appended to slop_livin_core::ledger::Ledger. trash_root() resolves to ~/.Trash unless SLOP_LIVIN_TRASH_DIR overrides it for tests. free_space_bytes() via `df -k` is read-only and advisory: a failed measurement reports 'unmeasured' rather than blocking or fabricating a number. After execution the in-memory Report is locally patched (successfully removed artifact paths dropped from their worktree) rather than re-walking the whole root, which stays out of scope for this action.",
+      "buildVsDesignNotes": "No divergence found between DESIGN.md and the shipped build for the four floor-review fix items (tree rail, g/s keys, header 'since'/docker-unowned fields, width-adaptive signals): all four are implemented exactly as DESIGN.md's grammar section already specified, confirmed against tests/frames fixtures at both 80x24 and 200x60."
+  }
+}

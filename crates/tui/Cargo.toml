@@ -1,14 +1,14 @@
 [package]
-name = "slop-livin"
+name = "slop-livin-tui"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 serde_json.workspace = true
 slop-livin-core = { path = "../core" }
-slop-livin-tui = { path = "../tui" }
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tempfile.workspace = true
