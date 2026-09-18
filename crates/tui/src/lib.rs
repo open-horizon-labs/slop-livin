@@ -315,6 +315,19 @@ mod tests {
     }
 
     #[test]
+    fn header_never_claims_a_window_longer_than_the_history() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.width = 200;
+        app.history_secs = Some(4 * 3_600);
+        app.filter_text = "growth > 100MB in 7d".into();
+        app.commit_filter();
+        let mut t = ratatui::Terminal::new(TestBackend::new(200, 10)).unwrap();
+        t.draw(|f| ui::draw(f, &app)).unwrap();
+        let s = t.backend().to_string();
+        assert!(s.contains("since 4h (asked 1w; history is 4h)"), "{s}");
+    }
+
+    #[test]
     fn narrow_signals_spell_out_the_loud_ones() {
         let sig = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(

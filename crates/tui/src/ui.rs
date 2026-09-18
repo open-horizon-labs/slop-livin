@@ -12,8 +12,21 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+/// The growth window the header reports. When the asked-for window is
+/// longer than the observations the store holds, the effective window is
+/// the history itself, and the label says so instead of implying a week
+/// of growth from four hours of data.
 fn since_label(app: &App) -> Option<String> {
-    crate::filter::growth_window_secs(&app.filter).map(human_duration)
+    let asked = crate::filter::growth_window_secs(&app.filter)?;
+    Some(match app.history_secs {
+        Some(hist) if hist < asked => format!(
+            "{} (asked {}; history is {})",
+            human_duration(hist),
+            human_duration(asked),
+            human_duration(hist)
+        ),
+        _ => human_duration(asked),
+    })
 }
 
 fn human_duration(secs: u64) -> String {
