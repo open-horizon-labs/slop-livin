@@ -1,0 +1,7 @@
+[package]
+name = "slop-livin-source-audit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+syn.workspace = true

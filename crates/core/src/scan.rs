@@ -1,0 +1,219 @@
+use crate::entities::*;
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ScanOptions {
+    pub roots: Vec<PathBuf>,
+    pub cross_device: bool,
+    pub max_depth: Option<usize>,
+}
+
+impl ScanOptions {
+    pub fn canonical_roots(&self) -> Result<Vec<PathBuf>> {
+        self.roots
+            .iter()
+            .map(|root| {
+                fs::canonicalize(root).with_context(|| format!("canonicalize {}", root.display()))
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ScanRow {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub device: u64,
+    pub folded: bool,
+    pub repo_root_id: Option<String>,
+    pub linked_worktree: bool,
+}
+
+pub fn scan(options: &ScanOptions) -> Result<Vec<ScanRow>> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for root in options.canonical_roots()? {
+        let device = fs::metadata(&root)
+            .with_context(|| format!("stat {}", root.display()))?
+            .dev();
+        walk(&root, device, options, 0, &mut seen, &mut rows)?;
+    }
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(rows)
+}
+
+fn walk(
+    path: &Path,
+    device: u64,
+    options: &ScanOptions,
+    depth: usize,
+    seen: &mut HashSet<(u64, u64)>,
+    rows: &mut Vec<ScanRow>,
+) -> Result<u64> {
+    let meta = fs::symlink_metadata(path)?;
+    if !options.cross_device && meta.dev() != device {
+        return Ok(0);
+    }
+    if meta.is_file() {
+        let key = (meta.dev(), meta.ino());
+        if !seen.insert(key) {
+            return Ok(0);
+        }
+        return Ok(meta.len());
+    }
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+    let repo = repo_identity(path);
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => {
+            rows.push(ScanRow {
+                path: path.to_path_buf(),
+                bytes: 0,
+                device: meta.dev(),
+                folded: true,
+                repo_root_id: repo.clone(),
+                linked_worktree: false,
+            });
+            return Ok(0);
+        }
+    };
+    if options.max_depth.is_some_and(|d| depth >= d) {
+        rows.push(ScanRow {
+            path: path.to_path_buf(),
+            bytes: 0,
+            device: meta.dev(),
+            folded: true,
+            repo_root_id: repo.clone(),
+            linked_worktree: false,
+        });
+        return Ok(0);
+    }
+    let mut total = 0;
+    for entry in entries.flatten() {
+        total += walk(&entry.path(), device, options, depth + 1, seen, rows)?;
+    }
+    rows.push(ScanRow {
+        path: path.to_path_buf(),
+        bytes: total,
+        device: meta.dev(),
+        folded: false,
+        repo_root_id: repo,
+        linked_worktree: false,
+    });
+    Ok(total)
+}
+
+pub fn repo_identity(path: &Path) -> Option<String> {
+    let git = path.join(".git");
+    let text = if git.is_dir() {
+        let meta = fs::metadata(&git).ok()?;
+        format!("git-object-store:{}:{}", meta.dev(), meta.ino())
+    } else if git.is_file() {
+        fs::read_to_string(&git)
+            .ok()?
+            .trim()
+            .strip_prefix("gitdir:")?
+            .trim()
+            .to_owned()
+    } else {
+        return None;
+    };
+    Some(id_for(&text))
+}
+
+pub fn fold_artifacts(rows: &[ScanRow]) -> Vec<Artifact> {
+    let mut grouped: BTreeMap<PathBuf, &ScanRow> = BTreeMap::new();
+    for row in rows.iter().filter(|r| r.folded) {
+        grouped.insert(row.path.clone(), row);
+    }
+    grouped
+        .into_iter()
+        .map(|(path, row)| {
+            let kind = classify(&path);
+            Artifact {
+                id: id_for(&format!("{}:{:?}", path.display(), kind)),
+                project_id: row.repo_root_id.clone(),
+                kind: kind.clone(),
+                path: path.clone(),
+                relative_path: None,
+                bytes: row.bytes,
+                recovery: recovery_for(&kind),
+                present: true,
+                regrowth_count: 0,
+                meta: FactMeta::now("filesystem.walk", Confidence::Medium),
+            }
+        })
+        .collect()
+}
+
+fn classify(path: &Path) -> ArtifactKind {
+    match path.file_name().and_then(|v| v.to_str()).unwrap_or("") {
+        "node_modules" | "target" | "dist" | "build" => ArtifactKind::BuildOutput,
+        ".git" => ArtifactKind::Git,
+        _ => ArtifactKind::Unknown,
+    }
+}
+fn recovery_for(kind: &ArtifactKind) -> RecoveryContract {
+    match kind {
+        ArtifactKind::BuildOutput | ArtifactKind::DependencyTree => RecoveryContract::LocalRebuild,
+        ArtifactKind::Git => RecoveryContract::Irrecoverable,
+        _ => RecoveryContract::Manual,
+    }
+}
+
+pub fn observation(options: &ScanOptions) -> Result<Observation> {
+    let rows = scan(options)?;
+    let artifacts = fold_artifacts(&rows);
+    let bytes = rows
+        .iter()
+        .filter(|r| !r.folded)
+        .map(|r| r.bytes)
+        .max()
+        .unwrap_or_default();
+    let roots = options.canonical_roots()?;
+    let projects = roots
+        .iter()
+        .filter_map(|p| {
+            repo_identity(p).map(|id| Project {
+                id,
+                path: p.clone(),
+                confidence: Confidence::High,
+                meta: FactMeta::now("git", Confidence::High),
+            })
+        })
+        .collect();
+    Ok(Observation {
+        volume_id: fs::metadata(options.roots.first().context("at least one root")?)?.dev(),
+        roots,
+        artifacts,
+        projects,
+        worktrees: vec![],
+        signals: vec![],
+        observed_at: now(),
+        source: "filesystem.walk".into(),
+        coverage_bytes: bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    #[test]
+    fn repo_identity_survives_path_rename() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join(".git")).unwrap();
+        let a = repo_identity(d.path()).unwrap();
+        fs::rename(d.path(), d.path().with_extension("moved")).unwrap();
+        assert_eq!(a, repo_identity(&d.path().with_extension("moved")).unwrap());
+    }
+}
