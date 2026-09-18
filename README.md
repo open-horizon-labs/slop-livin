@@ -150,7 +150,7 @@ There is no MCP tool that writes a grant. That is the design, not an omission.
 | Docker attributed to projects | ✓ | | | | | | | |
 | Agent interface | MCP, propose/execute with human grant | | | | | | read-only MCP | |
 | Incremental observation | FSEvents | | | | | | | |
-| Deletes to | Trash | rm | rm / Trash | Trash | rm | Trash | | Trash |
+| Deletes to | Trash | rm | rm | Trash | rm | Trash | | Trash |
 | Price | free | free | free | free | free | free (Mac app paid) | $19.99 | $9.99 |
 
 kondo and clean-dev-dirs are the right tool when you want a one-shot sweep of build output across ecosystems and don't need history. cargo-sweep is the right tool inside a single Rust workspace. Mole is a general macOS cleanup toolkit; `slop-livin` started as a Mole contribution and became its own thing when the questions turned out to be about projects, not caches. StorageRadar and DaisyDisk are directory-tree visualizers; DaisyDisk has no history, StorageRadar's is manual snapshots without a project model.
