@@ -138,6 +138,13 @@ pub struct Report {
 /// matches a discovered project name", which lands as an `UnownedRow`
 /// with reason `OwnedByNothing` rather than being attributed anywhere.
 pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
+    report_with(root, docker_facts, false)
+}
+
+/// Same as [`report`], optionally running `du -skPx` on the root as an
+/// independent oracle for `reconciliation.du_total`. `du` costs as much as
+/// the walk itself on a large tree, so it is off unless asked for.
+pub fn report_with(root: &Path, docker_facts: Option<&Path>, verify_du: bool) -> Result<Report> {
     let discovered = crate::git::discover(root)?;
     let observed_at = crate::entities::now();
 
@@ -192,7 +199,11 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
     }
     let _ = docker_unowned_bytes; // excluded from reconciliation: not part of the fs walk.
 
-    let du = crate::attribution::du_total(root);
+    let du = if verify_du {
+        crate::attribution::du_total(root)
+    } else {
+        None
+    };
 
     Ok(Report {
         observed_at,

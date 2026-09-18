@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
     measurement::preregister,
-    report::{render_text, report, to_json},
+    report::{render_text, report_with, to_json},
     scan::{ScanOptions, observation},
     store::Store,
     volume::truth,
@@ -59,6 +59,9 @@ enum Command {
         json: bool,
         #[arg(long)]
         docker_facts: Option<PathBuf>,
+        /// Also run `du -skPx` on the root as an independent total (slow).
+        #[arg(long)]
+        verify_du: bool,
     },
 }
 fn main() -> Result<()> {
@@ -106,8 +109,9 @@ fn main() -> Result<()> {
             root,
             json,
             docker_facts,
+            verify_du,
         } => {
-            let r = report(&root, docker_facts.as_deref())?;
+            let r = report_with(&root, docker_facts.as_deref(), verify_du)?;
             if json {
                 println!("{}", to_json(&r)?);
             } else {
