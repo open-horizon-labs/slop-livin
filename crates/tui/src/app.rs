@@ -691,27 +691,97 @@ impl App {
                 model::human_bytes(planned)
             )
         });
-        // Re-observe only the affected worktrees: re-running the walk for
-        // the whole root is out of scope here, so refresh growth/bytes
-        // for the units' own paths by dropping them from the in-memory
-        // report (they are gone) and marking bytes 0 where they used to
-        // be, which is the minimum "affected worktree" refresh without a
-        // second data path.
-        self.reobserve_after_delete(&results);
+        // What just left the disk leaves the screen now; the store and the
+        // header follow from a background incremental observe (FSEvents
+        // narrows it to the touched trees), the same path startup uses.
+        self.prune_removed(&results);
+        self.observe_in_background();
     }
 
-    fn reobserve_after_delete(&mut self, results: &[actions::UnitResult]) {
-        let removed: HashSet<String> = results
+    /// Drops every row under a successfully removed path from the
+    /// in-memory report -- artifacts, whole worktrees, Source directory
+    /// rollups -- and takes their bytes off the header totals, so the
+    /// screen is right before the re-observe lands.
+    pub fn prune_removed(&mut self, results: &[actions::UnitResult]) {
+        let removed: Vec<PathBuf> = results
             .iter()
             .filter(|r| r.outcome.is_ok())
-            .map(|r| r.path.display().to_string())
+            .map(|r| r.path.clone())
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
+        let mut freed = 0u64;
+        let wt_paths: std::collections::HashMap<String, PathBuf> = self
+            .report
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .map(|w| (w.worktree_id.clone(), w.path.clone()))
             .collect();
         for p in &mut self.report.projects {
+            p.worktrees.retain(|wt| {
+                if under(&wt.path) {
+                    freed += wt.artifacts.iter().map(|a| a.bytes).sum::<u64>();
+                    false
+                } else {
+                    true
+                }
+            });
             for wt in &mut p.worktrees {
-                wt.artifacts
-                    .retain(|a| !removed.contains(&a.path.display().to_string()));
+                wt.artifacts.retain(|a| {
+                    if under(&a.path) {
+                        freed += a.bytes;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
+        self.report.projects.retain(|p| !p.worktrees.is_empty());
+        if let Some(map) = self.report.dirs_by_worktree.as_mut() {
+            for (wt_id, rows) in map.iter_mut() {
+                let Some(base) = wt_paths.get(wt_id) else {
+                    continue;
+                };
+                rows.retain(|d| !under(&base.join(&d.rel_path)));
+            }
+        }
+        // Bytes of a removed Source directory were counted inside the
+        // worktree's Source row; the re-observe corrects that row. The
+        // totals shrink by what we know left.
+        let rec = &mut self.report.reconciliation;
+        rec.attributed = rec.attributed.saturating_sub(freed);
+        rec.walked_total = rec.walked_total.saturating_sub(freed);
+        for path in &removed {
+            self.track.remove(path);
+            self.collapsed.remove(&format!("source:{}", path.display()));
+        }
+        if self.selected >= self.rows().len() {
+            self.selected = self.rows().len().saturating_sub(1);
+        }
+    }
+
+    /// Starts an incremental observation of the root on a worker thread;
+    /// `event_loop` swaps the result in when it arrives. No-op without a
+    /// store (fixture apps in tests) or while one is already running.
+    pub fn observe_in_background(&mut self) {
+        let Some(store) = self.store_dir.clone() else {
+            return;
+        };
+        if self.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let res = slop_livin_core::report::report_with(&root, None, false, Some(&store), None);
+            let _ = tx.send(res);
+        });
+        self.pending = Some(rx);
+        self.observing = Some((0, 0));
     }
 
     pub fn toggle_help(&mut self) {
@@ -816,6 +886,75 @@ mod tests {
         // Space toggles it off again.
         app.mark_selected();
         assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn prune_removed_drops_worktrees_dirs_and_bytes_under_the_removed_paths() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        let before = app.report.reconciliation.attributed;
+        let wt_path = app.report.projects[0].worktrees[0].path.clone();
+        let art = app.report.projects[0].worktrees[0].artifacts[0].clone();
+        let mut dirs = std::collections::HashMap::new();
+        dirs.insert(
+            app.report.projects[0].worktrees[0].worktree_id.clone(),
+            vec![slop_livin_core::report::DirRollup {
+                worktree_id: app.report.projects[0].worktrees[0].worktree_id.clone(),
+                track: None,
+                rel_path: "node_modules/x".into(),
+                parent_rel_path: None,
+                allocated_total: 1,
+                own_allocated: 1,
+                file_count: 1,
+                entry_count: 1,
+                symlink_count: 0,
+                mod_time_min: 0,
+                complete: true,
+                growth_bytes: None,
+            }],
+        );
+        app.report.dirs_by_worktree = Some(dirs);
+        app.prune_removed(&[actions::UnitResult {
+            path: art.path.clone(),
+            outcome: Ok(slop_livin_core::execution::Outcome {
+                unit_id: String::new(),
+                status: "ok".into(),
+                reason: None,
+                intended_bytes: 0,
+                observed_free_space_delta: None,
+            }),
+        }]);
+        assert!(
+            app.report.projects[0].worktrees[0]
+                .artifacts
+                .iter()
+                .all(|a| a.path != art.path)
+        );
+        assert_eq!(
+            app.report.reconciliation.attributed,
+            before.saturating_sub(art.bytes)
+        );
+        assert!(
+            app.report
+                .dirs_by_worktree
+                .as_ref()
+                .unwrap()
+                .values()
+                .all(|rows| rows.is_empty()),
+            "dir rollups under the removed artifact go too"
+        );
+        // A whole worktree removal empties its project.
+        app.prune_removed(&[actions::UnitResult {
+            path: wt_path,
+            outcome: Ok(slop_livin_core::execution::Outcome {
+                unit_id: String::new(),
+                status: "ok".into(),
+                reason: None,
+                intended_bytes: 0,
+                observed_free_space_delta: None,
+            }),
+        }]);
+        assert!(app.report.projects.is_empty());
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
