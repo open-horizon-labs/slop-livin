@@ -146,7 +146,7 @@ fn checkout_name(dir: &Path) -> String {
         .to_string()
 }
 
-fn classify_main_checkout(dir: &Path, git_dir: &Path) -> Option<DiscoveredWorktree> {
+pub(crate) fn classify_main_checkout(dir: &Path, git_dir: &Path) -> Option<DiscoveredWorktree> {
     let common = fs::canonicalize(git_dir).ok()?;
     let project_id = id_for(&common.display().to_string());
     let remote_url = read_origin_url(&common);
@@ -169,7 +169,10 @@ fn classify_main_checkout(dir: &Path, git_dir: &Path) -> Option<DiscoveredWorktr
 ///   which has no `commondir` — it is an independent object store, not a
 ///   share of the parent's. It is its own project, kind `Main`, exactly
 ///   like a nested repo discovered through a `.git` directory.
-fn classify_git_file(worktree_dir: &Path, git_file: &Path) -> Option<DiscoveredWorktree> {
+pub(crate) fn classify_git_file(
+    worktree_dir: &Path,
+    git_file: &Path,
+) -> Option<DiscoveredWorktree> {
     let gitdir_path = resolve_gitdir(worktree_dir, git_file)?;
     let commondir_file = gitdir_path.join("commondir");
     if let Ok(commondir_content) = fs::read_to_string(&commondir_file) {

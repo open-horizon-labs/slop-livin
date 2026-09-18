@@ -47,7 +47,7 @@ const SHARED_CACHE_NAMES: &[&str] = &[
     ".gradle",
 ];
 
-fn classify(name: &str) -> Option<ArtifactKind> {
+pub(crate) fn classify(name: &str) -> Option<ArtifactKind> {
     ARTIFACT_KINDS
         .iter()
         .find(|(n, _)| *n == name)
@@ -60,13 +60,13 @@ fn classify(name: &str) -> Option<ArtifactKind> {
         .or_else(|| is_shared_cache_name(name).then_some(ArtifactKind::Cache))
 }
 
-fn is_shared_cache_name(name: &str) -> bool {
+pub(crate) fn is_shared_cache_name(name: &str) -> bool {
     SHARED_CACHE_NAMES.contains(&name)
 }
 
 /// Allocated bytes for one file: `st_blocks * 512`, the actual space the
 /// file occupies on disk rather than its logical length.
-fn allocated_bytes(meta: &fs::Metadata) -> u64 {
+pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
     meta.blocks() * 512
 }
 
