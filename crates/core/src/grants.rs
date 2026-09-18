@@ -86,3 +86,38 @@ pub fn plan(units: Vec<PlanUnit>, expires_at: u64) -> Plan {
         single_use: true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn index_cannot_mint_authorization() {
+        let artifact = Artifact {
+            id: "a".into(),
+            project_id: None,
+            kind: ArtifactKind::BuildOutput,
+            path: "/tmp/a".into(),
+            relative_path: None,
+            bytes: 1,
+            recovery: RecoveryContract::LocalRebuild,
+            present: true,
+            regrowth_count: 0,
+            meta: FactMeta::now("test", Confidence::High),
+        };
+        let grant = Grant {
+            id: "g".into(),
+            verb: Verb::Delete,
+            predicate: Predicate {
+                project_id: None,
+                kind: None,
+                max_bytes: 10,
+                require_fresh_within_secs: 60,
+            },
+            scope: vec![],
+            expires_at: now() + 60,
+            actor: "agent".into(),
+            created_outside_index: false,
+        };
+        assert!(grant.validate(&artifact, now()).is_err());
+    }
+}
