@@ -385,12 +385,13 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
             _ => String::new(),
         };
+        // Badges trail the name so names stay left-aligned and scannable.
         let badge = if row.badges.is_empty() {
             String::new()
         } else {
-            format!("{} ", row.badges)
+            format!("  {}", row.badges)
         };
-        let raw_name = format!("{}{mark_prefix}{badge}{}{track}", row.rail, row.label);
+        let raw_name = format!("{}{mark_prefix}{}{badge}{track}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
         let bytes = format!("{:>10}", human_bytes(row.bytes));
         let growth = format!(
