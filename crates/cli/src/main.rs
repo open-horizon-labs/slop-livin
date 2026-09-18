@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slop_livin_core::{
     render::{render_kinds, render_overview, render_project},
-    report::{report_with_observe, to_json},
+    report::{Report, report_full, to_json},
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -56,6 +56,17 @@ enum Command {
         /// default one-line-per-kind summary. Text output only.
         #[arg(long)]
         docker: bool,
+        /// R4c: print each worktree's subdirectory growth table (and any
+        /// large files that grew) instead of the overview. Combine with
+        /// `--project` to narrow to one project; text output only, kept
+        /// separate from `render.rs`'s overview rendering.
+        #[arg(long)]
+        dirs: bool,
+        /// With `--dirs`, only print directories up to this many path
+        /// components deep (relative to the worktree root). Unset shows
+        /// every directory.
+        #[arg(long)]
+        depth: Option<usize>,
     },
 }
 
@@ -92,22 +103,33 @@ fn main() -> Result<()> {
             kinds,
             all,
             docker,
+            dirs,
+            depth,
         } => {
             // The growth store is always consulted, even under
             // `--no-observe`: growth is read from whatever prior
             // observations already exist there (item 5), and only the
             // *write* of a new observation is skipped.
             let store_dir = slop_livin_dir();
-            let r = report_with_observe(
+            let r = report_full(
                 &root,
                 docker_facts.as_deref(),
                 verify_du,
                 Some(&store_dir),
                 since.as_deref(),
                 !no_observe,
+                dirs,
             )?;
             if json {
                 println!("{}", to_json(&r)?);
+            } else if dirs {
+                match render_dirs(&r, project.as_deref(), depth) {
+                    Ok(text) => print!("{text}"),
+                    Err(name) => {
+                        eprintln!("no project named {name:?} found under {}", root.display());
+                        std::process::exit(1);
+                    }
+                }
             } else if let Some(name) = project {
                 match render_project(&r, &name) {
                     Some(text) => print!("{text}"),
@@ -124,4 +146,124 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// R4c `--dirs` drill: per worktree, subdirectories sorted by growth desc
+/// then bytes desc, with `changed <age>` derived from `mod_time_min`;
+/// large files that grew are listed beneath. Kept in the CLI (not
+/// `render.rs`) per this slice's scope: it is a minimal text view over
+/// `dirs_by_worktree`/`files_by_worktree`, not part of the overview
+/// renderer's contract.
+///
+/// Returns `Err(name)` when `only_project` names a project not present
+/// in the report, mirroring `render_project`'s `None` case.
+fn render_dirs(
+    report: &Report,
+    only_project: Option<&str>,
+    depth: Option<usize>,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let empty_dirs = std::collections::HashMap::new();
+    let empty_files = std::collections::HashMap::new();
+    let dirs_by_worktree = report.dirs_by_worktree.as_ref().unwrap_or(&empty_dirs);
+    let files_by_worktree = report.files_by_worktree.as_ref().unwrap_or(&empty_files);
+
+    if let Some(name) = only_project
+        && !report.projects.iter().any(|p| p.name == name)
+    {
+        return Err(name.to_string());
+    }
+
+    let mut out = String::new();
+    for project in &report.projects {
+        if let Some(name) = only_project
+            && project.name != name
+        {
+            continue;
+        }
+        for worktree in &project.worktrees {
+            let mut rows: Vec<&slop_livin_core::report::DirRollup> = dirs_by_worktree
+                .get(&worktree.worktree_id)
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+            if let Some(max_depth) = depth {
+                rows.retain(|d| {
+                    d.rel_path.is_empty() || d.rel_path.matches('/').count() < max_depth
+                });
+            }
+            rows.sort_by(|a, b| {
+                b.growth_bytes
+                    .unwrap_or(0)
+                    .cmp(&a.growth_bytes.unwrap_or(0))
+                    .then(b.allocated_total.cmp(&a.allocated_total))
+            });
+
+            let _ = writeln!(
+                out,
+                "{} [{}] {}",
+                project.name,
+                worktree.worktree_id,
+                worktree.path.display()
+            );
+            for row in &rows {
+                let label = if row.rel_path.is_empty() {
+                    ".".to_string()
+                } else {
+                    row.rel_path.clone()
+                };
+                let growth = row
+                    .growth_bytes
+                    .map(|g| format!(" ({g:+} bytes)"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "  {label:<40} {:>12} bytes{growth}  changed {}",
+                    row.allocated_total,
+                    age_from_mod_time_min(row.mod_time_min)
+                );
+            }
+
+            let mut file_rows: Vec<&slop_livin_core::report::FileRow> = files_by_worktree
+                .get(&worktree.worktree_id)
+                .map(|v| {
+                    v.iter()
+                        .filter(|f| f.growth_bytes.unwrap_or(0) > 0)
+                        .collect()
+                })
+                .unwrap_or_default();
+            file_rows.sort_by(|a, b| b.growth_bytes.cmp(&a.growth_bytes));
+            for f in file_rows {
+                let _ = writeln!(
+                    out,
+                    "    large file {:<38} {:>12} bytes (+{} bytes)  changed {}",
+                    f.rel_path,
+                    f.allocated,
+                    f.growth_bytes.unwrap_or(0),
+                    age_from_mod_time_min(f.mod_time_min)
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A rough human age string ("3d", "5h", "12m", "just now") from minutes
+/// since the Unix epoch, relative to now.
+fn age_from_mod_time_min(mod_time_min: i32) -> String {
+    let now_min = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        / 60) as i64;
+    let age_min = (now_min - mod_time_min as i64).max(0);
+    if age_min < 1 {
+        "just now".to_string()
+    } else if age_min < 60 {
+        format!("{age_min}m")
+    } else if age_min < 60 * 24 {
+        format!("{}h", age_min / 60)
+    } else {
+        format!("{}d", age_min / (60 * 24))
+    }
 }

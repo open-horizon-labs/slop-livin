@@ -13,7 +13,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Paths and exact byte sizes for everything the fixture wrote.
+/// Paths and exact byte sizes for everything the fixture wrote. Not
+/// every consumer (e.g. `dirs_and_files.rs`) needs every field -- each
+/// integration test binary compiles this module separately, so an
+/// unused field here is a per-binary lint, not a real dead-code signal.
+#[allow(dead_code)]
 pub struct Fixture {
     pub root: PathBuf,
     pub checkout: PathBuf,

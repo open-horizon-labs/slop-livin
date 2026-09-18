@@ -22,7 +22,9 @@
 use crate::attribution::{AttributionResult, allocated_bytes, classify, is_shared_cache_name};
 use crate::entities::{Confidence, id_for};
 use crate::git::{DiscoveredWorktree, classify_git_file, classify_main_checkout};
-use crate::report::{ArtifactKind, ArtifactRow, Source, UnownedReason, UnownedRow};
+use crate::report::{
+    ArtifactKind, ArtifactRow, DirRollup, FileRow, Source, UnownedReason, UnownedRow,
+};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -210,6 +212,32 @@ fn nearest_worktree<'a>(worktrees: &'a [KnownWorktree], path: &Path) -> Option<&
         .map(|w| w.worktree_id.as_str())
 }
 
+/// The root path of the worktree with this id, for turning an absolute
+/// path into a rel_path (`DirRollup`/`FileRow` keys are always relative,
+/// same contract as `growth.rs`'s stored rows).
+fn worktree_root_path<'a>(worktrees: &'a [KnownWorktree], id: &str) -> Option<&'a Path> {
+    worktrees
+        .iter()
+        .find(|w| w.worktree_id == id)
+        .map(|w| w.path.as_path())
+}
+
+fn rel_path_string(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let s = rel.display().to_string();
+    if s == "." { String::new() } else { s }
+}
+
+fn parent_rel_path_of(rel_path: &str) -> Option<String> {
+    if rel_path.is_empty() {
+        return None;
+    }
+    match Path::new(rel_path).parent() {
+        Some(p) => Some(p.display().to_string()),
+        None => Some(String::new()),
+    }
+}
+
 /// Number of shards for the hardlink-dedup set. One `lstat`'s worth of
 /// work (a mutex lock + hash-set insert) happens per regular file across
 /// every worker, so a single global mutex there would serialize the
@@ -272,6 +300,15 @@ struct AttrShared {
     attributed_total: AtomicU64,
     unowned_total: AtomicU64,
     observed_at: u64,
+    /// R4c: one entry per Source-tree directory, keyed by
+    /// `(worktree_id, rel_path)`. Never populated for a directory inside
+    /// a folded artifact (those are `Size` jobs, not `Walk` jobs) or for
+    /// a directory outside every known worktree.
+    dirs: Mutex<HashMap<(String, String), DirRollup>>,
+    /// R4c: large-file rows (>= `large_file_min_bytes`) found directly
+    /// while walking the Source tree.
+    files: Mutex<Vec<FileRow>>,
+    large_file_min_bytes: u64,
 }
 
 /// Parallel equivalent of `attribution::attribute`: same classification
@@ -284,6 +321,7 @@ pub fn attribute_parallel(
     root: &Path,
     worktrees: &[(&Path, &str)],
     observed_at: u64,
+    large_file_min_bytes: u64,
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -303,6 +341,9 @@ pub fn attribute_parallel(
         attributed_total: AtomicU64::new(0),
         unowned_total: AtomicU64::new(0),
         observed_at,
+        dirs: Mutex::new(HashMap::new()),
+        files: Mutex::new(Vec::new()),
+        large_file_min_bytes,
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -348,6 +389,8 @@ pub fn attribute_parallel(
         walked_total: shared.walked_total.load(Ordering::Acquire),
         attributed_total: shared.attributed_total.load(Ordering::Acquire),
         unowned_total: shared.unowned_total.load(Ordering::Acquire),
+        dirs: shared.dirs.into_inner().unwrap().into_values().collect(),
+        files: shared.files.into_inner().unwrap(),
     }
 }
 
@@ -388,15 +431,39 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             return;
         }
     };
+
+    // R4c: this directory's own rollup, accumulated as entries are
+    // classified below. Only recorded at the end if `path` is inside a
+    // known worktree's Source tree (`nearest_worktree` returns `Some`).
+    let mut dir_own_allocated: u64 = 0;
+    let mut dir_file_count: u32 = 0;
+    let mut dir_dir_count: u32 = 0;
+    let mut dir_symlink_count: u32 = 0;
+    let mut dir_mtime_max: i64 = i64::MIN;
+
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
+        let child_path = entry.path();
         if ft.is_symlink() {
+            dir_symlink_count += 1;
+            if let Ok(smeta) = fs::symlink_metadata(&child_path) {
+                dir_mtime_max = dir_mtime_max.max(smeta.mtime());
+            }
             continue;
         }
-        let child_path = entry.path();
         if ft.is_file() {
-            record_file_typed(&child_path, known, shared);
+            dir_file_count += 1;
+            if let Some((mtime, bytes_opt)) = record_file_typed(&child_path, known, shared) {
+                dir_mtime_max = dir_mtime_max.max(mtime);
+                if let Some(bytes) = bytes_opt {
+                    dir_own_allocated += bytes;
+                    if bytes >= shared.large_file_min_bytes {
+                        record_large_file(&child_path, bytes, mtime, known, shared);
+                    }
+                }
+            }
         } else if ft.is_dir() {
+            dir_dir_count += 1;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(kind) = classify(&name) {
@@ -417,22 +484,88 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             }
         }
     }
+
+    if let Some(worktree_id) = nearest_worktree(known, &path).map(str::to_string)
+        && let Some(root) = worktree_root_path(known, &worktree_id)
+    {
+        let rel_path = rel_path_string(root, &path);
+        let parent_rel_path = parent_rel_path_of(&rel_path);
+        let mod_time_min = if dir_mtime_max == i64::MIN {
+            0
+        } else {
+            (dir_mtime_max / 60) as i32
+        };
+        shared.dirs.lock().unwrap().insert(
+            (worktree_id.clone(), rel_path.clone()),
+            DirRollup {
+                worktree_id,
+                rel_path,
+                parent_rel_path,
+                // Bottom-up aggregation into `allocated_total` happens
+                // once in `report::aggregate_dir_totals`, after every
+                // directory job has finished; starting equal to
+                // `own_allocated` keeps this row valid even if that
+                // aggregation step is skipped.
+                allocated_total: dir_own_allocated,
+                own_allocated: dir_own_allocated,
+                file_count: dir_file_count,
+                entry_count: dir_file_count + dir_dir_count + dir_symlink_count,
+                symlink_count: dir_symlink_count,
+                mod_time_min,
+                complete: true,
+                growth_bytes: None,
+            },
+        );
+    }
+}
+
+fn record_large_file(
+    path: &Path,
+    bytes: u64,
+    mtime_secs: i64,
+    known: &[KnownWorktree],
+    shared: &AttrShared,
+) {
+    let Some(worktree_id) = nearest_worktree(known, path) else {
+        return;
+    };
+    let Some(root) = worktree_root_path(known, worktree_id) else {
+        return;
+    };
+    shared.files.lock().unwrap().push(FileRow {
+        worktree_id: worktree_id.to_string(),
+        rel_path: rel_path_string(root, path),
+        allocated: bytes,
+        mod_time_min: (mtime_secs / 60) as i32,
+        growth_bytes: None,
+    });
 }
 
 /// Like `record_file`, but for an entry already known (from
 /// `DirEntry::file_type`) to be a non-symlink file, so it does the one
 /// `lstat` a regular file needs for size/hardlink identity without a
-/// redundant type check first.
-fn record_file_typed(path: &Path, known: &[KnownWorktree], shared: &AttrShared) {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    record_file(path, &meta, known, shared);
+/// redundant type check first. Returns `(mtime_secs, bytes_if_newly_counted)`
+/// so the caller can fold this file into its directory's rollup (mtime
+/// always; bytes only when this was not a hardlink dup, matching how
+/// `walked_total`/`attributed_total` already dedup).
+fn record_file_typed(
+    path: &Path,
+    known: &[KnownWorktree],
+    shared: &AttrShared,
+) -> Option<(i64, Option<u64>)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    Some(record_file(path, &meta, known, shared))
 }
 
-fn record_file(path: &Path, meta: &fs::Metadata, known: &[KnownWorktree], shared: &AttrShared) {
+fn record_file(
+    path: &Path,
+    meta: &fs::Metadata,
+    known: &[KnownWorktree],
+    shared: &AttrShared,
+) -> (i64, Option<u64>) {
+    let mtime = meta.mtime();
     if !shared.seen_inodes.insert_first((meta.dev(), meta.ino())) {
-        return;
+        return (mtime, None);
     }
     let bytes = allocated_bytes(meta);
     shared.walked_total.fetch_add(bytes, Ordering::Relaxed);
@@ -451,6 +584,7 @@ fn record_file(path: &Path, meta: &fs::Metadata, known: &[KnownWorktree], shared
             push_unowned_file(path, bytes, shared);
         }
     }
+    (mtime, Some(bytes))
 }
 
 fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
@@ -577,6 +711,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 pub fn discover_and_attribute(
     root: &Path,
     observed_at: u64,
+    large_file_min_bytes: u64,
 ) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
@@ -593,7 +728,7 @@ pub fn discover_and_attribute(
         .map(|(p, id)| (p.as_path(), id.as_str()))
         .collect();
     let t1 = std::time::Instant::now();
-    let attribution = attribute_parallel(root, &worktree_refs, observed_at);
+    let attribution = attribute_parallel(root, &worktree_refs, observed_at, large_file_min_bytes);
     if trace {
         eprintln!("[trace] walk::attribute_parallel: {:?}", t1.elapsed());
     }
