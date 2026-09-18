@@ -158,18 +158,27 @@ pub fn report_with(
     store_dir: Option<&Path>,
     since_override: Option<&str>,
 ) -> Result<Report> {
-    let discovered = crate::git::discover(root)?;
+    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let observed_at = crate::entities::now();
+
+    // Discovery and attribution are each still their own recursive pass
+    // over the tree; `walk::discover_and_attribute` runs both over a
+    // bounded thread pool instead of one directory at a time per pass.
+    // See its module docs for why the two walks are kept separate rather
+    // than fused into one (they stop recursion on different directories).
+    let t0 = std::time::Instant::now();
+    let (discovered, mut attribution) = crate::walk::discover_and_attribute(root, observed_at)?;
+    if trace {
+        eprintln!("[trace] discover_and_attribute: {:?}", t0.elapsed());
+    }
 
     // Group discovered checkouts/worktrees by project (object-store)
     // identity. A project's display name comes from its main checkout
     // when one was found under this root; otherwise it falls back to the
     // first worktree's own name (e.g. only a linked worktree was in scope).
     let mut projects: BTreeMap<String, ProjectRow> = BTreeMap::new();
-    let mut worktree_paths: Vec<(PathBuf, String)> = Vec::new();
     for dw in discovered {
         let worktree_id = id_for(&dw.path.display().to_string());
-        worktree_paths.push((dw.path.clone(), worktree_id.clone()));
         let entry = projects
             .entry(dw.project_id.clone())
             .or_insert_with(|| ProjectRow {
@@ -188,12 +197,6 @@ pub fn report_with(
             signals: Vec::new(),
         });
     }
-
-    let worktree_refs: Vec<(&Path, &str)> = worktree_paths
-        .iter()
-        .map(|(p, id)| (p.as_path(), id.as_str()))
-        .collect();
-    let mut attribution = crate::attribution::attribute(root, &worktree_refs, observed_at);
 
     let mut projects: Vec<ProjectRow> = projects.into_values().collect();
     for project in &mut projects {

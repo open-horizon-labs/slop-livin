@@ -19,6 +19,7 @@ pub mod report;
 pub mod scan;
 pub mod store;
 pub mod volume;
+pub mod walk;
 
 pub use entities::*;
 pub use grants::*;
