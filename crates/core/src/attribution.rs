@@ -203,6 +203,7 @@ struct KnownWorktree<'a> {
 
 /// Output of the attribution walk: per-worktree artifact rows (including
 /// the synthesized `Source` row), unowned rows, and the walked total.
+#[derive(Debug, Clone)]
 pub struct AttributionResult {
     /// worktree_id -> artifact rows for that worktree.
     pub artifacts_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>>,

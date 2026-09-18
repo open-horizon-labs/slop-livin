@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "001-event-bus-report-pipeline",
+  "title": "The report pipeline is consumers on an in-memory event bus",
+  "status": "implemented",
+  "source": "docs/ADRs/001-event-bus-report-pipeline.md",
+  "validate": {
+    "cargo_tests": [
+      "bus::tests::follow_on_events_are_routed_to_subscribers",
+      "bus::tests::follow_on_events_dispatch_depth_first",
+      "bus::tests::consumer_receives_events_regardless_of_registration_order",
+      "bus::tests::registration_is_closed_once_run_starts"
+    ],
+    "audits": [
+      "no_consumer_knows_other_consumers",
+      "static_registration_only",
+      "all_report_paths_through_bus",
+      "extractors_are_pluggable"
+    ],
+    "scripts": [],
+    "smoke": []
+  }
+}

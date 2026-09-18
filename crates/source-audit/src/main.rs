@@ -1,66 +1,41 @@
-use std::{fs, path::Path};
-use syn::visit::Visit;
+//! Source audits: every technical constraint in `.oh/guardrails/` as a
+//! named check over the AST. `--list` prints the names (what a guardrail
+//! or ADR may reference); a plain run executes them all and fails on the
+//! first broken constraint per audit, naming the file and shape.
 
-struct Audit {
-    names: Vec<String>,
-}
-impl<'ast> Visit<'ast> for Audit {
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.names.push(node.sig.ident.to_string());
-        syn::visit::visit_item_fn(self, node);
-    }
-}
+mod ast;
+mod audits;
+
+use std::path::Path;
+
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let store = fs::read_to_string(root.join("core/src/store.rs")).unwrap();
-    let scan = fs::read_to_string(root.join("core/src/scan.rs")).unwrap();
-    let grants = fs::read_to_string(root.join("core/src/grants.rs")).unwrap();
-    for (name, src) in [
-        ("store", store.as_str()),
-        ("scan", scan.as_str()),
-        ("grants", grants.as_str()),
-    ] {
-        syn::parse_file(src).unwrap_or_else(|e| panic!("{name} is not valid Rust: {e}"));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--list") {
+        for (name, _) in audits::AUDITS {
+            println!("{name}");
+        }
+        return;
     }
-    assert!(
-        store.contains("ArrowWriter"),
-        "store must write real Parquet"
-    );
-    assert!(
-        store.contains("WriterProperties"),
-        "Parquet writer must declare compression"
-    );
-    assert!(
-        scan.contains("canonical_roots"),
-        "roots must be canonicalized at the boundary"
-    );
-    assert!(
-        grants.contains("created_outside_index"),
-        "grants need non-index provenance"
-    );
-    // One byte formatter in the product: the TUI once divided by 1024
-    // under a decimal "GB" label while core divided by 1000, so the same
-    // number read 1.8GB in one surface and 2.0GB in the other and rows
-    // visibly failed to sum to their total. The TUI re-exports core's.
-    let tui_model = fs::read_to_string(root.join("tui/src/model.rs")).unwrap();
-    assert!(
-        !tui_model.contains("fn human_bytes(bytes: u64) -> String"),
-        "the TUI must re-export core's byte formatter, never define a second one"
-    );
-    assert!(
-        tui_model.contains("pub use slop_livin_core::render::human_bytes_pub as human_bytes"),
-        "the TUI must re-export core's byte formatter"
-    );
-    let render = fs::read_to_string(root.join("core/src/render.rs")).unwrap();
-    assert!(
-        render.contains("while value >= 1000.0"),
-        "byte units are decimal, matching their SI labels"
-    );
-
-    let mut audit = Audit { names: vec![] };
-    audit.visit_file(&syn::parse_file(&scan).unwrap());
-    assert!(
-        audit.names.iter().any(|n| n == "scan"),
-        "scan function must remain discoverable"
-    );
+    let only: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut failed = 0;
+    for (name, audit) in audits::AUDITS {
+        if !only.is_empty() && !only.contains(name) {
+            continue;
+        }
+        match audit(root) {
+            Ok(()) => println!("ok    {name}"),
+            Err(e) => {
+                failed += 1;
+                println!("FAIL  {name}: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("{failed} audit(s) failed");
+        std::process::exit(1);
+    }
 }

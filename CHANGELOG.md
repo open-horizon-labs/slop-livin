@@ -33,6 +33,11 @@ The clean-dev-dirs salvage: everything it does for a human, on top of the histor
 
 - Sparklines are drawn by ratatui's `Sparkline` widget from honest data: buckets before a row's first observation are `·` (not zero), flat rows draw nothing, and the header shows the whole root's history with its net change.
 
+**Architecture: the pipeline is on the bus**
+
+- The report is built by twelve consumers on an in-memory event bus (tokio, static registration, dynamic routing) instead of one thousand-line function: walk → projects → {signals, ecosystems, docker} → github → gate → growth store → tracking → history → assemble → cache. Reports are byte-identical to before. `docs/ADRs/001-event-bus-report-pipeline.md`.
+- Every technical constraint of the design (FSEvents before any walk, Parquet + zstd, reverse deltas, scheduled refresh, folding only for artifacts, symlinks never followed, incremental re-walks, the parallel pool, int32-minute mtimes, facts not verdicts, human-only authorization, pluggable consumers, one byte formatter) is a guardrail under `.oh/guardrails/` and a named AST audit in `crates/source-audit`; `scripts/check.sh` fails when one is broken.
+
 **Also**
 
 - `slop-livin config show | path | init`: the config file, every key with its meaning.

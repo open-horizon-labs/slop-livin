@@ -254,6 +254,7 @@ fn idle_for(dir: &Path, observed_at: u64, last_commit_secs: Option<u64>) -> Sign
 /// composite `merge_complete` fact and by `filter.rs`'s `idle >`
 /// predicate, in addition to the human-rendered `Signal` rows this
 /// module has always produced.
+#[derive(Debug, Clone)]
 pub struct RawSignals {
     pub last_commit_age_secs: Option<u64>,
     pub dirty: Option<bool>,

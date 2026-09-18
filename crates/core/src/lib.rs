@@ -5,7 +5,9 @@
 
 pub mod actions;
 pub mod attribution;
+pub mod bus;
 pub mod compose;
+pub mod consumers;
 pub mod docker;
 pub mod ecosystem;
 pub mod entities;

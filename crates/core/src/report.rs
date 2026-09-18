@@ -5,10 +5,9 @@
 //! stub entry point that returns an empty report so the golden test can
 //! exercise the real contract shape before any discovery logic exists.
 
-use crate::entities::{Confidence, id_for};
+use crate::entities::Confidence;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The text renderer lives in `render.rs`; re-exported here so existing
@@ -623,512 +622,21 @@ pub fn report_full_mode_with_source(
     force_full: bool,
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<Report> {
-    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
-    let observed_at = crate::entities::now();
-
-    let large_file_min_bytes = store_dir
-        .map(|dir| crate::growth::load_config(dir).large_file_min_bytes)
-        .unwrap_or(crate::growth::DEFAULT_LARGE_FILE_MIN_BYTES);
-
-    // Discovery and attribution are each still their own recursive pass
-    // over the tree; `walk::discover_and_attribute` runs both over a
-    // bounded thread pool instead of one directory at a time per pass.
-    // See its module docs for why the two walks are kept separate rather
-    // than fused into one (they stop recursion on different directories).
-    //
-    // R4b (#29): when a growth store is available, try an FSEvents-driven
-    // incremental re-walk first (`growth::observe_tracked_with_source`);
-    // it falls back to the same `discover_and_attribute` full walk on any
-    // refusal. The mode/reason it reports lands in `notes` as
-    // `"fsevents: mode=.. reason=.. changed_dirs=.."`, which is both this
-    // report's coverage line and (parsed back out by `observe_only`) the
-    // `observe` log line's `mode=`/`reason=` fields.
-    let t0 = std::time::Instant::now();
-    let mut notes: Vec<String> = Vec::new();
-    let (discovered, mut attribution) = if let Some(dir) = store_dir {
-        let tracked = crate::growth::observe_tracked_with_source(
-            dir,
-            root,
-            observed_at,
-            large_file_min_bytes,
-            force_full,
-            observe,
-            fs_events_source,
-        )?;
-        notes.push(format!(
-            "fsevents: mode={} reason={} changed_dirs={}",
-            tracked.mode, tracked.reason, tracked.changed_dirs
-        ));
-        (tracked.discovered, tracked.attribution)
-    } else {
-        notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
-        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?
-    };
-    if trace {
-        eprintln!("[trace] discover_and_attribute: {:?}", t0.elapsed());
-    }
-    let mut dirs = std::mem::take(&mut attribution.dirs);
-    let mut files = std::mem::take(&mut attribution.files);
-
-    // Group discovered checkouts/worktrees by project identity. When a
-    // checkout's `origin` remote is known, identity is the normalized
-    // remote URL: two separate clones of the same repo (each its own
-    // object store, its own `git::discover`-assigned `project_id`) are
-    // the same project, and every main checkout after the first-seen one
-    // (by path order, for determinism across the parallel walk) is
-    // demoted from `Main` to `Clone` rather than starting a second
-    // project row. A checkout with no remote configured falls back to
-    // its object-store identity, exactly as before -- unrelated
-    // checkouts never collide just because their remote is empty.
-    //
-    // `group_key` -> discovered rows sharing it, sorted by path so the
-    // first-seen main checkout is deterministic across the parallel walk.
-    let mut groups: BTreeMap<String, Vec<crate::git::DiscoveredWorktree>> = BTreeMap::new();
-    // group_key -> (display name, is a Main row seen).
-    for dw in discovered {
-        let group_key = match dw.remote_url.as_deref().and_then(normalize_remote) {
-            Some(remote) => format!("remote:{remote}"),
-            None => format!("store:{}", dw.project_id),
-        };
-        groups.entry(group_key).or_default().push(dw);
-    }
-
-    let mut projects: Vec<ProjectRow> = Vec::new();
-    let mut worktree_paths: Vec<(PathBuf, String)> = Vec::new();
-    // project_id -> normalized remote URL, first one seen for that project.
-    let mut project_remotes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    // worktree_id -> raw remote URL, this worktree's own (never
-    // normalized: github_owner_repo parses either form).
-    let mut worktree_remotes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (group_key, mut members) in groups {
-        members.sort_by(|a, b| a.path.cmp(&b.path));
-        let project_id = id_for(&group_key);
-        let mut name: Option<String> = None;
-        let mut worktrees: Vec<WorktreeRow> = Vec::new();
-        let mut main_assigned = false;
-        for dw in members {
-            let worktree_id = id_for(&dw.path.display().to_string());
-            worktree_paths.push((dw.path.clone(), worktree_id.clone()));
-            if let Some(remote) = &dw.remote_url {
-                worktree_remotes.insert(worktree_id.clone(), remote.clone());
-            }
-            if let Some(remote) = dw.remote_url.as_deref().and_then(normalize_remote) {
-                project_remotes.entry(project_id.clone()).or_insert(remote);
-            }
-            let kind = match dw.kind {
-                WorktreeKind::Linked => WorktreeKind::Linked,
-                WorktreeKind::Main | WorktreeKind::Clone => {
-                    if main_assigned {
-                        WorktreeKind::Clone
-                    } else {
-                        main_assigned = true;
-                        WorktreeKind::Main
-                    }
-                }
-            };
-            if kind == WorktreeKind::Main || name.is_none() {
-                name = Some(dw.project_name.clone());
-            }
-            worktrees.push(WorktreeRow {
-                worktree_id,
-                path: dw.path,
-                kind,
-                artifacts: Vec::new(),
-                signals: Vec::new(),
-                branch: None,
-                github: None,
-                merge_complete: None,
-                idle_secs: None,
-            });
-        }
-        let remote = project_remotes.get(&project_id).cloned();
-        projects.push(ProjectRow {
-            project_id,
-            name: name.unwrap_or_default(),
-            worktrees,
-            remote,
-            ecosystems: Vec::new(),
-        });
-    }
-    // Keep prior output ordering stable (by name) now that projects is a
-    // plain Vec instead of a BTreeMap keyed by the old per-checkout id.
-    projects.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.project_id.cmp(&b.project_id))
-    });
-
-    for project in &mut projects {
-        for worktree in &mut project.worktrees {
-            crate::attribution::apply_to_worktree(worktree, &mut attribution);
-        }
-    }
-
-    // worktree_id -> raw signal values, kept alongside the rendered
-    // `Signal` rows so the merge_complete composite and `filter.rs`'s
-    // `idle >` predicate can use them without re-parsing rendered
-    // strings.
-    let mut raw_by_worktree: std::collections::HashMap<String, crate::signals::RawSignals> =
-        std::collections::HashMap::new();
-    let t_signals = std::time::Instant::now();
-    let signal_paths: Vec<PathBuf> = projects
-        .iter()
-        .flat_map(|p| p.worktrees.iter().map(|w| w.path.clone()))
-        .collect();
-    let mut signals =
-        crate::signals::compute_signals_raw_parallel(&signal_paths, observed_at).into_iter();
-    for project in &mut projects {
-        for worktree in &mut project.worktrees {
-            let (rows, raw) = signals.next().unwrap_or_else(|| {
-                (
-                    Vec::new(),
-                    crate::signals::RawSignals {
-                        last_commit_age_secs: None,
-                        dirty: None,
-                        unpushed: None,
-                        locked: None,
-                        idle_for_secs: None,
-                    },
-                )
-            });
-            worktree.signals = rows;
-            worktree.branch = crate::github::current_branch(&worktree.path);
-            worktree.idle_secs = raw.idle_for_secs;
-            raw_by_worktree.insert(worktree.worktree_id.clone(), raw);
-        }
-    }
-    if trace {
-        eprintln!(
-            "[trace] signals ({} worktrees): {:?}",
-            signal_paths.len(),
-            t_signals.elapsed()
-        );
-    }
-
-    // GitHub enrichment: only for worktrees whose remote is on
-    // github.com. Cached in enrich.parquet under a volume-keyed
-    // directory: `store_dir` when given (same directory `growth.rs`
-    // uses), otherwise the same default `${SLOP_LIVIN_DIR}` the CLI/MCP
-    // resolve on their own.
-    //
-    // `enrich` (distinct from `observe`, which only controls the growth
-    // store) decides whether this call makes live `gh` calls at all:
-    // `false` (plain `report`/`--view worktrees`) reads `enrich.parquet`
-    // as-is via `github::read_cached` and never shells out; `true`
-    // (`slop-livin observe`'s full walk, or `report --enrich`) refreshes
-    // it live via `github::observe_all` (concurrent, coalesced per
-    // repo) before reading it back. See `github.rs`'s module doc for the
-    // full rationale.
-    let mut github_notes: Vec<String> = Vec::new();
-    let mut github_enrichment: Option<GithubEnrichmentSummary> = None;
-    let github_dir_owned = store_dir
-        .map(PathBuf::from)
-        .or_else(default_github_cache_dir);
-    if let Some(dir) = github_dir_owned.as_deref() {
-        let volume_id = std::fs::metadata(root)
-            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-            .unwrap_or(0);
-
-        // (worktree_id, owner, repo, branch, tip_sha) for every worktree
-        // whose remote resolves to a github.com owner/repo.
-        let mut owned: Vec<(String, String, String, Option<String>, String)> = Vec::new();
-        for project in &projects {
-            for worktree in &project.worktrees {
-                let Some(remote) = worktree_remotes.get(&worktree.worktree_id) else {
-                    continue;
-                };
-                let Some((owner, repo)) = crate::github::github_owner_repo(remote) else {
-                    continue;
-                };
-                let tip_sha = crate::signals::tip_sha(&worktree.path).unwrap_or_default();
-                owned.push((
-                    worktree.worktree_id.clone(),
-                    owner,
-                    repo,
-                    worktree.branch.clone(),
-                    tip_sha,
-                ));
-            }
-        }
-        let inputs: Vec<crate::github::EnrichInput> = owned
-            .iter()
-            .map(
-                |(worktree_id, owner, repo, branch, tip_sha)| crate::github::EnrichInput {
-                    worktree_id,
-                    tip_sha,
-                    branch: branch.as_deref(),
-                    owner,
-                    repo,
-                },
-            )
-            .collect();
-
-        let t_github = std::time::Instant::now();
-        let (facts_by_worktree, gh_notes) = if enrich {
-            let responder = crate::github::GhCliResponder;
-            let summary = crate::github::observe_all(
-                &responder,
-                dir,
-                volume_id,
-                &inputs,
-                observed_at,
-                crate::github::DEFAULT_GITHUB_TTL_SECS,
-                crate::github::DEFAULT_RUN_BUDGET_SECS,
-                crate::github::DEFAULT_CONCURRENCY,
-            );
-            let (facts, mut read_notes) = crate::github::read_cached(
-                dir,
-                volume_id,
-                &inputs,
-                observed_at,
-                crate::github::DEFAULT_GITHUB_TTL_SECS,
-            );
-            read_notes.retain(|n| !n.contains("not enriched") && !n.contains("stale cached"));
-            read_notes.extend(summary.notes);
-            github_enrichment = Some(GithubEnrichmentSummary {
-                calls_made: summary.calls_made,
-                worktrees_enriched: summary.worktrees_enriched,
-                elapsed_secs: t_github.elapsed().as_secs_f64(),
-            });
-            (facts, read_notes)
-        } else {
-            // Never shells out: reads whatever `enrich.parquet` already
-            // has, marking stale/missing entries `Unknown` with a note
-            // pointing at `slop-livin observe`.
-            crate::github::read_cached(
-                dir,
-                volume_id,
-                &inputs,
-                observed_at,
-                crate::github::DEFAULT_GITHUB_TTL_SECS,
-            )
-        };
-        for project in &mut projects {
-            for worktree in &mut project.worktrees {
-                if let Some(facts) = facts_by_worktree.get(&worktree.worktree_id) {
-                    let raw = raw_by_worktree.get(&worktree.worktree_id);
-                    let mc = crate::github::merge_complete(
-                        raw.and_then(|r| r.dirty),
-                        raw.and_then(|r| r.unpushed),
-                        &facts.merged,
-                    );
-                    worktree.signals.push(Signal {
-                        name: "merge_complete".to_string(),
-                        value: format!(
-                            "{} ({})",
-                            match mc.verdict {
-                                crate::github::TriState::Yes => "yes",
-                                crate::github::TriState::No => "no",
-                                crate::github::TriState::Unknown => "unknown",
-                            },
-                            mc.terms.join(", ")
-                        ),
-                    });
-                    worktree.signals.push(Signal {
-                        name: "pull_request".to_string(),
-                        value: render_pr_status(&facts.pull_request),
-                    });
-                    worktree.merge_complete = Some(mc);
-                    worktree.github = Some(facts.clone());
-                }
-            }
-        }
-        github_notes = gh_notes;
-    }
-
-    let mut unowned = attribution.unowned;
-    notes.extend(github_notes);
-    let facts = crate::docker::load(docker_facts);
-    if let Some(reason) = &facts.unavailable {
-        notes.push(reason.clone());
-    }
-    // compose_name -> worktree_ids whose worktree contains a compose file
-    // naming it (via its top-level `name:` or the file's directory
-    // basename). Built once per report so `join_one` can match a
-    // `com.docker.compose.project` label that names the compose project
-    // rather than the discovered project/repo name (#28).
-    let mut compose_index: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for (path, worktree_id) in &worktree_paths {
-        for name in crate::compose::discover_candidate_names(path) {
-            compose_index
-                .entry(name)
-                .or_default()
-                .push(worktree_id.clone());
-        }
-    }
-
-    let join = join_docker_facts(
-        &facts,
-        &projects,
-        &worktree_paths,
-        &project_remotes,
-        &compose_index,
+    // The pipeline is consumers on the event bus (ADR 001); this function
+    // only translates its arguments into the run context.
+    let ctx = crate::bus::ctx_for(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
     );
-    for (worktree_id, mut rows) in join.rows_by_worktree {
-        for project in &mut projects {
-            for worktree in &mut project.worktrees {
-                if worktree.worktree_id == worktree_id {
-                    worktree.artifacts.append(&mut rows);
-                    break;
-                }
-            }
-        }
-    }
-    unowned.extend(join.unowned);
-    let docker_attributed_bytes = join.attributed_bytes;
-    let docker_unowned_bytes = join.unowned_bytes;
-
-    let du = if verify_du {
-        crate::attribution::du_total(root)
-    } else {
-        None
-    };
-
-    // R4c: `own_allocated` is set by the walk; roll it up into
-    // `allocated_total` bottom-up (deepest directories first) before
-    // persisting/annotating, so a parent's total reflects every Source
-    // descendant without needing the walk itself to wait on children.
-    aggregate_dir_totals(&mut dirs);
-
-    let mut schedule_line = None;
-    if let Some(dir) = store_dir {
-        let volume_id = std::fs::metadata(root)
-            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-            .unwrap_or(0);
-        let config = crate::growth::load_config(dir);
-        let since_secs = since_override
-            .and_then(crate::growth::parse_duration_secs)
-            .or_else(|| crate::growth::parse_duration_secs(&config.since))
-            .unwrap_or(24 * 3600);
-        if observe {
-            crate::growth::observe_and_annotate(
-                dir,
-                volume_id,
-                &mut projects,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-            crate::growth::observe_and_annotate_dirs(
-                dir,
-                volume_id,
-                &mut dirs,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-            crate::growth::observe_and_annotate_files(
-                dir,
-                volume_id,
-                &mut files,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-        } else {
-            crate::growth::annotate_readonly(
-                dir,
-                volume_id,
-                &mut projects,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-            crate::growth::annotate_readonly_dirs(
-                dir,
-                volume_id,
-                &mut dirs,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-            crate::growth::annotate_readonly_files(
-                dir,
-                volume_id,
-                &mut files,
-                observed_at,
-                config.retention_days,
-                since_secs,
-            )?;
-        }
-        schedule_line = Some(crate::schedule::header_line(dir, root, observed_at));
-    }
-
-    let (mut dirs_by_worktree, files_by_worktree) = if include_dirs {
-        let mut by_dir: std::collections::HashMap<String, Vec<DirRollup>> =
-            std::collections::HashMap::new();
-        for d in dirs {
-            by_dir.entry(d.worktree_id.clone()).or_default().push(d);
-        }
-        let mut by_file: std::collections::HashMap<String, Vec<FileRow>> =
-            std::collections::HashMap::new();
-        for f in files {
-            by_file.entry(f.worktree_id.clone()).or_default().push(f);
-        }
-        (Some(by_dir), Some(by_file))
-    } else {
-        (None, None)
-    };
-
-    let t_track = std::time::Instant::now();
-    annotate_tracking(&mut projects, dirs_by_worktree.as_mut());
-    if trace {
-        eprintln!("[trace] annotate_tracking: {:?}", t_track.elapsed());
-    }
-    // History for sparklines, from the store's current + reverse deltas.
-    // Window: the effective growth window (asked, or the whole history).
-    let (series_by_key, total_series, series_window_secs) = match store_dir {
-        Some(dir) => {
-            let vol = crate::growth::volume_store_dir(dir, root);
-            let now_s = crate::entities::now();
-            let asked = since_override
-                .and_then(crate::growth::parse_duration_secs)
-                .unwrap_or_else(|| {
-                    crate::growth::parse_duration_secs(&crate::growth::load_config(dir).since)
-                        .unwrap_or(86_400)
-                });
-            let hist = crate::growth::history_span_secs(&vol, now_s).unwrap_or(asked);
-            let window = asked.min(hist).max(60);
-            let (s, t) = crate::growth::history_series(&vol, window, 24, now_s);
-            (s, t, window)
-        }
-        None => (Default::default(), Vec::new(), 0),
-    };
-    let projects_for_summary = projects.clone();
-    let report = Report {
-        observed_at,
-        root: root.to_path_buf(),
-        projects,
-        unowned,
-        series_by_key,
-        total_series,
-        series_window_secs,
-        reconciliation: Reconciliation {
-            attributed: attribution.attributed_total,
-            unowned: attribution.unowned_total,
-            walked_total: attribution.walked_total,
-            du_total: du,
-            docker_attributed: docker_attributed_bytes,
-            docker_unowned: docker_unowned_bytes,
-        },
-        notes,
-        dirs_by_worktree,
-        files_by_worktree,
-        schedule_line,
-        summary: summarize(&projects_for_summary),
-        github_enrichment,
-    };
-    // Cache the rendered report so a surface can paint the last known
-    // truth instantly (the TUI opens in milliseconds, then refreshes in
-    // the background) instead of blocking on a walk. Written only when
-    // this call observed, so the cache never runs ahead of the store.
-    if observe && let Some(dir) = store_dir {
-        let _ = write_last_report(dir, &report);
-    }
-    Ok(report)
+    crate::bus::run_report(&ctx)
 }
 
 /// Fills `track` on every artifact row and top-level Source directory:
@@ -1197,7 +705,7 @@ fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
     ))
 }
 
-fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
+pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
     std::fs::create_dir_all(store_dir)?;
     let path = last_report_path(store_dir, &report.root);
     let tmp = path.with_extension("json.tmp");
@@ -1225,7 +733,7 @@ pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
 /// directly beneath a directory -- those stay one `ArtifactRow`, never
 /// decomposed into `DirRollup`s, per the folding contract this issue
 /// requires.
-fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
+pub(crate) fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
     let mut totals: std::collections::HashMap<(String, String), u64> =
         std::collections::HashMap::new();
     for d in dirs.iter() {
@@ -1251,7 +759,7 @@ fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
 /// resolution the CLI and MCP server use on their own, duplicated here
 /// only as a fallback for GitHub enrichment's cache when no `store_dir`
 /// was supplied (see the call site in `report_with`).
-fn default_github_cache_dir() -> Option<PathBuf> {
+pub(crate) fn default_github_cache_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -1263,7 +771,7 @@ fn default_github_cache_dir() -> Option<PathBuf> {
 /// Renders a `PrStatus` for the `pull_request` signal row and the
 /// `--view worktrees` printer, e.g. `PR #123 open (approved)`,
 /// `PR #98 merged`, `no PR`, `unknown`.
-fn render_pr_status(status: &crate::github::PrStatus) -> String {
+pub(crate) fn render_pr_status(status: &crate::github::PrStatus) -> String {
     use crate::github::{PrState, PrStatus, ReviewDecision};
     match status {
         PrStatus::None => "no PR".to_string(),
@@ -1292,7 +800,7 @@ fn render_pr_status(status: &crate::github::PrStatus) -> String {
 /// Normalizes a git remote URL for comparison: strips a trailing `.git`,
 /// collapses the `git@host:path` scp-like ssh form and any `scheme://`
 /// form down to `host/path`, and lowercases the result.
-fn normalize_remote(url: &str) -> Option<String> {
+pub(crate) fn normalize_remote(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
         return None;
@@ -1310,11 +818,11 @@ fn normalize_remote(url: &str) -> Option<String> {
 }
 
 /// Result of joining Docker facts to discovered projects/worktrees.
-struct DockerJoinResult {
-    rows_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>>,
-    unowned: Vec<UnownedRow>,
-    attributed_bytes: u64,
-    unowned_bytes: u64,
+pub(crate) struct DockerJoinResult {
+    pub(crate) rows_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>>,
+    pub(crate) unowned: Vec<UnownedRow>,
+    pub(crate) attributed_bytes: u64,
+    pub(crate) unowned_bytes: u64,
 }
 
 /// One candidate Docker object (image, build-cache entry, or volume)
@@ -1535,7 +1043,7 @@ fn join_one(
     JoinOutcome::Unowned { note }
 }
 
-fn join_docker_facts(
+pub(crate) fn join_docker_facts(
     facts: &crate::docker::DockerFacts,
     projects: &[ProjectRow],
     worktree_paths: &[(PathBuf, String)],

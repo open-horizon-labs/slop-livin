@@ -138,6 +138,9 @@ There is no MCP tool that writes a grant. That is the design, not an omission.
 
 ## How it works
 
+**The pipeline is consumers on an event bus.** Walk, project grouping, git signals, GitHub, Docker, ecosystems, the growth store, tracking, history and assembly are each one `Consumer` in `crates/core/src/consumers/`, woken by the events they subscribe to and emitting facts; the bus (`crates/core/src/bus/`, tokio) is the only coupling. A new fact source is one file plus one line in `EventBus::with_builtins()`. Every technical constraint of the design is a guardrail in `.oh/guardrails/` with an AST audit in `crates/source-audit` (`cargo run -p slop-livin-source-audit -- --list`); the build fails when one is broken. ADR: `docs/ADRs/001-event-bus-report-pipeline.md`.
+
+
 **Column store with reverse deltas.** Each observation writes the current state to Parquet (zstd) plus an append-only delta holding the *previous* values of rows that changed. Growth over any window is a lookup, not a rescan; a no-change observation appends nothing; deltas compact and age out on a configurable retention window. On the test machine the store for 56 projects, 107 worktrees and 25 k directory rollups is a few hundred KiB.
 
 **Directory folding keeps it small.** There are no per-file rows. Artifact trees are one row each; Source trees get per-directory rollups (with `mod_time_min` as int32 minutes) and rows only for files over 1 MiB.
