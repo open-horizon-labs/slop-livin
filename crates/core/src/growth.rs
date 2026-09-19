@@ -1670,6 +1670,8 @@ fn parse_artifact_kind(s: &str) -> ArtifactKind {
         "Git" => ArtifactKind::Git,
         "Cache" => ArtifactKind::Cache,
         "Source" => ArtifactKind::Source,
+        "Ignored" => ArtifactKind::Ignored,
+        "Untracked" => ArtifactKind::Untracked,
         "DockerImage" => ArtifactKind::DockerImage,
         "DockerBuildCache" => ArtifactKind::DockerBuildCache,
         "DockerVolume" => ArtifactKind::DockerVolume,
@@ -2062,14 +2064,188 @@ fn to_stored_worktrees(discovered: &[DiscoveredWorktree]) -> Vec<StoredWorktree>
         .collect()
 }
 
+/// Merges a worktree's `Ignored` / `Untracked` rows back into its single
+/// `Source` row.
+///
+/// The split is a presentation of one fact — "everything here that is
+/// not a classified artifact" — and the incremental walk's arithmetic is
+/// written against that one number: it adjusts the remainder by a delta,
+/// re-lists directories into it, and carries it forward. Collapsing on
+/// the way in and splitting on the way out keeps that arithmetic in one
+/// shape, so the store's rows can be split without every incremental
+/// code path learning about three of them.
+fn collapse_remainder(attribution: &mut crate::attribution::AttributionResult) {
+    for rows in attribution.artifacts_by_worktree.values_mut() {
+        if !rows
+            .iter()
+            .any(|r| matches!(r.kind, ArtifactKind::Ignored | ArtifactKind::Untracked))
+        {
+            continue;
+        }
+        let mut merged: Option<ArtifactRow> = None;
+        rows.retain(|r| {
+            if !r.kind.is_worktree_remainder() {
+                return true;
+            }
+            match merged.as_mut() {
+                None => {
+                    let mut base = r.clone();
+                    base.kind = ArtifactKind::Source;
+                    base.track = None;
+                    merged = Some(base);
+                }
+                Some(m) => {
+                    m.bytes += r.bytes;
+                    m.local_bytes += r.local_bytes;
+                    m.observed_at = m.observed_at.max(r.observed_at);
+                    m.hardlinked |= r.hardlinked;
+                    if let (Some(a), Some(b)) = (m.growth_bytes, r.growth_bytes) {
+                        m.growth_bytes = Some(a + b);
+                    }
+                    m.mtime_max = m.mtime_max.max(r.mtime_max);
+                }
+            }
+            false
+        });
+        if let Some(m) = merged {
+            rows.push(m);
+        }
+    }
+}
+
+/// Splits each worktree's remainder row into what git tracks, what a
+/// gitignore rule matches, and what is in no version control at all.
+///
+/// A single row labelled `source` was a lie about every checkout that
+/// holds ignored output or private scratch data: those bytes are not
+/// authored work and no remote has a copy. Each kind now states its own
+/// recovery contract, and the three totals still sum to the one the
+/// walk measured — the split apportions that number rather than
+/// re-measuring, so no accounting is invented here.
+///
+/// Leaves the row undivided when the checkout is not a repository, when
+/// the walk kept no directory rows for it, or when the split would be
+/// entirely one bucket anyway.
+fn split_remainder(
+    discovered: &[DiscoveredWorktree],
+    attribution: &mut crate::attribution::AttributionResult,
+) {
+    let roots: std::collections::HashMap<String, PathBuf> = discovered
+        .iter()
+        .map(|d| {
+            (
+                crate::entities::id_for(&d.path.display().to_string()),
+                d.path.clone(),
+            )
+        })
+        .collect();
+    for (wt_id, rows) in attribution.artifacts_by_worktree.iter_mut() {
+        let Some(root) = roots.get(wt_id) else {
+            continue;
+        };
+        let Some(idx) = rows.iter().position(|r| r.kind == ArtifactKind::Source) else {
+            continue;
+        };
+        let artifact_rels: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| !r.kind.is_worktree_remainder())
+            .map(|r| rel_path_string(root, &r.path))
+            .collect();
+        let wt_dirs: Vec<crate::report::DirRollup> = attribution
+            .dirs
+            .iter()
+            .filter(|d| &d.worktree_id == wt_id)
+            .cloned()
+            .collect();
+        if wt_dirs.is_empty() {
+            continue;
+        }
+        let wt_files: Vec<crate::report::FileRow> = attribution
+            .files
+            .iter()
+            .filter(|f| &f.worktree_id == wt_id)
+            .cloned()
+            .collect();
+        let Some(split) =
+            crate::ignore::split_dirs_by_track(root, &wt_dirs, &wt_files, &artifact_rels)
+        else {
+            continue;
+        };
+        let measured = split.total();
+        if measured == 0 || split.tracked == measured {
+            continue;
+        }
+        let base = rows.remove(idx);
+        // Apportion what the walk measured, rather than substituting the
+        // directory rows' own sum: the walk's number is the one every
+        // total in the report was built from, and hardlink dedup can
+        // make the two differ.
+        let parts = [
+            (
+                ArtifactKind::Source,
+                crate::ignore::TrackState::Tracked,
+                split.tracked,
+            ),
+            (
+                ArtifactKind::Ignored,
+                crate::ignore::TrackState::Ignored,
+                split.ignored,
+            ),
+            (
+                ArtifactKind::Untracked,
+                crate::ignore::TrackState::Untracked,
+                split.untracked,
+            ),
+        ];
+        let largest = parts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, _, b))| *b)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let share = |total: u64, bucket: u64| -> u64 {
+            (total as u128 * bucket as u128 / measured as u128) as u64
+        };
+        // Every bucket but the largest takes its share; the largest then
+        // takes whatever is left, so the parts add back up to exactly
+        // what the walk measured no matter how the division rounds.
+        let mut bytes: [u64; 3] = [0; 3];
+        let mut local: [u64; 3] = [0; 3];
+        for (i, (_, _, bucket)) in parts.iter().enumerate() {
+            if i == largest {
+                continue;
+            }
+            bytes[i] = share(base.bytes, *bucket);
+            local[i] = share(base.local_bytes, *bucket);
+        }
+        bytes[largest] = base.bytes.saturating_sub(bytes.iter().sum::<u64>());
+        local[largest] = base.local_bytes.saturating_sub(local.iter().sum::<u64>());
+        for (i, (kind, track, bucket)) in parts.iter().enumerate() {
+            if bytes[i] == 0 && *bucket == 0 {
+                continue;
+            }
+            let mut row = base.clone();
+            row.kind = kind.clone();
+            row.track = Some(*track);
+            row.bytes = bytes[i];
+            row.local_bytes = local[i];
+            // The growth history belongs to the undivided remainder; a
+            // share of it would be a number nothing observed.
+            row.growth_bytes = None;
+            rows.push(row);
+        }
+    }
+}
+
 fn full_walk(
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
     reason: &'static str,
 ) -> Result<TrackedWalk> {
-    let (discovered, attribution) =
+    let (discovered, mut attribution) =
         crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?;
+    split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,
         attribution,
@@ -2435,6 +2611,9 @@ fn apply_incremental(
     let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
     let mut attribution = reconstruct_attribution(dir)?;
+    // The incremental arithmetic below works on one remainder row per
+    // worktree; the store holds it already split. See `collapse_remainder`.
+    collapse_remainder(&mut attribution);
     if trace {
         eprintln!("[trace] incremental: reconstruct store: {:?}", t0.elapsed());
     }
@@ -2493,7 +2672,7 @@ fn apply_incremental(
             .and_then(|rows| {
                 rows.iter()
                     .filter(|r| {
-                        r.kind != ArtifactKind::Source
+                        !r.kind.is_worktree_remainder()
                             && (changed == &r.path || changed.starts_with(&r.path))
                     })
                     .max_by_key(|r| r.path.as_os_str().len())
@@ -2553,7 +2732,7 @@ fn apply_incremental(
             .get(wt_id)
             .map(|rows| {
                 rows.iter()
-                    .filter(|r| r.kind != ArtifactKind::Source)
+                    .filter(|r| !r.kind.is_worktree_remainder())
                     .map(|r| rel_path_string(&root, &r.path))
                     .collect()
             })
@@ -2573,7 +2752,7 @@ fn apply_incremental(
                     // Artifact roots that vanished with a deleted directory.
                     rows.retain(|r| {
                         let rel = rel_path_string(&root, &r.path);
-                        if r.kind != ArtifactKind::Source && removed_artifact_rels.contains(&rel) {
+                        if !r.kind.is_worktree_remainder() && removed_artifact_rels.contains(&rel) {
                             total_delta -= r.bytes as i64;
                             false
                         } else {
@@ -2816,7 +2995,7 @@ fn apply_incremental(
             .get(worktree_id)
             .map(|rows| {
                 rows.iter()
-                    .filter(|r| r.kind != ArtifactKind::Source)
+                    .filter(|r| !r.kind.is_worktree_remainder())
                     .filter(|r| {
                         !changed_dirs
                             .iter()
@@ -2931,6 +3110,7 @@ fn apply_incremental(
             t_rewalk.elapsed()
         );
     }
+    split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,
         attribution,

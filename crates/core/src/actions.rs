@@ -170,6 +170,12 @@ pub fn refusal_for_kind(kind: &ArtifactKind) -> Option<&'static str> {
         ArtifactKind::DockerBuildCache => Some(
             "docker has no per-entry build-cache removal; `docker builder prune` acts on all of it",
         ),
+        // These two rows report bytes scattered across a checkout and
+        // carry the worktree's own path. Acting on that path would take
+        // the whole checkout, which is not what the row says.
+        ArtifactKind::Ignored | ArtifactKind::Untracked => Some(
+            "an aggregate of every such path under the checkout, not one directory; open the worktree and act on what is inside it",
+        ),
         _ => None,
     }
 }
@@ -184,6 +190,9 @@ fn recovery_for(kind: &ArtifactKind) -> &'static str {
         ArtifactKind::DockerImage => "pull_or_rebuild (permanent: no Trash)",
         ArtifactKind::DockerBuildCache => "local_rebuild (permanent: no Trash)",
         ArtifactKind::DockerVolume => "irrecoverable (permanent: no Trash, no copy anywhere)",
+        // Ignored bytes are in no version control at all: nothing to
+        // pull, nothing to check out again. Trash is the only copy.
+        ArtifactKind::Ignored | ArtifactKind::Untracked => "irrecoverable outside Trash",
         ArtifactKind::Source | ArtifactKind::Loose | ArtifactKind::Unknown => "depends: see track",
     }
 }
@@ -263,7 +272,7 @@ pub fn propose(
                 // A Source row shares its path with the worktree root; when
                 // that exact path is asked for, the human means the whole
                 // worktree/checkout (handled below with its own verb).
-                let is_worktree_root = a.kind == ArtifactKind::Source && a.path == wt.path;
+                let is_worktree_root = a.kind.is_worktree_remainder() && a.path == wt.path;
                 let wanted = if paths.is_empty() {
                     filter.is_none_or(|f| f.matches_artifact(project, a))
                 } else {

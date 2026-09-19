@@ -36,16 +36,39 @@ pub enum ArtifactKind {
     /// shape found *outside* every checkout is not an artifact row at
     /// all; it becomes an `UnownedRow` with reason `SharedCache` instead.
     Cache,
-    /// Bytes under a worktree that are not inside any classified
-    /// artifact directory: source files, VCS-tracked content, and small
-    /// housekeeping (a linked worktree's `.git` file, etc). Exactly one
-    /// `Source` row per worktree.
+    /// Bytes under a worktree that git tracks: authored work, in the
+    /// index, recoverable from a remote. This is what "source" means.
+    /// At most one `Source` row per worktree.
     Source,
+    /// Non-artifact bytes under a worktree that a gitignore rule
+    /// matches. Outside version control entirely: generated output
+    /// (rebuildable) or private data (irrecoverable), and git cannot
+    /// bring any of it back. Split out from `Source` because calling
+    /// ignored bytes "source" is a lie -- see `TrackState`.
+    Ignored,
+    /// Non-artifact bytes under a worktree that are in no index and
+    /// matched by no ignore rule: in the worktree and in no version
+    /// control at all.
+    Untracked,
     DockerImage,
     DockerBuildCache,
     DockerVolume,
     Loose,
     Unknown,
+}
+
+impl ArtifactKind {
+    /// True for the three kinds that stand for "everything under this
+    /// worktree that is not a classified artifact", split by git
+    /// tracking state. They share one path (the worktree root), are
+    /// aggregates over many files rather than one folded directory, and
+    /// every place that special-cased `Source` means all three.
+    pub fn is_worktree_remainder(&self) -> bool {
+        matches!(
+            self,
+            ArtifactKind::Source | ArtifactKind::Ignored | ArtifactKind::Untracked
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,7 +143,7 @@ pub fn summarize(projects: &[ProjectRow]) -> Summary {
         for wt in &p.worktrees {
             s.worktrees += 1;
             for a in &wt.artifacts {
-                if matches!(a.kind, ArtifactKind::Source | ArtifactKind::Git) {
+                if a.kind.is_worktree_remainder() || a.kind == ArtifactKind::Git {
                     continue;
                 }
                 s.artifacts += 1;
@@ -681,7 +704,8 @@ pub fn annotate_tracking(
             };
             for a in wt.artifacts.iter_mut() {
                 if a.ecosystem.is_none()
-                    && !matches!(a.kind, ArtifactKind::Source | ArtifactKind::Git)
+                    && !a.kind.is_worktree_remainder()
+                    && a.kind != ArtifactKind::Git
                     && let Some(name) = a.path.file_name().and_then(|n| n.to_str())
                 {
                     a.ecosystem = match a.path.parent() {
@@ -693,6 +717,12 @@ pub fn annotate_tracking(
                     .map(String::from);
                 }
                 if a.kind == ArtifactKind::Git || a.source.tool.starts_with("docker") {
+                    continue;
+                }
+                // A split remainder row already carries the state it was
+                // split by; asking the lens about its path would ask
+                // about the worktree root and call all three "tracked".
+                if a.track.is_some() {
                     continue;
                 }
                 let rel = a
@@ -729,7 +759,7 @@ pub(crate) fn artifact_roots(
     for p in projects {
         for wt in &p.worktrees {
             for a in &wt.artifacts {
-                if a.kind == ArtifactKind::Source || a.source.tool.starts_with("docker") {
+                if a.kind.is_worktree_remainder() || a.source.tool.starts_with("docker") {
                     continue;
                 }
                 if let Ok(rel) = a.path.strip_prefix(&wt.path) {

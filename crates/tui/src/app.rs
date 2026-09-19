@@ -734,6 +734,20 @@ impl App {
             self.set_refusal("nothing to delete on this row");
             return;
         };
+        // The ignored/untracked rows report bytes scattered across a
+        // checkout under the worktree's own path. Marking one would
+        // queue the whole checkout, which is not what the row says.
+        if let Some(kind) = &row.kind
+            && matches!(
+                kind,
+                slop_livin_core::report::ArtifactKind::Ignored
+                    | slop_livin_core::report::ArtifactKind::Untracked
+            )
+            && let Err(why) = crate::units::markable(kind)
+        {
+            self.set_refusal(why);
+            return;
+        }
         // A Docker object is removed through the daemon, not moved to
         // Trash. Which command that is depends on the kind, and build
         // cache has none.
@@ -1261,7 +1275,10 @@ mod tests {
         app.clear_filter();
         app.selected = 0;
         app.delete_here();
-        assert!(app.confirm_open, "Backspace asks once for the whole project");
+        assert!(
+            app.confirm_open,
+            "Backspace asks once for the whole project"
+        );
         assert!(!app.marked.is_empty());
     }
 

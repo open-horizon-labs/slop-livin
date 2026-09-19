@@ -37,6 +37,8 @@ pub fn kind_label(kind: &ArtifactKind) -> &'static str {
         ArtifactKind::Git => "git",
         ArtifactKind::Cache => "cache",
         ArtifactKind::Source => "source",
+        ArtifactKind::Ignored => "ignored",
+        ArtifactKind::Untracked => "untracked",
         ArtifactKind::DockerImage => "docker-image",
         ArtifactKind::DockerBuildCache => "docker-cache",
         ArtifactKind::DockerVolume => "docker-volume",

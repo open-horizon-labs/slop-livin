@@ -37,6 +37,11 @@ pub fn markable(kind: &ArtifactKind) -> Result<(), &'static str> {
         }
         ArtifactKind::Git => Err("git metadata is never a delete target"),
         ArtifactKind::Source => Err("source trees are never a delete target"),
+        // Bytes scattered across the checkout, reported under the
+        // worktree's own path: there is no single directory to act on.
+        ArtifactKind::Ignored | ArtifactKind::Untracked => Err(
+            "an aggregate of every such path under the checkout, not one directory; open the worktree and act on what is inside it",
+        ),
         ArtifactKind::Unknown => Err("kind is unclassified; not a folded unit"),
     }
 }
