@@ -2,6 +2,15 @@
 
 Release notes describe behavior at the named version. See the [README](README.md) and [usage reference](docs/usage.md) for current behavior. Timings below are historical observations from one developer's machine, not a benchmark suite.
 
+## v0.6.0
+
+- Added Rust build drilldown for Cargo profiles, folded dependencies, test/example executables, incremental-cache and build-script groups, and final executables/libraries. Group history does not inflate project totals. Dependency sizes remain a directory aggregate, not a per-crate breakdown.
+- Added reviewed selective cleanup for evidenced test/example executables and individual incremental/build-script groups. Cleanup checks contents, producer evidence, locks, hardlinks and occupancy before moving the selection to Trash with restore metadata. Shared dependencies and final outputs remain inspection-only; age is not proof that a build is unused.
+- Kept ordinary compiler files folded in reports and history, with trusted unchanged-container reuse instead of a persisted per-file inventory.
+- Made incremental hardlinked-artifact refreshes update directory allocations without a whole-artifact rewalk. Unique-byte totals are explicitly marked stale until a full scan reconciles them; stale unique measurements create history gaps and cannot spend standing-grant budgets.
+- Compacted small reverse deltas and delayed replay-checkpoint publication until report persistence succeeds.
+- Fixed Cargo cleanup lock lifetime under concurrent process creation. Added native Cargo build/cleanup/rebuild verification and parallel stress coverage.
+
 ## v0.5.2
 
 - Narrowed Ruby dependency attribution to `vendor/bundle`, preserving unrelated vendored source.

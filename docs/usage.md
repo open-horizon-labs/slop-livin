@@ -87,7 +87,7 @@ swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
 ```
 
-Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. It reports logical subtree bytes separately from charged physical bytes, preserves hardlink/shared-root accounting, and prints evidence limits and unknown variants.
+Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs are inspection-only.
 
 Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. In the TUI Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. CLI plans can select the same exact paths. Executable groups include existing dep-info and debug-symbol companions. Approval applies only to the reviewed group, not future files at that path.
 
