@@ -149,6 +149,11 @@ pub(crate) fn classify_at(parent: &Path, name: &str) -> Option<ArtifactKind> {
     if let Some(k) = classify(name) {
         return Some(k);
     }
+    // The strongest evidence there is: the tool that created the
+    // directory says it is a cache. No name, no marker, no guess.
+    if let Some(k) = self_declared_cache(&parent.join(name)) {
+        return Some(k);
+    }
     // Names several ecosystems generate (`build`, `dist`, `vendor`, `out`,
     // `coverage`, `*.egg-info`, …) count only next to a marker of one that
     // does: clean-dev-dirs' per-language detection, table-driven.
@@ -159,6 +164,29 @@ pub(crate) fn classify_at(parent: &Path, name: &str) -> Option<ArtifactKind> {
         .iter()
         .find(|(n, _, markers)| *n == name && has_marker(parent, markers))
         .map(|(_, k, _)| k.clone())
+}
+
+/// A directory that declares itself a cache under the Cache Directory
+/// Tagging Specification (<https://bford.info/cachedir/>): a *regular*
+/// file `CACHEDIR.TAG` whose first 43 bytes are exactly the signature
+/// below. Cargo writes one into `target/`, pytest into `.pytest_cache/`,
+/// uv into `.venv/`. Unlike a name or a sibling marker, this is the
+/// creating tool's own claim, so it needs no ecosystem gate — and a
+/// directory that merely *mentions* the string does not qualify, because
+/// the signature must start at byte 0.
+pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let tag = dir.join("CACHEDIR.TAG");
+    // `symlink_metadata`: the spec requires a regular file, and a symlink
+    // here would also be a path out of the tree we are sizing.
+    let meta = fs::symlink_metadata(&tag).ok()?;
+    if !meta.is_file() || meta.len() < SIGNATURE.len() as u64 {
+        return None;
+    }
+    let mut head = [0u8; 43];
+    let mut file = fs::File::open(&tag).ok()?;
+    std::io::Read::read_exact(&mut file, &mut head).ok()?;
+    (head == SIGNATURE).then_some(ArtifactKind::Cache)
 }
 
 /// Basenames that, when found *outside* every checkout/worktree, are a
@@ -644,6 +672,36 @@ mod tests {
             !parent_has_build,
             "parent must not also claim the nested build/"
         );
+    }
+
+    #[test]
+    fn a_directory_that_declares_itself_a_cache_is_one_whatever_its_name() {
+        const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("weird-name-nobody-tabulated");
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(classify_at(tmp.path(), "weird-name-nobody-tabulated"), None);
+        fs::write(dir.join("CACHEDIR.TAG"), SIG).unwrap();
+        assert_eq!(
+            classify_at(tmp.path(), "weird-name-nobody-tabulated"),
+            Some(ArtifactKind::Cache),
+            "the creating tool's own claim needs no marker gate"
+        );
+        // A file that merely contains the words is not a declaration: the
+        // signature must be the first 43 bytes.
+        let other = tmp.path().join("pretender");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("CACHEDIR.TAG"),
+            b"# see Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert_eq!(classify_at(tmp.path(), "pretender"), None);
+        // Neither is a symlink standing in for the tag.
+        let linked = tmp.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(dir.join("CACHEDIR.TAG"), linked.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(classify_at(tmp.path(), "linked"), None);
     }
 
     #[test]

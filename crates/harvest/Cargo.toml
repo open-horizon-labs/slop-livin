@@ -1,0 +1,8 @@
+[package]
+name = "slop-livin-harvest"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+slop-livin-core = { path = "../core" }

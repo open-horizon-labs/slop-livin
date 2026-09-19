@@ -2,6 +2,56 @@
 
 Release notes live here, one section per tag. The release workflow refuses a tag without one.
 
+## v0.3.0
+
+Watching instead of asking, and an incremental observation that is actually incremental.
+
+**Live FSEvents**
+
+- The TUI opens a live FSEvents stream on the root for its lifetime. Every change under it, including a Trash move the TUI itself just made, arrives as an event; after 400 ms of quiet the tool observes exactly those directories. Nothing asks for a refresh, and two deletes in a row cannot race each other. The header says `observed just now · live`.
+- A live plan skips the replay-lag floor that a log replay needs: the event *is* the change, not a query that might predate it.
+
+**Store depth inside folded artifacts**
+
+- A folded artifact is still one row in the report and one unit of action, but the store now also holds per-directory rows for its interior. A change deep inside re-lists that one directory and re-aggregates, instead of re-stating every file under the unit. A changed Source directory is likewise re-listed in place rather than sending its whole worktree back to the walker.
+- Summing directory rows is only correct when no inode appears twice in the unit. Cargo's `target/` hardlinks nearly every artifact: summing its rows overcounted a 16 GB tree by 4.4 GB against a full walk. Every artifact row now records whether its unit holds hardlinked files, measured by the walk and persisted, and the interior path runs only when it does not.
+- Growth annotation builds one history index per observation instead of re-reading the store per artifact, and the three stores skip rewriting their current file when no row changed.
+- Git signals are recomputed only for re-walked worktrees and aged for the rest; Docker facts are cached for five minutes; discovery at a changed directory looks one level deep, not the whole tree.
+
+One observation on `~/src` (55 projects, 44 GB):
+
+| Case | v0.2.0 | v0.3.0 |
+|---|---|---|
+| A source file was touched | 7.5 s | 75 ms |
+| A change deep inside a 16 GB `target/` | 7.5 s | 2.4 s |
+| Nothing changed | 7.5 s | 86 ms |
+
+**Artifacts the table was missing**
+
+- ESP-IDF is its own ecosystem, identified by `sdkconfig` / `idf_component.yml` / `partitions.csv` rather than a `CMakeLists.txt` it need not have. Its `build/`, per-variant `build-<target>/` and vendored `managed_components/` are artifacts.
+- CMake projects also build into `build-<variant>/`; marker patterns now match a prefix as well as a suffix.
+- Python is recognised from `requirements*`, so a repo whose only marker was `requirements-dev.txt` no longer keeps its `build/` in the Source total.
+- Measured on one developer's tree: one ESP-IDF repo's Source dropped from 3.5 GB to 244 MB, with 3.2 GB moving into deps and build rows where it can be acted on. A sweep of every remaining Source directory over 50 MB found only genuine data (generated datasets, experiment artifacts, KiCad files, photos) and two small ignored temp directories.
+
+**Charts that say something**
+
+- Growth is red and shrink is green: in a disk tool, arriving bytes are the bad news.
+- The signed number sits flush against its bar, no brackets, one diffstat token.
+- Sparklines plot *when* bytes moved, one bar per bucket of change, rather than redrawing the tree's size as a solid block. A bucket where nothing moved is blank; one before the row was first observed is a dim `·`.
+- The selected row is a dark background, not reverse video, so the growth colours stay readable.
+- Ecosystem and fact badges trail the project name instead of prefixing it, so names stay left-aligned.
+
+**Fixes**
+
+- A background observation keeps the cursor on its row instead of jumping to the top.
+- The TUI's startup observation produces per-directory rows, so a `source` row expands into its directories instead of reading `▸ 0 more`.
+- Nested walks no longer reset the shared progress counters, which made the header read past the total and stick at 99%. The percentage is an estimate against the last observation and is now shown only while it means something.
+- `slop-livin --version`, asserted against the tag by the release smoke test.
+
+**Docs**
+
+- The README was rewritten from real output: current frames, release-tarball install, a quick start, CLI recipes for every view, the filter grammar as a table, a trimmed real JSON report, the config file, MCP setup with request and response recipes, and a table of all twenty ecosystems with their markers and the artifacts each generates.
+
 ## v0.2.0
 
 The clean-dev-dirs salvage: everything it does for a human, on top of the history and project model it doesn't have.

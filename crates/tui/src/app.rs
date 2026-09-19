@@ -967,7 +967,14 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = self.root.clone();
         std::thread::spawn(move || {
-            let res = slop_livin_core::report::report_with(&root, None, false, Some(&store), None);
+            let res = slop_livin_core::report::report_with_dirs(
+                &root,
+                None,
+                false,
+                Some(&store),
+                None,
+                true,
+            );
             let _ = tx.send(res);
         });
         self.pending = Some(rx);

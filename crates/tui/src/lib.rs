@@ -159,8 +159,17 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             a.observing = Some((0, 0));
             let (root2, store2) = (root.clone(), store.clone());
             std::thread::spawn(move || {
-                let res =
-                    slop_livin_core::report::report_with(&root2, None, false, Some(&store2), None);
+                // include_dirs: the Source row expands into its own
+                // directories, so the startup observe must produce them
+                // too or the first report shows `source` with no children.
+                let res = slop_livin_core::report::report_with_dirs(
+                    &root2,
+                    None,
+                    false,
+                    Some(&store2),
+                    None,
+                    true,
+                );
                 let _ = tx.send(res);
             });
             a

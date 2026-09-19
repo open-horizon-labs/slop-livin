@@ -87,6 +87,22 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             (".expo", Cache),
             (".metro", Cache),
             ("coverage", Build),
+            // github/gitignore Node, Angular, Firebase, Nextjs, bun.
+            (".vite", Cache),
+            (".fusebox", Cache),
+            (".rpt2_cache", Cache),
+            (".rts2_cache_cjs", Cache),
+            (".rts2_cache_es", Cache),
+            (".rts2_cache_umd", Cache),
+            (".serverless", Build),
+            (".dynamodb", Cache),
+            (".firebase", Cache),
+            (".ng", Cache),
+            ("out-tsc", Build),
+            ("bower_components", Deps),
+            ("jspm_packages", Deps),
+            ("web_modules", Deps),
+            ("typings", Deps),
         ],
         glyph: "⬢",
         name_source: Some(("package.json", NameField::JsonName)),
@@ -95,7 +111,12 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "deno",
         name: "Deno",
         markers: &["deno.json", "deno.jsonc"],
-        cleans: &[("vendor", Deps), ("node_modules", Deps)],
+        cleans: &[
+            ("vendor", Deps),
+            ("node_modules", Deps),
+            // github/gitignore Deno.
+            (".deno", Cache),
+        ],
         glyph: "🦕",
         name_source: Some(("deno.json", NameField::JsonName)),
     },
@@ -104,7 +125,10 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         name: "Python",
         markers: &[
             "pyproject.toml",
-            "requirements.txt",
+            // `requirements.txt`, `requirements-dev.txt`, `requirements/`:
+            // a repo whose only marker was `requirements-dev.txt` kept a
+            // 255 MB `build/` in its Source total.
+            "requirements*",
             "setup.py",
             "setup.cfg",
             "Pipfile",
@@ -127,6 +151,26 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             (".coverage", Cache),
             ("__pypackages__", Deps),
             (".pixi", Deps),
+            // github/gitignore Python. Service data it also lists (var, instance, lib, mnesia, rabbitmq) is authored or live state and is deliberately absent.
+            (".hypothesis", Cache),
+            (".pytype", Cache),
+            (".pyre", Cache),
+            (".pdm-build", Build),
+            (".pybuilder", Build),
+            ("cython_debug", Build),
+            ("develop-eggs", Build),
+            ("eggs", Build),
+            ("sdist", Build),
+            ("wheels", Build),
+            ("downloads", Build),
+            ("parts", Build),
+            ("htmlcov", Build),
+            ("cover", Build),
+            ("profile_default", Cache),
+            ("__marimo__", Cache),
+            (".abstra", Cache),
+            ("env.bak", Deps),
+            ("venv.bak", Deps),
         ],
         glyph: "🐍",
         name_source: Some(("pyproject.toml", NameField::TomlName)),
@@ -148,7 +192,17 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             "build.gradle.kts",
             "settings.gradle",
         ],
-        cleans: &[("target", Build), ("build", Build), (".gradle", Cache)],
+        cleans: &[
+            ("target", Build),
+            ("build", Build),
+            (".gradle", Cache),
+            // github/gitignore Java, Kotlin, Gradle, Android.
+            (".kotlin", Cache),
+            (".mtj.tmp", Cache),
+            (".cxx", Build),
+            (".externalNativeBuild", Build),
+            ("captures", Build),
+        ],
         glyph: "☕",
         name_source: Some(("pom.xml", NameField::PomArtifactId)),
     },
@@ -166,11 +220,46 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         markers: &["CMakeLists.txt", "meson.build", "Makefile"],
         cleans: &[
             ("build", Build),
+            // ESP-IDF and other CMake projects build one directory per
+            // target or variant (`build-dial`, `build-stackchan`) and
+            // vendor their dependencies into `managed_components`. Both
+            // sat in the Source total until now: on one ESP-IDF repo
+            // that was 2.1 GB of "source".
+            ("build-*", Build),
+            ("cmake-build-*", Build),
             ("cmake-build-debug", Build),
             ("cmake-build-release", Build),
+            ("managed_components", Deps),
+            // github/gitignore C, C++, CMake, Autotools.
+            ("CMakeFiles", Build),
+            ("Testing", Build),
+            (".deps", Build),
+            (".libs", Build),
+            (".tmp_versions", Build),
+            ("vcpkg_installed", Deps),
         ],
         glyph: "🔧",
         name_source: Some(("CMakeLists.txt", NameField::CmakeProject)),
+    },
+    Ecosystem {
+        tag: "idf",
+        name: "ESP-IDF",
+        // An ESP-IDF component or app directory need not have its own
+        // `CMakeLists.txt`; `sdkconfig` and the component manifest are
+        // what identify it.
+        markers: &[
+            "sdkconfig",
+            "sdkconfig.defaults",
+            "idf_component.yml",
+            "partitions.csv",
+        ],
+        cleans: &[
+            ("build", Build),
+            ("build-*", Build),
+            ("managed_components", Deps),
+        ],
+        glyph: "📟",
+        name_source: None,
     },
     Ecosystem {
         tag: "swift",
@@ -181,6 +270,8 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             (".swiftpm", Cache),
             ("DerivedData", Build),
             ("Pods", Deps),
+            // github/gitignore Swift, Objective-C.
+            ("xcuserdata", Cache),
         ],
         glyph: "🐦",
         name_source: Some(("Package.swift", NameField::SwiftName)),
@@ -189,7 +280,24 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "net",
         name: ".NET",
         markers: &["*.csproj", "*.fsproj", "*.vbproj", "*.sln"],
-        cleans: &[("bin", Build), ("obj", Build)],
+        cleans: &[
+            ("bin", Build),
+            ("obj", Build),
+            // github/gitignore Dotnet, VisualStudio. Its case-insensitive globs ([Bb]in, [Oo]bj) are the same directories our marker-gated bin/obj already cover; its *Backup names are data.
+            (".vs", Cache),
+            ("ipch", Cache),
+            ("bld", Build),
+            ("AppPackages", Build),
+            ("ClientBin", Build),
+            ("BundleArtifacts", Build),
+            ("BenchmarkDotNet.Artifacts", Build),
+            ("CodeCoverage", Build),
+            ("FakesAssemblies", Build),
+            ("MSBuild_Logs", Build),
+            ("OpenCover", Build),
+            ("_UpgradeReport_Files", Build),
+            ("paket-files", Deps),
+        ],
         glyph: "🟣",
         name_source: Some(("*.csproj", NameField::FileStem)),
     },
@@ -197,7 +305,15 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "rb",
         name: "Ruby",
         markers: &["Gemfile"],
-        cleans: &[(".bundle", Deps), ("vendor", Deps)],
+        cleans: &[
+            (".bundle", Deps),
+            ("vendor", Deps),
+            // github/gitignore Ruby, Rails.
+            (".yardoc", Build),
+            ("_yardoc", Build),
+            ("rdoc", Build),
+            ("pkg", Build),
+        ],
         glyph: "💎",
         name_source: Some(("*.gemspec", NameField::FileStem)),
     },
@@ -227,7 +343,13 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "hs",
         name: "Haskell",
         markers: &["stack.yaml", "*.cabal", "cabal.project", "package.yaml"],
-        cleans: &[(".stack-work", Build), ("dist-newstyle", Build)],
+        cleans: &[
+            (".stack-work", Build),
+            ("dist-newstyle", Build),
+            // github/gitignore Haskell.
+            (".cabal-sandbox", Deps),
+            (".HTF", Build),
+        ],
         glyph: "λ",
         name_source: Some(("package.yaml", NameField::YamlName)),
     },
@@ -235,7 +357,14 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "dart",
         name: "Dart/Flutter",
         markers: &["pubspec.yaml"],
-        cleans: &[(".dart_tool", Cache), ("build", Build)],
+        cleans: &[
+            (".dart_tool", Cache),
+            ("build", Build),
+            // github/gitignore Dart, Flutter.
+            (".pub", Cache),
+            (".pub-preload-cache", Cache),
+            (".buildlog", Cache),
+        ],
         glyph: "🎯",
         name_source: Some(("pubspec.yaml", NameField::YamlName)),
     },
@@ -257,6 +386,76 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         markers: &["*.tf"],
         cleans: &[(".terraform", Deps)],
         glyph: "🌍",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "godot",
+        name: "Godot",
+        markers: &["project.godot"],
+        cleans: &[(".godot", Cache), (".import", Cache), (".mono", Build)],
+        glyph: "🤖",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "jekyll",
+        name: "Jekyll",
+        markers: &["_config.yml", "_config.toml"],
+        cleans: &[
+            ("_site", Build),
+            (".jekyll-cache", Cache),
+            (".jekyll-metadata", Cache),
+            (".sass-cache", Cache),
+        ],
+        glyph: "📄",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "elm",
+        name: "Elm",
+        markers: &["elm.json"],
+        cleans: &[("elm-stuff", Deps)],
+        glyph: "🌳",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "erl",
+        name: "Erlang",
+        markers: &["rebar.config", "erlang.mk"],
+        cleans: &[("_build", Build), (".rebar3", Cache), ("_checkouts", Deps)],
+        glyph: "☎️",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "ml",
+        name: "OCaml",
+        markers: &["dune-project", "*.opam"],
+        cleans: &[("_build", Build), ("_opam", Deps)],
+        glyph: "🐫",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "clj",
+        name: "Clojure",
+        markers: &["deps.edn", "project.clj", "shadow-cljs.edn"],
+        cleans: &[
+            (".cpcache", Cache),
+            (".lein-plugins", Cache),
+            (".shadow-cljs", Cache),
+            ("classes", Build),
+        ],
+        glyph: "🔮",
+        name_source: None,
+    },
+    Ecosystem {
+        tag: "nim",
+        name: "Nim",
+        markers: &["*.nimble", "nim.cfg"],
+        cleans: &[
+            ("nimcache", Cache),
+            ("nimblecache", Cache),
+            ("htmldocs", Build),
+        ],
+        glyph: "👑",
         name_source: None,
     },
     Ecosystem {
@@ -285,6 +484,11 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             ("MemoryCaptures", Cache),
             ("Build", Build),
             ("Builds", Build),
+            // github/gitignore Unity.
+            ("ExportedObj", Build),
+            ("UIElementsSchema", Build),
+            (".consulo", Cache),
+            (".utmp", Cache),
         ],
         glyph: "🎲",
         name_source: None,
@@ -299,6 +503,8 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             ("Saved", Cache),
             ("DerivedDataCache", Cache),
             ("Build", Build),
+            // github/gitignore UnrealEngine.
+            (".vs", Cache),
         ],
         glyph: "🎮",
         name_source: Some(("*.uproject", NameField::FileStem)),
@@ -315,10 +521,15 @@ fn dir_names(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `*.ext` matches by extension, `prefix*` by prefix, anything else is
+/// an exact file or directory name.
 fn marker_present(names: &[String], marker: &str) -> bool {
-    match marker.strip_prefix("*.") {
-        Some(ext) => names.iter().any(|n| n.ends_with(&format!(".{ext}"))),
-        None => names.iter().any(|n| n == marker),
+    if let Some(ext) = marker.strip_prefix("*.") {
+        names.iter().any(|n| n.ends_with(&format!(".{ext}")))
+    } else if let Some(prefix) = marker.strip_suffix('*') {
+        names.iter().any(|n| n.starts_with(prefix))
+    } else {
+        names.iter().any(|n| n == marker)
     }
 }
 
@@ -356,10 +567,16 @@ pub fn glyph_for(tag: &str) -> &'static str {
     by_tag(tag).map(|e| e.glyph).unwrap_or("?")
 }
 
+/// `*suffix` matches by suffix, `prefix*` by prefix, anything else is an
+/// exact name. Both wildcard forms require at least one character where
+/// the `*` is, so `build-*` never matches a bare `build-`.
 fn cleans_name(pattern: &str, name: &str) -> bool {
-    match pattern.strip_prefix('*') {
-        Some(suffix) => name.ends_with(suffix) && name.len() > suffix.len(),
-        None => pattern == name,
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix) && name.len() > suffix.len()
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix) && name.len() > prefix.len()
+    } else {
+        pattern == name
     }
 }
 
@@ -408,7 +625,7 @@ pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Opti
 /// mismatch forces one full walk so rows that no longer classify leave
 /// and rows that now do arrive, instead of lingering until something
 /// happens to touch their directory.
-pub const RULES_VERSION: u32 = 3;
+pub const RULES_VERSION: u32 = 4;
 
 /// Marker-gated classification: `name` inside `parent` is an artifact of
 /// the kind an ecosystem declares, if that ecosystem's marker sits in
@@ -567,6 +784,29 @@ mod tests {
         assert_eq!(classify_gated(tmp.path(), "vendor"), None);
         std::fs::write(tmp.path().join("CMakeLists.txt"), "project(x)").unwrap();
         assert_eq!(classify_gated(tmp.path(), "build"), Some(Build));
+        // ESP-IDF's per-variant build directories and vendored components.
+        assert_eq!(classify_gated(tmp.path(), "build-dial"), Some(Build));
+        assert_eq!(classify_gated(tmp.path(), "cmake-build-debug"), Some(Build));
+        assert_eq!(classify_gated(tmp.path(), "managed_components"), Some(Deps));
+        // ESP-IDF identifies itself by sdkconfig, with no CMakeLists.txt.
+        let idf = tempfile::tempdir().unwrap();
+        std::fs::write(idf.path().join("sdkconfig"), "").unwrap();
+        assert_eq!(classify_gated(idf.path(), "build"), Some(Build));
+        assert_eq!(classify_gated(idf.path(), "managed_components"), Some(Deps));
+        // A Python project whose only marker is requirements-dev.txt.
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("requirements-dev.txt"), "").unwrap();
+        assert_eq!(classify_gated(py.path(), "build"), Some(Build));
+        assert_eq!(
+            classify_gated(tmp.path(), "builder"),
+            None,
+            "prefix needs the dash"
+        );
+        assert_eq!(
+            classify_gated(tmp.path(), "build-"),
+            None,
+            "a bare prefix is not a variant"
+        );
         assert_eq!(classify_gated(tmp.path(), "vendor"), None);
         std::fs::write(tmp.path().join("go.mod"), "module a/b").unwrap();
         assert_eq!(classify_gated(tmp.path(), "vendor"), Some(Deps));

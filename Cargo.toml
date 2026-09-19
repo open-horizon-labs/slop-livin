@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/mcp", "crates/source-audit", "crates/tui"]
+members = [
+    "crates/core",
+    "crates/cli",
+    "crates/harvest",
+    "crates/mcp",
+    "crates/source-audit",
+    "crates/tui",
+]
 
 [workspace.package]
 edition = "2024"
-version = "0.2.0"
+version = "0.3.0"
 license = "MIT"
 
 [workspace.dependencies]
