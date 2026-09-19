@@ -6,7 +6,7 @@
 #                                com.docker.compose.project
 #   joined by image.source       an image labelled with the repo's remote
 #   unowned                      an image with no join evidence at all
-#   dangling                     an untagged layer left by a rebuild
+#   dangling                     an untagged image, built with no tag
 #   in use                       a stopped container holding an image, so
 #                                removal is refused by the daemon, in its
 #                                own words
@@ -83,7 +83,7 @@ FROM $base
 RUN dd if=/dev/zero of=/orphan.blob bs=1048576 count=24 2>/dev/null
 DOCKER
 
-  printf 'payload.bin\n' > .gitignore
+  printf 'payload.bin\nDockerfile.dangling\n.dangling-id\n' > .gitignore
   dd if=/dev/urandom of=payload.bin bs=1048576 count=18 status=none
   git add -A && git commit -qm "docker fixture" || true
 
@@ -96,12 +96,23 @@ DOCKER
     -t "${name}-worker:latest" . > /dev/null
   docker build -q -f Dockerfile.orphan -t "${name}-orphan:latest" . > /dev/null
 
-  # A dangling image: rebuild the app layer with different content so the
-  # previous one loses its tag.
-  echo "RUN echo rebuilt > /opt/app/rebuilt" >> Dockerfile.app
-  docker build -q -f Dockerfile.app \
-    --label com.docker.compose.project="$name" \
-    -t "${name}-app:latest" . > /dev/null
+  # A dangling image. Rebuilding a tagged image does not produce one on
+  # a daemon using the containerd image store (moving the tag drops the
+  # old record instead of leaving it untagged), so build one with no tag
+  # at all: that is untagged on every store. The content changes each run
+  # so the build cache cannot hand back an image that already exists.
+  cat > Dockerfile.dangling <<DOCKER
+FROM $base
+RUN dd if=/dev/zero of=/dangling.blob bs=1048576 count=12 2>/dev/null
+RUN echo dangling-$(date +%s) > /marker
+DOCKER
+  # Remove the one the previous `up` built, so re-running leaves one
+  # dangling image rather than a growing pile. Only ever this fixture's
+  # own id: a blanket `docker image prune` would take the user's.
+  if [ -f .dangling-id ]; then
+    docker image rm -f "$(cat .dangling-id)" > /dev/null 2>&1 || true
+  fi
+  docker build -q -f Dockerfile.dangling . | tail -1 | sed 's/^sha256://' > .dangling-id
 
   banner "creating volumes, one with contents"
   docker volume create --label com.docker.compose.project="$name" "${name}-app-data" > /dev/null
@@ -117,6 +128,7 @@ DOCKER
   banner "up: $repo"
   docker images --format '  image   {{.Repository}}:{{.Tag}} {{.Size}}' | grep -E "$name|<none>" || true
   docker volume ls --format '  volume  {{.Name}}' | grep "$name" || true
+  print "  image   <none> (dangling, $(cat .dangling-id | cut -c1-12))"
   print "  container $name-held (stopped, holds ${name}-worker:latest)"
   print ""
   print "Try:"
@@ -136,7 +148,9 @@ down)
   for i in "${name}-app:latest" "${name}-worker:latest" "${name}-orphan:latest"; do
     docker image rm -f "$i" > /dev/null 2>&1 || true
   done
-  docker image prune -f > /dev/null 2>&1 || true
+  if [ -f "$repo/.dangling-id" ]; then
+    docker image rm -f "$(cat "$repo/.dangling-id")" > /dev/null 2>&1 || true
+  fi
   rm -rf "$repo"
   # The earlier minimal probe, if it is still around.
   rm -rf "$root/slop-docker-probe"
