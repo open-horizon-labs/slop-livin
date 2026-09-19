@@ -640,6 +640,80 @@ mod tests {
     }
 
     #[test]
+    fn ruby_vendor_bundle_folds_only_the_bundle_subtree() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("ruby-app");
+        touch(&repo.join("Gemfile"), 16);
+        touch(&repo.join("vendor/bundle/gems/installed.rb"), 4096);
+        touch(&repo.join("vendor/handwritten/license.txt"), 2048);
+
+        let result = attribute(tmp.path(), &[(repo.as_path(), "ruby-wt")], 0);
+        let rows = result.artifacts_by_worktree.get("ruby-wt").unwrap();
+        let bundle = rows
+            .iter()
+            .find(|r| r.kind == ArtifactKind::DependencyTree)
+            .expect("vendor/bundle is a dependency artifact");
+        assert_eq!(bundle.path, repo.join("vendor/bundle"));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == ArtifactKind::DependencyTree)
+                .count(),
+            1
+        );
+        let source = rows
+            .iter()
+            .find(|r| r.kind == ArtifactKind::Source)
+            .expect("unrelated vendor content remains source");
+        assert!(source.bytes >= 2048);
+    }
+
+    #[test]
+    fn rust_workspace_target_is_single_and_nested_nonmember_target_is_retained() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        // A shared workspace target is one physical artifact at the root;
+        // the member has no target of its own.
+        touch(&workspace.join("target/shared.bin"), 4096);
+        fs::create_dir_all(workspace.join("member")).unwrap();
+        fs::write(
+            workspace.join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // This nested Cargo project is deliberately outside the workspace
+        // members and owns an independent target that must not be hidden by
+        // the shared-target fixture.
+        let nested = workspace.join("tools/independent");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname = \"independent\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        touch(&nested.join("target/independent.bin"), 2048);
+
+        let result = attribute(root, &[(workspace.as_path(), "workspace-wt")], 0);
+        let rows = result.artifacts_by_worktree.get("workspace-wt").unwrap();
+        let targets: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == ArtifactKind::BuildOutput)
+            .filter(|r| r.path.file_name().and_then(|n| n.to_str()) == Some("target"))
+            .collect();
+        assert_eq!(targets.len(), 2, "both physical targets are retained once");
+        assert!(targets.iter().any(|r| r.path == workspace.join("target")));
+        assert!(targets.iter().any(|r| r.path == nested.join("target")));
+        assert!(targets.iter().all(|r| r.bytes > 0));
+    }
+
+    #[test]
     fn nested_repo_build_dir_attributes_to_nested_repo_not_parent() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
