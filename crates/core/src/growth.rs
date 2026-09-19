@@ -562,6 +562,7 @@ pub fn observe_and_annotate(
                 }
                 let changed = prev.bytes != obs.bytes || !prev.present;
                 if changed {
+                    current_changed = true;
                     let regrowth_count = if !prev.present {
                         prev.regrowth_count + 1
                     } else {

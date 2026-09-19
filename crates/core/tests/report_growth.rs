@@ -5,7 +5,120 @@
 mod fixture;
 
 use std::fs;
-use swamp_core::report::{ArtifactKind, report_with, report_with_observe};
+use std::time::Duration;
+use swamp_core::entities::now;
+use swamp_core::growth::{history_series, series_key, volume_store_dir};
+use swamp_core::report::{ArtifactKind, Report, report_with, report_with_observe};
+
+fn node_modules_key_and_bytes(report: &Report, fx: &fixture::Fixture) -> (String, u64) {
+    let project = report
+        .projects
+        .iter()
+        .find(|p| p.name == fx.checkout_name)
+        .expect("checkout project");
+    let worktree = project
+        .worktrees
+        .iter()
+        .find(|w| w.path == fx.checkout)
+        .expect("main worktree");
+    let artifact = worktree
+        .artifacts
+        .iter()
+        .find(|a| a.path == fx.node_modules)
+        .expect("node_modules row");
+    let rel_path = artifact
+        .path
+        .strip_prefix(&worktree.path)
+        .expect("artifact is under worktree")
+        .display()
+        .to_string();
+    let kind = format!("{:?}", artifact.kind);
+    (
+        series_key(&project.project_id, &worktree.worktree_id, &kind, &rel_path),
+        artifact.bytes,
+    )
+}
+
+fn assert_persisted_latest(store: &std::path::Path, root: &std::path::Path, key: &str, bytes: u64) {
+    let (series, _) = history_series(&volume_store_dir(store, root), 24 * 60 * 60, 2, now() + 1);
+    assert_eq!(
+        series.get(key).and_then(|values| values.last().copied()),
+        Some(Some(bytes)),
+        "current.parquet must persist the latest byte-only update"
+    );
+}
+
+fn delta_count(volume_dir: &std::path::Path) -> usize {
+    fs::read_dir(volume_dir.join("deltas"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn byte_only_updates_persist_sequentially_and_noop_without_redundant_delta() {
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+
+    let first =
+        report_with(&fx.root, None, false, Some(store.path()), Some("24h")).expect("first report");
+    let (key, _) = node_modules_key_and_bytes(&first, &fx);
+    let volume = volume_store_dir(store.path(), &fx.root);
+
+    // Keep observation timestamps distinct so the reverse-delta series has
+    // an unambiguous latest point even on filesystems with coarse clocks.
+    std::thread::sleep(Duration::from_millis(1100));
+    let first_update_bytes = 1024 * 1024;
+    fs::write(
+        fx.node_modules.join("persistence-probe"),
+        vec![b'a'; first_update_bytes],
+    )
+    .expect("write first probe");
+    let first_update = report_with(&fx.root, None, false, Some(store.path()), Some("24h"))
+        .expect("first byte-only update");
+    let (_, first_expected) = node_modules_key_and_bytes(&first_update, &fx);
+    assert_persisted_latest(store.path(), &fx.root, &key, first_expected);
+
+    let deltas_after_first_update = delta_count(&volume);
+    assert!(
+        deltas_after_first_update > 0,
+        "a byte-only update must append its reverse delta"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let second_update_bytes = 2 * 1024 * 1024;
+    fs::write(
+        fx.node_modules.join("persistence-probe"),
+        vec![b'b'; second_update_bytes],
+    )
+    .expect("write second probe");
+    let second_update = report_with(&fx.root, None, false, Some(store.path()), Some("24h"))
+        .expect("second byte-only update");
+    let (_, second_expected) = node_modules_key_and_bytes(&second_update, &fx);
+    assert_persisted_latest(store.path(), &fx.root, &key, second_expected);
+
+    let deltas_after_second_update = delta_count(&volume);
+    assert!(
+        deltas_after_second_update > deltas_after_first_update,
+        "each sequential byte-only update must append one reverse delta"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let unchanged = report_with(&fx.root, None, false, Some(store.path()), Some("24h"))
+        .expect("unchanged report");
+    let (_, unchanged_expected) = node_modules_key_and_bytes(&unchanged, &fx);
+    assert_persisted_latest(store.path(), &fx.root, &key, unchanged_expected);
+    assert_eq!(
+        delta_count(&volume),
+        deltas_after_second_update,
+        "a no-change observation after an update must not append a redundant delta"
+    );
+}
 
 #[test]
 fn growing_one_artifact_shows_growth_there_and_zero_elsewhere() {
