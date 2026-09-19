@@ -2,6 +2,13 @@
 
 Release notes describe behavior at the named version. See the [README](README.md) and [usage reference](docs/usage.md) for current behavior. Timings below are historical observations from one developer's machine, not a benchmark suite.
 
+## v0.5.2
+
+- Narrowed Ruby dependency attribution to `vendor/bundle`, preserving unrelated vendored source.
+- Added declarative project-name fallbacks for Gradle settings, Cabal, and Python `setup.cfg` manifests.
+- Made strict JSON manifest names structural and top-level only.
+- Added regressions for shared Rust workspace targets and independent nested project targets.
+
 ## v0.5.1
 
 - Fixed project badges with linked worktree counts so the worktree glyph and multi-digit count remain visually separated in the terminal UI.

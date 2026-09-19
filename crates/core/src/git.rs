@@ -146,13 +146,22 @@ fn checkout_name(dir: &Path) -> String {
         .to_string()
 }
 
+fn project_name(dir: &Path, remote_url: Option<&str>) -> String {
+    if remote_url.is_none()
+        && let Some(name) = crate::ecosystem::manifest_name(dir)
+    {
+        return name;
+    }
+    checkout_name(dir)
+}
+
 pub(crate) fn classify_main_checkout(dir: &Path, git_dir: &Path) -> Option<DiscoveredWorktree> {
     let common = fs::canonicalize(git_dir).ok()?;
     let project_id = id_for(&common.display().to_string());
     let remote_url = read_origin_url(&common);
     Some(DiscoveredWorktree {
         project_id,
-        project_name: checkout_name(dir),
+        project_name: project_name(dir, remote_url.as_deref()),
         path: dir.to_path_buf(),
         kind: WorktreeKind::Main,
         remote_url,
@@ -180,14 +189,11 @@ pub(crate) fn classify_git_file(
         let project_id = id_for(&common.display().to_string());
         // The common dir is `<main checkout>/.git`; the project name is
         // the main checkout's directory name, not the linked worktree's.
-        let project_name = common
-            .parent()
-            .map(checkout_name)
-            .unwrap_or_else(|| checkout_name(worktree_dir));
+        let project_root = common.parent().unwrap_or(worktree_dir);
         let remote_url = read_origin_url(&common);
         Some(DiscoveredWorktree {
             project_id,
-            project_name,
+            project_name: project_name(project_root, remote_url.as_deref()),
             path: worktree_dir.to_path_buf(),
             kind: WorktreeKind::Linked,
             remote_url,
@@ -197,7 +203,7 @@ pub(crate) fn classify_git_file(
         let remote_url = read_origin_url(&gitdir_path);
         Some(DiscoveredWorktree {
             project_id,
-            project_name: checkout_name(worktree_dir),
+            project_name: project_name(worktree_dir, remote_url.as_deref()),
             path: worktree_dir.to_path_buf(),
             kind: WorktreeKind::Main,
             remote_url,
@@ -282,6 +288,26 @@ mod tests {
         assert_eq!(found[0].kind, WorktreeKind::Main);
         assert_eq!(found[0].path, checkout);
         assert_eq!(found[0].project_name, "proj");
+    }
+
+    #[test]
+    fn remote_less_checkout_uses_declarative_manifest_name() {
+        let tmp = tempdir().unwrap();
+        let checkout = tmp.path().join("folder-name");
+        fs::create_dir_all(&checkout).unwrap();
+        run_git(&checkout, &["init", "-q", "-b", "main"]);
+        run_git(&checkout, &["config", "commit.gpgsign", "false"]);
+        fs::write(
+            checkout.join("settings.gradle"),
+            "rootProject.name = \"declared-name\"\n",
+        )
+        .unwrap();
+        run_git(&checkout, &["add", "settings.gradle"]);
+        run_git(&checkout, &["commit", "-q", "-m", "init"]);
+
+        let found = discover(tmp.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].project_name, "declared-name");
     }
 
     #[test]

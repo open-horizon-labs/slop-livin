@@ -9,6 +9,7 @@
 //! Node); every match is kept.
 
 use crate::report::ArtifactKind;
+use serde_json::Value;
 use std::path::Path;
 
 pub struct Ecosystem {
@@ -31,8 +32,7 @@ pub struct Ecosystem {
     pub name_source: Option<(&'static str, NameField)>,
 }
 
-/// How to pull a project name out of a manifest without a parser per
-/// format: a `key = "value"` / `key: value` / `"key": "value"` line.
+/// How to pull a project name out of a manifest without executing it.
 #[derive(Clone, Copy)]
 pub enum NameField {
     /// `name = "x"` in a TOML `[package]`/`[project]`/`[tool.poetry]` table.
@@ -53,6 +53,12 @@ pub enum NameField {
     MixApp,
     /// `project(x ...)` in CMakeLists.txt.
     CmakeProject,
+    /// `rootProject.name = "x"` in settings.gradle or settings.gradle.kts.
+    GradleRootProject,
+    /// `name: x` in a Cabal package description.
+    CabalName,
+    /// `name = x` in the `[metadata]` section of setup.cfg.
+    SetupCfgMetadataName,
     /// The file's own stem (`Foo.csproj` → `Foo`).
     FileStem,
 }
@@ -191,6 +197,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             "build.gradle",
             "build.gradle.kts",
             "settings.gradle",
+            "settings.gradle.kts",
         ],
         cleans: &[
             ("target", Build),
@@ -307,7 +314,6 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         markers: &["Gemfile"],
         cleans: &[
             (".bundle", Deps),
-            ("vendor", Deps),
             // github/gitignore Ruby, Rails.
             (".yardoc", Build),
             ("_yardoc", Build),
@@ -610,6 +616,9 @@ pub fn artifact_ecosystem(tags: &[String], name: &str) -> Option<&'static str> {
 /// root is a Node monorepo), then the project's own tags, then a name
 /// only one ecosystem generates.
 pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Option<&'static str> {
+    if ruby_vendor_bundle(parent, name) {
+        return Some("rb");
+    }
     let names = dir_names(parent);
     if let Some(e) = detect_in(&names)
         .into_iter()
@@ -625,13 +634,16 @@ pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Opti
 /// mismatch forces one full walk so rows that no longer classify leave
 /// and rows that now do arrive, instead of lingering until something
 /// happens to touch their directory.
-pub const RULES_VERSION: u32 = 4;
+pub const RULES_VERSION: u32 = 5;
 
 /// Marker-gated classification: `name` inside `parent` is an artifact of
 /// the kind an ecosystem declares, if that ecosystem's marker sits in
 /// `parent`. This is what lets `build/`, `dist/`, `vendor/`, `bin/` and
 /// `obj/` count only where the project type that produces them lives.
 pub fn classify_gated(parent: &Path, name: &str) -> Option<ArtifactKind> {
+    if ruby_vendor_bundle(parent, name) {
+        return Some(Deps);
+    }
     let names = dir_names(parent);
     detect_in(&names).into_iter().find_map(|e| {
         e.cleans
@@ -647,29 +659,55 @@ pub fn classify_gated(parent: &Path, name: &str) -> Option<ArtifactKind> {
 pub fn manifest_name(root: &Path) -> Option<String> {
     let names = dir_names(root);
     for e in detect_in(&names) {
-        let Some((file, field)) = e.name_source else {
-            continue;
-        };
-        let file_name = match file.strip_prefix("*.") {
-            Some(ext) => names
-                .iter()
-                .find(|n| n.ends_with(&format!(".{ext}")))?
-                .clone(),
-            None => file.to_string(),
-        };
-        if let NameField::FileStem = field {
-            return Path::new(&file_name)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned());
-        }
-        let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
-            continue;
-        };
-        if let Some(n) = extract_name(&text, field) {
-            return Some(n);
+        for (file, field) in name_sources(e) {
+            let Some(file_name) = resolve_manifest_file(&names, file) else {
+                continue;
+            };
+            if let NameField::FileStem = field {
+                if let Some(stem) = Path::new(&file_name).file_stem() {
+                    return Some(stem.to_string_lossy().into_owned());
+                }
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
+                continue;
+            };
+            if let Some(n) = extract_name(&text, field) {
+                return Some(n);
+            }
         }
     }
     None
+}
+
+fn resolve_manifest_file(names: &[String], file: &str) -> Option<String> {
+    match file.strip_prefix("*.") {
+        Some(ext) => names
+            .iter()
+            .find(|n| n.ends_with(&format!(".{ext}")))
+            .cloned(),
+        None => names.iter().find(|n| n.as_str() == file).cloned(),
+    }
+}
+
+/// Existing manifest readers remain first in table order; these are only
+/// declarative fallbacks when the ecosystem's primary manifest is absent or
+/// does not yield a name.
+fn name_sources(e: &Ecosystem) -> Vec<(&'static str, NameField)> {
+    let mut sources = Vec::new();
+    if let Some(source) = e.name_source {
+        sources.push(source);
+    }
+    match e.tag {
+        "java" => sources.extend([
+            ("settings.gradle", NameField::GradleRootProject),
+            ("settings.gradle.kts", NameField::GradleRootProject),
+        ]),
+        "hs" => sources.push(("*.cabal", NameField::CabalName)),
+        "py" => sources.push(("setup.cfg", NameField::SetupCfgMetadataName)),
+        _ => {}
+    }
+    sources
 }
 
 fn quoted(s: &str) -> Option<String> {
@@ -704,11 +742,13 @@ fn extract_name(text: &str, field: NameField) -> Option<String> {
             }
             None
         }
-        NameField::JsonName => text.lines().find_map(|l| {
-            let l = l.trim();
-            let rest = l.strip_prefix("\"name\"")?.trim_start().strip_prefix(':')?;
-            quoted(rest)
-        }),
+        NameField::JsonName => serde_json::from_str::<Value>(text)
+            .ok()?
+            .as_object()?
+            .get("name")?
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
         NameField::GoModule => text.lines().find_map(|l| {
             let m = l.trim().strip_prefix("module ")?.trim();
             m.rsplit('/').next().map(str::to_string)
@@ -754,8 +794,44 @@ fn extract_name(text: &str, field: NameField) -> Option<String> {
                 .collect();
             (!v.is_empty()).then_some(v)
         }),
+        NameField::GradleRootProject => text.lines().find_map(|l| {
+            let rest = l.trim().strip_prefix("rootProject")?.trim_start();
+            let rest = rest.strip_prefix(".name")?.trim_start();
+            let rest = rest.strip_prefix('=')?;
+            quoted(rest)
+        }),
+        NameField::CabalName => text.lines().find_map(|l| {
+            let rest = l.trim().strip_prefix("name:")?.trim();
+            (!rest.is_empty()).then(|| rest.to_string())
+        }),
+        NameField::SetupCfgMetadataName => {
+            let mut in_metadata = false;
+            text.lines().find_map(|l| {
+                let l = l.trim();
+                if l.starts_with('[') && l.ends_with(']') {
+                    in_metadata = l[1..l.len() - 1].trim().eq_ignore_ascii_case("metadata");
+                    return None;
+                }
+                if !in_metadata {
+                    return None;
+                }
+                let (key, value) = l.split_once('=')?;
+                (key.trim().eq_ignore_ascii_case("name"))
+                    .then(|| value.trim().to_string())
+                    .filter(|name| !name.is_empty())
+            })
+        }
         NameField::FileStem => None,
     }
+}
+
+fn ruby_vendor_bundle(parent: &Path, name: &str) -> bool {
+    name == "bundle"
+        && parent.file_name().and_then(|n| n.to_str()) == Some("vendor")
+        && parent
+            .parent()
+            .map(|root| marker_present(&dir_names(root), "Gemfile"))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -853,10 +929,17 @@ mod tests {
         let js = tempfile::tempdir().unwrap();
         std::fs::write(
             js.path().join("package.json"),
-            "{\n  \"name\": \"@org/pkg\",\n}",
+            "{\"name\":\"@org/pkg\",\"nested\":{\"name\":\"wrong\"}}",
         )
         .unwrap();
         assert_eq!(manifest_name(js.path()).as_deref(), Some("@org/pkg"));
+        let malformed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            malformed.path().join("package.json"),
+            "{\"metadata\":{\"name\":\"nested-only\"}",
+        )
+        .unwrap();
+        assert_eq!(manifest_name(malformed.path()), None);
         let go = tempfile::tempdir().unwrap();
         std::fs::write(go.path().join("go.mod"), "module github.com/a/gopher\n").unwrap();
         assert_eq!(manifest_name(go.path()).as_deref(), Some("gopher"));
@@ -866,5 +949,78 @@ mod tests {
         let ex = tempfile::tempdir().unwrap();
         std::fs::write(ex.path().join("mix.exs"), "  app: :phoenix_app,\n").unwrap();
         assert_eq!(manifest_name(ex.path()).as_deref(), Some("phoenix_app"));
+
+        let gradle = tempfile::tempdir().unwrap();
+        std::fs::write(
+            gradle.path().join("settings.gradle.kts"),
+            "rootProject.name = \"declared-gradle\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_name(gradle.path()).as_deref(),
+            Some("declared-gradle")
+        );
+
+        let cabal = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cabal.path().join("sample.cabal"),
+            "name: cabal-project\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_name(cabal.path()).as_deref(),
+            Some("cabal-project")
+        );
+
+        let setup_cfg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            setup_cfg.path().join("setup.cfg"),
+            "[options]\nname = wrong\n\n[metadata]\nname = cfg-project\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_name(setup_cfg.path()).as_deref(),
+            Some("cfg-project")
+        );
+
+        let precedence = tempfile::tempdir().unwrap();
+        std::fs::write(
+            precedence.path().join("pyproject.toml"),
+            "[project]\nname = \"pyproject-wins\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            precedence.path().join("setup.cfg"),
+            "[metadata]\nname = cfg-loses\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_name(precedence.path()).as_deref(),
+            Some("pyproject-wins")
+        );
+    }
+
+    #[test]
+    fn ruby_vendor_bundle_is_the_only_vendor_dependency_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            "source \"https://rubygems.org\"\n",
+        )
+        .unwrap();
+        let vendor = tmp.path().join("vendor");
+        std::fs::create_dir_all(vendor.join("bundle/gems")).unwrap();
+        std::fs::create_dir_all(vendor.join("handwritten")).unwrap();
+        assert_eq!(classify_gated(tmp.path(), "vendor"), None);
+        assert_eq!(classify_gated(&vendor, "bundle"), Some(Deps));
+        assert_eq!(classify_gated(&vendor, "handwritten"), None);
+        assert_eq!(
+            artifact_ecosystem_at(&vendor, &["rb".into()], "bundle"),
+            Some("rb")
+        );
+        assert_eq!(
+            artifact_ecosystem_at(tmp.path(), &["rb".into()], "vendor"),
+            None
+        );
     }
 }
