@@ -26,6 +26,12 @@ One observation on `~/src` (55 projects, 44 GB):
 | A change deep inside a 16 GB `target/` | 7.5 s | 2.4 s |
 | Nothing changed | 7.5 s | 86 ms |
 
+**Where artifact names come from now**
+
+- `CACHEDIR.TAG` is honoured: a directory holding a regular `CACHEDIR.TAG` whose first 43 bytes are the [Cache Directory Tagging Specification](https://bford.info/cachedir/) signature is a cache, whatever its name and with no marker gate, because the tool that created it is the one making the claim. Cargo writes one into `target/`, pytest into `.pytest_cache/`, uv into `.venv/`. A file that merely mentions the string, or a symlink standing in for the tag, does not qualify.
+- [github/gitignore](https://github.com/github/gitignore) (163 templates) and [linguist](https://github.com/github/linguist)'s vendored-paths list are vendored under `vendor/`, and `cargo run -p slop-livin-harvest` reports what they list that our table lacks. It never writes the table: the Python template alone lists `var/`, `instance/`, `lib/`, `mnesia/` and `rabbitmq/`, which hold authored or live state. Its `--challenge <root>` mode uses a tree only to *contradict* a candidate, by finding it holding git-tracked content; that is how `artifacts`, `generated`, `inc`, `packages`, `settings` and `Screenshots` were kept out. Sizes rank nothing.
+- Curated from that report, marker-gated, each carrying its provenance: around 70 names across Python, Node, .NET, C/C++, JVM, Ruby, Dart, Deno, Haskell, Swift, Unity and Unreal, plus seven ecosystems we did not model at all — Godot, Jekyll, Elm, Erlang, OCaml, Clojure and Nim.
+
 **Artifacts the table was missing**
 
 - ESP-IDF is its own ecosystem, identified by `sdkconfig` / `idf_component.yml` / `partitions.csv` rather than a `CMakeLists.txt` it need not have. Its `build/`, per-variant `build-<target>/` and vendored `managed_components/` are artifacts.

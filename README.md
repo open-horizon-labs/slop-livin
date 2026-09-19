@@ -318,7 +318,9 @@ Plans expire after 30 minutes and are single-use. A grant is checked per unit at
 | 🎲 | Unity | `ProjectSettings/` | `Library/`, `Temp/`, `Obj/`, `Logs/`, `MemoryCaptures/`, `Build/`, `Builds/` |
 | 🎮 | Unreal | `*.uproject` | `Binaries/`, `Intermediate/`, `Saved/`, `DerivedDataCache/`, `Build/` |
 
-Plus names that are artifacts anywhere: `.cache`, `.git`, `.xwin-cache`, `.ipynb_checkpoints`, `.terraform`, and the unambiguous entries above. The table is `crates/core/src/ecosystem.rs`; a new ecosystem is one entry.
+Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), Erlang (☎️), OCaml (🐫), Clojure (🔮) and Nim (👑), and names that are artifacts anywhere: `.cache`, `.git`, `.xwin-cache`, `.ipynb_checkpoints`, `.terraform`.
+
+**Where the names come from.** A directory that holds a `CACHEDIR.TAG` with the [Cache Directory Tagging Specification](https://bford.info/cachedir/) signature in its first 43 bytes is a cache with no further argument: the tool that made it says so. Everything else is a name plus a marker, and the names are harvested from [github/gitignore](https://github.com/github/gitignore)'s 163 templates and [linguist](https://github.com/github/linguist)'s vendored-paths list, both vendored under `vendor/`. `cargo run -p slop-livin-harvest` reports what upstream lists that the table lacks; it never writes the table, because a `.gitignore` entry proves a path is generated, not that deleting it is safe (Python's template lists `var/`, `instance/` and `lib/`). Its `--challenge <root>` mode uses a real tree only to contradict a candidate, by finding it holding git-tracked content. The table is `crates/core/src/ecosystem.rs`; a new ecosystem is one entry.
 
 </details>
 
@@ -347,7 +349,7 @@ Plus names that are artifacts anywhere: `.cache`, `.git`, `.xwin-cache`, `.ipynb
 
 **One report, three surfaces.** The TUI, CLI and MCP render the same `Report`. Nothing is computed only for the screen.
 
-**Statically checked constraints.** Nineteen `syn`-based audits (`cargo run -p slop-livin-source-audit -- --list`) fail the build when a guardrail is broken: a walker that follows a symlink or folds a directory that is not an artifact, a Parquet writer without zstd, an observation that walks before asking FSEvents, a consumer that names another consumer, verdict vocabulary in output, a second byte formatter. `scripts/audit-mutants.sh` applies wrong-but-plausible walkers and shows each fails the audit that owns the rule.
+**Statically checked constraints.** Nineteen `syn`-based audits (`cargo run -p slop-livin-source-audit -- --list`) fail the build when a guardrail is broken: a walker that follows a symlink or folds a directory that is not an artifact, a Parquet writer without zstd, an observation that walks before asking FSEvents, a consumer that names another consumer, verdict vocabulary in output, a second byte formatter. `scripts/audit-mutants.sh` applies seven wrong-but-plausible walkers and shows each fails the audit that owns the rule; every mutation is anchored on exact text and asserts it applied, so the check cannot quietly stop testing.
 
 ## Compared with
 
