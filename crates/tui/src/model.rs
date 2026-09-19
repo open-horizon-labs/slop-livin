@@ -975,7 +975,15 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 "  cargo · {} · {} (physical {}){}",
                                 u.role.label(),
                                 u.path.display(),
-                                human_bytes(u.physical_total),
+                                if matches!(
+                                    u.membership,
+                                    swamp_core::artifact::Membership::Unknown
+                                        | swamp_core::artifact::Membership::SharedHardlink
+                                ) {
+                                    "unknown".into()
+                                } else {
+                                    human_bytes(u.physical_total)
+                                },
                                 if u.variant.unknowns.is_empty() {
                                     String::new()
                                 } else {

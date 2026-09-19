@@ -233,11 +233,9 @@ pub struct ArtifactRow {
     pub dangling: bool,
 }
 
-/// R4c: one directory's rollup inside a worktree's `Source` tree.
-/// Produced only for directories not inside a folded artifact (see
-/// `ArtifactKind`) and not `.git` -- both are already excluded because
-/// `walk::attribute_parallel` folds them into one `ArtifactRow` before
-/// ever recursing, so no `DirRollup` is ever emitted underneath them.
+/// One directory measurement within a worktree, including folded artifact
+/// interiors. Interior rows support incremental sizing without retaining files;
+/// artifact boundaries prevent their totals being added twice to source rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirRollup {
     pub worktree_id: String,

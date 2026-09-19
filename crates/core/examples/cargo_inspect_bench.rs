@@ -28,18 +28,13 @@ fn main() -> anyhow::Result<()> {
             false,
             full,
         )?;
-        let bytes: u64 = report
-            .nested_artifacts
-            .iter()
-            .map(|u| u.physical_bytes)
-            .sum();
         let tests = report
             .nested_artifacts
             .iter()
             .filter(|u| u.role == swamp_core::artifact::ArtifactRole::TestExecutable)
             .count();
         println!(
-            "full={full} elapsed={:?} units={} test_executables={tests} charged={bytes} store_bytes={}",
+            "full={full} elapsed={:?} units={} test_executables={tests} store_bytes={}",
             start.elapsed(),
             report.nested_artifacts.len(),
             size(store.path())

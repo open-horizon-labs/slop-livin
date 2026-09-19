@@ -908,7 +908,14 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
             role,
             profile,
             human_bytes(bytes),
-            human_bytes(charged),
+            if matches!(
+                unit.membership,
+                crate::artifact::Membership::Unknown | crate::artifact::Membership::SharedHardlink
+            ) {
+                "—".into()
+            } else {
+                human_bytes(charged)
+            },
             unit.growth_bytes
                 .map(human_bytes_signed)
                 .unwrap_or_else(|| "—".into()),

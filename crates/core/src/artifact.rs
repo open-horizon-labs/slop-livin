@@ -108,6 +108,8 @@ pub struct NestedArtifact {
     /// This is zero for aggregate/container nodes.
     pub physical_bytes: u64,
     /// Aggregate charge, for display only; do not sum with descendants.
+    /// Folded groups with Unknown membership have no subgroup charge estimate;
+    /// their zero placeholder must be displayed as unknown, not measured zero.
     #[serde(default)]
     pub physical_total: u64,
     pub mtime_max: u64,

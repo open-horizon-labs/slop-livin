@@ -236,14 +236,14 @@ fn write_parquet_atomic(
     write_parquet_batches_atomic(path, schema, std::iter::once(Ok(batch.clone())), zstd_level)
 }
 
-/// Shared columnar writer for bounded measurement batches and existing history.
+/// Atomic columnar writer for history batches.
 pub(crate) fn write_parquet_batches_atomic(
     path: &Path,
     schema: Arc<Schema>,
     batches: impl IntoIterator<Item = Result<RecordBatch>>,
     zstd_level: i32,
 ) -> Result<()> {
-    let properties = zstd_properties(&schema, zstd_level);
+    let properties = default_zstd_properties(zstd_level);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1006,45 +1006,6 @@ fn default_zstd_properties(level: i32) -> WriterProperties {
         .set_compression(Compression::ZSTD(level))
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .build()
-}
-
-/// Preserve values exactly while avoiding dictionaries for high-cardinality
-/// paths/numbers. Low-cardinality identity and role strings keep dictionaries.
-fn zstd_properties(schema: &Schema, level: i32) -> WriterProperties {
-    // Real-store comparisons found the established encodings smaller for the
-    // folded current/delta tables. Specialize only the new entry measurements.
-    if schema.field_with_name("inode").is_err() {
-        return default_zstd_properties(level);
-    }
-    use parquet::{basic::Encoding, schema::types::ColumnPath};
-    let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(level).unwrap_or_default(),
-        ))
-        .set_writer_version(WriterVersion::PARQUET_2_0);
-    for field in schema.fields() {
-        let encoding = match field.data_type() {
-            DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64 => {
-                Some(Encoding::DELTA_BINARY_PACKED)
-            }
-            DataType::Utf8 | DataType::Binary
-                if matches!(
-                    field.name().as_str(),
-                    "rel_path" | "parent_rel_path" | "relative"
-                ) =>
-            {
-                Some(Encoding::DELTA_BYTE_ARRAY)
-            }
-            _ => None,
-        };
-        if let Some(encoding) = encoding {
-            let column = ColumnPath::from(field.name().as_str());
-            builder = builder
-                .set_column_dictionary_enabled(column.clone(), false)
-                .set_column_encoding(column, encoding);
-        }
-    }
-    builder.build()
 }
 
 // --- dirs.parquet ---
@@ -3566,59 +3527,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn column_encoding_preserves_integer_extremes_and_reduces_path_storage() -> anyhow::Result<()> {
-        use super::*;
-        let tmp = tempfile::tempdir()?;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("rel_path", DataType::Utf8, false),
-            Field::new("inode", DataType::UInt64, false),
-            Field::new("time", DataType::Int64, false),
-        ]));
-        let count = 20_000;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values((0..count).map(|i| {
-                    format!("target/debug/incremental/shared-prefix/crate-{i:08}/state")
-                }))),
-                Arc::new(UInt64Array::from_iter_values((0..count).map(|i| {
-                    if i % 2 == 0 {
-                        u64::MAX - i as u64
-                    } else {
-                        i as u64
-                    }
-                }))),
-                Arc::new(arrow_array::Int64Array::from_iter_values((0..count).map(
-                    |i| {
-                        if i % 2 == 0 {
-                            i64::MIN + i as i64
-                        } else {
-                            i64::MAX - i as i64
-                        }
-                    },
-                ))),
-            ],
-        )?;
-        let old = tmp.path().join("old.parquet");
-        let mut writer = ArrowWriter::try_new(
-            File::create(&old)?,
-            schema.clone(),
-            Some(default_zstd_properties(3)),
-        )?;
-        writer.write(&batch)?;
-        writer.close()?;
-        let new = tmp.path().join("new.parquet");
-        write_parquet_atomic(&new, schema, &batch, 3)?;
-        let restored = ParquetRecordBatchReaderBuilder::try_new(File::open(&new)?)?
-            .with_batch_size(count)
-            .build()?
-            .next()
-            .unwrap()?;
-        assert_eq!(batch, restored);
-        assert!(fs::metadata(&new)?.len() < fs::metadata(&old)?.len());
-        Ok(())
-    }
     use super::*;
 
     #[test]

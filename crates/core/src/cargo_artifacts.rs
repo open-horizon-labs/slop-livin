@@ -332,6 +332,201 @@ pub fn inspect_target_incremental(
     }
 }
 
+/// Project decision-relevant units from the existing folded directory measurements.
+/// Only fingerprint metadata and example executables receive shallow extra reads.
+pub(crate) fn folded_units(
+    root: &Path,
+    projects: &[ProjectRow],
+    dirs: &[crate::report::DirRollup],
+) -> anyhow::Result<Vec<NestedArtifact>> {
+    let scope = NestedArtifact::storage_id(root, "");
+    let worktrees: HashMap<_, _> = projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .map(|w| (w.worktree_id.as_str(), w.path.as_path()))
+        .collect();
+    let mut units = Vec::new();
+    let mut fingerprints = Vec::new();
+    let mut examples = Vec::new();
+    let mut measurements = Vec::new();
+    for d in dirs {
+        let Some(worktree) = worktrees.get(d.worktree_id.as_str()) else {
+            continue;
+        };
+        let path = worktree.join(&d.rel_path);
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = relative.to_string_lossy();
+        measurements.push((path.clone(), d.mod_time_min.max(0) as u64 * 60, d.complete));
+        let parts: Vec<_> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        let offset = usize::from(parts.first().is_some_and(|p| looks_like_target_triple(p)));
+        if parts.len() == offset + 3 && parts.get(offset + 1) == Some(&".fingerprint") {
+            fingerprints.push(path.clone());
+        }
+        if parts.len() == offset + 2 && parts.get(offset + 1) == Some(&"examples") {
+            examples.push(path.clone());
+        }
+        let keep = parts.len() <= offset + 2
+            || (parts.len() == offset + 3
+                && matches!(parts.get(offset + 1), Some(&"incremental" | &"build")));
+        if !keep {
+            continue;
+        }
+        let mut u = folded_node(root, &scope, &path, true, d.allocated_total);
+        u.coverage.complete = d.complete;
+        u.mtime_max = d.mod_time_min.max(0) as u64 * 60;
+        units.push(u);
+    }
+    // A folded group's last change includes its deeper directories. Reuse their
+    // measured metadata; do not stat files to reconstruct an exact inventory.
+    let indexes: HashMap<_, _> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.path.clone(), i))
+        .collect();
+    for (path, mtime, complete) in measurements {
+        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
+            if let Some(&i) = indexes.get(ancestor) {
+                units[i].mtime_max = units[i].mtime_max.max(mtime);
+                units[i].coverage.complete &= complete;
+            }
+        }
+    }
+    // Temporary metadata nodes feed the shared parser, but are never retained.
+    // Ordinary compiler outputs in deps are not listed or statted here.
+    for dir in fingerprints {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let target = stem
+                .strip_prefix("test-lib-")
+                .or_else(|| stem.strip_prefix("test-bin-"))
+                .or_else(|| stem.strip_prefix("test-integration-test-"));
+            let Some(target) = target else { continue };
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let dir = path.parent().unwrap();
+            let Some((_, hash)) = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit_once('-'))
+            else {
+                continue;
+            };
+            let executable = dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("deps")
+                .join(format!("{target}-{hash}"));
+            if let Some(u) = folded_executable(root, &scope, &executable)? {
+                units.push(u);
+                units.push(folded_node(root, &scope, &path, false, 0));
+            }
+        }
+    }
+    for dir in examples {
+        for entry in fs::read_dir(dir)? {
+            if let Some(u) = folded_executable(root, &scope, &entry?.path())? {
+                units.push(u);
+            }
+        }
+    }
+    enrich_fingerprints(root, &mut units);
+    units.retain(|u| {
+        u.is_dir || matches!(u.role, ArtifactRole::TestExecutable | ArtifactRole::Example)
+    });
+    units.sort_by(|a, b| a.path.cmp(&b.path));
+    units.dedup_by(|a, b| a.path == b.path);
+    Ok(units)
+}
+
+fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) -> NestedArtifact {
+    let rel = relative_path(root, path);
+    let (role, variant) = classify_path(&rel, is_dir);
+    let mut u = node(
+        path,
+        root,
+        Some(NestedArtifact::within(scope, &rel)),
+        (path != root)
+            .then(|| NestedArtifact::within(scope, &relative_path(root, path.parent().unwrap()))),
+        role,
+        bytes,
+        0,
+        variant,
+        vec![evidence(
+            "cargo-folded",
+            "directory aggregates; internal files are not retained",
+            Confidence::High,
+        )],
+        vec![],
+        ArtifactCoverage {
+            supported: true,
+            complete: true,
+            limits: vec![
+                "internal file history and subgroup hardlink attribution are not retained".into(),
+            ],
+        },
+        None,
+        true,
+    );
+    u.container_id = Some(scope.into());
+    u.is_dir = is_dir;
+    u
+}
+
+fn folded_executable(
+    root: &Path,
+    scope: &str,
+    path: &Path,
+) -> anyhow::Result<Option<NestedArtifact>> {
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !m.is_file() || m.mode() & 0o111 == 0 {
+        return Ok(None);
+    }
+    let mut u = folded_node(root, scope, path, false, m.blocks() * 512);
+    u.device = m.dev();
+    u.inode = m.ino();
+    u.logical_bytes = m.len();
+    u.mtime_max = m.mtime().max(0) as u64;
+    if m.nlink() == 1 {
+        u.membership = Membership::Exclusive;
+        u.physical_total = u.bytes;
+        u.physical_bytes = u.bytes;
+    } else {
+        u.membership = Membership::SharedHardlink;
+    }
+    Ok(Some(u))
+}
+
+/// Recheck only the selected unit and its recorded producer evidence.
+pub(crate) fn reviewed_role(
+    root: &Path,
+    selected: &Path,
+    fingerprints: &[PathBuf],
+) -> anyhow::Result<(ArtifactRole, bool)> {
+    let meta = fs::symlink_metadata(selected)?;
+    let scope = NestedArtifact::storage_id(root, "");
+    let mut units = vec![folded_node(root, &scope, selected, meta.is_dir(), 0)];
+    for path in fingerprints {
+        units.push(folded_node(root, &scope, path, false, 0));
+    }
+    enrich_fingerprints(root, &mut units);
+    Ok((units[0].role.clone(), meta.is_dir()))
+}
+
 fn classify_path(rel: &str, is_dir: bool) -> (ArtifactRole, ArtifactVariant) {
     if rel.is_empty() {
         return (ArtifactRole::Container, ArtifactVariant::default());

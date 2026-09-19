@@ -23,10 +23,8 @@ impl Consumer for GrowthConsumer {
             return Ok(vec![]);
         };
         let mut d: Draft = (**draft).clone();
-        // Roll child totals up the directory chain first, so the store
-        // records (and measures growth on) aggregated directory sizes.
+        // CargoAnnotated carries directory totals already aggregated once.
         let roots = crate::report::artifact_roots(&d.projects);
-        crate::report::aggregate_dir_totals(&mut d.dirs, &roots);
         let nested_shadow_paths =
             add_nested_history_rows(&mut d.projects, &d.nested_artifacts, ctx.observed_at);
         if let Some(dir) = &ctx.store_dir {

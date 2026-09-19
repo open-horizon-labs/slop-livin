@@ -1,5 +1,68 @@
 # Nested artifact index: salvage and replacement solution space
 
+## Current direction — supersedes the design and binding criteria below
+
+The user explicitly corrected the frame: this manages a developer ecosystem,
+not perfect filesystem audits. Exhaustive internal-file/deleted-file history was
+an assistant-invented requirement. The per-file index prototype is discarded,
+not awaiting integration. All earlier plans and benchmarks below are historical
+evidence, not instructions to resume that architecture.
+
+Implemented direction: project compact Cargo groups from the existing folded
+directory measurements; retain evidenced test/example executables; keep aggregate
+history; reuse trusted unchanged observations. Ordinary compiler files stay
+folded. Deep inspection is explicit, and cleanup freshly checks only its selected
+group and evidence. The replay checkpoint publication fix is retained.
+
+Learning: [manage ecosystems, not filesystem audits](../metis/manage-ecosystems-not-filesystem-audits.md).
+
+## Historical exploration (superseded)
+
+The following execution/review is current; the older exploration resumes after it.
+
+### Execute and review — folded ecosystem units
+
+Aim: useful build identification, aggregate history, and selective cleanup without
+retaining a per-file compiler inventory. Status: implemented and locally verified.
+The checkpoint publication correction and small reverse-delta compaction remain.
+Removed the assistant-owned all-file prototype, recording hooks, benchmark/tests,
+and dead measurement-specific encoding specialization. Historical tracked versions
+remain available in Git; prototype findings remain below, not production code.
+
+Verification: `cargo test --workspace --quiet` passed 241 tests; two opt-in store
+diagnostics ignored. `cargo run -p swamp-source-audit` passed all 19 audits.
+`git diff --check` passed. The real checkout benchmark used an isolated temporary
+store and changed no source/build files there: 894 units / 154 tests, 224,511–226,428
+bytes total store, 1.80/1.89/1.79 seconds. All runs used full-walk fallbacks, not
+replay-only timing.
+
+Risk retirement:
+
+- Hidden per-file inventory: the 5,000-file regression checks report counts,
+  history-series counts, aggregate growth, cached units, and persisted Parquet.
+  An eager model merely compressed or hidden behind a cache fails this check.
+- Duplicate Cargo walk: normal consumer calls only folded projection; fingerprint
+  and example enumeration are shallow. Trusted unchanged-container reuse is
+  tested with unreadable fingerprint metadata, which must not be reopened.
+- Unsafe simplification of cleanup: existing stale-member, companion, hardlink,
+  lock, authorization, neighboring-file, and directory-group tests pass. New
+  evidence-change test refuses a changed fingerprint; an unrelated unreadable
+  subtree no longer blocks selected-group cleanup.
+- Lost group recency: propagate already-measured descendant timestamps and test
+  an old group directory containing newer internal files.
+- False accounting precision: group allocation remains measured; unknown subgroup
+  hardlink charge renders unknown. Exact reclaimed-space prediction is not promised.
+- Replay publication ordering: existing failed-cache/checkpoint regression passes.
+
+Frame review: aligned with the user's correction. Exhaustive deleted-file identity
+history is deliberately not delivered. Native event timing varies by machine;
+the fixture verifies reuse, while real measurements honestly report fallback.
+No production cleanup was performed. Final UI usefulness remains for the user's
+judgment; safety fixtures are not a claim of independent human review. No push,
+merge, release, or user-store rewrite is part of this execution.
+
+### Older exploration resumes here — superseded
+
 > Execution direction confirmed by user: apply and test the existing folded-folder
 > walk and Parquet/reverse-delta approach FIRST. Alternatives require demonstrated
 > failure of that implementation, not anticipated complexity. The uncommitted
@@ -346,3 +409,117 @@ facts; fold small interiors using the existing observation contract; avoid stori
 container/parent identity repeatedly; preserve all promised deleted-file history.
 Do not silently achieve a size target by weakening that contract. Existing global
 history rewrite/read granularity and rich-report integration remain unresolved.
+
+## Execute — partitioned facts and publication ordering, 2026-09-19
+
+User explicitly requested the unfinished architectural replacement next, including
+broader fixes. Scope remains full BA0/BA1b/BA2/BA3, not a narrowed first increment.
+No delegation, alternative database, migration, release or real cleanup occurred.
+
+Implemented the selected Parquet mechanism's storage/query boundary in
+`folded/index.rs`, plus bounded external ordering in `folded/sort.rs`:
+
+- Current and sparse reverse facts use byte-ordered range trees over the existing
+  Parquet/zstd writer. Leaves cap both rows (4,096) and path/scalar payload (2MiB);
+  routing fanout is 32. Container identity is not repeated per fact.
+- No-change checkpoint publication reads/writes no descendant partitions. Local
+  changes copy only affected partitions and routing ancestors. Retired current
+  segments are removed after publication, not retained as full snapshots.
+- Reverse facts are packed in their own bounded tree keyed by path/time/generation.
+  A historical value is a range lookup, not a scan of every observation. Prior
+  absence, deleted paths, raw names, inode/link evidence and nanoseconds survive.
+- Paged queries cap returned bytes as well as rows. Retention advances a coverage
+  floor and prunes one bounded page per call; historical queries before the floor
+  refuse rather than returning invented values.
+- One generated HEAD commits the two roots and caller checkpoint. Shared reader
+  and exclusive writer locks prevent retirement under live readers. PENDING
+  recovery rolls back an unpublished run or finishes committed retirement.
+  Publication-uncertain handles refuse further writes until reopened.
+- Complete reconciliation consumes sorted measurements and infers deletion only
+  after successful end-of-stream. It is the explicit full/event-gap path, not the
+  normal no-change path. The external sorter uses bounded runs and fan-in 16;
+  it performs no additional filesystem measurement.
+
+The storage boundary is exercised by a real folded-walker integration fixture:
+hardlinks, link removal, symlinks, current and deleted history. APFS rejects invalid
+UTF-8 filenames, so actual raw-name creation is Linux-only; columnar raw-byte
+round trips run on all platforms. Linux execution itself remains pending.
+
+### Broader pipeline correction now on the normal report path
+
+Inspection exposed a pre-existing checkpoint hazard: `observe_tracked_with_source`
+advanced replay before Cargo/history/report caching could fail, and cache errors
+were discarded. The report now calls `stage_tracked_with_source`; its walk consumer
+holds the checkpoint until a successful `ReportCached` event. Cache errors
+propagate. Topology/unowned writes precede replay-anchor publication.
+
+The existing low-level walk API still commits immediately for its callers; the
+report uses the staged API. Source audit now follows and checks that delegation
+and applies its existing replay-before-full-walk guard to the staged function.
+This preserves, rather than bypasses, the guard. A cache-publication blocker proves
+the failed report leaves the previous replay sidecar byte-for-byte unchanged;
+removing the fixture blocker and retrying commits the new event id.
+
+This is safe retry ordering, not a transaction across legacy volume datasets.
+The new index's generation contract is scoped to that index; it does not yet make
+all existing report stores atomic or fix concurrent legacy report writers.
+
+### Evidence and boundaries
+
+Real target probe (all output disposable), release/warm filesystem cache:
+256,504 facts; globally sorted raw Parquet 4,304,388B; complete partitioned index
+4,520,629B. Walk plus external sort 3.372s; initialize from ordered input 1.147s.
+Reopen/no-change checkpoint 66.3ms, zero child rows/partitions decoded or written.
+One synthetic changed fact: 120.5ms, one 4,096-row current leaf read, 4,097 rows
+written across current/reverse leaves; 72,314B partition/routing reads and 75,036B
+writes. Fifty-row page: 0.677ms, one leaf. These are single-run boundary timings,
+not complete report latency. Counters exclude lock/HEAD/journal metadata. The real
+filesystem was not changed; the synthetic mutation affected temporary index facts.
+
+10k, 100k and explicitly run release 1m fixtures retain the same one-leaf update
+bound; routing reads are 1, 1 and 2 respectively. Synthetic data is repetitive:
+its compressed sizes are not representative. Fresh handles remove any in-memory
+index state but do not create cold OS caches or independent processes.
+
+Adversarial checks cover byte-bounded long-path pages/reconciliation/retention,
+equal-size rename, same-size metadata changes, same-second generations, late input
+failure, unsigned/signed extremes, raw names, deletion before first expansion,
+split/delete/reinsert against a reference map, reader/writer exclusion, failure
+after replacement segments are written, and recovery before/after HEAD publication.
+One hundred tiny observations remain packed in <20KB including current/index
+metadata rather than retaining 100 Parquet footers. Tests simulate interruption;
+they do not establish every power-loss/filesystem behavior.
+
+### Review — Adjust; integration remains incomplete
+
+Aligned with C and the existing walker/store. The mechanism has not failed its
+storage-boundary proof; there is no evidence justifying an engine substitution.
+The necessary broader checkpoint correction is applied to the normal pipeline.
+
+The partition index is NOT authoritative for normal reports yet. It is currently
+called by fixtures and the benchmark. Eager Cargo annotation, rich report caching,
+shadow history rows, TUI filtering and whole-container cleanup rechecks remain.
+Do not claim end-to-end speedups or completed replacement from this commit.
+
+Required next integration: route complete measurement scopes from full AND
+incremental walks to the index; remove the second Cargo walk; replace report state
+with summaries and indexed domain projections; wire paged UI/exports/history and
+selected cleanup rechecks. Domain/config metadata invalidation, external roots,
+cross-root physical accounting and inode replacement need their full gates.
+Measure sparse-deletion leaf occupancy/compaction and real many-update storage.
+Independent cold-process, Linux gap and retained-native-build checks remain pending.
+No model-checkable end-to-end risk is marked accepted simply because it remains.
+
+The parallel workspace suite also exposed a transient lock-busy failure on a
+reopened index. A duplicated-descriptor fixture reproduces the relevant lifetime
+hazard (as with a concurrent fork before exec): closing the owner's descriptor
+alone can retain its flock. An explicit-unlock RAII guard now covers successful
+views and constructor failures. Multiple independent shared readers still block
+a writer until the last view drops. The workspace suite passed after this fix.
+
+Verification: workspace tests and source audit passed. The million-entry release
+probe was run explicitly (it is ignored in the routine suite). Strict clippy found
+15 pre-existing warnings in actions/artifact/Cargo/walk code; the new-code warning
+was corrected, and ordinary clippy completed with no warnings in the added modules.
+`docs/folded-index.md` records the implemented boundary, measurements and remaining
+integration gates separately from shipped architecture claims.

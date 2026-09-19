@@ -31,6 +31,7 @@ pub struct CargoGroup {
     pub role: ArtifactRole,
     pub members: Vec<Member>,
     pub lock_paths: Vec<PathBuf>,
+    pub evidence: Vec<Member>,
 }
 
 pub fn candidate(unit: &NestedArtifact) -> bool {
@@ -255,6 +256,17 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     let profile = dir.parent().context("missing profile")?.to_path_buf();
     let lock_paths = locks(&profile)?;
     let _held = acquire(&lock_paths)?;
+    let evidence: Vec<_> = unit
+        .producer_evidence
+        .iter()
+        .filter(|e| e.source == "cargo-fingerprint")
+        .map(|e| snapshot(Path::new(&e.detail)))
+        .collect::<Result<_>>()?;
+    let evidence_paths: Vec<_> = evidence.iter().map(|e| e.path.clone()).collect();
+    if crate::cargo_artifacts::reviewed_role(&container, &selected, &evidence_paths)?.0 != unit.role
+    {
+        bail!("Cargo role/evidence changed; refresh before proposing");
+    }
     let mut paths = vec![selected.clone()];
     let dep = selected.with_extension("d");
     if !directory_group && dep != selected && dep.exists() {
@@ -272,6 +284,7 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
         role: unit.role.clone(),
         members,
         lock_paths,
+        evidence,
     })
 }
 
@@ -283,27 +296,23 @@ pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf>
         bail!("Cargo lock set changed; propose again");
     }
     let _held = acquire(&group.lock_paths)?;
-    let inspection =
-        crate::cargo_artifacts::inspect_target(&group.container, Some(&group.container));
-    if !inspection.coverage.complete {
-        bail!("Cargo coverage incomplete; refusing cleanup");
+    for evidence in &group.evidence {
+        if snapshot(&evidence.path)? != *evidence {
+            bail!("Cargo role/evidence changed; propose again");
+        }
     }
-    // Recheck role, exact companion membership and file identities under locks.
-    // propose() also locks, so perform the structural comparison without it.
-    let current = inspection
-        .units
-        .iter()
-        .find(|u| u.path == group.selected)
-        .context("selected build vanished")?;
-    if current.role != group.role {
+    let paths: Vec<_> = group.evidence.iter().map(|e| e.path.clone()).collect();
+    let (role, is_dir) =
+        crate::cargo_artifacts::reviewed_role(&group.container, &group.selected, &paths)?;
+    if role != group.role {
         bail!("Cargo role/evidence changed; propose again");
     }
     let mut expected = vec![group.selected.clone()];
     let dep = group.selected.with_extension("d");
-    if !current.is_dir && dep.exists() && dep != group.selected {
+    if !is_dir && dep.exists() && dep != group.selected {
         expected.push(dep);
     }
-    if !current.is_dir && group.selected.with_extension("dSYM").exists() {
+    if !is_dir && group.selected.with_extension("dSYM").exists() {
         expected.push(group.selected.with_extension("dSYM"));
     }
     if expected

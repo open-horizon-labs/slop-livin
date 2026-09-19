@@ -1,6 +1,6 @@
-//! Replay-informed Cargo annotation. Failed coverage never reaches history.
+//! Replay-informed Cargo projection over the folded directory measurements.
 use crate::bus::{Consumer, Ctx, Draft, Event, EventKind};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -28,6 +28,9 @@ impl Consumer for CargoConsumer {
             return Ok(vec![]);
         };
         let mut draft: Draft = (**draft).clone();
+        // Aggregate once, before either Cargo interpretation or history uses it.
+        let artifact_roots = crate::report::artifact_roots(&draft.projects);
+        crate::report::aggregate_dir_totals(&mut draft.dirs, &artifact_roots);
         let cached = ctx
             .store_dir
             .as_deref()
@@ -45,7 +48,7 @@ impl Consumer for CargoConsumer {
                 .push(u);
         }
         let mut nested = Vec::new();
-        for (root, workspace) in roots {
+        for (root, _workspace) in roots {
             let old = grouped
                 .remove(&crate::artifact::NestedArtifact::storage_id(&root, ""))
                 .unwrap_or_default();
@@ -53,6 +56,9 @@ impl Consumer for CargoConsumer {
                 u.path == root
                     && u.id == crate::artifact::NestedArtifact::storage_id(&root, "")
                     && u.coverage.complete
+                    && u.producer_evidence
+                        .iter()
+                        .any(|e| e.source == "cargo-folded")
             });
             let changes = if valid && root.starts_with(&ctx.root) && !ctx.force_full {
                 changed.as_deref().map(|v| v.as_slice())
@@ -67,22 +73,12 @@ impl Consumer for CargoConsumer {
                 nested.extend(old);
                 continue;
             }
-            let inspection = crate::cargo_artifacts::inspect_target_incremental(
+            nested.extend(crate::cargo_artifacts::folded_units(
                 &root,
-                Some(&workspace),
-                &old,
-                changes,
-            );
-            if !inspection.coverage.complete {
-                bail!(
-                    "Cargo observation incomplete at {}: {}; previous history retained",
-                    root.display(),
-                    inspection.coverage.limits.join("; ")
-                );
-            }
-            nested.extend(inspection.units);
+                &draft.projects,
+                &draft.dirs,
+            )?);
         }
-        crate::cargo_artifacts::charge_physical(&mut nested);
         draft.nested_artifacts = Arc::new(nested);
         Ok(vec![Event::CargoAnnotated(Arc::new(draft))])
     }
