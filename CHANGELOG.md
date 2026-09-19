@@ -2,6 +2,57 @@
 
 Release notes live here, one section per tag. The release workflow refuses a tag without one.
 
+## v0.4.0
+
+Docker objects and orphans are things you can delete, "source" now means what git tracks, and a project acts from the row you are already on.
+
+**Deleting Docker objects and orphans**
+
+- Images, volumes and paths no project claims are units like any other: markable, plannable, and reachable from the TUI, the CLI and MCP alike. `A` marks every row in the view the tool can act on, so a screen of objects is one gesture and still one confirm.
+- The three kinds are not equivalent and the tool says so instead of flattening them. A path goes to Trash and comes back. An image is permanent and returns only by pulling or rebuilding. A volume's contents exist nowhere else at all. Each carries that contract into the plan, the confirm and the ledger.
+- Build cache is reported and refused per entry, because Docker exposes no per-record removal for it: `docker builder prune` acts on everything reclaimable at once, which is a different unit of action than a plan unit.
+- The executor re-derives each object at the sink and reports the daemon's own refusal text when Docker declines, rather than guessing at a reason. An image a container still holds refuses in Docker's words.
+- The confirm line names both destinations and their totals separately, and now names every object that cannot be restored rather than only counting its bytes: a project expands into many units and the three the line has room for are usually ordinary directories, which left the irreversible one invisible.
+- The ledger records a permanent removal with no recovery location, and the result separates `trashed_bytes` from `removed_permanently_bytes`, so a next step cannot claim bytes are in Trash when they are not.
+- `scripts/docker-fixture.sh up` builds the whole range to test against: an image joined by compose label, one joined by `org.opencontainers.image.source`, an orphan with no evidence, a dangling image, a stopped container holding an image so removal is refused, a volume with 32 MB actually written into it, and build cache. `down` removes all of it.
+
+**"source" now means what git tracks**
+
+- A single row called `source` carried every byte under a checkout that no artifact claimed. On a project whose 18.9 MB is one gitignored `payload.bin`, that row said `source 18.9MB`: none of it authored work, no remote holding a copy. It is now three rows — `source` for what git tracks, `ignored` for what a gitignore rule matches, `untracked` for what is in no version control at all — each with its own recovery contract, the latter two irrecoverable outside Trash.
+- The three totals sum to exactly what the walk measured. The split apportions that number rather than re-measuring, so no accounting is invented; the largest bucket absorbs the rounding.
+- It runs at directory granularity, then corrects every file the store holds a row of its own for, which is what catches a large ignored file sitting in a tracked directory. Checked against `git ls-files --others --ignored` on a real checkout: 284.1 MB reported against 272 MiB from git, the difference being allocated versus apparent size.
+- `ignored` and `untracked` report bytes scattered across a checkout and carry the worktree's own path, so neither is a delete target: acting on that path would take the whole checkout. The CLI refuses them by kind and the TUI refuses to mark them.
+- The incremental walk still works on one remainder row per worktree, so the rows are collapsed on the way in and split on the way out rather than teaching every incremental path about three of them.
+- Asking git about a path used to rebuild the exclude stack inside every call, at roughly 75 µs each, which is why nothing asked per path. It is built once per checkout and reused.
+
+**Acting from the row you are on**
+
+- A projects row had no unit, so Space, Backspace and `A` all refused it and the only way to reclaim a project's bytes was to open it first. A project row now expands into the artifacts that project holds: dependency trees, build output, caches and its Docker objects. The checkout, its `.git` and its source tree are not in that set.
+- A project with nothing rebuildable in it offers the checkout itself, carrying its dirty / unpushed / untracked-content warnings onto the confirm, because that is the only thing it has. Bulk marking with `A` never reaches for a checkout.
+
+**Bars that answer the question**
+
+- The growth column answered "how big is this change" with one bit: a linear scale over four orders of magnitude gave 13.6 GB the full width and drew 107 MB and 3 MB as the same sliver, both growing rightward so only colour said which way. It is now a diverging bar around a dim centre axis — shrink left, growth right, so direction is geometry — with logarithmic length, so 107 MB and 3 MB are plainly different. A change under 1 MB is one tick hugging the axis with its number dimmed. Only U+2580..U+259F blocks are used: the eighth-block range that would mirror the steps exactly is Unicode 13 and renders as tofu in many terminals.
+- The per-row sparkline is gone. With hours of history it said nothing, and it was taking the width the bar needed.
+- The growth sort ranked by magnitude, so a project that shrank by 3 GB sat above one that grew by 1 GB, at the top of a screen being read for things to delete. What arrived now sorts first and what left sorts last.
+
+**Traversal keys**
+
+- The footer advertised `→`/`←` while both ran the same toggle and the real traversal was Enter and Esc. `→` goes in (open a project, expand a row), `←` comes out (collapse an expanded row, else go back a level), the way a file tree does. Enter and Esc still work, and `←` at the projects view does nothing rather than quitting.
+
+**A store that survives being killed**
+
+- A killed process left a `current.parquet` whose footer never landed, and every later run died on it. Every Parquet write now goes to a temp file renamed over the target only after the writer closed, named uniquely per process because the scheduled LaunchAgent and a hand-run report observe the same store concurrently. A read failure names the file and says how to recover.
+- That function is also the one place a writer is built, so "every observation is zstd" is structural rather than a habit.
+
+**Fixes**
+
+- A project that shrank printed `+-18.9MB` in its header: the sign was stripped and then hardcoded.
+- Carrying signals forward re-added the `merge_complete` and `pull_request` rows the gate appends every run, so a worktree line printed each of them twice.
+- A container the daemon gives no name rendered as an empty `()` in the list of what holds an image.
+- `scripts/check.sh` could not pass: its destructive-shortcut guard matched the comments in `render.rs` and `filter.rs` that explain the ban in the words it bans, and it required ripgrep, which is not a dependency of this repo. It now uses `grep`, skips comment-only lines, and is checked against both a raw `remove_dir_all` and a verdict string.
+- The fixture silently lost its dangling-image case on a daemon using the containerd image store, where moving a tag drops the old record instead of leaving it untagged. It builds an untagged image directly, and keeps one rather than a growing pile.
+
 ## v0.3.0
 
 Watching instead of asking, and an incremental observation that is actually incremental.
