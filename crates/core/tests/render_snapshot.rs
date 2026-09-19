@@ -22,6 +22,7 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         bytes,
         mtime_max: 0,
         ecosystem: None,
+        hardlinked: false,
         local_bytes: 0,
         track: None,
         growth_bytes: growth,

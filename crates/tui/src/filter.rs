@@ -145,6 +145,7 @@ pub fn type_passes(f: &Filter, project: &slop_livin_core::report::ProjectRow) ->
                 bytes: 0,
                 mtime_max: 0,
                 ecosystem: None,
+                hardlinked: false,
                 local_bytes: 0,
                 track: None,
                 growth_bytes: None,

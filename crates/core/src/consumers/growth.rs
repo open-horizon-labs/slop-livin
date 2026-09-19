@@ -25,7 +25,8 @@ impl Consumer for GrowthConsumer {
         let mut d: Draft = (**draft).clone();
         // Roll child totals up the directory chain first, so the store
         // records (and measures growth on) aggregated directory sizes.
-        crate::report::aggregate_dir_totals(&mut d.dirs);
+        let roots = crate::report::artifact_roots(&d.projects);
+        crate::report::aggregate_dir_totals(&mut d.dirs, &roots);
         if let Some(dir) = &ctx.store_dir {
             let volume_id = std::fs::metadata(&ctx.root)
                 .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
@@ -37,6 +38,8 @@ impl Consumer for GrowthConsumer {
                 .and_then(crate::growth::parse_duration_secs)
                 .or_else(|| crate::growth::parse_duration_secs(&config.since))
                 .unwrap_or(24 * 3600);
+            let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+            let t = std::time::Instant::now();
             if ctx.observe {
                 crate::growth::observe_and_annotate(
                     dir,
@@ -46,6 +49,10 @@ impl Consumer for GrowthConsumer {
                     config.retention_days,
                     since_secs,
                 )?;
+                if trace {
+                    eprintln!("[trace] growth: artifacts store: {:?}", t.elapsed());
+                }
+                let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_dirs(
                     dir,
                     volume_id,
@@ -54,6 +61,14 @@ impl Consumer for GrowthConsumer {
                     config.retention_days,
                     since_secs,
                 )?;
+                if trace {
+                    eprintln!(
+                        "[trace] growth: dirs store ({} rows): {:?}",
+                        d.dirs.len(),
+                        t.elapsed()
+                    );
+                }
+                let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_files(
                     dir,
                     volume_id,
@@ -62,6 +77,13 @@ impl Consumer for GrowthConsumer {
                     config.retention_days,
                     since_secs,
                 )?;
+                if trace {
+                    eprintln!(
+                        "[trace] growth: files store ({} rows): {:?}",
+                        d.files.len(),
+                        t.elapsed()
+                    );
+                }
             } else {
                 crate::growth::annotate_readonly(
                     dir,
@@ -94,6 +116,10 @@ impl Consumer for GrowthConsumer {
                 ctx.observed_at,
             ));
         }
+        // Interior rows of folded artifacts live in the store only: the
+        // report shows an artifact as one unit.
+        d.dirs
+            .retain(|row| !crate::report::dir_inside_artifact(row, &roots));
         if ctx.include_dirs {
             let mut by_dir: HashMap<String, Vec<_>> = HashMap::new();
             for row in std::mem::take(&mut d.dirs) {

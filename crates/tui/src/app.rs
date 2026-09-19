@@ -258,8 +258,35 @@ impl App {
     /// derived from `report` on demand, so nothing else needs rebuilding;
     /// the selection is clamped by `rows()` consumers.
     pub fn replace_report(&mut self, report: Report) {
+        // A background observation must not move the cursor: remember
+        // which row it is on and put it back on the same row, wherever
+        // the new report sorts it.
+        let anchor = self.selected_row_key();
         self.report = report;
-        self.selected = 0;
+        self.restore_selection(anchor);
+    }
+
+    /// Identity of the selected row: its unit path when it has one
+    /// (stable across re-sorts), otherwise its label.
+    fn selected_row_key(&self) -> Option<String> {
+        self.rows()
+            .into_iter()
+            .nth(self.selected)
+            .map(|r| r.unit.map(|u| u.0).unwrap_or(r.label))
+    }
+
+    fn restore_selection(&mut self, key: Option<String>) {
+        let rows = self.rows();
+        let found = key.and_then(|k| {
+            rows.iter().position(|r| {
+                r.unit
+                    .as_ref()
+                    .map(|u| u.0.clone())
+                    .unwrap_or_else(|| r.label.clone())
+                    == k
+            })
+        });
+        self.selected = found.unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
     }
 
     /// Rows for the current view, honoring the active filter and, for
@@ -980,6 +1007,7 @@ mod tests {
                             bytes: 200 * 1024 * 1024,
                             mtime_max: 0,
                             ecosystem: None,
+                            hardlinked: false,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(150 * 1024 * 1024),
@@ -999,6 +1027,7 @@ mod tests {
                             bytes: 10 * 1024 * 1024,
                             mtime_max: 0,
                             ecosystem: None,
+                            hardlinked: false,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(1024),

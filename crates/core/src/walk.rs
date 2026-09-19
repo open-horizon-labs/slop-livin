@@ -312,6 +312,11 @@ struct SizeGroup {
     root_path: PathBuf,
     kind: ArtifactKind,
     worktree: Option<String>,
+    /// The owning worktree's root, when known: interior directories of
+    /// the folded unit then get their own rollup rows in the store (never
+    /// in the report), so a later change deep inside re-sizes one
+    /// directory instead of the whole tree.
+    worktree_root: Option<PathBuf>,
     total: AtomicU64,
     /// Per-row hardlink dedup (see `ArtifactRow::local_bytes`): only
     /// inodes with nlink > 1 are recorded, so the set stays tiny.
@@ -341,18 +346,27 @@ type LocalAcc = (u64, HashSet<(u64, u64)>);
 /// so far, and whether a walk is running. Relaxed atomics; a few counters
 /// per directory cost nothing next to the stat calls.
 pub mod progress {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
     pub static DIRS: AtomicU64 = AtomicU64::new(0);
     pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+    /// Walks in flight. An observation re-sizes artifacts with their own
+    /// nested walks; only the outermost one owns the counters, or a
+    /// nested walk resets them mid-observation and the reading jumps
+    /// backwards (and, run repeatedly, past the total).
+    static DEPTH: AtomicUsize = AtomicUsize::new(0);
 
     pub fn start() {
-        BYTES.store(0, Ordering::Relaxed);
-        DIRS.store(0, Ordering::Relaxed);
-        ACTIVE.store(true, Ordering::Relaxed);
+        if DEPTH.fetch_add(1, Ordering::SeqCst) == 0 {
+            BYTES.store(0, Ordering::Relaxed);
+            DIRS.store(0, Ordering::Relaxed);
+            ACTIVE.store(true, Ordering::Relaxed);
+        }
     }
     pub fn finish() {
-        ACTIVE.store(false, Ordering::Relaxed);
+        if DEPTH.fetch_sub(1, Ordering::SeqCst) == 1 {
+            ACTIVE.store(false, Ordering::Relaxed);
+        }
     }
     /// `(bytes, dirs, active)` right now.
     pub fn snapshot() -> (u64, u64, bool) {
@@ -476,6 +490,9 @@ fn attribute_parallel_inner(
 
     for (worktree_id, bytes) in source_bytes {
         let local_bytes = source_local.get(&worktree_id).map(|e| e.0).unwrap_or(bytes);
+        let source_hardlinked = source_local
+            .get(&worktree_id)
+            .is_some_and(|e| !e.1.is_empty());
         if bytes == 0 {
             continue;
         }
@@ -493,6 +510,7 @@ fn attribute_parallel_inner(
                 bytes,
                 mtime_max: 0,
                 ecosystem: None,
+                hardlinked: source_hardlinked,
                 local_bytes,
                 track: None,
                 growth_bytes: None,
@@ -602,6 +620,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             let name = name.to_string_lossy();
             if let Some(kind) = classify_at(&path, &name) {
                 let worktree = nearest_worktree(known, &child_path).map(str::to_string);
+                let worktree_root = worktree
+                    .as_deref()
+                    .and_then(|id| worktree_root_path(known, id))
+                    .map(Path::to_path_buf);
                 if let (Some(row), Some(wt)) = (shared.carry.get(&child_path), worktree.as_ref()) {
                     // Nothing under this artifact changed since its row
                     // was stored: take the row, skip the tree.
@@ -623,6 +645,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                     root_path: child_path.clone(),
                     kind,
                     worktree,
+                    worktree_root,
                     total: AtomicU64::new(0),
                     local_total: AtomicU64::new(0),
                     local_seen: Mutex::new(HashSet::new()),
@@ -783,12 +806,20 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         finish_size_job(group, shared);
         return;
     };
+    // This directory's own rollup (store depth inside the folded unit).
+    let mut own_allocated: u64 = 0;
+    let mut file_count: u32 = 0;
+    let mut dir_count: u32 = 0;
+    let mut symlink_count: u32 = 0;
+    let mut dir_mtime_max: i64 = fs::symlink_metadata(&path).map(|m| m.mtime()).unwrap_or(0);
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
+            symlink_count += 1;
             continue;
         }
         if ft.is_dir() {
+            dir_count += 1;
             group.remaining.fetch_add(1, Ordering::SeqCst);
             pool.push(AttrJob::Size {
                 path: entry.path(),
@@ -801,6 +832,9 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
+            file_count += 1;
+            own_allocated += allocated_bytes(&meta);
+            dir_mtime_max = dir_mtime_max.max(meta.mtime());
             let key = (meta.dev(), meta.ino());
             group
                 .mtime_max
@@ -824,6 +858,27 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             }
         }
     }
+    if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
+        let rel_path = rel_path_string(root, &path);
+        let parent_rel_path = parent_rel_path_of(&rel_path);
+        shared.dirs.lock().unwrap().insert(
+            (worktree_id.clone(), rel_path.clone()),
+            DirRollup {
+                worktree_id: worktree_id.clone(),
+                track: None,
+                rel_path,
+                parent_rel_path,
+                allocated_total: own_allocated,
+                own_allocated,
+                file_count,
+                entry_count: file_count + dir_count + symlink_count,
+                symlink_count,
+                mod_time_min: (dir_mtime_max / 60) as i32,
+                complete: true,
+                growth_bytes: None,
+            },
+        );
+    }
     finish_size_job(group, shared);
 }
 
@@ -846,6 +901,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     bytes,
                     mtime_max: group.mtime_max.load(Ordering::Acquire),
                     ecosystem: None,
+                    hardlinked: !group.local_seen.lock().unwrap().is_empty(),
                     local_bytes: group.local_total.load(Ordering::Acquire),
                     track: None,
                     growth_bytes: None,
@@ -949,6 +1005,17 @@ pub fn attribute_one_worktree(
 /// every other artifact/Source row in the worktree carries forward with
 /// its previously observed bytes untouched.
 pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -> ArtifactRow {
+    resize_artifact_with_dirs(root_path, kind, observed_at, None).0
+}
+
+/// `resize_artifact` that also returns the unit's interior directory
+/// rollups (relative to `worktree`), for the store.
+pub fn resize_artifact_with_dirs(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    worktree: Option<(&str, &Path)>,
+) -> (ArtifactRow, Vec<DirRollup>) {
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
@@ -968,10 +1035,14 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
         large_file_min_bytes: u64::MAX,
         carry: HashMap::new(),
     });
+    let wt_id = worktree
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_else(|| "resize".to_string());
     let group = Arc::new(SizeGroup {
         root_path: root_path.to_path_buf(),
         kind: kind.clone(),
-        worktree: Some("resize".to_string()),
+        worktree: Some(wt_id.clone()),
+        worktree_root: worktree.map(|(_, r)| r.to_path_buf()),
         total: AtomicU64::new(0),
         local_total: AtomicU64::new(0),
         local_seen: Mutex::new(HashSet::new()),
@@ -990,11 +1061,12 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
         AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
     });
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
+    let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
     let mut rows = shared
         .artifacts_by_worktree
         .into_inner()
         .unwrap()
-        .remove("resize")
+        .remove(&wt_id)
         .unwrap_or_default();
     let mut row = rows.pop().unwrap_or(ArtifactRow {
         kind: kind.clone(),
@@ -1002,6 +1074,7 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
         bytes: 0,
         mtime_max: 0,
         ecosystem: None,
+        hardlinked: false,
         local_bytes: 0,
         track: None,
         growth_bytes: None,
@@ -1021,7 +1094,7 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
     // `local_bytes` (the full walk charges shared inodes to whichever row
     // saw them first; the incremental merge applies the local delta).
     row.local_bytes = row.bytes.max(row.local_bytes);
-    row
+    (row, dirs)
 }
 
 /// Checkouts at `dir` and its immediate children only: what a changed

@@ -408,7 +408,7 @@ pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Opti
 /// mismatch forces one full walk so rows that no longer classify leave
 /// and rows that now do arrive, instead of lingering until something
 /// happens to touch their directory.
-pub const RULES_VERSION: u32 = 2;
+pub const RULES_VERSION: u32 = 3;
 
 /// Marker-gated classification: `name` inside `parent` is an artifact of
 /// the kind an ecosystem declares, if that ecosystem's marker sits in

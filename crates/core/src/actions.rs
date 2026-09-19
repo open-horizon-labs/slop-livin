@@ -369,6 +369,7 @@ fn unit_from_worktree(project: &ProjectRow, wt: &WorktreeRow) -> PlanUnit {
         bytes,
         mtime_max: 0,
         ecosystem: None,
+        hardlinked: false,
         local_bytes: bytes,
         track: None,
         growth_bytes: wt
@@ -414,6 +415,7 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
         bytes: d.allocated_total,
         mtime_max: 0,
         ecosystem: None,
+        hardlinked: false,
         local_bytes: d.allocated_total,
         track: d.track,
         growth_bytes: None,

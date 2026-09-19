@@ -113,10 +113,14 @@ fn header_line(app: &App, width: usize) -> String {
         // the percent is a floor, never a promise).
         let (bytes, dirs, _) = slop_livin_core::walk::progress::snapshot();
         let total = app.report.reconciliation.walked_total;
-        let pct = if total > 0 {
-            format!(" · {}%", (bytes * 100 / total).min(99))
-        } else {
-            String::new()
+        // The percentage compares against the last observation's total,
+        // so it is an estimate; an incremental walk visits a fraction and
+        // a grown tree can exceed it. Show it only while it means
+        // something.
+        let pct = match total {
+            0 => String::new(),
+            t if bytes <= t => format!(" · {}%", bytes * 100 / t),
+            _ => String::new(),
         };
         format!("observing… {} · {dirs} dirs{pct}", human_bytes(bytes))
     } else {

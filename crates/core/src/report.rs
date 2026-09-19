@@ -142,6 +142,10 @@ pub fn summarize(projects: &[ProjectRow]) -> Summary {
     s
 }
 
+fn yes() -> bool {
+    true
+}
+
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }
@@ -160,6 +164,17 @@ pub struct ArtifactRow {
     /// `js` for `node_modules`), see `ecosystem::artifact_ecosystem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecosystem: Option<String>,
+    /// Whether this unit contains hardlinked files (`nlink > 1`). A unit
+    /// without them can be re-sized from its stored per-directory rows,
+    /// because summing those rows counts every byte exactly once. A unit
+    /// with them cannot: the same inode appears in several directories
+    /// and the unit's own figure counts it once (Cargo's `target/`
+    /// hardlinks almost every artifact, and summing its directory rows
+    /// overcounted a 16 GB tree by 4.4 GB). `true` is the safe answer
+    /// when nobody has measured, so a store written before this field
+    /// existed re-sizes whole until its next full walk.
+    #[serde(default = "yes")]
+    pub hardlinked: bool,
     /// Bytes with hardlinks deduplicated *within this row only* (a
     /// deterministic per-row figure), unlike `bytes`, where a hardlinked
     /// inode is charged to whichever row the full walk saw first. The
@@ -705,6 +720,44 @@ fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
     ))
 }
 
+/// (worktree_id, rel_path) of every folded artifact row, for
+/// `aggregate_dir_totals` and for keeping interior rows out of the report.
+pub(crate) fn artifact_roots(
+    projects: &[ProjectRow],
+) -> std::collections::HashSet<(String, String)> {
+    let mut out = std::collections::HashSet::new();
+    for p in projects {
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if a.kind == ArtifactKind::Source || a.source.tool.starts_with("docker") {
+                    continue;
+                }
+                if let Ok(rel) = a.path.strip_prefix(&wt.path) {
+                    out.insert((wt.worktree_id.clone(), rel.display().to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a directory row lies at or under one of `roots` in its worktree.
+pub(crate) fn dir_inside_artifact(
+    d: &DirRollup,
+    roots: &std::collections::HashSet<(String, String)>,
+) -> bool {
+    let mut rel = d.rel_path.as_str();
+    loop {
+        if roots.contains(&(d.worktree_id.clone(), rel.to_string())) {
+            return true;
+        }
+        match rel.rfind('/') {
+            Some(i) => rel = &rel[..i],
+            None => return false,
+        }
+    }
+}
+
 pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
     std::fs::create_dir_all(store_dir)?;
     let path = last_report_path(store_dir, &report.root);
@@ -733,7 +786,14 @@ pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
 /// directly beneath a directory -- those stay one `ArtifactRow`, never
 /// decomposed into `DirRollup`s, per the folding contract this issue
 /// requires.
-pub(crate) fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
+/// Rolls each directory's own bytes up into its ancestors' totals.
+/// `artifact_roots` (worktree_id, rel_path) are folded units: their
+/// interior rows roll up into the unit's root row, and the root row rolls
+/// no further, so a Source directory's total never absorbs an artifact.
+pub(crate) fn aggregate_dir_totals(
+    dirs: &mut [DirRollup],
+    artifact_roots: &std::collections::HashSet<(String, String)>,
+) {
     let mut totals: std::collections::HashMap<(String, String), u64> =
         std::collections::HashMap::new();
     for d in dirs.iter() {
@@ -743,6 +803,9 @@ pub(crate) fn aggregate_dir_totals(dirs: &mut [DirRollup]) {
     order.sort_by_key(|&i| std::cmp::Reverse(dirs[i].rel_path.matches('/').count()));
     for &i in &order {
         let key = (dirs[i].worktree_id.clone(), dirs[i].rel_path.clone());
+        if artifact_roots.contains(&key) {
+            continue;
+        }
         let value = *totals.get(&key).unwrap_or(&0);
         if let Some(parent_rel) = dirs[i].parent_rel_path.clone() {
             let pkey = (dirs[i].worktree_id.clone(), parent_rel);
@@ -1163,6 +1226,7 @@ pub(crate) fn join_docker_facts(
                         bytes: candidate.unique_bytes,
                         mtime_max: 0,
                         ecosystem: None,
+                        hardlinked: false,
                         local_bytes: 0,
                         track: None,
                         growth_bytes: None,

@@ -219,6 +219,148 @@ fn touching_one_artifact_resizes_only_that_row_and_matches_a_full_walk() {
 }
 
 #[test]
+fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a_full_walk() {
+    disable_too_soon_floor();
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+    // Deep structure inside node_modules before the first (full) walk.
+    let deep = fx.node_modules.join("pkg/lib/sub");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("old.bin"), vec![b'o'; 8192]).unwrap();
+    let doomed = fx.node_modules.join("pkg/doomed");
+    fs::create_dir_all(&doomed).unwrap();
+    fs::write(doomed.join("x.bin"), vec![b'x'; 16384]).unwrap();
+
+    let first = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("first (full) report");
+    assert!(
+        first
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=full"))
+    );
+    // Interior rows are in the store, not in the report.
+    let with_dirs = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        false,
+        true,
+        false,
+        true,
+        &no_op_source(),
+    )
+    .expect("dirs report");
+    let wt_id = with_dirs
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .find(|w| w.path == fx.checkout)
+        .unwrap()
+        .worktree_id
+        .clone();
+    assert!(
+        with_dirs.dirs_by_worktree.as_ref().unwrap()[&wt_id]
+            .iter()
+            .all(|d| !d.rel_path.starts_with("node_modules")),
+        "no interior row of a folded artifact reaches the report"
+    );
+
+    // Three kinds of change, three levels down: a write, a new subtree,
+    // a deleted subtree.
+    fs::write(deep.join("new.bin"), vec![b'n'; 40960]).unwrap();
+    let fresh = fx.node_modules.join("pkg/lib/fresh/deeper");
+    fs::create_dir_all(&fresh).unwrap();
+    fs::write(fresh.join("f.bin"), vec![b'f'; 12288]).unwrap();
+    fs::remove_dir_all(&doomed).unwrap();
+
+    // FSEvents names the directories whose listings changed (and, by our
+    // rule, their parents).
+    let source = CannedSource(incremental_plan(
+        vec![
+            deep.clone(),
+            fx.node_modules.join("pkg/lib"),
+            fx.node_modules.join("pkg/lib/fresh"),
+            fresh.clone(),
+            fx.node_modules.join("pkg"),
+        ],
+        2,
+    ));
+    let second = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    )
+    .expect("incremental report");
+    assert!(
+        second
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        second.notes
+    );
+
+    let full = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        false,
+        false,
+        false,
+        true,
+        &no_op_source(),
+    )
+    .expect("forced full report");
+    let bytes_of = |r: &slop_livin_core::report::Report, path: &std::path::Path| {
+        r.projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .flat_map(|w| w.artifacts.iter())
+            .find(|a| a.path == path)
+            .map(|a| a.bytes)
+            .expect("row")
+    };
+    assert_eq!(
+        bytes_of(&second, &fx.node_modules),
+        bytes_of(&full, &fx.node_modules),
+        "interior re-size must agree with a full walk (write + new subtree - deleted subtree)"
+    );
+    assert_eq!(
+        bytes_of(&second, &fx.target_dir),
+        fx.target_bytes,
+        "untouched artifact carries forward"
+    );
+    assert_eq!(
+        second.reconciliation.attributed + second.reconciliation.unowned,
+        second.reconciliation.walked_total
+    );
+}
+
+#[test]
 fn new_nested_repo_is_discovered_incrementally() {
     disable_too_soon_floor();
     let tmp = tempfile::tempdir().expect("tmp root");

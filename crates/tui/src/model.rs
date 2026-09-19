@@ -1103,6 +1103,7 @@ mod tests {
             bytes,
             mtime_max: 0,
             ecosystem: None,
+            hardlinked: false,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
