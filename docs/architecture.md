@@ -1,0 +1,184 @@
+# Architecture
+
+Swamp measures a development tree, attaches project context, and keeps observations for later comparison. Repeated use depends on three choices: retain enough state to reuse unchanged measurements, keep the history smaller than repeated full snapshots, and model the units a developer actually works with.
+
+The CLI, TUI, and MCP server call the same report pipeline in `swamp-core`. This guide describes the implementation, including where work is still proportional to the full stored dataset.
+
+## The data model
+
+A report groups storage along these relationships:
+
+| Entity | Identity and purpose |
+|---|---|
+| Project | Checkouts grouped by normalized `origin` remote; repositories without a remote fall back to their Git common-directory identity. |
+| Checkout or linked worktree | A working directory and its Git context: branch, activity, tracking state, PR and merge facts. Worktree IDs are derived from paths. |
+| Artifact | A classified unit such as build output, dependencies, cache, or Git metadata, attributed to the nearest containing worktree. |
+| Directory or large file | Detail used for updates and growth inspection. Artifact interior directories are retained in storage but hidden behind the artifact row in the report. |
+| Docker object | An image, volume, or build-cache record joined through explicit evidence, or reported as unowned. |
+| Unowned row | Measured storage for which no project attribution was established, with a reason. |
+
+Project grouping is implemented in [projects.rs](../crates/core/src/consumers/projects.rs). A linked worktree resolves its shared Git directory; a submodule resolves its own repository. Different clones with the same normalized remote share a project in the report. This is URL normalization, not server-side alias resolution: changing a remote URL or moving a worktree can change identity and split its history.
+
+### Classification supplies context
+
+The [ecosystem table](../crates/core/src/ecosystem.rs) associates markers such as `Cargo.toml` and `package.json` with artifact names. Ambiguous names such as `build`, `dist`, and `vendor` require a matching marker in their parent directory. Some names are recognized without a marker. A valid `CACHEDIR.TAG` also identifies a cache.
+
+Classification supplies an artifact kind and ecosystem. It does not prove that everything inside a build directory is reproducible. The [harvest utility](../crates/harvest/src/main.rs) compares the table with vendored ignore and language lists; it reports candidates without editing the table. An ignore rule alone says nothing about whether the contents can be recreated.
+
+Files outside classified artifacts are split into tracked, ignored, and untracked remainder buckets. The [ignore lens](../crates/core/src/ignore.rs) uses Git's index and exclude rules through gitoxide. Byte totals are apportioned using directory observations, with corrections for individually recorded large files. This preserves the measured total but is not an exhaustive per-file accounting of Git status.
+
+### Attribution and recovery are separate
+
+An image's source label or Compose metadata can associate it with a project even though it is stored by Docker. Similar names alone do not establish ownership. An unmatched object stays unowned.
+
+Filesystem reconciliation separates attributed and unowned bytes. Docker has separate attributed and unowned totals, because daemon storage and shared layers do not map directly to the walked tree. The optional `--verify-du` result is an independent comparison; it does not establish that an entire volume, snapshots, or inaccessible paths have been accounted for.
+
+## Observation pipeline
+
+Each consumer subscribes to typed events and returns follow-on events. Registration happens in [EventBus::with_builtins](../crates/core/src/bus/mod.rs) before the run begins. Large shared event payloads use `Arc`.
+
+```mermaid
+flowchart TD
+    Request[Report request] --> Walk[Discover and measure]
+    Walk --> Projects[Group projects and worktrees]
+    Projects --> Signals[Git activity]
+    Signals --> GitHub[Cached or refreshed GitHub facts]
+    Projects --> Ecosystems[Ecosystem markers]
+    Projects --> Docker[Docker facts and attribution]
+    Projects --> Gate[Assemble project rows]
+    Signals --> Gate
+    GitHub --> Gate
+    Ecosystems --> Gate
+    Docker --> Gate
+    Gate --> Growth[Record or read growth history]
+    Growth --> Tracking[Git tracking annotations]
+    Growth --> History[Load time series]
+    Tracking --> Report[Assemble Report]
+    History --> Report
+    Report --> Cache[Cache the report]
+    Report --> Interfaces[CLI / TUI / MCP]
+```
+
+The assembly gate waits for local signals, GitHub results, ecosystem tags, and Docker results. Unavailable enrichment produces unknown facts or notes so the rest of the report can still be built. After growth annotation, tracking and time-series consumers run as sibling subscribers; the final assembler waits for both.
+
+The bus uses a Tokio current-thread runtime and `join_all` for subscribers of one event. Follow-on events are dispatched depth-first in registration order. An `async` consumer is not automatically nonblocking: several call synchronous filesystem and subprocess code. Filesystem traversal and some enrichment work have their own concurrency. The bus's main benefit is explicit dependencies and separate stages, not a guarantee of parallel execution.
+
+See [ADR 001](ADRs/001-event-bus-report-pipeline.md) for the decision and [consumers](../crates/core/src/consumers/) for the stages.
+
+## Incremental observation
+
+### Establish a baseline
+
+The initial observation discovers repositories and measures allocated filesystem bytes. The [walker](../crates/core/src/walk.rs) uses a worker pool, stays on the root's device, avoids following symlinks, and deduplicates hardlinked files by device and inode.
+
+Folding an artifact means grouping its bytes under one report row. The walker still traverses that directory to measure it. During the walk it also records interior directory rows for later updates.
+
+### Ask macOS where to look next
+
+Subsequent observations use the stored FSEvents ID and device to request changes under the root. Events identify areas to remeasure; they do not supply byte deltas or the process that caused a change.
+
+An observation with usable event history reconstructs the previous topology and attribution, applies changes, and carries untouched rows forward. The work depends on the change:
+
+| Change | Work performed |
+|---|---|
+| Existing remainder directory changes | Re-list that directory and update its stored totals when the stored structure permits it. |
+| Directory inside an artifact changes | Re-list affected interior directories and re-aggregate the artifact when interior rows exist and the unit has no hardlinks. |
+| Artifact contains hardlinks, or interior detail is unavailable | Resize the whole artifact. |
+| New or structurally changed subtree | Discover repositories or artifacts and perform the broader walk needed to rebuild attribution. |
+| Event history is incomplete or cannot be trusted | Perform a full walk and report the reason. |
+
+Hardlinks explain why a small change inside a Cargo `target/` can still require a large traversal. Summing independently measured directory rows could charge one inode more than once. Artifact rows retain both their globally attributed bytes and a local measurement; the incremental code applies local differences to the attributed total.
+
+The fallback reasons include a missing or future event ID, a device mismatch, dropped or inconclusive events, too many changed directories, and changed classification rules. A replay too soon after the previous observation also falls back, because the persisted event log can lag writes. `--full` explicitly forces a full walk.
+
+Apple documents event coalescing and rescan requirements in its [FSEvents flags reference](https://developer.apple.com/documentation/coreservices/1455361-fseventstreameventflags/kfseventstreameventflagmustscansubdirs). Swamp's handling is in [fs_events.rs](../crates/core/src/fs_events.rs) and [growth.rs](../crates/core/src/growth.rs). The [incremental tests](../crates/core/tests/fsevents_incremental.rs) compare representative changes with full walks, including nested worktrees and shared hardlinks.
+
+### Keep the interface responsive
+
+The TUI opens a cached report when one exists, then observes on a background thread. While open, it receives live FSEvents and waits for 400 ms of quiet before observing the affected directories. Live events bypass the replay-lag floor. The first run, without a cached report, must wait for its initial observation.
+
+The optional LaunchAgent starts `swamp observe` at an interval and lets it exit. It keeps observations accumulating when no UI is open. It is not a permanent swamp daemon.
+
+## History storage
+
+### Current values and reverse deltas
+
+The report history lives under `~/.local/share/swamp/<volume-id>/`, or the directory selected by `SWAMP_DIR`.
+
+| Stored data | Purpose |
+|---|---|
+| Artifact current rows and reverse deltas | Bytes, presence, previous values, and regrowth counts |
+| Directory current rows and reverse deltas | Own and rolled-up bytes, counts, completeness, and modification time |
+| Large-file current rows and reverse deltas | Allocated bytes and modification time for files above the configured threshold |
+| Topology and FSEvents state | Worktree locations and the event cursor needed to reuse observations |
+| GitHub enrichment | Cached remote facts, separate from filesystem measurements |
+| Last report JSON | Data the UI can display before the next observation finishes |
+
+The implementation is in [growth.rs](../crates/core/src/growth.rs); the older `store.rs` supports the separate `scan` command and is not the report-history implementation.
+
+A reverse delta stores a changed row's previous value. As an illustrative sequence:
+
+| Observation | Current size | Previous value saved |
+|---|---|---|
+| First observation | 1 GB | None; no earlier measurement exists |
+| Artifact grows | 3 GB | 1 GB and its observation time |
+| Artifact shrinks | 2 GB | 3 GB and its observation time |
+| Size stays the same | 2 GB | No new byte-history value |
+
+The current rows and retained previous values form a time series. Growth is today's measured size minus the historical value nearest the requested baseline time. It is a comparison of observations, not an exact measurement at every intervening instant.
+
+Artifact disappearance produces a tombstone; a later reappearance increments a regrowth count. That records presence transitions. It cannot establish that a particular tool or cleanup caused them.
+
+### What keeps the store smaller
+
+Artifact histories use a key containing project ID, worktree ID, kind, and worktree-relative path. Directory rollups avoid indexing every small file separately. Files at least 1 MiB get individual rows by default; the threshold is configurable. Directory and file modification times are stored as 32-bit minute values.
+
+Parquet groups fields into columns and zstd compresses the stored batches. A size/presence change saves the old artifact value; an unchanged observation need not add a delta. Metadata changes can still cause directory or file writes. When a current dataset changes, that current Parquet file is rewritten: this is not an in-place row-update store.
+
+History lookup builds an index from retained rows once for growth annotation, rather than reloading the files for every artifact. Delta compaction starts above 20 files and drops records outside the retention window. Default retention is 30 days; physical pruning happens during maintenance, not at a precise wall-clock deadline.
+
+The history writer closes each temporary Parquet file before renaming it into place, so ordinary readers do not see an unfinished footer. This is per-file replacement, not a transaction across all history files or a guarantee against every crash or concurrent-writer failure.
+
+### What history can answer
+
+The UI and growth-oriented MCP responses expose the available history window. A newly discovered artifact has no earlier baseline. Unobserved periods are not evidence of zero activity, and a file that grows and shrinks between observations may leave no net change.
+
+Retained size history helps locate recurring growth and compare periods without traversing the filesystem separately for each baseline. It is not a backup or a forensic log of every write.
+
+## Enrichment and freshness
+
+Enrichment gives measured bytes context for a decision. Its freshness differs by source:
+
+| Source | Collection and reuse |
+|---|---|
+| Local Git | Activity, branch, dirty status, unpushed count, and locks. Unchanged worktrees can reuse previous signals with ages advanced. |
+| Ecosystems | Markers and the shared classification table attach project types and artifact provenance. |
+| GitHub | `gh` queries coalesce branches per repository. Cache validity includes the worktree tip SHA and a six-hour TTL. |
+| Docker | Daemon facts are cached for five minutes; an enrichment run requests fresh facts. |
+| Git tracking | gitoxide reads the index and ignore rules; the exclude stack is reused for path queries within a checkout. |
+
+Plain `report` reads cached GitHub information. `observe` and `report --enrich` allow refreshes, subject to the cache policy and query budgets. Missing credentials, unknown facts, and query failures remain visible. Docker may still be queried by a normal report when its cache expires.
+
+Merge status is combined with clean/unpushed terms in `merge-complete`; it is evidence a user can inspect, not a permission to delete. The current `tip_reachable` term is derived from the merged result rather than a separate reachability proof.
+
+## Actions and extension points
+
+A report supplies the context for a plan. CLI/MCP plans carry selected units, observations, recovery information, and warnings. Approval supplies a one-shot grant or execution uses a matching standing grant. Execution records outcomes and recovery locations in a ledger. TUI confirmation creates its own short-lived plan and grant and uses core execution primitives.
+
+These action paths share concepts and lower-level code but do not have identical validation. Do not infer a universal guarantee from a check present in only one path. Docker removal is delegated to the daemon; filesystem moves go to Trash. An MCP grant-writing tool is intentionally absent, but a shell-capable agent still has the operating-system permissions of its account.
+
+To add a fact source, implement a consumer and register it before dispatch. If it introduces a new event payload or report field, also update the event definitions, assembly gate or final assembler, serialization, and relevant interfaces. Registration alone is sufficient only when the existing contracts already express the new fact.
+
+To add artifact recognition, update the ecosystem rules and fixtures. Classification changes must invalidate old observations through the rules version. An upstream ignore entry is research input; inspect what a directory can contain before classifying it.
+
+## Limits of the current implementation
+
+- Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.
+- Worktree identity is path-derived. Relative artifact paths do not make history portable across arbitrary moves or renamed remotes.
+- Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI/MCP `since` values for window comparisons.
+- The store is partitioned by volume; topology and current-row replacement are not independently namespaced for every overlapping root. Prefer one common development root per store. Use separate stores when independently observing different roots on the same volume.
+- Filesystem events may require a full scan. Hardlinks can make an artifact update much more expensive than the changed directory alone suggests.
+- The report covers what swamp measured under the requested root. It is not a complete accounting of volume free space, snapshots, backups, or Docker's physical storage.
+- GitHub and Docker context can lag local measurements. Check observation times and notes before acting.
+
+The [accuracy report](accuracy.md) records the source checks behind these descriptions. Historical timings in the [changelog](../CHANGELOG.md) are individual observations; representative benchmarks are still needed for latency and storage-size claims.

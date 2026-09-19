@@ -1,5 +1,11 @@
 # Dissent report: Epic #1 architecture
 
+Historical record from Epic #1 (2026-09-17). The project was reframed on
+2026-09-18. Statements below describe decisions and expectations at that time,
+including features that were deferred, replaced, or later implemented. For
+current behavior, use the [usage](usage.md) and [architecture](architecture.md)
+guides. These notes are not current guarantees or test results.
+
 **Decision under review:** Build one Rust core around entities, facts, grants,
 and a ledger, then expose it through CLI JSON and MCP.
 

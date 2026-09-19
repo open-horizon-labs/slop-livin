@@ -1,31 +1,41 @@
-# Design — swamp terminal UI
+# Terminal design
 
-World: **diffstat ledger**. The screen traditions of the audience (git diff --stat, git log --graph, ncdu, k9s, htop) supply every element; nothing is invented for flavor. Mode: Operate.
+The UI presents disk growth as a table that opens into a project tree. Size, signed change, and activity facts stay close to the row they describe. Use [committed frames](crates/tui/tests/frames/) and the [renderer](crates/tui/src/ui.rs) to check the current behavior.
 
-## Grammar
-- **Row = diffstat line.** `name  bytes  Δbytes  ▕bar▏  signals`. The bar is scaled to |growth| within the visible set, drawn with `+` for growth and `-` for shrink (`+++++++---`), never to size. Size is a number; growth is the picture.
-- **Tree = graph rail.** Box-drawing rail (`├─ └─ │`) on the left, one indent level per depth: project → checkout/worktree → artifact → dir. Collapsed nodes show `▸`, expanded `▾`, count of hidden children in dim.
-- **Filter line** at the top, editable with `/`: `growth > 100MB in 7d` (default on open). Grammar: `growth [><] <size> in <duration>`, plus `kind:<k>`, `project:<name>`, `merge-complete`, `idle > <dur>`. Parse errors show inline in red under the line; the previous filter stays applied.
-- **Header** (one line): `root · observed 3m ago · since 7d · 63 projects · 41.6 GB attributed · 194 MB unowned · docker 15.8 GB unowned`.
-- **Footer** (one line): key vocabulary, always visible: `↑↓ move  →/← expand  Enter open/confirm  ⌫ mark delete  / filter  v view  g growth-sort  s size-sort  ? help  q quit`.
-- **Views** (`v` cycles, also `1–5`): projects · tree · kinds · docker · unowned. All render the same Report; nothing is computed only for the screen.
+## Rows and hierarchy
 
-## Color (16-color safe; truecolor is a refinement, never a dependency)
-- Default fg on terminal bg. Growth `+` green, shrink `-` red, unchanged dim. Selected row: reverse video. Marked-for-delete: yellow name + `✗` prefix — the only yellow on screen. Errors and refusals: red text, never a red background. No other color. Signals are dim; a fact that *blocks* deletion (occupied, dirty, unpushed) renders in default weight, not red — it is information, not alarm.
+Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
-## Type & density
-- Monospace is the medium, not a costume. Tabular alignment: numbers right-aligned in fixed columns, human units with one decimal (`1.2 GB`, `+175.5 MB`, `—` when no baseline). Names truncated with `…` in the middle, keeping the tail.
-- Works at 80×24 (bar shrinks to 8 cells, signals drop to a single glyph column) and uses width up to 200 (bar grows, signals spell out).
+The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to visible changes. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
 
-## States
-- Empty filter result: the filter line plus one line `no rows match — Backspace to widen, 0 to clear`; never a blank pane.
-- Observing: header shows `observing… 38%` with the walk's directory count; the previous Report stays on screen (skeleton = last truth, never a spinner over nothing).
-- Refusal at the sink: the row stays, the mark clears, the footer is replaced for 4 s by the cause and next step (`refused: activity changed since plan — press ⌫ again to re-plan`).
-- Delete confirmation: inline, not modal — the marked rows collapse into a one-line summary above the footer: `delete 3 units · 1.9 GB → Trash · Enter confirm · Esc cancel`.
-- Help (`?`): an overlay listing keys and the filter grammar; the only overlay in the product.
+Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
 
-## Motion
-- None decorative. The bar redraws on filter change; the marked-row collapse is instantaneous. Observation progress ticks in the header.
+## Color
 
-## Refuse
-- Sunbursts, block-drawing pie charts, sparklines, colored backgrounds, emoji, ASCII logos, verdict words ("safe", "stale", "unused", "abandoned"), modals for anything but help.
+Growth is red, shrink is green, and secondary information is dim. The selected row uses a dark background (`Color::Indexed(236)`) and bold text. Marked rows use yellow and an `✗` prefix. Refusals use red text. Signed values and bar direction carry information independently of color.
+
+The renderer uses terminal colors and an indexed selection color. Committed frames exercise 80×24 and 200×60 layouts; visual behavior on a particular terminal and palette still needs inspection.
+
+## Navigation and filters
+
+`→` opens or expands; `←` collapses or returns to projects. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
+
+The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. Eight views are available through `v` and `1`–`8`. The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
+
+## Header, progress, and history
+
+The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals. A cached report can appear while an observation runs in the background; the first run needs an observation before it can display data.
+
+Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live FSEvents watch batches changes after 400 ms of quiet. The header can display a history sparkline; body rows use change bars.
+
+## Actions
+
+Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a single inline row with selected paths, sizes, warnings, and destinations. Enter authorizes the action; Esc cancels it.
+
+Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk marking with `A` skips that fallback. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
+
+Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.
+
+## Review
+
+Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.

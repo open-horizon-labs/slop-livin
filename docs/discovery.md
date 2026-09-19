@@ -1,5 +1,11 @@
 # Epic #1 discovery answers (#15)
 
+Historical record from Epic #1 (2026-09-17). The project was reframed on
+2026-09-18. Statements below describe decisions and expectations at that time,
+including features that were deferred, replaced, or later implemented. For
+current behavior, use the [usage](usage.md) and [architecture](architecture.md)
+guides. These notes are not current guarantees or test results.
+
 These are explicit boundaries for the first implementation, not hidden future
 work. Each can become a follow-up when evidence justifies it.
 

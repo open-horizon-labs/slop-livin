@@ -14,68 +14,39 @@ validate:
     - extractors_are_pluggable
 ---
 
-# The report pipeline is consumers on an in-memory event bus
+# ADR 001: Report construction through an in-memory event bus
 
-**Guardrails:** event-bus-pluggable-consumers, extractors-are-pluggable
-**Date:** 2026-09-18
-**Reference:** repo-native-alignment `docs/ADRs/001-event-bus-extraction-pipeline.md`
+Decision date: 2026-09-18. Status: implemented.
 
 ## Context
 
-The restart brief named the repo-native-alignment architecture: extractors per source, async
-enrichers, an event bus with consumers, provenance and confidence on every fact. The pipeline
-that shipped instead was `report_full_mode_with_source`, one function of roughly a thousand
-lines calling discovery, attribution, grouping, git signals, GitHub, Docker, tracking,
-ecosystems, growth, history and assembly in fixed order. Every enrichment added since landed as
-another block in that function.
+Report construction originally placed discovery, attribution, project grouping, Git signals, GitHub, Docker, ecosystems, tracking, history, and assembly in one orchestration function. Each new source of facts added another dependency to that function.
+
+The pipeline needed explicit stage inputs and a common entry point for the CLI, TUI, and MCP server.
 
 ## Decision
 
-Every stage is an independent `Consumer` that declares which `EventKind`s wake it and returns
-follow-on events. The `EventBus` holds the registry and routes; it is the only coupling.
+Each stage implements `Consumer`, declares the `EventKind` values it subscribes to, and emits follow-on events. The event bus owns registration and dispatch. Consumers exchange typed payloads rather than calling one another.
 
-**Static registration, dynamic routing.** `EventBus::with_builtins()` registers every consumer
-before the first event fires. There is no runtime registration and no conditional wiring.
+`EventBus::with_builtins()` registers the consumers before dispatch. The registry is sealed once a run begins. The assembly gate waits for the project, signal, GitHub, ecosystem, and Docker inputs; the final report assembler waits for both tracking annotations and history.
 
-**Runtime.** Consumers are `async fn on_event`, dispatched on a tokio current-thread runtime so
-inherently async work (GitHub, Docker daemon, FSEvents replay) does not block the dispatch loop
-and sync consumers cost nothing. Subscribers of one event run concurrently; follow-on events are
-dispatched depth-first.
+The runtime is Tokio on one thread. Subscribers to an event are polled with `join_all`, and follow-on events are dispatched depth-first in registration order. This permits cooperative concurrency, but synchronous filesystem and subprocess calls inside a consumer still block that runtime thread. Traversal and selected enrichment functions provide their own concurrency.
 
-**Facts flow as events, not as mutation.** A consumer never receives `&mut Report`. It receives
-the facts it subscribed to and emits new facts; the `AssemblyGate` waits for the set it needs and
-emits the assembled rows; the `ReportAssembler` folds the final facts into `Report`.
+See the [architecture guide](../architecture.md#observation-pipeline) for the current event diagram and source links.
 
-## Event flow
+## Extension contract
 
-```
-RootRequested(ctx)
-  → WalkConsumer                → RootObserved(discovered, attribution)        [FSEvents-first]
-    → ProjectsConsumer          → ProjectsGrouped(projects, worktree_paths, remotes)
-      → SignalsConsumer         → SignalsComputed(by_worktree)
-        → GithubConsumer        → GithubEnriched(facts_by_worktree, summary, notes)
-      → EcosystemConsumer       → EcosystemsDetected(by_project)
-      → DockerConsumer          → DockerJoined(rows_by_worktree, unowned, bytes, notes)
-      → AssemblyGate  (waits: Signals, Github, Ecosystems, Docker)
-                                → RowsAssembled(projects, unowned, dirs, files, notes)
-        → GrowthConsumer        → GrowthAnnotated(projects, dirs, files, schedule_line)   [store]
-          → TrackingConsumer    → TrackingAnnotated(projects, dirs)
-            → HistoryConsumer   → HistoryLoaded(series_by_key, total_series, window)
-              → ReportAssembler → ReportAssembled(report)
-                → CacheWriter   (last_report-<hash>.json)
-```
+A new stage needs a consumer implementation and registration. It may also need new event payloads, assembly inputs, report fields, serialization, and interface changes. “One file plus one registration line” applies only when the existing event and report contracts already cover the new fact.
 
-## Adding a consumer
-
-1. Implement `Consumer` in a new file under `crates/core/src/consumers/`.
-2. Register it in `EventBus::with_builtins()`.
-
-Nothing else changes. The audits below fail the build if a consumer imports another, registers
-at runtime, or if `report.rs` calls a stage directly.
+Consumers must not import other consumers or register stages during a run. Report entry points call the bus; they do not invoke pipeline stages directly.
 
 ## Consequences
 
-- `report_full_mode_with_source` becomes `bus::run_report(ctx)`; every existing golden and
-  fixture test must produce a byte-identical `Report` across the change.
-- Stage bodies move, unchanged, from `report.rs` into their consumer files.
-- `tokio` and `async-trait` enter the core crate.
+- Stage dependencies are expressed in event types and subscriptions.
+- The CLI, TUI, and MCP server share report construction.
+- Missing or unavailable enrichment must produce an explicit result so assembly can finish.
+- Intermediate payloads and drafts add allocation and copying; this design does not make report construction constant-cost.
+- The event bus is local to a report run. It is not a durable queue or a daemon.
+- Source audits check selected structural constraints; tests check routing and report behavior. Run them through [the contributor checks](../../CONTRIBUTING.md#checks).
+
+The implemented types and dispatch loop are in [bus/mod.rs](../../crates/core/src/bus/mod.rs), with stages under [consumers](../../crates/core/src/consumers/).

@@ -1,5 +1,11 @@
 # Epic #1 solution-space selection
 
+Historical record from Epic #1 (2026-09-17). The project was reframed on
+2026-09-18. Statements below describe decisions and expectations at that time,
+including features that were deferred, replaced, or later implemented. For
+current behavior, use the [usage](usage.md) and [architecture](architecture.md)
+guides. These notes are not current guarantees or test results.
+
 ## Problem
 
 Developers running many coding agents need an honest, project-aware account of
