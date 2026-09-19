@@ -850,11 +850,13 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
 /// Builds view: every `BuildOutput`/`Cache` row across the whole root,
 /// same kind set as the CLI's `--view builds` (#33).
 pub fn builds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
-    kind_filtered_rows(
+    let mut rows = kind_filtered_rows(
         report,
         &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
         filter,
-    )
+    );
+    append_cargo_breakdowns(report, filter, &mut rows);
+    rows
 }
 
 /// Deps view: every `DependencyTree` row across the whole root, same as
@@ -897,6 +899,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
                 row.mtime_max = a.mtime_max;
+                row.label.push_str(&swamp_core::render::allocation_note(a));
                 if let Some(t) = &a.ecosystem {
                     row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
                     row.ecosystems = vec![t.clone()];
@@ -906,6 +909,117 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
         }
     }
     out
+}
+
+/// Adds a compact, non-actionable Cargo breakdown below build rows.  The
+/// common build row remains the accounting/authorization boundary; these
+/// aggregate children explain the logical storage without turning the TUI
+/// into a second cleanup authority or rendering every hashed leaf.
+fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>) {
+    let mut additions = Vec::new();
+    for p in &report.projects {
+        if !filter::type_passes(filter, p) {
+            continue;
+        }
+        if let Some(name) = filter::project_name(filter)
+            && !swamp_core::filter::name_matches(name, &p.name)
+        {
+            continue;
+        }
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if a.kind != ArtifactKind::BuildOutput {
+                    continue;
+                }
+                let Some(parent_index) = rows.iter().position(|r| {
+                    r.kind.as_ref() == Some(&ArtifactKind::BuildOutput)
+                        && r.unit == Some(UnitId::for_artifact(&a.path))
+                }) else {
+                    continue;
+                };
+                let mut children: Vec<_> = report
+                    .nested_artifacts
+                    .iter()
+                    .filter(|u| u.path != a.path && u.path.starts_with(&a.path))
+                    .filter(|u| {
+                        matches!(
+                            u.role,
+                            swamp_core::artifact::ArtifactRole::Profile
+                                | swamp_core::artifact::ArtifactRole::Dependency
+                                | swamp_core::artifact::ArtifactRole::Example
+                                | swamp_core::artifact::ArtifactRole::BuildScriptOutput
+                                | swamp_core::artifact::ArtifactRole::Incremental
+                                | swamp_core::artifact::ArtifactRole::Residual
+                                | swamp_core::artifact::ArtifactRole::TestExecutable
+                        )
+                    })
+                    .filter(|u| {
+                        u.path
+                            .strip_prefix(&a.path)
+                            .map(|p| {
+                                p.components().count() <= 2
+                                    || swamp_core::cargo_cleanup::candidate(u)
+                                    || u.role == swamp_core::artifact::ArtifactRole::TestExecutable
+                                    || (!u.is_dir
+                                        && u.role == swamp_core::artifact::ArtifactRole::Example)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                children.sort_by_key(|u| (u.path.components().count(), u.path.clone()));
+                let additions_for_row: Vec<_> = children
+                    .into_iter()
+                    .map(|u| {
+                        let mut row = Row::leaf(
+                            1,
+                            format!(
+                                "  cargo · {} · {} (physical {}){}",
+                                u.role.label(),
+                                u.path.display(),
+                                if matches!(
+                                    u.membership,
+                                    swamp_core::artifact::Membership::Unknown
+                                        | swamp_core::artifact::Membership::SharedHardlink
+                                ) {
+                                    "unknown".into()
+                                } else {
+                                    human_bytes(u.physical_total)
+                                },
+                                if u.variant.unknowns.is_empty() {
+                                    String::new()
+                                } else {
+                                    " · unknowns".to_string()
+                                }
+                            ),
+                            u.bytes,
+                            u.growth_bytes,
+                        );
+                        row.mtime_max = u.mtime_max;
+                        row.series = report
+                            .series_by_key
+                            .get(&format!("Nested:{}", u.id))
+                            .cloned();
+                        if swamp_core::cargo_cleanup::candidate(u) {
+                            row.unit = Some(UnitId::for_artifact(&u.path));
+                            row.kind = Some(ArtifactKind::BuildOutput);
+                            row.signals = vec!["review exact group".into()];
+                        } else {
+                            row.signals = if u.coverage.supported {
+                                vec!["inspection-only".into()]
+                            } else {
+                                vec!["coverage-limited".into()]
+                            };
+                        }
+                        row
+                    })
+                    .collect();
+                additions.push((parent_index + 1, additions_for_row));
+            }
+        }
+    }
+    for (index, mut children) in additions.into_iter().rev() {
+        rows.splice(index..index, children.drain(..));
+    }
 }
 
 /// Types view: one row per ecosystem, with the projects wearing the tag
@@ -1235,6 +1349,9 @@ mod tests {
             mtime_max: 0,
             ecosystem: None,
             hardlinked: false,
+            dedup_stale: false,
+            allocated_bytes: None,
+            allocated_growth_bytes: None,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
@@ -1306,6 +1423,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         };
         let rows = tree_rows(
             &report,
@@ -1321,6 +1439,30 @@ mod tests {
         // (first worktree is not the last sibling).
         assert!(rows[1].rail.starts_with("│  ├─"));
         assert!(rows[2].rail.starts_with("│  └─"));
+
+        // Nested candidates must be selectable, while whole dependency groups
+        // stay inspection-only. Inserting several children must not displace
+        // the following worktree's rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = std::fs::canonicalize(tmp.path()).unwrap().join("target");
+        std::fs::create_dir_all(target.join("debug/incremental/crate-a")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(target.join("debug/incremental/crate-a/state"), b"state").unwrap();
+        let mut report = report;
+        report.projects[0].worktrees[0].artifacts[0].path = target.clone();
+        report.nested_artifacts =
+            swamp_core::cargo_artifacts::inspect_target(&target, Some(&target)).units;
+        report.projects[0].worktrees[0].artifacts[0].dedup_stale = true;
+        report.projects[0].worktrees[0].artifacts[0].allocated_bytes = Some(4096);
+        let rows = builds_rows(&report, &Filter::default());
+        assert!(
+            rows.iter()
+                .any(|r| r.label.contains("unique stale; allocated"))
+        );
+        let selected = UnitId::for_artifact(&target.join("debug/incremental/crate-a"));
+        assert!(rows.iter().any(|r| r.unit == Some(selected.clone())));
+        let deps = UnitId::for_artifact(&target.join("debug/deps"));
+        assert!(!rows.iter().any(|r| r.unit == Some(deps.clone())));
     }
 
     #[test]
@@ -1372,6 +1514,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
     }

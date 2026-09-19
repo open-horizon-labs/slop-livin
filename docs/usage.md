@@ -78,6 +78,7 @@ swamp report ~/src --all
 swamp report ~/src --project api
 swamp report ~/src --project api --dirs --depth 2
 swamp report ~/src --view builds
+swamp report ~/src --view rust
 swamp report ~/src --view deps
 swamp report ~/src --view types
 swamp report ~/src --view docker
@@ -86,7 +87,11 @@ swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
 ```
 
-Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals.
+Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs are inspection-only.
+
+Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. In the TUI Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. CLI plans can select the same exact paths. Executable groups include existing dep-info and debug-symbol companions. Approval applies only to the reviewed group, not future files at that path.
+
+Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, hardlinks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
 
 The CLI currently applies `report --filter` only to the root `--view worktrees` output. It does not filter the builds view, project drill-down, overview, or JSON. For artifact filters use the TUI, MCP `report`, or `propose --filter`. `--project` scopes the project tree and supported artifact views; it does not scope every summary view.
 

@@ -32,6 +32,9 @@ enum View {
     /// Per-ecosystem rollup: projects wearing the tag, artifacts it
     /// generates, bytes and growth.
     Types,
+    /// Nested Cargo target/build units with physical-accounting and
+    /// evidence/unknown details. Inspection only.
+    Rust,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -115,7 +118,7 @@ enum Command {
         /// Named view, at root or narrowed with `--project`: worktrees
         /// (git-enriched one-line-per-worktree listing at root, the tree
         /// drill with `--project`), builds, deps, docker, kinds, unowned,
-        /// reconciliation. Every question the issue lists is exactly one
+        /// reconciliation, rust. Every question the issue lists is exactly one
         /// command through this flag. Text output only.
         #[arg(long, value_enum)]
         view: Option<View>,
@@ -414,6 +417,17 @@ fn main() -> Result<()> {
             );
             progress.stop();
             let r = r?;
+            if !json
+                && r.projects
+                    .iter()
+                    .flat_map(|p| &p.worktrees)
+                    .flat_map(|w| &w.artifacts)
+                    .any(|a| a.dedup_stale)
+            {
+                eprintln!(
+                    "Unique-byte totals are stale; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
+                );
+            }
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
                 Some(Ok(f)) => Some(f),
                 Some(Err(e)) => {
@@ -458,6 +472,9 @@ fn main() -> Result<()> {
                     Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
                     Some(View::Kinds) => print!("{}", render_kinds(&r)),
                     Some(View::Types) => print!("{}", render_types(&r)),
+                    Some(View::Rust) => {
+                        print!("{}", swamp_core::render::render_view_rust(&r, Some(&name)))
+                    }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                 }
@@ -472,6 +489,9 @@ fn main() -> Result<()> {
                     Some(View::Deps) => print!("{}", render_view_deps(&r, None)),
                     Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
                     Some(View::Types) => print!("{}", render_types(&r)),
+                    Some(View::Rust) => {
+                        print!("{}", swamp_core::render::render_view_rust(&r, None))
+                    }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                     None => print!(

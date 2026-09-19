@@ -4,9 +4,12 @@
 
 use crate::bus::{Consumer, Ctx, Event, EventKind};
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-pub struct WalkConsumer;
+#[derive(Default)]
+pub struct WalkConsumer {
+    checkpoint: Mutex<Option<crate::growth::ObservationCheckpoint>>,
+}
 
 #[async_trait::async_trait(?Send)]
 impl Consumer for WalkConsumer {
@@ -14,13 +17,21 @@ impl Consumer for WalkConsumer {
         "walk"
     }
     fn subscribes_to(&self) -> &[EventKind] {
-        &[EventKind::RootRequested]
+        &[EventKind::RootRequested, EventKind::ReportCached]
     }
-    async fn on_event(&self, _event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+        if matches!(event, Event::ReportCached) {
+            if let Some(checkpoint) = self.checkpoint.lock().unwrap().take() {
+                checkpoint.commit()?;
+            }
+            return Ok(vec![]);
+        }
+        *self.checkpoint.lock().unwrap() = None;
         let mut notes: Vec<String> = Vec::new();
         let mut rewalked: Option<Arc<Vec<String>>> = None;
+        let mut changed_paths = None;
         let (discovered, attribution) = if let Some(dir) = &ctx.store_dir {
-            let tracked = crate::growth::observe_tracked_with_source(
+            let (tracked, checkpoint) = crate::growth::stage_tracked_with_source(
                 dir,
                 &ctx.root,
                 ctx.observed_at,
@@ -29,11 +40,13 @@ impl Consumer for WalkConsumer {
                 ctx.observe,
                 ctx.fs_events,
             )?;
+            *self.checkpoint.lock().unwrap() = checkpoint;
             notes.push(format!(
                 "fsevents: mode={} reason={} changed_dirs={}",
                 tracked.mode, tracked.reason, tracked.changed_dirs
             ));
             rewalked = tracked.rewalked.map(Arc::new);
+            changed_paths = tracked.changed_paths.map(Arc::new);
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
@@ -44,6 +57,7 @@ impl Consumer for WalkConsumer {
             )?
         };
         Ok(vec![Event::RootObserved {
+            changed_paths,
             discovered: Arc::new(discovered),
             attribution: Arc::new(attribution),
             notes,

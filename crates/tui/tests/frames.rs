@@ -25,6 +25,9 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: false,
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: 0,
         track: None,
         growth_bytes: growth,
@@ -131,6 +134,7 @@ fn fixture_report() -> Report {
         files_by_worktree: None,
         schedule_line: None,
         github_enrichment: None,
+        nested_artifacts: Vec::new(),
         reconciliation: Reconciliation {
             attributed: 0,
             unowned: 0,
@@ -506,6 +510,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
 
     let unit = |path: &std::path::Path| MarkedUnit {
+        cargo_plan: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),

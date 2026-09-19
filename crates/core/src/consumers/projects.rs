@@ -26,6 +26,7 @@ impl Consumer for ProjectsConsumer {
             attribution,
             notes,
             rewalked,
+            ..
         } = event
         else {
             return Ok(vec![]);

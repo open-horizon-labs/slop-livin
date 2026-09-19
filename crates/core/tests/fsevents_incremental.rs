@@ -554,6 +554,76 @@ fn stored_event_id_is_recorded_after_an_observation() {
     );
 }
 
+#[test]
+fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
+    disable_too_soon_floor();
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+    report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("baseline");
+    let device = std::os::unix::fs::MetadataExt::dev(&fs::metadata(&fx.root).unwrap());
+    let sidecar = store.path().join(device.to_string()).join("fsevents.json");
+    let before = fs::read(&sidecar).unwrap();
+    let cache = fs::read_dir(store.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("last_report-")
+        })
+        .unwrap();
+    let blocker = cache.with_extension("tmp");
+    fs::create_dir(&blocker).unwrap();
+    let source = CannedSource(incremental_plan(vec![], 77));
+    let result = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    );
+    assert!(
+        result.is_err(),
+        "cache failure must propagate rather than advance replay past uncached evidence"
+    );
+    assert_eq!(fs::read(&sidecar).unwrap(), before);
+    fs::remove_dir(blocker).unwrap();
+    report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    )
+    .expect("retry");
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+    assert_eq!(after["event_id"], 77);
+}
+
 /// Regression for a live-run bug against `~/src`: a project whose linked
 /// worktrees live *inside* the main checkout's own directory tree (e.g.
 /// `.worktrees/<name>`, the real shape `swamp` itself uses), each
@@ -754,8 +824,8 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
 /// `target/` inflated `walked_total` by ~32 MB because the re-size
 /// re-charged hardlinked inodes the full walk had already charged to
 /// another row. Two artifact rows share hardlinked files; after an
-/// incremental re-size of one of them, every row and every total must
-/// equal a forced full walk byte for byte.
+/// incremental update, allocation totals advance but unique charges remain
+/// explicitly stale until a full walk reconciles them.
 #[test]
 fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     disable_too_soon_floor();
@@ -831,12 +901,12 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     .expect("forced full report");
 
     assert_eq!(
-        second.reconciliation.walked_total, full.reconciliation.walked_total,
-        "incremental walked_total must equal a full walk (before touch: {full_before})"
+        second.reconciliation.walked_total, full_before,
+        "unique totals retain the last measurement, not a sum of overlapping allocations"
     );
     assert_eq!(
         second.reconciliation.attributed,
-        full.reconciliation.attributed
+        first.reconciliation.attributed
     );
     assert_eq!(second.reconciliation.unowned, full.reconciliation.unowned);
     // The only change is the 8 KiB probe.
@@ -881,12 +951,51 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     let (pair_inc, rest_inc) = split(rows(&second));
     let (pair_full, rest_full) = split(rows(&full));
     assert_eq!(
-        pair_inc, pair_full,
-        "target+node_modules must hold the same bytes as a full walk"
+        pair_inc + 8192,
+        pair_full,
+        "full reconciliation accounts for the added probe exactly once"
     );
     assert_eq!(
         rest_inc, rest_full,
         "every other row must match a full walk"
+    );
+    let target_row = |r: &swamp_core::Report| {
+        r.projects
+            .iter()
+            .flat_map(|p| &p.worktrees)
+            .flat_map(|w| &w.artifacts)
+            .find(|a| a.path == target)
+            .unwrap()
+            .clone()
+    };
+    assert!(target_row(&second).dedup_stale);
+    assert_eq!(target_row(&second).growth_bytes, None);
+    assert_eq!(
+        target_row(&second).allocated_bytes.unwrap(),
+        target_row(&first).allocated_bytes.unwrap() + 8192
+    );
+    assert!(!target_row(&full).dedup_stale);
+    assert!(second.notes.iter().any(|n| n.contains("reconciliation")));
+    let unchanged = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &CannedSource(incremental_plan(vec![], 2)),
+    )
+    .unwrap();
+    assert!(
+        target_row(&unchanged).dedup_stale,
+        "stale state survives persisted no-change refresh"
+    );
+    assert_eq!(
+        target_row(&unchanged).allocated_bytes,
+        target_row(&second).allocated_bytes
     );
 }
 

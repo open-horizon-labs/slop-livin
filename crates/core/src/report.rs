@@ -190,14 +190,19 @@ pub struct ArtifactRow {
     /// Whether this unit contains hardlinked files (`nlink > 1`). A unit
     /// without them can be re-sized from its stored per-directory rows,
     /// because summing those rows counts every byte exactly once. A unit
-    /// with them cannot: the same inode appears in several directories
-    /// and the unit's own figure counts it once (Cargo's `target/`
-    /// hardlinks almost every artifact, and summing its directory rows
-    /// overcounted a 16 GB tree by 4.4 GB). `true` is the safe answer
-    /// when nobody has measured, so a store written before this field
-    /// existed re-sizes whole until its next full walk.
+    /// with them still gets current directory allocations, but its unique-byte
+    /// count is retained as stale until reconciliation. `true` is conservative
+    /// when nobody has measured: allocation sums are not unique-byte totals.
     #[serde(default = "yes")]
     pub hardlinked: bool,
+    /// True when unique-byte totals await reconciliation; directory allocations are current.
+    #[serde(default)]
+    pub dedup_stale: bool,
+    /// Current path allocations (hardlinks may count more than once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_growth_bytes: Option<i64>,
     /// Bytes with hardlinks deduplicated *within this row only* (a
     /// deterministic per-row figure), unlike `bytes`, where a hardlinked
     /// inode is charged to whichever row the full walk saw first. The
@@ -233,11 +238,9 @@ pub struct ArtifactRow {
     pub dangling: bool,
 }
 
-/// R4c: one directory's rollup inside a worktree's `Source` tree.
-/// Produced only for directories not inside a folded artifact (see
-/// `ArtifactKind`) and not `.git` -- both are already excluded because
-/// `walk::attribute_parallel` folds them into one `ArtifactRow` before
-/// ever recursing, so no `DirRollup` is ever emitted underneath them.
+/// One directory measurement within a worktree, including folded artifact
+/// interiors. Interior rows support incremental sizing without retaining files;
+/// artifact boundaries prevent their totals being added twice to source rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirRollup {
     pub worktree_id: String,
@@ -432,6 +435,11 @@ pub struct Report {
     /// as-is and never shells out to `gh`.
     #[serde(default)]
     pub github_enrichment: Option<GithubEnrichmentSummary>,
+    /// Nested Cargo/build-artifact facts. These are identification units
+    /// inside existing artifact rows; their physical bytes are not added to
+    /// reconciliation totals a second time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
 }
 
 /// Live GitHub enrichment stats for one `report_full(.., enrich: true)`
@@ -745,7 +753,7 @@ pub fn annotate_tracking(
 
 fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
     store_dir.join(format!(
-        "last_report-{}.json",
+        "last_report-{}.json.zst",
         &crate::entities::id_for(&root.display().to_string())[..16]
     ))
 }
@@ -791,11 +799,19 @@ pub(crate) fn dir_inside_artifact(
 pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
     std::fs::create_dir_all(store_dir)?;
     let path = last_report_path(store_dir, &report.root);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension("tmp");
     let mut slim = report.clone();
     slim.dirs_by_worktree = None;
     slim.files_by_worktree = None;
-    std::fs::write(&tmp, serde_json::to_vec(&slim)?)?;
+    let file = std::fs::File::create(&tmp)?;
+    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, encoder);
+    serde_json::to_writer(&mut writer, &slim)?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .finish()?
+        .sync_all()?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -804,8 +820,9 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
 /// run, TUI), without walking anything. `None` when no observation of
 /// this root has been cached yet.
 pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
-    let text = std::fs::read_to_string(last_report_path(store_dir, root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let file = std::fs::File::open(last_report_path(store_dir, root)).ok()?;
+    let bytes = zstd::stream::decode_all(file).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Rolls `own_allocated` up into `allocated_total` bottom-up: deepest
@@ -1257,6 +1274,9 @@ pub(crate) fn join_docker_facts(
                         mtime_max: 0,
                         ecosystem: None,
                         hardlinked: false,
+                        dedup_stale: false,
+                        allocated_bytes: None,
+                        allocated_growth_bytes: None,
                         local_bytes: 0,
                         track: None,
                         growth_bytes: None,

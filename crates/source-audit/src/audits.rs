@@ -103,16 +103,20 @@ fn legacy_invariants(root: &Path) -> Result<(), String> {
 fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
     let g = core(root, "growth.rs")?;
     let funcs = ast::functions(&g.ast);
-    let f = ast::function(&funcs, "observe_tracked_with_source")?;
+    let entry = ast::function(&funcs, "observe_tracked_with_source")?;
+    if !entry.body.contains("stage_tracked_with_source") || entry.body.contains("full_walk") {
+        return Err("observe_tracked_with_source must delegate replay planning to stage_tracked_with_source".into());
+    }
+    let f = ast::function(&funcs, "stage_tracked_with_source")?;
     let replay_at = f
         .stmts
         .iter()
         .position(|s| s.contains(". replay (") || s.contains(".replay("))
-        .ok_or("observe_tracked_with_source never calls FSEvents replay")?;
+        .ok_or("stage_tracked_with_source never calls FSEvents replay")?;
     for (i, s) in f.stmts.iter().enumerate() {
         if i < replay_at && s.contains("full_walk") && !s.contains("force_full") {
             return Err(format!(
-                "observe_tracked_with_source: statement {i} runs full_walk before the FSEvents replay without a force_full guard"
+                "stage_tracked_with_source: statement {i} runs full_walk before the FSEvents replay without a force_full guard"
             ));
         }
     }
@@ -465,6 +469,7 @@ fn static_registration_only(root: &Path) -> Result<(), String> {
 /// Stage entry points that may be called only from a consumer.
 const STAGE_CALLS: &[&str] = &[
     "observe_tracked_with_source",
+    "stage_tracked_with_source",
     "discover_and_attribute",
     "compute_signals_raw_parallel",
     "observe_all",

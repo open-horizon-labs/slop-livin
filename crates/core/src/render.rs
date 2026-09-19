@@ -75,6 +75,21 @@ fn human_signed_bytes(delta: i64) -> String {
     format!("{sign}{}", human_bytes(delta.unsigned_abs()))
 }
 
+pub fn allocation_note(row: &crate::report::ArtifactRow) -> String {
+    if !row.dedup_stale {
+        return String::new();
+    }
+    let allocated = row
+        .allocated_bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "unknown".into());
+    let growth = row
+        .allocated_growth_bytes
+        .map(|g| format!("; allocated growth {}", human_signed_bytes(g)))
+        .unwrap_or_default();
+    format!(" [unique stale; allocated {allocated}{growth}]")
+}
+
 fn kind_label(kind: &ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::BuildOutput => "build",
@@ -850,6 +865,87 @@ pub fn render_view_deps(report: &Report, only_project: Option<&str>) -> String {
     render_kind_view(report, only_project, &[ArtifactKind::DependencyTree])
 }
 
+/// rust view: nested Cargo units inside already-accounted target rows.
+/// Aggregate rows show logical bytes while leaves show physically charged
+/// bytes, making hardlink and residual limits visible.
+pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  path / evidence",
+        "project", "role", "profile", "allocated", "charged", "growth"
+    );
+    let mut rows = Vec::new();
+    for unit in &report.nested_artifacts {
+        let project = report
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "unknown".into());
+        if only_project.is_some_and(|wanted| wanted != project) {
+            continue;
+        }
+        let profile = unit.variant.profile.clone().unwrap_or_else(|| "?".into());
+        let evidence = unit
+            .producer_evidence
+            .first()
+            .map(|e| e.source.as_str())
+            .unwrap_or("unknown");
+        rows.push((
+            project,
+            unit.role.label(),
+            profile,
+            unit.bytes,
+            unit.physical_total,
+            unit,
+            evidence,
+        ));
+    }
+    rows.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| a.5.relative_path.cmp(&b.5.relative_path))
+    });
+    if rows.is_empty() {
+        let _ = writeln!(out, "0 (no Cargo target rows or no supported nested facts)");
+        return out;
+    }
+    for (project, role, profile, bytes, charged, unit, evidence) in rows {
+        let unknown = if unit.variant.unknowns.is_empty() {
+            String::new()
+        } else {
+            format!("; unknown: {}", unit.variant.unknowns.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  {} [{}{}]",
+            project,
+            role,
+            profile,
+            human_bytes(bytes),
+            if matches!(
+                unit.membership,
+                crate::artifact::Membership::Unknown | crate::artifact::Membership::SharedHardlink
+            ) {
+                "—".into()
+            } else {
+                human_bytes(charged)
+            },
+            unit.growth_bytes
+                .map(human_bytes_signed)
+                .unwrap_or_else(|| "—".into()),
+            unit.relative_path,
+            evidence,
+            unknown
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Parent rows include their children: do not sum them. Charged bytes are inode-deduplicated allocation, not reclaimable space. debug/release name output directories, not unique dev/test/bench configurations."
+    );
+    out
+}
+
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -877,7 +973,7 @@ fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[Artifa
                 rows.push((
                     project.name.clone(),
                     kind_label(&a.kind),
-                    rel,
+                    format!("{rel}{}", allocation_note(a)),
                     a.bytes,
                     a.growth_bytes,
                 ));

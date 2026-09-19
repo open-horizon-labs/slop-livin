@@ -25,6 +25,14 @@ The [ecosystem table](../crates/core/src/ecosystem.rs) associates markers such a
 
 Classification supplies an artifact kind and ecosystem. It does not prove that everything inside a build directory is reproducible. The [harvest utility](../crates/harvest/src/main.rs) compares the table with vendored ignore and language lists; it reports candidates without editing the table. An ignore rule alone says nothing about whether the contents can be recreated.
 
+Cargo reports retain profiles, role directories, individual incremental/build-script groups, identified test/example executables, and final executables/libraries directly inside each profile. Group sizes come from existing folded directory measurements; selected output files use shallow metadata reads. Cargo annotation does not recursively walk the build tree again. IDs are scoped to the canonical storage container, independently of project ownership. Trusted event coverage lets unchanged containers reuse these units. Only these units receive nested history; ordinary compiler files do not become report or history rows. Nested history does not inflate project totals. The small report cache is compressed; measurements and reverse deltas remain in Parquet. Dependencies remain a folded directory aggregate, not a per-crate size breakdown. Final outputs are currently inspection-only.
+
+Folded groups show allocated totals, not an inferred reclaimable size. Subgroup hardlink attribution is unknown and displayed as such. Internal files can be inspected explicitly, but their past identities are not retained after deletion. This is a developer storage tool, not a filesystem audit log.
+
+Path layout identifies profiles, dependencies, examples, build-script output, incremental state, and companion metadata. Existing Cargo fingerprints identify test executables and supply feature/compiler evidence where available. A fingerprint is not proof of last execution or obsolescence. Unknown variants stay unknown; historical compiler-message evidence does not establish freshness. Scanning never runs Cargo or build scripts.
+
+Selective cleanup uses the existing plan, explicit approval, and ledger boundary. Supported selections are evidenced test/example executables with their dep-info/debug-symbol companions, or individual incremental/build-script directories. Execution holds existing Cargo profile locks and rechecks the selected group's role, fingerprint evidence, membership, identity, content, and occupancy—not the whole build tree. It then moves members into a same-filesystem Trash envelope with a restore manifest. Unsupported layouts, shared hardlinks, missing locks, and uncertain occupancy refuse cleanup. Locks are advisory: manual writers must be stopped. Shared dependency groups remain inspection-only.
+
 Files outside classified artifacts are split into tracked, ignored, and untracked remainder buckets. The [ignore lens](../crates/core/src/ignore.rs) uses Git's index and exclude rules through gitoxide. Byte totals are apportioned using directory observations, with corrections for individually recorded large files. This preserves the measured total but is not an exhaustive per-file accounting of Git status.
 
 ### Attribution and recovery are separate
@@ -56,10 +64,13 @@ flowchart TD
     Tracking --> Report[Assemble Report]
     History --> Report
     Report --> Cache[Cache the report]
-    Report --> Interfaces[CLI / TUI / MCP]
+    Cache --> Checkpoint[Commit replay checkpoint]
+    Checkpoint --> Interfaces[CLI / TUI / MCP]
 ```
 
 The assembly gate waits for local signals, GitHub results, ecosystem tags, and Docker results. Unavailable enrichment produces unknown facts or notes so the rest of the report can still be built. After growth annotation, tracking and time-series consumers run as sibling subscribers; the final assembler waits for both.
+
+The walk stages its replay checkpoint. Observing runs publish it only after history and report-cache writes succeed. A later consumer or cache failure leaves the prior replay anchor in place so the next run can retry that interval. This ordering is not a transaction across the legacy history tables; already-written tables may need reconciliation after a failed run.
 
 The bus uses a Tokio current-thread runtime and `join_all` for subscribers of one event. Follow-on events are dispatched depth-first in registration order. An `async` consumer is not automatically nonblocking: several call synchronous filesystem and subprocess code. Filesystem traversal and some enrichment work have their own concurrency. The bus's main benefit is explicit dependencies and separate stages, not a guarantee of parallel execution.
 
@@ -82,12 +93,15 @@ An observation with usable event history reconstructs the previous topology and 
 | Change | Work performed |
 |---|---|
 | Existing remainder directory changes | Re-list that directory and update its stored totals when the stored structure permits it. |
-| Directory inside an artifact changes | Re-list affected interior directories and re-aggregate the artifact when interior rows exist and the unit has no hardlinks. |
-| Artifact contains hardlinks, or interior detail is unavailable | Resize the whole artifact. |
+| Directory inside an artifact changes | Re-list affected interior directories and update allocated totals. Wide directories use bounded batches on the existing worker pool. |
+| Changed artifact has hardlinks | Keep its last unique-byte measurement, mark it stale, and update directory allocations without traversing unchanged interiors. |
+| Interior detail is unavailable | Resize the whole artifact. |
 | New or structurally changed subtree | Discover repositories or artifacts and perform the broader walk needed to rebuild attribution. |
 | Event history is incomplete or cannot be trusted | Perform a full walk and report the reason. |
 
-Hardlinks explain why a small change inside a Cargo `target/` can still require a large traversal. Summing independently measured directory rows could charge one inode more than once. Artifact rows retain both their globally attributed bytes and a local measurement; the incremental code applies local differences to the attributed total.
+Hardlinks do not force a whole-target walk when interior measurements are available. `allocated_bytes` and `allocated_growth_bytes` describe current path allocations, which may count a linked inode more than once. `bytes` and `local_bytes` retain their last deduplicated measurements; `dedup_stale` distinguishes those from current measurements. CLI/TUI warn when unique-byte totals are stale. Unique-byte growth is unavailable and its history has a gap while stale, rather than inventing zero growth. A full scan reconciles the counts. Cleanup still checks its actual selected members; allocated size is not promised reclaimable space.
+
+Plans warn about stale unique-byte estimates, and standing grants cannot spend a budget against them. A human may explicitly approve a plan with that warning. A scoped Cargo cleanup measures its selected members freshly and still requires per-plan approval.
 
 The fallback reasons include a missing or future event ID, a device mismatch, dropped or inconclusive events, too many changed directories, and changed classification rules. A replay too soon after the previous observation also falls back, because the persisted event log can lag writes. `--full` explicitly forces a full walk.
 
@@ -135,9 +149,9 @@ Artifact histories use a key containing project ID, worktree ID, kind, and workt
 
 Parquet groups fields into columns and zstd compresses the stored batches. A size/presence change saves the old artifact value; an unchanged observation need not add a delta. Metadata changes can still cause directory or file writes. When a current dataset changes, that current Parquet file is rewritten: this is not an in-place row-update store.
 
-History lookup builds an index from retained rows once for growth annotation, rather than reloading the files for every artifact. Delta compaction starts above 20 files and drops records outside the retention window. Default retention is 30 days; physical pruning happens during maintenance, not at a precise wall-clock deadline.
+History lookup builds an index from retained rows once for growth annotation, rather than reloading the files for every artifact. Delta compaction starts above 20 files, or at eight files when their combined size is at most 128 KiB. The earlier trigger amortizes repeated Parquet headers and footers in small observations. Compaction groups retained rows by identity and time without discarding their fields, and drops records outside the retention window. Default retention is 30 days; physical pruning happens during maintenance, not at a precise wall-clock deadline.
 
-The history writer closes each temporary Parquet file before renaming it into place, so ordinary readers do not see an unfinished footer. This is per-file replacement, not a transaction across all history files or a guarantee against every crash or concurrent-writer failure.
+The history writer closes and syncs each temporary Parquet file before publishing it, so ordinary readers do not see an unfinished footer. Compaction publishes its replacement before removing input files; publication failure leaves the inputs intact. This is per-file replacement, not a transaction across all history files or a guarantee against every crash or concurrent-writer failure. Interruption during input retirement can leave duplicate historical rows.
 
 ### What history can answer
 

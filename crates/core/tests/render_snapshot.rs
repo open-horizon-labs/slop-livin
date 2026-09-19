@@ -23,6 +23,9 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: false,
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: 0,
         track: None,
         growth_bytes: growth,
@@ -139,6 +142,7 @@ fn fixture_report() -> Report {
         files_by_worktree: None,
         schedule_line: None,
         github_enrichment: None,
+        nested_artifacts: Vec::new(),
         unowned: vec![
             UnownedRow {
                 path_or_object: "old-project/build".to_string(),

@@ -306,6 +306,9 @@ fn dummy_artifact() -> swamp_core::report::ArtifactRow {
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: false,
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: 0,
         track: None,
         growth_bytes: None,
@@ -982,6 +985,9 @@ mod tests {
             mtime_max: 0,
             ecosystem: None,
             hardlinked: false,
+            dedup_stale: false,
+            allocated_bytes: None,
+            allocated_growth_bytes: None,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
@@ -1041,6 +1047,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         }
     }
 

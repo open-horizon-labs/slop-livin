@@ -54,7 +54,17 @@ impl Consumer for ReportAssembler {
             return Ok(vec![]);
         }
         p.emitted = true;
-        let d: Draft = (*draft).clone();
+        let mut d: Draft = (*draft).clone();
+        let stale = d
+            .projects
+            .iter()
+            .flat_map(|p| &p.worktrees)
+            .flat_map(|w| &w.artifacts)
+            .filter(|a| a.dedup_stale)
+            .count();
+        if stale > 0 {
+            d.notes.push(format!("{stale} artifact unique-byte totals await full-scan reconciliation; directory allocations are current but may count hardlinks multiple times."));
+        }
         let summary = crate::report::summarize(&d.projects);
         let report = Report {
             observed_at: ctx.observed_at,
@@ -71,6 +81,7 @@ impl Consumer for ReportAssembler {
             schedule_line: d.schedule_line,
             summary,
             github_enrichment: d.github_enrichment,
+            nested_artifacts: Arc::try_unwrap(d.nested_artifacts).unwrap_or_else(|a| (*a).clone()),
         };
         Ok(vec![Event::ReportAssembled(Arc::new(report))])
     }

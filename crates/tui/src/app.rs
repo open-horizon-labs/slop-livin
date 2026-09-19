@@ -842,6 +842,30 @@ impl App {
         }
         let label = row.label.trim().to_string();
         let unit_path = PathBuf::from(&unit_id.0);
+        let cargo_plan = if self
+            .report
+            .nested_artifacts
+            .iter()
+            .any(|u| u.path == unit_path)
+        {
+            match swamp_core::actions::propose(
+                &self.report,
+                None,
+                std::slice::from_ref(&unit_path),
+                "human:tui",
+            ) {
+                Ok(plan) => {
+                    warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
+                    Some(plan)
+                }
+                Err(e) => {
+                    self.set_refusal(&e.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // The worktree this unit lives in: where `bin/` goes when keeping
         // executables. A worktree row is its own worktree.
         let worktree_path = self
@@ -858,13 +882,18 @@ impl App {
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default()
             });
+        let selected_bytes = cargo_plan
+            .as_ref()
+            .map(|p| p.planned_bytes())
+            .unwrap_or(row.bytes);
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
+                cargo_plan,
                 path: unit_path,
                 docker,
                 worktree_path,
-                bytes: row.bytes,
+                bytes: selected_bytes,
                 observed_at: self.report.observed_at,
                 worktree,
                 label,
@@ -1004,6 +1033,14 @@ impl App {
             return;
         }
         let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
+        // Companion paths are part of the exact group, not just the selected
+        // executable. Suppress stale nested facts until the observer refreshes.
+        self.report.nested_artifacts.retain(|u| {
+            !under(&u.path)
+                && !removed.iter().any(|r| {
+                    u.path == r.with_extension("d") || u.path.starts_with(r.with_extension("dSYM"))
+                })
+        });
         let mut freed = 0u64;
         let wt_paths: std::collections::HashMap<String, PathBuf> = self
             .report
@@ -1193,6 +1230,9 @@ mod tests {
                             mtime_max: 0,
                             ecosystem: None,
                             hardlinked: false,
+                            dedup_stale: false,
+                            allocated_bytes: None,
+                            allocated_growth_bytes: None,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(150 * 1024 * 1024),
@@ -1213,6 +1253,9 @@ mod tests {
                             mtime_max: 0,
                             ecosystem: None,
                             hardlinked: false,
+                            dedup_stale: false,
+                            allocated_bytes: None,
+                            allocated_growth_bytes: None,
                             local_bytes: 0,
                             track: None,
                             growth_bytes: Some(1024),
@@ -1252,6 +1295,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         }
     }
 

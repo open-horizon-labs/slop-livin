@@ -5,6 +5,7 @@
 
 mod assemble;
 mod cache;
+mod cargo;
 mod docker;
 mod ecosystem;
 mod gate;
@@ -18,6 +19,7 @@ mod walk;
 
 pub use assemble::ReportAssembler;
 pub use cache::CacheWriter;
+pub use cargo::CargoConsumer;
 pub use docker::DockerConsumer;
 pub use ecosystem::EcosystemConsumer;
 pub use gate::AssemblyGate;

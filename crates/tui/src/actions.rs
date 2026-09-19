@@ -17,6 +17,7 @@ use crate::model::human_bytes;
 /// facts all came from the one `Report`).
 #[derive(Debug, Clone)]
 pub struct MarkedUnit {
+    pub cargo_plan: Option<swamp_core::actions::Plan>,
     pub path: PathBuf,
     /// Set for a Docker object: what removing it actually runs, and the
     /// fact that it never reaches Trash.
@@ -101,6 +102,56 @@ fn execute_one(
     actor: &str,
     keep_executables: bool,
 ) -> UnitResult {
+    if let Some(plan) = &unit.cargo_plan {
+        let result = (|| -> Result<Outcome> {
+            if !grant.created_outside_index
+                || grant.expires_at < now()
+                || !grant
+                    .scope
+                    .contains(&id_for(&unit.path.display().to_string()))
+                || _plan_unit.artifact_id != id_for(&unit.path.display().to_string())
+            {
+                anyhow::bail!("Cargo selection not covered by current confirmation");
+            }
+            if keep_executables {
+                anyhow::bail!("keep-executables conflicts with selective build removal");
+            }
+            let store = ledger
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("ledger has no store directory"))?;
+            if swamp_core::actions::load_plan(store, &plan.id)
+                .is_ok_and(|p| p.status == swamp_core::actions::PlanStatus::Executed)
+            {
+                anyhow::bail!("Cargo plan already executed");
+            }
+            swamp_core::actions::save_plan(store, plan)?;
+            swamp_core::actions::approve(store, &plan.id, actor)?;
+            let result =
+                swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
+            let outcome = result
+                .outcomes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{}", result.state))?;
+            if outcome.status != "completed" {
+                anyhow::bail!(
+                    "{}",
+                    outcome.cause.as_deref().unwrap_or("Cargo action refused")
+                );
+            }
+            Ok(Outcome {
+                unit_id: id_for(&unit.path.display().to_string()),
+                status: "completed".into(),
+                reason: None,
+                intended_bytes: unit.bytes,
+                observed_free_space_delta: result.freed_measured,
+            })
+        })();
+        return UnitResult {
+            path: unit.path.clone(),
+            outcome: result.map_err(|e| e.to_string()),
+        };
+    }
     if let Some(terms) = &unit.worktree {
         return UnitResult {
             path: unit.path.clone(),
@@ -320,6 +371,23 @@ pub fn execute_plan(
     actor: &str,
     keep_executables: bool,
 ) -> Vec<UnitResult> {
+    if units.iter().any(|u| u.cargo_plan.is_some()) {
+        for (i, a) in units.iter().enumerate() {
+            for b in units.iter().skip(i + 1) {
+                if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                    return units
+                        .iter()
+                        .map(|u| UnitResult {
+                            path: u.path.clone(),
+                            outcome: Err(
+                                "overlapping parent/child selection; nothing executed".into()
+                            ),
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
     units
         .iter()
         .zip(plan.units.iter())
@@ -454,6 +522,7 @@ mod tests {
 
     fn unit(path: &str, bytes: u64, docker: Option<swamp_core::docker::Removal>) -> MarkedUnit {
         MarkedUnit {
+            cargo_plan: None,
             path: PathBuf::from(path),
             docker,
             worktree_path: PathBuf::new(),
@@ -507,6 +576,78 @@ mod tests {
     }
 
     #[test]
+    fn cargo_confirmation_executes_the_reviewed_core_plan() {
+        let tmp = tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
+        let selected = root.join("target/debug/incremental/crate-a");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(selected.join("state"), b"state").unwrap();
+        std::fs::write(root.join("target/debug/.cargo-lock"), b"").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let store = tempdir().unwrap();
+        let report = swamp_core::report::report_full_mode(
+            &root,
+            None,
+            false,
+            Some(store.path()),
+            Some("1h"),
+            true,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let core_plan = swamp_core::actions::propose(
+            &report,
+            None,
+            std::slice::from_ref(&selected),
+            "human:tui",
+        )
+        .unwrap();
+        let mut marked = unit(selected.to_str().unwrap(), core_plan.planned_bytes(), None);
+        marked.cargo_plan = Some(core_plan);
+        let units = vec![marked];
+        let (plan, mut grant) = authorize(&units, "human");
+        let ledger = Ledger::open(store.path().join("ledger.jsonl")).unwrap();
+        let trash = store.path().join("Trash");
+        grant.created_outside_index = false;
+        assert!(
+            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
+                .outcome
+                .is_err()
+        );
+        assert!(selected.exists());
+        grant.created_outside_index = true;
+        let results = execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false);
+        assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
+        assert!(!selected.exists());
+        assert!(
+            ledger
+                .all()
+                .unwrap()
+                .iter()
+                .any(|r| r.outcome == "completed")
+        );
+        assert!(
+            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
+                .outcome
+                .is_err()
+        );
+    }
+
+    #[test]
     fn end_to_end_delete_moves_to_trash_and_appends_ledger() {
         let workdir = tempdir().unwrap();
         let target = workdir.path().join("node_modules");
@@ -515,6 +656,7 @@ mod tests {
         let bytes = 1024u64;
 
         let unit = MarkedUnit {
+            cargo_plan: None,
             path: target.clone(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -544,6 +686,7 @@ mod tests {
     #[test]
     fn confirm_summary_names_units_and_states_their_warnings() {
         let clean = MarkedUnit {
+            cargo_plan: None,
             path: "/tmp/target".into(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -554,6 +697,7 @@ mod tests {
             worktree: None,
         };
         let risky = MarkedUnit {
+            cargo_plan: None,
             path: "/tmp/raw".into(),
             docker: None,
             worktree_path: PathBuf::new(),
