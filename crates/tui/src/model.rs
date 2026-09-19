@@ -369,13 +369,13 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
     }
     match sort {
         Sort::None => {}
+        // Signed, not by magnitude: the question "what grew" is answered
+        // by what arrived, and bytes that left are the opposite of the
+        // answer. Sorting by magnitude put a project that shrank by 3GB
+        // above one that grew by 1GB, at the top of a screen the human
+        // is reading for things to delete. Shrinkage sorts last.
         Sort::Growth => {
-            rows.sort_by(|a, b| {
-                b.growth
-                    .unwrap_or(0)
-                    .abs()
-                    .cmp(&a.growth.unwrap_or(0).abs())
-            });
+            rows.sort_by(|a, b| b.growth.unwrap_or(0).cmp(&a.growth.unwrap_or(0)));
         }
         Sort::Size => rows.sort_by(|a, b| b.bytes.cmp(&a.bytes)),
         Sort::Name => rows.sort_by(|a, b| {
@@ -1186,16 +1186,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_sort_growth_orders_by_magnitude() {
+    fn apply_sort_growth_puts_what_arrived_first_and_what_left_last() {
         let mut rows = vec![
             Row::leaf(0, "a".into(), 10, Some(5)),
             Row::leaf(0, "b".into(), 20, Some(-50)),
             Row::leaf(0, "c".into(), 30, Some(1)),
         ];
         apply_sort(&mut rows, Sort::Growth, false);
-        assert_eq!(rows[0].label, "b");
-        assert_eq!(rows[1].label, "a");
-        assert_eq!(rows[2].label, "c");
+        assert_eq!(rows[0].label, "a", "the largest growth leads");
+        assert_eq!(rows[1].label, "c");
+        assert_eq!(
+            rows[2].label, "b",
+            "a big shrink sorts last, not first: it is not what grew"
+        );
     }
 
     #[test]
