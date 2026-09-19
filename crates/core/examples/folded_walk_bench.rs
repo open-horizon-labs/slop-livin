@@ -1,57 +1,76 @@
-//! Read-only measurement of the existing folded walk with compact entry output.
-//! Uses a disposable store outside the scanned root; does not clean artifacts.
-use std::{collections::HashMap, path::PathBuf, sync::mpsc::sync_channel, time::Instant};
+//! Same-root warm-cache comparison; no cleanup or persistent user-store writes.
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 fn main() -> anyhow::Result<()> {
     let root = std::fs::canonicalize(PathBuf::from(std::env::args_os().nth(1).expect("root")))?;
+    let repeats = std::env::args()
+        .nth(2)
+        .unwrap_or("3".into())
+        .parse::<usize>()?;
     let store = tempfile::tempdir()?;
-    let path = store.path().join("measurements.parquet");
-    let (send, recv) = sync_channel(swamp_core::folded::BATCH_ROWS);
-    let started = Instant::now();
-    let (attribution, count) = std::thread::scope(|s| -> anyhow::Result<_> {
-        let worker = s.spawn(|| {
-            swamp_core::walk::attribute_parallel_recording(
-                &root,
-                &[(&root, "bench")],
-                1,
-                u64::MAX,
-                HashMap::new(),
-                send,
-            )
-        });
-        let count = swamp_core::folded::write_measurements(&path, recv)?;
-        Ok((worker.join().unwrap(), count))
-    })?;
     println!(
-        "initial elapsed={:?} entries={count} parquet_bytes={}",
-        started.elapsed(),
-        std::fs::metadata(&path)?.len()
+        "profile={} repeats={repeats} cache=warm/order-rotated",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
-    let carry = attribution.artifacts_by_worktree["bench"]
-        .iter()
-        .filter(|a| !a.kind.is_worktree_remainder())
-        .map(|a| (a.path.clone(), a.clone()))
-        .collect();
-    let (send, recv) = sync_channel(swamp_core::folded::BATCH_ROWS);
-    let started = Instant::now();
-    let count = std::thread::scope(|s| {
-        let worker = s.spawn(|| {
-            swamp_core::walk::attribute_parallel_recording(
-                &root,
-                &[(&root, "bench")],
-                2,
-                u64::MAX,
-                carry,
-                send,
-            )
-        });
-        let count = recv.into_iter().count();
-        worker.join().unwrap();
-        count
-    });
-    anyhow::ensure!(count == 0, "unchanged folded interiors were visited");
-    println!(
-        "carried elapsed={:?} interior_entries={count} detail_bytes_written=0",
-        started.elapsed()
-    );
+    let baseline = swamp_core::walk::attribute_parallel(&root, &[(&root, "bench")], 1, u64::MAX);
+    for round in 0..repeats {
+        for slot in 0..3 {
+            let mode = (round + slot) % 3;
+            let start = Instant::now();
+            let (attribution, count, size) = if mode == 0 {
+                (
+                    swamp_core::walk::attribute_parallel(&root, &[(&root, "bench")], 1, u64::MAX),
+                    0,
+                    0,
+                )
+            } else {
+                let (send, recv) = swamp_core::folded::channel(8);
+                std::thread::scope(|s| -> anyhow::Result<_> {
+                    let worker = s.spawn(|| {
+                        swamp_core::walk::attribute_parallel_recording(
+                            &root,
+                            &[(&root, "bench")],
+                            1,
+                            u64::MAX,
+                            HashMap::new(),
+                            send,
+                        )
+                    });
+                    let path = store.path().join("measurements.parquet");
+                    let count = if mode == 1 {
+                        let mut n = 0;
+                        for entry in recv {
+                            entry.map_err(anyhow::Error::msg)?;
+                            n += 1;
+                        }
+                        n
+                    } else {
+                        swamp_core::folded::write_measurements(&path, recv)?
+                    };
+                    Ok((
+                        worker.join().unwrap(),
+                        count,
+                        if mode == 2 {
+                            std::fs::metadata(path)?.len()
+                        } else {
+                            0
+                        },
+                    ))
+                })?
+            };
+            anyhow::ensure!(
+                attribution.walked_total == baseline.walked_total,
+                "fixture changed during benchmark"
+            );
+            println!(
+                "round={round} mode={} elapsed_ms={} entries={count} parquet_bytes={size}",
+                ["walk", "collect", "persist"][mode],
+                start.elapsed().as_millis()
+            );
+        }
+    }
     Ok(())
 }

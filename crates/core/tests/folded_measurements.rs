@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::{collections::HashMap, fs, os::unix::fs::symlink, sync::mpsc::sync_channel};
+use std::{collections::HashMap, fs, os::unix::fs::symlink, sync::Arc};
 use swamp_core::{folded, walk};
 
 #[test]
@@ -13,7 +13,7 @@ fn existing_folded_walk_emits_once_and_carry_emits_nothing() -> Result<()> {
     let odd = target.join("odd");
     fs::write(&odd, b"odd")?;
     symlink(root.join("outside"), target.join("link"))?;
-    let (send, recv) = sync_channel(2);
+    let (send, recv) = swamp_core::folded::channel(2);
     let (attribution, entries) = std::thread::scope(|s| {
         let worker = s.spawn(|| {
             walk::attribute_parallel_recording(&root, &[(&root, "w")], 1, 0, HashMap::new(), send)
@@ -39,12 +39,16 @@ fn existing_folded_walk_emits_once_and_carry_emits_nothing() -> Result<()> {
         .find(|e| e.relative == b"debug/deps/b")
         .unwrap();
     assert_eq!((a.device, a.inode), (b.device, b.inode));
+    assert!(
+        Arc::ptr_eq(&a.container, &b.container),
+        "same-directory entries share container storage"
+    );
     let artifact = attribution.artifacts_by_worktree["w"]
         .iter()
         .find(|a| a.path == target)
         .unwrap()
         .clone();
-    let (send, recv) = sync_channel(2);
+    let (send, recv) = swamp_core::folded::channel(2);
     let carried = walk::attribute_parallel_recording(
         &root,
         &[(&root, "w")],
@@ -70,11 +74,49 @@ fn existing_folded_walk_emits_once_and_carry_emits_nothing() -> Result<()> {
 }
 
 #[test]
+fn batched_transfer_preserves_full_batches_tail_and_receiver_disconnect() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = fs::canonicalize(tmp.path())?;
+    let target = root.join("target");
+    fs::create_dir(&target)?;
+    for i in 0..600 {
+        fs::write(target.join(format!("{i}")), b"x")?;
+    }
+    let (send, recv) = folded::channel(1);
+    let entries = std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            walk::attribute_parallel_recording(&root, &[(&root, "w")], 1, 0, HashMap::new(), send)
+        });
+        let entries = recv.collect::<Vec<_>>();
+        worker.join().unwrap();
+        entries
+    });
+    let entries = entries
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(entries.len(), 601);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| &e.relative)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        601
+    );
+    let (send, recv) = folded::channel(1);
+    drop(recv);
+    // A failed writer must not leave worker threads blocked on a full queue.
+    walk::attribute_parallel_recording(&root, &[(&root, "w")], 1, 0, HashMap::new(), send);
+    Ok(())
+}
+
+#[test]
 fn compact_batches_use_existing_parquet_writer_and_failed_scan_is_not_published() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let file = tmp.path().join("current.parquet");
     let entry = folded::Entry {
-        container: b"target".to_vec(),
+        container: Arc::from(b"target".as_slice()),
         relative: b"debug/\xff".to_vec(),
         device: 1,
         inode: 2,
@@ -95,8 +137,28 @@ fn compact_batches_use_existing_parquet_writer_and_failed_scan_is_not_published(
     )?;
     assert_eq!(reader.metadata().num_row_groups(), 4);
     assert_eq!(reader.metadata().file_metadata().num_rows(), count as i64);
+    let first = reader.build()?.next().unwrap()?;
+    let names = first
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .unwrap();
+    assert_eq!(names.value(0), b"debug/\xff");
     let previous = fs::read(&file)?;
-    assert!(folded::write_measurements(&file, [Ok(entry), Err("lost access".into())]).is_err());
+    assert!(
+        folded::write_measurements(
+            &file,
+            (0..folded::BATCH_ROWS + 1)
+                .map(|_| Ok(entry.clone()))
+                .chain(std::iter::once(Err("lost access".into())))
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(&file)?, previous);
+    assert_eq!(
+        fs::read_dir(tmp.path())?.count(),
+        1,
+        "failed output leaves no partial file"
+    );
     Ok(())
 }

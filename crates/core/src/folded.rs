@@ -11,11 +11,74 @@ use std::{
 };
 
 pub type EntryResult = std::result::Result<Entry, String>;
-pub const BATCH_ROWS: usize = 1024;
+pub const BATCH_ROWS: usize = 16_384;
+const TRANSFER_ROWS: usize = 256;
+
+pub struct Sender(std::sync::mpsc::SyncSender<Vec<EntryResult>>);
+pub struct Receiver {
+    source: std::sync::mpsc::Receiver<Vec<EntryResult>>,
+    pending: std::vec::IntoIter<EntryResult>,
+}
+pub fn channel(capacity: usize) -> (Sender, Receiver) {
+    let (send, source) = std::sync::mpsc::sync_channel(capacity);
+    (
+        Sender(send),
+        Receiver {
+            source,
+            pending: Vec::new().into_iter(),
+        },
+    )
+}
+impl Iterator for Receiver {
+    type Item = EntryResult;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(entry) = self.pending.next() {
+                return Some(entry);
+            }
+            self.pending = self.source.recv().ok()?.into_iter();
+        }
+    }
+}
+pub(crate) struct Buffer<'a> {
+    sender: &'a Sender,
+    entries: Vec<EntryResult>,
+    pub container: Arc<[u8]>,
+}
+impl Sender {
+    pub(crate) fn for_root(&self, root: &Path) -> Buffer<'_> {
+        Buffer {
+            sender: self,
+            entries: Vec::with_capacity(TRANSFER_ROWS),
+            container: root.as_os_str().as_bytes().into(),
+        }
+    }
+}
+impl Buffer<'_> {
+    pub fn send(&mut self, entry: EntryResult) {
+        self.entries.push(entry);
+        if self.entries.len() == TRANSFER_ROWS {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        if !self.entries.is_empty() {
+            let _ = self.sender.0.send(std::mem::replace(
+                &mut self.entries,
+                Vec::with_capacity(TRANSFER_ROWS),
+            ));
+        }
+    }
+}
+impl Drop for Buffer<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    pub container: Vec<u8>,
+    pub container: Arc<[u8]>,
     pub relative: Vec<u8>,
     pub device: u64,
     pub inode: u64,
@@ -29,9 +92,9 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn measured(root: &Path, path: &Path, m: &Metadata) -> Self {
+    pub fn measured(root: &Path, path: &Path, m: &Metadata, container: Arc<[u8]>) -> Self {
         Self {
-            container: root.as_os_str().as_bytes().into(),
+            container,
             relative: path
                 .strip_prefix(root)
                 .expect("folded entry inside root")
@@ -82,7 +145,7 @@ fn schema() -> Arc<Schema> {
 fn batch(entries: &[Entry]) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(BinaryArray::from_iter_values(
-            entries.iter().map(|e| e.container.as_slice()),
+            entries.iter().map(|e| e.container.as_ref()),
         )),
         Arc::new(BinaryArray::from_iter_values(
             entries.iter().map(|e| e.relative.as_slice()),

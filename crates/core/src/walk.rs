@@ -379,7 +379,7 @@ pub mod progress {
 }
 
 struct AttrShared {
-    folded: Option<std::sync::mpsc::SyncSender<crate::folded::EntryResult>>,
+    folded: Option<crate::folded::Sender>,
     seen_inodes: ShardedInodeSet,
     artifacts_by_worktree: Mutex<HashMap<String, Vec<ArtifactRow>>>,
     source_bytes: Mutex<HashMap<String, u64>>,
@@ -459,7 +459,7 @@ pub fn attribute_parallel_recording(
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
-    folded: std::sync::mpsc::SyncSender<crate::folded::EntryResult>,
+    folded: crate::folded::Sender,
 ) -> AttributionResult {
     progress::start();
     let result = attribute_parallel_inner(
@@ -480,7 +480,7 @@ fn attribute_parallel_inner(
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
-    folded: Option<std::sync::mpsc::SyncSender<crate::folded::EntryResult>>,
+    folded: Option<crate::folded::Sender>,
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -835,10 +835,11 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
 /// as the serial `size_as_unit`, since a classified directory is sized as
 /// a best-effort unit rather than reported as a permission gap.
 fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool: &Pool<AttrJob>) {
+    let mut recording = shared.folded.as_ref().map(|s| s.for_root(&group.root_path));
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
         Err(e) => {
-            if let Some(sink) = &shared.folded {
+            if let Some(sink) = &mut recording {
                 let _ = sink.send(Err(format!("{}: {e}", path.display())));
             }
             finish_size_job(group, shared);
@@ -851,10 +852,12 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
     let directory_meta = fs::symlink_metadata(&path);
-    if let Some(sink) = &shared.folded {
+    if let Some(sink) = &mut recording {
         let result = directory_meta
             .as_ref()
-            .map(|m| crate::folded::Entry::measured(&group.root_path, &path, m))
+            .map(|m| {
+                crate::folded::Entry::measured(&group.root_path, &path, m, sink.container.clone())
+            })
             .map_err(|e| format!("{}: {e}", path.display()));
         let _ = sink.send(result);
     }
@@ -863,7 +866,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                if let Some(sink) = &shared.folded {
+                if let Some(sink) = &mut recording {
                     let _ = sink.send(Err(format!("{}: {e}", path.display())));
                 }
                 continue;
@@ -872,18 +875,23 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) => {
-                if let Some(sink) = &shared.folded {
+                if let Some(sink) = &mut recording {
                     let _ = sink.send(Err(format!("{}: {e}", entry.path().display())));
                 }
                 continue;
             }
         };
         if ft.is_symlink() {
-            if let Some(sink) = &shared.folded {
+            if let Some(sink) = &mut recording {
                 let _ = sink.send(
                     fs::symlink_metadata(entry.path())
                         .map(|m| {
-                            crate::folded::Entry::measured(&group.root_path, &entry.path(), &m)
+                            crate::folded::Entry::measured(
+                                &group.root_path,
+                                &entry.path(),
+                                &m,
+                                sink.container.clone(),
+                            )
                         })
                         .map_err(|e| e.to_string()),
                 );
@@ -900,7 +908,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             });
         } else if ft.is_file() {
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                if let Some(sink) = &shared.folded {
+                if let Some(sink) = &mut recording {
                     let _ = sink.send(Err(format!(
                         "metadata unavailable: {}",
                         entry.path().display()
@@ -908,11 +916,12 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
                 }
                 continue;
             };
-            if let Some(sink) = &shared.folded {
+            if let Some(sink) = &mut recording {
                 let _ = sink.send(Ok(crate::folded::Entry::measured(
                     &group.root_path,
                     &entry.path(),
                     &meta,
+                    sink.container.clone(),
                 )));
             }
             if meta.file_type().is_symlink() || !meta.is_file() {

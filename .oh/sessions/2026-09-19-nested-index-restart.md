@@ -252,3 +252,42 @@ million-entry scaling, retained-build validation and Linux verification remain
 required checks, NOT accepted omissions. The existing path has not failed; an
 alternative engine is not justified. No merge, release, or cleanup authorized by
 this measurement result. Scope and GBA sufficiency remain unchanged.
+
+### Execute / review — collection overhead comparison
+
+Replaced per-entry synchronized sends with directory-local transfer buffers of
+256 entries and bounded batch queues. Entries in a directory share the container
+path allocation. Parquet batches use 16,384 rows instead of 1,024. No measurements
+or precision were dropped; the format remains typed Parquet/zstd using the existing
+writer. This is still the measurement seam, not completed report/history rewiring.
+
+The benchmark now compares the same warm root across walk-only, collect-and-drain,
+and collect-and-persist modes, rotating their order. It checks attributed total
+bytes against the baseline and uses only disposable output. Real root:
+`/Users/muness1/src/open-horizon-labs/swamp`; 257,717 measured entries.
+
+Three-run wall-time medians (2026-09-19):
+
+| Version / build | Walk | Collect | Persist | Persisted bytes |
+|---|---:|---:|---:|---:|
+| Per-entry baseline, debug | 1.228s | 1.594s | 1.698s | ~13.37MB |
+| Batched, debug | 1.301s | 1.329s | 2.398s | ~10.12MB |
+| Batched, release | 1.249s | 1.219s | 1.293s | ~10.15MB |
+
+The earlier 3.25s single sample was not a comparable baseline. A run overlapping
+release compilation was excluded. Release collection is within timing noise of
+the walk; persistence overhead was ~44ms in this small warm-cache sample. No old
+release comparison or cold-filesystem-cache test was run, so neither a before/after
+release speedup nor cold-start performance is established. Larger row groups
+reduce size but regress debug persistence; do not conceal that trade-off.
+
+Risk checks: full buffers and tails preserve every path exactly once, shared
+container pointers are verified, receiver disconnection does not hang the walk,
+raw path bytes round-trip through Parquet, failed output after a flushed batch
+preserves the old file and removes its temporary file. Existing carry test still
+requires zero interior entries on an unchanged artifact. Workspace/source-audit
+checks cover compatibility, not remaining end-to-end architectural requirements.
+
+Review: aligned with reusing the existing walk/store; performance comparison is
+now meaningful at this boundary. The outstanding integration gates above remain
+required. Do not present this benchmark as a complete incremental refresh.
