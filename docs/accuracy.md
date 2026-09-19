@@ -11,7 +11,7 @@ Quoted legacy wording identifies claims corrected or removed. Other rows state t
 | Claim | Status | Evidence | Correction or disposition |
 |---|---|---|---|
 | “The only tool that combines…” / no other tool has history | Unsupported | [StorageRadar's official site](https://storageradar.app/) documents snapshot history and comparisons. No exhaustive survey supports exclusivity. | Describe swamp's combination of capabilities; remove the competitive matrix and uniqueness claim. |
-| The README's renamed v0.4.0 download URLs exist | Incorrect | [Release assets](https://github.com/open-horizon-labs/swamp/releases/tag/v0.4.0), checked through the GitHub API | Assets still use `slop-livin-0.4.0-*`. Lead with source installation; retain actual old asset names in the release instructions. |
+| The README's renamed v0.4.0 download URLs exist | Incorrect | [Release assets](https://github.com/open-horizon-labs/swamp/releases/tag/v0.4.0), checked through the GitHub API | Assets still use `slop-livin-0.4.0-*`. The install instructions now target v0.5.0, built from the renamed source; old names belong in migration notes. |
 | Rust 1.92 is the minimum supported version | Needs citation | [Workspace manifest](../Cargo.toml) and [release workflow](../.github/workflows/release.yml) do not establish a tested minimum. | Say recent stable Rust; do not invent a minimum. |
 | “Opens in milliseconds” | Unsupported | [TUI startup](../crates/tui/src/lib.rs) loads a cache when available but blocks for the initial uncached report. No general timing study was supplied. | Describe cached startup and background observation. |
 | “There are no per-file rows” | Incorrect | [Growth configuration and file storage](../crates/core/src/growth.rs), [walker](../crates/core/src/walk.rs) | Directory rollups plus selected large-file rows; default threshold 1 MiB. |
@@ -76,4 +76,4 @@ The artifact persistence issue was delegated to a Luna worker at the user's requ
 - The new artifact-history regression was observed failing without the fix and passing with it.
 - All 116 local documentation links and anchors resolved; fenced blocks, 16 shell examples, and JSON examples passed syntax checks.
 - The running MCP binary advertised the nine tools listed in the usage reference.
-- GitHub release metadata confirmed the actual v0.4.0 archive names. The release binaries were not rebuilt or republished during this work.
+- GitHub release metadata confirmed the actual v0.4.0 archive names. Those historical assets remain unchanged; v0.5.0 is the first release built from the renamed source.

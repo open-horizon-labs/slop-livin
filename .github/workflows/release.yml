@@ -127,11 +127,16 @@ jobs:
             echo
             echo "### Install (macOS, Apple silicon)"
             echo '```bash'
-            echo "curl -fsSL -o swamp.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/swamp-${v#v}-aarch64-apple-darwin.tar.gz"
-            echo "tar -xzf swamp.tar.gz && cp swamp-${v#v}-aarch64-apple-darwin/swamp* ~/.local/bin/"
-            echo "xattr -d com.apple.quarantine ~/.local/bin/swamp ~/.local/bin/swamp-mcp 2>/dev/null || true"
+            echo "archive=swamp-${v#v}-aarch64-apple-darwin"
+            echo "curl -fLO \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/\$archive.tar.gz\""
+            echo "curl -fLO \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/\$archive.tar.gz.sha256\""
+            echo 'shasum -a 256 -c "$archive.tar.gz.sha256"'
+            echo 'tar -xzf "$archive.tar.gz"'
+            echo 'mkdir -p ~/.local/bin'
+            echo 'install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/'
+            echo '~/.local/bin/swamp --version'
             echo '```'
-            echo "The binaries are not code-signed; the \`xattr\` line clears Gatekeeper's quarantine flag. Verify with the \`.sha256\` file."
+            echo "The binaries are unsigned. If macOS blocks them, verify the checksum and source before deciding whether to clear their quarantine flags. See https://github.com/${GITHUB_REPOSITORY}/blob/${v}/docs/usage.md#installing-a-release."
           } >> release-notes.md
 
       - name: Release

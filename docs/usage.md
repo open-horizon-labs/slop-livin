@@ -4,25 +4,25 @@ For the product overview, start with the [README](../README.md). This reference 
 
 ## Installing a release
 
-The supported release target is Apple silicon macOS. The [v0.4.0 assets](https://github.com/open-horizon-labs/swamp/releases/tag/v0.4.0) were published before the rename and still contain `slop-livin` binaries:
+The supported release target is Apple silicon macOS. The [v0.5.0 release](https://github.com/open-horizon-labs/swamp/releases/tag/v0.5.0) contains `swamp` and `swamp-mcp`:
 
 ```bash
-v=0.4.0
-archive="slop-livin-$v-aarch64-apple-darwin"
+v=0.5.0
+archive="swamp-$v-aarch64-apple-darwin"
 curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz"
 curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz.sha256"
 shasum -a 256 -c "$archive.tar.gz.sha256"
 tar -xzf "$archive.tar.gz"
 mkdir -p ~/.local/bin
-install -m 755 "$archive/slop-livin" "$archive/slop-livin-mcp" ~/.local/bin/
-~/.local/bin/slop-livin --version
+install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/
+~/.local/bin/swamp --version
 ```
 
-Those binaries retain their old command, store, and environment-variable names. Renaming the executable alone does not migrate them. To use the current `swamp` commands below, [build from source](../README.md#install).
-
-Release binaries are unsigned. If macOS blocks a downloaded binary with a quarantine warning, verify its checksum and source before deciding whether to clear that flag for the specific binary. The current release workflow packages future builds under the `swamp` name.
+Release binaries are unsigned. If macOS blocks a downloaded binary with a quarantine warning, verify its checksum and source before deciding whether to clear that flag for the specific binary. You can also [build from source](../README.md#build-from-source).
 
 ### Existing installations
+
+Releases through v0.4.0 contain the old `slop-livin` and `slop-livin-mcp` binaries. Install v0.5.0 rather than renaming those executables: their embedded command, store, and environment-variable names have not changed.
 
 The new defaults are `~/.local/share/swamp`, `SWAMP_DIR`, and the LaunchAgent label `com.open-horizon-labs.swamp.observe`. Existing history and schedules are not automatically migrated by the repository rename.
 

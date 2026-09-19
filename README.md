@@ -37,7 +37,22 @@ History begins with the first observation. Swamp records sizes and metadata; it 
 
 ## Install
 
-The supported platform is macOS. Published binaries target Apple silicon.
+The supported platform is macOS. Download the Apple silicon binaries from [v0.5.0](https://github.com/open-horizon-labs/swamp/releases/tag/v0.5.0):
+
+```bash
+archive=swamp-0.5.0-aarch64-apple-darwin
+curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v0.5.0/$archive.tar.gz"
+curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v0.5.0/$archive.tar.gz.sha256"
+shasum -a 256 -c "$archive.tar.gz.sha256"
+tar -xzf "$archive.tar.gz"
+mkdir -p ~/.local/bin
+install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/
+~/.local/bin/swamp --version
+```
+
+Add `~/.local/bin` to your `PATH` if needed. The binaries are unsigned. See the [installation guide](docs/usage.md#installing-a-release) for quarantine guidance and migration from the old `slop-livin` releases.
+
+### Build from source
 
 Build the current `swamp` version from source with a recent stable Rust toolchain:
 
@@ -49,8 +64,6 @@ mkdir -p ~/.local/bin
 install -m 755 target/release/swamp target/release/swamp-mcp ~/.local/bin/
 ~/.local/bin/swamp --version
 ```
-
-Add `~/.local/bin` to your `PATH` if needed. The existing [v0.4.0 release](https://github.com/open-horizon-labs/swamp/releases/tag/v0.4.0) predates the rename: its archives and binaries still use the previous name. The [installation guide](docs/usage.md#installing-a-release) covers those assets and migration of an existing installation.
 
 ## Use it
 
