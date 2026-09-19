@@ -62,10 +62,13 @@ flowchart TD
     Tracking --> Report[Assemble Report]
     History --> Report
     Report --> Cache[Cache the report]
-    Report --> Interfaces[CLI / TUI / MCP]
+    Cache --> Checkpoint[Commit replay checkpoint]
+    Checkpoint --> Interfaces[CLI / TUI / MCP]
 ```
 
 The assembly gate waits for local signals, GitHub results, ecosystem tags, and Docker results. Unavailable enrichment produces unknown facts or notes so the rest of the report can still be built. After growth annotation, tracking and time-series consumers run as sibling subscribers; the final assembler waits for both.
+
+The walk stages its replay checkpoint. Observing runs publish it only after history and report-cache writes succeed. A later consumer or cache failure leaves the prior replay anchor in place so the next run can retry that interval. This ordering is not a transaction across the legacy history tables; already-written tables may need reconciliation after a failed run.
 
 The bus uses a Tokio current-thread runtime and `join_all` for subscribers of one event. Follow-on events are dispatched depth-first in registration order. An `async` consumer is not automatically nonblocking: several call synchronous filesystem and subprocess code. Filesystem traversal and some enrichment work have their own concurrency. The bus's main benefit is explicit dependencies and separate stages, not a guarantee of parallel execution.
 

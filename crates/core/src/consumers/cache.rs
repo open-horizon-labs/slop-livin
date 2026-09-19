@@ -20,8 +20,8 @@ impl Consumer for CacheWriter {
             && ctx.observe
             && let Some(dir) = &ctx.store_dir
         {
-            let _ = crate::report::write_last_report(dir, report);
+            crate::report::write_last_report(dir, report)?;
         }
-        Ok(vec![])
+        Ok(vec![Event::ReportCached])
     }
 }

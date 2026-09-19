@@ -554,6 +554,76 @@ fn stored_event_id_is_recorded_after_an_observation() {
     );
 }
 
+#[test]
+fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
+    disable_too_soon_floor();
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("tmp store");
+    report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("baseline");
+    let device = std::os::unix::fs::MetadataExt::dev(&fs::metadata(&fx.root).unwrap());
+    let sidecar = store.path().join(device.to_string()).join("fsevents.json");
+    let before = fs::read(&sidecar).unwrap();
+    let cache = fs::read_dir(store.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("last_report-")
+        })
+        .unwrap();
+    let blocker = cache.with_extension("tmp");
+    fs::create_dir(&blocker).unwrap();
+    let source = CannedSource(incremental_plan(vec![], 77));
+    let result = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    );
+    assert!(
+        result.is_err(),
+        "cache failure must propagate rather than advance replay past uncached evidence"
+    );
+    assert_eq!(fs::read(&sidecar).unwrap(), before);
+    fs::remove_dir(blocker).unwrap();
+    report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &source,
+    )
+    .expect("retry");
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+    assert_eq!(after["event_id"], 77);
+}
+
 /// Regression for a live-run bug against `~/src`: a project whose linked
 /// worktrees live *inside* the main checkout's own directory tree (e.g.
 /// `.worktrees/<name>`, the real shape `swamp` itself uses), each

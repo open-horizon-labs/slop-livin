@@ -1959,6 +1959,9 @@ pub fn observe_tracked(
 /// is true. A `--no-observe` read must not silently advance the stored
 /// event id, or the next real observation would replay from a point it
 /// never actually walked from.
+///
+/// This low-level entry point commits after the walk. Report pipelines must use
+/// [`stage_tracked_with_source`] and commit only after their downstream writes.
 #[allow(clippy::too_many_arguments)]
 pub fn observe_tracked_with_source(
     swamp_dir: &Path,
@@ -1969,6 +1972,53 @@ pub fn observe_tracked_with_source(
     observe: bool,
     source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<TrackedWalk> {
+    let (walk, checkpoint) = stage_tracked_with_source(
+        swamp_dir,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        force_full,
+        observe,
+        source,
+    )?;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.commit()?;
+    }
+    Ok(walk)
+}
+
+/// Replay state is staged until all observation consumers have persisted their
+/// facts. Dropping this value on any later failure leaves the old replay anchor.
+pub struct ObservationCheckpoint {
+    dir: PathBuf,
+    state: Option<FsEventsState>,
+    topology: Vec<StoredWorktree>,
+    unowned: Vec<crate::report::UnownedRow>,
+}
+
+impl ObservationCheckpoint {
+    pub fn commit(self) -> Result<()> {
+        write_topology(&self.dir, &self.topology)?;
+        write_unowned(&self.dir, &self.unowned)?;
+        // Publish the replay anchor last. This is safe replay ordering, not an
+        // atomic transaction across the legacy volume-wide datasets.
+        if let Some(state) = self.state {
+            write_fsevents_state(&self.dir, &state)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_tracked_with_source(
+    swamp_dir: &Path,
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    force_full: bool,
+    observe: bool,
+    source: &dyn crate::fs_events::FsEventsSource,
+) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
     let volume_id = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
     let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
@@ -2009,26 +2059,22 @@ pub fn observe_tracked_with_source(
             "full_rules_changed"
         };
         let result = full_walk(root, observed_at, large_file_min_bytes, reason)?;
-        if observe {
-            write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
-            write_unowned(&dir, &result.attribution.unowned)?;
+        let checkpoint = observe.then(|| ObservationCheckpoint {
+            dir,
+            topology: to_stored_worktrees(&result.discovered),
+            unowned: result.attribution.unowned.clone(),
             // The stored FSEvents id/device is deliberately left as-is: a
             // forced full walk has nothing new to report there (no
             // replay ran), and an older stored id just means the next
             // real incremental attempt replays a larger, still-correct
             // window rather than a wrong one. The rules version is
             // stamped so the next call goes incremental again.
-            if rules_changed {
-                write_fsevents_state(
-                    &dir,
-                    &FsEventsState {
-                        rules_version: crate::ecosystem::RULES_VERSION,
-                        ..prev_state.clone()
-                    },
-                )?;
-            }
-        }
-        return Ok(result);
+            state: rules_changed.then(|| FsEventsState {
+                rules_version: crate::ecosystem::RULES_VERSION,
+                ..prev_state.clone()
+            }),
+        });
+        return Ok((result, checkpoint));
     }
 
     // FSEvents always answers in canonical paths (ask about `/tmp/x` on
@@ -2119,22 +2165,20 @@ pub fn observe_tracked_with_source(
         }
     };
 
-    if observe {
+    let checkpoint = observe.then(|| ObservationCheckpoint {
         // Re-anchor for the next call regardless of which path was taken.
-        write_fsevents_state(
-            &dir,
-            &FsEventsState {
-                event_id: Some(plan.current_event_id),
-                device: plan.device,
-                last_observed_at: Some(observed_at),
-                rules_version: crate::ecosystem::RULES_VERSION,
-            },
-        )?;
-        write_topology(&dir, &to_stored_worktrees(&result.discovered))?;
-        write_unowned(&dir, &result.attribution.unowned)?;
-    }
+        state: Some(FsEventsState {
+            event_id: Some(plan.current_event_id),
+            device: plan.device,
+            last_observed_at: Some(observed_at),
+            rules_version: crate::ecosystem::RULES_VERSION,
+        }),
+        topology: to_stored_worktrees(&result.discovered),
+        unowned: result.attribution.unowned.clone(),
+        dir,
+    });
 
-    Ok(result)
+    Ok((result, checkpoint))
 }
 
 /// Translates a canonical path (as FSEvents reports it) back into the

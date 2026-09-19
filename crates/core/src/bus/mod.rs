@@ -104,6 +104,7 @@ pub enum EventKind {
     TrackingAnnotated,
     HistoryLoaded,
     ReportAssembled,
+    ReportCached,
     /// Test-only traffic for the bus's own tests; no builtin subscribes.
     Probe,
 }
@@ -164,6 +165,9 @@ pub enum Event {
         window_secs: u64,
     },
     ReportAssembled(Arc<Report>),
+    /// All observation/history consumers and the rebuildable report cache have
+    /// completed successfully. Only now may the walk advance its replay anchor.
+    ReportCached,
     Probe {
         tag: String,
         depth: u8,
@@ -186,6 +190,7 @@ impl Event {
             Event::TrackingAnnotated(_) => EventKind::TrackingAnnotated,
             Event::HistoryLoaded { .. } => EventKind::HistoryLoaded,
             Event::ReportAssembled(_) => EventKind::ReportAssembled,
+            Event::ReportCached => EventKind::ReportCached,
             Event::Probe { .. } => EventKind::Probe,
         }
     }
@@ -230,7 +235,7 @@ impl EventBus {
         use crate::consumers::*;
         let mut bus = EventBus::new();
         for c in [
-            Box::new(WalkConsumer) as Box<dyn Consumer>,
+            Box::new(WalkConsumer::default()) as Box<dyn Consumer>,
             Box::new(ProjectsConsumer),
             Box::new(SignalsConsumer),
             Box::new(EcosystemConsumer),
