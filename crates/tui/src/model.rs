@@ -117,6 +117,11 @@ pub struct Row {
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
     pub expandable: bool,
+    /// Set on a projects-view row: the project's own name (not its
+    /// display name), so marking can expand the row into that project's
+    /// artifacts without parsing the rendered label back into an
+    /// identity.
+    pub project: Option<String>,
 }
 
 impl Row {
@@ -138,6 +143,7 @@ impl Row {
             mtime_max: 0,
             collapsed_children: None,
             expandable: false,
+            project: None,
         }
     }
 }
@@ -508,6 +514,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             mtime_max,
             collapsed_children: None,
             expandable: true,
+            project: Some(p.name.clone()),
         });
     }
     out
@@ -607,6 +614,7 @@ pub fn tree_rows(
             mtime_max: 0,
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
+            project: None,
         });
         if is_collapsed {
             continue;
@@ -773,6 +781,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             mtime_max: 0,
             collapsed_children: None,
             expandable: false,
+            project: None,
         })
         .collect()
 }

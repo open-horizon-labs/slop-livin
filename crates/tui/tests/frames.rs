@@ -385,6 +385,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         mtime_max: 0,
         collapsed_children: None,
         expandable: false,
+        project: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [

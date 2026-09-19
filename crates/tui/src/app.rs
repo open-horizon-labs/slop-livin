@@ -624,6 +624,14 @@ impl App {
         let mut marked = 0usize;
         for row in rows {
             let Some(kind) = row.kind.clone() else {
+                // Projects view: each row stands for a whole project.
+                if let Some(project) = row.project.clone() {
+                    let n = self.mark_project(&project);
+                    if n == 0 {
+                        refused = refused.or(Some("nothing reclaimable in this project"));
+                    }
+                    marked += n;
+                }
                 continue;
             };
             match crate::units::markable(&kind) {
@@ -650,6 +658,60 @@ impl App {
         self.mark_row(&row);
     }
 
+    /// Mark every reclaimable artifact in one project: dependency
+    /// trees, build output, caches, and its Docker objects. The
+    /// checkout, its `.git`, and its source tree are never included —
+    /// removing those is a deliberate act one level in, on the row that
+    /// names the worktree and carries its dirty/unpushed warnings.
+    ///
+    /// The project's own filter state is deliberately not applied: the
+    /// projects row shows the project's whole size, so marking it acts
+    /// on the whole project rather than on whatever the current filter
+    /// happens to show. Returns how many units it newly marked; a second
+    /// press on a fully marked project clears it and returns 0.
+    fn mark_project(&mut self, project: &str) -> usize {
+        let units: Vec<Row> = model::tree_rows(
+            &self.report,
+            project,
+            &Filter::default(),
+            &std::collections::HashSet::new(),
+            &self.track,
+        )
+        .into_iter()
+        .filter(|r| {
+            r.unit.is_some()
+                && r.kind
+                    .as_ref()
+                    .is_some_and(|k| crate::units::markable(k).is_ok())
+        })
+        .collect();
+        if units.is_empty() {
+            return 0;
+        }
+        let marked_already = |app: &Self, r: &Row| {
+            r.unit
+                .as_ref()
+                .is_some_and(|u| app.marked.contains_key(&u.0))
+        };
+        if units.iter().all(|r| marked_already(self, r)) {
+            for r in &units {
+                if let Some(u) = &r.unit {
+                    self.marked.remove(&u.0);
+                }
+            }
+            return 0;
+        }
+        let mut newly = 0usize;
+        for r in units {
+            if marked_already(self, &r) {
+                continue;
+            }
+            self.mark_row(&r);
+            newly += 1;
+        }
+        newly
+    }
+
     /// The mark decision for one row (testable without a selection).
     ///
     /// Anything with a path can be marked: an artifact, a Source
@@ -660,6 +722,15 @@ impl App {
     /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
         let Some(unit_id) = row.unit.clone() else {
+            // A projects-view row is a whole project rather than one
+            // path. Marking it means marking what that project can give
+            // back, so the human does not have to open it first.
+            if let Some(project) = row.project.clone() {
+                if self.mark_project(&project) == 0 {
+                    self.set_refusal("nothing reclaimable in this project");
+                }
+                return;
+            }
             self.set_refusal("nothing to delete on this row");
             return;
         };
@@ -1155,6 +1226,43 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
         }
+    }
+
+    #[test]
+    fn a_project_row_marks_the_projects_artifacts_without_entering_it() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        assert_eq!(app.view, ViewKind::Projects);
+        app.selected = 0;
+        app.mark_selected();
+        assert!(
+            app.refusal_active().is_none(),
+            "a project row is actionable from the projects view"
+        );
+        assert!(!app.marked.is_empty(), "the project's artifacts are marked");
+        assert!(
+            app.marked.keys().any(|k| k.ends_with("node_modules")),
+            "the dependency tree is included: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !app.marked.keys().any(|k| k.ends_with("/src")),
+            "the source tree is not: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        // A second press clears the project rather than re-marking it.
+        app.mark_selected();
+        assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn backspace_on_a_project_row_opens_one_confirm() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.selected = 0;
+        app.delete_here();
+        assert!(app.confirm_open, "Backspace asks once for the whole project");
+        assert!(!app.marked.is_empty());
     }
 
     #[test]

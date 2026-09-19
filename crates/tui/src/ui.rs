@@ -516,7 +516,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "  Space     mark / unmark the row
   A         mark every row here the tool can act on
-  Backspace delete what is under the cursor (or the marks), asks once",
+  Backspace delete what is under the cursor (or the marks), asks once
+            on a project row, that is every artifact it holds; its checkout, .git and source stay",
         ),
         Line::from(
             "            paths go to Trash; docker images and volumes are removed by the daemon and do not",
