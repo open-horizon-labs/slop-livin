@@ -55,6 +55,21 @@ pub const DEFAULT_OBSERVE_TIMEOUT_SEC: u64 = crate::schedule::DEFAULT_OBSERVE_TI
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
+fn should_compact(files: &[PathBuf]) -> bool {
+    if files.len() > COMPACTION_THRESHOLD {
+        return true;
+    }
+    // Amortize repeated schema/footer costs for tiny reverse deltas, without
+    // repeatedly merging large history runs on every observation.
+    files.len() >= 8
+        && files
+            .iter()
+            .try_fold(0u64, |n, p| {
+                fs::metadata(p).map(|m| n.saturating_add(m.len()))
+            })
+            .is_ok_and(|bytes| bytes <= 128 * 1024)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrowthConfig {
     pub retention_days: u64,
@@ -167,7 +182,7 @@ fn row_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &str) -> S
 /// One stored row. Used both for `current.parquet` (where `bytes`/
 /// `present` are the latest known value) and for delta files (where they
 /// are the *previous* value, before the observation at `observed_at`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredRow {
     project_id: String,
     worktree_id: String,
@@ -228,7 +243,7 @@ pub(crate) fn write_parquet_batches_atomic(
     batches: impl IntoIterator<Item = Result<RecordBatch>>,
     zstd_level: i32,
 ) -> Result<()> {
-    let properties = zstd_properties(zstd_level);
+    let properties = zstd_properties(&schema, zstd_level);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -375,17 +390,7 @@ fn deltas_dir(dir: &Path) -> PathBuf {
 }
 
 fn list_delta_files(dir: &Path) -> Vec<PathBuf> {
-    let dir = deltas_dir(dir);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
-        .collect();
-    files.sort();
-    files
+    list_files_in(&deltas_dir(dir))
 }
 
 fn next_delta_path(dir: &Path) -> PathBuf {
@@ -790,7 +795,7 @@ fn growth_since(history: &[(u64, u64, bool)], bytes_now: u64, target_time: u64) 
 /// [`COMPACTION_THRESHOLD`].
 fn compact_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let files = list_delta_files(dir);
-    if files.len() <= COMPACTION_THRESHOLD {
+    if !should_compact(&files) {
         return Ok(());
     }
     let retention_secs = retention_days.saturating_mul(86400);
@@ -804,12 +809,28 @@ fn compact_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
             }
         }
     }
+    if !merged.is_empty() {
+        merged.sort_by(|a, b| {
+            (
+                &a.project_id,
+                &a.worktree_id,
+                &a.kind,
+                &a.rel_path,
+                a.observed_at,
+            )
+                .cmp(&(
+                    &b.project_id,
+                    &b.worktree_id,
+                    &b.kind,
+                    &b.rel_path,
+                    b.observed_at,
+                ))
+        });
+        write_rows(&next_delta_path(dir), &merged)?;
+    }
+    // Publish the completed replacement before retiring any source file.
     for path in &files {
         fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    }
-    if !merged.is_empty() {
-        merged.sort_by_key(|r| r.observed_at);
-        write_rows(&next_delta_path(dir), &merged)?;
     }
     Ok(())
 }
@@ -957,6 +978,7 @@ fn list_files_in(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .filter(|p| p.is_file())
         .collect();
     files.sort();
     files
@@ -978,7 +1000,7 @@ fn next_seq_path(dir: &Path, prefix: &str) -> PathBuf {
     dir.join(format!("{prefix}{next_seq:012}.parquet"))
 }
 
-fn zstd_properties(level: i32) -> WriterProperties {
+fn default_zstd_properties(level: i32) -> WriterProperties {
     let level = ZstdLevel::try_new(level).unwrap_or_default();
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
@@ -986,9 +1008,48 @@ fn zstd_properties(level: i32) -> WriterProperties {
         .build()
 }
 
+/// Preserve values exactly while avoiding dictionaries for high-cardinality
+/// paths/numbers. Low-cardinality identity and role strings keep dictionaries.
+fn zstd_properties(schema: &Schema, level: i32) -> WriterProperties {
+    // Real-store comparisons found the established encodings smaller for the
+    // folded current/delta tables. Specialize only the new entry measurements.
+    if schema.field_with_name("inode").is_err() {
+        return default_zstd_properties(level);
+    }
+    use parquet::{basic::Encoding, schema::types::ColumnPath};
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(level).unwrap_or_default(),
+        ))
+        .set_writer_version(WriterVersion::PARQUET_2_0);
+    for field in schema.fields() {
+        let encoding = match field.data_type() {
+            DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64 => {
+                Some(Encoding::DELTA_BINARY_PACKED)
+            }
+            DataType::Utf8 | DataType::Binary
+                if matches!(
+                    field.name().as_str(),
+                    "rel_path" | "parent_rel_path" | "relative"
+                ) =>
+            {
+                Some(Encoding::DELTA_BYTE_ARRAY)
+            }
+            _ => None,
+        };
+        if let Some(encoding) = encoding {
+            let column = ColumnPath::from(field.name().as_str());
+            builder = builder
+                .set_column_dictionary_enabled(column.clone(), false)
+                .set_column_encoding(column, encoding);
+        }
+    }
+    builder.build()
+}
+
 // --- dirs.parquet ---
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredDirRow {
     worktree_id: String,
     rel_path: String,
@@ -1325,7 +1386,7 @@ pub fn observe_and_annotate_dirs(
 fn compact_dir_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let deltas_dir_path = dirs_deltas_dir(dir);
     let files = list_files_in(&deltas_dir_path);
-    if files.len() <= COMPACTION_THRESHOLD {
+    if !should_compact(&files) {
         return Ok(());
     }
     let retention_secs = retention_days.saturating_mul(86400);
@@ -1338,23 +1399,29 @@ fn compact_dir_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Re
             }
         }
     }
-    for path in &files {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    }
     if !merged.is_empty() {
-        merged.sort_by_key(|r| r.observed_at);
+        merged.sort_by(|a, b| {
+            (&a.worktree_id, &a.rel_path, a.observed_at).cmp(&(
+                &b.worktree_id,
+                &b.rel_path,
+                b.observed_at,
+            ))
+        });
         write_dir_rows(
             &next_seq_path(&deltas_dir_path, "delta-"),
             &merged,
             DIR_DELTA_ZSTD_LEVEL,
         )?;
     }
+    for path in &files {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
     Ok(())
 }
 
 // --- files.parquet ---
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredFileRow {
     worktree_id: String,
     rel_path: String,
@@ -1582,7 +1649,7 @@ pub fn observe_and_annotate_files(
 fn compact_file_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let deltas_dir_path = files_deltas_dir(dir);
     let files = list_files_in(&deltas_dir_path);
-    if files.len() <= COMPACTION_THRESHOLD {
+    if !should_compact(&files) {
         return Ok(());
     }
     let retention_secs = retention_days.saturating_mul(86400);
@@ -1595,16 +1662,22 @@ fn compact_file_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> R
             }
         }
     }
-    for path in &files {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    }
     if !merged.is_empty() {
-        merged.sort_by_key(|r| r.observed_at);
+        merged.sort_by(|a, b| {
+            (&a.worktree_id, &a.rel_path, a.observed_at).cmp(&(
+                &b.worktree_id,
+                &b.rel_path,
+                b.observed_at,
+            ))
+        });
         write_file_rows(
             &next_seq_path(&deltas_dir_path, "delta-"),
             &merged,
             DIR_DELTA_ZSTD_LEVEL,
         )?;
+    }
+    for path in &files {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
 }
@@ -3165,6 +3238,343 @@ fn apply_incremental(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
+        use super::*;
+        for artifact in [true, false] {
+            let tmp = tempfile::tempdir()?;
+            let dir = tmp.path();
+            let delta_dir = if artifact {
+                deltas_dir(dir)
+            } else {
+                files_deltas_dir(dir)
+            };
+            for i in 0..8 {
+                let path = next_seq_path(&delta_dir, "delta-");
+                if artifact {
+                    write_rows(
+                        &path,
+                        &[StoredRow {
+                            project_id: "p".into(),
+                            worktree_id: "w".into(),
+                            kind: "BuildOutput".into(),
+                            rel_path: "target".into(),
+                            bytes: i,
+                            local_bytes: i,
+                            mtime_max: i,
+                            hardlinked: false,
+                            present: i % 2 == 0,
+                            observed_at: i,
+                            regrowth_count: i as u32,
+                        }],
+                    )?;
+                } else {
+                    write_file_rows(
+                        &path,
+                        &[StoredFileRow {
+                            worktree_id: "w".into(),
+                            rel_path: "a".into(),
+                            allocated: i,
+                            mod_time_min: i as i32,
+                            observed_at: i,
+                        }],
+                        3,
+                    )?;
+                }
+            }
+            let files = list_files_in(&delta_dir);
+            let contents = files
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let blocker = next_seq_path(&delta_dir, "delta-");
+            fs::create_dir(&blocker)?;
+            let result = if artifact {
+                compact_if_needed(dir, 30, 100)
+            } else {
+                compact_file_deltas_if_needed(dir, 30, 100)
+            };
+            assert!(result.is_err());
+            for (p, b) in files.iter().zip(&contents) {
+                assert_eq!(&fs::read(p)?, b);
+            }
+            fs::remove_dir(blocker)?; // empty directory belonging to this fixture
+            if artifact {
+                let expected = files
+                    .iter()
+                    .map(|p| read_rows(p))
+                    .collect::<Result<Vec<_>>>()?
+                    .concat();
+                compact_if_needed(dir, 30, 100)?;
+                let after = list_files_in(&delta_dir);
+                assert_eq!(after.len(), 1);
+                assert_eq!(read_rows(&after[0])?, expected);
+            } else {
+                let expected = files
+                    .iter()
+                    .map(|p| read_file_rows(p))
+                    .collect::<Result<Vec<_>>>()?
+                    .concat();
+                compact_file_deltas_if_needed(dir, 30, 100)?;
+                let after = list_files_in(&delta_dir);
+                assert_eq!(after.len(), 1);
+                assert_eq!(read_file_rows(&after[0])?, expected);
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn small_delta_compaction_is_lossless_and_publication_failure_keeps_sources()
+    -> anyhow::Result<()> {
+        use super::*;
+        for fail in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let dir = tmp.path();
+            let mut expected = Vec::new();
+            for i in 0..8 {
+                let row = StoredDirRow {
+                    worktree_id: "w".into(),
+                    rel_path: "target/debug".into(),
+                    parent_rel_path: Some("target".into()),
+                    allocated_total: i * 4096,
+                    own_allocated: i * 512,
+                    file_count: i as u32,
+                    entry_count: i as u32 + 1,
+                    symlink_count: 0,
+                    mod_time_min: i as i32,
+                    complete: i % 2 == 0,
+                    observed_at: 100 + i,
+                };
+                write_dir_rows(
+                    &next_seq_path(&dirs_deltas_dir(dir), "delta-"),
+                    std::slice::from_ref(&row),
+                    3,
+                )?;
+                expected.push(row);
+            }
+            let before = list_files_in(&dirs_deltas_dir(dir));
+            let bytes: u64 = before.iter().map(|p| fs::metadata(p).unwrap().len()).sum();
+            let contents = before
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            if fail {
+                fs::create_dir(next_seq_path(&dirs_deltas_dir(dir), "delta-"))?;
+                assert!(compact_dir_deltas_if_needed(dir, 30, 200).is_err());
+                for (path, content) in before.iter().zip(contents) {
+                    assert_eq!(fs::read(path)?, content);
+                }
+            } else {
+                compact_dir_deltas_if_needed(dir, 30, 200)?;
+                let after = list_files_in(&dirs_deltas_dir(dir));
+                assert_eq!(after.len(), 1);
+                let restored = read_dir_rows(&after[0])?;
+                assert_eq!(
+                    expected, restored,
+                    "all metadata, coverage and timestamps must survive"
+                );
+                assert!(fs::metadata(&after[0])?.len() < bytes / 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "read-only real-store delta packing comparison; set SWAMP_ENCODING_INPUT"]
+    fn compare_real_delta_packing() -> anyhow::Result<()> {
+        use super::*;
+        let source =
+            PathBuf::from(std::env::var_os("SWAMP_ENCODING_INPUT").context("input required")?);
+        let tmp = tempfile::tempdir()?;
+        for volume in fs::read_dir(source)? {
+            let volume = volume?;
+            if !volume.file_type()?.is_dir() {
+                continue;
+            }
+            let dest = tmp.path().join(volume.file_name());
+            fs::create_dir(&dest)?;
+            for name in ["deltas", "dirs_deltas", "files_deltas"] {
+                let inputs = list_files_in(&volume.path().join(name));
+                if inputs.is_empty() {
+                    continue;
+                }
+                fs::create_dir_all(dest.join(name))?;
+                let before: u64 = inputs.iter().map(|p| fs::metadata(p).unwrap().len()).sum();
+                for p in &inputs {
+                    fs::copy(p, dest.join(name).join(p.file_name().unwrap()))?;
+                }
+                match name {
+                    "deltas" => {
+                        let mut expected = Vec::new();
+                        for p in &inputs {
+                            expected.extend(read_rows(p)?);
+                        }
+                        expected.sort_by_key(|r| format!("{:?}", r));
+                        compact_if_needed(&dest, u64::MAX, 0)?;
+                        let mut actual = Vec::new();
+                        for p in list_files_in(&dest.join(name)) {
+                            actual.extend(read_rows(&p)?);
+                        }
+                        actual.sort_by_key(|r| format!("{:?}", r));
+                        assert_eq!(expected, actual);
+                    }
+                    "dirs_deltas" => {
+                        let mut expected = Vec::new();
+                        for p in &inputs {
+                            expected.extend(read_dir_rows(p)?);
+                        }
+                        expected.sort_by_key(|r| format!("{:?}", r));
+                        compact_dir_deltas_if_needed(&dest, u64::MAX, 0)?;
+                        let mut actual = Vec::new();
+                        for p in list_files_in(&dest.join(name)) {
+                            actual.extend(read_dir_rows(&p)?);
+                        }
+                        actual.sort_by_key(|r| format!("{:?}", r));
+                        assert_eq!(expected, actual);
+                    }
+                    _ => {
+                        let mut expected = Vec::new();
+                        for p in &inputs {
+                            expected.extend(read_file_rows(p)?);
+                        }
+                        expected.sort_by_key(|r| format!("{:?}", r));
+                        compact_file_deltas_if_needed(&dest, u64::MAX, 0)?;
+                        let mut actual = Vec::new();
+                        for p in list_files_in(&dest.join(name)) {
+                            actual.extend(read_file_rows(&p)?);
+                        }
+                        actual.sort_by_key(|r| format!("{:?}", r));
+                        assert_eq!(expected, actual);
+                    }
+                }
+                let after: u64 = list_files_in(&dest.join(name))
+                    .iter()
+                    .map(|p| fs::metadata(p).unwrap().len())
+                    .sum();
+                println!(
+                    "{}/{name}: before={before} after={after}",
+                    volume.file_name().to_string_lossy()
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "read-only real-store comparison; set SWAMP_ENCODING_INPUT"]
+    fn compare_real_store_encoding() -> anyhow::Result<()> {
+        use super::*;
+        fn collect(path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    collect(&entry.path(), out)?;
+                } else if entry.path().extension().is_some_and(|x| x == "parquet") {
+                    out.push(entry.path());
+                }
+            }
+            Ok(())
+        }
+        let source = PathBuf::from(
+            std::env::var_os("SWAMP_ENCODING_INPUT").context("SWAMP_ENCODING_INPUT required")?,
+        );
+        let tmp = tempfile::tempdir()?;
+        let mut files = Vec::new();
+        collect(&source, &mut files)?;
+        let (mut old_total, mut new_total) = (0, 0);
+        for (i, path) in files.iter().enumerate() {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
+                .with_batch_size(1_000_000)
+                .build()?;
+            let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+            if batches.is_empty() {
+                continue;
+            }
+            let schema = batches[0].schema();
+            let out = tmp.path().join(format!("{i}.parquet"));
+            let level = if path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("delta")
+            {
+                3
+            } else {
+                9
+            };
+            write_parquet_batches_atomic(&out, schema, batches.iter().cloned().map(Ok), level)?;
+            let restored = ParquetRecordBatchReaderBuilder::try_new(File::open(&out)?)?
+                .with_batch_size(1_000_000)
+                .build()?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert_eq!(batches, restored, "{}", path.display());
+            let old = fs::metadata(path)?.len();
+            let new = fs::metadata(&out)?.len();
+            old_total += old;
+            new_total += new;
+            println!(
+                "{} old={old} new={new}",
+                path.strip_prefix(&source)?.display()
+            );
+        }
+        println!("total old={old_total} new={new_total}");
+        Ok(())
+    }
+
+    #[test]
+    fn column_encoding_preserves_integer_extremes_and_reduces_path_storage() -> anyhow::Result<()> {
+        use super::*;
+        let tmp = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rel_path", DataType::Utf8, false),
+            Field::new("inode", DataType::UInt64, false),
+            Field::new("time", DataType::Int64, false),
+        ]));
+        let count = 20_000;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values((0..count).map(|i| {
+                    format!("target/debug/incremental/shared-prefix/crate-{i:08}/state")
+                }))),
+                Arc::new(UInt64Array::from_iter_values((0..count).map(|i| {
+                    if i % 2 == 0 {
+                        u64::MAX - i as u64
+                    } else {
+                        i as u64
+                    }
+                }))),
+                Arc::new(arrow_array::Int64Array::from_iter_values((0..count).map(
+                    |i| {
+                        if i % 2 == 0 {
+                            i64::MIN + i as i64
+                        } else {
+                            i64::MAX - i as i64
+                        }
+                    },
+                ))),
+            ],
+        )?;
+        let old = tmp.path().join("old.parquet");
+        let mut writer = ArrowWriter::try_new(
+            File::create(&old)?,
+            schema.clone(),
+            Some(default_zstd_properties(3)),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let new = tmp.path().join("new.parquet");
+        write_parquet_atomic(&new, schema, &batch, 3)?;
+        let restored = ParquetRecordBatchReaderBuilder::try_new(File::open(&new)?)?
+            .with_batch_size(count)
+            .build()?
+            .next()
+            .unwrap()?;
+        assert_eq!(batch, restored);
+        assert!(fs::metadata(&new)?.len() < fs::metadata(&old)?.len());
+        Ok(())
+    }
     use super::*;
 
     #[test]

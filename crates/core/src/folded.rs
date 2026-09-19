@@ -195,6 +195,11 @@ pub fn write_measurements(
         if rows.is_empty() {
             None
         } else {
+            // Prefix encoding works on adjacent paths. Sorting is bounded to
+            // one batch and does not require materializing the whole tree.
+            rows.sort_unstable_by(|a, b| {
+                (&a.container, &a.relative).cmp(&(&b.container, &b.relative))
+            });
             count += rows.len();
             Some(batch(&rows))
         }

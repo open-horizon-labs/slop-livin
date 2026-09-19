@@ -291,3 +291,58 @@ checks cover compatibility, not remaining end-to-end architectural requirements.
 Review: aligned with reusing the existing walk/store; performance comparison is
 now meaningful at this boundary. The outstanding integration gates above remain
 required. Do not present this benchmark as a complete incremental refresh.
+
+### Execute / review — storage overhead, 2026-09-19
+
+Kept the existing Parquet/zstd current + reverse-delta model. The byte/presence
+delta selection was already sparse by row; directory/file deltas can also record
+metadata changes. This change does not discard those fields or coarsen precision.
+
+Tested a global encoding change on temporary copies of the real store. It made
+the existing Parquet files larger (1,544,230 -> 1,579,769 bytes), so it was rejected
+for existing schemas. Preserve their established settings. The new raw entry
+measurement schema uses sorted bounded batches, delta-encoded integers and path
+prefixes, retaining every field and nanosecond timestamp. One debug measurement
+fell from ~10.15MB to 7,762,671 bytes for 257,733 entries. This remains a full entry
+measurement dump, not the final folded historical index or an acceptable substitute
+for the pending report/history integration.
+
+Release confirmation (three warm-cache, order-rotated rounds; compilation excluded):
+257,733 entries, median plain walk 1,114ms, collection 1,169ms, persistence 1,195ms;
+median output 7,762,356 bytes. Persistence adds 81ms against the same-run walk
+median. This small sample establishes neither cold performance nor full-report
+refresh performance; the persisted data is still the raw measurement dump.
+
+General storage improvement: compact eight small delta files when their combined
+size is <=128KiB, in addition to the existing >20-file trigger. Group rows by
+identity/time to improve locality. On copied real data, retaining every row:
+
+| Delta family | Before | After |
+|---|---:|---:|
+| 16777231 artifact deltas | 61,177 B | 4,412 B |
+| 16777231 directory deltas | 109,415 B | 17,005 B |
+| 16777235 artifact deltas (below threshold) | 5,727 B | unchanged |
+| 16777235 directory deltas (below threshold) | 10,846 B | unchanged |
+
+The first two families shrink 87.4% combined, by amortizing repeated schema,
+footer and compression costs, not dropping observations. This is not an 87%
+reduction of the whole store. Existing current snapshots and user data were not
+rewritten. Real-store comparisons are ignored diagnostic tests requiring explicit
+SWAMP_ENCODING_INPUT; all output goes into temporary directories.
+
+Compaction previously deleted source files before writing their replacement.
+All three families now publish the completed replacement first. Failure-injection
+fixtures block publication and assert source bytes survive, then remove the fixture
+blocker and verify every restored field exactly. This is not a complete transaction
+or concurrent-writer fix: interruption during input retirement can leave duplicates.
+
+Checks include UInt64/Int64 extreme-value round trips (no truncation), raw name
+bytes, all prior growth/history and no-op tests, small-delta size reduction, exact
+real-row equivalence, and publication failure for artifact/directory/file deltas.
+No SQLite, new storage engine, migration operation, or deletion of real artifacts.
+
+Remaining schema-level decisions: separate ephemeral cleanup rechecks from retained
+facts; fold small interiors using the existing observation contract; avoid storing
+container/parent identity repeatedly; preserve all promised deleted-file history.
+Do not silently achieve a size target by weakening that contract. Existing global
+history rewrite/read granularity and rich-report integration remain unresolved.
