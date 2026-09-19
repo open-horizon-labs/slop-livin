@@ -436,6 +436,12 @@ fn parse_container_inspect(entry: &serde_json::Value) -> ContainerFact {
 /// name.
 fn join_containers(facts: &mut DockerFacts, containers: &[ContainerFact]) {
     for c in containers {
+        // A container the daemon gave us no name for tells the human
+        // nothing, and rendered it as an empty `()` in the list of what
+        // holds an image. Skip it rather than print a blank.
+        if c.name.trim().is_empty() {
+            continue;
+        }
         let container_ref = ContainerRef {
             name: c.name.clone(),
             state: c.state.clone(),
