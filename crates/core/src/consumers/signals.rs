@@ -75,7 +75,17 @@ impl Consumer for SignalsConsumer {
                         .map(|s| s.value == "locked"),
                     idle_for_secs: w.idle_secs,
                 };
-                let (rows, raw) = crate::signals::age_signals(&w.signals, &raw, elapsed);
+                // The gate appends `merge_complete` and `pull_request`
+                // from the GitHub facts every run. Carrying a previous
+                // report's rows forward wholesale re-adds them, and the
+                // worktree line printed each one twice.
+                let previous: Vec<crate::report::Signal> = w
+                    .signals
+                    .iter()
+                    .filter(|s| s.name != "merge_complete" && s.name != "pull_request")
+                    .cloned()
+                    .collect();
+                let (rows, raw) = crate::signals::age_signals(&previous, &raw, elapsed);
                 by_worktree.insert(
                     id.clone(),
                     WorktreeSignals {
