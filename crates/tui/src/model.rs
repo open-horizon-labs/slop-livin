@@ -109,7 +109,7 @@ pub struct Row {
     pub series: Option<Vec<Option<u64>>>,
     /// Glyph badges drawn before the name: ecosystem glyphs, 🐳 when the
     /// project has Docker objects joined, 🔨 when it holds build output,
-    /// ⎇N for N linked worktrees. Empty for rows without facts to badge.
+    /// ⎇ N for N linked worktrees. Empty for rows without facts to badge.
     pub badges: String,
     /// Ecosystem tags, for the type sort.
     pub ecosystems: Vec<String>,
@@ -195,7 +195,12 @@ pub fn badges(
         b.push('🔨');
     }
     if linked_worktrees > 0 {
-        b.push_str(&format!("⎇{linked_worktrees}"));
+        if !b.is_empty() {
+            b.push(' ');
+        }
+        // Give the branching glyph breathing room: terminal fonts can
+        // overhang its cell and crowd the first digit, especially in bold.
+        b.push_str(&format!("⎇ {linked_worktrees}"));
     }
     b
 }
@@ -1053,6 +1058,18 @@ impl RawWorktreeSignals for swamp_core::report::WorktreeRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_badges_separate_glyphs_from_multi_digit_counts() {
+        assert_eq!(badges(&[], false, false, 0), "");
+        assert_eq!(badges(&[], false, true, 0), "🔨");
+        for count in [1, 9, 10, 12, 99, 100] {
+            assert_eq!(badges(&[], false, false, count), format!("⎇ {count}"));
+            let badge = badges(&[], false, true, count);
+            assert_eq!(badge, format!("🔨 ⎇ {count}"));
+            assert_eq!(display_width(&badge), 5 + count.to_string().len());
+        }
+    }
 
     #[test]
     fn human_bytes_formats_units() {

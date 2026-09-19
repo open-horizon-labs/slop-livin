@@ -554,7 +554,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "        💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue",
         ),
-        Line::from("        🔨 has build output   ⎇N  N linked worktrees"),
+        Line::from("        🔨 has build output   ⎇ N  N linked worktrees"),
     ];
     let block = Block::default()
         .borders(Borders::ALL)

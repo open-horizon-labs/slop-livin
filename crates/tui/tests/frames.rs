@@ -174,6 +174,30 @@ fn projects_view() {
 }
 
 #[test]
+fn worktree_counts_have_room_in_project_rows() {
+    for count in [1, 12, 100] {
+        let mut report = fixture_report();
+        let project = &mut report.projects[0];
+        for index in 0..count {
+            let mut linked = project.worktrees[0].clone();
+            linked.worktree_id = format!("linked-{index}");
+            linked.path = format!("/Users/dev/worktrees/mole-{index}").into();
+            linked.kind = WorktreeKind::Linked;
+            linked.artifacts.clear();
+            project.worktrees.push(linked);
+        }
+        let mut app = App::new(report, "/Users/dev/src".into());
+        for selected in [0, 1] {
+            app.selected = selected;
+            for (w, h) in [(80, 24), (200, 60)] {
+                let frame = capture(&app, w, h);
+                assert!(frame.contains(&format!("mole  🔨 ⎇ {count}")), "{frame}");
+            }
+        }
+    }
+}
+
+#[test]
 fn tree_view() {
     for (w, h) in [(80, 24), (200, 60)] {
         let mut app = App::new(fixture_report(), "/Users/dev/src".into());
