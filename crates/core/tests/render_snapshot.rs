@@ -4,16 +4,16 @@
 //! "0" rather than crashing or sorting as null, and unowned aggregation
 //! by top-level directory/reason with shared caches split out.
 
-use slop_livin_core::entities::Confidence;
-use slop_livin_core::render::{
+use std::path::PathBuf;
+use swamp_core::entities::Confidence;
+use swamp_core::render::{
     render_kinds, render_overview, render_project, render_project_tree, render_view_builds,
     render_view_docker, render_worktrees,
 };
-use slop_livin_core::report::{
+use swamp_core::report::{
     ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Report, Signal, Source, UnownedReason,
     UnownedRow, WorktreeKind, WorktreeRow,
 };
-use std::path::PathBuf;
 
 fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> ArtifactRow {
     ArtifactRow {
@@ -422,7 +422,7 @@ fn worktrees_view_shows_removal_hint_only_for_linked() {
         merge_complete: None,
         idle_secs: None,
     });
-    let text = render_worktrees(&report, &slop_livin_core::filter::Filter::default());
+    let text = render_worktrees(&report, &swamp_core::filter::Filter::default());
     assert!(
         text.contains("git worktree remove /src/big-grower/.worktrees/store"),
         "expected removal command for the linked worktree, got: {text}"

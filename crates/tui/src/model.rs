@@ -3,15 +3,15 @@
 
 use crate::filter::{self, Filter};
 use crate::units::UnitId;
-use slop_livin_core::report::{ArtifactKind, Report, UnownedReason};
 use std::collections::BTreeMap;
+use swamp_core::report::{ArtifactKind, Report, UnownedReason};
 
 /// Byte formatting is defined once, in core, so the TUI and the CLI can
 /// never disagree about what "1.8GB" means (they did: one divided by 1024
 /// under a decimal label while the other divided by 1000).
-pub use slop_livin_core::render::human_bytes_pub as human_bytes;
+pub use swamp_core::render::human_bytes_pub as human_bytes;
 
-pub use slop_livin_core::render::human_bytes_signed as human_signed_bytes;
+pub use swamp_core::render::human_bytes_signed as human_signed_bytes;
 
 /// Truncates `s` to `width` chars, keeping the tail: `foo…bar` rather
 /// than `foo…`, per DESIGN.md ("truncated with `…` in the middle,
@@ -104,7 +104,7 @@ pub struct Row {
     /// git tracking status of this path, when known: tracked / ignored /
     /// untracked. Untracked bytes are in no version control and covered by
     /// no ignore rule — the fact that most changes what a human decides.
-    pub track: Option<slop_livin_core::ignore::TrackState>,
+    pub track: Option<swamp_core::ignore::TrackState>,
     /// Byte history over the growth window, from the store (sparkline).
     pub series: Option<Vec<Option<u64>>>,
     /// Glyph badges drawn before the name: ecosystem glyphs, 🐳 when the
@@ -186,7 +186,7 @@ pub fn badges(
     let mut b: String = ecosystems
         .iter()
         .take(3)
-        .map(|t| slop_livin_core::ecosystem::glyph_for(t))
+        .map(|t| swamp_core::ecosystem::glyph_for(t))
         .collect();
     if docker && !ecosystems.iter().any(|t| t == "docker") {
         b.push('🐳');
@@ -361,7 +361,7 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
         r.ecosystems
             .first()
             .and_then(|t| {
-                slop_livin_core::ecosystem::ECOSYSTEMS
+                swamp_core::ecosystem::ECOSYSTEMS
                     .iter()
                     .position(|e| e.tag == t)
             })
@@ -480,7 +480,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         let linked = p
             .worktrees
             .iter()
-            .filter(|w| w.kind == slop_livin_core::report::WorktreeKind::Linked)
+            .filter(|w| w.kind == swamp_core::report::WorktreeKind::Linked)
             .count();
         let series = sum_series(p.worktrees.iter().flat_map(|wt| {
             wt.artifacts.iter().filter_map(move |a| {
@@ -489,14 +489,12 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
                     .strip_prefix(&wt.path)
                     .map(|r| r.display().to_string())
                     .unwrap_or_default();
-                report
-                    .series_by_key
-                    .get(&slop_livin_core::growth::series_key(
-                        &p.project_id,
-                        &wt.worktree_id,
-                        &format!("{:?}", a.kind),
-                        &rel,
-                    ))
+                report.series_by_key.get(&swamp_core::growth::series_key(
+                    &p.project_id,
+                    &wt.worktree_id,
+                    &format!("{:?}", a.kind),
+                    &rel,
+                ))
             })
         }));
         out.push(Row {
@@ -523,7 +521,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
 }
 
 /// Tree view for one project: checkout/worktree -> (folded) artifact
-/// rows, built from the same [`slop_livin_core::tree::build_project_tree`]
+/// rows, built from the same [`swamp_core::tree::build_project_tree`]
 /// the CLI's `--project` drill uses, so the two never drift apart (#33).
 /// This function only adds the TUI-specific rail glyphs
 /// (`├─`/`└─`/`│`, DESIGN.md's graph-rail grammar), the collapse/expand
@@ -534,13 +532,13 @@ pub fn tree_rows(
     project_name: &str,
     filter: &Filter,
     collapsed: &std::collections::HashSet<String>,
-    track: &std::collections::HashMap<std::path::PathBuf, slop_livin_core::ignore::TrackState>,
+    track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
 ) -> Vec<Row> {
     let mut out = Vec::new();
     let Some(p) = report.projects.iter().find(|p| p.name == project_name) else {
         return out;
     };
-    let tree = slop_livin_core::tree::build_project_tree(p, &report.root);
+    let tree = swamp_core::tree::build_project_tree(p, &report.root);
     let wt_count = tree.worktrees.len();
     for (wi, wt) in tree.worktrees.iter().enumerate() {
         // Look up the underlying `WorktreeRow` for its absolute path (the
@@ -561,7 +559,7 @@ pub fn tree_rows(
         let raw = source_wt.raw_signals();
         let mark = WorktreeMark {
             path: source_wt.path.clone(),
-            linked: matches!(wt.kind, slop_livin_core::report::WorktreeKind::Linked),
+            linked: matches!(wt.kind, swamp_core::report::WorktreeKind::Linked),
             remote: p.remote.clone(),
             dirty: raw.0,
             unpushed: raw.1,
@@ -569,12 +567,12 @@ pub fn tree_rows(
             merge_complete: source_wt
                 .merge_complete
                 .as_ref()
-                .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes),
+                .is_some_and(|m| m.verdict == swamp_core::github::TriState::Yes),
             pr: source_wt
                 .github
                 .as_ref()
                 .and_then(|g| match &g.pull_request {
-                    slop_livin_core::github::PrStatus::Some(pr) => {
+                    swamp_core::github::PrStatus::Some(pr) => {
                         Some(format!("PR #{} {:?}", pr.number, pr.state).to_lowercase())
                     }
                     _ => None,
@@ -586,14 +584,12 @@ pub fn tree_rows(
                 .strip_prefix(&source_wt.path)
                 .map(|r| r.display().to_string())
                 .unwrap_or_default();
-            report
-                .series_by_key
-                .get(&slop_livin_core::growth::series_key(
-                    &p.project_id,
-                    &source_wt.worktree_id,
-                    &format!("{:?}", a.kind),
-                    &rel,
-                ))
+            report.series_by_key.get(&swamp_core::growth::series_key(
+                &p.project_id,
+                &source_wt.worktree_id,
+                &format!("{:?}", a.kind),
+                &rel,
+            ))
         }));
         out.push(Row {
             depth: 1,
@@ -622,7 +618,7 @@ pub fn tree_rows(
             continue;
         }
         let child_prefix = if wt_last { "   " } else { "│  " };
-        let visible: Vec<&slop_livin_core::tree::TreeRow> = wt
+        let visible: Vec<&swamp_core::tree::TreeRow> = wt
             .rows
             .iter()
             .filter(|row| {
@@ -645,7 +641,7 @@ pub fn tree_rows(
                 format!("{} {}", row.kind_label, row.rel_path)
             };
             let abs = source_wt.path.join(&row.rel_path);
-            let series_key = slop_livin_core::growth::series_key(
+            let series_key = swamp_core::growth::series_key(
                 &p.project_id,
                 &source_wt.worktree_id,
                 &row.kind
@@ -658,7 +654,7 @@ pub fn tree_rows(
             let is_source = row.kind_label == "source";
             let source_key = format!("source:{}", source_wt.path.display());
             let source_collapsed = collapsed.contains(&source_key);
-            let children: Vec<&slop_livin_core::report::DirRollup> = if is_source {
+            let children: Vec<&swamp_core::report::DirRollup> = if is_source {
                 source_children(report, &source_wt.worktree_id)
             } else {
                 Vec::new()
@@ -676,7 +672,7 @@ pub fn tree_rows(
             out_row.series = series;
             out_row.mtime_max = row.mtime_max;
             if let Some(t) = &row.ecosystem {
-                out_row.badges = slop_livin_core::ecosystem::glyph_for(t).to_string();
+                out_row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
                 out_row.ecosystems = vec![t.clone()];
             }
             // `.git` is git's own store, not content it tracks: annotating
@@ -707,7 +703,7 @@ pub fn tree_rows(
                     child.rail = format!("{child_prefix}   {c_connector}");
                     child.track = track.get(&dir_abs).copied();
                     child.unit = Some(UnitId::for_artifact(&dir_abs));
-                    child.kind = Some(slop_livin_core::report::ArtifactKind::Unknown);
+                    child.kind = Some(swamp_core::report::ArtifactKind::Unknown);
                     out.push(child);
                 }
                 if children.len() > shown {
@@ -727,14 +723,14 @@ pub fn tree_rows(
     out
 }
 
-pub use slop_livin_core::render::project_display_name;
+pub use swamp_core::render::project_display_name;
 
 /// Top-level directories of a worktree's Source tree, biggest first.
 /// Empty when the report was built without directory rollups.
 fn source_children<'a>(
     report: &'a Report,
     worktree_id: &str,
-) -> Vec<&'a slop_livin_core::report::DirRollup> {
+) -> Vec<&'a swamp_core::report::DirRollup> {
     let Some(dirs) = report
         .dirs_by_worktree
         .as_ref()
@@ -742,7 +738,7 @@ fn source_children<'a>(
     else {
         return Vec::new();
     };
-    let mut top: Vec<&slop_livin_core::report::DirRollup> = dirs
+    let mut top: Vec<&swamp_core::report::DirRollup> = dirs
         .iter()
         .filter(|d| !d.rel_path.is_empty() && d.rel_path != "." && !d.rel_path.contains('/'))
         .collect();
@@ -869,7 +865,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
             continue;
         }
         if let Some(name) = filter::project_name(filter)
-            && !slop_livin_core::filter::name_matches(name, &p.name)
+            && !swamp_core::filter::name_matches(name, &p.name)
         {
             continue;
         }
@@ -897,7 +893,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 row.unit = Some(UnitId::for_artifact(&a.path));
                 row.mtime_max = a.mtime_max;
                 if let Some(t) = &a.ecosystem {
-                    row.badges = slop_livin_core::ecosystem::glyph_for(t).to_string();
+                    row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
                     row.ecosystems = vec![t.clone()];
                 }
                 out.push(row);
@@ -917,7 +913,7 @@ pub fn types_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         .filter(|(tag, _)| {
             filter::type_passes(
                 filter,
-                &slop_livin_core::report::ProjectRow {
+                &swamp_core::report::ProjectRow {
                     project_id: String::new(),
                     name: String::new(),
                     worktrees: Vec::new(),
@@ -943,7 +939,7 @@ pub fn types_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             row.badges = if tag == "other" {
                 String::new()
             } else {
-                slop_livin_core::ecosystem::glyph_for(tag).to_string()
+                swamp_core::ecosystem::glyph_for(tag).to_string()
             };
             row.ecosystems = vec![tag.clone()];
             row
@@ -1002,13 +998,13 @@ fn sum_series<'a>(it: impl Iterator<Item = &'a Vec<Option<u64>>>) -> Option<Vec<
 }
 
 /// Worktree-level predicates against a report row's facts.
-fn worktree_passes(filter: &Filter, wt: &slop_livin_core::report::WorktreeRow) -> bool {
+fn worktree_passes(filter: &Filter, wt: &swamp_core::report::WorktreeRow) -> bool {
     let merge_complete = wt
         .merge_complete
         .as_ref()
-        .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes);
+        .is_some_and(|m| m.verdict == swamp_core::github::TriState::Yes);
     let pr_state = wt.github.as_ref().and_then(|g| match &g.pull_request {
-        slop_livin_core::github::PrStatus::Some(pr) => Some(&pr.state),
+        swamp_core::github::PrStatus::Some(pr) => Some(&pr.state),
         _ => None,
     });
     filter::worktree_passes(filter, wt.idle_secs, merge_complete, pr_state)
@@ -1019,7 +1015,7 @@ fn worktree_passes(filter: &Filter, wt: &slop_livin_core::report::WorktreeRow) -
 trait RawWorktreeSignals {
     fn raw_signals(&self) -> (Option<bool>, Option<u32>, Option<bool>);
 }
-impl RawWorktreeSignals for slop_livin_core::report::WorktreeRow {
+impl RawWorktreeSignals for swamp_core::report::WorktreeRow {
     fn raw_signals(&self) -> (Option<bool>, Option<u32>, Option<bool>) {
         let mut dirty = None;
         let mut unpushed = None;
@@ -1214,8 +1210,8 @@ mod tests {
         assert_eq!(rows[2].label, "a");
     }
 
-    fn art(kind: ArtifactKind, path: &str, bytes: u64) -> slop_livin_core::report::ArtifactRow {
-        slop_livin_core::report::ArtifactRow {
+    fn art(kind: ArtifactKind, path: &str, bytes: u64) -> swamp_core::report::ArtifactRow {
+        swamp_core::report::ArtifactRow {
             kind,
             path: path.into(),
             bytes,
@@ -1227,8 +1223,8 @@ mod tests {
             growth_bytes: None,
             regrowth_count: 0,
             observed_at: 0,
-            confidence: slop_livin_core::entities::Confidence::High,
-            source: slop_livin_core::report::Source::new("t"),
+            confidence: swamp_core::entities::Confidence::High,
+            source: swamp_core::report::Source::new("t"),
             note: None,
             created_at: None,
             containers: Vec::new(),
@@ -1242,16 +1238,16 @@ mod tests {
         let report = Report {
             observed_at: 0,
             root: "/r".into(),
-            projects: vec![slop_livin_core::report::ProjectRow {
+            projects: vec![swamp_core::report::ProjectRow {
                 project_id: "p".into(),
                 name: "proj".into(),
                 remote: None,
                 ecosystems: Vec::new(),
                 worktrees: vec![
-                    slop_livin_core::report::WorktreeRow {
+                    swamp_core::report::WorktreeRow {
                         worktree_id: "w1".into(),
                         path: "/r/proj".into(),
-                        kind: slop_livin_core::report::WorktreeKind::Main,
+                        kind: swamp_core::report::WorktreeKind::Main,
                         artifacts: vec![
                             art(ArtifactKind::BuildOutput, "/r/proj/target", 10),
                             art(ArtifactKind::DependencyTree, "/r/proj/node_modules", 20),
@@ -1262,10 +1258,10 @@ mod tests {
                         merge_complete: None,
                         idle_secs: None,
                     },
-                    slop_livin_core::report::WorktreeRow {
+                    swamp_core::report::WorktreeRow {
                         worktree_id: "w2".into(),
                         path: "/r/proj/.worktrees/x".into(),
-                        kind: slop_livin_core::report::WorktreeKind::Linked,
+                        kind: swamp_core::report::WorktreeKind::Linked,
                         artifacts: vec![],
                         signals: vec![],
                         branch: None,
@@ -1276,7 +1272,7 @@ mod tests {
                 ],
             }],
             unowned: vec![],
-            reconciliation: slop_livin_core::report::Reconciliation {
+            reconciliation: swamp_core::report::Reconciliation {
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -1317,7 +1313,7 @@ mod tests {
             root: "/r".into(),
             projects: vec![],
             unowned: vec![
-                slop_livin_core::report::UnownedRow {
+                swamp_core::report::UnownedRow {
                     path_or_object: "img".into(),
                     bytes: 100,
                     reason: UnownedReason::DockerNoJoin,
@@ -1329,7 +1325,7 @@ mod tests {
                     shared_with: Vec::new(),
                     dangling: false,
                 },
-                slop_livin_core::report::UnownedRow {
+                swamp_core::report::UnownedRow {
                     path_or_object: "cache".into(),
                     bytes: 200,
                     reason: UnownedReason::SharedCache,
@@ -1342,7 +1338,7 @@ mod tests {
                     dangling: false,
                 },
             ],
-            reconciliation: slop_livin_core::report::Reconciliation {
+            reconciliation: swamp_core::report::Reconciliation {
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

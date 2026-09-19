@@ -427,7 +427,7 @@ pub struct Report {
     #[serde(default)]
     pub summary: Summary,
     /// Set only when this call ran live GitHub enrichment (`enrich:
-    /// true` -- `slop-livin observe`'s full walk, or `report --enrich`).
+    /// true` -- `swamp observe`'s full walk, or `report --enrich`).
     /// `None` for a plain `report` call, which reads `enrich.parquet`
     /// as-is and never shells out to `gh`.
     #[serde(default)]
@@ -461,7 +461,7 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 /// independent oracle for `reconciliation.du_total`, and optionally
 /// observing into the reverse-delta growth store (`growth.rs`).
 ///
-/// `store_dir` is the top-level `${SLOP_LIVIN_DIR}`-style directory; when
+/// `store_dir` is the top-level `${SWAMP_DIR}`-style directory; when
 /// `None`, nothing is persisted and every `growth_bytes`/`regrowth_count`
 /// stays at the R3 default (`None`/`0`) -- a read-only report, which is
 /// what the golden test and `--no-observe` want. `since_override`
@@ -547,7 +547,7 @@ pub fn report_with_dirs(
 
 /// Same as [`report_with`], with an explicit `enrich` flag: when `true`
 /// (`report --enrich`), GitHub facts are refreshed live (same
-/// concurrent, coalesced `observe_all` path `slop-livin observe` uses)
+/// concurrent, coalesced `observe_all` path `swamp observe` uses)
 /// before being read back. When `false` (the default for every other
 /// caller, including `report_with`), GitHub facts come **only** from
 /// `enrich.parquet` -- this call never shells out to `gh`. See the
@@ -848,17 +848,17 @@ pub(crate) fn aggregate_dir_totals(
     }
 }
 
-/// `${SLOP_LIVIN_DIR}` (or `~/.local/share/slop-livin`): the same
+/// `${SWAMP_DIR}` (or `~/.local/share/swamp`): the same
 /// resolution the CLI and MCP server use on their own, duplicated here
 /// only as a fallback for GitHub enrichment's cache when no `store_dir`
 /// was supplied (see the call site in `report_with`).
 pub(crate) fn default_github_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
+    if let Ok(dir) = std::env::var("SWAMP_DIR") {
         return Some(PathBuf::from(dir));
     }
     std::env::var("HOME")
         .ok()
-        .map(|home| PathBuf::from(home).join(".local/share/slop-livin"))
+        .map(|home| PathBuf::from(home).join(".local/share/swamp"))
 }
 
 /// Renders a `PrStatus` for the `pull_request` signal row and the
@@ -1324,7 +1324,7 @@ pub struct ObserveSummary {
     pub github: GithubEnrichmentSummary,
 }
 
-/// Observe-only entry point for `slop-livin observe`: walks `root`,
+/// Observe-only entry point for `swamp observe`: walks `root`,
 /// writes the growth store under `store_dir`, refreshes GitHub
 /// enrichment live for every GitHub-remote worktree found (concurrent,
 /// coalesced per repo -- see `github::observe_all`), and returns the

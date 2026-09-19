@@ -2,7 +2,8 @@ mod schedule;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use slop_livin_core::{
+use std::path::PathBuf;
+use swamp_core::{
     filter,
     render::{
         OverviewSort, render_kinds, render_overview_sorted, render_project_tree, render_types,
@@ -13,7 +14,6 @@ use slop_livin_core::{
     scan::{ScanOptions, observation},
     store::Store,
 };
-use std::path::PathBuf;
 
 /// `--view` at root or with `--project`. `--kinds`/`--docker` remain as
 /// aliases for `--view kinds`/`--view docker` (#33). `Worktrees` at root
@@ -56,7 +56,7 @@ impl From<SortArg> for OverviewSort {
 }
 
 #[derive(Parser)]
-#[command(name = "slop-livin", version)]
+#[command(name = "swamp", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -125,13 +125,13 @@ enum Command {
         #[arg(long)]
         worktree: Option<PathBuf>,
         /// Filter worktrees/artifacts, e.g. "merge-complete idle > 48h".
-        /// See `slop_livin_core::filter` for the grammar. Only consulted
+        /// See `swamp_core::filter` for the grammar. Only consulted
         /// by `--view worktrees` at root.
         #[arg(long)]
         filter: Option<String>,
         /// Refresh GitHub enrichment live before reading it, instead of
         /// reading `enrich.parquet` as-is. By default `report` never
-        /// shells out to `gh` -- run `slop-livin observe` (or wait for
+        /// shells out to `gh` -- run `swamp observe` (or wait for
         /// the schedule) to keep the cache warm, and reach for this flag
         /// only when you're fine waiting on live calls right now.
         #[arg(long)]
@@ -171,7 +171,7 @@ enum Command {
     /// GitHub enrichment live for every GitHub-remote worktree found
     /// (concurrent, coalesced per repo -- see `github::observe_all`). No
     /// rendering. This is what a scheduled LaunchAgent run executes, and
-    /// the only `slop-livin` command that calls `gh` on your behalf by
+    /// the only `swamp` command that calls `gh` on your behalf by
     /// default; `report` reads whatever this last wrote.
     Observe {
         #[arg(required = true)]
@@ -291,22 +291,21 @@ fn parse_size_arg(s: &str) -> Result<u64> {
     Ok((v * mult as f64) as u64)
 }
 
-fn print_plan(plan: &slop_livin_core::actions::Plan) {
+fn print_plan(plan: &swamp_core::actions::Plan) {
     println!(
         "plan {}  {} units  {}  expires in {}s",
         plan.id,
         plan.units.len(),
-        slop_livin_core::render::human_bytes_pub(plan.planned_bytes()),
-        plan.expires_at
-            .saturating_sub(slop_livin_core::entities::now())
+        swamp_core::render::human_bytes_pub(plan.planned_bytes()),
+        plan.expires_at.saturating_sub(swamp_core::entities::now())
     );
     for u in &plan.units {
         println!(
             "  {:<14} {:>10}  {:>+10}  {}  {}  [{}]  {}",
             format!("{:?}", u.kind).to_lowercase(),
-            slop_livin_core::render::human_bytes_pub(u.bytes),
+            swamp_core::render::human_bytes_pub(u.bytes),
             u.growth_bytes
-                .map(slop_livin_core::render::human_bytes_signed)
+                .map(swamp_core::render::human_bytes_signed)
                 .unwrap_or_else(|| "—".into()),
             u.project,
             u.path.display(),
@@ -328,17 +327,17 @@ fn print_plan(plan: &slop_livin_core::actions::Plan) {
     }
     println!(
         "authorize (human only): {}",
-        slop_livin_core::actions::approve_command(&plan.id)
+        swamp_core::actions::approve_command(&plan.id)
     );
 }
 
-/// `${SLOP_LIVIN_DIR}`, defaulting to `~/.local/share/slop-livin`.
-fn slop_livin_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
+/// `${SWAMP_DIR}`, defaulting to `~/.local/share/swamp`.
+fn swamp_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SWAMP_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/slop-livin")
+    PathBuf::from(home).join(".local/share/swamp")
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -347,7 +346,7 @@ fn main() -> Result<()> {
         no_observe: false,
     }) {
         Command::Ui { root, no_observe } => {
-            slop_livin_tui::run(&root, no_observe)?;
+            swamp_tui::run(&root, no_observe)?;
         }
         Command::Scan { root, store } => {
             let obs = observation(&ScanOptions {
@@ -399,7 +398,7 @@ fn main() -> Result<()> {
             // *write* of a new observation is skipped. GitHub enrichment
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
-            let store_dir = slop_livin_dir();
+            let store_dir = swamp_dir();
             let progress =
                 spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
             let r = report_full_mode(
@@ -489,7 +488,7 @@ fn main() -> Result<()> {
             since,
             json,
         } => {
-            let store_dir = slop_livin_dir();
+            let store_dir = swamp_dir();
             let r = report_full_mode(
                 &root,
                 None,
@@ -509,8 +508,8 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let plan = slop_livin_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
-            slop_livin_core::actions::save_plan(&store_dir, &plan)?;
+            let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
+            swamp_core::actions::save_plan(&store_dir, &plan)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -520,12 +519,12 @@ fn main() -> Result<()> {
         Command::Approve { plan_id } => {
             // The human's confirm line: every unit with the facts on it,
             // before the grant is written.
-            let plan = slop_livin_core::actions::load_plan(&slop_livin_dir(), &plan_id)?;
+            let plan = swamp_core::actions::load_plan(&swamp_dir(), &plan_id)?;
             for u in &plan.units {
                 println!(
                     "  {:<16} {:>10}  {}{}",
                     u.verb,
-                    slop_livin_core::render::human_bytes_pub(u.bytes),
+                    swamp_core::render::human_bytes_pub(u.bytes),
                     u.path.display(),
                     if u.warnings.is_empty() {
                         String::new()
@@ -534,27 +533,27 @@ fn main() -> Result<()> {
                     }
                 );
             }
-            let g = slop_livin_core::actions::approve(&slop_livin_dir(), &plan_id, "human:cli")?;
+            let g = swamp_core::actions::approve(&swamp_dir(), &plan_id, "human:cli")?;
             println!(
                 "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
                 plan_id,
                 g.id,
-                slop_livin_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+                swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
                 g.max_units.unwrap_or(0),
                 g.expires_at
             );
-            println!("execute with: slop-livin execute {plan_id}");
+            println!("execute with: swamp execute {plan_id}");
         }
         Command::Config { action } => {
-            let dir = slop_livin_dir();
+            let dir = swamp_dir();
             let path = dir.join("config.toml");
             match action {
                 ConfigAction::Path => println!("{}", path.display()),
                 ConfigAction::Show => {
-                    print!("{}", slop_livin_core::growth::load_config(&dir).to_toml());
+                    print!("{}", swamp_core::growth::load_config(&dir).to_toml());
                     if !path.exists() {
                         eprintln!(
-                            "(defaults; no file at {} — `slop-livin config init` writes one)",
+                            "(defaults; no file at {} — `swamp config init` writes one)",
                             path.display()
                         );
                     }
@@ -565,10 +564,7 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                     std::fs::create_dir_all(&dir)?;
-                    std::fs::write(
-                        &path,
-                        slop_livin_core::growth::GrowthConfig::default().to_toml(),
-                    )?;
+                    std::fs::write(&path, swamp_core::growth::GrowthConfig::default().to_toml())?;
                     println!("wrote {}", path.display());
                 }
             }
@@ -580,13 +576,9 @@ fn main() -> Result<()> {
             keep_executables,
         } => {
             let res = if keep_executables {
-                slop_livin_core::actions::execute_keeping_executables(
-                    &slop_livin_dir(),
-                    &plan_id,
-                    &actor,
-                )?
+                swamp_core::actions::execute_keeping_executables(&swamp_dir(), &plan_id, &actor)?
             } else {
-                slop_livin_core::actions::execute(&slop_livin_dir(), &plan_id, &actor)?
+                swamp_core::actions::execute(&swamp_dir(), &plan_id, &actor)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -596,7 +588,7 @@ fn main() -> Result<()> {
                     println!(
                         "  {:<9} {:>10}  {}{}",
                         o.status,
-                        slop_livin_core::render::human_bytes_pub(o.planned_bytes),
+                        swamp_core::render::human_bytes_pub(o.planned_bytes),
                         o.path.display(),
                         o.cause
                             .as_ref()
@@ -610,17 +602,17 @@ fn main() -> Result<()> {
                 let permanent = if res.removed_permanently_bytes > 0 {
                     format!(
                         " · removed permanently {}",
-                        slop_livin_core::render::human_bytes_pub(res.removed_permanently_bytes)
+                        swamp_core::render::human_bytes_pub(res.removed_permanently_bytes)
                     )
                 } else {
                     String::new()
                 };
                 println!(
                     "planned {} · trashed {}{permanent} · free space measured {}",
-                    slop_livin_core::render::human_bytes_pub(res.planned_bytes),
-                    slop_livin_core::render::human_bytes_pub(res.trashed_bytes),
+                    swamp_core::render::human_bytes_pub(res.planned_bytes),
+                    swamp_core::render::human_bytes_pub(res.trashed_bytes),
                     res.freed_measured
-                        .map(slop_livin_core::render::human_bytes_signed)
+                        .map(swamp_core::render::human_bytes_signed)
                         .unwrap_or_else(|| "n/a".into())
                 );
                 if let Some(n) = &res.next_step {
@@ -629,7 +621,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Plans { json } => {
-            let plans = slop_livin_core::actions::list_plans(&slop_livin_dir())?;
+            let plans = swamp_core::actions::list_plans(&swamp_dir())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plans)?);
             } else if plans.is_empty() {
@@ -641,7 +633,7 @@ fn main() -> Result<()> {
                         p.id,
                         p.status,
                         p.units.len(),
-                        slop_livin_core::render::human_bytes_pub(p.planned_bytes()),
+                        swamp_core::render::human_bytes_pub(p.planned_bytes()),
                         p.created_at,
                         p.expires_at
                     );
@@ -649,7 +641,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Grant { cmd } => {
-            let dir = slop_livin_dir();
+            let dir = swamp_dir();
             match cmd {
                 GrantCmd::Add {
                     predicate,
@@ -658,11 +650,11 @@ fn main() -> Result<()> {
                     max_units,
                 } => {
                     let budget_bytes = parse_size_arg(&budget)?;
-                    let expires_secs = slop_livin_core::growth::parse_duration_secs(&expires)
+                    let expires_secs = swamp_core::growth::parse_duration_secs(&expires)
                         .ok_or_else(|| {
                             anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)")
                         })?;
-                    let g = slop_livin_core::actions::add_standing_grant(
+                    let g = swamp_core::actions::add_standing_grant(
                         &dir,
                         &predicate,
                         budget_bytes,
@@ -676,7 +668,7 @@ fn main() -> Result<()> {
                     );
                 }
                 GrantCmd::List => {
-                    let gs = slop_livin_core::actions::list_grants(&dir)?;
+                    let gs = swamp_core::actions::list_grants(&dir)?;
                     if gs.is_empty() {
                         println!("no grants");
                     }
@@ -689,8 +681,8 @@ fn main() -> Result<()> {
                                 .as_ref()
                                 .map(|p| format!("plan {p}"))
                                 .unwrap_or_else(|| format!("where {}", g.predicate)),
-                            slop_livin_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                            slop_livin_core::render::human_bytes_pub(g.spent_bytes),
+                            swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+                            swamp_core::render::human_bytes_pub(g.spent_bytes),
                             g.used_units,
                             g.max_units
                                 .map(|m| m.to_string())
@@ -701,16 +693,16 @@ fn main() -> Result<()> {
                     }
                 }
                 GrantCmd::Revoke { grant_id } => {
-                    slop_livin_core::actions::revoke_grant(&dir, &grant_id)?;
+                    swamp_core::actions::revoke_grant(&dir, &grant_id)?;
                     println!("grant {grant_id} revoked");
                 }
             }
         }
         Command::Observe { roots, full } => {
-            schedule::cmd_observe(slop_livin_dir(), roots, full)?;
+            schedule::cmd_observe(swamp_dir(), roots, full)?;
         }
         Command::Schedule { every, off, roots } => {
-            schedule::cmd_schedule(slop_livin_dir(), every, off, roots)?;
+            schedule::cmd_schedule(swamp_dir(), every, off, roots)?;
         }
     }
     Ok(())
@@ -751,7 +743,7 @@ fn render_dirs(
             continue;
         }
         for worktree in &project.worktrees {
-            let mut rows: Vec<&slop_livin_core::report::DirRollup> = dirs_by_worktree
+            let mut rows: Vec<&swamp_core::report::DirRollup> = dirs_by_worktree
                 .get(&worktree.worktree_id)
                 .map(|v| v.iter().collect())
                 .unwrap_or_default();
@@ -796,7 +788,7 @@ fn render_dirs(
                 );
             }
 
-            let mut file_rows: Vec<&slop_livin_core::report::FileRow> = files_by_worktree
+            let mut file_rows: Vec<&swamp_core::report::FileRow> = files_by_worktree
                 .get(&worktree.worktree_id)
                 .map(|v| {
                     v.iter()
@@ -868,12 +860,12 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
         use std::io::Write;
         let mut drew = false;
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-            let (bytes, dirs, active) = slop_livin_core::walk::progress::snapshot();
+            let (bytes, dirs, active) = swamp_core::walk::progress::snapshot();
             if active {
                 let _ = write!(
                     std::io::stderr(),
                     "\r\x1b[2Kobserving… {} · {dirs} dirs",
-                    slop_livin_core::render::human_bytes_pub(bytes)
+                    swamp_core::render::human_bytes_pub(bytes)
                 );
                 drew = true;
             }

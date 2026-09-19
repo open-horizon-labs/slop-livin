@@ -1,4 +1,4 @@
-//! End-to-end `slop-livin observe` checks against the built binary:
+//! End-to-end `swamp observe` checks against the built binary:
 //! it writes the growth store and prints one machine-readable line per
 //! root.
 
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_slop-livin"))
+    PathBuf::from(env!("CARGO_BIN_EXE_swamp"))
 }
 
 #[test]
@@ -18,8 +18,8 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     let output = Command::new(bin())
         .arg("observe")
         .arg(root.path())
-        .env("SLOP_LIVIN_DIR", store.path())
-        .env("SLOP_LIVIN_TEST_MODE", "1")
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe");
 
@@ -34,7 +34,7 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
         "stdout did not contain a machine-readable observe line: {stdout}"
     );
 
-    // The volume-keyed growth store must now exist under SLOP_LIVIN_DIR.
+    // The volume-keyed growth store must now exist under SWAMP_DIR.
     let has_store = std::fs::read_dir(store.path())
         .unwrap()
         .filter_map(|e| e.ok())

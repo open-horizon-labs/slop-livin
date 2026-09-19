@@ -22,7 +22,7 @@
 //! - [`observe_all`]: does the live work, concurrently (bounded worker
 //!   pool) and coalesced per `(owner, repo)` -- one GraphQL call per repo
 //!   covers every branch of interest in that repo, rather than 2-3 REST
-//!   calls per worktree. This is what `slop-livin observe` and
+//!   calls per worktree. This is what `swamp observe` and
 //!   `report --enrich` call.
 
 use anyhow::{Context, Result};
@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_GITHUB_TTL_SECS: u64 = 6 * 3600;
 /// Bound on any single `gh api graphql` call.
 const PER_CALL_TIMEOUT: Duration = Duration::from_secs(8);
-/// Overall wall-clock budget for a `slop-livin observe` (or
+/// Overall wall-clock budget for a `swamp observe` (or
 /// `report --enrich`) run, regardless of how many repos need a live
 /// lookup. Concurrency plus per-repo coalescing is expected to keep real
 /// runs well under this.
@@ -543,10 +543,8 @@ fn cache_schema() -> Arc<Schema> {
     ]))
 }
 
-fn cache_path(slop_livin_dir: &Path, volume_id: u64) -> PathBuf {
-    slop_livin_dir
-        .join(volume_id.to_string())
-        .join("enrich.parquet")
+fn cache_path(swamp_dir: &Path, volume_id: u64) -> PathBuf {
+    swamp_dir.join(volume_id.to_string()).join("enrich.parquet")
 }
 
 fn read_cache(path: &Path) -> Vec<CacheRow> {
@@ -851,19 +849,19 @@ pub struct EnrichInput<'a> {
 }
 
 /// **Never shells out.** Reads `enrich.parquet` under
-/// `slop_livin_dir/<volume_id>/` for every worktree in `inputs`. A fresh
+/// `swamp_dir/<volume_id>/` for every worktree in `inputs`. A fresh
 /// row (younger than `ttl_secs`, same tip) is returned as-is; a stale
 /// row or a missing one comes back as `Unknown` with a note telling the
 /// caller to run `observe`. This is what `report`/`--view worktrees` use
 /// by default (see the module doc for why).
 pub fn read_cached(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     inputs: &[EnrichInput],
     observed_at: u64,
     ttl_secs: u64,
 ) -> (HashMap<String, GithubFacts>, Vec<String>) {
-    let path = cache_path(slop_livin_dir, volume_id);
+    let path = cache_path(swamp_dir, volume_id);
     let cache: HashMap<(String, String, String), CacheRow> = read_cache(&path)
         .into_iter()
         .map(|r| {
@@ -901,7 +899,7 @@ pub fn read_cached(
                 out.insert(
                     input.worktree_id.to_string(),
                     GithubFacts::unknown(Some(
-                        "github: not enriched (run `slop-livin observe` or wait for the schedule)"
+                        "github: not enriched (run `swamp observe` or wait for the schedule)"
                             .to_string(),
                     )),
                 );
@@ -912,12 +910,12 @@ pub fn read_cached(
     let mut notes = Vec::new();
     if stale > 0 {
         notes.push(format!(
-            "github: {stale} worktree(s) have stale cached enrichment (run `slop-livin observe` to refresh)"
+            "github: {stale} worktree(s) have stale cached enrichment (run `swamp observe` to refresh)"
         ));
     }
     if missing > 0 {
         notes.push(format!(
-            "github: {missing} worktree(s) not enriched (run `slop-livin observe` or wait for the schedule)"
+            "github: {missing} worktree(s) not enriched (run `swamp observe` or wait for the schedule)"
         ));
     }
     (out, notes)
@@ -945,7 +943,7 @@ pub struct ObserveSummary {
 #[allow(clippy::too_many_arguments)]
 pub fn observe_all(
     responder: &(dyn GithubResponder + Sync),
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     inputs: &[EnrichInput],
     observed_at: u64,
@@ -953,7 +951,7 @@ pub fn observe_all(
     budget_secs: u64,
     concurrency: usize,
 ) -> ObserveSummary {
-    let path = cache_path(slop_livin_dir, volume_id);
+    let path = cache_path(swamp_dir, volume_id);
     let mut cache: HashMap<(String, String, String), CacheRow> = read_cache(&path)
         .into_iter()
         .map(|r| {

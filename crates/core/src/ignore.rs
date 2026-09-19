@@ -108,7 +108,7 @@ impl IgnoreLens {
         // inside it rather than the directory itself (a trailing slash
         // alone returns the container's state, not the rule's effect).
         let lookup = if is_dir {
-            format!("{rel_trimmed}/.slop-livin-probe")
+            format!("{rel_trimmed}/.swamp-probe")
         } else {
             rel_trimmed.to_string()
         };

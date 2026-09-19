@@ -5,10 +5,10 @@
 use crate::actions::{self, MarkedUnit};
 use crate::filter::{self, Filter};
 use crate::model::{self, Row, Sort};
-use slop_livin_core::report::Report;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use swamp_core::report::Report;
 
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 
@@ -113,15 +113,15 @@ pub struct App {
     pub history_secs: Option<u64>,
     /// git tracking status per absolute path, filled when a project is
     /// opened (one exclude stack per worktree, reused for its rows).
-    pub track: std::collections::HashMap<PathBuf, slop_livin_core::ignore::TrackState>,
+    pub track: std::collections::HashMap<PathBuf, swamp_core::ignore::TrackState>,
     /// Store dir, when known: the applied filter is persisted there so it
     /// survives relaunch (`ui_filter.txt`).
     pub store_dir: Option<PathBuf>,
     /// The live FSEvents stream on the root, running for the TUI's
     /// lifetime. Every change under the root, including our own deletes,
     /// arrives here; nothing "asks" for a refresh.
-    pub watch: Option<slop_livin_core::fs_events::Watcher>,
-    pub watch_rx: Option<std::sync::mpsc::Receiver<slop_livin_core::fs_events::WatchBatch>>,
+    pub watch: Option<swamp_core::fs_events::Watcher>,
+    pub watch_rx: Option<std::sync::mpsc::Receiver<swamp_core::fs_events::WatchBatch>>,
     /// Changed directories received and not yet observed.
     pub live_changes: std::collections::HashSet<PathBuf>,
     pub live_last_event_id: u64,
@@ -229,7 +229,7 @@ impl App {
         };
         let mut found = std::collections::HashMap::new();
         for wt in &p.worktrees {
-            let Some(lens) = slop_livin_core::ignore::IgnoreLens::open(&wt.path) else {
+            let Some(lens) = swamp_core::ignore::IgnoreLens::open(&wt.path) else {
                 continue;
             };
             for a in &wt.artifacts {
@@ -759,8 +759,8 @@ impl App {
         if let Some(kind) = &row.kind
             && matches!(
                 kind,
-                slop_livin_core::report::ArtifactKind::Ignored
-                    | slop_livin_core::report::ArtifactKind::Untracked
+                swamp_core::report::ArtifactKind::Ignored
+                    | swamp_core::report::ArtifactKind::Untracked
             )
             && let Err(why) = crate::units::markable(kind)
         {
@@ -771,13 +771,13 @@ impl App {
         // Trash. Which command that is depends on the kind, and build
         // cache has none.
         let docker = match row.kind {
-            Some(slop_livin_core::report::ArtifactKind::DockerImage) => {
-                Some(slop_livin_core::docker::Removal::Image {
+            Some(swamp_core::report::ArtifactKind::DockerImage) => {
+                Some(swamp_core::docker::Removal::Image {
                     id: unit_id.0.clone(),
                 })
             }
-            Some(slop_livin_core::report::ArtifactKind::DockerVolume) => {
-                Some(slop_livin_core::docker::Removal::Volume {
+            Some(swamp_core::report::ArtifactKind::DockerVolume) => {
+                Some(swamp_core::docker::Removal::Volume {
                     name: unit_id.0.clone(),
                 })
             }
@@ -804,7 +804,7 @@ impl App {
                 warnings.push("locked".into());
             }
             if whole_checkout {
-                for (p, b) in slop_livin_core::ignore::untracked_content(&wt.path, 3, 100_000) {
+                for (p, b) in swamp_core::ignore::untracked_content(&wt.path, 3, 100_000) {
                     let rel = p.strip_prefix(&wt.path).unwrap_or(&p).display().to_string();
                     warnings.push(format!("{rel} untracked {}", model::human_bytes(b)));
                 }
@@ -817,25 +817,25 @@ impl App {
             }
         });
         match row.track {
-            Some(slop_livin_core::ignore::TrackState::Untracked) => {
+            Some(swamp_core::ignore::TrackState::Untracked) => {
                 warnings.push("untracked: in no version control".into())
             }
-            Some(slop_livin_core::ignore::TrackState::Tracked) if row.worktree.is_none() => {
+            Some(swamp_core::ignore::TrackState::Tracked) if row.worktree.is_none() => {
                 warnings.push("tracked source".into())
             }
             _ => {}
         }
-        if row.kind == Some(slop_livin_core::report::ArtifactKind::Git) {
+        if row.kind == Some(swamp_core::report::ArtifactKind::Git) {
             warnings.push("git object store: history goes with it".into());
         }
         match row.kind {
-            Some(slop_livin_core::report::ArtifactKind::DockerVolume) => warnings.push(
+            Some(swamp_core::report::ArtifactKind::DockerVolume) => warnings.push(
                 "docker volume: its contents exist nowhere else, and this does not go to Trash"
                     .into(),
             ),
-            Some(slop_livin_core::report::ArtifactKind::DockerImage) => warnings
+            Some(swamp_core::report::ArtifactKind::DockerImage) => warnings
                 .push("docker image: permanent, comes back only by pulling or rebuilding".into()),
-            Some(slop_livin_core::report::ArtifactKind::Loose) => {
+            Some(swamp_core::report::ArtifactKind::Loose) => {
                 warnings.push("no project claims these bytes".into())
             }
             _ => {}
@@ -930,7 +930,7 @@ impl App {
         let trash = actions::trash_root();
         let free_before = actions::free_space_bytes(&trash);
         let ledger_path = crate::ledger_path();
-        let ledger = match slop_livin_core::ledger::Ledger::open(&ledger_path) {
+        let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
             Ok(l) => l,
             Err(e) => {
                 self.set_refusal(&format!("could not open ledger: {e}"));
@@ -1068,7 +1068,7 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(w) = slop_livin_core::fs_events::watch(&self.root, tx) {
+        if let Some(w) = swamp_core::fs_events::watch(&self.root, tx) {
             self.watch = Some(w);
             self.watch_rx = Some(rx);
         }
@@ -1111,7 +1111,7 @@ impl App {
         let device = std::fs::metadata(&self.root)
             .ok()
             .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
-        let plan = slop_livin_core::fs_events::FsEventsPlan::from_live(
+        let plan = swamp_core::fs_events::FsEventsPlan::from_live(
             changed,
             self.live_last_event_id,
             device,
@@ -1119,8 +1119,8 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = self.root.clone();
         std::thread::spawn(move || {
-            let source = slop_livin_core::fs_events::testing::CannedSource(plan);
-            let res = slop_livin_core::report::report_full_mode_with_source(
+            let source = swamp_core::fs_events::testing::CannedSource(plan);
+            let res = swamp_core::report::report_full_mode_with_source(
                 &root,
                 None,
                 false,
@@ -1151,14 +1151,8 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = self.root.clone();
         std::thread::spawn(move || {
-            let res = slop_livin_core::report::report_with_dirs(
-                &root,
-                None,
-                false,
-                Some(&store),
-                None,
-                true,
-            );
+            let res =
+                swamp_core::report::report_with_dirs(&root, None, false, Some(&store), None, true);
             let _ = tx.send(res);
         });
         self.pending = Some(rx);
@@ -1173,8 +1167,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slop_livin_core::entities::Confidence;
-    use slop_livin_core::report::{
+    use swamp_core::entities::Confidence;
+    use swamp_core::report::{
         ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Source, WorktreeKind, WorktreeRow,
     };
 
@@ -1295,7 +1289,7 @@ mod tests {
         for p in report.projects.iter_mut() {
             for wt in p.worktrees.iter_mut() {
                 wt.artifacts
-                    .retain(|a| a.kind == slop_livin_core::report::ArtifactKind::Source);
+                    .retain(|a| a.kind == swamp_core::report::ArtifactKind::Source);
             }
         }
         report
@@ -1404,7 +1398,7 @@ mod tests {
         app.store_dir = Some(std::env::temp_dir());
         let (tx, rx) = std::sync::mpsc::channel();
         app.watch_rx = Some(rx);
-        tx.send(slop_livin_core::fs_events::WatchBatch {
+        tx.send(swamp_core::fs_events::WatchBatch {
             changed_dirs: vec![PathBuf::from("/root/mole/node_modules")],
             last_event_id: 42,
         })
@@ -1430,7 +1424,7 @@ mod tests {
         let mut dirs = std::collections::HashMap::new();
         dirs.insert(
             app.report.projects[0].worktrees[0].worktree_id.clone(),
-            vec![slop_livin_core::report::DirRollup {
+            vec![swamp_core::report::DirRollup {
                 worktree_id: app.report.projects[0].worktrees[0].worktree_id.clone(),
                 track: None,
                 rel_path: "node_modules/x".into(),
@@ -1448,7 +1442,7 @@ mod tests {
         app.report.dirs_by_worktree = Some(dirs);
         app.prune_removed(&[actions::UnitResult {
             path: art.path.clone(),
-            outcome: Ok(slop_livin_core::execution::Outcome {
+            outcome: Ok(swamp_core::execution::Outcome {
                 unit_id: String::new(),
                 status: "ok".into(),
                 reason: None,
@@ -1478,7 +1472,7 @@ mod tests {
         // A whole worktree removal empties its project.
         app.prune_removed(&[actions::UnitResult {
             path: wt_path,
-            outcome: Ok(slop_livin_core::execution::Outcome {
+            outcome: Ok(swamp_core::execution::Outcome {
                 unit_id: String::new(),
                 status: "ok".into(),
                 reason: None,

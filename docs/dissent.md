@@ -29,7 +29,7 @@ again at the sink. Thin interfaces avoid duplicating safety logic.
 | --- | --- | --- | --- |
 | Git object-store identity is stable across renames | Git repository identity | Non-git projects need a low-confidence fallback | Rename and fallback identity tests |
 | Facts can be re-observed at execution | Filesystem and extractor APIs | Stale plans could delete changed content | Mutate-after-plan test |
-| The human grant channel is outside scanned disk | CLI/MCP input | Repo-local instructions could self-authorize | Ignore `.sloplivinrc` test |
+| The human grant channel is outside scanned disk | CLI/MCP input | Repo-local instructions could self-authorize | Ignore `.swamprc` test |
 
 ## Reconstructed story
 

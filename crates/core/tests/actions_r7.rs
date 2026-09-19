@@ -4,15 +4,15 @@
 
 mod fixture;
 
-use slop_livin_core::actions::{
+use std::fs;
+use std::path::{Path, PathBuf};
+use swamp_core::actions::{
     self, PlanStatus, add_standing_grant, approve, execute_with_trash, list_grants, load_plan,
     propose, save_plan,
 };
-use slop_livin_core::report::{ArtifactKind, report_full_mode};
-use std::fs;
-use std::path::{Path, PathBuf};
+use swamp_core::report::{ArtifactKind, report_full_mode};
 
-fn report_for(root: &Path, store: &Path) -> slop_livin_core::Report {
+fn report_for(root: &Path, store: &Path) -> swamp_core::Report {
     report_full_mode(
         root,
         None,
@@ -33,7 +33,7 @@ fn set_trash(dir: &Path) -> PathBuf {
     t
 }
 
-fn row_path(r: &slop_livin_core::Report, kind: ArtifactKind, ends: &str) -> PathBuf {
+fn row_path(r: &swamp_core::Report, kind: ArtifactKind, ends: &str) -> PathBuf {
     r.projects
         .iter()
         .flat_map(|p| p.worktrees.iter())
@@ -129,12 +129,12 @@ fn a_worktree_path_plans_as_remove_worktree_and_a_checkout_as_archive_with_warni
         let main = p
             .worktrees
             .iter()
-            .find(|w| w.kind == slop_livin_core::report::WorktreeKind::Main)
+            .find(|w| w.kind == swamp_core::report::WorktreeKind::Main)
             .unwrap();
         let link = p
             .worktrees
             .iter()
-            .find(|w| w.kind == slop_livin_core::report::WorktreeKind::Linked)
+            .find(|w| w.kind == swamp_core::report::WorktreeKind::Linked)
             .unwrap();
         (main.path.clone(), link.path.clone())
     };
@@ -213,7 +213,7 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
     assert_eq!(res.trashed_bytes, plan.planned_bytes());
 
     // Ledger: actor and evidence recorded, independent of the index.
-    let ledger = slop_livin_core::ledger::Ledger::open(store.path().join("ledger.jsonl")).unwrap();
+    let ledger = swamp_core::ledger::Ledger::open(store.path().join("ledger.jsonl")).unwrap();
     let recs = ledger.all().unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].actor, "agent:test");

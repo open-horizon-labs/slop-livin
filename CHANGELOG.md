@@ -80,7 +80,7 @@ One observation on `~/src` (55 projects, 44 GB):
 **Where artifact names come from now**
 
 - `CACHEDIR.TAG` is honoured: a directory holding a regular `CACHEDIR.TAG` whose first 43 bytes are the [Cache Directory Tagging Specification](https://bford.info/cachedir/) signature is a cache, whatever its name and with no marker gate, because the tool that created it is the one making the claim. Cargo writes one into `target/`, pytest into `.pytest_cache/`, uv into `.venv/`. A file that merely mentions the string, or a symlink standing in for the tag, does not qualify.
-- [github/gitignore](https://github.com/github/gitignore) (163 templates) and [linguist](https://github.com/github/linguist)'s vendored-paths list are vendored under `vendor/`, and `cargo run -p slop-livin-harvest` reports what they list that our table lacks. It never writes the table: the Python template alone lists `var/`, `instance/`, `lib/`, `mnesia/` and `rabbitmq/`, which hold authored or live state. Its `--challenge <root>` mode uses a tree only to *contradict* a candidate, by finding it holding git-tracked content; that is how `artifacts`, `generated`, `inc`, `packages`, `settings` and `Screenshots` were kept out. Sizes rank nothing.
+- [github/gitignore](https://github.com/github/gitignore) (163 templates) and [linguist](https://github.com/github/linguist)'s vendored-paths list are vendored under `vendor/`, and `cargo run -p swamp-harvest` reports what they list that our table lacks. It never writes the table: the Python template alone lists `var/`, `instance/`, `lib/`, `mnesia/` and `rabbitmq/`, which hold authored or live state. Its `--challenge <root>` mode uses a tree only to *contradict* a candidate, by finding it holding git-tracked content; that is how `artifacts`, `generated`, `inc`, `packages`, `settings` and `Screenshots` were kept out. Sizes rank nothing.
 - Curated from that report, marker-gated, each carrying its provenance: around 70 names across Python, Node, .NET, C/C++, JVM, Ruby, Dart, Deno, Haskell, Swift, Unity and Unreal, plus seven ecosystems we did not model at all — Godot, Jekyll, Elm, Erlang, OCaml, Clojure and Nim.
 
 **Artifacts the table was missing**
@@ -103,7 +103,7 @@ One observation on `~/src` (55 projects, 44 GB):
 - A background observation keeps the cursor on its row instead of jumping to the top.
 - The TUI's startup observation produces per-directory rows, so a `source` row expands into its directories instead of reading `▸ 0 more`.
 - Nested walks no longer reset the shared progress counters, which made the header read past the total and stick at 99%. The percentage is an estimate against the last observation and is now shown only while it means something.
-- `slop-livin --version`, asserted against the tag by the release smoke test.
+- `swamp --version`, asserted against the tag by the release smoke test.
 
 **Docs**
 
@@ -147,21 +147,21 @@ The clean-dev-dirs salvage: everything it does for a human, on top of the histor
 
 **Also**
 
-- `slop-livin config show | path | init`: the config file, every key with its meaning.
+- `swamp config show | path | init`: the config file, every key with its meaning.
 - `filter:` parameter on the MCP `report` tool, same grammar as everywhere else.
 
 ## v0.1.0
 
-First release. `slop-livin` answers "what grew on this disk, by project, and what do I do about it" for developers running many coding agents at once — and lets you or your agent act on the answer with the facts in front of you.
+First release. `swamp` answers "what grew on this disk, by project, and what do I do about it" for developers running many coding agents at once — and lets you or your agent act on the answer with the facts in front of you.
 
 **What you get**
 
-- **Terminal UI** (`slop-livin ui ~/src`): projects sorted by growth, a tree per project (checkouts → worktrees → artifacts → directories), a history sparkline on every row, a filter form (`/`) and a filter line with Tab completion (`:`). Space marks, Backspace deletes what's under the cursor after one confirm that states the facts — `dirty · 26 unpushed · raw untracked 1.1GB` — and everything goes to Trash.
-- **CLI** (`slop-livin report`): the same report as one screen, a project tree, and named views (`worktrees`, `builds`, `deps`, `docker`, `kinds`, `unowned`, `reconciliation`), with `--json`.
-- **MCP server** (`slop-livin-mcp`): `report`, `what_grew`, `list_projects`, `list_worktrees`, `docker_objects`, `propose`, `execute`, `plans`, `grants`. An agent can propose and execute; only a human at the CLI can authorize (`slop-livin approve <plan>` or a bounded standing `grant`).
+- **Terminal UI** (`swamp ui ~/src`): projects sorted by growth, a tree per project (checkouts → worktrees → artifacts → directories), a history sparkline on every row, a filter form (`/`) and a filter line with Tab completion (`:`). Space marks, Backspace deletes what's under the cursor after one confirm that states the facts — `dirty · 26 unpushed · raw untracked 1.1GB` — and everything goes to Trash.
+- **CLI** (`swamp report`): the same report as one screen, a project tree, and named views (`worktrees`, `builds`, `deps`, `docker`, `kinds`, `unowned`, `reconciliation`), with `--json`.
+- **MCP server** (`swamp-mcp`): `report`, `what_grew`, `list_projects`, `list_worktrees`, `docker_objects`, `propose`, `execute`, `plans`, `grants`. An agent can propose and execute; only a human at the CLI can authorize (`swamp approve <plan>` or a bounded standing `grant`).
 - **Growth over time.** Every observation goes into a Parquet column store with reverse deltas, so growth over any window is a lookup. Growth windows are capped at the history the store actually holds, and the header says so.
 - **Incremental observation** via FSEvents: re-walk only what changed, byte-identical to a full walk. Full walk of ~41 GB / 107 worktrees: ~7.5 s; incremental: 2–3 s (one machine).
-- **Scheduled observation**: `slop-livin schedule --every 15m ~/src` installs a low-priority LaunchAgent so history accumulates without you.
+- **Scheduled observation**: `swamp schedule --every 15m ~/src` installs a low-priority LaunchAgent so history accumulates without you.
 - **Projects, not paths.** Identity is the git object store, unified across clones by remote; rows read `owner/repo`. Artifacts (`node_modules`, `target`, `build`, `.venv`, `.cache`, …, ~50 names across 20 ecosystems) are one unit each and attributed to the nearest checkout.
 - **Git status on every row**: `tracked`, `ignored`, `untracked`. Untracked bytes are in no version control and under no ignore rule — nothing brings them back.
 - **Worktree facts**: last commit age, dirty, unpushed, locked, idle; with `gh`, PR state and whether the branch is merged, shown as `merge-complete` with all its terms. Never a verdict word.

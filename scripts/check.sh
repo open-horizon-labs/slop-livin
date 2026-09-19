@@ -3,7 +3,7 @@ set -euo pipefail
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -q -p slop-livin-source-audit
+cargo run -q -p swamp-source-audit
 
 # These checks intentionally fail obvious safety regressions in source
 # review: a raw recursive delete, and verdict vocabulary the tool never

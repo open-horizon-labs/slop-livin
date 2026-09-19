@@ -111,7 +111,7 @@ fn header_line(app: &App, width: usize) -> String {
         // Live counters from the walk thread; percent against the last
         // observation's walked total (an incremental walk stops early, so
         // the percent is a floor, never a promise).
-        let (bytes, dirs, _) = slop_livin_core::walk::progress::snapshot();
+        let (bytes, dirs, _) = swamp_core::walk::progress::snapshot();
         let total = app.report.reconciliation.walked_total;
         // The percentage compares against the last observation's total,
         // so it is an estimate; an incremental walk visits a fraction and

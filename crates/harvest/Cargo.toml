@@ -1,8 +1,8 @@
 [package]
-name = "slop-livin-harvest"
+name = "swamp-harvest"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-slop-livin-core = { path = "../core" }
+swamp-core = { path = "../core" }

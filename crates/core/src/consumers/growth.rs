@@ -38,7 +38,7 @@ impl Consumer for GrowthConsumer {
                 .and_then(crate::growth::parse_duration_secs)
                 .or_else(|| crate::growth::parse_duration_secs(&config.since))
                 .unwrap_or(24 * 3600);
-            let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+            let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
             let t = std::time::Instant::now();
             if ctx.observe {
                 crate::growth::observe_and_annotate(

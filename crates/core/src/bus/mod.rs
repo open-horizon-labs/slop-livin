@@ -23,7 +23,7 @@
 //!
 //! Adding a stage: implement [`Consumer`] in a new file under
 //! `consumers/`, register it in [`EventBus::with_builtins`]. The source
-//! audits (`cargo run -p slop-livin-source-audit`) fail the build if a
+//! audits (`cargo run -p swamp-source-audit`) fail the build if a
 //! consumer names another, registers at runtime, or if `report.rs` calls a
 //! stage directly.
 
@@ -277,7 +277,7 @@ impl EventBus {
                 .map(|c| c.as_ref())
                 .filter(|c| c.subscribes_to().contains(&kind))
                 .collect();
-            let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+            let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
             let results = futures_util::future::join_all(subscribers.iter().map(|c| async {
                 let t = std::time::Instant::now();
                 let r = c.on_event(&event, ctx).await;

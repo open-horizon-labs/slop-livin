@@ -328,9 +328,9 @@ mod macos {
     /// from local, in-kernel state, so a replay that has not reached
     /// `HistoryDone` in this long is not going to; refusing with
     /// `HelperInconclusive` beats blocking an observation indefinitely.
-    /// Overridable for slow CI via `SLOP_LIVIN_FSEVENTS_TIMEOUT_SEC`.
+    /// Overridable for slow CI via `SWAMP_FSEVENTS_TIMEOUT_SEC`.
     fn replay_budget() -> Duration {
-        std::env::var("SLOP_LIVIN_FSEVENTS_TIMEOUT_SEC")
+        std::env::var("SWAMP_FSEVENTS_TIMEOUT_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)

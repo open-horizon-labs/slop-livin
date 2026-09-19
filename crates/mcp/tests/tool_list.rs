@@ -1,9 +1,9 @@
-//! Spawns the real `slop-livin-mcp` binary and asserts its `tools/list`
+//! Spawns the real `swamp-mcp` binary and asserts its `tools/list`
 //! response is exactly `docker_objects` (added by #33), `list_projects`,
 //! `list_worktrees` (added by #35), `report`, and `what_grew` --
 //! plus the R7 action tools `propose`, `execute`, `plans`, `grants` (#26).
 //! No tool that *writes* a grant may ever appear here: authorization is
-//! human-at-CLI only (`slop-livin approve`, `slop-livin grant add`).
+//! human-at-CLI only (`swamp approve`, `swamp grant add`).
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -11,13 +11,13 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn tools_list_is_exactly_report_what_grew_list_projects_list_worktrees_and_docker_objects() {
-    let exe = env!("CARGO_BIN_EXE_slop-livin-mcp");
+    let exe = env!("CARGO_BIN_EXE_swamp-mcp");
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn slop-livin-mcp");
+        .expect("spawn swamp-mcp");
 
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list"}}"#).unwrap();

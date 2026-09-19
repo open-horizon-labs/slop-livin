@@ -1,5 +1,5 @@
 [package]
-name = "slop-livin-source-audit"
+name = "swamp-source-audit"
 version.workspace = true
 edition.workspace = true
 

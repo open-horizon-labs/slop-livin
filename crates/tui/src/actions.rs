@@ -1,14 +1,14 @@
 //! The action layer: plan -> human authorization -> sink re-derivation ->
 //! Trash -> per-unit outcome -> ledger. Wires the minimum of
-//! `grants`/`execution`/`ledger`/`occupancy` from `slop_livin_core`;
+//! `grants`/`execution`/`ledger`/`occupancy` from `swamp_core`;
 //! nothing there is widened.
 
 use anyhow::Result;
-use slop_livin_core::entities::{id_for, now};
-use slop_livin_core::execution::Outcome;
-use slop_livin_core::grants::{Grant, Predicate, Verb, plan};
-use slop_livin_core::ledger::Ledger;
 use std::path::{Path, PathBuf};
+use swamp_core::entities::{id_for, now};
+use swamp_core::execution::Outcome;
+use swamp_core::grants::{Grant, Predicate, Verb, plan};
+use swamp_core::ledger::Ledger;
 
 use crate::model::human_bytes;
 
@@ -20,7 +20,7 @@ pub struct MarkedUnit {
     pub path: PathBuf,
     /// Set for a Docker object: what removing it actually runs, and the
     /// fact that it never reaches Trash.
-    pub docker: Option<slop_livin_core::docker::Removal>,
+    pub docker: Option<swamp_core::docker::Removal>,
     /// The worktree containing the unit (itself, for a worktree row).
     pub worktree_path: PathBuf,
     pub bytes: u64,
@@ -48,10 +48,10 @@ pub struct WorktreeTerms {
 /// Human pressing Enter at the confirm summary is the authorization for
 /// this one plan (never the index, never an agent). Builds the plan and
 /// grant together since they are minted for the same keypress.
-pub fn authorize(units: &[MarkedUnit], actor: &str) -> (slop_livin_core::grants::Plan, Grant) {
+pub fn authorize(units: &[MarkedUnit], actor: &str) -> (swamp_core::grants::Plan, Grant) {
     let plan_units = units
         .iter()
-        .map(|u| slop_livin_core::grants::PlanUnit {
+        .map(|u| swamp_core::grants::PlanUnit {
             artifact_id: id_for(&u.path.display().to_string()),
             verb: match &u.worktree {
                 Some(t) if t.whole_checkout => Verb::Archive,
@@ -65,7 +65,7 @@ pub fn authorize(units: &[MarkedUnit], actor: &str) -> (slop_livin_core::grants:
         .collect();
     let plan = plan(plan_units, now() + 300);
     let grant = Grant {
-        id: slop_livin_core::entities::new_id(),
+        id: swamp_core::entities::new_id(),
         verb: Verb::Delete,
         predicate: Predicate {
             project_id: None,
@@ -94,7 +94,7 @@ pub struct UnitResult {
 /// the per-unit result.
 fn execute_one(
     unit: &MarkedUnit,
-    _plan_unit: &slop_livin_core::grants::PlanUnit,
+    _plan_unit: &swamp_core::grants::PlanUnit,
     grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
@@ -120,7 +120,7 @@ fn execute_one(
     // Compiled outputs first, so a failure to copy them refuses the unit
     // before anything moves.
     let extra = if keep_executables {
-        match slop_livin_core::actions::preserve_executables(&unit.path, &unit.worktree_path) {
+        match swamp_core::actions::preserve_executables(&unit.path, &unit.worktree_path) {
             Ok(kept) => Some(serde_json::json!({
                 "preserved": kept.iter().map(|k| k.to.display().to_string()).collect::<Vec<_>>()
             })),
@@ -149,17 +149,16 @@ fn execute_one(
 /// and the ledger says so.
 fn remove_docker(
     unit: &MarkedUnit,
-    target: &slop_livin_core::docker::Removal,
+    target: &swamp_core::docker::Removal,
     grant: &Grant,
     ledger: &Ledger,
     actor: &str,
 ) -> Result<Outcome> {
     use std::time::Duration;
-    slop_livin_core::docker::still_removable(target).map_err(|e| anyhow::anyhow!(e))?;
-    slop_livin_core::docker::remove(target, Duration::from_secs(30))
-        .map_err(|e| anyhow::anyhow!(e))?;
-    ledger.append(&slop_livin_core::ledger::ActionRecord {
-        id: slop_livin_core::entities::new_id(),
+    swamp_core::docker::still_removable(target).map_err(|e| anyhow::anyhow!(e))?;
+    swamp_core::docker::remove(target, Duration::from_secs(30)).map_err(|e| anyhow::anyhow!(e))?;
+    ledger.append(&swamp_core::ledger::ActionRecord {
+        id: swamp_core::entities::new_id(),
         verb: Verb::Delete,
         entity_id: id_for(&unit.path.display().to_string()),
         evidence: serde_json::json!({
@@ -221,8 +220,8 @@ fn trash_path(
             map.insert(k.clone(), v.clone());
         }
     }
-    ledger.append(&slop_livin_core::ledger::ActionRecord {
-        id: slop_livin_core::entities::new_id(),
+    ledger.append(&swamp_core::ledger::ActionRecord {
+        id: swamp_core::entities::new_id(),
         verb,
         entity_id: id_for(&path.display().to_string()),
         evidence,
@@ -314,7 +313,7 @@ fn remove_worktree(
 /// reports refusals per unit, not as a single aborted batch.
 pub fn execute_plan(
     units: &[MarkedUnit],
-    plan: &slop_livin_core::grants::Plan,
+    plan: &swamp_core::grants::Plan,
     grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
@@ -329,10 +328,10 @@ pub fn execute_plan(
 }
 
 /// The default Trash root: `~/.Trash` on macOS. Overridable via
-/// `SLOP_LIVIN_TRASH_DIR` for tests and CI, which never wants a real
+/// `SWAMP_TRASH_DIR` for tests and CI, which never wants a real
 /// `~/.Trash`.
 pub fn trash_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_TRASH_DIR") {
+    if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -417,8 +416,8 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
             .take(6)
             .map(|u| {
                 let what = match &u.docker {
-                    Some(slop_livin_core::docker::Removal::Image { .. }) => "image",
-                    Some(slop_livin_core::docker::Removal::Volume { .. }) => "volume",
+                    Some(swamp_core::docker::Removal::Image { .. }) => "image",
+                    Some(swamp_core::docker::Removal::Volume { .. }) => "volume",
                     _ => "object",
                 };
                 let name = if u.label.trim().is_empty() {
@@ -453,11 +452,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn unit(
-        path: &str,
-        bytes: u64,
-        docker: Option<slop_livin_core::docker::Removal>,
-    ) -> MarkedUnit {
+    fn unit(path: &str, bytes: u64, docker: Option<swamp_core::docker::Removal>) -> MarkedUnit {
         MarkedUnit {
             path: PathBuf::from(path),
             docker,
@@ -479,14 +474,14 @@ mod tests {
             unit(
                 "app-data",
                 200,
-                Some(slop_livin_core::docker::Removal::Volume {
+                Some(swamp_core::docker::Removal::Volume {
                     name: "app-data".into(),
                 }),
             ),
             unit(
                 "sha256:abc",
                 300,
-                Some(slop_livin_core::docker::Removal::Image { id: "abc".into() }),
+                Some(swamp_core::docker::Removal::Image { id: "abc".into() }),
             ),
         ];
         let line = confirm_summary(&units, false);

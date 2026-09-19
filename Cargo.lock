@@ -2546,80 +2546,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "slop-livin"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde_json",
- "slop-livin-core",
- "slop-livin-tui",
- "tempfile",
-]
-
-[[package]]
-name = "slop-livin-core"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "blake3",
- "core-foundation",
- "core-foundation-sys",
- "fsevent-sys",
- "futures-util",
- "gix",
- "parquet",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "slop-livin-harvest"
-version = "0.4.0"
-dependencies = [
- "slop-livin-core",
-]
-
-[[package]]
-name = "slop-livin-mcp"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "slop-livin-core",
- "tempfile",
-]
-
-[[package]]
-name = "slop-livin-source-audit"
-version = "0.4.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "slop-livin-tui"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "slop-livin-core",
- "tempfile",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2669,6 +2595,80 @@ dependencies = [
  "quote",
  "rustversion",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "swamp"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "swamp-core",
+ "swamp-tui",
+ "tempfile",
+]
+
+[[package]]
+name = "swamp-core"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "blake3",
+ "core-foundation",
+ "core-foundation-sys",
+ "fsevent-sys",
+ "futures-util",
+ "gix",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "swamp-harvest"
+version = "0.4.0"
+dependencies = [
+ "swamp-core",
+]
+
+[[package]]
+name = "swamp-mcp"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "swamp-core",
+ "tempfile",
+]
+
+[[package]]
+name = "swamp-source-audit"
+version = "0.4.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "swamp-tui"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "swamp-core",
+ "tempfile",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

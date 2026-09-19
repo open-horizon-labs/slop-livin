@@ -2,7 +2,7 @@
 //!
 //! Reuses the existing zstd/Parquet `Store` (see `store.rs`) rather than
 //! adding a second persistence layer. Layout under
-//! `${SLOP_LIVIN_DIR}/<volume-id>/`:
+//! `${SWAMP_DIR}/<volume-id>/`:
 //!
 //! - `current.parquet`: one row per known artifact key, holding its most
 //!   recently observed value (including tombstones for keys that are no
@@ -81,7 +81,7 @@ impl GrowthConfig {
     /// human can edit.
     pub fn to_toml(&self) -> String {
         format!(
-            "# slop-livin configuration. Every key is optional; these are the effective values.\n\
+            "# swamp configuration. Every key is optional; these are the effective values.\n\
 # How far back growth is measured by default (\"24h\", \"7d\"); --since overrides per call.\n\
 since = \"{}\"\n\
 # Days of observation history kept in the store before deltas are pruned.\n\
@@ -95,14 +95,14 @@ observe_timeout_sec = {}\n",
     }
 }
 
-/// Reads `<slop_livin_dir>/config.toml` (`retention_days = 30`,
+/// Reads `<swamp_dir>/config.toml` (`retention_days = 30`,
 /// `since = "24h"`, `observe_timeout_sec = 1800`). A missing file, or keys
 /// it does not recognize, fall back to defaults; this is a tiny
 /// hand-rolled reader so the crate does not need a full TOML dependency
 /// for a handful of scalar settings.
-pub fn load_config(slop_livin_dir: &Path) -> GrowthConfig {
+pub fn load_config(swamp_dir: &Path) -> GrowthConfig {
     let mut cfg = GrowthConfig::default();
-    let Ok(text) = fs::read_to_string(slop_livin_dir.join("config.toml")) else {
+    let Ok(text) = fs::read_to_string(swamp_dir.join("config.toml")) else {
         return cfg;
     };
     for line in text.lines() {
@@ -354,8 +354,8 @@ fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanAr
         .with_context(|| format!("column {name} is not Boolean"))
 }
 
-fn volume_dir(slop_livin_dir: &Path, volume_id: u64) -> PathBuf {
-    slop_livin_dir.join(volume_id.to_string())
+fn volume_dir(swamp_dir: &Path, volume_id: u64) -> PathBuf {
+    swamp_dir.join(volume_id.to_string())
 }
 fn current_path(dir: &Path) -> PathBuf {
     dir.join("current.parquet")
@@ -456,14 +456,14 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
 /// observation in the store keeps `growth_bytes: None`, same as the
 /// first-ever `observe_and_annotate` call would leave it.
 pub fn annotate_readonly(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     projects: &mut [ProjectRow],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     let current_file = current_path(&dir);
     if !current_file.exists() {
         // Store has never been observed for this volume; nothing to
@@ -517,18 +517,18 @@ pub fn annotate_readonly(
 /// annotates each artifact row in `projects` with `growth_bytes` (since
 /// `since_secs` ago) and `regrowth_count`.
 ///
-/// `slop_livin_dir` is the top-level store root (e.g.
-/// `${SLOP_LIVIN_DIR}`); the volume-keyed subdirectory is derived from
+/// `swamp_dir` is the top-level store root (e.g.
+/// `${SWAMP_DIR}`); the volume-keyed subdirectory is derived from
 /// `volume_id`.
 pub fn observe_and_annotate(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     projects: &mut [ProjectRow],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
     let current_file = current_path(&dir);
 
@@ -882,10 +882,10 @@ pub fn series_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &st
 }
 
 /// The volume-keyed store directory for the volume `root` lives on.
-pub fn volume_store_dir(slop_livin_dir: &Path, root: &Path) -> PathBuf {
+pub fn volume_store_dir(swamp_dir: &Path, root: &Path) -> PathBuf {
     use std::os::unix::fs::MetadataExt;
     let dev = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
-    volume_dir(slop_livin_dir, dev)
+    volume_dir(swamp_dir, dev)
 }
 
 pub fn history_span_for_root(store: &Path, root: &Path, now: u64) -> Option<u64> {
@@ -1143,14 +1143,14 @@ fn growth_since_u64(history: &[(u64, u64)], now_val: u64, target_time: u64) -> O
 /// [`annotate_readonly`] for artifacts: annotates `growth_bytes` from
 /// whatever the store already has, without writing a new observation.
 pub fn annotate_readonly_dirs(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     dirs: &mut [crate::report::DirRollup],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     let current_file = dirs_current_path(&dir);
     if !current_file.exists() {
         return Ok(());
@@ -1176,18 +1176,18 @@ pub fn annotate_readonly_dirs(
 /// no-change row appends no delta, matching the artifact store's
 /// contract.
 pub fn observe_and_annotate_dirs(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     dirs: &mut [crate::report::DirRollup],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
     let current_file = dirs_current_path(&dir);
 
-    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t = std::time::Instant::now();
     let mut current: HashMap<String, StoredDirRow> = read_dir_rows(&current_file)?
         .into_iter()
@@ -1451,14 +1451,14 @@ fn build_file_history_index(
 /// Read-only counterpart to [`observe_and_annotate_files`], mirroring
 /// [`annotate_readonly_dirs`] for large-file rows.
 pub fn annotate_readonly_files(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     files: &mut [crate::report::FileRow],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     let current_file = files_current_path(&dir);
     if !current_file.exists() {
         return Ok(());
@@ -1480,14 +1480,14 @@ pub fn annotate_readonly_files(
 
 /// Same shape as [`observe_and_annotate_dirs`], for large-file rows.
 pub fn observe_and_annotate_files(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     volume_id: u64,
     files: &mut [crate::report::FileRow],
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
     let current_file = files_current_path(&dir);
 
@@ -1807,12 +1807,12 @@ pub struct TrackedWalk {
 const TOO_MANY_CHANGES_FRACTION: f64 = 0.20;
 
 /// The [`RefreshRefusal::TooSoon`] floor, in seconds. Overridable via
-/// `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so a test driving a canned
+/// `SWAMP_FSEVENTS_MIN_INTERVAL_SECS` so a test driving a canned
 /// [`crate::fs_events::FsEventsSource`] -- which has no real FSEvents
 /// log-persistence lag to protect against -- can set it to `0` and reach
 /// the incremental path without a real `sleep`.
 fn min_interval_secs() -> u64 {
-    std::env::var("SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS")
+    std::env::var("SWAMP_FSEVENTS_MIN_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
@@ -1826,7 +1826,7 @@ fn min_interval_secs() -> u64 {
 /// the next call has a baseline to replay from regardless of which path
 /// this one took.
 pub fn observe_tracked(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
@@ -1834,7 +1834,7 @@ pub fn observe_tracked(
     observe: bool,
 ) -> Result<TrackedWalk> {
     observe_tracked_with_source(
-        slop_livin_dir,
+        swamp_dir,
         root,
         observed_at,
         large_file_min_bytes,
@@ -1859,7 +1859,7 @@ pub fn observe_tracked(
 /// never actually walked from.
 #[allow(clippy::too_many_arguments)]
 pub fn observe_tracked_with_source(
-    slop_livin_dir: &Path,
+    swamp_dir: &Path,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
@@ -1868,7 +1868,7 @@ pub fn observe_tracked_with_source(
     source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<TrackedWalk> {
     let volume_id = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
-    let dir = volume_dir(slop_livin_dir, volume_id);
+    let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
 
     // FSEvents always answers in canonical paths (ask about `/tmp/x` on
@@ -1951,7 +1951,7 @@ pub fn observe_tracked_with_source(
     // legitimately report zero changes for a write that already
     // happened. Below this floor, skip straight to a full walk rather
     // than trust an answer FSEvents itself cannot yet vouch for.
-    // Overridable via `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS` so tests
+    // Overridable via `SWAMP_FSEVENTS_MIN_INTERVAL_SECS` so tests
     // that use a canned source (which has no real log-lag to protect
     // against) can set it to `0` and skip real sleeps entirely.
     let too_soon = prev_state
@@ -1962,7 +1962,7 @@ pub fn observe_tracked_with_source(
         root: canonical_root.clone(),
         since: prev_state,
     });
-    if std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
         eprintln!(
             "[trace] fsevents replay: {:?} (incremental={}, changed_dirs={})",
             t_replay.elapsed(),
@@ -2408,7 +2408,7 @@ fn resize_interior(
         .find(|d| d.rel_path == rel_root)
         .map(|d| d.allocated_total)
     else {
-        if std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
             eprintln!(
                 "[trace]   interior rows exist ({}) but no root row {rel_root:?}",
                 interior.len()
@@ -2608,7 +2608,7 @@ fn apply_incremental(
     large_file_min_bytes: u64,
     dir: &Path,
 ) -> Result<TrackedWalk> {
-    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
     let mut attribution = reconstruct_attribution(dir)?;
     // The incremental arithmetic below works on one remainder row per

@@ -1,3 +1,3 @@
-# Surface: terminal UI (`slop-livin ui`)
+# Surface: terminal UI (`swamp ui`)
 Mode: Operate. Task: see what grew by project/worktree/artifact since the window; drill; mark folded artifacts for deletion; confirm; see the freed result. Frequency: on disk pressure or weekly. Must remain untouched: the Report contract, the action layer's sink recheck, Trash default, no-verdict vocabulary. Would feel wrong: anything that looks like a dashboard, colored backgrounds, a modal confirm, a spinner over an empty pane, a "safe to delete" label.
 Direction contract: see DESIGN.md (diffstat ledger). Key vocabulary and filter grammar are part of the contract.

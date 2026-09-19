@@ -4,7 +4,7 @@
 //! to the raw line for anyone who prefers typing. The composed text is the
 //! same string `filter::parse` accepts, so the two paths cannot diverge.
 
-use slop_livin_core::report::Report;
+use swamp_core::report::Report;
 
 pub const SIZES: &[&str] = &[
     "off", "1MB", "10MB", "50MB", "100MB", "500MB", "1GB", "5GB", "20GB",
@@ -139,7 +139,7 @@ impl Picker {
             projects,
             types: std::iter::once("any".to_string())
                 .chain(
-                    slop_livin_core::ecosystem::ECOSYSTEMS
+                    swamp_core::ecosystem::ECOSYSTEMS
                         .iter()
                         .map(|e| e.tag.to_string()),
                 )
@@ -436,9 +436,9 @@ impl Picker {
                 "type".into(),
                 {
                     let t = self.types.get(self.type_ix).cloned().unwrap_or_default();
-                    match slop_livin_core::ecosystem::name_for(&t) {
+                    match swamp_core::ecosystem::name_for(&t) {
                         Some(n) => {
-                            format!("{} {t} ({n})", slop_livin_core::ecosystem::glyph_for(&t))
+                            format!("{} {t} ({n})", swamp_core::ecosystem::glyph_for(&t))
                         }
                         None => t,
                     }
@@ -480,7 +480,7 @@ pub fn complete(text: &str, projects: &[String]) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
     if let Some(t) = last.strip_prefix("type:") {
         cands.extend(
-            slop_livin_core::ecosystem::ECOSYSTEMS
+            swamp_core::ecosystem::ECOSYSTEMS
                 .iter()
                 .map(|e| e.tag)
                 .filter(|x| x.starts_with(t.to_ascii_lowercase().as_str()))
@@ -640,7 +640,7 @@ mod tests {
             text,
             "growth > 100MB in 7d kind:BuildOutput project:mole idle > 48h merge-complete pr:open"
         );
-        assert!(slop_livin_core::filter::parse(&text).is_ok());
+        assert!(swamp_core::filter::parse(&text).is_ok());
         p.size_ix = 0;
         p.kind_ix = 0;
         p.project_ix = 0;
@@ -652,17 +652,17 @@ mod tests {
         p.min_size_ix = 5;
         p.age_ix = 3;
         assert_eq!(p.compose(), "type:rs size > 500MB age > 7d");
-        assert!(slop_livin_core::filter::parse(&p.compose()).is_ok());
+        assert!(swamp_core::filter::parse(&p.compose()).is_ok());
     }
 
     #[test]
     fn seeds_from_current_text() {
-        let report = slop_livin_core::Report {
+        let report = swamp_core::Report {
             observed_at: 0,
             root: "/r".into(),
             projects: vec![],
             unowned: vec![],
-            reconciliation: slop_livin_core::report::Reconciliation {
+            reconciliation: swamp_core::report::Reconciliation {
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

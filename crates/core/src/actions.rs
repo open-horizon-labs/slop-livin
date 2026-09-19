@@ -671,7 +671,7 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
 /// The exact command a human runs to authorize this plan. Printed in every
 /// `awaiting-authorization` refusal so the agent can relay it verbatim.
 pub fn approve_command(plan_id: &str) -> String {
-    format!("slop-livin approve {plan_id}")
+    format!("swamp approve {plan_id}")
 }
 
 // ---------------------------------------------------------------------
@@ -748,7 +748,7 @@ fn newest_mtime(path: &Path, max_entries: usize) -> Option<u64> {
 }
 
 pub fn trash_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_TRASH_DIR") {
+    if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -943,7 +943,7 @@ pub fn execute_with_trash_opts(
         return Ok(base(
             "awaiting-authorization",
             Some(format!(
-                "no grant covers this plan; a human runs `{}` (this plan only) or `slop-livin grant add '<kind:/project:/idle >/merge-complete>' --budget <size> --expires <dur>` (standing)",
+                "no grant covers this plan; a human runs `{}` (this plan only) or `swamp grant add '<kind:/project:/idle >/merge-complete>' --budget <size> --expires <dur>` (standing)",
                 approve_command(plan_id)
             )),
         ));

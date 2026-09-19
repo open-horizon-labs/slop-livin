@@ -1,20 +1,20 @@
 use anyhow::Result;
 use serde_json::{Value, json};
-use slop_livin_core::filter;
-use slop_livin_core::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
-use slop_livin_core::growth::{DEFAULT_SINCE, load_config, parse_duration_secs};
-use slop_livin_core::report::{ArtifactKind, Report, UnownedReason};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use swamp_core::filter;
+use swamp_core::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
+use swamp_core::growth::{DEFAULT_SINCE, load_config, parse_duration_secs};
+use swamp_core::report::{ArtifactKind, Report, UnownedReason};
 
-/// `${SLOP_LIVIN_DIR}`, defaulting to `~/.local/share/slop-livin`. Same
+/// `${SWAMP_DIR}`, defaulting to `~/.local/share/swamp`. Same
 /// resolution as the CLI so both surfaces observe into the same store.
-fn slop_livin_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_DIR") {
+fn swamp_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SWAMP_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/slop-livin")
+    PathBuf::from(home).join(".local/share/swamp")
 }
 
 fn run_report(root: &str, since: Option<&str>) -> Result<Report> {
@@ -22,11 +22,11 @@ fn run_report(root: &str, since: Option<&str>) -> Result<Report> {
 }
 
 fn run_report_dirs(root: &str, since: Option<&str>, dirs: bool) -> Result<Report> {
-    slop_livin_core::report::report_full_mode(
+    swamp_core::report::report_full_mode(
         &PathBuf::from(root),
         None,
         false,
-        Some(&slop_livin_dir()),
+        Some(&swamp_dir()),
         since,
         true,
         dirs,
@@ -38,13 +38,10 @@ fn run_report_dirs(root: &str, since: Option<&str>, dirs: bool) -> Result<Report
 /// History the store holds for `root`'s volume, and the growth window this
 /// call can honestly honor: the asked window, or the history if shorter.
 fn history_block(root: &str, since: Option<&str>) -> Value {
-    let now = slop_livin_core::entities::now();
-    let history = slop_livin_core::growth::history_span_for_root(
-        &slop_livin_dir(),
-        &PathBuf::from(root),
-        now,
-    );
-    let asked = since.and_then(slop_livin_core::growth::parse_duration_secs);
+    let now = swamp_core::entities::now();
+    let history =
+        swamp_core::growth::history_span_for_root(&swamp_dir(), &PathBuf::from(root), now);
+    let asked = since.and_then(swamp_core::growth::parse_duration_secs);
     let effective = match (asked, history) {
         (Some(a), Some(h)) => Some(a.min(h)),
         (Some(a), None) => Some(a),
@@ -77,7 +74,7 @@ fn effective_since(since: Option<&str>) -> String {
     {
         return s.to_string();
     }
-    let config = load_config(&slop_livin_dir());
+    let config = load_config(&swamp_dir());
     if parse_duration_secs(&config.since).is_some() {
         return config.since;
     }
@@ -133,9 +130,7 @@ fn tool_report(params: &Value) -> Result<Value> {
     let view = args.get("view").and_then(Value::as_str).map(String::from);
     let dirs = args.get("dirs").and_then(Value::as_bool).unwrap_or(false);
     let filter = match args.get("filter").and_then(Value::as_str) {
-        Some(f) if !f.trim().is_empty() && f.trim() != "0" => {
-            Some(slop_livin_core::filter::parse(f)?)
-        }
+        Some(f) if !f.trim().is_empty() && f.trim() != "0" => Some(swamp_core::filter::parse(f)?),
         _ => None,
     };
 
@@ -179,9 +174,7 @@ fn tool_report(params: &Value) -> Result<Value> {
             let keep: std::collections::HashSet<String> = r
                 .projects
                 .iter()
-                .filter(|p| {
-                    p.name == name || slop_livin_core::render::project_display_name(p) == name
-                })
+                .filter(|p| p.name == name || swamp_core::render::project_display_name(p) == name)
                 .flat_map(|p| p.worktrees.iter().map(|w| w.worktree_id.clone()))
                 .collect();
             let scoped: serde_json::Map<String, Value> =
@@ -202,8 +195,8 @@ fn tool_report(params: &Value) -> Result<Value> {
 /// predicates (`kind:`, `growth`, `size`, `age`); artifacts that fail are
 /// dropped from the kept projects. Worktree predicates (`idle`,
 /// `merge-complete`, `pr:`) keep a project when any worktree passes.
-fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
-    use slop_livin_core::filter::Predicate;
+fn apply_filter_to_report(r: &mut Report, f: &swamp_core::filter::Filter) {
+    use swamp_core::filter::Predicate;
     let has_artifact_preds = f.predicates.iter().any(|p| {
         matches!(
             p,
@@ -221,10 +214,10 @@ fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
     });
     r.projects.retain_mut(|p| {
         let project_level = f.predicates.iter().all(|pred| match pred {
-            Predicate::Project(name) => slop_livin_core::filter::name_matches(name, &p.name),
+            Predicate::Project(name) => swamp_core::filter::name_matches(name, &p.name),
             Predicate::Type(_) => {
                 let probe = p.clone();
-                slop_livin_core::filter::Filter {
+                swamp_core::filter::Filter {
                     predicates: vec![pred.clone()],
                 }
                 .matches_artifact(&probe, &dummy_artifact())
@@ -239,10 +232,10 @@ fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
                 let merge_complete = wt
                     .merge_complete
                     .as_ref()
-                    .is_some_and(|m| m.verdict == slop_livin_core::github::TriState::Yes);
-                let unknown = slop_livin_core::github::PrStatus::Unknown;
-                let none = slop_livin_core::github::MergedStatus::Unknown;
-                let facts = slop_livin_core::filter::WorktreeFacts {
+                    .is_some_and(|m| m.verdict == swamp_core::github::TriState::Yes);
+                let unknown = swamp_core::github::PrStatus::Unknown;
+                let none = swamp_core::github::MergedStatus::Unknown;
+                let facts = swamp_core::filter::WorktreeFacts {
                     merge_complete,
                     idle_secs: wt.idle_secs,
                     pr: wt
@@ -252,7 +245,7 @@ fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
                         .unwrap_or(&unknown),
                     merged: wt.github.as_ref().map(|g| &g.merged).unwrap_or(&none),
                 };
-                slop_livin_core::filter::Filter {
+                swamp_core::filter::Filter {
                     predicates: f
                         .predicates
                         .iter()
@@ -278,7 +271,7 @@ fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
             let mut any = false;
             for wt in &mut p.worktrees {
                 wt.artifacts.retain(|a| {
-                    let keep = slop_livin_core::filter::Filter {
+                    let keep = swamp_core::filter::Filter {
                         predicates: f
                             .predicates
                             .iter()
@@ -305,8 +298,8 @@ fn apply_filter_to_report(r: &mut Report, f: &slop_livin_core::filter::Filter) {
     });
 }
 
-fn dummy_artifact() -> slop_livin_core::report::ArtifactRow {
-    slop_livin_core::report::ArtifactRow {
+fn dummy_artifact() -> swamp_core::report::ArtifactRow {
+    swamp_core::report::ArtifactRow {
         kind: ArtifactKind::Source,
         path: Default::default(),
         bytes: 0,
@@ -318,8 +311,8 @@ fn dummy_artifact() -> slop_livin_core::report::ArtifactRow {
         growth_bytes: None,
         regrowth_count: 0,
         observed_at: 0,
-        confidence: slop_livin_core::entities::Confidence::High,
-        source: slop_livin_core::report::Source::new("filter"),
+        confidence: swamp_core::entities::Confidence::High,
+        source: swamp_core::report::Source::new("filter"),
         note: None,
         created_at: None,
         containers: Vec::new(),
@@ -552,8 +545,8 @@ fn tool_list_projects(params: &Value) -> Result<Value> {
                 .filter(|w| {
                     matches!(
                         w.kind,
-                        slop_livin_core::report::WorktreeKind::Main
-                            | slop_livin_core::report::WorktreeKind::Clone
+                        swamp_core::report::WorktreeKind::Main
+                            | swamp_core::report::WorktreeKind::Clone
                     )
                 })
                 .count();
@@ -570,7 +563,7 @@ fn tool_list_projects(params: &Value) -> Result<Value> {
             }
             json!({
                 "name": p.name,
-                "display_name": slop_livin_core::render::project_display_name(p),
+                "display_name": swamp_core::render::project_display_name(p),
                 "project_id": p.project_id,
                 "bytes": bytes,
                 "growth_bytes": growth,
@@ -786,7 +779,7 @@ fn tool_propose(params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("root is required"))?;
     let since = args.get("since").and_then(Value::as_str).map(String::from);
     let filter = match args.get("filter").and_then(Value::as_str) {
-        Some(f) if !f.trim().is_empty() => Some(slop_livin_core::filter::parse(f)?),
+        Some(f) if !f.trim().is_empty() => Some(swamp_core::filter::parse(f)?),
         _ => None,
     };
     let paths: Vec<PathBuf> = args
@@ -801,14 +794,14 @@ fn tool_propose(params: &Value) -> Result<Value> {
         .unwrap_or_default();
     // Dir rollups so a Source directory can be planned by path.
     let r = run_report_dirs(root, since.as_deref(), true)?;
-    let plan = slop_livin_core::actions::propose(&r, filter.as_ref(), &paths, "agent:mcp")?;
-    slop_livin_core::actions::save_plan(&slop_livin_dir(), &plan)?;
+    let plan = swamp_core::actions::propose(&r, filter.as_ref(), &paths, "agent:mcp")?;
+    swamp_core::actions::save_plan(&swamp_dir(), &plan)?;
     let mut v = serde_json::to_value(&plan)?;
     v["state"] = json!("awaiting-authorization");
     v["planned_bytes"] = json!(plan.planned_bytes());
     v["next_step"] = json!(format!(
-        "a human authorizes with `{}` (this plan) or a standing `slop-livin grant add ...`; then call execute with plan_id. This tool cannot authorize.",
-        slop_livin_core::actions::approve_command(&plan.id)
+        "a human authorizes with `{}` (this plan) or a standing `swamp grant add ...`; then call execute with plan_id. This tool cannot authorize.",
+        swamp_core::actions::approve_command(&plan.id)
     ));
     v["observed_at"] = json!(r.observed_at);
     Ok(v)
@@ -826,27 +819,23 @@ fn tool_execute(params: &Value) -> Result<Value> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let res = if keep {
-        slop_livin_core::actions::execute_keeping_executables(
-            &slop_livin_dir(),
-            plan_id,
-            "agent:mcp",
-        )?
+        swamp_core::actions::execute_keeping_executables(&swamp_dir(), plan_id, "agent:mcp")?
     } else {
-        slop_livin_core::actions::execute(&slop_livin_dir(), plan_id, "agent:mcp")?
+        swamp_core::actions::execute(&swamp_dir(), plan_id, "agent:mcp")?
     };
     Ok(serde_json::to_value(&res)?)
 }
 
 fn tool_plans(_params: &Value) -> Result<Value> {
-    let plans = slop_livin_core::actions::list_plans(&slop_livin_dir())?;
+    let plans = swamp_core::actions::list_plans(&swamp_dir())?;
     Ok(json!({"plans": plans}))
 }
 
 fn tool_grants(_params: &Value) -> Result<Value> {
     // Read-only by construction: there is no MCP tool that writes a grant.
-    let grants = slop_livin_core::actions::list_grants(&slop_livin_dir())?;
+    let grants = swamp_core::actions::list_grants(&swamp_dir())?;
     Ok(
-        json!({"grants": grants, "note": "grants are written only by a human at the CLI (slop-livin approve / grant add); this server cannot mint authorization"}),
+        json!({"grants": grants, "note": "grants are written only by a human at the CLI (swamp approve / grant add); this server cannot mint authorization"}),
     )
 }
 
@@ -858,7 +847,7 @@ fn main() -> Result<()> {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let result = match method {
             "initialize" => {
-                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"slop-livin","version":env!("CARGO_PKG_VERSION")}})
+                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"swamp","version":env!("CARGO_PKG_VERSION")}})
             }
             "tools/list" => {
                 json!({"tools":[
@@ -911,7 +900,7 @@ fn main() -> Result<()> {
                     },
                     {
                         "name":"execute",
-                        "description":"Execute a plan that a human has authorized (slop-livin approve <plan_id> or a standing grant). Every unit is re-derived at the sink (still an artifact dir, no activity since the plan, not occupied) and moved to Trash; per-unit outcomes name the fact behind any refusal; the ledger records actor=agent:mcp. Returns awaiting-authorization with the approve command when no grant covers the plan. This tool cannot authorize anything.",
+                        "description":"Execute a plan that a human has authorized (swamp approve <plan_id> or a standing grant). Every unit is re-derived at the sink (still an artifact dir, no activity since the plan, not occupied) and moved to Trash; per-unit outcomes name the fact behind any refusal; the ledger records actor=agent:mcp. Returns awaiting-authorization with the approve command when no grant covers the plan. This tool cannot authorize anything.",
                         "inputSchema":{"type":"object","required":["plan_id"],"properties":{
                             "plan_id":{"type":"string"},
                             "keep_executables":{"type":"boolean","description":"Before trashing a build directory, copy compiled outputs to <worktree>/bin/ (Rust target/{release,debug} executables, Python dist/*.whl and build/**/*.so). Outcomes list what was kept under `preserved`"}
@@ -979,11 +968,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slop_livin_core::entities::Confidence;
-    use slop_livin_core::report::{
+    use std::path::PathBuf;
+    use swamp_core::entities::Confidence;
+    use swamp_core::report::{
         ArtifactRow, ProjectRow, Reconciliation, Signal, Source, WorktreeKind, WorktreeRow,
     };
-    use std::path::PathBuf;
 
     fn docker_image_row(reference: &str, bytes: u64) -> ArtifactRow {
         ArtifactRow {

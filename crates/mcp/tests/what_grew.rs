@@ -1,4 +1,4 @@
-//! Drives the real `slop-livin-mcp` binary end to end over a fixture with
+//! Drives the real `swamp-mcp` binary end to end over a fixture with
 //! a known growth event: observe, grow an artifact, observe again, then
 //! call `what_grew` and assert the grown row is present. This reproduces
 //! issue #32 item 4 ("MCP `what_grew` returned `grown: []` while the CLI
@@ -37,14 +37,14 @@ struct McpProcess {
 
 impl McpProcess {
     fn spawn(store_dir: &Path) -> Self {
-        let exe = env!("CARGO_BIN_EXE_slop-livin-mcp");
+        let exe = env!("CARGO_BIN_EXE_swamp-mcp");
         let mut child = Command::new(exe)
-            .env("SLOP_LIVIN_DIR", store_dir)
+            .env("SWAMP_DIR", store_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn slop-livin-mcp");
+            .expect("spawn swamp-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Self {

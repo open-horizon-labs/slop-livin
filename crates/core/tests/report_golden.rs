@@ -9,7 +9,7 @@
 #[path = "fixture/mod.rs"]
 mod fixture;
 
-use slop_livin_core::report::report;
+use swamp_core::report::report;
 
 #[test]
 fn report_matches_fixture_and_reconciles() {
@@ -35,10 +35,7 @@ fn report_matches_fixture_and_reconciles() {
         .iter()
         .find(|w| w.path == fx.checkout)
         .expect("main worktree row for checkout");
-    assert_eq!(
-        main_worktree.kind,
-        slop_livin_core::report::WorktreeKind::Main
-    );
+    assert_eq!(main_worktree.kind, swamp_core::report::WorktreeKind::Main);
 
     let linked_worktree = checkout_project
         .worktrees
@@ -47,7 +44,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("linked worktree row for checkout-linked");
     assert_eq!(
         linked_worktree.kind,
-        slop_livin_core::report::WorktreeKind::Linked
+        swamp_core::report::WorktreeKind::Linked
     );
 
     let node_modules_row = main_worktree
@@ -58,7 +55,7 @@ fn report_matches_fixture_and_reconciles() {
     assert_eq!(node_modules_row.bytes, fx.node_modules_bytes);
     assert_eq!(
         node_modules_row.kind,
-        slop_livin_core::report::ArtifactKind::DependencyTree
+        swamp_core::report::ArtifactKind::DependencyTree
     );
 
     let target_row = main_worktree
@@ -69,7 +66,7 @@ fn report_matches_fixture_and_reconciles() {
     assert_eq!(target_row.bytes, fx.target_bytes);
     assert_eq!(
         target_row.kind,
-        slop_livin_core::report::ArtifactKind::BuildOutput
+        swamp_core::report::ArtifactKind::BuildOutput
     );
 
     let dist_row = main_worktree
@@ -78,10 +75,7 @@ fn report_matches_fixture_and_reconciles() {
         .find(|a| a.path == fx.dist_dir)
         .expect("dist artifact row");
     assert_eq!(dist_row.bytes, fx.dist_bytes);
-    assert_eq!(
-        dist_row.kind,
-        slop_livin_core::report::ArtifactKind::BuildOutput
-    );
+    assert_eq!(dist_row.kind, swamp_core::report::ArtifactKind::BuildOutput);
 
     let nested_project = r
         .projects
@@ -122,14 +116,8 @@ fn report_matches_fixture_and_reconciles() {
         .iter()
         .find(|a| a.path.to_string_lossy().contains("fixture/with-project"))
         .expect("compose-label-joined docker image row");
-    assert_eq!(
-        aaaa_row.kind,
-        slop_livin_core::report::ArtifactKind::DockerImage
-    );
-    assert_eq!(
-        aaaa_row.confidence,
-        slop_livin_core::entities::Confidence::High
-    );
+    assert_eq!(aaaa_row.kind, swamp_core::report::ArtifactKind::DockerImage);
+    assert_eq!(aaaa_row.confidence, swamp_core::entities::Confidence::High);
     assert_eq!(aaaa_row.bytes, 8_388_608);
 
     // bbbb: unlabeled, named exactly like the project -> unowned. Name
@@ -141,11 +129,11 @@ fn report_matches_fixture_and_reconciles() {
         .expect("unlabeled same-name-as-project docker image unowned row");
     assert_eq!(
         bbbb_row.reason,
-        slop_livin_core::report::UnownedReason::DockerNoJoin
+        swamp_core::report::UnownedReason::DockerNoJoin
     );
     assert!(
         !main_worktree.artifacts.iter().any(|a| {
-            a.kind == slop_livin_core::report::ArtifactKind::DockerImage
+            a.kind == swamp_core::report::ArtifactKind::DockerImage
                 && a.path.to_string_lossy().contains(&fx.checkout_name)
                 && !a.path.to_string_lossy().contains("fixture/")
         }),
@@ -161,7 +149,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("image.source-joined docker image row");
     assert_eq!(
         cccc_row.confidence,
-        slop_livin_core::entities::Confidence::Medium
+        swamp_core::entities::Confidence::Medium
     );
     assert!(
         !fx.checkout_remote.is_empty(),
@@ -177,7 +165,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("elsewhere-sourced docker image unowned row");
     assert_eq!(
         dddd_row.reason,
-        slop_livin_core::report::UnownedReason::DockerNoJoin
+        swamp_core::report::UnownedReason::DockerNoJoin
     );
     assert!(
         dddd_row
@@ -199,7 +187,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("base-image-trap docker image unowned row");
     assert_eq!(
         eeee_row.reason,
-        slop_livin_core::report::UnownedReason::DockerNoJoin
+        swamp_core::report::UnownedReason::DockerNoJoin
     );
     assert!(
         eeee_row
@@ -235,10 +223,7 @@ fn report_matches_fixture_and_reconciles() {
                 .contains("fixture/working-dir-join")
         })
         .expect("working_dir-joined docker image row, under the linked worktree");
-    assert_eq!(
-        ffff_row.confidence,
-        slop_livin_core::entities::Confidence::High
-    );
+    assert_eq!(ffff_row.confidence, swamp_core::entities::Confidence::High);
 
     // gggg: compose-project label matches no discovered project and has
     // no other evidence -> unowned, with a compose_project note so a
@@ -253,7 +238,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("unmatched-compose-project docker image unowned row");
     assert_eq!(
         gggg_row.reason,
-        slop_livin_core::report::UnownedReason::DockerNoJoin
+        swamp_core::report::UnownedReason::DockerNoJoin
     );
     assert!(
         gggg_row
@@ -271,7 +256,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("unowned build cache row");
     assert_eq!(
         build_cache_row.reason,
-        slop_livin_core::report::UnownedReason::DockerNoJoin
+        swamp_core::report::UnownedReason::DockerNoJoin
     );
 
     // the volume's compose-project label matches the checkout directly
@@ -284,11 +269,11 @@ fn report_matches_fixture_and_reconciles() {
         .expect("compose-label-joined volume row");
     assert_eq!(
         volume_row.kind,
-        slop_livin_core::report::ArtifactKind::DockerVolume
+        swamp_core::report::ArtifactKind::DockerVolume
     );
     assert_eq!(
         volume_row.confidence,
-        slop_livin_core::entities::Confidence::High
+        swamp_core::entities::Confidence::High
     );
 
     // 9999 (#28): compose-project label matches no discovered project's
@@ -306,7 +291,7 @@ fn report_matches_fixture_and_reconciles() {
         .expect("compose-file-name-joined docker image row");
     assert_eq!(
         compose_name_row.confidence,
-        slop_livin_core::entities::Confidence::High
+        swamp_core::entities::Confidence::High
     );
     assert_eq!(compose_name_row.source.tool, "docker.compose_file_name");
     assert!(
@@ -321,11 +306,11 @@ fn report_matches_fixture_and_reconciles() {
         .expect("compose-file-name-joined volume row");
     assert_eq!(
         compose_name_volume_row.kind,
-        slop_livin_core::report::ArtifactKind::DockerVolume
+        swamp_core::report::ArtifactKind::DockerVolume
     );
     assert_eq!(
         compose_name_volume_row.confidence,
-        slop_livin_core::entities::Confidence::High
+        swamp_core::entities::Confidence::High
     );
     assert_eq!(
         compose_name_volume_row.source.tool,

@@ -6,7 +6,7 @@
 //! with an explicit canned source -- never `report_full_mode` (which
 //! resolves the real macOS source) -- and every test disables the
 //! [`RefreshRefusal::TooSoon`] floor via
-//! `SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS=0` instead of sleeping past it.
+//! `SWAMP_FSEVENTS_MIN_INTERVAL_SECS=0` instead of sleeping past it.
 //! Both are load-bearing for CI/shared-machine safety, not style: this
 //! suite used to spend real wall-clock seconds per case and, worse, once
 //! wired a "first observation" call through the real platform source
@@ -18,13 +18,13 @@
 #[path = "fixture/mod.rs"]
 mod fixture;
 
-use slop_livin_core::fs_events::{
-    FsEventsPlan, FsEventsRequest, FsEventsSource, RefreshRefusal, testing::CannedSource,
-};
-use slop_livin_core::report::{ArtifactKind, report_full_mode_with_source};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Once;
+use swamp_core::fs_events::{
+    FsEventsPlan, FsEventsRequest, FsEventsSource, RefreshRefusal, testing::CannedSource,
+};
+use swamp_core::report::{ArtifactKind, report_full_mode_with_source};
 
 /// Disables the `TooSoon` floor for this process. Idempotent and safe to
 /// call from every test regardless of thread-parallel execution: every
@@ -38,7 +38,7 @@ fn disable_too_soon_floor() {
         // SAFETY: set once, before any thread in this test binary reads
         // it via `growth::min_interval_secs`; no other code in this
         // process depends on this variable being absent.
-        std::env::set_var("SLOP_LIVIN_FSEVENTS_MIN_INTERVAL_SECS", "0");
+        std::env::set_var("SWAMP_FSEVENTS_MIN_INTERVAL_SECS", "0");
     });
 }
 
@@ -159,7 +159,7 @@ fn touching_one_artifact_resizes_only_that_row_and_matches_a_full_walk() {
     )
     .expect("forced full report");
 
-    let checkout_worktree = |r: &slop_livin_core::report::Report| {
+    let checkout_worktree = |r: &swamp_core::report::Report| {
         r.projects
             .iter()
             .find(|p| p.name == fx.checkout_name)
@@ -335,7 +335,7 @@ fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a
         &no_op_source(),
     )
     .expect("forced full report");
-    let bytes_of = |r: &slop_livin_core::report::Report, path: &std::path::Path| {
+    let bytes_of = |r: &swamp_core::report::Report, path: &std::path::Path| {
         r.projects
             .iter()
             .flat_map(|p| p.worktrees.iter())
@@ -556,7 +556,7 @@ fn stored_event_id_is_recorded_after_an_observation() {
 
 /// Regression for a live-run bug against `~/src`: a project whose linked
 /// worktrees live *inside* the main checkout's own directory tree (e.g.
-/// `.worktrees/<name>`, the real shape `slop-livin` itself uses), each
+/// `.worktrees/<name>`, the real shape `swamp` itself uses), each
 /// with its own large `target/` artifact. Touching one file in the main
 /// checkout's `target/` and re-observing incrementally must not fold any
 /// linked worktree's bytes into the main checkout's row: every row in
@@ -608,7 +608,7 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
 
     // Three linked worktrees living *inside* the main checkout's tree,
     // each with its own large artifact -- the exact shape that tripped
-    // the bug on the real `slop-livin` repo (13 nested worktrees).
+    // the bug on the real `swamp` repo (13 nested worktrees).
     let worktrees_dir = root.join(".worktrees");
     let mut linked_paths = Vec::new();
     for name in ["a", "b", "c"] {
@@ -710,15 +710,14 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
 
     // And every row in every worktree (not just the touched one) must be
     // byte-for-byte identical to a forced full walk.
-    let rows_by_path =
-        |r: &slop_livin_core::report::Report| -> std::collections::HashMap<PathBuf, u64> {
-            r.projects
-                .iter()
-                .flat_map(|p| &p.worktrees)
-                .flat_map(|w| &w.artifacts)
-                .map(|a| (a.path.clone(), a.bytes))
-                .collect()
-        };
+    let rows_by_path = |r: &swamp_core::report::Report| -> std::collections::HashMap<PathBuf, u64> {
+        r.projects
+            .iter()
+            .flat_map(|p| &p.worktrees)
+            .flat_map(|w| &w.artifacts)
+            .map(|a| (a.path.clone(), a.bytes))
+            .collect()
+    };
     let inc_rows = rows_by_path(&incremental);
     let full_rows = rows_by_path(&full);
     assert_eq!(
@@ -844,7 +843,7 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     assert_eq!(full.reconciliation.walked_total, full_before + 8192);
 
     // Per-row equality, order-independent.
-    let rows = |r: &slop_livin_core::Report| {
+    let rows = |r: &swamp_core::Report| {
         let mut v: Vec<(String, String, u64)> = r
             .projects
             .iter()
@@ -917,7 +916,7 @@ fn docker_rows_stay_out_of_walked_total_and_are_not_duplicated_on_incremental() 
         &no_op_source(),
     )
     .expect("first (full) report");
-    let docker_rows = |r: &slop_livin_core::Report| -> Vec<String> {
+    let docker_rows = |r: &swamp_core::Report| -> Vec<String> {
         let mut v: Vec<String> = r
             .projects
             .iter()
@@ -926,9 +925,9 @@ fn docker_rows_stay_out_of_walked_total_and_are_not_duplicated_on_incremental() 
             .filter(|a| {
                 matches!(
                     a.kind,
-                    slop_livin_core::report::ArtifactKind::DockerImage
-                        | slop_livin_core::report::ArtifactKind::DockerBuildCache
-                        | slop_livin_core::report::ArtifactKind::DockerVolume
+                    swamp_core::report::ArtifactKind::DockerImage
+                        | swamp_core::report::ArtifactKind::DockerBuildCache
+                        | swamp_core::report::ArtifactKind::DockerVolume
                 )
             })
             .map(|a| a.path.display().to_string())

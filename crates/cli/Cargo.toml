@@ -1,5 +1,5 @@
 [package]
-name = "slop-livin"
+name = "swamp"
 version.workspace = true
 edition.workspace = true
 
@@ -7,8 +7,8 @@ edition.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-slop-livin-core = { path = "../core" }
-slop-livin-tui = { path = "../tui" }
+swamp-core = { path = "../core" }
+swamp-tui = { path = "../tui" }
 
 [dev-dependencies]
 tempfile.workspace = true

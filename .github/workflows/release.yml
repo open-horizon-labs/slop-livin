@@ -64,7 +64,7 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
-        run: cargo build --release --locked --target aarch64-apple-darwin -p slop-livin -p slop-livin-mcp
+        run: cargo build --release --locked --target aarch64-apple-darwin -p swamp -p swamp-mcp
 
       # Same profile and target as the build: the library and binary
       # crates are already compiled above, so only the test harnesses are
@@ -81,9 +81,9 @@ jobs:
         run: |
           set -euo pipefail
           v="${{ steps.v.outputs.version }}"
-          out="slop-livin-${v}-aarch64-apple-darwin"
+          out="swamp-${v}-aarch64-apple-darwin"
           mkdir -p "dist/${out}"
-          cp target/aarch64-apple-darwin/release/slop-livin target/aarch64-apple-darwin/release/slop-livin-mcp "dist/${out}/"
+          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${out}/"
           cp README.md "dist/${out}/"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           (cd dist && shasum -a 256 "${out}.tar.gz" > "${out}.tar.gz.sha256")
@@ -94,15 +94,15 @@ jobs:
       - name: Smoke
         run: |
           set -euo pipefail
-          ./target/aarch64-apple-darwin/release/slop-livin --help | head -3
+          ./target/aarch64-apple-darwin/release/swamp --help | head -3
           # The binary must report the version being released.
-          test "$(./target/aarch64-apple-darwin/release/slop-livin --version)" = "slop-livin ${{ steps.v.outputs.version }}"
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/slop-livin-mcp | grep -q '"report"'
+          test "$(./target/aarch64-apple-darwin/release/swamp --version)" = "swamp ${{ steps.v.outputs.version }}"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/swamp-mcp | grep -q '"report"'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: slop-livin-macos-arm64
+          name: swamp-macos-arm64
           path: dist/*
 
       # Release notes are written by a human in CHANGELOG.md under
@@ -127,9 +127,9 @@ jobs:
             echo
             echo "### Install (macOS, Apple silicon)"
             echo '```bash'
-            echo "curl -fsSL -o slop-livin.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/slop-livin-${v#v}-aarch64-apple-darwin.tar.gz"
-            echo "tar -xzf slop-livin.tar.gz && cp slop-livin-${v#v}-aarch64-apple-darwin/slop-livin* ~/.local/bin/"
-            echo "xattr -d com.apple.quarantine ~/.local/bin/slop-livin ~/.local/bin/slop-livin-mcp 2>/dev/null || true"
+            echo "curl -fsSL -o swamp.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/swamp-${v#v}-aarch64-apple-darwin.tar.gz"
+            echo "tar -xzf swamp.tar.gz && cp swamp-${v#v}-aarch64-apple-darwin/swamp* ~/.local/bin/"
+            echo "xattr -d com.apple.quarantine ~/.local/bin/swamp ~/.local/bin/swamp-mcp 2>/dev/null || true"
             echo '```'
             echo "The binaries are not code-signed; the \`xattr\` line clears Gatekeeper's quarantine flag. Verify with the \`.sha256\` file."
           } >> release-notes.md

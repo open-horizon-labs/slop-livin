@@ -1,5 +1,5 @@
 //! The TUI's filter line speaks the same grammar as `--filter` on the CLI
-//! and the MCP tools — it *is* `slop_livin_core::filter`. This module only
+//! and the MCP tools — it *is* `swamp_core::filter`. This module only
 //! adds the TUI's conveniences: the default line, the `0` = no filter
 //! shorthand, and small accessors the row builders need.
 //!
@@ -7,9 +7,9 @@
 //! `kind:<k>`, `project:<name>`, `idle > <dur>`, `merge-complete`,
 //! `pr:open|merged|closed|none`.
 
-pub use slop_livin_core::filter::Filter;
-use slop_livin_core::filter::Predicate;
-use slop_livin_core::report::ArtifactKind;
+pub use swamp_core::filter::Filter;
+use swamp_core::filter::Predicate;
+use swamp_core::report::ArtifactKind;
 
 /// The filter shown on open, per DESIGN.md.
 pub fn default_filter_text() -> &'static str {
@@ -17,7 +17,7 @@ pub fn default_filter_text() -> &'static str {
 }
 
 pub fn default_filter() -> Filter {
-    slop_livin_core::filter::parse(default_filter_text()).expect("default filter parses")
+    swamp_core::filter::parse(default_filter_text()).expect("default filter parses")
 }
 
 /// Parses one filter line. `0` or an empty line means "no filter".
@@ -28,7 +28,7 @@ pub fn parse(input: &str) -> Result<Filter, String> {
     if raw.is_empty() || raw == "0" {
         return Ok(Filter::default());
     }
-    slop_livin_core::filter::parse(raw).map_err(|e| e.to_string())
+    swamp_core::filter::parse(raw).map_err(|e| e.to_string())
 }
 
 /// The growth window named by the filter, for the header's `since`.
@@ -81,10 +81,10 @@ pub fn worktree_passes(
     f: &Filter,
     idle_secs: Option<u64>,
     merge_complete: bool,
-    pr_state: Option<&slop_livin_core::github::PrState>,
+    pr_state: Option<&swamp_core::github::PrState>,
 ) -> bool {
-    use slop_livin_core::filter::PrFilter;
-    use slop_livin_core::github::PrState;
+    use swamp_core::filter::PrFilter;
+    use swamp_core::github::PrState;
     f.predicates.iter().all(|p| match p {
         Predicate::IdleGreaterThan(secs) => idle_secs.is_some_and(|i| i > *secs),
         Predicate::MergeComplete => merge_complete,
@@ -101,7 +101,7 @@ pub fn worktree_passes(
 
 /// Every `size` predicate against a rollup's bytes.
 pub fn size_passes(f: &Filter, bytes: u64) -> bool {
-    slop_livin_core::filter::size_passes(f, bytes)
+    swamp_core::filter::size_passes(f, bytes)
 }
 
 /// Every `age >` predicate against an artifact's newest mtime. Unknown
@@ -110,7 +110,7 @@ pub fn size_passes(f: &Filter, bytes: u64) -> bool {
 pub fn age_passes(f: &Filter, mtime_max: u64) -> bool {
     f.predicates.iter().all(|p| match p {
         Predicate::AgeGreaterThan(secs) => {
-            mtime_max > 0 && slop_livin_core::entities::now().saturating_sub(mtime_max) > *secs
+            mtime_max > 0 && swamp_core::entities::now().saturating_sub(mtime_max) > *secs
         }
         _ => true,
     })
@@ -136,11 +136,11 @@ pub fn has_worktree_predicates(f: &Filter) -> bool {
 }
 
 /// Every `type:` predicate against the project's ecosystem tags.
-pub fn type_passes(f: &Filter, project: &slop_livin_core::report::ProjectRow) -> bool {
+pub fn type_passes(f: &Filter, project: &swamp_core::report::ProjectRow) -> bool {
     f.predicates.iter().all(|p| match p {
         Predicate::Type(t) => {
-            let dummy = slop_livin_core::report::ArtifactRow {
-                kind: slop_livin_core::report::ArtifactKind::Source,
+            let dummy = swamp_core::report::ArtifactRow {
+                kind: swamp_core::report::ArtifactKind::Source,
                 path: Default::default(),
                 bytes: 0,
                 mtime_max: 0,
@@ -151,8 +151,8 @@ pub fn type_passes(f: &Filter, project: &slop_livin_core::report::ProjectRow) ->
                 growth_bytes: None,
                 regrowth_count: 0,
                 observed_at: 0,
-                confidence: slop_livin_core::entities::Confidence::High,
-                source: slop_livin_core::report::Source::new("filter"),
+                confidence: swamp_core::entities::Confidence::High,
+                source: swamp_core::report::Source::new("filter"),
                 note: None,
                 created_at: None,
                 containers: Vec::new(),

@@ -1,12 +1,12 @@
 [package]
-name = "slop-livin-mcp"
+name = "swamp-mcp"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-slop-livin-core = { path = "../core" }
+swamp-core = { path = "../core" }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -4,8 +4,8 @@
 #[path = "fixture/mod.rs"]
 mod fixture;
 
-use slop_livin_core::report::{ArtifactKind, report_with, report_with_observe};
 use std::fs;
+use swamp_core::report::{ArtifactKind, report_with, report_with_observe};
 
 #[test]
 fn growing_one_artifact_shows_growth_there_and_zero_elsewhere() {
@@ -221,7 +221,7 @@ fn golden_report_without_observe_flag_stays_read_only() {
     // silently start writing to disk from a plain `report()` call.
     let tmp = tempfile::tempdir().expect("tmp root");
     let fx = fixture::build(tmp.path());
-    let r = slop_livin_core::report::report(&fx.root, Some(&fx.docker_facts))
+    let r = swamp_core::report::report(&fx.root, Some(&fx.docker_facts))
         .expect("report() should not error");
     assert!(!r.projects.is_empty());
     for project in &r.projects {

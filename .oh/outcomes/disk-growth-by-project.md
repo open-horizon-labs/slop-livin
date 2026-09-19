@@ -23,7 +23,7 @@ files:
 
 Every technical constraint Muness specified for this tool is recorded as a hard guardrail
 under `.oh/guardrails/` and enforced as an AST audit in `crates/source-audit` (`cargo run
--p slop-livin-source-audit -- --list` names them). A constraint that is not enforced by an
+-p swamp-source-audit -- --list` names them). A constraint that is not enforced by an
 audit is not considered implemented.
 
 ## Guardrails

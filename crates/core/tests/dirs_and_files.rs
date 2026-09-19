@@ -5,8 +5,8 @@
 #[path = "fixture/mod.rs"]
 mod fixture;
 
-use slop_livin_core::report::report_with_dirs;
 use std::fs;
+use swamp_core::report::report_with_dirs;
 
 #[test]
 fn growth_appears_on_file_row_and_every_directory_in_the_chain() {

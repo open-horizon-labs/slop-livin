@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedAt": "2026-09-18T00:00:00Z",
-  "title": "Design System: slop-livin terminal UI (diffstat ledger)",
+  "title": "Design System: swamp terminal UI (diffstat ledger)",
   "note": "Terminal (ratatui) surface, not a web app. No CSS/HTML DOM exists; components below are text-art/state snippets captured from committed frame fixtures in crates/tui/tests/frames/*.txt, verified against crates/tui/src/{model,ui,app,filter,units,actions}.rs as of the tui crate build (issue #34).",
   "extensions": {
     "colorMeta": {
@@ -132,7 +132,7 @@
       "refusal": "Two independent sources feed the same 4s-red-footer mechanism: mark-time kind refusal (units::markable) and action-layer sink refusal at confirm time (e.g. ledger open failure) — both call App::set_refusal.",
       "help": "? toggles help_open; it is rendered as an overlay on top of whatever view/state is current, never a separate mode that suspends input elsewhere."
     },
-    "actionLayerWiring": "actions.rs is a thin driver, not new policy: MarkedUnit (path/bytes/observed_at) is enough to re-derive a slop_livin_core Artifact. authorize() mints a Plan and a Grant together for the same keypress (grant.created_outside_index = true, actor = the confirming human, never an agent or the index). execute_plan() calls slop_livin_core::execution::execute_delete once per unit, which does its own re-symlink_metadata + occupancy recheck immediately before the rename — the TUI does not re-implement sink safety. Every outcome is appended to slop_livin_core::ledger::Ledger. trash_root() resolves to ~/.Trash unless SLOP_LIVIN_TRASH_DIR overrides it for tests. free_space_bytes() via `df -k` is read-only and advisory: a failed measurement reports 'unmeasured' rather than blocking or fabricating a number. After execution the in-memory Report is locally patched (successfully removed artifact paths dropped from their worktree) rather than re-walking the whole root, which stays out of scope for this action.",
+    "actionLayerWiring": "actions.rs is a thin driver, not new policy: MarkedUnit (path/bytes/observed_at) is enough to re-derive a swamp_core Artifact. authorize() mints a Plan and a Grant together for the same keypress (grant.created_outside_index = true, actor = the confirming human, never an agent or the index). execute_plan() calls swamp_core::execution::execute_delete once per unit, which does its own re-symlink_metadata + occupancy recheck immediately before the rename — the TUI does not re-implement sink safety. Every outcome is appended to swamp_core::ledger::Ledger. trash_root() resolves to ~/.Trash unless SWAMP_TRASH_DIR overrides it for tests. free_space_bytes() via `df -k` is read-only and advisory: a failed measurement reports 'unmeasured' rather than blocking or fabricating a number. After execution the in-memory Report is locally patched (successfully removed artifact paths dropped from their worktree) rather than re-walking the whole root, which stays out of scope for this action.",
       "buildVsDesignNotes": "No divergence found between DESIGN.md and the shipped build for the four floor-review fix items (tree rail, g/s keys, header 'since'/docker-unowned fields, width-adaptive signals): all four are implemented exactly as DESIGN.md's grammar section already specified, confirmed against tests/frames fixtures at both 80x24 and 200x60."
   }
 }

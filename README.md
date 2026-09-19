@@ -1,13 +1,13 @@
-# slop-livin
+# swamp
 
 Find out what grew on your disk, by project, and delete it from where you're standing.
 
-`slop-livin` is for developers who run many coding agents at once. Every agent builds, installs, and caches, and a week later the disk is full and nobody remembers which project did it. `du` tells you what is big. `slop-livin` tells you what **grew**, attributes it to a git project → checkout/worktree → artifact, and lets you (or your agent) act on it with the facts in front of you.
+`swamp` is for developers who run many coding agents at once. Every agent builds, installs, and caches, and a week later the disk is full and nobody remembers which project did it. `du` tells you what is big. `swamp` tells you what **grew**, attributes it to a git project → checkout/worktree → artifact, and lets you (or your agent) act on it with the facts in front of you.
 
 ```
 ~/src · observed just now · since 24h · 46 projects · 39.6GB attributed · 202.9MB unowned · docker 11.1GB unowned
 view: projects · filter: none
-open-horizon-labs/slop-livin  🦀🔨                      20.4GB    +14.6GB             │█████████████▏
+open-horizon-labs/swamp  🦀🔨                      20.4GB    +14.6GB             │█████████████▏
 obsidian-am  ⬢                                         81.2MB         0B             │
 hiphi-repos/hiphi  ⎇1                                  72.6MB         0B             │
 …
@@ -40,47 +40,47 @@ Apple silicon macOS. Each release ships a tarball and its checksum.
 
 ```bash
 v=0.4.0
-curl -fsSLO "https://github.com/open-horizon-labs/slop-livin/releases/download/v$v/slop-livin-$v-aarch64-apple-darwin.tar.gz"
-curl -fsSLO "https://github.com/open-horizon-labs/slop-livin/releases/download/v$v/slop-livin-$v-aarch64-apple-darwin.tar.gz.sha256"
-shasum -a 256 -c "slop-livin-$v-aarch64-apple-darwin.tar.gz.sha256"
-tar xzf "slop-livin-$v-aarch64-apple-darwin.tar.gz"
-xattr -d com.apple.quarantine "slop-livin-$v-aarch64-apple-darwin"/slop-livin*   # binaries are unsigned
-install -m 755 "slop-livin-$v-aarch64-apple-darwin"/slop-livin* ~/.local/bin/
-slop-livin --version
+curl -fsSLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/swamp-$v-aarch64-apple-darwin.tar.gz"
+curl -fsSLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/swamp-$v-aarch64-apple-darwin.tar.gz.sha256"
+shasum -a 256 -c "swamp-$v-aarch64-apple-darwin.tar.gz.sha256"
+tar xzf "swamp-$v-aarch64-apple-darwin.tar.gz"
+xattr -d com.apple.quarantine "swamp-$v-aarch64-apple-darwin"/swamp*   # binaries are unsigned
+install -m 755 "swamp-$v-aarch64-apple-darwin"/swamp* ~/.local/bin/
+swamp --version
 ```
 
 Or from source (Rust 1.92+):
 
 ```bash
-git clone https://github.com/open-horizon-labs/slop-livin && cd slop-livin
+git clone https://github.com/open-horizon-labs/swamp && cd swamp
 cargo build --release
-install -m 755 target/release/slop-livin target/release/slop-livin-mcp ~/.local/bin/
+install -m 755 target/release/swamp target/release/swamp-mcp ~/.local/bin/
 ```
 
 ## Quick start
 
 ```bash
-slop-livin ui ~/src                       # the TUI: what grew, by project; Backspace deletes to Trash
-slop-livin report ~/src                   # the same on one screen
-slop-livin report ~/src --view types      # by ecosystem: Rust 20GB, Node 5.6GB, …
-slop-livin schedule --every 15m ~/src     # observe in the background so growth has history
-claude mcp add slop-livin ~/.local/bin/slop-livin-mcp   # let your agent ask instead of you
+swamp ui ~/src                       # the TUI: what grew, by project; Backspace deletes to Trash
+swamp report ~/src                   # the same on one screen
+swamp report ~/src --view types      # by ecosystem: Rust 20GB, Node 5.6GB, …
+swamp schedule --every 15m ~/src     # observe in the background so growth has history
+claude mcp add swamp ~/.local/bin/swamp-mcp   # let your agent ask instead of you
 ```
 
 Optional: observe every 15 minutes in the background so growth history accumulates without you running anything.
 
 ```bash
-slop-livin schedule --every 15m ~/src
+swamp schedule --every 15m ~/src
 ```
 
-`slop-livin schedule --off` removes it. It is a per-user LaunchAgent (`ProcessType Background`, low I/O priority); the log is at `~/Library/Logs/slop-livin/observe.log`.
+`swamp schedule --off` removes it. It is a per-user LaunchAgent (`ProcessType Background`, low I/O priority); the log is at `~/Library/Logs/swamp/observe.log`.
 
 ## Usage
 
 ### Terminal UI
 
 ```bash
-slop-livin ui ~/src
+swamp ui ~/src
 ```
 
 Opens in milliseconds from the last observation and refreshes in the background; the header shows `observing… 12.3GB · 4210 dirs · 31%` while it does.
@@ -122,7 +122,7 @@ Anything that cannot be restored is named on the confirm line, not just counted:
 delete node_modules, target, .cache +2 more (2.1GB) → 1.6GB to Trash, 501.0MB removed permanently (docker, no Trash) · gone for good: app-data (docker volume), slop-app:latest (docker image)?  Enter yes · Esc no · k keep executables
 ```
 
-Paths go to Trash. Docker objects do not: the daemon removes them and there is no copy anywhere, so they are listed by name. The row and everything under it leave the screen at once, the totals drop by what left, and an incremental re-observe runs in the background. The ledger (`~/.local/share/slop-livin/ledger.jsonl`) records what was removed, by whom, and which warnings were on screen.
+Paths go to Trash. Docker objects do not: the daemon removes them and there is no copy anywhere, so they are listed by name. The row and everything under it leave the screen at once, the totals drop by what left, and an incremental re-observe runs in the background. The ledger (`~/.local/share/swamp/ledger.jsonl`) records what was removed, by whom, and which warnings were on screen.
 
 Filter, sort and the keep-executables setting persist between sessions. The growth window can only be as long as the history the store holds; the header says `since 4h (asked 1w; history is 4h)` rather than pretending.
 
@@ -153,10 +153,10 @@ Orphans are removable too. An image with no join evidence, a dangling layer or a
 From the command line the same objects go through propose → approve → execute:
 
 ```bash
-slop-livin report ~/src --view docker                            # joined and unowned together
-slop-livin propose ~/src --filter 'kind:DockerImage project:my-app'
-slop-livin approve <plan-id>                                     # prints each unit's warnings and recovery contract
-slop-livin execute <plan-id>                                     # refused units name the fact that refused them
+swamp report ~/src --view docker                            # joined and unowned together
+swamp propose ~/src --filter 'kind:DockerImage project:my-app'
+swamp approve <plan-id>                                     # prints each unit's warnings and recovery contract
+swamp execute <plan-id>                                     # refused units name the fact that refused them
 ```
 
 ### Command line
@@ -165,38 +165,38 @@ Every question is one command. `report` observes (and records) by default; add `
 
 ```bash
 # What grew, by project (growth, then size). --all for every row.
-slop-livin report ~/src
-slop-livin report ~/src --since 7d --sort size --reverse         # window; smallest first (also name, type, age)
+swamp report ~/src
+swamp report ~/src --since 7d --sort size --reverse         # window; smallest first (also name, type, age)
 
 # One project: checkouts → worktrees → artifacts → directories
-slop-livin report ~/src --project roon-knob
-slop-livin report ~/src --project roon-knob --dirs --depth 2    # per-directory growth, large files that grew
+swamp report ~/src --project roon-knob
+swamp report ~/src --project roon-knob --dirs --depth 2    # per-directory growth, large files that grew
 
 # Views, at the root or narrowed with --project
-slop-livin report ~/src --view types                            # per ecosystem: projects, artifacts, bytes, growth
-slop-livin report ~/src --view builds                           # every build output / cache, largest first
-slop-livin report ~/src --view deps                             # every dependency tree
-slop-livin report ~/src --view worktrees --filter 'merge-complete idle > 48h'   # worktrees whose branch is merged and idle
-slop-livin report ~/src --view docker                           # images, build cache, volumes, joined or unowned
-slop-livin report ~/src --view unowned                          # bytes under the root that no project claims
-slop-livin report ~/src --view reconciliation --verify-du       # attributed + unowned = walked, checked against du
+swamp report ~/src --view types                            # per ecosystem: projects, artifacts, bytes, growth
+swamp report ~/src --view builds                           # every build output / cache, largest first
+swamp report ~/src --view deps                             # every dependency tree
+swamp report ~/src --view worktrees --filter 'merge-complete idle > 48h'   # worktrees whose branch is merged and idle
+swamp report ~/src --view docker                           # images, build cache, volumes, joined or unowned
+swamp report ~/src --view unowned                          # bytes under the root that no project claims
+swamp report ~/src --view reconciliation --verify-du       # attributed + unowned = walked, checked against du
 
 # Filters compose (all must hold)
-slop-livin report ~/src --view builds --filter 'type:rust size > 1GB age > 30d'
-slop-livin report ~/src --view worktrees --filter 'project:hiphi-* pr:merged'
+swamp report ~/src --view builds --filter 'type:rust size > 1GB age > 30d'
+swamp report ~/src --view worktrees --filter 'project:hiphi-* pr:merged'
 
 # Acting: propose → a human approves → execute
-slop-livin propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
-slop-livin approve <plan-id>                                     # prints each unit's warnings first
-slop-livin execute <plan-id> --keep-executables                  # Trash; binaries copied to <worktree>/bin/ first
-slop-livin grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d   # a standing, bounded grant
-slop-livin plans                                                  # what was proposed, by whom, what happened
+swamp propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
+swamp approve <plan-id>                                     # prints each unit's warnings first
+swamp execute <plan-id> --keep-executables                  # Trash; binaries copied to <worktree>/bin/ first
+swamp grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d   # a standing, bounded grant
+swamp plans                                                  # what was proposed, by whom, what happened
 
 # Plumbing
-slop-livin observe ~/src                                          # observe only (what the schedule runs); refreshes GitHub facts
-slop-livin schedule --every 15m ~/src                             # LaunchAgent; --off removes it
-slop-livin config show | path | init                              # the config file, every key with its meaning
-slop-livin report ~/src --json                                    # the full report as JSON
+swamp observe ~/src                                          # observe only (what the schedule runs); refreshes GitHub facts
+swamp schedule --every 15m ~/src                             # LaunchAgent; --off removes it
+swamp config show | path | init                              # the config file, every key with its meaning
+swamp report ~/src --json                                    # the full report as JSON
 ```
 
 **Filter grammar**, shared by the CLI, the TUI form and line, the MCP tools and grants:
@@ -218,9 +218,9 @@ Sizes are decimal: `500MB` is 500,000,000 bytes, the base the tool prints in. Wr
 **JSON.** `--json` prints the whole `Report`: projects → worktrees → artifacts, each artifact with `bytes`, `growth_bytes`, `mtime_max`, `ecosystem`, `track`; `reconciliation`; `summary.by_type`; `notes` naming what the walk could and could not see.
 
 ```bash
-slop-livin report ~/src --json --no-observe | jq '.summary.by_type'
-slop-livin report ~/src --json --no-observe | jq '[.projects[].worktrees[].artifacts[] | select(.growth_bytes > 1e9) | {path, growth_bytes}]'
-slop-livin report ~/src --json --no-observe | jq '.reconciliation'
+swamp report ~/src --json --no-observe | jq '.summary.by_type'
+swamp report ~/src --json --no-observe | jq '[.projects[].worktrees[].artifacts[] | select(.growth_bytes > 1e9) | {path, growth_bytes}]'
+swamp report ~/src --json --no-observe | jq '.reconciliation'
 ```
 
 <details>
@@ -231,15 +231,15 @@ slop-livin report ~/src --json --no-observe | jq '.reconciliation'
   "observed_at": 1789774367,
   "root": "/Users/me/src",
   "projects": [{
-    "name": "slop-livin",
-    "remote": "github.com/open-horizon-labs/slop-livin",
+    "name": "swamp",
+    "remote": "github.com/open-horizon-labs/swamp",
     "ecosystems": ["rs"],
     "worktrees": [{
-      "path": "/Users/me/src/open-horizon-labs/slop-livin",
+      "path": "/Users/me/src/open-horizon-labs/swamp",
       "kind": "Main", "branch": "main", "idle_secs": 32,
       "signals": [{"name": "last_commit", "value": "last commit 1m"}, {"name": "dirty", "value": "clean"}],
       "artifacts": [{
-        "kind": "BuildOutput", "path": "/Users/me/src/open-horizon-labs/slop-livin/target",
+        "kind": "BuildOutput", "path": "/Users/me/src/open-horizon-labs/swamp/target",
         "bytes": 16206716928, "growth_bytes": 10367176704, "mtime_max": 1789774334,
         "ecosystem": "rs", "track": "Ignored", "regrowth_count": 0
       }]
@@ -255,7 +255,7 @@ slop-livin report ~/src --json --no-observe | jq '.reconciliation'
 
 </details>
 
-**Configuration** lives at `~/.local/share/slop-livin/config.toml` (`slop-livin config path`). `config show` prints the effective values; `config init` writes them out with their meaning:
+**Configuration** lives at `~/.local/share/swamp/config.toml` (`swamp config path`). `config show` prints the effective values; `config init` writes them out with their meaning:
 
 ```toml
 since = "24h"                 # default growth window; --since overrides per call
@@ -264,17 +264,17 @@ large_file_min_bytes = 1048576  # files at least this large get their own row un
 observe_timeout_sec = 1800    # watchdog for one observe run
 ```
 
-`SLOP_LIVIN_DIR` relocates the store. The TUI's filter, sort and keep-executables choice persist in `ui_state.json` next to it.
+`SWAMP_DIR` relocates the store. The TUI's filter, sort and keep-executables choice persist in `ui_state.json` next to it.
 
 ### Agent (MCP)
 
-`slop-livin-mcp` speaks MCP over stdio. It is the primary operator surface: an agent asks what grew, proposes a plan, and executes it once a human has authorized it. It cannot authorize anything itself.
+`swamp-mcp` speaks MCP over stdio. It is the primary operator surface: an agent asks what grew, proposes a plan, and executes it once a human has authorized it. It cannot authorize anything itself.
 
 ```bash
-claude mcp add slop-livin ~/.local/bin/slop-livin-mcp        # Claude Code
+claude mcp add swamp ~/.local/bin/swamp-mcp        # Claude Code
 ```
 ```json
-{ "mcpServers": { "slop-livin": { "command": "/Users/me/.local/bin/slop-livin-mcp" } } }
+{ "mcpServers": { "swamp": { "command": "/Users/me/.local/bin/swamp-mcp" } } }
 ```
 
 | Tool | Arguments | Answers |
@@ -311,23 +311,23 @@ Every answer carries `observed_at`, the `since` it actually used, and `history` 
 // "Propose deleting Rust build output nobody wrote to in a month."
 {"name": "propose", "arguments": {"root": "/Users/me/src", "filter": "kind:BuildOutput type:rust age > 30d"}}
 // → {"state": "awaiting-authorization", "id": "cb86f0ba-…", "planned_bytes": 19754430464,
-//    "units": [{"path": "…/slop-livin/target", "bytes": 16329043968, "recovery": "local_rebuild",
+//    "units": [{"path": "…/swamp/target", "bytes": 16329043968, "recovery": "local_rebuild",
 //               "track": "Ignored", "signals": ["last commit 1m", "clean", "0 unpushed", …], "warnings": []}],
-//    "next_step": "a human authorizes with `slop-livin approve cb86f0ba-…` (this plan) or a standing
-//                  `slop-livin grant add ...`; then call execute with plan_id. This tool cannot authorize."}
+//    "next_step": "a human authorizes with `swamp approve cb86f0ba-…` (this plan) or a standing
+//                  `swamp grant add ...`; then call execute with plan_id. This tool cannot authorize."}
 
-// After the human ran `slop-livin approve cb86f0ba-…`:
+// After the human ran `swamp approve cb86f0ba-…`:
 {"name": "execute", "arguments": {"plan_id": "cb86f0ba-…", "keep_executables": true}}
 // → {"state": "executed", "outcomes": [{"path": "…/target", "status": "completed",
-//    "recovery_location": "~/.Trash/target-slop-livin-1789774700", "preserved": ["…/slop-livin/bin/release/slop-livin"]}],
+//    "recovery_location": "~/.Trash/target-swamp-1789774700", "preserved": ["…/swamp/bin/release/swamp"]}],
 //    "trashed_bytes": 16329043968, "freed_measured": 0}   // Trash keeps the bytes until emptied; it says so
 ```
 
 Authorization is a human at the keyboard:
 
 ```bash
-slop-livin approve <plan-id>                                             # this plan, once; prints each unit's warnings first
-slop-livin grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d   # standing, bounded
+swamp approve <plan-id>                                             # this plan, once; prints each unit's warnings first
+swamp grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d   # standing, bounded
 ```
 
 Plans expire after 30 minutes and are single-use. A grant is checked per unit at the sink against the disk as it is then, not as it was proposed. There is no MCP tool that writes a grant. That is the design, not an omission.
@@ -366,7 +366,7 @@ Plans expire after 30 minutes and are single-use. A grant is checked per unit at
 
 Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), Erlang (☎️), OCaml (🐫), Clojure (🔮) and Nim (👑), and names that are artifacts anywhere: `.cache`, `.git`, `.xwin-cache`, `.ipynb_checkpoints`, `.terraform`.
 
-**Where the names come from.** A directory that holds a `CACHEDIR.TAG` with the [Cache Directory Tagging Specification](https://bford.info/cachedir/) signature in its first 43 bytes is a cache with no further argument: the tool that made it says so. Everything else is a name plus a marker, and the names are harvested from [github/gitignore](https://github.com/github/gitignore)'s 163 templates and [linguist](https://github.com/github/linguist)'s vendored-paths list, both vendored under `vendor/`. `cargo run -p slop-livin-harvest` reports what upstream lists that the table lacks; it never writes the table, because a `.gitignore` entry proves a path is generated, not that deleting it is safe (Python's template lists `var/`, `instance/` and `lib/`). Its `--challenge <root>` mode uses a real tree only to contradict a candidate, by finding it holding git-tracked content. The table is `crates/core/src/ecosystem.rs`; a new ecosystem is one entry.
+**Where the names come from.** A directory that holds a `CACHEDIR.TAG` with the [Cache Directory Tagging Specification](https://bford.info/cachedir/) signature in its first 43 bytes is a cache with no further argument: the tool that made it says so. Everything else is a name plus a marker, and the names are harvested from [github/gitignore](https://github.com/github/gitignore)'s 163 templates and [linguist](https://github.com/github/linguist)'s vendored-paths list, both vendored under `vendor/`. `cargo run -p swamp-harvest` reports what upstream lists that the table lacks; it never writes the table, because a `.gitignore` entry proves a path is generated, not that deleting it is safe (Python's template lists `var/`, `instance/` and `lib/`). Its `--challenge <root>` mode uses a real tree only to contradict a candidate, by finding it holding git-tracked content. The table is `crates/core/src/ecosystem.rs`; a new ecosystem is one entry.
 
 </details>
 
@@ -382,7 +382,7 @@ Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), 
 
 ## How it works
 
-**The pipeline is consumers on an event bus.** Walk, project grouping, git signals, GitHub, Docker, ecosystems, the growth store, tracking, history and assembly are each one `Consumer` in `crates/core/src/consumers/`, woken by the events they subscribe to and emitting facts; the bus (`crates/core/src/bus/`, tokio) is the only coupling. A new fact source is one file plus one line in `EventBus::with_builtins()`. Every technical constraint of the design is a guardrail in `.oh/guardrails/` with an AST audit in `crates/source-audit` (`cargo run -p slop-livin-source-audit -- --list`); the build fails when one is broken. ADR: `docs/ADRs/001-event-bus-report-pipeline.md`.
+**The pipeline is consumers on an event bus.** Walk, project grouping, git signals, GitHub, Docker, ecosystems, the growth store, tracking, history and assembly are each one `Consumer` in `crates/core/src/consumers/`, woken by the events they subscribe to and emitting facts; the bus (`crates/core/src/bus/`, tokio) is the only coupling. A new fact source is one file plus one line in `EventBus::with_builtins()`. Every technical constraint of the design is a guardrail in `.oh/guardrails/` with an AST audit in `crates/source-audit` (`cargo run -p swamp-source-audit -- --list`); the build fails when one is broken. ADR: `docs/ADRs/001-event-bus-report-pipeline.md`.
 
 
 **Column store with reverse deltas.** Each observation writes the current state to Parquet (zstd) plus an append-only delta holding the *previous* values of rows that changed. Growth over any window is a lookup, not a rescan; a no-change observation appends nothing; deltas compact and age out on a configurable retention window. On the test machine the store for 56 projects, 89 worktrees and 25 k directory rollups is a few hundred KiB.
@@ -395,11 +395,11 @@ Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), 
 
 **One report, three surfaces.** The TUI, CLI and MCP render the same `Report`. Nothing is computed only for the screen.
 
-**Statically checked constraints.** Nineteen `syn`-based audits (`cargo run -p slop-livin-source-audit -- --list`) fail the build when a guardrail is broken: a walker that follows a symlink or folds a directory that is not an artifact, a Parquet writer without zstd, an observation that walks before asking FSEvents, a consumer that names another consumer, verdict vocabulary in output, a second byte formatter. `scripts/audit-mutants.sh` applies seven wrong-but-plausible walkers and shows each fails the audit that owns the rule; every mutation is anchored on exact text and asserts it applied, so the check cannot quietly stop testing.
+**Statically checked constraints.** Nineteen `syn`-based audits (`cargo run -p swamp-source-audit -- --list`) fail the build when a guardrail is broken: a walker that follows a symlink or folds a directory that is not an artifact, a Parquet writer without zstd, an observation that walks before asking FSEvents, a consumer that names another consumer, verdict vocabulary in output, a second byte formatter. `scripts/audit-mutants.sh` applies seven wrong-but-plausible walkers and shows each fails the audit that owns the rule; every mutation is anchored on exact text and asserts it applied, so the check cannot quietly stop testing.
 
 ## Compared with
 
-| | slop-livin | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [clean-dev-dirs](https://github.com/clean-dev-dirs/clean-dev-dirs) | [cargo-sweep](https://github.com/holmgr/cargo-sweep) | [Mole](https://github.com/tw93/Mole) | StorageRadar | DaisyDisk |
+| | swamp | [kondo](https://github.com/tbillington/kondo) | [npkill](https://github.com/voidcosmos/npkill) | [clean-dev-dirs](https://github.com/clean-dev-dirs/clean-dev-dirs) | [cargo-sweep](https://github.com/holmgr/cargo-sweep) | [Mole](https://github.com/tw93/Mole) | StorageRadar | DaisyDisk |
 |---|---|---|---|---|---|---|---|---|
 | Finds build/deps artifacts | ✓ ~50 names, 20 ecosystems, marker-gated where the name is ambiguous | ✓ 20+ types | node_modules | ✓ 16 ecosystems | Cargo `target/` | ✓ (purge) | | |
 | Project type on every row, filter and sort by it | ✓ glyph badges, `type:` filter, `t` sort, per-type view | ✓ tag | | ✓ tag, `-p`, `--sort type` | | | | |
@@ -415,7 +415,7 @@ Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), 
 | Deletes to | Trash | rm | rm | Trash | rm | Trash | | Trash |
 | Price | free | free | free | free | free | free (Mac app paid) | $19.99 | $9.99 |
 
-kondo and clean-dev-dirs are the right tool when you want a one-shot sweep of build output across ecosystems and don't need history. cargo-sweep is the right tool inside a single Rust workspace. Mole is a general macOS cleanup toolkit; `slop-livin` started as a Mole contribution and became its own thing when the questions turned out to be about projects, not caches. StorageRadar and DaisyDisk are directory-tree visualizers; DaisyDisk has no history, StorageRadar's is manual snapshots without a project model.
+kondo and clean-dev-dirs are the right tool when you want a one-shot sweep of build output across ecosystems and don't need history. cargo-sweep is the right tool inside a single Rust workspace. Mole is a general macOS cleanup toolkit; `swamp` started as a Mole contribution and became its own thing when the questions turned out to be about projects, not caches. StorageRadar and DaisyDisk are directory-tree visualizers; DaisyDisk has no history, StorageRadar's is manual snapshots without a project model.
 
 ## Numbers, and their limits
 

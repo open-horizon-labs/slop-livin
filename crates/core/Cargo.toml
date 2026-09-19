@@ -1,5 +1,5 @@
 [package]
-name = "slop-livin-core"
+name = "swamp-core"
 version.workspace = true
 edition.workspace = true
 

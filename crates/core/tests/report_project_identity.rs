@@ -4,10 +4,10 @@
 //! normalized `origin` remote URL -- not reported as two projects just
 //! because each clone has its own object store.
 
-use slop_livin_core::report::{WorktreeKind, report};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use swamp_core::report::{WorktreeKind, report};
 
 fn run_git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")

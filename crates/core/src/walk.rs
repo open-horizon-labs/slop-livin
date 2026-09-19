@@ -1152,7 +1152,7 @@ pub fn discover_and_attribute(
     observed_at: u64,
     large_file_min_bytes: u64,
 ) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
-    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
     let discovered = discover_parallel(root)?;
     if trace {

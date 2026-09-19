@@ -1,6 +1,6 @@
-//! `slop-livin ui`: the diffstat-ledger terminal UI. See DESIGN.md and
+//! `swamp ui`: the diffstat-ledger terminal UI. See DESIGN.md and
 //! `.impeccable/surfaces/tui.md` (binding). Renders the same
-//! `slop_livin_core::report_with` `Report` the CLI/MCP use; no second
+//! `swamp_core::report_with` `Report` the CLI/MCP use; no second
 //! data path.
 
 pub mod actions;
@@ -21,14 +21,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub fn ledger_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SLOP_LIVIN_LEDGER_PATH") {
+    if let Ok(dir) = std::env::var("SWAMP_LEDGER_PATH") {
         return PathBuf::from(dir);
     }
-    let dir = if let Ok(d) = std::env::var("SLOP_LIVIN_DIR") {
+    let dir = if let Ok(d) = std::env::var("SWAMP_DIR") {
         PathBuf::from(d)
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".local/share/slop-livin")
+        PathBuf::from(home).join(".local/share/swamp")
     };
     dir.join("ledger.jsonl")
 }
@@ -122,27 +122,27 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
 }
 
 /// Runs the interactive UI against `root`. `no_observe` skips persisting
-/// a new observation (read-only report, same as `slop-livin report
+/// a new observation (read-only report, same as `swamp report
 /// --no-observe`).
 /// How far back the store can answer for `root`'s volume. Growth windows
 /// are bounded by it: a 7d window over 4h of observations would report a
 /// week of growth that was never observed.
 fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
-    let now = slop_livin_core::entities::now();
+    let now = swamp_core::entities::now();
     let dev = std::fs::metadata(root).ok().map(|m| {
         use std::os::unix::fs::MetadataExt;
         m.dev()
     })?;
     let dir = store.join(dev.to_string());
-    slop_livin_core::growth::history_span_secs(&dir, now)
+    swamp_core::growth::history_span_secs(&dir, now)
 }
 
 fn store_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("SLOP_LIVIN_DIR") {
+    if let Ok(d) = std::env::var("SWAMP_DIR") {
         return PathBuf::from(d);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/slop-livin")
+    PathBuf::from(home).join(".local/share/swamp")
 }
 
 pub fn run(root: &Path, no_observe: bool) -> Result<()> {
@@ -151,8 +151,8 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     // Paint the last cached report immediately (milliseconds); observe in
     // the background and swap the result in. With no cache yet, the first
     // observation has to happen before there is anything to show.
-    let cached = slop_livin_core::report::load_last_report(&store, &root);
-    let (tx, rx) = std::sync::mpsc::channel::<Result<slop_livin_core::Report>>();
+    let cached = swamp_core::report::load_last_report(&store, &root);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<swamp_core::Report>>();
     let mut app = match cached {
         Some(r) if no_observe => {
             let mut a = App::new(r, root.clone());
@@ -168,7 +168,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                 // include_dirs: the Source row expands into its own
                 // directories, so the startup observe must produce them
                 // too or the first report shows `source` with no children.
-                let res = slop_livin_core::report::report_with_dirs(
+                let res = swamp_core::report::report_with_dirs(
                     &root2,
                     None,
                     false,
@@ -181,7 +181,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             a
         }
         None => {
-            let report = slop_livin_core::report::report_full_mode(
+            let report = swamp_core::report::report_full_mode(
                 &root,
                 None,
                 false,
@@ -271,7 +271,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
-    use slop_livin_core::report::{Reconciliation, Report};
+    use swamp_core::report::{Reconciliation, Report};
 
     fn empty_report() -> Report {
         Report {

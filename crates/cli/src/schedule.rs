@@ -1,22 +1,22 @@
-//! `slop-livin observe` and `slop-livin schedule` subcommand handlers.
+//! `swamp observe` and `swamp schedule` subcommand handlers.
 //!
 //! `observe` is the program the LaunchAgent installed by `schedule` runs:
 //! walk + growth-store write only, never a rendered report. `schedule`
 //! installs/reports/removes the per-user LaunchAgent itself. All LaunchAgent
-//! logic lives in `slop_livin_core::schedule`; this module is CLI glue only.
+//! logic lives in `swamp_core::schedule`; this module is CLI glue only.
 
 use anyhow::{Result, bail};
-use slop_livin_core::growth::load_config;
-use slop_livin_core::report::observe_only;
-use slop_livin_core::schedule::{
-    self, LockOutcome, RunOutcome, acquire_lock, append_log, log_file, write_last_run,
-};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use swamp_core::growth::load_config;
+use swamp_core::report::observe_only;
+use swamp_core::schedule::{
+    self, LockOutcome, RunOutcome, acquire_lock, append_log, log_file, write_last_run,
+};
 
-/// `slop-livin observe <root>...`. Exits 0 on success, on a graceful
+/// `swamp observe <root>...`. Exits 0 on success, on a graceful
 /// "another observation is running" skip, and even on a timeout/error --
 /// only in-process misuse (e.g. no roots given) is a hard error, since a
 /// launchd-triggered run should never wedge into a retry storm.
@@ -60,7 +60,7 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) ->
     match rx.recv_timeout(timeout) {
         Ok((summaries, failure)) => {
             let wall_ms = start.elapsed().as_millis() as u64;
-            let now = slop_livin_core::entities::now();
+            let now = swamp_core::entities::now();
 
             if let Some(msg) = failure {
                 let outcome = RunOutcome {
@@ -122,7 +122,7 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) ->
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let wall_ms = start.elapsed().as_millis() as u64;
-            let now = slop_livin_core::entities::now();
+            let now = swamp_core::entities::now();
             let outcome = RunOutcome {
                 observed_at: now,
                 wall_ms,
@@ -144,7 +144,7 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) ->
     }
 }
 
-/// `slop-livin schedule [--every <interval>] [--off] <root>...`.
+/// `swamp schedule [--every <interval>] [--off] <root>...`.
 pub fn cmd_schedule(
     store_dir: PathBuf,
     every: Option<String>,

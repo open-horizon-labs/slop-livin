@@ -1,4 +1,4 @@
-# Design — slop-livin terminal UI
+# Design — swamp terminal UI
 
 World: **diffstat ledger**. The screen traditions of the audience (git diff --stat, git log --graph, ncdu, k9s, htop) supply every element; nothing is invented for flavor. Mode: Operate.
 

@@ -2,20 +2,20 @@
 //! first-class terminal sizes (80x24, 200x60), and commits them under
 //! `tests/frames/*.txt` for hand-checked alignment review.
 //!
-//! Regenerate with `UPDATE_FRAMES=1 cargo test -p slop-livin-tui
+//! Regenerate with `UPDATE_FRAMES=1 cargo test -p swamp-tui
 //! --test frames`; otherwise the test asserts the committed frame is
 //! still exactly reproduced.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use slop_livin_core::entities::Confidence;
-use slop_livin_core::report::{
+use std::path::PathBuf;
+use swamp_core::entities::Confidence;
+use swamp_core::report::{
     ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Report, Signal, Source, UnownedReason,
     UnownedRow, WorktreeKind, WorktreeRow,
 };
-use slop_livin_tui::app::{App, ViewKind};
-use slop_livin_tui::ui;
-use std::path::PathBuf;
+use swamp_tui::app::{App, ViewKind};
+use swamp_tui::ui;
 
 fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> ArtifactRow {
     ArtifactRow {
@@ -86,23 +86,23 @@ fn fixture_report() -> Report {
             },
             ProjectRow {
                 project_id: "p-slop".into(),
-                name: "slop-livin".into(),
+                name: "swamp".into(),
                 remote: None,
                 ecosystems: Vec::new(),
                 worktrees: vec![WorktreeRow {
                     worktree_id: "w-slop".into(),
-                    path: PathBuf::from("/Users/dev/src/slop-livin"),
+                    path: PathBuf::from("/Users/dev/src/swamp"),
                     kind: WorktreeKind::Main,
                     artifacts: vec![
                         art(
                             ArtifactKind::BuildOutput,
-                            "/Users/dev/src/slop-livin/target",
+                            "/Users/dev/src/swamp/target",
                             6_442_450_944,
                             Some(2_684_354_560),
                         ),
                         art(
                             ArtifactKind::DockerImage,
-                            "/Users/dev/src/slop-livin/.docker/img",
+                            "/Users/dev/src/swamp/.docker/img",
                             1_610_612_736,
                             Some(-104_857_600),
                         ),
@@ -260,8 +260,8 @@ fn docker_mark_refusal_state() {
         let mut app = App::new(fixture_report(), "/Users/dev/src".into());
         app.clear_filter();
         app.set_view(ViewKind::Tree);
-        app.selected_project = Some("slop-livin".into());
-        // slop-livin's worktree has one build row (higher growth) then
+        app.selected_project = Some("swamp".into());
+        // swamp's worktree has one build row (higher growth) then
         // one Docker image row; select the Docker row.
         app.selected = 2;
         app.mark_selected();
@@ -296,10 +296,10 @@ fn picker_frame() {
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
     app.history_secs = Some(30 * 86_400);
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('/'));
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Right);
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('/'));
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Right);
     let got = capture(&app, 200, 60);
     assert!(got.contains("▸ kind"), "kind field selected:\n{got}");
     assert!(
@@ -313,10 +313,10 @@ fn picker_frame() {
 fn drill_shows_view_scope_and_esc_returns_to_projects() {
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(before.contains("view: projects · filter: none"), "{before}");
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
     assert!(
@@ -324,7 +324,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
         "second line must name the scope:\n{tree}"
     );
     assert!(tree.contains("(Esc back)"), "{tree}");
-    slop_livin_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
     assert!(back.contains("view: projects"), "{back}");
@@ -335,12 +335,12 @@ fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
     use crossterm::event::KeyCode;
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     app.width = 200;
-    slop_livin_tui::handle_key(&mut app, KeyCode::Char('0'));
-    slop_livin_tui::handle_key(&mut app, KeyCode::Enter); // drill into first project
+    swamp_tui::handle_key(&mut app, KeyCode::Char('0'));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter); // drill into first project
     assert_eq!(app.view, ViewKind::Tree);
     // The fixture's project has no remote: Backspace still marks it and
     // asks once, with that fact on the confirm line.
-    slop_livin_tui::handle_key(&mut app, KeyCode::Backspace);
+    swamp_tui::handle_key(&mut app, KeyCode::Backspace);
     let f = capture(&app, 200, 60);
     assert_eq!(app.marked.len(), 1);
     assert!(app.confirm_open);
@@ -353,7 +353,7 @@ fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
 
 #[test]
 fn worktree_rows_always_mark_and_carry_their_warnings() {
-    use slop_livin_tui::model::{Row, WorktreeMark};
+    use swamp_tui::model::{Row, WorktreeMark};
     let mark = |linked: bool, dirty: Option<bool>, unpushed: Option<u32>, locked: Option<bool>| {
         WorktreeMark {
             path: "/x/wt".into(),
@@ -373,7 +373,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         bytes: 1,
         growth: None,
         signals: vec![],
-        unit: Some(slop_livin_tui::units::UnitId::for_artifact(
+        unit: Some(swamp_tui::units::UnitId::for_artifact(
             std::path::Path::new("/x/wt"),
         )),
         kind: None,
@@ -430,8 +430,8 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
 /// file is refused, because nothing would bring that file back.
 #[test]
 fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
-    use slop_livin_tui::actions::{MarkedUnit, WorktreeTerms, authorize, execute_plan};
     use std::process::Command;
+    use swamp_tui::actions::{MarkedUnit, WorktreeTerms, authorize, execute_plan};
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         assert!(
@@ -486,7 +486,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
         docker: None,
         worktree_path: PathBuf::new(),
         bytes: 4096,
-        observed_at: slop_livin_core::entities::now(),
+        observed_at: swamp_core::entities::now(),
         label: String::new(),
         warnings: Vec::new(),
         worktree: Some(WorktreeTerms {
@@ -496,7 +496,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
             remote: Some("github.com/o/r".into()),
         }),
     };
-    let ledger = slop_livin_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
+    let ledger = swamp_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
 
     // Untracked content present: no longer a bar — the human saw it on
     // the confirm line. The sink moves the checkout and the ledger keeps
@@ -518,7 +518,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     assert!(!work.exists(), "checkout moved to Trash");
     let recs = ledger.all().unwrap();
     let last = recs.last().unwrap();
-    assert!(matches!(last.verb, slop_livin_core::grants::Verb::Archive));
+    assert!(matches!(last.verb, swamp_core::grants::Verb::Archive));
     assert!(
         last.evidence["recover"]
             .as_str()

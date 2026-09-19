@@ -19,13 +19,13 @@
 //! - `vendor/linguist-vendor.yml` — github/linguist's vendored paths.
 //!
 //! ```text
-//! cargo run -p slop-livin-harvest                    # gaps, by ecosystem
-//! cargo run -p slop-livin-harvest -- --challenge ~/src  # …which ones hold authored content
+//! cargo run -p swamp-harvest                    # gaps, by ecosystem
+//! cargo run -p swamp-harvest -- --challenge ~/src  # …which ones hold authored content
 //! ```
 
-use slop_livin_core::ecosystem::ECOSYSTEMS;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use swamp_core::ecosystem::ECOSYSTEMS;
 
 /// Which upstream template describes which of our ecosystems. Curated:
 /// the upstream file names are product names, ours are ecosystem tags,

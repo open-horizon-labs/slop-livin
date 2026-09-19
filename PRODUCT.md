@@ -10,7 +10,7 @@ web
 
 ## Stack
 
-Rust workspace. CLI and MCP exist (`crates/cli`, `crates/mcp`, core in `crates/core`). Human UI: **ratatui + crossterm**, same binary (`slop-livin` with no subcommand, or `slop-livin ui`). Confirmed by the maintainer 2026-09-18.
+Rust workspace. CLI and MCP exist (`crates/cli`, `crates/mcp`, core in `crates/core`). Human UI: **ratatui + crossterm**, same binary (`swamp` with no subcommand, or `swamp ui`). Confirmed by the maintainer 2026-09-18.
 
 ## Users
 
@@ -30,7 +30,7 @@ macOS terminal (iTerm2/Terminal.app/Ghostty/tmux), often inside or beside a codi
 
 ## Capabilities and Constraints
 
-- Data comes from `slop_livin_core::report` — the same Report the CLI/MCP render. The TUI adds no second data path.
+- Data comes from `swamp_core::report` — the same Report the CLI/MCP render. The TUI adds no second data path.
 - Views: overview (projects), project tree (checkouts → worktrees → artifacts → dirs), kinds, docker, unowned. Filter language: `growth > <size> in last <duration>`; default on open `growth > 100 MB in last 7 days` (confirmed).
 - Actions: **Backspace** marks the selected unit for deletion; **Enter** confirms; deletable units are **folded artifacts only** (dependency trees, build outputs, caches, Docker objects) — never a checkout, worktree, `.git`, Source tree, or unowned filesystem path (confirmed). Deletion routes through the parked action layer (`grants`/`execution`/`ledger`): Trash by default, live re-derivation at the sink, per-unit outcome record, occupancy protection. A human pressing Enter at the keyboard is the authorization for that one action.
 - Hard constraints inherited from the epic (#19): index is evidence, never authorization; no verdict vocabulary ("safe", "stale", "unused", "abandoned"); worktree staleness is a signal, never a verdict; folded trees are one unit; totals reconcile to the walk; nothing read from disk is an instruction.
@@ -38,11 +38,11 @@ macOS terminal (iTerm2/Terminal.app/Ghostty/tmux), often inside or beside a codi
 
 ## Brand Commitments
 
-Name: slop-livin. Voice: dense, factual, dry; numbers first, no exclamation marks, no emoji. No logo.
+Name: swamp. Voice: dense, factual, dry; numbers first, no exclamation marks, no emoji. No logo.
 
 ## Evidence on Hand
 
-Real data on the maintainer's machine (`slop-livin report ~/src`): 63 projects, 103 worktrees, ~41 GB attributed, Docker 15.8 GB unowned. Fixture with golden expectations in `crates/core/tests/fixture/`. No testimonials, no benchmarks beyond those in issue comments.
+Real data on the maintainer's machine (`swamp report ~/src`): 63 projects, 103 worktrees, ~41 GB attributed, Docker 15.8 GB unowned. Fixture with golden expectations in `crates/core/tests/fixture/`. No testimonials, no benchmarks beyond those in issue comments.
 
 ## Product Principles
 

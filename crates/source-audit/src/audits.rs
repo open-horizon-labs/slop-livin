@@ -70,7 +70,7 @@ fn one_byte_formatter(root: &Path) -> Result<(), String> {
     }
     if !tui
         .text
-        .contains("pub use slop_livin_core::render::human_bytes_pub as human_bytes")
+        .contains("pub use swamp_core::render::human_bytes_pub as human_bytes")
     {
         return Err("tui/src/model.rs must re-export core's byte formatter".into());
     }

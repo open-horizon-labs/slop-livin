@@ -3,7 +3,7 @@
 //! (dependency trees, build outputs, caches, Docker objects) — never a
 //! checkout, worktree, `.git`, Source tree, or unowned path.
 
-use slop_livin_core::report::ArtifactKind;
+use swamp_core::report::ArtifactKind;
 
 /// A stable identity for a unit that can be marked, used as the key in
 /// the app's mark-set and later to build the plan.

@@ -1,13 +1,13 @@
 //! Opt-in scheduled observation: a per-user LaunchAgent that runs
-//! `slop-livin observe <roots>` on a fixed interval.
+//! `swamp observe <roots>` on a fixed interval.
 //!
 //! Ported from the mole `integrate` branch's `lib/manage/schedule.sh` +
 //! `docs/scheduled-inventory-refresh.md` design: a scheduled job, not a
 //! daemon. `launchd` starts one process, it exits. No resident process, no
 //! menu bar, no notifications. Off by default, installed only by the
-//! explicit `slop-livin schedule --every <interval>` command.
+//! explicit `swamp schedule --every <interval>` command.
 //!
-//! The scheduled program is `slop-livin observe`, which only walks and
+//! The scheduled program is `swamp observe`, which only walks and
 //! writes the growth store -- it never renders a report and has no path to
 //! any destructive command (there are none in this tool).
 
@@ -17,7 +17,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const LABEL: &str = "com.open-horizon-labs.slop-livin.observe";
+pub const LABEL: &str = "com.open-horizon-labs.swamp.observe";
 
 /// Default watchdog budget for one `observe` invocation, in seconds.
 pub const DEFAULT_OBSERVE_TIMEOUT_SECS: u64 = 1800;
@@ -32,7 +32,7 @@ fn home() -> PathBuf {
 
 pub fn agents_dir() -> PathBuf {
     env_dir(
-        "SLOP_LIVIN_LAUNCH_AGENTS_DIR",
+        "SWAMP_LAUNCH_AGENTS_DIR",
         home().join("Library/LaunchAgents"),
     )
 }
@@ -42,7 +42,7 @@ pub fn plist_path() -> PathBuf {
 }
 
 pub fn log_dir() -> PathBuf {
-    env_dir("SLOP_LIVIN_LOG_DIR", home().join("Library/Logs/slop-livin"))
+    env_dir("SWAMP_LOG_DIR", home().join("Library/Logs/swamp"))
 }
 
 pub fn log_file() -> PathBuf {
@@ -79,10 +79,10 @@ pub fn format_interval(seconds: u64) -> String {
 }
 
 fn test_mode() -> bool {
-    std::env::var("SLOP_LIVIN_TEST_MODE").is_ok_and(|v| v == "1")
+    std::env::var("SWAMP_TEST_MODE").is_ok_and(|v| v == "1")
 }
 
-/// `launchctl` indirection. Under `SLOP_LIVIN_TEST_MODE=1` every call is a
+/// `launchctl` indirection. Under `SWAMP_TEST_MODE=1` every call is a
 /// no-op that prints what it would have run, so no test suite can ever
 /// register a real job on the machine running it.
 fn run_launchctl(args: &[&str]) -> Result<bool> {
@@ -100,7 +100,7 @@ fn run_launchctl(args: &[&str]) -> Result<bool> {
 }
 
 fn domain() -> String {
-    let uid = std::env::var("SLOP_LIVIN_UID").ok().unwrap_or_else(|| {
+    let uid = std::env::var("SWAMP_UID").ok().unwrap_or_else(|| {
         std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -141,7 +141,7 @@ pub fn render_plist(
     roots: &[PathBuf],
     seconds: u64,
     log_path: &Path,
-    slop_livin_dir_env: Option<&str>,
+    swamp_dir_env: Option<&str>,
 ) -> String {
     let mut args = String::new();
     args.push_str(&format!(
@@ -156,9 +156,9 @@ pub fn render_plist(
         ));
     }
 
-    let env_block = match slop_livin_dir_env {
+    let env_block = match swamp_dir_env {
         Some(dir) => format!(
-            "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>SLOP_LIVIN_DIR</key>\n        <string>{}</string>\n    </dict>\n",
+            "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>SWAMP_DIR</key>\n        <string>{}</string>\n    </dict>\n",
             xml_escape(dir)
         ),
         None => String::new(),
@@ -201,7 +201,7 @@ fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("resolve current executable")
 }
 
-/// `slop-livin schedule --every <interval> <root>...`.
+/// `swamp schedule --every <interval> <root>...`.
 pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     if roots.is_empty() {
         bail!("schedule needs at least one root");
@@ -221,8 +221,8 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
         unload_plist(&plist);
     }
 
-    let slop_livin_dir_env = std::env::var("SLOP_LIVIN_DIR").ok();
-    let body = render_plist(&exe, roots, seconds, &log, slop_livin_dir_env.as_deref());
+    let swamp_dir_env = std::env::var("SWAMP_DIR").ok();
+    let body = render_plist(&exe, roots, seconds, &log, swamp_dir_env.as_deref());
     fs::write(&plist, body).with_context(|| format!("write {}", plist.display()))?;
 
     load_plist(&plist)?;
@@ -233,7 +233,7 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Ok(format!(
-        "Scheduled observation every {}\n  Label: {LABEL}\n  Plist: {}\n  Log:   {}\n  Roots: {}\n  Turn it off with: slop-livin schedule --off\n",
+        "Scheduled observation every {}\n  Label: {LABEL}\n  Plist: {}\n  Log:   {}\n  Roots: {}\n  Turn it off with: swamp schedule --off\n",
         format_interval(seconds),
         plist.display(),
         log.display(),
@@ -241,7 +241,7 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     ))
 }
 
-/// `slop-livin schedule --off`.
+/// `swamp schedule --off`.
 pub fn uninstall() -> Result<String> {
     let plist = plist_path();
     if !plist.exists() {
@@ -422,7 +422,7 @@ fn format_ago(now: u64, then: u64) -> String {
 pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String {
     if !plist_path().exists() {
         return format!(
-            "no schedule (slop-livin schedule --every 30m {})",
+            "no schedule (swamp schedule --every 30m {})",
             suggested_root.display()
         );
     }
@@ -446,13 +446,13 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
     }
 }
 
-/// `slop-livin schedule` with no arguments: report installed/loaded
+/// `swamp schedule` with no arguments: report installed/loaded
 /// state, interval, roots, last run, and the next expected run.
 pub fn status(store_dir: &Path) -> Result<String> {
     let plist = plist_path();
     if !plist.exists() {
         return Ok(
-            "Scheduled observation: not installed\n  Enable it with: slop-livin schedule --every 30m <root>\n"
+            "Scheduled observation: not installed\n  Enable it with: swamp schedule --every 30m <root>\n"
                 .to_string(),
         );
     }
@@ -595,12 +595,12 @@ mod tests {
 
     #[test]
     fn plist_golden_content() {
-        let exe = PathBuf::from("/usr/local/bin/slop-livin");
+        let exe = PathBuf::from("/usr/local/bin/swamp");
         let roots = vec![PathBuf::from("/Users/test/src")];
-        let log = PathBuf::from("/Users/test/Library/Logs/slop-livin/observe.log");
+        let log = PathBuf::from("/Users/test/Library/Logs/swamp/observe.log");
         let body = render_plist(&exe, &roots, 1800, &log, Some("/tmp/store"));
         assert!(body.contains(&format!("<string>{LABEL}</string>")));
-        assert!(body.contains("<string>/usr/local/bin/slop-livin</string>"));
+        assert!(body.contains("<string>/usr/local/bin/swamp</string>"));
         assert!(body.contains("<string>observe</string>"));
         assert!(body.contains("<string>/Users/test/src</string>"));
         assert!(body.contains("<integer>1800</integer>"));
@@ -608,7 +608,7 @@ mod tests {
         assert!(body.contains("<key>LowPriorityIO</key>\n<true/>"));
         assert!(body.contains("<key>Nice</key>\n<integer>10</integer>"));
         assert!(body.contains("<key>RunAtLoad</key>\n<false/>"));
-        assert!(body.contains("SLOP_LIVIN_DIR"));
+        assert!(body.contains("SWAMP_DIR"));
         assert!(body.contains("/tmp/store"));
         assert!(body.contains(&log.to_string_lossy().to_string()));
 
@@ -662,7 +662,7 @@ mod tests {
         assert!(matches!(outcome, LockOutcome::Acquired(_)));
     }
 
-    // Tests below mutate process-global env vars (SLOP_LIVIN_* dirs and
+    // Tests below mutate process-global env vars (SWAMP_* dirs and
     // test mode) to point launchd/plist/log paths at a temp dir instead
     // of the real machine. Serialized so parallel `cargo test` threads
     // never observe each other's env var.
@@ -671,17 +671,17 @@ mod tests {
     #[test]
     fn header_line_reports_no_schedule_when_plist_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // SLOP_LIVIN_LAUNCH_AGENTS_DIR points somewhere with no plist.
+        // SWAMP_LAUNCH_AGENTS_DIR points somewhere with no plist.
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR", tmp.path());
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", tmp.path());
         }
         let store = tempfile::tempdir().unwrap();
         let line = header_line(store.path(), Path::new("/Users/test/src"), 0);
         assert!(line.contains("no schedule"));
-        assert!(line.contains("slop-livin schedule --every 30m"));
+        assert!(line.contains("swamp schedule --every 30m"));
         unsafe {
-            std::env::remove_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
         }
     }
 
@@ -690,8 +690,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let agents = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR", agents.path());
-            std::env::set_var("SLOP_LIVIN_TEST_MODE", "1");
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_TEST_MODE", "1");
         }
         let plist = plist_path();
         fs::write(&plist, "placeholder").unwrap();
@@ -702,8 +702,8 @@ mod tests {
         assert!(message.contains("Removed the scheduled observation"));
 
         unsafe {
-            std::env::remove_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR");
-            std::env::remove_var("SLOP_LIVIN_TEST_MODE");
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
         }
     }
 
@@ -712,14 +712,14 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let agents = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR", agents.path());
-            std::env::set_var("SLOP_LIVIN_TEST_MODE", "1");
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_TEST_MODE", "1");
         }
         let message = uninstall().unwrap();
         assert!(message.contains("No scheduled observation is installed"));
         unsafe {
-            std::env::remove_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR");
-            std::env::remove_var("SLOP_LIVIN_TEST_MODE");
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
         }
     }
 
@@ -728,10 +728,10 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let agents = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
         }
         let plist = plist_path();
-        let exe = PathBuf::from("/usr/local/bin/slop-livin");
+        let exe = PathBuf::from("/usr/local/bin/swamp");
         let body = render_plist(
             &exe,
             &[PathBuf::from("/Users/test/src")],
@@ -760,7 +760,7 @@ mod tests {
         assert!(text.contains("4.2 s"));
 
         unsafe {
-            std::env::remove_var("SLOP_LIVIN_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
         }
     }
 

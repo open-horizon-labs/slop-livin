@@ -29,7 +29,7 @@ open(path, "w").write(s.replace(old, new, 1))
 PY
   echo "$name"
   local out
-  out="$(cargo run -q -p slop-livin-source-audit -- folding_only_for_artifacts symlinks_never_followed 2>&1 | grep -E '^(ok|FAIL)')"
+  out="$(cargo run -q -p swamp-source-audit -- folding_only_for_artifacts symlinks_never_followed 2>&1 | grep -E '^(ok|FAIL)')"
   echo "$out" | sed 's/^/    /'
   if ! echo "$out" | grep -q "FAIL  $expect"; then
     echo "    ^^ SURVIVED: expected $expect to fail" >&2
