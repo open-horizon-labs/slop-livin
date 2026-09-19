@@ -82,6 +82,8 @@ fn kind_label(kind: &ArtifactKind) -> &'static str {
         ArtifactKind::Git => "git",
         ArtifactKind::Cache => "cache",
         ArtifactKind::Source => "source",
+        ArtifactKind::Ignored => "ignored",
+        ArtifactKind::Untracked => "untracked",
         ArtifactKind::DockerImage => "docker-image",
         ArtifactKind::DockerBuildCache => "docker-cache",
         ArtifactKind::DockerVolume => "docker-volume",
@@ -753,7 +755,14 @@ pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
     let mut out = String::new();
     let growth_str = tree
         .growth_bytes
-        .map(|g| format!(" (+{}/24h)", human_signed_bytes(g).trim_start_matches('+')))
+        .map(|g| {
+            // `human_signed_bytes` already carries the sign. Stripping a
+            // leading `+` and then hardcoding one printed `+-18.9MB` for
+            // a shrink; only an exact zero needs a sign added.
+            let signed = human_signed_bytes(g);
+            let signed = if g == 0 { format!("+{signed}") } else { signed };
+            format!(" ({signed}/24h)")
+        })
         .unwrap_or_default();
     let _ = writeln!(
         out,
