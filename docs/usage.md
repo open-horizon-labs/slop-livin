@@ -4,10 +4,10 @@ For the product overview, start with the [README](../README.md).
 
 ## Installing a release
 
-The supported release target is Apple silicon macOS. The [v0.5.0 release](https://github.com/open-horizon-labs/swamp/releases/tag/v0.5.0) contains `swamp` and `swamp-mcp`:
+The supported release target is Apple silicon macOS. The current [v0.5.1 release](https://github.com/open-horizon-labs/swamp/releases/tag/v0.5.1) contains `swamp` and `swamp-mcp`:
 
 ```bash
-v=0.5.0
+v=0.5.1
 archive="swamp-$v-aarch64-apple-darwin"
 curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz"
 curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz.sha256"
