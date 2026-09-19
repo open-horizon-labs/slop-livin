@@ -392,11 +392,8 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
     };
     // Two destinations, and the difference is the whole point: a path
     // goes to Trash and comes back, a Docker object does not.
-    let permanent: u64 = units
-        .iter()
-        .filter(|u| u.docker.is_some())
-        .map(|u| u.bytes)
-        .sum();
+    let permanent_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.docker.is_some()).collect();
+    let permanent: u64 = permanent_units.iter().map(|u| u.bytes).sum();
     let destination = match (permanent, total - permanent) {
         (0, _) => "→ Trash".to_string(),
         (p, 0) => format!("→ removed permanently, no Trash ({})", human_bytes(p)),
@@ -406,8 +403,46 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
             human_bytes(p)
         ),
     };
+    // Name every unit that cannot come back, not just its bytes. One
+    // project expands into many units, and the three the line has room
+    // for are usually ordinary directories -- which left the one
+    // irreversible thing in the plan showing as a number and nothing
+    // else. The human authorizing this should read what they are
+    // destroying by name.
+    let no_way_back = if permanent_units.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = permanent_units
+            .iter()
+            .take(6)
+            .map(|u| {
+                let what = match &u.docker {
+                    Some(slop_livin_core::docker::Removal::Image { .. }) => "image",
+                    Some(slop_livin_core::docker::Removal::Volume { .. }) => "volume",
+                    _ => "object",
+                };
+                let name = if u.label.trim().is_empty() {
+                    u.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                } else {
+                    u.label.trim().to_string()
+                };
+                format!("{name} (docker {what})")
+            })
+            .collect();
+        let extra = permanent_units.len().saturating_sub(6);
+        let extra = if extra > 0 {
+            format!(" +{extra} more")
+        } else {
+            String::new()
+        };
+        format!(" · gone for good: {}{extra}", names.join(", "))
+    };
     format!(
-        "delete {} ({}) {destination}{more}?  Enter yes · Esc no{keep}",
+        "delete {}{more} ({}) {destination}{no_way_back}?  Enter yes · Esc no{keep}",
         what.join(", "),
         human_bytes(total)
     )
@@ -417,6 +452,64 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn unit(
+        path: &str,
+        bytes: u64,
+        docker: Option<slop_livin_core::docker::Removal>,
+    ) -> MarkedUnit {
+        MarkedUnit {
+            path: PathBuf::from(path),
+            docker,
+            worktree_path: PathBuf::new(),
+            bytes,
+            observed_at: now(),
+            label: path.rsplit('/').next().unwrap_or(path).to_string(),
+            warnings: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn the_confirm_names_what_cannot_come_back() {
+        let units = vec![
+            unit("/w/node_modules", 100, None),
+            unit("/w/target", 100, None),
+            unit("/w/.cache", 100, None),
+            unit(
+                "app-data",
+                200,
+                Some(slop_livin_core::docker::Removal::Volume {
+                    name: "app-data".into(),
+                }),
+            ),
+            unit(
+                "sha256:abc",
+                300,
+                Some(slop_livin_core::docker::Removal::Image { id: "abc".into() }),
+            ),
+        ];
+        let line = confirm_summary(&units, false);
+        // The three the line has room for are all ordinary directories,
+        // so without naming them the irreversible units would show only
+        // as a byte count.
+        assert!(
+            line.contains("app-data (docker volume)"),
+            "volume not named: {line}"
+        );
+        assert!(
+            line.contains("sha256:abc (docker image)"),
+            "image not named: {line}"
+        );
+        assert!(line.contains("gone for good"), "{line}");
+    }
+
+    #[test]
+    fn a_plan_with_no_docker_says_nothing_about_permanence() {
+        let line = confirm_summary(&[unit("/w/node_modules", 100, None)], false);
+        assert!(!line.contains("gone for good"), "{line}");
+        assert!(line.contains("→ Trash"), "{line}");
+    }
 
     #[test]
     fn end_to_end_delete_moves_to_trash_and_appends_ledger() {
