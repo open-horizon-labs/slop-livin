@@ -58,7 +58,7 @@ impl Consumer for CargoConsumer {
                     && u.coverage.complete
                     && u.producer_evidence
                         .iter()
-                        .any(|e| e.source == "cargo-folded")
+                        .any(|e| e.source == "cargo-folded-v2")
             });
             let changes = if valid && root.starts_with(&ctx.root) && !ctx.force_full {
                 changed.as_deref().map(|v| v.as_slice())

@@ -64,6 +64,36 @@ folded annotation rows whose unknown subgroup charge is represented by zero.
 
 ## Historical exploration (superseded)
 
+### Release review follow-through — 2026-09-19
+
+Aim: close Rust identification and cleanup verification gaps while preserving
+folded storage, selected-group safety checks, and explicit accounting limits.
+
+Delivered: normal reports retain final executables and library outputs using
+shallow profile-root enumeration (including target-triple profiles). Dependencies
+remain folded; final outputs are inspection-only. Updated the projection evidence
+version so cached old projections cannot indefinitely hide the new output rows.
+Tests check symlink/metadata exclusion, cleanup refusal for final outputs, and
+unchanged top-level accounting.
+
+A native, offline, temporary Cargo fixture now tests build → identify → approve
+→ Trash → rebuild → execute. It touches no user build artifacts. It passed.
+
+Parallel stress reproduced the prior lock failure. Cleanup now explicitly unlocks
+at the end of its critical section instead of relying solely on descriptor close.
+A deterministic duplicate-descriptor test demonstrates the lifetime problem and
+checks continued exclusion while the guard is live. Transient fork inheritance
+is the likely explanation for the parallel-only symptom; that exact fork was not
+instrumented. After the change, 20 consecutive parallel Cargo delivery suites
+passed. The full parallel workspace suite passed 248 tests (two diagnostics
+ignored); all 19 source audits and diff whitespace checks passed.
+
+Review: aligned; no per-file inventory or expanded cleanup authority. Continue
+for this change, Adjust for release completion. Per-crate dependency attribution,
+broader native Cargo variant/custom-root checks, real FSEvents smoke testing,
+release-profile verification and publication remain open. Human verification of
+the CLI/TUI accounting language remains required. This is not a shipped release.
+
 The following execution/review is current; the older exploration resumes after it.
 
 ### Execute and review — folded ecosystem units

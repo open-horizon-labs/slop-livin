@@ -348,6 +348,7 @@ pub(crate) fn folded_units(
     let mut units = Vec::new();
     let mut fingerprints = Vec::new();
     let mut examples = Vec::new();
+    let mut profiles = Vec::new();
     let mut measurements = Vec::new();
     for d in dirs {
         let Some(worktree) = worktrees.get(d.worktree_id.as_str()) else {
@@ -361,6 +362,9 @@ pub(crate) fn folded_units(
         measurements.push((path.clone(), d.mod_time_min.max(0) as u64 * 60, d.complete));
         let parts: Vec<_> = rel.split('/').filter(|s| !s.is_empty()).collect();
         let offset = usize::from(parts.first().is_some_and(|p| looks_like_target_triple(p)));
+        if parts.len() == offset + 1 {
+            profiles.push(path.clone());
+        }
         if parts.len() == offset + 3 && parts.get(offset + 1) == Some(&".fingerprint") {
             fingerprints.push(path.clone());
         }
@@ -440,9 +444,28 @@ pub(crate) fn folded_units(
             }
         }
     }
+    // Final outputs live immediately inside profiles, not inside deps. Keep
+    // executables and library products, but leave metadata and internal files
+    // folded. This is shallow even when the target contains millions of files.
+    for dir in profiles {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            let library = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("rlib" | "a" | "so" | "dylib")
+            );
+            if let Some(u) = folded_output(root, &scope, &path, !library)? {
+                units.push(u);
+            }
+        }
+    }
     enrich_fingerprints(root, &mut units);
     units.retain(|u| {
-        u.is_dir || matches!(u.role, ArtifactRole::TestExecutable | ArtifactRole::Example)
+        u.is_dir
+            || matches!(
+                u.role,
+                ArtifactRole::TestExecutable | ArtifactRole::Example | ArtifactRole::FinalOutput
+            )
     });
     units.sort_by(|a, b| a.path.cmp(&b.path));
     units.dedup_by(|a, b| a.path == b.path);
@@ -463,7 +486,7 @@ fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) 
         0,
         variant,
         vec![evidence(
-            "cargo-folded",
+            "cargo-folded-v2",
             "directory aggregates; internal files are not retained",
             Confidence::High,
         )],
@@ -488,12 +511,21 @@ fn folded_executable(
     scope: &str,
     path: &Path,
 ) -> anyhow::Result<Option<NestedArtifact>> {
+    folded_output(root, scope, path, true)
+}
+
+fn folded_output(
+    root: &Path,
+    scope: &str,
+    path: &Path,
+    executable_required: bool,
+) -> anyhow::Result<Option<NestedArtifact>> {
     let m = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    if !m.is_file() || m.mode() & 0o111 == 0 {
+    if !m.is_file() || (executable_required && m.mode() & 0o111 == 0) {
         return Ok(None);
     }
     let mut u = folded_node(root, scope, path, false, m.blocks() * 512);

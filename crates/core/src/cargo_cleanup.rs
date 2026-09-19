@@ -183,8 +183,20 @@ fn locks(profile: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn acquire(paths: &[PathBuf]) -> Result<Vec<fs::File>> {
-    let mut held = Vec::new();
+struct HeldLocks(Vec<fs::File>);
+
+impl Drop for HeldLocks {
+    fn drop(&mut self) {
+        // Closing alone leaves flock held when another thread's fork temporarily
+        // inherits the open file description. End our critical section explicitly.
+        for file in &self.0 {
+            let _ = file.unlock();
+        }
+    }
+}
+
+fn acquire(paths: &[PathBuf]) -> Result<HeldLocks> {
+    let mut held = HeldLocks(Vec::new());
     for p in paths {
         let file = regular(p)?;
         file.try_lock().map_err(|e| {
@@ -193,14 +205,32 @@ fn acquire(paths: &[PathBuf]) -> Result<Vec<fs::File>> {
                 p.display()
             )
         })?;
+        held.0.push(file);
+        let file = held.0.last().unwrap();
         let fd = file.metadata()?;
         let path = fs::symlink_metadata(p)?;
         if (fd.dev(), fd.ino()) != (path.dev(), path.ino()) {
             bail!("Cargo lock replaced");
         }
-        held.push(file);
     }
     Ok(held)
+}
+
+#[test]
+fn explicit_unlock_releases_even_with_a_duplicated_description() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".cargo-lock");
+    fs::write(&path, b"").unwrap();
+    let held = acquire(&[path.clone()]).unwrap();
+    let duplicate = held.0[0].try_clone().unwrap();
+    assert!(
+        acquire(&[path.clone()]).is_err(),
+        "live guard must exclude another holder"
+    );
+    drop(held);
+    let reacquired = acquire(&[path]).expect("duplicate must not extend the critical section");
+    drop(reacquired);
+    drop(duplicate);
 }
 
 /// Select an evidenced test/example executable with its companions, or one

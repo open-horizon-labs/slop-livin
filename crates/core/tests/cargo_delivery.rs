@@ -67,6 +67,134 @@ fn report(root: &Path, store: &Path) -> swamp_core::Report {
     .unwrap()
 }
 #[test]
+fn native_cargo_rebuilds_after_reviewed_test_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap().join("repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='native-fixture'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "#[test] fn works() { assert_eq!(2 + 2, 4); }\n",
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    let build = || {
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["test", "--offline", "--no-run"])
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .env_remove("CARGO_BUILD_TARGET")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    build();
+    let store = tempfile::tempdir().unwrap();
+    let r = report(&root, store.path());
+    let selected = r
+        .nested_artifacts
+        .iter()
+        .find(|u| u.role == ArtifactRole::TestExecutable)
+        .expect("native Cargo test identified")
+        .path
+        .clone();
+    let plan = actions::propose(&r, None, &[selected.clone()], "native-test").unwrap();
+    actions::save_plan(store.path(), &plan).unwrap();
+    actions::approve(store.path(), &plan.id, "human:test").unwrap();
+    let result = actions::execute_with_trash(
+        store.path(),
+        &plan.id,
+        "native-test",
+        &store.path().join("trash"),
+    )
+    .unwrap();
+    assert_eq!(
+        result.outcomes[0].status, "completed",
+        "{:?}",
+        result.outcomes
+    );
+    assert!(!selected.exists());
+    build();
+    assert!(
+        selected.is_file(),
+        "Cargo must regenerate the removed test executable"
+    );
+    assert!(
+        std::process::Command::new(selected)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn folded_reports_include_final_outputs_without_unfolding_dependencies() {
+    let (_tmp, root, target) = fixture();
+    let store = tempfile::tempdir().unwrap();
+    for profile in ["debug", "aarch64-apple-darwin/release"] {
+        let dir = target.join(profile);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("fixture"), vec![1u8; 8192]).unwrap();
+        fs::set_permissions(dir.join("fixture"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("libfixture.rlib"), vec![1u8; 8192]).unwrap();
+        fs::write(dir.join("fixture.d"), b"metadata").unwrap();
+        std::os::unix::fs::symlink(dir.join("fixture"), dir.join("alias")).unwrap();
+    }
+    let r = report(&root, store.path());
+    for profile in ["debug", "aarch64-apple-darwin/release"] {
+        for name in ["fixture", "libfixture.rlib"] {
+            let u = r
+                .nested_artifacts
+                .iter()
+                .find(|u| u.path == target.join(profile).join(name))
+                .unwrap();
+            assert_eq!(u.role, ArtifactRole::FinalOutput);
+            assert!(u.bytes > 0);
+            assert!(
+                actions::propose(&r, None, &[u.path.clone()], "test").is_err(),
+                "identification must not enable unreviewed cleanup roles"
+            );
+        }
+        for name in ["fixture.d", "alias"] {
+            assert!(
+                !r.nested_artifacts
+                    .iter()
+                    .any(|u| u.path == target.join(profile).join(name))
+            );
+        }
+    }
+    assert!(
+        !r.nested_artifacts
+            .iter()
+            .any(|u| u.path == target.join("debug/deps/libdependency.rlib"))
+    );
+    let top_bytes: u64 = r
+        .projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.artifacts)
+        .map(|a| a.bytes)
+        .sum();
+    assert_eq!(r.total_series.last().copied().flatten(), Some(top_bytes));
+}
+
+#[test]
 fn normal_report_identifies_tests_and_exact_cleanup_preserves_neighbors() {
     let (_tmp, root, target) = fixture();
     let store = tempfile::tempdir().unwrap();
