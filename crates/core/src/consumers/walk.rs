@@ -19,6 +19,7 @@ impl Consumer for WalkConsumer {
     async fn on_event(&self, _event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
         let mut notes: Vec<String> = Vec::new();
         let mut rewalked: Option<Arc<Vec<String>>> = None;
+        let mut changed_paths = None;
         let (discovered, attribution) = if let Some(dir) = &ctx.store_dir {
             let tracked = crate::growth::observe_tracked_with_source(
                 dir,
@@ -34,6 +35,7 @@ impl Consumer for WalkConsumer {
                 tracked.mode, tracked.reason, tracked.changed_dirs
             ));
             rewalked = tracked.rewalked.map(Arc::new);
+            changed_paths = tracked.changed_paths.map(Arc::new);
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
@@ -44,6 +46,7 @@ impl Consumer for WalkConsumer {
             )?
         };
         Ok(vec![Event::RootObserved {
+            changed_paths,
             discovered: Arc::new(discovered),
             attribution: Arc::new(attribution),
             notes,

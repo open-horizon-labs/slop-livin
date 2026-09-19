@@ -158,6 +158,9 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
 
 /// One row's storage identity: never an absolute path.
 fn row_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &str) -> String {
+    if kind.starts_with("Nested:") {
+        return kind.to_string();
+    }
     format!("{project_id}\u{1}{worktree_id}\u{1}{kind}\u{1}{rel_path}")
 }
 
@@ -434,7 +437,9 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     hardlinked: artifact.hardlinked,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
-                    local_bytes: if artifact.local_bytes == 0 {
+                    local_bytes: if artifact.local_bytes == 0
+                        && artifact.source.tool != "cargo.layout"
+                    {
                         artifact.bytes
                     } else {
                         artifact.local_bytes
@@ -679,7 +684,7 @@ pub fn observe_and_annotate(
                     .strip_prefix(&worktree.path)
                     .unwrap_or(&artifact.path)
                     .to_path_buf();
-                let kind = format!("{:?}", artifact.kind);
+                let kind = observed_kind(artifact);
                 let key = row_key(
                     &project.project_id,
                     &worktree.worktree_id,
@@ -881,7 +886,9 @@ pub fn history_series(
         for (i, t) in times.iter().enumerate() {
             let v = pts.iter().rev().find(|(pt, _)| pt <= t).map(|(_, b)| *b);
             out.push(v);
-            if let Some(v) = v {
+            if let Some(v) = v
+                && !key.starts_with("Nested:")
+            {
                 total[i] = Some(total[i].unwrap_or(0) + v);
             }
         }
@@ -1795,6 +1802,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
 /// [`crate::walk::discover_and_attribute`] returns, plus the mode/reason
 /// a caller reports in the coverage block and the `observe` log line.
 pub struct TrackedWalk {
+    pub changed_paths: Option<Vec<PathBuf>>,
     pub discovered: Vec<DiscoveredWorktree>,
     pub attribution: crate::attribution::AttributionResult,
     /// `"incremental"` or `"full"`.
@@ -2264,6 +2272,7 @@ fn full_walk(
         discovered,
         attribution,
         mode: "full",
+        changed_paths: None,
         reason,
         changed_dirs: 0,
         rewalked: None,
@@ -3129,6 +3138,7 @@ fn apply_incremental(
         discovered,
         attribution,
         mode: "incremental",
+        changed_paths: Some(changed_dirs.to_vec()),
         reason: "incremental",
         changed_dirs: changed_dirs.len(),
         rewalked: Some(

@@ -77,13 +77,15 @@ pub struct ArtifactVariant {
 pub struct ArtifactCoverage {
     pub supported: bool,
     #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
     pub limits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NestedArtifact {
-    /// Stable identity based on the observed storage boundary and role, not
-    /// on an inferred project/package owner.
+    /// Stable identity based on canonical container and relative path, not
+    /// role or an inferred project/package owner.
     pub id: String,
     pub path: PathBuf,
     pub relative_path: String,
@@ -91,12 +93,23 @@ pub struct NestedArtifact {
     pub container_id: Option<String>,
     pub role: ArtifactRole,
     pub membership: Membership,
-    /// Aggregate bytes for this node. Container values include descendants;
+    #[serde(default)]
+    pub is_dir: bool,
+    #[serde(default)]
+    pub device: u64,
+    #[serde(default)]
+    pub inode: u64,
+    #[serde(default)]
+    pub logical_bytes: u64,
+    /// Aggregate allocated bytes for this node. Container values include descendants;
     /// only leaf `physical_bytes` are charged to the containing report row.
     pub bytes: u64,
     /// Physical bytes charged by this node after hardlink de-duplication.
     /// This is zero for aggregate/container nodes.
     pub physical_bytes: u64,
+    /// Aggregate charge, for display only; do not sum with descendants.
+    #[serde(default)]
+    pub physical_total: u64,
     pub mtime_max: u64,
     pub variant: ArtifactVariant,
     #[serde(default)]
@@ -116,6 +129,21 @@ pub struct NestedArtifact {
 }
 
 impl NestedArtifact {
+    pub fn storage_id(root: &Path, relative: &str) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"nested-storage:v2\0");
+        hash.update(root.as_os_str().as_bytes());
+        hash.update(b"\0");
+        Self::within(&hash.finalize().to_hex().to_string(), relative)
+    }
+    pub fn within(container_id: &str, relative: &str) -> String {
+        if relative.is_empty() {
+            return container_id.to_string();
+        }
+        id_for(&format!("nested-entry:v2:{container_id}:{relative}"))
+    }
     pub fn stable_id(relative_path: &str, _role: &ArtifactRole) -> String {
         // Role is evidence and may be reclassified when a build message
         // arrives. The physical boundary is the identity.
@@ -131,7 +159,7 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .replace('\\', "/")
+        .into_owned()
 }
 
 pub fn architecture_from_target(target: &str) -> Option<String> {

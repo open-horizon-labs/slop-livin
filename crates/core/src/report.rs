@@ -750,7 +750,7 @@ pub fn annotate_tracking(
 
 fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
     store_dir.join(format!(
-        "last_report-{}.json",
+        "last_report-{}.json.zst",
         &crate::entities::id_for(&root.display().to_string())[..16]
     ))
 }
@@ -796,11 +796,19 @@ pub(crate) fn dir_inside_artifact(
 pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
     std::fs::create_dir_all(store_dir)?;
     let path = last_report_path(store_dir, &report.root);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension("tmp");
     let mut slim = report.clone();
     slim.dirs_by_worktree = None;
     slim.files_by_worktree = None;
-    std::fs::write(&tmp, serde_json::to_vec(&slim)?)?;
+    let file = std::fs::File::create(&tmp)?;
+    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, encoder);
+    serde_json::to_writer(&mut writer, &slim)?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .finish()?
+        .sync_all()?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -809,8 +817,9 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
 /// run, TUI), without walking anything. `None` when no observation of
 /// this root has been cached yet.
 pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
-    let text = std::fs::read_to_string(last_report_path(store_dir, root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let file = std::fs::File::open(last_report_path(store_dir, root)).ok()?;
+    let bytes = zstd::stream::decode_all(file).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Rolls `own_allocated` up into `allocated_total` bottom-up: deepest

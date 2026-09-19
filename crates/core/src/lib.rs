@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod attribution;
 pub mod bus;
 pub mod cargo_artifacts;
+pub mod cargo_cleanup;
 pub mod compose;
 pub mod consumers;
 pub mod docker;

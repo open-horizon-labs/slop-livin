@@ -507,6 +507,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
 
     let unit = |path: &std::path::Path| MarkedUnit {
+        cargo_plan: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),

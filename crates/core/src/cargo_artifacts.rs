@@ -28,6 +28,10 @@ pub struct CargoInspection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CargoMessageEvidence {
+    #[serde(default)]
+    pub profile_test: bool,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
     pub target_name: Option<String>,
     pub target_kind: Vec<String>,
     pub package_id: Option<String>,
@@ -75,14 +79,13 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
         layout.build_dir = build.map(|p| resolve_config_path(config.as_deref(), p));
     }
-    if layout.target_dir.is_none() {
-        layout.target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-        if layout.target_dir.is_none() {
-            layout.target_dir = std::env::var_os("CARGO_BUILD_TARGET_DIR").map(PathBuf::from);
-        }
+    if let Some(p) =
+        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+    {
+        layout.target_dir = Some(p.into());
     }
-    if layout.build_dir.is_none() {
-        layout.build_dir = std::env::var_os("CARGO_BUILD_BUILD_DIR").map(PathBuf::from);
+    if let Some(p) = std::env::var_os("CARGO_BUILD_BUILD_DIR") {
+        layout.build_dir = Some(p.into());
     }
     for p in [&mut layout.target_dir, &mut layout.build_dir] {
         if let Some(path) = p.as_mut() {
@@ -106,28 +109,17 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
 }
 
 fn parse_build_paths(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-    let mut section = String::new();
-    let mut target = None;
-    let mut build = None;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line[1..line.len() - 1].trim().to_string();
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if section == "build" {
-            match key.trim() {
-                "target-dir" => target = Some(PathBuf::from(value)),
-                "build-dir" => build = Some(PathBuf::from(value)),
-                _ => {}
-            }
-        }
-    }
-    (target, build)
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return (None, None);
+    };
+    let path = |key| {
+        value
+            .get("build")
+            .and_then(|b| b.get(key))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+    };
+    (path("target-dir"), path("build-dir"))
 }
 
 fn resolve_config_path(config: Option<&Path>, value: PathBuf) -> PathBuf {
@@ -145,147 +137,304 @@ fn resolve_config_path(config: Option<&Path>, value: PathBuf) -> PathBuf {
 /// Inspect a target/build directory directly. This is useful when the build
 /// root is shared or custom and is not beneath the checkout being reported.
 pub fn inspect_target(target_dir: &Path, workspace_root: Option<&Path>) -> CargoInspection {
-    let mut units = Vec::new();
-    let target_rel = target_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("target");
-    let root_id = NestedArtifact::stable_id("", &ArtifactRole::Container);
-    units.push(node(
-        target_dir,
-        workspace_root.unwrap_or(target_dir),
-        Some(root_id.clone()),
-        None,
-        ArtifactRole::Container,
-        0,
-        0,
-        ArtifactVariant::default(),
-        vec![evidence(
-            "path-layout",
-            format!("Cargo target/build container `{target_rel}`"),
-            Confidence::Medium,
-        )],
-        vec![],
-        ArtifactCoverage {
-            supported: true,
-            limits: vec![
-                "toolchain, features, and generation are unknown without build records".into(),
-                "Cargo build-dir internals are subject to change".into(),
-            ],
-        },
-        None,
-        true,
-    ));
+    inspect_target_incremental(target_dir, workspace_root, &[], None)
+}
 
-    let mut seen = HashSet::new();
-    if let Ok(entries) = fs::read_dir(target_dir) {
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "CACHEDIR.TAG" || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let role = if name.ends_with(".d") {
-                    ArtifactRole::CompanionMetadata
-                } else {
-                    ArtifactRole::Residual
-                };
-                add_leaf(
-                    &mut units,
-                    &path,
-                    target_dir,
-                    Some(root_id.clone()),
-                    role,
-                    &mut seen,
-                    &ArtifactVariant::default(),
-                    &format!("target/{name}"),
-                );
-                continue;
+/// Replay-driven refresh. Only directories named by a complete event batch
+/// (and their ancestors) are listed again; unaffected subtrees use saved facts.
+pub fn inspect_target_incremental(
+    target_dir: &Path,
+    workspace_root: Option<&Path>,
+    cached: &[NestedArtifact],
+    changed: Option<&[PathBuf]>,
+) -> CargoInspection {
+    let scope = NestedArtifact::storage_id(target_dir, "");
+    let mut units = Vec::new();
+    let mut limits = Vec::new();
+    let old: HashMap<PathBuf, &NestedArtifact> =
+        cached.iter().map(|u| (u.path.clone(), u)).collect();
+    let mut children: HashMap<PathBuf, Vec<&NestedArtifact>> = HashMap::new();
+    for u in cached {
+        if u.path != target_dir {
+            if let Some(p) = u.path.parent() {
+                children.entry(p.to_path_buf()).or_default().push(u);
             }
-            let (role, variant) = top_level_role(&name);
-            let profile_id = NestedArtifact::stable_id(
-                &relative_path(target_dir, &path),
-                &ArtifactRole::Profile,
-            );
-            units.push(node(
-                &path,
-                target_dir,
-                Some(profile_id.clone()),
-                Some(root_id.clone()),
-                if role == ArtifactRole::Profile {
-                    ArtifactRole::Profile
-                } else {
-                    role.clone()
-                },
-                0,
-                0,
-                variant.clone(),
-                vec![evidence(
-                    "path-layout",
-                    format!("Cargo target child `{name}`"),
-                    Confidence::High,
-                )],
-                vec![],
-                coverage_for_role(&role),
-                None,
-                true,
-            ));
-            inspect_profile(
-                &path,
-                target_dir,
-                &profile_id,
-                role,
-                variant,
-                &mut seen,
-                &mut units,
-            );
         }
+    }
+    fn copy_tree(
+        path: &Path,
+        old: &HashMap<PathBuf, &NestedArtifact>,
+        children: &HashMap<PathBuf, Vec<&NestedArtifact>>,
+        out: &mut Vec<NestedArtifact>,
+    ) {
+        if let Some(u) = old.get(path) {
+            let mut u = (*u).clone();
+            if u.is_dir {
+                u.bytes = 0;
+                u.logical_bytes = 0;
+            }
+            u.physical_bytes = 0;
+            out.push(u);
+            if let Some(kids) = children.get(path) {
+                for k in kids {
+                    copy_tree(&k.path, old, children, out);
+                }
+            }
+        }
+    }
+    fn visit(
+        path: &Path,
+        root: &Path,
+        scope: &str,
+        old: &HashMap<PathBuf, &NestedArtifact>,
+        children: &HashMap<PathBuf, Vec<&NestedArtifact>>,
+        changed: Option<&[PathBuf]>,
+        out: &mut Vec<NestedArtifact>,
+        limits: &mut Vec<String>,
+    ) {
+        if path.to_str().is_none() {
+            limits.push("non-UTF8 Cargo path unsupported; observation incomplete".into());
+            return;
+        }
+        if let Some(changed) = changed {
+            if old.contains_key(path)
+                && !changed
+                    .iter()
+                    .any(|c| c.starts_with(path) || c == path.parent().unwrap_or(path))
+            {
+                copy_tree(path, old, children, out);
+                return;
+            }
+        }
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                limits.push(format!("{}: {e}", path.display()));
+                return;
+            }
+        };
+        let rel = relative_path(root, path);
+        let (role, variant) = classify_path(&rel, meta.is_dir());
+        let id = NestedArtifact::within(scope, &rel);
+        let parent = if path == root {
+            None
+        } else {
+            Some(NestedArtifact::within(
+                scope,
+                &relative_path(root, path.parent().unwrap()),
+            ))
+        };
+        let mut u = node(
+            path,
+            root,
+            Some(id),
+            parent,
+            role,
+            if meta.is_file() {
+                meta.blocks() * 512
+            } else {
+                0
+            },
+            0,
+            variant,
+            vec![evidence(
+                "cargo-layout",
+                "observed layout; not evidence of last use or obsolescence",
+                Confidence::Medium,
+            )],
+            vec![],
+            ArtifactCoverage {
+                supported: true,
+                complete: true,
+                limits: vec!["Cargo intermediate layout is version-dependent".into()],
+            },
+            None,
+            true,
+        );
+        u.is_dir = meta.is_dir();
+        u.mtime_max = meta.mtime().max(0) as u64;
+        u.device = meta.dev();
+        u.inode = meta.ino();
+        if meta.file_type().is_symlink() {
+            u.role = ArtifactRole::Unknown;
+            u.coverage.limits.push("symlink not followed".into());
+        }
+        u.logical_bytes = if meta.is_file() { meta.len() } else { 0 };
+        u.membership = if meta.nlink() > 1 && meta.is_file() {
+            Membership::SharedHardlink
+        } else {
+            Membership::Exclusive
+        };
+        if path != root {
+            u.container_id = Some(scope.to_string());
+        }
+        out.push(u);
+        if meta.is_dir() {
+            match fs::read_dir(path) {
+                Err(e) => limits.push(format!("{}: {e}", path.display())),
+                Ok(entries) => {
+                    let mut paths = Vec::new();
+                    for entry in entries {
+                        match entry {
+                            Ok(e) => paths.push(e.path()),
+                            Err(e) => limits.push(format!("{}: {e}", path.display())),
+                        }
+                    }
+                    paths.sort();
+                    for p in paths {
+                        visit(&p, root, scope, old, children, changed, out, limits);
+                    }
+                }
+            }
+        } else if path == root {
+            limits.push("build root is not a directory".into());
+        }
+    }
+    visit(
+        target_dir,
+        target_dir,
+        &scope,
+        &old,
+        &children,
+        changed,
+        &mut units,
+        &mut limits,
+    );
+    let complete = limits.is_empty();
+    if workspace_root.is_none() {
+        limits.push("Cargo.toml was not established; ownership unknown".into());
+    }
+    let mut seen = HashSet::new();
+    for u in &mut units {
+        if !u.is_dir && seen.insert((u.device, u.inode)) {
+            u.physical_bytes = u.bytes;
+        }
+        u.coverage.complete = complete;
+        u.coverage.supported = workspace_root.is_some() && complete;
+        u.coverage.limits.extend(limits.iter().cloned());
     }
     aggregate_units(&mut units);
-    let total_bytes = units
-        .iter()
-        .find(|u| u.id == root_id)
-        .map(|u| u.bytes)
-        .unwrap_or_default();
-    let physical_bytes: u64 = units.iter().map(|u| u.physical_bytes).sum();
-    for unit in units.iter_mut() {
-        if unit.id != root_id {
-            unit.container_id = Some(root_id.clone());
-        }
-    }
+    charge_physical(&mut units);
+    enrich_fingerprints(target_dir, &mut units);
+    let physical_bytes = units.iter().map(|u| u.physical_bytes).sum();
+    let total_bytes = units.first().map_or(0, |u| u.bytes);
     CargoInspection {
-        target_dir: target_dir.to_path_buf(),
+        target_dir: target_dir.into(),
         build_dir: None,
         total_bytes,
         physical_bytes,
         units,
         coverage: ArtifactCoverage {
-            supported: workspace_root.is_some(),
-            limits: if workspace_root.is_some() {
-                vec![
-                    "crate/package ownership is not inferred from hashed filenames".into(),
-                    "test-vs-library identity needs compiler-artifact JSON evidence".into(),
-                ]
-            } else {
-                vec!["Cargo.toml was not established; ownership is unknown".into()]
-            },
+            supported: workspace_root.is_some() && complete,
+            complete,
+            limits,
         },
     }
 }
 
-fn top_level_role(name: &str) -> (ArtifactRole, ArtifactVariant) {
-    match name {
-        "debug" => (ArtifactRole::Profile, profile_variant("debug")),
-        "release" => (ArtifactRole::Profile, profile_variant("release")),
-        "build" => (ArtifactRole::BuildScriptOutput, profile_variant("unknown")),
-        "incremental" => (ArtifactRole::Incremental, profile_variant("unknown")),
-        n if looks_like_target_triple(n) => {
-            let mut v = ArtifactVariant::default();
-            v.target = Some(n.to_string());
-            v.architecture = architecture_from_target(n);
-            (ArtifactRole::Container, v)
+fn classify_path(rel: &str, is_dir: bool) -> (ArtifactRole, ArtifactVariant) {
+    if rel.is_empty() {
+        return (ArtifactRole::Container, ArtifactVariant::default());
+    }
+    let parts: Vec<_> = rel.split('/').collect();
+    let triple = looks_like_target_triple(parts[0]);
+    let offset = usize::from(triple);
+    let mut variant = profile_variant(parts.get(offset).copied().unwrap_or("unknown"));
+    if triple {
+        variant.architecture = architecture_from_target(parts[0]);
+        variant.configuration = Some(parts[0].into());
+        variant.unknowns.retain(|s| s != "architecture");
+    }
+    if parts.len() <= offset {
+        return (ArtifactRole::Container, variant);
+    }
+    if parts.len() == offset + 1 && is_dir {
+        return (ArtifactRole::Profile, variant);
+    }
+    let role = match parts.get(offset + 1).copied() {
+        Some("deps") => ArtifactRole::Dependency,
+        Some("examples") => ArtifactRole::Example,
+        Some("incremental") => ArtifactRole::Incremental,
+        Some("build") => ArtifactRole::BuildScriptOutput,
+        Some(".fingerprint") => ArtifactRole::CompanionMetadata,
+        _ if !is_dir && parts.len() == offset + 2 => ArtifactRole::FinalOutput,
+        _ => ArtifactRole::Residual,
+    };
+    let role = if !is_dir && rel.ends_with(".d") {
+        ArtifactRole::CompanionMetadata
+    } else {
+        role
+    };
+    (role, variant)
+}
+
+/// Fingerprints provide a baseline test/executable distinction without running
+/// Cargo. They describe an observed build variant, never current project intent.
+fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
+    let mut facts = HashMap::new();
+    for u in units.iter().filter(|u| {
+        !u.is_dir
+            && u.role == ArtifactRole::CompanionMetadata
+            && u.relative_path.contains("/.fingerprint/")
+            && u.path.extension().is_some_and(|e| e == "json")
+    }) {
+        let name = u.path.file_name().unwrap().to_string_lossy();
+        if !name.starts_with("test-") {
+            continue;
         }
-        _ => (ArtifactRole::Residual, profile_variant("unknown")),
+        let Some(dir) = u.path.parent() else { continue };
+        let Some(crate_hash) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((_, hash)) = crate_hash.rsplit_once('-') else {
+            continue;
+        };
+        let stem = name.trim_end_matches(".json");
+        let target = stem
+            .strip_prefix("test-lib-")
+            .or_else(|| stem.strip_prefix("test-bin-"))
+            .or_else(|| stem.strip_prefix("test-integration-test-"));
+        let Some(target) = target else { continue };
+        let Some(profile) = dir.parent().and_then(Path::parent) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&u.path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        facts.insert(
+            profile.join("deps").join(format!("{target}-{hash}")),
+            (target.to_string(), json, u.path.clone()),
+        );
+    }
+    for u in units.iter_mut() {
+        if u.role == ArtifactRole::TestExecutable {
+            // Cached enrichment is current evidence, not permanent identity.
+            u.role = ArtifactRole::Dependency;
+            u.variant.target = None;
+            u.variant.features = None;
+            u.variant.toolchain = None;
+            u.action_group = None;
+            u.producer_evidence
+                .retain(|e| e.source != "cargo-fingerprint");
+        }
+        if let Some((target, json, path)) = facts.get(&u.path) {
+            u.role = ArtifactRole::TestExecutable;
+            u.variant.target = Some(target.clone());
+            u.variant.features = json.get("features").map(|v| v.to_string());
+            u.variant.toolchain = json.get("rustc").map(|v| format!("fingerprint:{v}"));
+            u.producer_evidence.push(evidence(
+                "cargo-fingerprint",
+                path.display().to_string(),
+                Confidence::Medium,
+            ));
+            u.action_group = Some(NestedArtifact::storage_id(
+                root,
+                &format!("action:{}", u.relative_path),
+            ));
+        }
     }
 }
 
@@ -308,225 +457,6 @@ fn looks_like_target_triple(name: &str) -> bool {
     name.matches('-').count() >= 2 && !name.contains('.')
 }
 
-fn inspect_profile(
-    profile_dir: &Path,
-    target_dir: &Path,
-    parent_id: &str,
-    parent_role: ArtifactRole,
-    mut variant: ArtifactVariant,
-    seen: &mut HashSet<(u64, u64)>,
-    units: &mut Vec<NestedArtifact>,
-) {
-    if let Some(name) = profile_dir.file_name().and_then(|n| n.to_str()) {
-        if looks_like_target_triple(name) {
-            variant.target = Some(name.into());
-            variant.architecture = architecture_from_target(name);
-        }
-    }
-    let Ok(entries) = fs::read_dir(profile_dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let (role, child_variant) = match name.as_str() {
-            "deps" => (ArtifactRole::Dependency, variant.clone()),
-            "examples" => (ArtifactRole::Example, variant.clone()),
-            "build" => (ArtifactRole::BuildScriptOutput, variant.clone()),
-            "incremental" => (ArtifactRole::Incremental, variant.clone()),
-            _ if is_dir => (ArtifactRole::Residual, variant.clone()),
-            _ if name.ends_with(".d") => (ArtifactRole::CompanionMetadata, variant.clone()),
-            _ => (ArtifactRole::FinalOutput, variant.clone()),
-        };
-        if is_dir {
-            let id = NestedArtifact::stable_id(&relative_path(target_dir, &path), &role);
-            units.push(node(
-                &path,
-                target_dir,
-                Some(id.clone()),
-                Some(parent_id.to_string()),
-                role.clone(),
-                0,
-                0,
-                child_variant.clone(),
-                vec![evidence(
-                    "path-layout",
-                    format!("Cargo profile child `{name}`"),
-                    Confidence::High,
-                )],
-                vec![],
-                coverage_for_role(&role),
-                None,
-                true,
-            ));
-            inspect_leaf_directory(&path, target_dir, &id, role, child_variant, seen, units);
-        } else {
-            let group = action_group_for_companion(target_dir, &path, &name);
-            add_leaf(
-                units,
-                &path,
-                target_dir,
-                Some(parent_id.to_string()),
-                role,
-                seen,
-                &child_variant,
-                &group,
-            );
-        }
-    }
-    let _ = parent_role;
-}
-
-fn inspect_leaf_directory(
-    dir: &Path,
-    target_dir: &Path,
-    parent_id: &str,
-    role: ArtifactRole,
-    variant: ArtifactVariant,
-    seen: &mut HashSet<(u64, u64)>,
-    units: &mut Vec<NestedArtifact>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let child_role = if role == ArtifactRole::Dependency && name.ends_with(".d") {
-            ArtifactRole::CompanionMetadata
-        } else if role == ArtifactRole::Example {
-            ArtifactRole::Example
-        } else if role == ArtifactRole::BuildScriptOutput {
-            ArtifactRole::BuildScriptOutput
-        } else if role == ArtifactRole::Incremental {
-            ArtifactRole::Incremental
-        } else if name.ends_with(".d") {
-            ArtifactRole::CompanionMetadata
-        } else {
-            role.clone()
-        };
-        let group = action_group_for_companion(target_dir, &path, &name);
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            let id = NestedArtifact::stable_id(&relative_path(target_dir, &path), &child_role);
-            units.push(node(
-                &path,
-                target_dir,
-                Some(id.clone()),
-                Some(parent_id.to_string()),
-                child_role.clone(),
-                0,
-                0,
-                variant.clone(),
-                vec![evidence(
-                    "path-layout",
-                    "nested Cargo output directory",
-                    Confidence::Medium,
-                )],
-                vec![],
-                coverage_for_role(&child_role),
-                Some(group),
-                true,
-            ));
-            inspect_leaf_directory(
-                &path,
-                target_dir,
-                &id,
-                child_role,
-                variant.clone(),
-                seen,
-                units,
-            );
-        } else {
-            add_leaf(
-                units,
-                &path,
-                target_dir,
-                Some(parent_id.to_string()),
-                child_role,
-                seen,
-                &variant,
-                &group,
-            );
-        }
-    }
-}
-
-fn action_group_for_companion(target_dir: &Path, path: &Path, name: &str) -> String {
-    let stem = name.strip_suffix(".d").unwrap_or(name);
-    NestedArtifact::action_group(&format!(
-        "{}:group:{stem}",
-        relative_path(target_dir, path.parent().unwrap_or(target_dir))
-    ))
-}
-
-fn add_leaf(
-    units: &mut Vec<NestedArtifact>,
-    path: &Path,
-    target_dir: &Path,
-    parent_id: Option<String>,
-    role: ArtifactRole,
-    seen: &mut HashSet<(u64, u64)>,
-    variant: &ArtifactVariant,
-    action_group: &str,
-) {
-    let bytes = file_bytes(path);
-    let physical_bytes = if let Some(meta) = fs::symlink_metadata(path).ok() {
-        if meta.file_type().is_file() && seen.insert((meta.dev(), meta.ino())) {
-            meta.blocks() * 512
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    let rel = relative_path(target_dir, path);
-    let coverage = coverage_for_role(&role);
-    let mut producer = vec![evidence(
-        "path-layout",
-        format!("Cargo `{}` layout", role.label()),
-        Confidence::Medium,
-    )];
-    let mut unknowns = variant.unknowns.clone();
-    if role == ArtifactRole::Dependency {
-        producer.push(evidence(
-            "filename",
-            "hashed dependency filename; package ownership not inferred",
-            Confidence::Low,
-        ));
-        unknowns.push("package (unless JSON build evidence is supplied)".into());
-    }
-    let mut variant = variant.clone();
-    variant.unknowns = unknowns;
-    let id = NestedArtifact::stable_id(&rel, &role);
-    let mut unit = node(
-        path,
-        target_dir,
-        Some(id.clone()),
-        parent_id.clone(),
-        role,
-        bytes,
-        physical_bytes,
-        variant,
-        producer,
-        vec![],
-        coverage,
-        Some(action_group.to_string()),
-        true,
-    );
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|m| m.nlink() > 1)
-    {
-        unit.membership = Membership::SharedHardlink;
-    }
-    units.push(unit);
-}
-
 fn node(
     path: &Path,
     root: &Path,
@@ -544,11 +474,13 @@ fn node(
 ) -> NestedArtifact {
     let relative_path = relative_path(root, path);
     let id = id.unwrap_or_else(|| NestedArtifact::stable_id(&relative_path, &role));
-    let mtime_max = fs::symlink_metadata(path)
-        .ok()
-        .map(|m| m.mtime().max(0) as u64)
-        .unwrap_or(0);
+    let mtime_max = 0;
     NestedArtifact {
+        physical_total: 0,
+        is_dir: false,
+        device: 0,
+        inode: 0,
+        logical_bytes: 0,
         id: id.clone(),
         path: path.to_path_buf(),
         relative_path,
@@ -582,25 +514,6 @@ fn evidence(source: &str, detail: impl Into<String>, confidence: Confidence) -> 
     }
 }
 
-fn coverage_for_role(role: &ArtifactRole) -> ArtifactCoverage {
-    let mut limits = vec!["toolchain, features, and generation are unknown".into()];
-    if matches!(role, ArtifactRole::Dependency | ArtifactRole::FinalOutput) {
-        limits.push("hashed filenames do not establish package or test ownership".into());
-    }
-    ArtifactCoverage {
-        supported: true,
-        limits,
-    }
-}
-
-fn file_bytes(path: &Path) -> u64 {
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|meta| meta.file_type().is_file())
-        .map(|meta| meta.blocks() * 512)
-        .unwrap_or_default()
-}
-
 /// Every directory is emitted before its descendants. Fold child logical
 /// totals and newest mtimes upward once, after the single layout traversal.
 /// This keeps a 250k-file target from being recursively sized once per
@@ -622,9 +535,41 @@ fn aggregate_units(units: &mut [NestedArtifact]) {
             continue;
         }
         let child_bytes = units[child_index].bytes;
+        let child_logical = units[child_index].logical_bytes;
         let child_mtime = units[child_index].mtime_max;
         units[parent_index].bytes += child_bytes;
+        units[parent_index].logical_bytes += child_logical;
         units[parent_index].mtime_max = units[parent_index].mtime_max.max(child_mtime);
+    }
+}
+
+/// One deterministic charge per inode across all observed Cargo roots.
+pub fn charge_physical(units: &mut [NestedArtifact]) {
+    let mut seen = HashSet::new();
+    for u in units.iter_mut() {
+        u.physical_bytes = if !u.is_dir && seen.insert((u.device, u.inode)) {
+            u.bytes
+        } else {
+            0
+        };
+        u.physical_total = u.physical_bytes;
+    }
+    let indexes: HashMap<_, _> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.id.clone(), i))
+        .collect();
+    for i in (0..units.len()).rev() {
+        if let Some(parent) = units[i]
+            .parent_id
+            .as_ref()
+            .and_then(|p| indexes.get(p))
+            .copied()
+        {
+            if parent != i {
+                units[parent].physical_total += units[i].physical_total;
+            }
+        }
     }
 }
 
@@ -643,16 +588,20 @@ pub fn apply_message_evidence(inspection: &mut CargoInspection, messages: &[Carg
             if let Some(package_id) = &message.package_id {
                 unit.variant.package = Some(package_id.clone());
             }
-            if message.target_kind.iter().any(|k| k == "test") {
+            if message.profile_test || message.target_kind.iter().any(|k| k == "test") {
                 unit.role = ArtifactRole::TestExecutable;
             } else if message.target_kind.iter().any(|k| k == "example") {
                 unit.role = ArtifactRole::Example;
             }
             unit.producer_evidence.push(evidence(
                 "cargo-json",
-                "existing compiler-artifact message",
-                Confidence::High,
+                "caller-supplied historical compiler-artifact message; path match does not prove freshness or execution",
+                Confidence::Low,
             ));
+            if let Some(features) = &message.features {
+                unit.variant.features = Some(features.join(","));
+            }
+            unit.coverage.limits.push("JSON build record is not bound to current file content; cleanup requires fresh native evidence".into());
             unit.variant
                 .unknowns
                 .retain(|u| u != "package (unless JSON build evidence is supplied)");
@@ -681,6 +630,16 @@ pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|v| v.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact"))
         .map(|v| CargoMessageEvidence {
+            profile_test: v
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            features: v.get("features").and_then(|v| v.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            }),
             target_name: v
                 .get("target")
                 .and_then(|t| t.get("name"))
@@ -717,11 +676,23 @@ pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
 /// annotates them. It intentionally does not add an out-of-scope path to a
 /// report: an external shared target must be observed explicitly first.
 pub fn inspect_projects(projects: &[ProjectRow]) -> Vec<NestedArtifact> {
+    project_roots(projects)
+        .into_iter()
+        .flat_map(|(root, workspace)| inspect_target(&root, Some(&workspace)).units)
+        .collect()
+}
+
+/// Already observed Cargo build boundaries only, deduplicated across owners.
+pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for project in projects {
         for wt in &project.worktrees {
             let layout = layout_for(&wt.path);
             let cargo_present = wt.path.join("Cargo.toml").is_file();
+            if !cargo_present && !project.ecosystems.iter().any(|t| t == "rs") {
+                continue;
+            }
             for row in &wt.artifacts {
                 if row.kind != ArtifactKind::BuildOutput || !row.path.is_dir() {
                     continue;
@@ -732,20 +703,10 @@ pub fn inspect_projects(projects: &[ProjectRow]) -> Vec<NestedArtifact> {
                 if !matches_layout {
                     continue;
                 }
-                let mut inspection =
-                    inspect_target(&row.path, cargo_present.then_some(wt.path.as_path()));
-                inspection.build_dir = layout.build_dir.clone();
-                if !cargo_present {
-                    inspection.coverage.supported = false;
-                    inspection
-                        .coverage
-                        .limits
-                        .push("Cargo.toml absent at the worktree root".into());
-                    for unit in &mut inspection.units {
-                        unit.variant.unknowns.push("Cargo ownership".into());
-                    }
+                let canonical = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+                if seen.insert(canonical) {
+                    out.push((row.path.clone(), wt.path.clone()));
                 }
-                out.extend(inspection.units);
             }
         }
     }
@@ -847,6 +808,8 @@ mod tests {
         apply_message_evidence(
             &mut inspection,
             &[CargoMessageEvidence {
+                profile_test: true,
+                features: None,
                 target_name: Some("renamed-test".into()),
                 target_kind: vec!["test".into()],
                 package_id: Some("pkg 1.0.0".into()),

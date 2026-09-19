@@ -44,6 +44,8 @@ pub enum PlanStatus {
 /// human needs to authorize it and the sink needs to re-derive it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanUnit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_group: Option<crate::cargo_cleanup::CargoGroup>,
     pub path: PathBuf,
     pub rel_path: String,
     pub project: String,
@@ -299,6 +301,56 @@ pub fn propose(
         if units.iter().any(|u| &u.path == p) || refused.iter().any(|r| &r.path == p) {
             continue;
         }
+        if let Some(nested) = report.nested_artifacts.iter().find(|u| &u.path == p) {
+            let container = report
+                .nested_artifacts
+                .iter()
+                .find(|u| Some(&u.id) == nested.container_id.as_ref());
+            let owner = report
+                .projects
+                .iter()
+                .flat_map(|project| project.worktrees.iter().map(move |wt| (project, wt)))
+                .find(|(_, wt)| {
+                    container.is_some_and(|c| wt.artifacts.iter().any(|a| a.path == c.path))
+                });
+            if let (Some(container), Some((project, wt))) = (container, owner) {
+                match crate::cargo_cleanup::propose(&report.nested_artifacts, p, &container.path) {
+                    Ok(group) => {
+                        let row = wt
+                            .artifacts
+                            .iter()
+                            .find(|a| a.path == container.path)
+                            .unwrap();
+                        let mut unit = unit_from_row(project, wt, row);
+                        unit.path = p.clone();
+                        unit.rel_path = p.strip_prefix(&wt.path).unwrap_or(p).display().to_string();
+                        unit.bytes = group.members.iter().map(|m| m.bytes).sum();
+                        unit.growth_bytes = nested.growth_bytes;
+                        unit.verb = "cargo-group".into();
+                        unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
+                        unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
+                        unit.warnings.extend(
+                            group
+                                .members
+                                .iter()
+                                .map(|m| format!("member: {}", m.path.display())),
+                        );
+                        unit.cargo_group = Some(group);
+                        units.push(unit);
+                    }
+                    Err(e) => refused.push(Refused {
+                        path: p.clone(),
+                        cause: e.to_string(),
+                    }),
+                }
+            } else {
+                refused.push(Refused {
+                    path: p.clone(),
+                    cause: "nested artifact has no observed owning container".into(),
+                });
+            }
+            continue;
+        }
         let mut found = false;
         'outer: for project in &report.projects {
             for wt in &project.worktrees {
@@ -344,6 +396,25 @@ pub fn propose(
             }
         );
     }
+    if units.iter().any(|u| u.cargo_group.is_some()) {
+        for (i, a) in units.iter().enumerate() {
+            for b in units.iter().skip(i + 1) {
+                if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                    bail!(
+                        "overlapping cleanup selections; select either parent or child, not both"
+                    );
+                }
+                if let (Some(a), Some(b)) = (&a.cargo_group, &b.cargo_group) {
+                    if a.members
+                        .iter()
+                        .any(|x| b.members.iter().any(|y| x.path == y.path))
+                    {
+                        bail!("overlapping Cargo companion selections");
+                    }
+                }
+            }
+        }
+    }
     units.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     let created_at = now();
     Ok(Plan {
@@ -365,6 +436,7 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| a.path.display().to_string());
     PlanUnit {
+        cargo_group: None,
         path: a.path.clone(),
         rel_path: rel,
         project: project.name.clone(),
@@ -641,6 +713,9 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
     if let Some(pid) = &g.plan_id {
         return pid == &plan.id; // a one-shot approval covers the whole plan
     }
+    if unit.cargo_group.is_some() {
+        return false;
+    } // explicit per-plan approval only
     if g.verb != unit.verb {
         return false;
     }
@@ -1042,6 +1117,47 @@ pub fn execute_with_trash_opts(
             continue;
         }
         // Sink re-derivation: the path must still be the artifact it was.
+        if let Some(group) = &unit.cargo_group {
+            if keep_executables {
+                outcome.cause =
+                    Some("keep-executables conflicts with selective executable removal".into());
+                outcomes.push(outcome);
+                continue;
+            }
+            ledger.append(&ActionRecord {
+                id: crate::entities::new_id(),
+                verb: crate::grants::Verb::Delete,
+                entity_id: crate::entities::id_for(&unit.path.display().to_string()),
+                evidence: serde_json::json!({"plan_id":plan.id,"cargo_group":group}),
+                grant_id: g.id.clone(),
+                actor: actor.into(),
+                outcome: "intent".into(),
+                recovery_location: None,
+                measured_free_space_delta: None,
+                observed_path_state: Some("preflight".into()),
+                recorded_at: at,
+            })?;
+            match crate::cargo_cleanup::move_reviewed(group, trash) {
+                Ok(dest) => {
+                    outcome.status = "completed".into();
+                    outcome.recovery_location = Some(dest);
+                    trashed += unit.bytes;
+                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
+                }
+                Err(e) => {
+                    outcome.status = "failed".into();
+                    outcome.cause = Some(e.to_string());
+                }
+            }
+            ledger.append(&ActionRecord {
+                id:crate::entities::new_id(),verb:crate::grants::Verb::Delete,entity_id:crate::entities::id_for(&unit.path.display().to_string()),
+                evidence:serde_json::json!({"plan_id":plan.id,"cargo_group":group,"cause":outcome.cause}),
+                grant_id:g.id.clone(),actor:actor.into(),outcome:outcome.status.clone(),recovery_location:outcome.recovery_location.clone(),
+                measured_free_space_delta:None,observed_path_state:Some("see recovery manifest and outcome".into()),recorded_at:at,
+            })?;
+            outcomes.push(outcome);
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&unit.path) else {
             outcome.cause = Some("path no longer exists".into());
             outcomes.push(outcome);

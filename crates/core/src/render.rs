@@ -857,8 +857,8 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<18} {:<20} {:<10} {:>10} {:>10}  path / evidence",
-        "project", "role", "profile", "bytes", "charged"
+        "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  path / evidence",
+        "project", "role", "profile", "allocated", "charged", "growth"
     );
     let mut rows = Vec::new();
     for unit in &report.nested_artifacts {
@@ -882,7 +882,7 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
             unit.role.label(),
             profile,
             unit.bytes,
-            unit.physical_bytes,
+            unit.physical_total,
             unit,
             evidence,
         ));
@@ -903,17 +903,24 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
         };
         let _ = writeln!(
             out,
-            "{:<18} {:<20} {:<10} {:>10} {:>10}  {} [{}{}]",
+            "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  {} [{}{}]",
             project,
             role,
             profile,
             human_bytes(bytes),
             human_bytes(charged),
+            unit.growth_bytes
+                .map(human_bytes_signed)
+                .unwrap_or_else(|| "—".into()),
             unit.relative_path,
             evidence,
             unknown
         );
     }
+    let _ = writeln!(
+        out,
+        "Parent rows include their children: do not sum them. Charged bytes are inode-deduplicated allocation, not reclaimable space. debug/release name output directories, not unique dev/test/bench configurations."
+    );
     out
 }
 

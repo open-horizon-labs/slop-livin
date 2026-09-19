@@ -86,7 +86,7 @@ pub struct Draft {
     pub reconciliation: Reconciliation,
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
-    pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
+    pub nested_artifacts: Arc<Vec<crate::artifact::NestedArtifact>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,6 +114,7 @@ pub enum EventKind {
 pub enum Event {
     RootRequested,
     RootObserved {
+        changed_paths: Option<Arc<Vec<PathBuf>>>,
         discovered: Arc<Vec<DiscoveredWorktree>>,
         attribution: Arc<AttributionResult>,
         notes: Vec<String>,
@@ -236,7 +237,7 @@ impl EventBus {
             Box::new(GithubConsumer::default()),
             Box::new(DockerConsumer),
             Box::new(AssemblyGate::default()),
-            Box::new(CargoConsumer),
+            Box::new(CargoConsumer::default()),
             Box::new(GrowthConsumer),
             Box::new(TrackingConsumer),
             Box::new(HistoryConsumer),

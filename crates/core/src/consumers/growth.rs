@@ -124,7 +124,7 @@ impl Consumer for GrowthConsumer {
             .retain(|row| !crate::report::dir_inside_artifact(row, &roots));
         copy_nested_history(
             &mut d.projects,
-            &mut d.nested_artifacts,
+            Arc::make_mut(&mut d.nested_artifacts).as_mut_slice(),
             &nested_shadow_paths,
         );
         if ctx.include_dirs {
@@ -156,7 +156,15 @@ fn add_nested_history_rows(
         let Some((_, wt)) = projects
             .iter_mut()
             .flat_map(|p| p.worktrees.iter_mut())
-            .find_map(|wt| unit.path.starts_with(&wt.path).then_some(((), wt)))
+            .filter(|wt| {
+                unit.path.starts_with(&wt.path)
+                    || wt
+                        .artifacts
+                        .iter()
+                        .any(|a| a.source.tool != "cargo.layout" && unit.path.starts_with(&a.path))
+            })
+            .max_by_key(|wt| wt.path.components().count())
+            .map(|wt| ((), wt))
         else {
             continue;
         };
@@ -167,11 +175,7 @@ fn add_nested_history_rows(
             mtime_max: unit.mtime_max,
             ecosystem: None,
             hardlinked: matches!(unit.membership, crate::artifact::Membership::SharedHardlink),
-            local_bytes: if unit.physical_bytes == 0 {
-                unit.bytes
-            } else {
-                unit.physical_bytes
-            },
+            local_bytes: unit.physical_bytes,
             track: None,
             growth_bytes: unit.growth_bytes,
             regrowth_count: unit.regrowth_count,
@@ -194,17 +198,18 @@ fn copy_nested_history(
     nested: &mut [crate::artifact::NestedArtifact],
     paths: &[(String, std::path::PathBuf)],
 ) {
-    for (id, path) in paths {
-        let fact = projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .flat_map(|wt| wt.artifacts.iter())
-            .find(|a| a.source.tool == "cargo.layout" && &a.path == path);
-        if let Some(fact) = fact
-            && let Some(unit) = nested.iter_mut().find(|u| &u.id == id)
-        {
-            unit.growth_bytes = fact.growth_bytes;
-            unit.regrowth_count = fact.regrowth_count;
+    let _ = paths;
+    let facts: HashMap<_, _> = projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.artifacts)
+        .filter(|a| a.source.tool == "cargo.layout")
+        .map(|a| (a.path.clone(), (a.growth_bytes, a.regrowth_count)))
+        .collect();
+    for unit in nested {
+        if let Some((growth, regrowth)) = facts.get(&unit.path) {
+            unit.growth_bytes = *growth;
+            unit.regrowth_count = *regrowth;
         }
     }
     for project in projects {

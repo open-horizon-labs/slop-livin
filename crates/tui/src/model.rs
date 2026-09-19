@@ -940,7 +940,6 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                     .nested_artifacts
                     .iter()
                     .filter(|u| u.path != a.path && u.path.starts_with(&a.path))
-                    .filter(|u| u.physical_bytes == 0)
                     .filter(|u| {
                         matches!(
                             u.role,
@@ -950,12 +949,19 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 | swamp_core::artifact::ArtifactRole::BuildScriptOutput
                                 | swamp_core::artifact::ArtifactRole::Incremental
                                 | swamp_core::artifact::ArtifactRole::Residual
+                                | swamp_core::artifact::ArtifactRole::TestExecutable
                         )
                     })
                     .filter(|u| {
                         u.path
                             .strip_prefix(&a.path)
-                            .map(|p| p.components().count() <= 2)
+                            .map(|p| {
+                                p.components().count() <= 2
+                                    || swamp_core::cargo_cleanup::candidate(u)
+                                    || u.role == swamp_core::artifact::ArtifactRole::TestExecutable
+                                    || (!u.is_dir
+                                        && u.role == swamp_core::artifact::ArtifactRole::Example)
+                            })
                             .unwrap_or(false)
                     })
                     .collect();
@@ -969,7 +975,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 "  cargo · {} · {} (physical {}){}",
                                 u.role.label(),
                                 u.path.display(),
-                                human_bytes(u.physical_bytes),
+                                human_bytes(u.physical_total),
                                 if u.variant.unknowns.is_empty() {
                                     String::new()
                                 } else {
@@ -980,11 +986,21 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                             u.growth_bytes,
                         );
                         row.mtime_max = u.mtime_max;
-                        row.signals = if u.coverage.supported {
-                            vec!["inspection-only".into()]
+                        row.series = report
+                            .series_by_key
+                            .get(&format!("Nested:{}", u.id))
+                            .cloned();
+                        if swamp_core::cargo_cleanup::candidate(u) {
+                            row.unit = Some(UnitId::for_artifact(&u.path));
+                            row.kind = Some(ArtifactKind::BuildOutput);
+                            row.signals = vec!["review exact group".into()];
                         } else {
-                            vec!["coverage-limited".into()]
-                        };
+                            row.signals = if u.coverage.supported {
+                                vec!["inspection-only".into()]
+                            } else {
+                                vec!["coverage-limited".into()]
+                            };
+                        }
                         row
                     })
                     .collect();
@@ -992,8 +1008,8 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
             }
         }
     }
-    for (offset, (index, mut children)) in additions.into_iter().enumerate() {
-        rows.splice(index + offset..index + offset, children.drain(..));
+    for (index, mut children) in additions.into_iter().rev() {
+        rows.splice(index..index, children.drain(..));
     }
 }
 
@@ -1411,6 +1427,24 @@ mod tests {
         // (first worktree is not the last sibling).
         assert!(rows[1].rail.starts_with("│  ├─"));
         assert!(rows[2].rail.starts_with("│  └─"));
+
+        // Nested candidates must be selectable, while whole dependency groups
+        // stay inspection-only. Inserting several children must not displace
+        // the following worktree's rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = std::fs::canonicalize(tmp.path()).unwrap().join("target");
+        std::fs::create_dir_all(target.join("debug/incremental/crate-a")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(target.join("debug/incremental/crate-a/state"), b"state").unwrap();
+        let mut report = report;
+        report.projects[0].worktrees[0].artifacts[0].path = target.clone();
+        report.nested_artifacts =
+            swamp_core::cargo_artifacts::inspect_target(&target, Some(&target)).units;
+        let rows = builds_rows(&report, &Filter::default());
+        let selected = UnitId::for_artifact(&target.join("debug/incremental/crate-a"));
+        assert!(rows.iter().any(|r| r.unit == Some(selected.clone())));
+        let deps = UnitId::for_artifact(&target.join("debug/deps"));
+        assert!(!rows.iter().any(|r| r.unit == Some(deps.clone())));
     }
 
     #[test]
