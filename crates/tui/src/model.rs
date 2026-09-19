@@ -196,27 +196,83 @@ fn passes_filter(growth: Option<i64>, filter: &Filter) -> bool {
     filter::growth_passes(filter, growth)
 }
 
-/// Scale a growth delta to a bar of `+`/`-` characters, `width` wide,
-/// relative to the largest |growth| in the visible set (never to size).
-pub fn growth_bar(growth: Option<i64>, max_abs: i64, width: usize) -> String {
-    // Eight sub-cell steps per column, so small growth shows as a sliver
-    // instead of rounding to nothing or to a whole cell.
+/// Bytes below which a change is noise on a disk of this size: drawn as
+/// a tick and never a bar, and the number beside it is dimmed.
+pub const NOISE_FLOOR: i64 = 1_000_000;
+
+/// One row's change as a diverging bar around a fixed centre axis:
+/// shrink extends left, growth extends right, so the direction is the
+/// geometry and the colour only reinforces it. Length is logarithmic
+/// over `max_abs`, because a linear scale across four orders of
+/// magnitude renders everything below the largest row as the same
+/// one-cell sliver — 107 MB and 3 MB looked identical while 13.6 GB
+/// filled the column.
+///
+/// Returns `(left, axis, right)`: the caller styles the two sides
+/// separately. Each side is `half` cells wide; `axis` is one cell.
+pub fn diverging_bar(growth: Option<i64>, max_abs: i64, half: usize) -> (String, char, String) {
+    // Eighth-blocks for the right side, which fills away from the axis,
+    // and one half-block for the left, which fills toward it. Only
+    // U+2580..U+259F here: the U+1FB8x "eighth block" range that would
+    // mirror the steps exactly is Unicode 13 and renders as tofu in many
+    // terminals, which is worse than a coarser left edge.
     const STEPS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+    const PARTIAL_L: char = '▐';
+    let blank = " ".repeat(half);
     let g = growth.unwrap_or(0);
-    if max_abs <= 0 || g == 0 || width == 0 {
-        return " ".repeat(width);
+    if half == 0 {
+        return (String::new(), '│', String::new());
     }
-    let frac = (g.unsigned_abs() as f64 / max_abs as f64).clamp(0.0, 1.0);
-    let eighths = ((frac * width as f64) * 8.0).round().max(1.0) as usize;
-    let full = eighths / 8;
-    let rem = eighths % 8;
-    let mut s = "█".repeat(full.min(width));
-    if full < width && rem > 0 {
-        s.push(STEPS[rem - 1]);
+    if g == 0 || max_abs <= 0 {
+        return (blank.clone(), '│', blank);
     }
-    let used = s.chars().count();
-    s.push_str(&" ".repeat(width.saturating_sub(used)));
-    s
+    let magnitude = g.unsigned_abs() as f64;
+    let grew = g > 0;
+
+    // Below the floor: one tick hugging the axis, never scaled. A change
+    // nobody would act on must not look like one that someone would.
+    if magnitude < NOISE_FLOOR as f64 {
+        return if grew {
+            (blank, '│', STEPS[0].to_string() + &" ".repeat(half - 1))
+        } else {
+            (" ".repeat(half - 1) + &PARTIAL_L.to_string(), '│', blank)
+        };
+    }
+
+    // log1p over the range, so the floor is a visible nub rather than
+    // nothing and the largest change is exactly full.
+    let span =
+        ((max_abs.max(NOISE_FLOOR) as f64).ln() - (NOISE_FLOOR as f64).ln()).max(f64::EPSILON);
+    let frac = ((magnitude.ln() - (NOISE_FLOOR as f64).ln()) / span).clamp(0.0, 1.0);
+    let eighths = ((frac * half as f64) * 8.0).round().max(1.0) as usize;
+    let full = (eighths / 8).min(half);
+    let rem = if full == half { 0 } else { eighths % 8 };
+
+    if grew {
+        let mut bar = "█".repeat(full);
+        if rem > 0 {
+            bar.push(STEPS[rem - 1]);
+        }
+        let pad = half.saturating_sub(bar.chars().count());
+        (blank, '│', bar + &" ".repeat(pad))
+    } else {
+        // Anchored at the axis: the partial cell is the outer one, inked
+        // on its inner edge so the bar stays continuous.
+        let partial = if rem > 0 { 1 } else { 0 };
+        let pad = half.saturating_sub(full + partial);
+        let mut bar = " ".repeat(pad);
+        if partial == 1 {
+            bar.push(PARTIAL_L);
+        }
+        bar.push_str(&"█".repeat(full));
+        (bar, '│', blank)
+    }
+}
+
+/// Whether this change is below the noise floor, so the row's number can
+/// be dimmed with it.
+pub fn is_noise(growth: Option<i64>) -> bool {
+    growth.is_some_and(|g| g != 0 && g.unsigned_abs() < NOISE_FLOOR as u64)
 }
 
 /// Per-bucket change of a byte series: `series[i] - series[i-1]`, `None`
@@ -763,12 +819,18 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
         if u.reason != UnownedReason::DockerNoJoin {
             continue;
         }
-        out.push(Row::leaf(
-            0,
-            format!("unowned · {}", u.path_or_object),
-            u.bytes,
-            None,
-        ));
+        let mut row = Row::leaf(0, format!("unowned · {}", u.path_or_object), u.bytes, None);
+        // An unjoined object is still a real object: it can be acted on,
+        // it just belongs to no project. The kind decides what happens.
+        row.kind = Some(match u.docker_kind.as_deref() {
+            Some("volume") => ArtifactKind::DockerVolume,
+            Some("build-cache") => ArtifactKind::DockerBuildCache,
+            _ => ArtifactKind::DockerImage,
+        });
+        row.unit = Some(UnitId::for_artifact(std::path::Path::new(
+            &u.path_or_object,
+        )));
+        out.push(row);
     }
     out
 }
@@ -887,12 +949,23 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .iter()
         .filter(|u| u.reason != UnownedReason::DockerNoJoin)
         .map(|u| {
-            Row::leaf(
+            let mut row = Row::leaf(
                 0,
                 format!("{:?} · {}", u.reason, u.path_or_object),
                 u.bytes,
                 None,
-            )
+            );
+            // Bytes nothing claims are still bytes, and the path is real:
+            // it can be marked like any other unit and goes to Trash.
+            // Except one the walk could not even read — there is nothing
+            // to stand behind.
+            if u.reason != UnownedReason::PermissionDenied {
+                row.kind = Some(ArtifactKind::Loose);
+                row.unit = Some(UnitId::for_artifact(std::path::Path::new(
+                    &u.path_or_object,
+                )));
+            }
+            row
         })
         .collect()
 }
@@ -994,24 +1067,61 @@ mod tests {
     }
 
     #[test]
-    fn growth_bar_scales_to_visible_max_not_size() {
-        // Same growth, different max: bar length differs.
-        let wide = growth_bar(Some(50), 100, 10);
-        let narrow = growth_bar(Some(50), 50, 10);
-        assert!(wide.trim_end().len() < narrow.trim_end().len());
+    fn diverging_bar_puts_direction_in_the_geometry() {
+        let max = 10_000_000_000;
+        let (l, axis, r) = diverging_bar(Some(max), max, 8);
+        assert_eq!(axis, '│');
+        assert_eq!(r, "████████", "the largest growth fills the right side");
+        assert_eq!(l, "        ", "and leaves the left side empty");
+        let (l, _, r) = diverging_bar(Some(-max), max, 8);
+        assert_eq!(l, "████████", "shrink of the same size fills the left");
+        // The left bar hugs the axis: its padding is on the outside.
+        let (l, _, _) = diverging_bar(Some(-107_000_000), max, 8);
+        assert!(l.starts_with(' ') && l.ends_with('█'), "{l:?}");
+        assert_eq!(r, "        ");
+        let (l, _, r) = diverging_bar(None, max, 8);
+        assert_eq!((l.trim(), r.trim()), ("", ""), "no measurement, no bar");
+        assert_eq!(diverging_bar(Some(0), max, 8).2.trim(), "");
     }
 
     #[test]
-    fn growth_bar_uses_block_glyphs_with_sub_cell_resolution() {
-        // Full scale fills the column; a small fraction is still visible as
-        // a sliver rather than rounding away; the sign is carried by the
-        // signed number and the bar colour, not by the glyph.
-        assert_eq!(growth_bar(Some(10), 10, 4), "████");
-        assert_eq!(growth_bar(Some(-10), 10, 4), "████");
-        let sliver = growth_bar(Some(1), 1000, 8);
-        assert!(sliver.starts_with('▏'), "{sliver:?}");
-        assert_eq!(sliver.chars().count(), 8);
-        assert_eq!(growth_bar(Some(5), 10, 4), "██  ");
+    fn a_log_scale_separates_the_sizes_a_linear_one_flattened() {
+        // The frame that prompted this: 13.6GB, 107MB and 3MB shared a
+        // column, and the last two were the same single sliver.
+        let max = 13_600_000_000;
+        let big = diverging_bar(Some(13_600_000_000), max, 20)
+            .2
+            .trim_end()
+            .chars()
+            .count();
+        let mid = diverging_bar(Some(107_000_000), max, 20)
+            .2
+            .trim_end()
+            .chars()
+            .count();
+        let small = diverging_bar(Some(3_000_000), max, 20)
+            .2
+            .trim_end()
+            .chars()
+            .count();
+        assert_eq!(big, 20);
+        assert!(mid < big && small < mid, "{big} {mid} {small}");
+        assert!(
+            mid >= small + 2,
+            "107MB must be clearly longer than 3MB: {mid} vs {small}"
+        );
+    }
+
+    #[test]
+    fn noise_is_a_tick_not_a_bar() {
+        let max = 10_000_000_000;
+        let (_, _, r) = diverging_bar(Some(4_096), max, 20);
+        assert_eq!(r.trim_end(), "▏", "a 4KB change is one tick");
+        let (l, _, _) = diverging_bar(Some(-4_096), max, 20);
+        assert_eq!(l.trim_start(), "▐", "and on the left it hugs the axis too");
+        assert!(is_noise(Some(4_096)) && is_noise(Some(-4_096)));
+        assert!(!is_noise(Some(0)), "no change is not noise, it is nothing");
+        assert!(!is_noise(Some(NOISE_FLOOR)) && !is_noise(None));
     }
 
     #[test]
@@ -1062,12 +1172,6 @@ mod tests {
     #[test]
     fn truncate_middle_leaves_short_strings_alone() {
         assert_eq!(truncate_middle("short", 20), "short");
-    }
-
-    #[test]
-    fn growth_bar_empty_when_no_signal() {
-        assert_eq!(growth_bar(None, 10, 4), "    ");
-        assert_eq!(growth_bar(Some(0), 0, 4), "    ");
     }
 
     #[test]

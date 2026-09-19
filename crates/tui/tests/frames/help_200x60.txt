@@ -1,7 +1,7 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
 "view: projects · filter: growth > 100MB in 7d                                                                                                                                                           "
-"mole  🔨                                                                                 2.6GB     +1.3GB ██████████▊                                                                                   " Hidden by multi-width symbols: [(7, " ")]
-"slop-livin  🐳🔨                                                                         8.1GB     +2.6GB ██████████████████████                                                                        " Hidden by multi-width symbols: [(13, " "), (15, " ")]
+"mole  🔨                                                                                      2.6GB     +1.3GB              │███████████▉                                                               " Hidden by multi-width symbols: [(7, " ")]
+"slop-livin  🐳🔨                                                                              8.1GB     +2.6GB              │█████████████                                                              " Hidden by multi-width symbols: [(13, " "), (15, " ")]
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
@@ -16,9 +16,10 @@
 "                                                       ┌help (? to close)───────────────────────────────────────────────────────────────────────┐                                                       "
 "                                                       │Keys                                                                                    │                                                       "
 "                                                       │  ↑↓        move selection                                                              │                                                       "
-"                                                       │  →/←       expand / collapse                                                           │                                                       "
+"                                                       │  →/←       in / out: open or expand · collapse or go back                              │                                                       "
 "                                                       │  Enter     open project / confirm delete                                               │                                                       "
-"                                                       │  Space     mark / unmark the row  Backspace delete what is under the cursor (or the mar│                                                       "
+"                                                       │  Space     mark / unmark the row  A         mark every row here the tool can act on  Ba│                                                       "
+"                                                       │            paths go to Trash; docker images and volumes are removed by the daemon and d│                                                       "
 "                                                       │  /         filter picker (form) · : edit filter as text, Tab completes                 │                                                       "
 "                                                       │  0         clear filter                                                                │                                                       "
 "                                                       │  v, 1-8    switch view (projects · tree · builds · deps · docker · kinds · unowned · ty│                                                       "
@@ -27,7 +28,7 @@
 "                                                       │  ?         toggle this help                                                            │                                                       "
 "                                                       │  q         quit                                                                        │                                                       "
 "                                                       │                                                                                        │                                                       "
-"                                                       │Columns: bytes · growth in window with its bar (red grew, green shrank) · when it moved │                                                       "
+"                                                       │Columns: bytes · growth in window, then its bar around the centre axis: left green shran│                                                       "
 "                                                       │  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere           │                                                       "
 "                                                       │                                                                                        │                                                       "
 "                                                       │Filter grammar                                                                          │                                                       "
@@ -38,7 +39,6 @@
 "                                                       │Badges  🦀 rs  ⬢ js  🦕 deno  🐍 py  🐹 go  ☕ java  🔺 scala  🔧 cpp  🐦 swift  🟣 net │                                                       " Hidden by multi-width symbols: [(65, " "), (78, " "), (87, " "), (94, " "), (101, " "), (110, " "), (120, " "), (128, " "), (138, " ")]
 "                                                       │        💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue  │                                                       " Hidden by multi-width symbols: [(65, " "), (72, " "), (79, " "), (93, " "), (102, " "), (110, " "), (117, " "), (128, " "), (138, " ")]
 "                                                       │        🔨 has build output   ⎇N  N linked worktrees                                    │                                                       " Hidden by multi-width symbols: [(65, " ")]
-"                                                       │                                                                                        │                                                       "
 "                                                       │                                                                                        │                                                       "
 "                                                       │                                                                                        │                                                       "
 "                                                       │                                                                                        │                                                       "
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit                                                                              "
+"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit                                                                  "

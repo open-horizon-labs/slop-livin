@@ -200,6 +200,49 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// Writes a Parquet file so an interrupted write can never leave a
+/// corrupt one behind: the rows go to a sibling temp file, which is
+/// renamed over `path` only after the writer closed cleanly. A process
+/// killed mid-write (this happened: a SIGKILL during `observe` left a
+/// `current.parquet` whose footer never landed, and every later run died
+/// reading it) loses the new observation, never the store.
+/// The one place this crate builds a Parquet writer, so "every
+/// observation is zstd-compressed" is structural rather than a habit:
+/// callers choose a level, never a codec.
+fn write_parquet_atomic(
+    path: &Path,
+    schema: Arc<Schema>,
+    batch: &RecordBatch,
+    zstd_level: i32,
+) -> Result<()> {
+    let properties = zstd_properties(zstd_level);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Unique per process and per call: the scheduled LaunchAgent and a
+    // hand-run `report` observe the same store concurrently, and a shared
+    // temp name would let them interleave into one file. With a rename,
+    // the last writer wins and a reader only ever sees a whole file.
+    let tmp = path.with_extension(format!(
+        "parquet.writing.{}.{}",
+        std::process::id(),
+        crate::entities::now()
+    ));
+    {
+        let file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
+        writer.write(batch)?;
+        // `close` writes the footer and the trailing magic; until it
+        // returns the file is not a Parquet file at all.
+        writer.close()?;
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} to {}", tmp.display(), path.display()));
+    }
+    Ok(())
+}
+
 fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
     let schema = schema();
     let project_ids: Vec<&str> = rows.iter().map(|r| r.project_id.as_str()).collect();
@@ -230,18 +273,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(BooleanArray::from(hardlinked)),
         ],
     )?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
 }
 
 fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
@@ -249,7 +281,14 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         return Ok(Vec::new());
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .with_context(|| {
+            format!(
+                "read {} (delete it to rebuild this store from a full walk)",
+                path.display()
+            )
+        })?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -876,6 +915,9 @@ pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
 // pruned well before compaction).
 // ---------------------------------------------------------------------
 
+/// The artifacts store is small and read on every observation, so it
+/// gets the same level the directory base file does.
+const ARTIFACT_ZSTD_LEVEL: i32 = 9;
 const DIR_BASE_ZSTD_LEVEL: i32 = 9;
 const DIR_DELTA_ZSTD_LEVEL: i32 = 3;
 
@@ -991,14 +1033,7 @@ fn write_dir_rows(path: &Path, rows: &[StoredDirRow], zstd_level: i32) -> Result
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(zstd_properties(zstd_level)))?;
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+    write_parquet_atomic(path, schema, &batch, zstd_level)
 }
 
 fn read_dir_rows(path: &Path) -> Result<Vec<StoredDirRow>> {
@@ -1006,7 +1041,14 @@ fn read_dir_rows(path: &Path) -> Result<Vec<StoredDirRow>> {
         return Ok(Vec::new());
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .with_context(|| {
+            format!(
+                "read {} (delete it to rebuild this store from a full walk)",
+                path.display()
+            )
+        })?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -1332,14 +1374,7 @@ fn write_file_rows(path: &Path, rows: &[StoredFileRow], zstd_level: i32) -> Resu
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(zstd_properties(zstd_level)))?;
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+    write_parquet_atomic(path, schema, &batch, zstd_level)
 }
 
 fn read_file_rows(path: &Path) -> Result<Vec<StoredFileRow>> {
@@ -1347,7 +1382,14 @@ fn read_file_rows(path: &Path) -> Result<Vec<StoredFileRow>> {
         return Ok(Vec::new());
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .with_context(|| {
+            format!(
+                "read {} (delete it to rebuild this store from a full walk)",
+                path.display()
+            )
+        })?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;

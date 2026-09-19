@@ -482,6 +482,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
 
     let unit = |path: &std::path::Path| MarkedUnit {
         path: path.to_path_buf(),
+        docker: None,
         worktree_path: PathBuf::new(),
         bytes: 4096,
         observed_at: slop_livin_core::entities::now(),

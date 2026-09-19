@@ -18,6 +18,9 @@ use crate::model::human_bytes;
 #[derive(Debug, Clone)]
 pub struct MarkedUnit {
     pub path: PathBuf,
+    /// Set for a Docker object: what removing it actually runs, and the
+    /// fact that it never reaches Trash.
+    pub docker: Option<slop_livin_core::docker::Removal>,
     /// The worktree containing the unit (itself, for a worktree row).
     pub worktree_path: PathBuf,
     pub bytes: u64,
@@ -105,6 +108,15 @@ fn execute_one(
                 .map_err(|e| e.to_string()),
         };
     }
+    // A Docker object is not a path: it is removed through the daemon,
+    // permanently, and the ledger records that there is no recovery
+    // location rather than pretending there is one.
+    if let Some(target) = &unit.docker {
+        return UnitResult {
+            path: unit.path.clone(),
+            outcome: remove_docker(unit, target, grant, ledger, actor).map_err(|e| e.to_string()),
+        };
+    }
     // Compiled outputs first, so a failure to copy them refuses the unit
     // before anything moves.
     let extra = if keep_executables {
@@ -128,6 +140,52 @@ fn execute_one(
         path: unit.path.clone(),
         outcome,
     }
+}
+
+/// Removes one Docker object. Re-derived at the sink (still present),
+/// then handed to the daemon, whose own refusal text is the outcome when
+/// it declines — an image a container still references, a volume still
+/// mounted. Nothing here is reversible, so `recovery_location` is `None`
+/// and the ledger says so.
+fn remove_docker(
+    unit: &MarkedUnit,
+    target: &slop_livin_core::docker::Removal,
+    grant: &Grant,
+    ledger: &Ledger,
+    actor: &str,
+) -> Result<Outcome> {
+    use std::time::Duration;
+    slop_livin_core::docker::still_removable(target).map_err(|e| anyhow::anyhow!(e))?;
+    slop_livin_core::docker::remove(target, Duration::from_secs(30))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    ledger.append(&slop_livin_core::ledger::ActionRecord {
+        id: slop_livin_core::entities::new_id(),
+        verb: Verb::Delete,
+        entity_id: id_for(&unit.path.display().to_string()),
+        evidence: serde_json::json!({
+            "label": unit.label,
+            "bytes": unit.bytes,
+            "observed_at": unit.observed_at,
+            "warnings_shown": unit.warnings,
+            "docker": format!("{target:?}"),
+            "permanent": true,
+        }),
+        grant_id: grant.id.clone(),
+        actor: actor.to_string(),
+        outcome: "completed".to_string(),
+        // The daemon has no Trash: there is nowhere to point at.
+        recovery_location: None,
+        measured_free_space_delta: None,
+        observed_path_state: Some("removed via docker".to_string()),
+        recorded_at: now(),
+    })?;
+    Ok(Outcome {
+        unit_id: unit.path.display().to_string(),
+        status: "completed".to_string(),
+        reason: None,
+        intended_bytes: unit.bytes,
+        observed_free_space_delta: None,
+    })
 }
 
 /// Moves one path to Trash and records it. The only refusal is a path
@@ -332,8 +390,24 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
     } else {
         " · k keep executables"
     };
+    // Two destinations, and the difference is the whole point: a path
+    // goes to Trash and comes back, a Docker object does not.
+    let permanent: u64 = units
+        .iter()
+        .filter(|u| u.docker.is_some())
+        .map(|u| u.bytes)
+        .sum();
+    let destination = match (permanent, total - permanent) {
+        (0, _) => "→ Trash".to_string(),
+        (p, 0) => format!("→ removed permanently, no Trash ({})", human_bytes(p)),
+        (p, t) => format!(
+            "→ {} to Trash, {} removed permanently (docker, no Trash)",
+            human_bytes(t),
+            human_bytes(p)
+        ),
+    };
     format!(
-        "delete {} ({}) → Trash{more}?  Enter yes · Esc no{keep}",
+        "delete {} ({}) {destination}{more}?  Enter yes · Esc no{keep}",
         what.join(", "),
         human_bytes(total)
     )
@@ -354,6 +428,7 @@ mod tests {
 
         let unit = MarkedUnit {
             path: target.clone(),
+            docker: None,
             worktree_path: PathBuf::new(),
             bytes,
             observed_at: now(),
@@ -382,6 +457,7 @@ mod tests {
     fn confirm_summary_names_units_and_states_their_warnings() {
         let clean = MarkedUnit {
             path: "/tmp/target".into(),
+            docker: None,
             worktree_path: PathBuf::new(),
             bytes: 2 * 1024 * 1024 * 1024,
             observed_at: 0,
@@ -391,6 +467,7 @@ mod tests {
         };
         let risky = MarkedUnit {
             path: "/tmp/raw".into(),
+            docker: None,
             worktree_path: PathBuf::new(),
             bytes: 1_100_000_000,
             observed_at: 0,

@@ -4,8 +4,8 @@
 
 use crate::app::{App, ViewKind};
 use crate::model::{
-    growth_bar, human_bytes, human_signed_bytes, is_flat, max_abs_growth, net_change, pad_display,
-    spark_deltas, truncate_middle,
+    diverging_bar, human_bytes, human_signed_bytes, is_noise, max_abs_growth, net_change,
+    pad_display, spark_deltas, truncate_middle,
 };
 use ratatui::{
     Frame,
@@ -165,7 +165,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 }
 
 fn footer_line() -> &'static str {
-    "↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit"
+    "↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit"
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -378,15 +378,10 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // 80-column layout centered in empty space.
     let width = area.width as usize;
     let narrow = width < 120;
-    let bar_width: usize = ((width.saturating_sub(90)) / 5).clamp(8, 32);
-    let spark_width: usize = if width >= 120 {
-        SPARK_WIDTH as usize
-    } else {
-        0
-    };
-    // name | bytes(10) | sp | growth(10) | sp | bar | sp | spark | sp signals
-    let fixed =
-        10 + 1 + 10 + 1 + bar_width + 1 + 1 + if spark_width > 0 { spark_width + 1 } else { 0 };
+    // Half the diverging bar, each side; plus one cell for the axis.
+    let half: usize = ((width.saturating_sub(90)) / 8).clamp(6, 20);
+    // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
+    let fixed = 10 + 1 + 10 + 1 + (half * 2 + 1) + 1;
     let flexible = width.saturating_sub(fixed).max(40);
     let signals_width: usize = if narrow {
         flexible / 4
@@ -394,10 +389,6 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         (flexible * 2 / 5).min(70)
     };
     let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
-    // Sparklines are widgets, drawn over the text after the paragraph:
-    // (row index, series) for every row that has a non-flat history.
-    let spark_x = area.x + (name_width + 10 + 1 + 10 + 1 + bar_width + 1 + 1) as u16;
-    let mut sparks: Vec<(usize, &Vec<Option<u64>>)> = Vec::new();
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let marked = row
@@ -424,11 +415,17 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
                 .map(human_signed_bytes)
                 .unwrap_or_else(|| "—".into())
         );
-        let bar = growth_bar(row.growth, max_abs, bar_width);
+        let (bar_left, axis, bar_right) = diverging_bar(row.growth, max_abs, half);
         let bar_color = match row.growth {
             Some(g) if g > 0 => GROW,
             Some(g) if g < 0 => SHRINK,
             _ => Color::DarkGray,
+        };
+        // A change too small to act on is dimmed, number and tick alike.
+        let bar_style = if is_noise(row.growth) {
+            Style::default().fg(bar_color).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(bar_color)
         };
         let hidden = row
             .collapsed_children
@@ -468,23 +465,17 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             // The signed number and its bar are one diffstat token: same
             // colour, number flush against the bar it measures.
-            Span::styled(growth, Style::default().fg(bar_color)),
+            Span::styled(growth, bar_style),
             Span::raw(" "),
-            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::styled(bar_left, bar_style),
+            Span::styled(
+                axis.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(bar_right, bar_style),
             Span::raw(" "),
-            {
-                // History column: blank in the text; a flat history stays
-                // blank (nothing happened), anything else gets a Sparkline
-                // widget drawn over this slot below.
-                if let Some(s) = row
-                    .series
-                    .as_ref()
-                    .filter(|s| spark_width > 0 && !is_flat(s))
-                {
-                    sparks.push((i, s));
-                }
-                Span::raw(" ".repeat(if spark_width > 0 { spark_width + 1 } else { 0 }))
-            },
             Span::styled(
                 format!(" {signals_text}"),
                 Style::default().add_modifier(Modifier::DIM),
@@ -503,22 +494,6 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
     frame.render_widget(Paragraph::new(lines), area);
-    for (i, series) in sparks {
-        if i as u16 >= area.height {
-            break;
-        }
-        draw_spark(
-            frame,
-            series,
-            Rect {
-                x: spark_x,
-                y: area.y + i as u16,
-                width: spark_width as u16,
-                height: 1,
-            },
-            i == app.selected,
-        );
-    }
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
@@ -536,11 +511,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::from("Keys"),
         Line::from("  ↑↓        move selection"),
-        Line::from("  →/←       expand / collapse"),
+        Line::from("  →/←       in / out: open or expand · collapse or go back"),
         Line::from("  Enter     open project / confirm delete"),
         Line::from(
             "  Space     mark / unmark the row
+  A         mark every row here the tool can act on
   Backspace delete what is under the cursor (or the marks), asks once",
+        ),
+        Line::from(
+            "            paths go to Trash; docker images and volumes are removed by the daemon and do not",
         ),
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
@@ -557,7 +536,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  q         quit"),
         Line::from(""),
         Line::from(
-            "Columns: bytes · growth in window with its bar (red grew, green shrank) · when it moved · facts",
+            "Columns: bytes · growth in window, then its bar around the centre axis: left green shrank, right red grew, log-scaled, a dim tick below 1MB · facts",
         ),
         Line::from("  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere"),
         Line::from(""),

@@ -1,6 +1,6 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
 "view: unowned  (Esc back) · filter: growth > 100MB in 7d                        "
-"Shar…e · /Users/dev/.cache/leftover   209.7MB          —                        "
+"Shar… /Users/dev/.cache/leftover   209.7MB          —       │                   "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"↑↓ move  →/← expand  Enter open/confirm  Space mark  ⌫ delete  / filter  v view "
+"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / fil"

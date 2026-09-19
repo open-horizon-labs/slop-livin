@@ -82,8 +82,11 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
-        KeyCode::Right => app.toggle_expand(),
-        KeyCode::Left => app.toggle_expand(),
+        // Traversal, the way every file tree does it: right goes in,
+        // left comes back out. Enter and Esc still do the same, so the
+        // muscle memory either way works.
+        KeyCode::Right => app.enter_row(),
+        KeyCode::Left => app.leave_row(),
         KeyCode::Enter => app.drill_into_selected(),
         KeyCode::Esc => {
             if app.confirm_open {
@@ -93,6 +96,9 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             }
         }
         KeyCode::Char(' ') => app.mark_selected(),
+        // Shift-A, not `a`: `a` sorts by age, and a key that means two
+        // things depending on state is a key nobody trusts.
+        KeyCode::Char('A') => app.mark_all_in_view(),
         KeyCode::Backspace => app.delete_here(),
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),

@@ -607,8 +607,16 @@ fn main() -> Result<()> {
                         println!("            kept {}", kept.display());
                     }
                 }
+                let permanent = if res.removed_permanently_bytes > 0 {
+                    format!(
+                        " · removed permanently {}",
+                        slop_livin_core::render::human_bytes_pub(res.removed_permanently_bytes)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "planned {} · trashed {} · free space measured {}",
+                    "planned {} · trashed {}{permanent} · free space measured {}",
                     slop_livin_core::render::human_bytes_pub(res.planned_bytes),
                     slop_livin_core::render::human_bytes_pub(res.trashed_bytes),
                     res.freed_measured

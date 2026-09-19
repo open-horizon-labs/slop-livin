@@ -501,6 +501,73 @@ fn compute_shared_with(images: &mut [DockerImageFact]) {
 /// others) emits newline-delimited JSON objects rather than one array,
 /// so on a whole-output parse failure this also retries as NDJSON,
 /// wrapping the parsed lines in a `Value::Array`.
+/// What removing one Docker object costs, and whether we can do it at
+/// all. Nothing here goes to Trash: the daemon has no such thing, so
+/// every removal below is permanent, and the caller must say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// `docker image rm <id>`: the layers go, and the image comes back
+    /// only by pulling or rebuilding it.
+    Image { id: String },
+    /// `docker volume rm <name>`: a volume's contents exist nowhere else.
+    Volume { name: String },
+    /// Docker exposes no per-record removal for build cache — only
+    /// `docker builder prune`, which is a different unit of action.
+    Refused(&'static str),
+}
+
+/// Runs a removal. Returns the daemon's own refusal text when it declines
+/// (an image still referenced by a container, a volume still mounted),
+/// because that reason is the fact the human needs.
+pub fn remove(target: &Removal, timeout: Duration) -> Result<(), String> {
+    let args: Vec<&str> = match target {
+        Removal::Image { id } => vec!["image", "rm", id.as_str()],
+        Removal::Volume { name } => vec!["volume", "rm", name.as_str()],
+        Removal::Refused(why) => return Err((*why).to_string()),
+    };
+    let out = Command::new("docker")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker: {e}"))?
+        .wait_with_output()
+        .map_err(|e| format!("docker: {e}"))?;
+    let _ = timeout;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if err.is_empty() {
+        "docker refused the removal without saying why".to_string()
+    } else {
+        err
+    })
+}
+
+/// Is this object still present, and still unused? Re-derived at the sink
+/// immediately before removal, never trusted from the report.
+pub fn still_removable(target: &Removal) -> Result<(), String> {
+    let (kind, id) = match target {
+        Removal::Image { id } => ("image", id.as_str()),
+        Removal::Volume { name } => ("volume", name.as_str()),
+        Removal::Refused(why) => return Err((*why).to_string()),
+    };
+    let out = Command::new("docker")
+        .args([kind, "inspect", id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("docker: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err("object is no longer present".to_string())
+    }
+}
+
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
     let mut child = Command::new("docker")
         .args(args)

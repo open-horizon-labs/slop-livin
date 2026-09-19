@@ -25,11 +25,18 @@ pub fn markable(kind: &ArtifactKind) -> Result<(), &'static str> {
         | ArtifactKind::BuildOutput
         | ArtifactKind::Cache
         | ArtifactKind::DockerImage
-        | ArtifactKind::DockerBuildCache
-        | ArtifactKind::DockerVolume => Ok(()),
+        | ArtifactKind::DockerVolume
+        // A path under the root that no project claims: a unit with an
+        // owner of nobody, not a non-unit. It goes to Trash like any
+        // other path, and the confirm line says nothing claims it.
+        | ArtifactKind::Loose => Ok(()),
+        // Docker has no per-entry build-cache removal, so there is no
+        // action to authorize for one record.
+        ArtifactKind::DockerBuildCache => {
+            Err("docker has no per-entry build-cache removal; `docker builder prune` acts on all of it")
+        }
         ArtifactKind::Git => Err("git metadata is never a delete target"),
         ArtifactKind::Source => Err("source trees are never a delete target"),
-        ArtifactKind::Loose => Err("loose bytes have no single owning path to fold"),
         ArtifactKind::Unknown => Err("kind is unclassified; not a folded unit"),
     }
 }
@@ -45,8 +52,8 @@ mod tests {
             ArtifactKind::BuildOutput,
             ArtifactKind::Cache,
             ArtifactKind::DockerImage,
-            ArtifactKind::DockerBuildCache,
             ArtifactKind::DockerVolume,
+            ArtifactKind::Loose,
         ] {
             assert!(markable(&k).is_ok(), "{k:?} should be markable");
         }
@@ -57,7 +64,7 @@ mod tests {
         for k in [
             ArtifactKind::Git,
             ArtifactKind::Source,
-            ArtifactKind::Loose,
+            ArtifactKind::DockerBuildCache,
             ArtifactKind::Unknown,
         ] {
             let reason = markable(&k).unwrap_err();

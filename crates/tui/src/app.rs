@@ -491,6 +491,37 @@ impl App {
     }
 
     /// Toggles a worktree's collapsed state (tree view only).
+    /// `→`: go one level in. On an expandable row that means expanding
+    /// it; in the projects view it opens the project; otherwise nothing,
+    /// because there is nowhere further in.
+    pub fn enter_row(&mut self) {
+        if self.view == ViewKind::Projects {
+            self.drill_into_selected();
+            return;
+        }
+        if self.selected_row().is_some_and(|r| r.expandable) {
+            self.toggle_expand();
+        }
+    }
+
+    /// `←`: go one level out. Collapse an expanded row where that is what
+    /// "out" means; otherwise leave the view, the same as `Esc`. At the
+    /// projects view there is no level above, so it does nothing rather
+    /// than quitting.
+    pub fn leave_row(&mut self) {
+        if self.view == ViewKind::Projects {
+            return;
+        }
+        let expanded = self
+            .selected_row()
+            .is_some_and(|r| r.expandable && r.collapsed_children.is_none());
+        if expanded {
+            self.toggle_expand();
+        } else {
+            self.set_view(ViewKind::Projects);
+        }
+    }
+
     pub fn toggle_expand(&mut self) {
         if self.view != ViewKind::Tree {
             return;
@@ -583,6 +614,35 @@ impl App {
 
     /// Backspace: mark the selected row for deletion, or refuse inline
     /// with the reason.
+    /// `a`: mark every row in this view the tool knows how to act on,
+    /// so "everything we know of here" is one gesture and still one
+    /// confirm. Rows it cannot act on are left alone, and the refusal
+    /// names how many and why.
+    pub fn mark_all_in_view(&mut self) {
+        let rows = self.rows();
+        let mut refused: Option<&'static str> = None;
+        let mut marked = 0usize;
+        for row in rows {
+            let Some(kind) = row.kind.clone() else {
+                continue;
+            };
+            match crate::units::markable(&kind) {
+                Ok(()) => {
+                    if row.unit.is_some() {
+                        self.mark_row(&row);
+                        marked += 1;
+                    }
+                }
+                Err(why) => refused = refused.or(Some(why)),
+            }
+        }
+        if marked == 0 {
+            self.set_refusal(refused.unwrap_or("nothing in this view can be acted on"));
+            return;
+        }
+        self.confirm_open = true;
+    }
+
     pub fn mark_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -603,15 +663,22 @@ impl App {
             self.set_refusal("nothing to delete on this row");
             return;
         };
-        if matches!(
-            row.kind,
-            Some(slop_livin_core::report::ArtifactKind::DockerImage)
-                | Some(slop_livin_core::report::ArtifactKind::DockerBuildCache)
-                | Some(slop_livin_core::report::ArtifactKind::DockerVolume)
-        ) {
-            self.set_refusal("docker removal not available yet");
-            return;
-        }
+        // A Docker object is removed through the daemon, not moved to
+        // Trash. Which command that is depends on the kind, and build
+        // cache has none.
+        let docker = match row.kind {
+            Some(slop_livin_core::report::ArtifactKind::DockerImage) => {
+                Some(slop_livin_core::docker::Removal::Image {
+                    id: unit_id.0.clone(),
+                })
+            }
+            Some(slop_livin_core::report::ArtifactKind::DockerVolume) => {
+                Some(slop_livin_core::docker::Removal::Volume {
+                    name: unit_id.0.clone(),
+                })
+            }
+            _ => None,
+        };
         if self.marked.remove(&unit_id.0).is_some() {
             return; // toggle off
         }
@@ -657,6 +724,18 @@ impl App {
         if row.kind == Some(slop_livin_core::report::ArtifactKind::Git) {
             warnings.push("git object store: history goes with it".into());
         }
+        match row.kind {
+            Some(slop_livin_core::report::ArtifactKind::DockerVolume) => warnings.push(
+                "docker volume: its contents exist nowhere else, and this does not go to Trash"
+                    .into(),
+            ),
+            Some(slop_livin_core::report::ArtifactKind::DockerImage) => warnings
+                .push("docker image: permanent, comes back only by pulling or rebuilding".into()),
+            Some(slop_livin_core::report::ArtifactKind::Loose) => {
+                warnings.push("no project claims these bytes".into())
+            }
+            _ => {}
+        }
         let label = row.label.trim().to_string();
         let unit_path = PathBuf::from(&unit_id.0);
         // The worktree this unit lives in: where `bin/` goes when keeping
@@ -679,6 +758,7 @@ impl App {
             unit_id.0.clone(),
             MarkedUnit {
                 path: unit_path,
+                docker,
                 worktree_path,
                 bytes: row.bytes,
                 observed_at: self.report.observed_at,
@@ -1090,6 +1170,45 @@ mod tests {
         // Space toggles it off again.
         app.mark_selected();
         assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn mark_all_marks_what_it_can_and_opens_one_confirm() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.mark_all_in_view();
+        assert!(!app.marked.is_empty(), "dependency trees are actionable");
+        assert!(app.confirm_open, "one confirm for the whole set");
+    }
+
+    #[test]
+    fn right_goes_in_and_left_comes_back_out() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        assert_eq!(app.view, ViewKind::Projects);
+        // Left at the top level is not an exit: there is no level above.
+        app.leave_row();
+        assert_eq!(
+            app.view,
+            ViewKind::Projects,
+            "left must not leave the projects view"
+        );
+        app.enter_row();
+        assert_eq!(app.view, ViewKind::Tree, "right opens the project");
+        // In the tree, left first collapses the expanded row under the
+        // cursor, the way a file tree does; only then does it go out.
+        app.leave_row();
+        assert_eq!(app.view, ViewKind::Tree, "the first left collapsed the row");
+        assert!(
+            app.selected_row()
+                .is_some_and(|r| r.collapsed_children.is_some()),
+            "the row under the cursor is now collapsed"
+        );
+        app.leave_row();
+        assert_eq!(
+            app.view,
+            ViewKind::Projects,
+            "the second left comes back out"
+        );
     }
 
     #[test]

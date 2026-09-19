@@ -146,15 +146,30 @@ pub fn list_plans(dir: &Path) -> Result<Vec<Plan>> {
     Ok(out)
 }
 
+/// The daemon-side removal for a Docker unit, or `None` for a unit that
+/// is an ordinary path. The unit's "path" is the object's id or name.
+fn docker_target(kind: &ArtifactKind, path: &Path) -> Option<crate::docker::Removal> {
+    let id = path.display().to_string();
+    match kind {
+        ArtifactKind::DockerImage => Some(crate::docker::Removal::Image { id }),
+        ArtifactKind::DockerVolume => Some(crate::docker::Removal::Volume { name: id }),
+        _ => None,
+    }
+}
+
 /// What may be planned: anything with a path on this filesystem. The
-/// one refusal is a Docker object, for which no removal exists yet —
-/// marking one would be a lie. Everything else is the human's call, made
-/// with the unit's `warnings` in front of them.
+/// one refusal is Docker build cache, which the daemon exposes no
+/// per-entry removal for. Everything else is the human's call, made with
+/// the unit's `warnings` in front of them — including a Docker image or
+/// volume, whose removal is permanent and says so.
 pub fn refusal_for_kind(kind: &ArtifactKind) -> Option<&'static str> {
     match kind {
-        ArtifactKind::DockerImage | ArtifactKind::DockerBuildCache | ArtifactKind::DockerVolume => {
-            Some("docker removal not available yet (no implementation)")
-        }
+        // Docker exposes no per-record removal for build cache: only
+        // `docker builder prune`, which acts on everything reclaimable at
+        // once and so is a different unit of action than a plan unit.
+        ArtifactKind::DockerBuildCache => Some(
+            "docker has no per-entry build-cache removal; `docker builder prune` acts on all of it",
+        ),
         _ => None,
     }
 }
@@ -164,8 +179,12 @@ fn recovery_for(kind: &ArtifactKind) -> &'static str {
         ArtifactKind::DependencyTree => "network_fetch",
         ArtifactKind::BuildOutput | ArtifactKind::Cache => "local_rebuild",
         ArtifactKind::Git => "irrecoverable",
+        // Docker removals never reach Trash, so the contract is the only
+        // thing standing between the human and a permanent loss.
+        ArtifactKind::DockerImage => "pull_or_rebuild (permanent: no Trash)",
+        ArtifactKind::DockerBuildCache => "local_rebuild (permanent: no Trash)",
+        ArtifactKind::DockerVolume => "irrecoverable (permanent: no Trash, no copy anywhere)",
         ArtifactKind::Source | ArtifactKind::Loose | ArtifactKind::Unknown => "depends: see track",
-        _ => "unknown",
     }
 }
 
@@ -674,7 +693,13 @@ pub struct ExecuteResult {
     pub next_step: Option<String>,
     pub outcomes: Vec<UnitOutcome>,
     pub planned_bytes: u64,
+    /// Bytes moved to Trash, which is to say recoverable.
     pub trashed_bytes: u64,
+    /// Bytes removed with no Trash behind them: Docker objects, which the
+    /// daemon deletes outright. Reported apart from `trashed_bytes`
+    /// because the two mean opposite things to whoever has to undo this.
+    #[serde(default)]
+    pub removed_permanently_bytes: u64,
     pub free_before: Option<u64>,
     pub free_after: Option<u64>,
     /// Measured (free_after - free_before). Trash keeps the bytes on the
@@ -881,6 +906,7 @@ pub fn execute_with_trash_opts(
         outcomes: vec![],
         planned_bytes: planned,
         trashed_bytes: 0,
+        removed_permanently_bytes: 0,
         free_before: None,
         free_after: None,
         freed_measured: None,
@@ -919,6 +945,7 @@ pub fn execute_with_trash_opts(
     let free_before = free_space_bytes(&plan.root);
     let mut outcomes = Vec::new();
     let mut trashed = 0u64;
+    let mut removed_permanently = 0u64;
     let mut spent_by_grant: HashMap<usize, (u64, u32)> = HashMap::new();
 
     for (unit, choice) in plan.units.iter().zip(chosen.iter()) {
@@ -961,6 +988,47 @@ pub fn execute_with_trash_opts(
             && used + 1 > mu
         {
             outcome.cause = Some(format!("grant unit cap reached ({mu})"));
+            outcomes.push(outcome);
+            continue;
+        }
+        // A Docker object is not a path: it lives in the daemon, and it
+        // is removed there, permanently. Same discipline — re-derived at
+        // the sink, refused with the daemon's own words — but no Trash
+        // and so no recovery location.
+        if let Some(target) = docker_target(&unit.kind, &unit.path) {
+            if let Err(why) = crate::docker::still_removable(&target) {
+                outcome.cause = Some(why);
+                outcomes.push(outcome);
+                continue;
+            }
+            match crate::docker::remove(&target, std::time::Duration::from_secs(30)) {
+                Ok(()) => {
+                    outcome.status = "completed".into();
+                    removed_permanently += unit.bytes;
+                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
+                    ledger.append(&crate::ledger::ActionRecord {
+                        id: crate::entities::new_id(),
+                        verb: crate::grants::Verb::Delete,
+                        entity_id: crate::entities::id_for(&unit.path.display().to_string()),
+                        evidence: serde_json::json!({
+                            "plan_id": plan_id,
+                            "kind": format!("{:?}", unit.kind),
+                            "bytes": unit.bytes,
+                            "recovery": unit.recovery,
+                            "docker": format!("{target:?}"),
+                            "permanent": true,
+                        }),
+                        grant_id: g.id.clone(),
+                        actor: actor.to_string(),
+                        outcome: "completed".to_string(),
+                        recovery_location: None,
+                        measured_free_space_delta: None,
+                        observed_path_state: Some("removed via docker".to_string()),
+                        recorded_at: at,
+                    })?;
+                }
+                Err(why) => outcome.cause = Some(why),
+            }
             outcomes.push(outcome);
             continue;
         }
@@ -1104,14 +1172,28 @@ pub fn execute_with_trash_opts(
     Ok(ExecuteResult {
         plan_id: plan_id.to_string(),
         state: "executed".into(),
-        next_step: if outcomes.iter().any(|o| o.status == "completed") {
-            Some("re-observe the affected worktrees; bytes are in Trash until it is emptied".into())
-        } else {
-            Some("every unit was refused; read each cause".into())
+        next_step: match (
+            outcomes.iter().any(|o| o.status == "completed"),
+            trashed,
+            removed_permanently,
+        ) {
+            (false, _, _) => Some("every unit was refused; read each cause".into()),
+            (true, 0, _) => Some(
+                "re-observe the affected worktrees; what the daemon removed is gone, not in Trash"
+                    .into(),
+            ),
+            (true, _, 0) => {
+                Some("re-observe the affected worktrees; bytes are in Trash until it is emptied".into())
+            }
+            (true, _, _) => Some(
+                "re-observe the affected worktrees; the paths are in Trash until it is emptied, what the daemon removed is gone"
+                    .into(),
+            ),
         },
         outcomes,
         planned_bytes: planned,
         trashed_bytes: trashed,
+        removed_permanently_bytes: removed_permanently,
         free_before,
         free_after,
         freed_measured: match (free_before, free_after) {
