@@ -5,7 +5,7 @@ Release notes describe behavior at the named version. See the [README](README.md
 ## v0.5.0
 
 - Fixed persistence of existing artifact byte changes in `current.parquet`. Added regression coverage for successive updates and unchanged observations after an update.
-- Renamed the repository, source packages, binaries, environment variables, and release artifacts to `swamp`. Install `swamp` and `swamp-mcp` from the v0.5.0 archive. Existing v0.4.0 release assets retain their original names. See [installation and migration](docs/usage.md#installing-a-release).
+- Renamed the repository, source packages, binaries, environment variables, and release artifacts to `swamp`. The v0.5.0 archive contains `swamp` and `swamp-mcp`.
 - Reorganized the documentation into a product overview, usage reference, architecture guide, and contributor guide. Corrected outdated UI, filter, installation, and history claims.
 
 ## v0.4.0

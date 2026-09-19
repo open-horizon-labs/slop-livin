@@ -50,7 +50,7 @@ install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/
 ~/.local/bin/swamp --version
 ```
 
-Add `~/.local/bin` to your `PATH` if needed. The binaries are unsigned. See the [installation guide](docs/usage.md#installing-a-release) for quarantine guidance and migration from the old `slop-livin` releases.
+Add `~/.local/bin` to your `PATH` if needed. The binaries are unsigned; see the [installation guide](docs/usage.md#installing-a-release) for quarantine guidance.
 
 ### Build from source
 

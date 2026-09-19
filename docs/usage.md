@@ -1,6 +1,6 @@
 # Usage
 
-For the product overview, start with the [README](../README.md). This reference describes the current source tree. Older release binaries can differ.
+For the product overview, start with the [README](../README.md).
 
 ## Installing a release
 
@@ -19,14 +19,6 @@ install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/
 ```
 
 Release binaries are unsigned. If macOS blocks a downloaded binary with a quarantine warning, verify its checksum and source before deciding whether to clear that flag for the specific binary. You can also [build from source](../README.md#build-from-source).
-
-### Existing installations
-
-Releases through v0.4.0 contain the old `slop-livin` and `slop-livin-mcp` binaries. Install v0.5.0 rather than renaming those executables: their embedded command, store, and environment-variable names have not changed.
-
-The new defaults are `~/.local/share/swamp`, `SWAMP_DIR`, and the LaunchAgent label `com.open-horizon-labs.swamp.observe`. Existing history and schedules are not automatically migrated by the repository rename.
-
-Stop the old schedule with the old binary's `schedule --off` and close old UI/MCP processes before migrating. Back up the old store. If no new store exists, move it to the new path; if both exist, keep them separate rather than overwriting or merging their contents. Alternatively, `SWAMP_DIR` can explicitly point the new binary at the existing store. Update MCP client configuration and reinstall the schedule with the new binary.
 
 ## Observations and history
 
