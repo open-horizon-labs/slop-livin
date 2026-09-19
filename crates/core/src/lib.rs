@@ -17,6 +17,7 @@ pub mod entities;
 pub mod execution;
 pub mod extractor;
 pub mod filter;
+pub mod folded;
 pub mod fs_events;
 pub mod git;
 pub mod github;

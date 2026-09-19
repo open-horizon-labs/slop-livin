@@ -218,31 +218,38 @@ fn write_parquet_atomic(
     batch: &RecordBatch,
     zstd_level: i32,
 ) -> Result<()> {
+    write_parquet_batches_atomic(path, schema, std::iter::once(Ok(batch.clone())), zstd_level)
+}
+
+/// Shared columnar writer for bounded measurement batches and existing history.
+pub(crate) fn write_parquet_batches_atomic(
+    path: &Path,
+    schema: Arc<Schema>,
+    batches: impl IntoIterator<Item = Result<RecordBatch>>,
+    zstd_level: i32,
+) -> Result<()> {
     let properties = zstd_properties(zstd_level);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Unique per process and per call: the scheduled LaunchAgent and a
-    // hand-run `report` observe the same store concurrently, and a shared
-    // temp name would let them interleave into one file. With a rename,
-    // the last writer wins and a reader only ever sees a whole file.
-    let tmp = path.with_extension(format!(
-        "parquet.writing.{}.{}",
-        std::process::id(),
-        crate::entities::now()
-    ));
+    // Unique even for concurrent writes within the same process/second.
+    // RAII removes a failed partial stream; readers retain the prior file.
+    let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
     {
-        let file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let file = tmp.reopen()?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-        writer.write(batch)?;
+        for batch in batches {
+            writer.write(&batch?)?;
+            writer.flush()?;
+        }
         // `close` writes the footer and the trailing magic; until it
         // returns the file is not a Parquet file at all.
         writer.close()?;
     }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("rename {} to {}", tmp.display(), path.display()));
-    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("publish {}", path.display()))?;
     Ok(())
 }
 

@@ -379,6 +379,7 @@ pub mod progress {
 }
 
 struct AttrShared {
+    folded: Option<std::sync::mpsc::SyncSender<crate::folded::EntryResult>>,
     seen_inodes: ShardedInodeSet,
     artifacts_by_worktree: Mutex<HashMap<String, Vec<ArtifactRow>>>,
     source_bytes: Mutex<HashMap<String, u64>>,
@@ -437,8 +438,38 @@ pub fn attribute_parallel_carrying(
     carry: HashMap<PathBuf, ArtifactRow>,
 ) -> AttributionResult {
     progress::start();
-    let result =
-        attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes, carry);
+    let result = attribute_parallel_inner(
+        root,
+        worktrees,
+        observed_at,
+        large_file_min_bytes,
+        carry,
+        None,
+    );
+    progress::finish();
+    result
+}
+
+/// The same attribution walk, with an optional bounded stream of measurements
+/// from folded interiors. Carried roots emit no entries. Consumers must drain
+/// concurrently; a failed consumer may disconnect without blocking the walk.
+pub fn attribute_parallel_recording(
+    root: &Path,
+    worktrees: &[(&Path, &str)],
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    carry: HashMap<PathBuf, ArtifactRow>,
+    folded: std::sync::mpsc::SyncSender<crate::folded::EntryResult>,
+) -> AttributionResult {
+    progress::start();
+    let result = attribute_parallel_inner(
+        root,
+        worktrees,
+        observed_at,
+        large_file_min_bytes,
+        carry,
+        Some(folded),
+    );
     progress::finish();
     result
 }
@@ -449,6 +480,7 @@ fn attribute_parallel_inner(
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
+    folded: Option<std::sync::mpsc::SyncSender<crate::folded::EntryResult>>,
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -460,6 +492,7 @@ fn attribute_parallel_inner(
     let known = Arc::new(known);
 
     let shared = Arc::new(AttrShared {
+        folded,
         seen_inodes: ShardedInodeSet::new(),
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
@@ -802,19 +835,59 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
 /// as the serial `size_as_unit`, since a classified directory is sized as
 /// a best-effort unit rather than reported as a permission gap.
 fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool: &Pool<AttrJob>) {
-    let Ok(entries) = fs::read_dir(&path) else {
-        finish_size_job(group, shared);
-        return;
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if let Some(sink) = &shared.folded {
+                let _ = sink.send(Err(format!("{}: {e}", path.display())));
+            }
+            finish_size_job(group, shared);
+            return;
+        }
     };
     // This directory's own rollup (store depth inside the folded unit).
     let mut own_allocated: u64 = 0;
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    let mut dir_mtime_max: i64 = fs::symlink_metadata(&path).map(|m| m.mtime()).unwrap_or(0);
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
+    let directory_meta = fs::symlink_metadata(&path);
+    if let Some(sink) = &shared.folded {
+        let result = directory_meta
+            .as_ref()
+            .map(|m| crate::folded::Entry::measured(&group.root_path, &path, m))
+            .map_err(|e| format!("{}: {e}", path.display()));
+        let _ = sink.send(result);
+    }
+    let mut dir_mtime_max: i64 = directory_meta.map(|m| m.mtime()).unwrap_or(0);
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                if let Some(sink) = &shared.folded {
+                    let _ = sink.send(Err(format!("{}: {e}", path.display())));
+                }
+                continue;
+            }
+        };
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                if let Some(sink) = &shared.folded {
+                    let _ = sink.send(Err(format!("{}: {e}", entry.path().display())));
+                }
+                continue;
+            }
+        };
         if ft.is_symlink() {
+            if let Some(sink) = &shared.folded {
+                let _ = sink.send(
+                    fs::symlink_metadata(entry.path())
+                        .map(|m| {
+                            crate::folded::Entry::measured(&group.root_path, &entry.path(), &m)
+                        })
+                        .map_err(|e| e.to_string()),
+                );
+            }
             symlink_count += 1;
             continue;
         }
@@ -827,8 +900,21 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             });
         } else if ft.is_file() {
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                if let Some(sink) = &shared.folded {
+                    let _ = sink.send(Err(format!(
+                        "metadata unavailable: {}",
+                        entry.path().display()
+                    )));
+                }
                 continue;
             };
+            if let Some(sink) = &shared.folded {
+                let _ = sink.send(Ok(crate::folded::Entry::measured(
+                    &group.root_path,
+                    &entry.path(),
+                    &meta,
+                )));
+            }
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
@@ -1021,6 +1107,7 @@ pub fn resize_artifact_with_dirs(
     // took ~1.8 s serially; on the pool it takes what the full walk
     // spends on it.
     let shared = Arc::new(AttrShared {
+        folded: None,
         seen_inodes: ShardedInodeSet::new(),
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),

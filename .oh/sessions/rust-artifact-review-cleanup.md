@@ -1,5 +1,10 @@
 # Rust artifact review corrections and selective cleanup
 
+> Superseded completion assessment: the 2026-09-19 dissent found the eager model,
+> walk and persistence violate the incremental-cost requirement. See
+> [salvage and replacement solution space](2026-09-19-nested-index-restart.md).
+> Passing tests below do not establish architectural readiness to merge.
+
 ## Aim and scope
 
 Follow-up to #66 under #74: make the worker's nested Cargo facts trustworthy,
