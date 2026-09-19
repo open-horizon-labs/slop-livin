@@ -131,6 +131,7 @@ fn fixture_report() -> Report {
         files_by_worktree: None,
         schedule_line: None,
         github_enrichment: None,
+        nested_artifacts: Vec::new(),
         reconciliation: Reconciliation {
             attributed: 0,
             unowned: 0,

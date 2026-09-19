@@ -71,6 +71,7 @@ impl Consumer for ReportAssembler {
             schedule_line: d.schedule_line,
             summary,
             github_enrichment: d.github_enrichment,
+            nested_artifacts: d.nested_artifacts,
         };
         Ok(vec![Event::ReportAssembled(Arc::new(report))])
     }

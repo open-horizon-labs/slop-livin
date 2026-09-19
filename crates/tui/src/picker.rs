@@ -679,6 +679,7 @@ mod tests {
             schedule_line: None,
             summary: Default::default(),
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         };
         let p = Picker::from_report(
             &report,

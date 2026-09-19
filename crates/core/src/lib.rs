@@ -4,8 +4,10 @@
 //! authority and must re-observe every predicate before changing the filesystem.
 
 pub mod actions;
+pub mod artifact;
 pub mod attribution;
 pub mod bus;
+pub mod cargo_artifacts;
 pub mod compose;
 pub mod consumers;
 pub mod docker;

@@ -185,6 +185,7 @@ impl Consumer for AssemblyGate {
             reconciliation,
             github_enrichment: gh_summary,
             schedule_line: None,
+            nested_artifacts: Vec::new(),
         }))])
     }
 }

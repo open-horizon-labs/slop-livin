@@ -25,6 +25,8 @@ The [ecosystem table](../crates/core/src/ecosystem.rs) associates markers such a
 
 Classification supplies an artifact kind and ecosystem. It does not prove that everything inside a build directory is reproducible. The [harvest utility](../crates/harvest/src/main.rs) compares the table with vendored ignore and language lists; it reports candidates without editing the table. An ignore rule alone says nothing about whether the contents can be recreated.
 
+Cargo build rows also carry a nested, read-only identification model. Container and profile nodes report logical subtree bytes; leaf nodes carry the de-duplicated physical charge, so parent/child totals do not double-count hardlinks. Path layout identifies dependencies, examples, build-script output, incremental state, final outputs, and companion metadata where supported. Package, test, feature, toolchain, and generation claims remain unknown unless existing compiler-artifact JSON evidence supports them. These nested facts feed the same reverse-delta history store, but they do not expand cleanup authority: only an exact group that passes the existing authorization and recheck boundary could become actionable.
+
 Files outside classified artifacts are split into tracked, ignored, and untracked remainder buckets. The [ignore lens](../crates/core/src/ignore.rs) uses Git's index and exclude rules through gitoxide. Byte totals are apportioned using directory observations, with corrections for individually recorded large files. This preserves the measured total but is not an exhaustive per-file accounting of Git status.
 
 ### Attribution and recovery are separate

@@ -850,6 +850,73 @@ pub fn render_view_deps(report: &Report, only_project: Option<&str>) -> String {
     render_kind_view(report, only_project, &[ArtifactKind::DependencyTree])
 }
 
+/// rust view: nested Cargo units inside already-accounted target rows.
+/// Aggregate rows show logical bytes while leaves show physically charged
+/// bytes, making hardlink and residual limits visible.
+pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<18} {:<20} {:<10} {:>10} {:>10}  path / evidence",
+        "project", "role", "profile", "bytes", "charged"
+    );
+    let mut rows = Vec::new();
+    for unit in &report.nested_artifacts {
+        let project = report
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "unknown".into());
+        if only_project.is_some_and(|wanted| wanted != project) {
+            continue;
+        }
+        let profile = unit.variant.profile.clone().unwrap_or_else(|| "?".into());
+        let evidence = unit
+            .producer_evidence
+            .first()
+            .map(|e| e.source.as_str())
+            .unwrap_or("unknown");
+        rows.push((
+            project,
+            unit.role.label(),
+            profile,
+            unit.bytes,
+            unit.physical_bytes,
+            unit,
+            evidence,
+        ));
+    }
+    rows.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| a.5.relative_path.cmp(&b.5.relative_path))
+    });
+    if rows.is_empty() {
+        let _ = writeln!(out, "0 (no Cargo target rows or no supported nested facts)");
+        return out;
+    }
+    for (project, role, profile, bytes, charged, unit, evidence) in rows {
+        let unknown = if unit.variant.unknowns.is_empty() {
+            String::new()
+        } else {
+            format!("; unknown: {}", unit.variant.unknowns.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "{:<18} {:<20} {:<10} {:>10} {:>10}  {} [{}{}]",
+            project,
+            role,
+            profile,
+            human_bytes(bytes),
+            human_bytes(charged),
+            unit.relative_path,
+            evidence,
+            unknown
+        );
+    }
+    out
+}
+
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {
     let mut out = String::new();
     let _ = writeln!(

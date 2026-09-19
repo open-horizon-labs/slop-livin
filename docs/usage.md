@@ -78,6 +78,7 @@ swamp report ~/src --all
 swamp report ~/src --project api
 swamp report ~/src --project api --dirs --depth 2
 swamp report ~/src --view builds
+swamp report ~/src --view rust
 swamp report ~/src --view deps
 swamp report ~/src --view types
 swamp report ~/src --view docker
@@ -86,7 +87,9 @@ swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
 ```
 
-Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals.
+Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. It reports logical subtree bytes separately from charged physical bytes, preserves hardlink/shared-root accounting, and prints evidence limits and unknown variants.
+
+Rust inspection is read-only: it does not invoke Cargo, build scripts, or project configuration. Existing Cargo JSON compiler messages may strengthen package/target evidence, but hashed filenames alone do not establish ownership. The common build row remains the cleanup boundary; nested Rust units are currently inspection-only, so unsupported layouts and partial coverage cannot appear as deletion candidates.
 
 The CLI currently applies `report --filter` only to the root `--view worktrees` output. It does not filter the builds view, project drill-down, overview, or JSON. For artifact filters use the TUI, MCP `report`, or `propose --filter`. `--project` scopes the project tree and supported artifact views; it does not scope every summary view.
 

@@ -850,11 +850,13 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
 /// Builds view: every `BuildOutput`/`Cache` row across the whole root,
 /// same kind set as the CLI's `--view builds` (#33).
 pub fn builds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
-    kind_filtered_rows(
+    let mut rows = kind_filtered_rows(
         report,
         &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
         filter,
-    )
+    );
+    append_cargo_breakdowns(report, filter, &mut rows);
+    rows
 }
 
 /// Deps view: every `DependencyTree` row across the whole root, same as
@@ -906,6 +908,93 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
         }
     }
     out
+}
+
+/// Adds a compact, non-actionable Cargo breakdown below build rows.  The
+/// common build row remains the accounting/authorization boundary; these
+/// aggregate children explain the logical storage without turning the TUI
+/// into a second cleanup authority or rendering every hashed leaf.
+fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>) {
+    let mut additions = Vec::new();
+    for p in &report.projects {
+        if !filter::type_passes(filter, p) {
+            continue;
+        }
+        if let Some(name) = filter::project_name(filter)
+            && !swamp_core::filter::name_matches(name, &p.name)
+        {
+            continue;
+        }
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if a.kind != ArtifactKind::BuildOutput {
+                    continue;
+                }
+                let Some(parent_index) = rows.iter().position(|r| {
+                    r.kind.as_ref() == Some(&ArtifactKind::BuildOutput)
+                        && r.unit == Some(UnitId::for_artifact(&a.path))
+                }) else {
+                    continue;
+                };
+                let mut children: Vec<_> = report
+                    .nested_artifacts
+                    .iter()
+                    .filter(|u| u.path != a.path && u.path.starts_with(&a.path))
+                    .filter(|u| u.physical_bytes == 0)
+                    .filter(|u| {
+                        matches!(
+                            u.role,
+                            swamp_core::artifact::ArtifactRole::Profile
+                                | swamp_core::artifact::ArtifactRole::Dependency
+                                | swamp_core::artifact::ArtifactRole::Example
+                                | swamp_core::artifact::ArtifactRole::BuildScriptOutput
+                                | swamp_core::artifact::ArtifactRole::Incremental
+                                | swamp_core::artifact::ArtifactRole::Residual
+                        )
+                    })
+                    .filter(|u| {
+                        u.path
+                            .strip_prefix(&a.path)
+                            .map(|p| p.components().count() <= 2)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                children.sort_by_key(|u| (u.path.components().count(), u.path.clone()));
+                let additions_for_row: Vec<_> = children
+                    .into_iter()
+                    .map(|u| {
+                        let mut row = Row::leaf(
+                            1,
+                            format!(
+                                "  cargo · {} · {} (physical {}){}",
+                                u.role.label(),
+                                u.path.display(),
+                                human_bytes(u.physical_bytes),
+                                if u.variant.unknowns.is_empty() {
+                                    String::new()
+                                } else {
+                                    " · unknowns".to_string()
+                                }
+                            ),
+                            u.bytes,
+                            u.growth_bytes,
+                        );
+                        row.mtime_max = u.mtime_max;
+                        row.signals = if u.coverage.supported {
+                            vec!["inspection-only".into()]
+                        } else {
+                            vec!["coverage-limited".into()]
+                        };
+                        row
+                    })
+                    .collect();
+                additions.push((parent_index + 1, additions_for_row));
+            }
+        }
+    }
+    for (offset, (index, mut children)) in additions.into_iter().enumerate() {
+        rows.splice(index + offset..index + offset, children.drain(..));
+    }
 }
 
 /// Types view: one row per ecosystem, with the projects wearing the tag
@@ -1306,6 +1395,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         };
         let rows = tree_rows(
             &report,
@@ -1372,6 +1462,7 @@ mod tests {
             files_by_worktree: None,
             schedule_line: None,
             github_enrichment: None,
+            nested_artifacts: Vec::new(),
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
     }

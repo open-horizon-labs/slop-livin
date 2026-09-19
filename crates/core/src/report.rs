@@ -432,6 +432,11 @@ pub struct Report {
     /// as-is and never shells out to `gh`.
     #[serde(default)]
     pub github_enrichment: Option<GithubEnrichmentSummary>,
+    /// Nested Cargo/build-artifact facts. These are identification units
+    /// inside existing artifact rows; their physical bytes are not added to
+    /// reconciliation totals a second time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
 }
 
 /// Live GitHub enrichment stats for one `report_full(.., enrich: true)`

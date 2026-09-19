@@ -86,6 +86,7 @@ pub struct Draft {
     pub reconciliation: Reconciliation,
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
+    pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +99,7 @@ pub enum EventKind {
     GithubEnriched,
     DockerJoined,
     RowsAssembled,
+    CargoAnnotated,
     GrowthAnnotated,
     TrackingAnnotated,
     HistoryLoaded,
@@ -152,6 +154,7 @@ pub enum Event {
         notes: Vec<String>,
     },
     RowsAssembled(Arc<Draft>),
+    CargoAnnotated(Arc<Draft>),
     GrowthAnnotated(Arc<Draft>),
     TrackingAnnotated(Arc<Draft>),
     HistoryLoaded {
@@ -177,6 +180,7 @@ impl Event {
             Event::GithubEnriched { .. } => EventKind::GithubEnriched,
             Event::DockerJoined { .. } => EventKind::DockerJoined,
             Event::RowsAssembled(_) => EventKind::RowsAssembled,
+            Event::CargoAnnotated(_) => EventKind::CargoAnnotated,
             Event::GrowthAnnotated(_) => EventKind::GrowthAnnotated,
             Event::TrackingAnnotated(_) => EventKind::TrackingAnnotated,
             Event::HistoryLoaded { .. } => EventKind::HistoryLoaded,
@@ -232,6 +236,7 @@ impl EventBus {
             Box::new(GithubConsumer::default()),
             Box::new(DockerConsumer),
             Box::new(AssemblyGate::default()),
+            Box::new(CargoConsumer),
             Box::new(GrowthConsumer),
             Box::new(TrackingConsumer),
             Box::new(HistoryConsumer),

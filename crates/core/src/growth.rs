@@ -418,7 +418,7 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     .strip_prefix(&worktree.path)
                     .unwrap_or(&artifact.path)
                     .to_path_buf();
-                let kind = format!("{:?}", artifact.kind);
+                let kind = observed_kind(artifact);
                 let rel_path_str = rel_path.display().to_string();
                 out.push(Observed {
                     key: row_key(
@@ -444,6 +444,19 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
         }
     }
     out
+}
+
+fn observed_kind(artifact: &ArtifactRow) -> String {
+    if artifact.source.tool == "cargo.layout" {
+        artifact
+            .note
+            .as_deref()
+            .and_then(|n| n.strip_prefix("nested-id="))
+            .map(|id| format!("Nested:{id}"))
+            .unwrap_or_else(|| format!("{:?}", artifact.kind))
+    } else {
+        format!("{:?}", artifact.kind)
+    }
 }
 
 /// Read-only counterpart to [`observe_and_annotate`]: annotates each
@@ -494,7 +507,7 @@ pub fn annotate_readonly(
                     .strip_prefix(&worktree.path)
                     .unwrap_or(&artifact.path)
                     .to_path_buf();
-                let kind = format!("{:?}", artifact.kind);
+                let kind = observed_kind(artifact);
                 let key = row_key(
                     &project.project_id,
                     &worktree.worktree_id,
@@ -1703,7 +1716,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
     let is_docker_kind = |k: &str| matches!(k, "DockerImage" | "DockerBuildCache" | "DockerVolume");
     for row in current_rows
         .iter()
-        .filter(|r| r.present && !is_docker_kind(&r.kind))
+        .filter(|r| r.present && !is_docker_kind(&r.kind) && !r.kind.starts_with("Nested:"))
     {
         attributed_total += row.bytes;
         artifacts_by_worktree
