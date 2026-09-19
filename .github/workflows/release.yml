@@ -82,11 +82,17 @@ jobs:
           set -euo pipefail
           v="${{ steps.v.outputs.version }}"
           out="swamp-${v}-aarch64-apple-darwin"
+          latest_out="swamp-aarch64-apple-darwin"
           mkdir -p "dist/${out}"
           cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${out}/"
           cp README.md "dist/${out}/"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           (cd dist && shasum -a 256 "${out}.tar.gz" > "${out}.tar.gz.sha256")
+          mkdir -p "dist/${latest_out}"
+          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${latest_out}/"
+          cp README.md "dist/${latest_out}/"
+          tar -C dist -czf "dist/${latest_out}.tar.gz" "${latest_out}"
+          (cd dist && shasum -a 256 "${latest_out}.tar.gz" > "${latest_out}.tar.gz.sha256")
           echo "tarball=dist/${out}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha=dist/${out}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           ls -l dist

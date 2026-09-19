@@ -37,13 +37,12 @@ History begins with the first observation. Swamp records sizes and metadata; it 
 
 ## Install
 
-The supported platform is Apple silicon macOS. Download the current [v0.5.1 release](https://github.com/open-horizon-labs/swamp/releases/tag/v0.5.1):
+The supported platform is Apple silicon macOS. Download the latest [swamp release](https://github.com/open-horizon-labs/swamp/releases/latest):
 
 ```bash
-v=0.5.1
-archive="swamp-$v-aarch64-apple-darwin"
-curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz"
-curl -fLO "https://github.com/open-horizon-labs/swamp/releases/download/v$v/$archive.tar.gz.sha256"
+archive=swamp-aarch64-apple-darwin
+curl -fLO "https://github.com/open-horizon-labs/swamp/releases/latest/download/$archive.tar.gz"
+curl -fLO "https://github.com/open-horizon-labs/swamp/releases/latest/download/$archive.tar.gz.sha256"
 shasum -a 256 -c "$archive.tar.gz.sha256"
 tar -xzf "$archive.tar.gz"
 mkdir -p ~/.local/bin
