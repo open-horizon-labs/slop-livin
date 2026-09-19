@@ -120,7 +120,11 @@ fn header_line(app: &App, width: usize) -> String {
         };
         format!("observing… {} · {dirs} dirs{pct}", human_bytes(bytes))
     } else {
-        format!("observed {}", app.observed_label)
+        format!(
+            "observed {}{}",
+            app.observed_label,
+            if app.watch.is_some() { " · live" } else { "" }
+        )
     };
     let since = since_label(app)
         .map(|s| format!(" · since {s}"))

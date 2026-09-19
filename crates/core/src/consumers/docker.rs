@@ -29,7 +29,11 @@ impl Consumer for DockerConsumer {
             return Ok(vec![]);
         };
         let mut notes = Vec::new();
-        let facts = crate::docker::load(ctx.docker_facts.as_deref());
+        let facts = crate::docker::load_cached(
+            ctx.docker_facts.as_deref(),
+            ctx.store_dir.as_deref(),
+            ctx.enrich,
+        );
         if let Some(reason) = &facts.unavailable {
             notes.push(reason.clone());
         }

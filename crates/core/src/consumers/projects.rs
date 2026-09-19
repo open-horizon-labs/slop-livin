@@ -25,6 +25,7 @@ impl Consumer for ProjectsConsumer {
             discovered,
             attribution,
             notes,
+            rewalked,
         } = event
         else {
             return Ok(vec![]);
@@ -132,6 +133,7 @@ impl Consumer for ProjectsConsumer {
         };
         Ok(vec![Event::ProjectsGrouped {
             projects: Arc::new(projects),
+            rewalked: rewalked.clone(),
             worktree_paths: Arc::new(worktree_paths),
             project_remotes: Arc::new(project_remotes),
             worktree_remotes: Arc::new(worktree_remotes),

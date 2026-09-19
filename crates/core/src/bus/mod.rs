@@ -115,9 +115,12 @@ pub enum Event {
         discovered: Arc<Vec<DiscoveredWorktree>>,
         attribution: Arc<AttributionResult>,
         notes: Vec<String>,
+        /// Worktree ids the walk actually visited; `None` = all of them.
+        rewalked: Option<Arc<Vec<String>>>,
     },
     ProjectsGrouped {
         projects: Arc<Vec<ProjectRow>>,
+        rewalked: Option<Arc<Vec<String>>>,
         worktree_paths: Arc<Vec<(PathBuf, String)>>,
         /// project_id -> normalized remote URL.
         project_remotes: Arc<HashMap<String, String>>,
@@ -274,9 +277,16 @@ impl EventBus {
                 .map(|c| c.as_ref())
                 .filter(|c| c.subscribes_to().contains(&kind))
                 .collect();
-            let results =
-                futures_util::future::join_all(subscribers.iter().map(|c| c.on_event(&event, ctx)))
-                    .await;
+            let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+            let results = futures_util::future::join_all(subscribers.iter().map(|c| async {
+                let t = std::time::Instant::now();
+                let r = c.on_event(&event, ctx).await;
+                if trace {
+                    eprintln!("[trace] {:?} → {}: {:?}", kind, c.name(), t.elapsed());
+                }
+                r
+            }))
+            .await;
             let mut follow_on: Vec<Event> = Vec::new();
             for (c, r) in subscribers.iter().zip(results) {
                 let events =

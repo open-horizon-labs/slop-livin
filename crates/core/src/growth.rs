@@ -1660,6 +1660,11 @@ pub struct TrackedWalk {
     /// / `"full_forced"` for the two non-FSEvents reasons a walk is full.
     pub reason: &'static str,
     pub changed_dirs: usize,
+    /// Worktree ids this observation actually re-walked (incremental
+    /// path); `None` on a full walk, meaning all of them. Downstream
+    /// stages may carry forward what they computed last time for every
+    /// worktree not listed.
+    pub rewalked: Option<Vec<String>>,
 }
 
 /// Threshold past which re-walking piecemeal costs more than a full
@@ -1818,10 +1823,19 @@ pub fn observe_tracked_with_source(
     let too_soon = prev_state
         .last_observed_at
         .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
+    let t_replay = std::time::Instant::now();
     let mut plan = source.replay(&FsEventsRequest {
         root: canonical_root.clone(),
         since: prev_state,
     });
+    if std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        eprintln!(
+            "[trace] fsevents replay: {:?} (incremental={}, changed_dirs={})",
+            t_replay.elapsed(),
+            plan.incremental,
+            plan.changed_dirs.len()
+        );
+    }
     plan.changed_dirs = plan
         .changed_dirs
         .iter()
@@ -1830,7 +1844,7 @@ pub fn observe_tracked_with_source(
 
     let prev_topology = read_topology(&dir);
 
-    let result = if too_soon {
+    let result = if too_soon && !plan.live {
         full_walk(
             root,
             observed_at,
@@ -1930,6 +1944,7 @@ fn full_walk(
         mode: "full",
         reason,
         changed_dirs: 0,
+        rewalked: None,
     })
 }
 
@@ -1943,7 +1958,12 @@ fn apply_incremental(
     large_file_min_bytes: u64,
     dir: &Path,
 ) -> Result<TrackedWalk> {
+    let trace = std::env::var("SLOP_LIVIN_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let t0 = std::time::Instant::now();
     let mut attribution = reconstruct_attribution(dir)?;
+    if trace {
+        eprintln!("[trace] incremental: reconstruct store: {:?}", t0.elapsed());
+    }
     let worktree_root: HashMap<String, PathBuf> = prev
         .iter()
         .map(|w| (w.worktree_id.clone(), w.path.clone()))
@@ -2018,8 +2038,10 @@ fn apply_incremental(
     }
 
     // New checkouts/worktrees discovered under any scan root.
+    let t_scan = std::time::Instant::now();
     for scan_root in &discovery_scan_roots {
-        if let Ok(found) = crate::walk::discover_parallel(scan_root) {
+        {
+            let found = crate::walk::discover_shallow(scan_root);
             for dw in found {
                 if discovered.iter().any(|w| w.path == dw.path) {
                     continue;
@@ -2029,6 +2051,13 @@ fn apply_incremental(
                 discovered.push(dw);
             }
         }
+    }
+    if trace {
+        eprintln!(
+            "[trace] incremental: shallow discovery at {} changed dirs: {:?}",
+            discovery_scan_roots.len(),
+            t_scan.elapsed()
+        );
     }
     // Rebuild the root lookup now that new worktrees may have been added.
     let worktree_root: HashMap<String, PathBuf> = discovered
@@ -2063,6 +2092,7 @@ fn apply_incremental(
     let mut total_delta: i64 = 0;
 
     // Resize individual artifact roots.
+    let t_resize = std::time::Instant::now();
     for (root_path, (worktree_id, kind)) in &artifact_roots_to_resize {
         if worktrees_to_rewalk.contains(worktree_id) {
             continue; // superseded by the full worktree rewalk below.
@@ -2129,15 +2159,43 @@ fn apply_incremental(
         .map(|(dw, id)| (dw.path.as_path(), id.as_str()))
         .collect();
 
+    if trace {
+        eprintln!(
+            "[trace] incremental: resize {} artifact roots: {:?}",
+            artifact_roots_to_resize.len(),
+            t_resize.elapsed()
+        );
+    }
+    let t_rewalk = std::time::Instant::now();
     for worktree_id in &worktrees_to_rewalk {
         let Some(root) = worktree_root.get(worktree_id) else {
             continue;
         };
+        // Every stored artifact root in this worktree that no changed
+        // directory touches is carried forward as-is; the walk re-sizes
+        // only the implicated ones (a touch inside `target/` re-sizes
+        // `target/`, not the six other artifacts next to it).
+        let carry: HashMap<PathBuf, ArtifactRow> = attribution
+            .artifacts_by_worktree
+            .get(worktree_id)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.kind != ArtifactKind::Source)
+                    .filter(|r| {
+                        !changed_dirs
+                            .iter()
+                            .any(|c| c == &r.path || c.starts_with(&r.path))
+                    })
+                    .map(|r| (r.path.clone(), r.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let fresh = crate::walk::attribute_one_worktree(
             root,
             &all_worktree_refs,
             observed_at,
             large_file_min_bytes,
+            carry,
         );
         // Merge per row by (kind, path): a row present before and after
         // keeps its globally-deduped `bytes` adjusted by the change in its
@@ -2225,12 +2283,26 @@ fn apply_incremental(
         (attribution.attributed_total as i64 + total_delta).max(0) as u64;
     attribution.walked_total = (attribution.walked_total as i64 + total_delta).max(0) as u64;
 
+    if trace {
+        eprintln!(
+            "[trace] incremental: re-walk {} worktrees: {:?}",
+            worktrees_to_rewalk.len(),
+            t_rewalk.elapsed()
+        );
+    }
     Ok(TrackedWalk {
         discovered,
         attribution,
         mode: "incremental",
         reason: "incremental",
         changed_dirs: changed_dirs.len(),
+        rewalked: Some(
+            worktrees_to_rewalk
+                .iter()
+                .cloned()
+                .chain(artifact_roots_to_resize.values().map(|(id, _)| id.clone()))
+                .collect(),
+        ),
     })
 }
 

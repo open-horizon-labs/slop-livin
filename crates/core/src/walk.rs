@@ -80,6 +80,17 @@ impl<J: Send> Pool<J> {
         self.cv.notify_one();
     }
 
+    /// Takes a queued job without waiting; `None` when the queue is empty.
+    /// For callers that pump the pool inline instead of draining it.
+    fn try_pop(&self) -> Option<J> {
+        let mut st = self.state.lock().unwrap();
+        let job = st.queue.pop_front();
+        if job.is_some() {
+            st.outstanding = st.outstanding.saturating_sub(1);
+        }
+        job
+    }
+
     fn finish_one(&self) {
         let mut st = self.state.lock().unwrap();
         debug_assert!(st.outstanding > 0, "finish_one without a matching push");
@@ -374,6 +385,11 @@ struct AttrShared {
     /// while walking the Source tree.
     files: Mutex<Vec<FileRow>>,
     large_file_min_bytes: u64,
+    /// Artifact roots whose stored row is still current (nothing under
+    /// them changed since it was recorded): when the walk reaches one, it
+    /// takes the row instead of sizing the tree again. Empty on a full
+    /// walk.
+    carry: HashMap<PathBuf, ArtifactRow>,
 }
 
 /// Parallel equivalent of `attribution::attribute`: same classification
@@ -388,8 +404,27 @@ pub fn attribute_parallel(
     observed_at: u64,
     large_file_min_bytes: u64,
 ) -> AttributionResult {
+    attribute_parallel_carrying(
+        root,
+        worktrees,
+        observed_at,
+        large_file_min_bytes,
+        HashMap::new(),
+    )
+}
+
+/// `attribute_parallel` that takes `carry`ed artifact rows as read (see
+/// `AttrShared::carry`), for the incremental path.
+pub fn attribute_parallel_carrying(
+    root: &Path,
+    worktrees: &[(&Path, &str)],
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    carry: HashMap<PathBuf, ArtifactRow>,
+) -> AttributionResult {
     progress::start();
-    let result = attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes);
+    let result =
+        attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes, carry);
     progress::finish();
     result
 }
@@ -399,6 +434,7 @@ fn attribute_parallel_inner(
     worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
+    carry: HashMap<PathBuf, ArtifactRow>,
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -422,6 +458,7 @@ fn attribute_parallel_inner(
         dirs: Mutex::new(HashMap::new()),
         files: Mutex::new(Vec::new()),
         large_file_min_bytes,
+        carry,
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -565,6 +602,23 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             let name = name.to_string_lossy();
             if let Some(kind) = classify_at(&path, &name) {
                 let worktree = nearest_worktree(known, &child_path).map(str::to_string);
+                if let (Some(row), Some(wt)) = (shared.carry.get(&child_path), worktree.as_ref()) {
+                    // Nothing under this artifact changed since its row
+                    // was stored: take the row, skip the tree.
+                    shared.walked_total.fetch_add(row.bytes, Ordering::Relaxed);
+                    shared
+                        .attributed_total
+                        .fetch_add(row.bytes, Ordering::Relaxed);
+                    progress::BYTES.fetch_add(row.bytes, Ordering::Relaxed);
+                    shared
+                        .artifacts_by_worktree
+                        .lock()
+                        .unwrap()
+                        .entry(wt.clone())
+                        .or_default()
+                        .push(row.clone());
+                    continue;
+                }
                 let group = Arc::new(SizeGroup {
                     root_path: child_path.clone(),
                     kind,
@@ -875,12 +929,14 @@ pub fn attribute_one_worktree(
     all_worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
+    carry: HashMap<PathBuf, ArtifactRow>,
 ) -> AttributionResult {
-    attribute_parallel(
+    attribute_parallel_carrying(
         worktree_root,
         all_worktrees,
         observed_at,
         large_file_min_bytes,
+        carry,
     )
 }
 
@@ -893,16 +949,60 @@ pub fn attribute_one_worktree(
 /// every other artifact/Source row in the worktree carries forward with
 /// its previously observed bytes untouched.
 pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -> ArtifactRow {
-    let mut seen = HashSet::new();
-    let mut mtime_max = 0u64;
-    let bytes = size_dir_recursive(root_path, &mut seen, &mut mtime_max);
-    ArtifactRow {
-        kind,
+    // Same machinery as the full walk's folded units: the root is one
+    // Size job, subdirectories fan out across the pool. A 16 GB `target/`
+    // took ~1.8 s serially; on the pool it takes what the full walk
+    // spends on it.
+    let shared = Arc::new(AttrShared {
+        seen_inodes: ShardedInodeSet::new(),
+        artifacts_by_worktree: Mutex::new(HashMap::new()),
+        source_bytes: Mutex::new(HashMap::new()),
+        source_local: Mutex::new(HashMap::new()),
+        unowned: Mutex::new(Vec::new()),
+        walked_total: AtomicU64::new(0),
+        attributed_total: AtomicU64::new(0),
+        unowned_total: AtomicU64::new(0),
+        observed_at,
+        dirs: Mutex::new(HashMap::new()),
+        files: Mutex::new(Vec::new()),
+        large_file_min_bytes: u64::MAX,
+        carry: HashMap::new(),
+    });
+    let group = Arc::new(SizeGroup {
+        root_path: root_path.to_path_buf(),
+        kind: kind.clone(),
+        worktree: Some("resize".to_string()),
+        total: AtomicU64::new(0),
+        local_total: AtomicU64::new(0),
+        local_seen: Mutex::new(HashSet::new()),
+        remaining: AtomicUsize::new(1),
+        mtime_max: AtomicU64::new(0),
+    });
+    let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
+    // The kind is the store's: this path was classified when it was
+    // first walked, and a re-size never reclassifies.
+    pool.push(AttrJob::Size {
         path: root_path.to_path_buf(),
-        bytes,
-        mtime_max,
+        group,
+    });
+    pool.drain(worker_count(), |job| match job {
+        AttrJob::Walk(path) => process_walk(path, &[], &shared, &pool),
+        AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
+    });
+    let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
+    let mut rows = shared
+        .artifacts_by_worktree
+        .into_inner()
+        .unwrap()
+        .remove("resize")
+        .unwrap_or_default();
+    let mut row = rows.pop().unwrap_or(ArtifactRow {
+        kind: kind.clone(),
+        path: root_path.to_path_buf(),
+        bytes: 0,
+        mtime_max: 0,
         ecosystem: None,
-        local_bytes: bytes,
+        local_bytes: 0,
         track: None,
         growth_bytes: None,
         regrowth_count: 0,
@@ -914,32 +1014,56 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
-    }
+    });
+    row.kind = kind;
+    row.source = Source::new("filesystem.fsevents");
+    // A lone re-size sees every inode once, so its `bytes` are its
+    // `local_bytes` (the full walk charges shared inodes to whichever row
+    // saw them first; the incremental merge applies the local delta).
+    row.local_bytes = row.bytes.max(row.local_bytes);
+    row
 }
 
-fn size_dir_recursive(path: &Path, seen: &mut HashSet<(u64, u64)>, mtime_max: &mut u64) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
+/// Checkouts at `dir` and its immediate children only: what a changed
+/// directory can have gained or lost. FSEvents names the directory whose
+/// listing changed, so a new clone under `~/src` shows up as `~/src` (and
+/// the clone itself); a recursive discovery of `~/src` here cost ~0.5 s
+/// per incremental observation and found nothing new.
+pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_symlink() {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Vec::new();
+    }
+    let device = meta.dev();
+    let discovered: Mutex<Vec<DiscoveredWorktree>> = Mutex::new(Vec::new());
+    let pool: Pool<PathBuf> = Pool::new();
+    discover_one(dir, device, &pool, &discovered);
+    // discover_one queued the children it would have recursed into; take
+    // exactly one level of them, without recursing further.
+    while let Some(child) = pool.try_pop() {
+        let Ok(cm) = fs::symlink_metadata(&child) else {
+            continue;
+        };
+        if cm.file_type().is_symlink() || !cm.is_dir() || cm.dev() != device {
             continue;
         }
-        if ft.is_dir() {
-            total += size_dir_recursive(&entry.path(), seen, mtime_max);
-        } else if ft.is_file() {
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                continue;
+        let git_path = child.join(".git");
+        if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
+            let dw = if git_meta.is_dir() {
+                classify_main_checkout(&child, &git_path)
+            } else if git_meta.is_file() {
+                classify_git_file(&child, &git_path)
+            } else {
+                None
             };
-            *mtime_max = (*mtime_max).max(meta.mtime().max(0) as u64);
-            if meta.is_file() && seen.insert((meta.dev(), meta.ino())) {
-                total += allocated_bytes(&meta);
+            if let Some(dw) = dw {
+                discovered.lock().unwrap().push(dw);
             }
         }
     }
-    total
+    discovered.into_inner().unwrap()
 }
 
 // ---------------------------------------------------------------------

@@ -134,9 +134,29 @@ pub struct FsEventsPlan {
     /// `current_event_id` so the next call can detect a root that moved
     /// to a different volume.
     pub device: Option<u64>,
+    /// The changes came from a live stream (`watch`), not a replay of the
+    /// persisted log, so the replay-lag floor (`TooSoon`) does not apply:
+    /// a live event is the change, not a query that might predate it.
+    pub live: bool,
 }
 
 impl FsEventsPlan {
+    /// An incremental plan built from live stream batches.
+    pub fn from_live(
+        changed_dirs: Vec<PathBuf>,
+        current_event_id: u64,
+        device: Option<u64>,
+    ) -> Self {
+        Self {
+            incremental: true,
+            refusal: None,
+            changed_dirs,
+            current_event_id,
+            device,
+            live: true,
+        }
+    }
+
     fn refuse(reason: RefreshRefusal, current_event_id: u64, device: Option<u64>) -> Self {
         Self {
             incremental: false,
@@ -144,6 +164,7 @@ impl FsEventsPlan {
             changed_dirs: Vec::new(),
             current_event_id,
             device,
+            live: false,
         }
     }
 
@@ -154,6 +175,7 @@ impl FsEventsPlan {
             changed_dirs,
             current_event_id,
             device,
+            live: false,
         }
     }
 
@@ -179,6 +201,58 @@ pub fn platform_source() -> Box<dyn FsEventsSource> {
     #[cfg(not(target_os = "macos"))]
     {
         Box::new(UnsupportedPlatformSource)
+    }
+}
+
+/// One delivery from a live [`watch`]: the directories FSEvents reported
+/// (each with its parent, within the root) and the newest event id seen.
+#[derive(Debug, Clone)]
+pub struct WatchBatch {
+    pub changed_dirs: Vec<PathBuf>,
+    pub last_event_id: u64,
+}
+
+/// A running live stream. Dropping it, or calling `stop`, ends the
+/// thread and releases the stream.
+pub struct Watcher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watcher {
+    pub fn stop(mut self) {
+        self.signal_stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+    fn signal_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.signal_stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Starts a live FSEvents stream on `root` from now, delivering a
+/// [`WatchBatch`] on `tx` each time FSEvents flushes (latency 0.5 s). The
+/// stream runs on its own thread with its own run loop. `None` where the
+/// platform has no FSEvents.
+pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Watcher> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::watch(root, tx)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (root, tx);
+        None
     }
 }
 
@@ -330,6 +404,153 @@ mod macos {
             let cstr = unsafe { CStr::from_ptr(cpath) };
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes()));
             add_with_parent(&mut collector.changes, &collector.root, &path);
+        }
+    }
+
+    /// State behind the live stream's callback: where batches go.
+    struct WatchState {
+        root: PathBuf,
+        tx: std::sync::mpsc::Sender<super::WatchBatch>,
+    }
+
+    extern "C" fn watch_callback(
+        _stream: fs::FSEventStreamRef,
+        info: *mut c_void,
+        num_events: usize,
+        event_paths: *mut c_void,
+        event_flags: *const fs::FSEventStreamEventFlags,
+        event_ids: *const fs::FSEventStreamEventId,
+    ) {
+        if info.is_null() || num_events == 0 {
+            return;
+        }
+        // SAFETY: `info` is the `WatchState` the watch thread boxed and
+        // keeps alive until after the stream is invalidated; FSEvents
+        // invokes this callback only on that thread's run loop.
+        let state = unsafe { &*(info as *const WatchState) };
+        let paths = event_paths as *const *const std::os::raw::c_char;
+        // SAFETY: FSEvents guarantees `num_events` valid entries in the
+        // flags, paths and ids arrays.
+        let flags = unsafe { std::slice::from_raw_parts(event_flags, num_events) };
+        let ids = unsafe { std::slice::from_raw_parts(event_ids, num_events) };
+        let mut changes = std::collections::HashSet::new();
+        let mut last_id = 0u64;
+        for (i, &f) in flags.iter().enumerate() {
+            last_id = last_id.max(ids[i]);
+            if (f & fs::kFSEventStreamEventFlagMustScanSubDirs) != 0
+                || (f & fs::kFSEventStreamEventFlagRootChanged) != 0
+                || (f & fs::kFSEventStreamEventFlagUnmount) != 0
+            {
+                // Everything under the root may have changed: report the
+                // root itself; the consumer decides between an incremental
+                // re-walk of it and a full walk.
+                changes.insert(state.root.clone());
+                continue;
+            }
+            // SAFETY: validated non-null by FSEvents; `i` in range.
+            let cpath = unsafe { *paths.add(i) };
+            if cpath.is_null() {
+                continue;
+            }
+            // SAFETY: FSEvents paths are NUL-terminated C strings.
+            let cstr = unsafe { CStr::from_ptr(cpath) };
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes()));
+            add_with_parent(&mut changes, &state.root, &path);
+        }
+        if !changes.is_empty() {
+            let _ = state.tx.send(super::WatchBatch {
+                changed_dirs: changes.into_iter().collect(),
+                last_event_id: last_id,
+            });
+        }
+    }
+
+    pub fn watch(
+        root: &Path,
+        tx: std::sync::mpsc::Sender<super::WatchBatch>,
+    ) -> Option<super::Watcher> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+        let thread = std::thread::Builder::new()
+            .name("fsevents-watch".into())
+            .spawn(move || {
+                let state = Box::new(WatchState {
+                    root: root.clone(),
+                    tx,
+                });
+                let info_ptr = state.as_ref() as *const WatchState as *mut c_void;
+                let cf_path = CFString::new(&root.to_string_lossy());
+                let paths_array: CFArray<CFString> = CFArray::from_CFTypes(&[cf_path]);
+                let context = fs::FSEventStreamContext {
+                    version: 0,
+                    info: info_ptr,
+                    retain: None,
+                    release: None,
+                    copy_description: None,
+                };
+                let create_flags =
+                    fs::kFSEventStreamCreateFlagNoDefer | fs::kFSEventStreamCreateFlagWatchRoot;
+                // SAFETY: `paths_array`, `context` and `state` outlive the
+                // stream, which is released below before they drop.
+                let stream = unsafe {
+                    fs::FSEventStreamCreate(
+                        core_foundation_sys::base::kCFAllocatorDefault,
+                        watch_callback,
+                        &context,
+                        paths_array.as_concrete_TypeRef() as CFArrayRef,
+                        fs::kFSEventStreamEventIdSinceNow,
+                        0.5,
+                        create_flags,
+                    )
+                };
+                if stream.is_null() {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                // SAFETY: stream just created; released on every exit below.
+                let started = unsafe {
+                    fs::FSEventStreamScheduleWithRunLoop(
+                        stream,
+                        CFRunLoop::get_current().as_concrete_TypeRef(),
+                        kCFRunLoopDefaultMode,
+                    );
+                    fs::FSEventStreamStart(stream) != 0
+                };
+                let _ = ready_tx.send(started);
+                if started {
+                    while !stop_thread.load(Ordering::Relaxed) {
+                        CFRunLoop::run_in_mode(
+                            unsafe { kCFRunLoopDefaultMode },
+                            Duration::from_millis(250),
+                            true,
+                        );
+                    }
+                    // SAFETY: matches the successful start above.
+                    unsafe {
+                        fs::FSEventStreamStop(stream);
+                    }
+                }
+                // SAFETY: matches `FSEventStreamCreate` above.
+                unsafe {
+                    fs::FSEventStreamInvalidate(stream);
+                    fs::FSEventStreamRelease(stream);
+                }
+                drop(state);
+            })
+            .ok()?;
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(true) => Some(super::Watcher {
+                stop,
+                thread: Some(thread),
+            }),
+            _ => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                None
+            }
         }
     }
 
@@ -512,6 +733,36 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_watch_reports_a_write_under_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = watch(&root, tx).expect("fseventsd available on macOS");
+        std::thread::sleep(Duration::from_millis(300));
+        let dir = root.join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if let Ok(b) = rx.recv_timeout(Duration::from_millis(200)) {
+                seen.extend(b.changed_dirs);
+                if seen.iter().any(|p| p == &dir) {
+                    break;
+                }
+            }
+        }
+        watcher.stop();
+        assert!(
+            seen.iter().any(|p| p == &dir),
+            "expected {} among live changes, got {seen:?}",
+            dir.display()
+        );
+    }
 
     #[test]
     fn unsupported_platform_source_always_refuses() {

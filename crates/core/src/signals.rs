@@ -273,6 +273,33 @@ pub fn compute_signals(dir: &Path, observed_at: u64) -> Vec<Signal> {
 /// Same as [`compute_signals`], but also returns the raw (unrendered)
 /// values the `merge_complete` composite and `filter.rs`'s `idle >`
 /// predicate need, so neither has to re-parse a rendered string.
+/// Re-renders a worktree's signals `elapsed` seconds after they were
+/// computed, for a worktree FSEvents reported no change under: ages and
+/// idle time grow with the clock; dirty, unpushed and locked cannot have
+/// changed without a filesystem event under the worktree.
+pub fn age_signals(rows: &[Signal], raw: &RawSignals, elapsed: u64) -> (Vec<Signal>, RawSignals) {
+    let mut raw = raw.clone();
+    raw.last_commit_age_secs = raw.last_commit_age_secs.map(|a| a + elapsed);
+    raw.idle_for_secs = raw.idle_for_secs.map(|i| i + elapsed);
+    let rows = rows
+        .iter()
+        .map(
+            |r| match (r.name.as_str(), raw.last_commit_age_secs, raw.idle_for_secs) {
+                ("last_commit", Some(a), _) => Signal {
+                    name: r.name.clone(),
+                    value: SignalValue::LastCommitAgeSecs(a).render(),
+                },
+                ("idle_for", _, Some(i)) => Signal {
+                    name: r.name.clone(),
+                    value: SignalValue::IdleForSecs(i).render(),
+                },
+                _ => r.clone(),
+            },
+        )
+        .collect();
+    (rows, raw)
+}
+
 pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSignals) {
     let Ok(repo) = gix::open(dir) else {
         let unknown = SignalValue::Unknown.render();

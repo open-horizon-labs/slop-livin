@@ -11,7 +11,7 @@ Folding is what keeps the walk affordable (a node_modules is one stat-tree, one 
 
 ## Detection
 AST audit `folding_only_for_artifacts`:
-1. every `AttrJob::Size` literal in `walk.rs` sits in the then-branch of an `if let ... = classify_at(..)` (or inside `process_size`, recursion within a folded unit);
+1. every `AttrJob::Size` literal in `walk.rs` sits in the then-branch of an `if let ... = classify_at(..)` (or inside `process_size`, recursion within a folded unit, or `resize_artifact`, which re-sizes a path the store already classified);
 2. every `record_artifact` call in the serial walker sits under the same guard;
 3. `classify_at` ends in a table lookup or `None` and, like `classify` and `classify_gated`, constructs no `ArtifactKind` of its own.
 

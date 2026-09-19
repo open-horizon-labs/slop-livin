@@ -30,14 +30,14 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
 /// object's row. Never a verdict: "state" and "finished_at" are facts
 /// ("exited"/"running"/... and a timestamp or `None`), not a judgment
 /// about whether the object is safe to remove.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerRef {
     pub name: String,
     pub state: String,
     pub finished_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerImageFact {
     pub id: String,
     pub repo_tags: Vec<String>,
@@ -59,7 +59,7 @@ pub struct DockerImageFact {
     pub dangling: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerCacheFact {
     pub id: String,
     pub bytes: u64,
@@ -69,7 +69,7 @@ pub struct DockerCacheFact {
     pub shared: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerVolumeFact {
     pub name: String,
     pub labels: HashMap<String, String>,
@@ -79,7 +79,7 @@ pub struct DockerVolumeFact {
     pub containers: Vec<ContainerRef>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerFacts {
     pub images: Vec<DockerImageFact>,
     pub build_cache: Vec<DockerCacheFact>,
@@ -94,7 +94,7 @@ pub struct DockerFacts {
 /// (precise `FinishedAt`, volume mount names). Not part of the public
 /// `DockerFacts` shape -- it exists only to drive `containers` on the
 /// image/volume facts above.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct ContainerFact {
     name: String,
     /// The `Image` field from `ps`: usually `repo:tag`, sometimes a bare
@@ -565,6 +565,48 @@ pub fn load(facts_path: Option<&Path>) -> DockerFacts {
         Some(path) => load_from_file(path),
         None => load_live(),
     }
+}
+
+/// How long a live Docker answer is reused before the daemon is asked
+/// again. A file touch under the root says nothing about Docker; asking
+/// the daemon cost ~0.9 s per observation.
+pub const DOCKER_CACHE_TTL_SECS: u64 = 300;
+
+/// `load`, with the live answer cached under the store
+/// (`docker_facts.json`) for [`DOCKER_CACHE_TTL_SECS`]. `fresh` forces the
+/// daemon (the scheduled `observe`, `--enrich`).
+pub fn load_cached(
+    facts_path: Option<&Path>,
+    store_dir: Option<&Path>,
+    fresh: bool,
+) -> DockerFacts {
+    if facts_path.is_some() {
+        return load(facts_path);
+    }
+    let Some(dir) = store_dir else {
+        return load_live();
+    };
+    let cache = dir.join("docker_facts.json");
+    if !fresh
+        && let Ok(meta) = std::fs::metadata(&cache)
+        && let Ok(age) = meta
+            .modified()
+            .and_then(|m| m.elapsed().map_err(std::io::Error::other))
+        && age.as_secs() < DOCKER_CACHE_TTL_SECS
+        && let Ok(text) = std::fs::read_to_string(&cache)
+        && let Ok(facts) = serde_json::from_str::<DockerFacts>(&text)
+        && facts.unavailable.is_none()
+    {
+        return facts;
+    }
+    let facts = load_live();
+    if facts.unavailable.is_none()
+        && let Ok(text) = serde_json::to_string(&facts)
+    {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&cache, text);
+    }
+    facts
 }
 
 fn load_from_file(path: &Path) -> DockerFacts {

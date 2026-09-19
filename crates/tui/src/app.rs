@@ -117,6 +117,17 @@ pub struct App {
     /// Store dir, when known: the applied filter is persisted there so it
     /// survives relaunch (`ui_filter.txt`).
     pub store_dir: Option<PathBuf>,
+    /// The live FSEvents stream on the root, running for the TUI's
+    /// lifetime. Every change under the root, including our own deletes,
+    /// arrives here; nothing "asks" for a refresh.
+    pub watch: Option<slop_livin_core::fs_events::Watcher>,
+    pub watch_rx: Option<std::sync::mpsc::Receiver<slop_livin_core::fs_events::WatchBatch>>,
+    /// Changed directories received and not yet observed.
+    pub live_changes: std::collections::HashSet<PathBuf>,
+    pub live_last_event_id: u64,
+    /// When the last batch arrived; observation starts once the stream has
+    /// been quiet for `LIVE_QUIET`.
+    pub live_last_batch: Option<Instant>,
 }
 
 fn ui_state_path(store: &std::path::Path) -> PathBuf {
@@ -200,6 +211,11 @@ impl App {
             quit: false,
             width: 0,
             store_dir: None,
+            watch: None,
+            watch_rx: None,
+            live_changes: std::collections::HashSet::new(),
+            live_last_event_id: 0,
+            live_last_batch: None,
             track: std::collections::HashMap::new(),
             history_secs: None,
         }
@@ -755,8 +771,12 @@ impl App {
         // What just left the disk leaves the screen now; the store and the
         // header follow from a background incremental observe (FSEvents
         // narrows it to the touched trees), the same path startup uses.
+        // The screen is right now; the store follows through the live
+        // FSEvents stream, which sees the move to Trash like any change.
         self.prune_removed(&results);
-        self.observe_in_background();
+        if self.watch.is_none() {
+            self.observe_in_background();
+        }
     }
 
     /// Drops every row under a successfully removed path from the
@@ -823,6 +843,88 @@ impl App {
         if self.selected >= self.rows().len() {
             self.selected = self.rows().len().saturating_sub(1);
         }
+    }
+
+    /// How long the stream must be quiet before its changes are observed.
+    /// FSEvents already coalesces at 0.5 s; this only lets a burst (a
+    /// build writing thousands of files) land as one observation.
+    pub const LIVE_QUIET: Duration = Duration::from_millis(400);
+
+    /// Starts the live FSEvents stream. `None` (no store, or no FSEvents
+    /// on this platform) leaves the TUI on the scheduled observer alone.
+    pub fn start_watch(&mut self) {
+        if self.store_dir.is_none() || self.watch.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(w) = slop_livin_core::fs_events::watch(&self.root, tx) {
+            self.watch = Some(w);
+            self.watch_rx = Some(rx);
+        }
+    }
+
+    /// Consumes every batch the stream has delivered so far.
+    pub fn drain_watch(&mut self) {
+        let Some(rx) = &self.watch_rx else {
+            return;
+        };
+        while let Ok(batch) = rx.try_recv() {
+            self.live_changes.extend(batch.changed_dirs);
+            self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
+            self.live_last_batch = Some(Instant::now());
+        }
+    }
+
+    /// Changes are waiting, no observation is running, and the stream has
+    /// been quiet long enough.
+    pub fn live_observe_due(&self) -> bool {
+        self.pending.is_none()
+            && !self.live_changes.is_empty()
+            && self
+                .live_last_batch
+                .is_some_and(|t| t.elapsed() >= Self::LIVE_QUIET)
+    }
+
+    /// Observes exactly the directories the stream reported, on a worker
+    /// thread, through the same pipeline as everything else: the plan is
+    /// the live batch, so the store re-walks those subtrees and carries
+    /// every other row forward.
+    pub fn observe_live(&mut self) {
+        let Some(store) = self.store_dir.clone() else {
+            return;
+        };
+        if self.pending.is_some() || self.live_changes.is_empty() {
+            return;
+        }
+        let changed: Vec<PathBuf> = self.live_changes.drain().collect();
+        let device = std::fs::metadata(&self.root)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+        let plan = slop_livin_core::fs_events::FsEventsPlan::from_live(
+            changed,
+            self.live_last_event_id,
+            device,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let source = slop_livin_core::fs_events::testing::CannedSource(plan);
+            let res = slop_livin_core::report::report_full_mode_with_source(
+                &root,
+                None,
+                false,
+                Some(&store),
+                None,
+                true,
+                true,
+                false,
+                false,
+                &source,
+            );
+            let _ = tx.send(res);
+        });
+        self.pending = Some(rx);
+        self.observing = Some((0, 0));
     }
 
     /// Starts an incremental observation of the root on a worker thread;
@@ -952,6 +1054,29 @@ mod tests {
         // Space toggles it off again.
         app.mark_selected();
         assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn live_changes_are_observed_after_the_stream_goes_quiet() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(std::env::temp_dir());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.watch_rx = Some(rx);
+        tx.send(slop_livin_core::fs_events::WatchBatch {
+            changed_dirs: vec![PathBuf::from("/root/mole/node_modules")],
+            last_event_id: 42,
+        })
+        .unwrap();
+        app.drain_watch();
+        assert_eq!(app.live_changes.len(), 1);
+        assert_eq!(app.live_last_event_id, 42);
+        assert!(!app.live_observe_due(), "not before the quiet window");
+        app.live_last_batch = Some(Instant::now() - Duration::from_secs(1));
+        assert!(app.live_observe_due());
+        // While an observation runs, more changes just accumulate.
+        let (_ptx, prx) = std::sync::mpsc::channel();
+        app.pending = Some(prx);
+        assert!(!app.live_observe_due());
     }
 
     #[test]

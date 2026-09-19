@@ -182,6 +182,9 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     };
     app.pending = Some(rx);
     app.store_dir = Some(store.clone());
+    if !no_observe {
+        app.start_watch();
+    }
     app.history_secs = history_span(&store, &root);
     let saved = app::load_ui_state(&store);
     if !saved.filter.is_empty() {
@@ -223,6 +226,10 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                 }
                 Err(e) => app.status = Some(format!("observation failed: {e}")),
             }
+        }
+        app.drain_watch();
+        if app.live_observe_due() {
+            app.observe_live();
         }
         if let Ok(sz) = terminal.size() {
             app.width = sz.width;
