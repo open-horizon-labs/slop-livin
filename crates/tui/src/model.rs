@@ -899,6 +899,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
                 row.mtime_max = a.mtime_max;
+                row.label.push_str(&swamp_core::render::allocation_note(a));
                 if let Some(t) = &a.ecosystem {
                     row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
                     row.ecosystems = vec![t.clone()];
@@ -1348,6 +1349,9 @@ mod tests {
             mtime_max: 0,
             ecosystem: None,
             hardlinked: false,
+            dedup_stale: false,
+            allocated_bytes: None,
+            allocated_growth_bytes: None,
             local_bytes: 0,
             track: None,
             growth_bytes: None,
@@ -1448,7 +1452,13 @@ mod tests {
         report.projects[0].worktrees[0].artifacts[0].path = target.clone();
         report.nested_artifacts =
             swamp_core::cargo_artifacts::inspect_target(&target, Some(&target)).units;
+        report.projects[0].worktrees[0].artifacts[0].dedup_stale = true;
+        report.projects[0].worktrees[0].artifacts[0].allocated_bytes = Some(4096);
         let rows = builds_rows(&report, &Filter::default());
+        assert!(
+            rows.iter()
+                .any(|r| r.label.contains("unique stale; allocated"))
+        );
         let selected = UnitId::for_artifact(&target.join("debug/incremental/crate-a"));
         assert!(rows.iter().any(|r| r.unit == Some(selected.clone())));
         let deps = UnitId::for_artifact(&target.join("debug/deps"));

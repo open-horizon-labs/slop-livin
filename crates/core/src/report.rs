@@ -190,14 +190,19 @@ pub struct ArtifactRow {
     /// Whether this unit contains hardlinked files (`nlink > 1`). A unit
     /// without them can be re-sized from its stored per-directory rows,
     /// because summing those rows counts every byte exactly once. A unit
-    /// with them cannot: the same inode appears in several directories
-    /// and the unit's own figure counts it once (Cargo's `target/`
-    /// hardlinks almost every artifact, and summing its directory rows
-    /// overcounted a 16 GB tree by 4.4 GB). `true` is the safe answer
-    /// when nobody has measured, so a store written before this field
-    /// existed re-sizes whole until its next full walk.
+    /// with them still gets current directory allocations, but its unique-byte
+    /// count is retained as stale until reconciliation. `true` is conservative
+    /// when nobody has measured: allocation sums are not unique-byte totals.
     #[serde(default = "yes")]
     pub hardlinked: bool,
+    /// True when unique-byte totals await reconciliation; directory allocations are current.
+    #[serde(default)]
+    pub dedup_stale: bool,
+    /// Current path allocations (hardlinks may count more than once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_growth_bytes: Option<i64>,
     /// Bytes with hardlinks deduplicated *within this row only* (a
     /// deterministic per-row figure), unlike `bytes`, where a hardlinked
     /// inode is charged to whichever row the full walk saw first. The
@@ -1269,6 +1274,9 @@ pub(crate) fn join_docker_facts(
                         mtime_max: 0,
                         ecosystem: None,
                         hardlinked: false,
+                        dedup_stale: false,
+                        allocated_bytes: None,
+                        allocated_growth_bytes: None,
                         local_bytes: 0,
                         track: None,
                         growth_bytes: None,

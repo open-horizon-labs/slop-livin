@@ -75,6 +75,21 @@ fn human_signed_bytes(delta: i64) -> String {
     format!("{sign}{}", human_bytes(delta.unsigned_abs()))
 }
 
+pub fn allocation_note(row: &crate::report::ArtifactRow) -> String {
+    if !row.dedup_stale {
+        return String::new();
+    }
+    let allocated = row
+        .allocated_bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "unknown".into());
+    let growth = row
+        .allocated_growth_bytes
+        .map(|g| format!("; allocated growth {}", human_signed_bytes(g)))
+        .unwrap_or_default();
+    format!(" [unique stale; allocated {allocated}{growth}]")
+}
+
 fn kind_label(kind: &ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::BuildOutput => "build",
@@ -958,7 +973,7 @@ fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[Artifa
                 rows.push((
                     project.name.clone(),
                     kind_label(&a.kind),
-                    rel,
+                    format!("{rel}{}", allocation_note(a)),
                     a.bytes,
                     a.growth_bytes,
                 ));

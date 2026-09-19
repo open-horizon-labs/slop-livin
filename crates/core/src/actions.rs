@@ -54,6 +54,8 @@ pub struct PlanUnit {
     pub worktree_path: PathBuf,
     pub kind: ArtifactKind,
     pub bytes: u64,
+    #[serde(default)]
+    pub dedup_stale: bool,
     pub growth_bytes: Option<i64>,
     pub regrowth_count: u32,
     pub observed_at: u64,
@@ -203,6 +205,9 @@ fn recovery_for(kind: &ArtifactKind) -> &'static str {
 /// TUI puts on its confirm prompt.
 fn warnings_for(wt: &WorktreeRow, a: &ArtifactRow, whole: Option<&ProjectRow>) -> Vec<String> {
     let mut w = Vec::new();
+    if a.dedup_stale {
+        w.push("unique-byte estimate is stale; full scan required before budgeted standing-grant cleanup".into());
+    }
     match a.track {
         Some(crate::ignore::TrackState::Untracked) => {
             w.push("untracked: in no version control and under no ignore rule".into())
@@ -325,6 +330,7 @@ pub fn propose(
                         unit.path = p.clone();
                         unit.rel_path = p.strip_prefix(&wt.path).unwrap_or(p).display().to_string();
                         unit.bytes = group.members.iter().map(|m| m.bytes).sum();
+                        unit.dedup_stale = false; // selected members were freshly measured
                         unit.growth_bytes = nested.growth_bytes;
                         unit.verb = "cargo-group".into();
                         unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
@@ -445,6 +451,7 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         worktree_path: wt.path.clone(),
         kind: a.kind.clone(),
         bytes: a.bytes,
+        dedup_stale: a.dedup_stale,
         growth_bytes: a.growth_bytes,
         regrowth_count: a.regrowth_count,
         observed_at: a.observed_at,
@@ -470,6 +477,9 @@ fn unit_from_worktree(project: &ProjectRow, wt: &WorktreeRow) -> PlanUnit {
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: wt.artifacts.iter().any(|a| a.dedup_stale),
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: bytes,
         track: None,
         growth_bytes: wt
@@ -516,6 +526,9 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: false,
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: d.allocated_total,
         track: d.track,
         growth_bytes: None,
@@ -713,7 +726,7 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
     if let Some(pid) = &g.plan_id {
         return pid == &plan.id; // a one-shot approval covers the whole plan
     }
-    if unit.cargo_group.is_some() {
+    if unit.cargo_group.is_some() || unit.dedup_stale {
         return false;
     } // explicit per-plan approval only
     if g.verb != unit.verb {

@@ -417,6 +417,17 @@ fn main() -> Result<()> {
             );
             progress.stop();
             let r = r?;
+            if !json
+                && r.projects
+                    .iter()
+                    .flat_map(|p| &p.worktrees)
+                    .flat_map(|w| &w.artifacts)
+                    .any(|a| a.dedup_stale)
+            {
+                eprintln!(
+                    "Unique-byte totals are stale; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
+                );
+            }
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
                 Some(Ok(f)) => Some(f),
                 Some(Err(e)) => {

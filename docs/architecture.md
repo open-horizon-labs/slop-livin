@@ -93,12 +93,15 @@ An observation with usable event history reconstructs the previous topology and 
 | Change | Work performed |
 |---|---|
 | Existing remainder directory changes | Re-list that directory and update its stored totals when the stored structure permits it. |
-| Directory inside an artifact changes | Re-list affected interior directories and re-aggregate the artifact when interior rows exist and the unit has no hardlinks. |
-| Artifact contains hardlinks, or interior detail is unavailable | Resize the whole artifact. |
+| Directory inside an artifact changes | Re-list affected interior directories and update allocated totals. Wide directories use bounded batches on the existing worker pool. |
+| Changed artifact has hardlinks | Keep its last unique-byte measurement, mark it stale, and update directory allocations without traversing unchanged interiors. |
+| Interior detail is unavailable | Resize the whole artifact. |
 | New or structurally changed subtree | Discover repositories or artifacts and perform the broader walk needed to rebuild attribution. |
 | Event history is incomplete or cannot be trusted | Perform a full walk and report the reason. |
 
-Hardlinks explain why a small change inside a Cargo `target/` can still require a large traversal. Summing independently measured directory rows could charge one inode more than once. Artifact rows retain both their globally attributed bytes and a local measurement; the incremental code applies local differences to the attributed total.
+Hardlinks do not force a whole-target walk when interior measurements are available. `allocated_bytes` and `allocated_growth_bytes` describe current path allocations, which may count a linked inode more than once. `bytes` and `local_bytes` retain their last deduplicated measurements; `dedup_stale` distinguishes those from current measurements. CLI/TUI warn when unique-byte totals are stale. Unique-byte growth is unavailable and its history has a gap while stale, rather than inventing zero growth. A full scan reconciles the counts. Cleanup still checks its actual selected members; allocated size is not promised reclaimable space.
+
+Plans warn about stale unique-byte estimates, and standing grants cannot spend a budget against them. A human may explicitly approve a plan with that warning. A scoped Cargo cleanup measures its selected members freshly and still requires per-plan approval.
 
 The fallback reasons include a missing or future event ID, a device mismatch, dropped or inconclusive events, too many changed directories, and changed classification rules. A replay too soon after the previous observation also falls back, because the persisted event log can lag writes. `--full` explicitly forces a full walk.
 

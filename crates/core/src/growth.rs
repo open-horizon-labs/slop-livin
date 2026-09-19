@@ -194,9 +194,9 @@ struct StoredRow {
     mtime_max: u64,
     /// Whether the unit contains hardlinked files. Missing in a store
     /// written before this column existed, where it reads `true`: the
-    /// safe answer, since the interior fast path is only sound at
-    /// `false`.
+    /// conservative answer: unique totals need reconciliation after changes.
     hardlinked: bool,
+    dedup_stale: bool,
     present: bool,
     observed_at: u64,
     regrowth_count: u32,
@@ -215,6 +215,7 @@ fn schema() -> Arc<Schema> {
         Field::new("local_bytes", DataType::UInt64, false),
         Field::new("mtime_max", DataType::UInt64, false),
         Field::new("hardlinked", DataType::Boolean, false),
+        Field::new("dedup_stale", DataType::Boolean, false),
     ]))
 }
 
@@ -296,6 +297,9 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(UInt64Array::from(local_bytes)),
             Arc::new(UInt64Array::from(mtime_max)),
             Arc::new(BooleanArray::from(hardlinked)),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.dedup_stale).collect::<Vec<_>>(),
+            )),
         ],
     )?;
     write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
@@ -331,6 +335,7 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         // Likewise stores written before artifact age was recorded.
         let mtime_max = downcast_u64(&batch, "mtime_max").ok();
         let hardlinked = downcast_bool(&batch, "hardlinked").ok();
+        let dedup_stale = downcast_bool(&batch, "dedup_stale").ok();
         for i in 0..batch.num_rows() {
             rows.push(StoredRow {
                 project_id: project_id.value(i).to_string(),
@@ -341,10 +346,10 @@ fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
                 local_bytes: local_bytes
                     .as_ref()
                     .map(|c| c.value(i))
-                    .filter(|v| *v != 0)
                     .unwrap_or_else(|| bytes.value(i)),
                 mtime_max: mtime_max.as_ref().map(|c| c.value(i)).unwrap_or(0),
                 hardlinked: hardlinked.as_ref().map(|c| c.value(i)).unwrap_or(true),
+                dedup_stale: dedup_stale.as_ref().map(|c| c.value(i)).unwrap_or(false),
                 present: present.value(i),
                 observed_at: observed_at.value(i),
                 regrowth_count: regrowth.value(i),
@@ -421,6 +426,7 @@ struct Observed {
     local_bytes: u64,
     mtime_max: u64,
     hardlinked: bool,
+    dedup_stale: bool,
 }
 
 fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
@@ -447,6 +453,7 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     kind,
                     mtime_max: artifact.mtime_max,
                     hardlinked: artifact.hardlinked,
+                    dedup_stale: artifact.dedup_stale,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
                     local_bytes: if artifact.local_bytes == 0
@@ -532,7 +539,9 @@ pub fn annotate_readonly(
                     &rel_path.display().to_string(),
                 );
                 let history = history_index.get(&key).unwrap_or(&empty);
-                artifact.growth_bytes = growth_since(history, artifact.bytes, target_time);
+                artifact.growth_bytes = (!artifact.dedup_stale)
+                    .then(|| growth_since(history, artifact.bytes, target_time))
+                    .flatten();
                 artifact.regrowth_count = current_by_key
                     .get(&key)
                     .map(|r| r.regrowth_count)
@@ -586,11 +595,15 @@ pub fn observe_and_annotate(
                 // when the bytes did not move, or a row first recorded
                 // under the conservative default would keep that default
                 // forever and never regain the fast path.
-                if prev.hardlinked != obs.hardlinked {
-                    prev.hardlinked = obs.hardlinked;
+                if prev.hardlinked != obs.hardlinked
+                    || prev.dedup_stale != obs.dedup_stale
+                    || prev.mtime_max != obs.mtime_max
+                    || prev.local_bytes != obs.local_bytes
+                {
                     current_changed = true;
                 }
-                let changed = prev.bytes != obs.bytes || !prev.present;
+                let changed =
+                    prev.bytes != obs.bytes || !prev.present || prev.dedup_stale != obs.dedup_stale;
                 if changed {
                     current_changed = true;
                     let regrowth_count = if !prev.present {
@@ -616,6 +629,7 @@ pub fn observe_and_annotate(
                         local_bytes: prev.local_bytes,
                         mtime_max: prev.mtime_max,
                         hardlinked: prev.hardlinked,
+                        dedup_stale: prev.dedup_stale,
                         present: prev.present,
                         observed_at: prev.observed_at,
                         regrowth_count: prev.regrowth_count,
@@ -626,6 +640,10 @@ pub fn observe_and_annotate(
                     prev.observed_at = observed_at;
                     prev.regrowth_count = regrowth_count;
                 }
+                prev.dedup_stale = obs.dedup_stale;
+                prev.hardlinked = obs.hardlinked;
+                prev.mtime_max = obs.mtime_max;
+                prev.local_bytes = obs.local_bytes;
             }
             None => {
                 // Newly discovered row: there is no prior observation to
@@ -648,6 +666,7 @@ pub fn observe_and_annotate(
                         local_bytes: obs.local_bytes,
                         mtime_max: obs.mtime_max,
                         hardlinked: obs.hardlinked,
+                        dedup_stale: obs.dedup_stale,
                         present: true,
                         observed_at,
                         regrowth_count: 0,
@@ -671,6 +690,7 @@ pub fn observe_and_annotate(
                 local_bytes: row.local_bytes,
                 mtime_max: row.mtime_max,
                 hardlinked: row.hardlinked,
+                dedup_stale: row.dedup_stale,
                 present: row.present,
                 observed_at: row.observed_at,
                 regrowth_count: row.regrowth_count,
@@ -704,7 +724,9 @@ pub fn observe_and_annotate(
                     &rel_path.display().to_string(),
                 );
                 let history = history_index.get(&key).cloned().unwrap_or_default();
-                artifact.growth_bytes = growth_since(&history, artifact.bytes, target_time);
+                artifact.growth_bytes = (!artifact.dedup_stale)
+                    .then(|| growth_since(&history, artifact.bytes, target_time))
+                    .flatten();
                 artifact.regrowth_count = current.get(&key).map(|r| r.regrowth_count).unwrap_or(0);
             }
         }
@@ -736,9 +758,10 @@ pub fn observe_and_annotate(
 /// One historical snapshot of a row's value: `(observed_at, bytes,
 /// present)`, oldest first, ending with the value on disk right now
 /// (before this observation's write).
-/// `(observed_at, bytes, present)` history for every key in the store,
+/// `(observed_at, bytes, measurement_usable)` history for every key in the store,
 /// from the current file plus every delta within retention, sorted by
 /// time. Built once per observation.
+// (observation time, last measured bytes, measurement usable at that time).
 type HistoryIndex = HashMap<String, Vec<(u64, u64, bool)>>;
 
 fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<HistoryIndex> {
@@ -754,7 +777,7 @@ fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<Hist
                 &row.rel_path,
             ))
             .or_default()
-            .push((row.observed_at, row.bytes, row.present));
+            .push((row.observed_at, row.bytes, !row.present || !row.dedup_stale));
     }
     for delta_path in list_delta_files(dir) {
         for row in read_rows(&delta_path)? {
@@ -769,7 +792,7 @@ fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<Hist
                     &row.rel_path,
                 ))
                 .or_default()
-                .push((row.observed_at, row.bytes, row.present));
+                .push((row.observed_at, row.bytes, !row.present || !row.dedup_stale));
         }
     }
     for values in index.values_mut() {
@@ -787,7 +810,7 @@ fn growth_since(history: &[(u64, u64, bool)], bytes_now: u64, target_time: u64) 
     let closest = history
         .iter()
         .min_by_key(|(t, _, _)| t.abs_diff(target_time))?;
-    Some(bytes_now as i64 - closest.1 as i64)
+    closest.2.then_some(bytes_now as i64 - closest.1 as i64)
 }
 
 /// Merges every delta file into one, dropping deltas older than the
@@ -885,21 +908,28 @@ pub fn history_series(
     now: u64,
 ) -> (HashMap<String, Series>, Series) {
     let buckets = buckets.max(2);
-    let mut points: HashMap<String, Vec<(u64, u64)>> = HashMap::new(); // key -> (observed_at, bytes)
+    let mut points: HashMap<String, Vec<(u64, Option<u64>)>> = HashMap::new();
     let mut push = |rows: Vec<StoredRow>| {
         for r in rows {
             let key = row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path);
-            let bytes = if r.present { r.bytes } else { 0 };
+            let bytes = if !r.present {
+                Some(0)
+            } else if r.dedup_stale {
+                None
+            } else {
+                Some(r.bytes)
+            };
             points.entry(key).or_default().push((r.observed_at, bytes));
         }
     };
-    if let Ok(rows) = read_rows(&current_path(dir)) {
-        push(rows);
-    }
     for f in list_delta_files(dir) {
         if let Ok(rows) = read_rows(&f) {
             push(rows);
         }
+    }
+    // Current wins ties when several observations share a second.
+    if let Ok(rows) = read_rows(&current_path(dir)) {
+        push(rows);
     }
     let start = now.saturating_sub(window_secs);
     let step = (window_secs.max(1) as f64) / ((buckets - 1) as f64);
@@ -908,11 +938,16 @@ pub fn history_series(
         .collect();
     let mut series: HashMap<String, Series> = HashMap::with_capacity(points.len());
     let mut total: Series = vec![None; buckets];
+    let mut stale_total = vec![false; buckets];
     for (key, mut pts) in points {
         pts.sort_by_key(|(t, _)| *t);
         let mut out = Vec::with_capacity(buckets);
         for (i, t) in times.iter().enumerate() {
-            let v = pts.iter().rev().find(|(pt, _)| pt <= t).map(|(_, b)| *b);
+            let point = pts.iter().rev().find(|(pt, _)| pt <= t);
+            let v = point.and_then(|(_, b)| *b);
+            if point.is_some() && v.is_none() && !key.starts_with("Nested:") {
+                stale_total[i] = true;
+            }
             out.push(v);
             if let Some(v) = v
                 && !key.starts_with("Nested:")
@@ -921,6 +956,11 @@ pub fn history_series(
             }
         }
         series.insert(key, out);
+    }
+    for (i, stale) in stale_total.into_iter().enumerate() {
+        if stale {
+            total[i] = None;
+        }
     }
     (series, total)
 }
@@ -1777,7 +1817,10 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
                 mtime_max: row.mtime_max,
                 ecosystem: None,
                 hardlinked: row.hardlinked,
+                dedup_stale: row.dedup_stale,
                 local_bytes: row.local_bytes,
+                allocated_bytes: None,
+                allocated_growth_bytes: None,
                 track: None,
                 growth_bytes: None,
                 regrowth_count: row.regrowth_count,
@@ -2381,7 +2424,7 @@ fn under(rel: &str, root: &str) -> bool {
 /// changed directory is re-listed (own bytes, counts, mtime); a vanished
 /// directory drops its subtree's rows; a new subdirectory is walked and
 /// gets rows. Then the unit's rows are re-aggregated and the root row's
-/// total is the unit's new local byte count. Returns `None` when the
+/// total is its path allocation, not a deduplicated count. Returns `None` when the
 /// store has no row for the root (older store: caller re-sizes whole).
 fn resize_interior(
     wt_root: &Path,
@@ -2389,9 +2432,10 @@ fn resize_interior(
     rel_root: &str,
     changed: &[PathBuf],
     dirs: &mut Vec<DirRollup>,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, bool)> {
     use std::os::unix::fs::MetadataExt;
     let mut mtime_max: u64 = 0;
+    let mut saw_hardlink = false;
     let mut changed_rels: Vec<String> = changed
         .iter()
         .map(|c| rel_path_string(wt_root, c))
@@ -2409,58 +2453,43 @@ fn resize_interior(
         if meta.file_type().is_symlink() || !meta.is_dir() {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&abs) else {
-            continue;
-        };
-        let mut own: u64 = 0;
-        let (mut files, mut subdirs, mut symlinks) = (0u32, 0u32, 0u32);
-        let mut dir_mtime: i64 = meta.mtime();
-        let mut on_disk_subdirs: Vec<String> = Vec::new();
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() {
-                symlinks += 1;
-                continue;
-            }
-            if ft.is_dir() {
-                subdirs += 1;
-                on_disk_subdirs.push(format!("{rel_c}/{}", e.file_name().to_string_lossy()));
-            } else if ft.is_file() {
-                let Ok(fm) = fs::symlink_metadata(e.path()) else {
-                    continue;
-                };
-                if fm.file_type().is_symlink() || !fm.is_file() {
-                    continue;
-                }
-                files += 1;
-                own += crate::attribution::allocated_bytes(&fm);
-                dir_mtime = dir_mtime.max(fm.mtime());
-            }
-        }
+        let measured = crate::walk::measure_directory(&abs).ok()?;
+        let own = measured.allocated;
+        let files = measured.files;
+        let subdirs = measured.children.len() as u32;
+        let symlinks = measured.symlinks;
+        let dir_mtime = meta.mtime().max(measured.mtime);
+        saw_hardlink |= measured.hardlinked;
+        let on_disk_subdirs: HashSet<String> = measured
+            .children
+            .into_iter()
+            .map(|name| format!("{rel_c}/{name}"))
+            .collect();
         mtime_max = mtime_max.max(dir_mtime.max(0) as u64);
         // Children the store knows that are no longer on disk.
-        let stored_children: Vec<String> = dirs
+        let stored_children: HashSet<String> = dirs
             .iter()
             .filter(|d| d.worktree_id == worktree_id && d.parent_rel_path.as_deref() == Some(rel_c))
             .map(|d| d.rel_path.clone())
             .collect();
         for gone in stored_children
             .iter()
-            .filter(|c| !on_disk_subdirs.contains(c))
+            .filter(|c| !on_disk_subdirs.contains(c.as_str()))
         {
             dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, gone)));
         }
         // Subdirectories on disk the store has never seen: walk them.
         for new_rel in on_disk_subdirs
             .iter()
-            .filter(|c| !stored_children.contains(c))
+            .filter(|c| !stored_children.contains(c.as_str()))
         {
-            let (_, rows) = crate::walk::resize_artifact_with_dirs(
+            let (measured, rows) = crate::walk::resize_artifact_with_dirs(
                 &wt_root.join(new_rel),
                 ArtifactKind::Cache,
                 0,
                 Some((worktree_id, wt_root)),
             );
+            saw_hardlink |= measured.hardlinked;
             for r in &rows {
                 mtime_max = mtime_max.max((r.mod_time_min as i64 * 60).max(0) as u64);
             }
@@ -2526,7 +2555,7 @@ fn resize_interior(
     };
     dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, rel_root)));
     dirs.extend(interior);
-    Some((root_total, mtime_max))
+    Some((root_total, mtime_max, saw_hardlink))
 }
 
 /// Re-lists changed Source directories of one worktree from their stored
@@ -2986,22 +3015,21 @@ fn apply_incremental(
         // the unit's total is re-aggregated from the rows.
         let new_local: u64;
         let new_mtime: u64;
-        // Summing stored directory rows counts each byte once only when
-        // no inode appears twice in the unit. Cargo's `target/` hardlinks
-        // nearly every artifact, so it re-sizes whole.
+        let measured_hardlinked: bool;
+        // Update path allocations without retaining an inode inventory.
+        // Hardlinked units keep their last unique-byte measurement as stale.
         let hardlinked = attribution
             .artifacts_by_worktree
             .get(worktree_id)
             .and_then(|rows| rows.iter().find(|r| &r.path == root_path))
             .map(|r| r.hardlinked)
             .unwrap_or(true);
-        let has_interior = !hardlinked
-            && attribution
-                .dirs
-                .iter()
-                .any(|d| d.worktree_id == *worktree_id && d.rel_path == rel_root);
+        let has_interior = attribution
+            .dirs
+            .iter()
+            .any(|d| d.worktree_id == *worktree_id && d.rel_path == rel_root);
         if has_interior
-            && let Some((local, mtime)) = resize_interior(
+            && let Some((local, mtime, saw_hardlink)) = resize_interior(
                 &wt_root,
                 worktree_id,
                 &rel_root,
@@ -3009,8 +3037,25 @@ fn apply_incremental(
                 &mut attribution.dirs,
             )
         {
+            if hardlinked || saw_hardlink {
+                if let Some(existing) = attribution
+                    .artifacts_by_worktree
+                    .get_mut(worktree_id)
+                    .and_then(|rows| rows.iter_mut().find(|r| &r.path == root_path))
+                {
+                    // Allocation rollups are current. Unique-byte charges stay
+                    // at their last measurement until a full reconciliation.
+                    existing.dedup_stale = true;
+                    existing.hardlinked = true;
+                    existing.mtime_max = existing.mtime_max.max(mtime);
+                    existing.observed_at = observed_at;
+                }
+                n_interior += 1;
+                continue;
+            }
             new_local = local;
             new_mtime = mtime;
+            measured_hardlinked = false;
             n_interior += 1;
         } else {
             n_whole += 1;
@@ -3026,6 +3071,7 @@ fn apply_incremental(
             attribution.dirs.extend(dirs);
             new_local = row.local_bytes.max(row.bytes);
             new_mtime = row.mtime_max;
+            measured_hardlinked = row.hardlinked;
         }
         if let Some(rows) = attribution.artifacts_by_worktree.get_mut(worktree_id) {
             if let Some(existing) = rows.iter_mut().find(|r| &r.path == root_path) {
@@ -3041,6 +3087,8 @@ fn apply_incremental(
                 let delta = new_local as i64 - old_local as i64;
                 existing.bytes = (existing.bytes as i64 + delta).max(0) as u64;
                 existing.local_bytes = new_local;
+                existing.dedup_stale = false;
+                existing.hardlinked = measured_hardlinked;
                 existing.mtime_max = existing.mtime_max.max(new_mtime);
                 existing.observed_at = observed_at;
                 existing.source = crate::report::Source::new("filesystem.fsevents");
@@ -3268,6 +3316,7 @@ mod tests {
                             local_bytes: i,
                             mtime_max: i,
                             hardlinked: false,
+                            dedup_stale: false,
                             present: i % 2 == 0,
                             observed_at: i,
                             regrowth_count: i as u32,
@@ -3582,7 +3631,10 @@ mod tests {
                     mtime_max: 0,
                     ecosystem: None,
                     hardlinked: false,
+                    dedup_stale: false,
                     local_bytes: 0,
+                    allocated_bytes: None,
+                    allocated_growth_bytes: None,
                     track: None,
                     growth_bytes: None,
                     regrowth_count: 0,
@@ -3606,6 +3658,31 @@ mod tests {
 
     fn artifact_row(projects: &[ProjectRow]) -> &ArtifactRow {
         &projects[0].worktrees[0].artifacts[0]
+    }
+
+    #[test]
+    fn stale_unique_measurements_are_gaps_until_reconciled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/repo");
+        let mut projects = vec![one_artifact_project(&root, 1000)];
+        observe_and_annotate(tmp.path(), 1, &mut projects, 1000, 30, 1000).unwrap();
+        projects[0].worktrees[0].artifacts[0].dedup_stale = true;
+        observe_and_annotate(tmp.path(), 1, &mut projects, 2000, 30, 1000).unwrap();
+        assert_eq!(artifact_row(&projects).growth_bytes, None);
+        let dir = volume_dir(tmp.path(), 1);
+        assert!(read_rows(&current_path(&dir)).unwrap()[0].dedup_stale);
+        let (_, totals) = history_series(&dir, 1000, 2, 2000);
+        assert_eq!(totals, vec![Some(1000), None]);
+        projects[0].worktrees[0].artifacts[0].dedup_stale = false;
+        projects[0].worktrees[0].artifacts[0].bytes = 2000;
+        observe_and_annotate(tmp.path(), 1, &mut projects, 3000, 30, 1000).unwrap();
+        assert_eq!(
+            artifact_row(&projects).growth_bytes,
+            None,
+            "baseline at 2000 was stale"
+        );
+        let (_, totals) = history_series(&dir, 2000, 3, 3000);
+        assert_eq!(totals, vec![Some(1000), None, Some(2000)]);
     }
 
     #[test]

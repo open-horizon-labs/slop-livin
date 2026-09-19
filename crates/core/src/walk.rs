@@ -155,6 +155,107 @@ fn worker_count() -> usize {
 // Discovery
 // ---------------------------------------------------------------------
 
+#[derive(Default)]
+pub(crate) struct DirectoryMeasurement {
+    pub allocated: u64,
+    pub files: u32,
+    pub symlinks: u32,
+    pub children: Vec<String>,
+    pub mtime: i64,
+    pub hardlinked: bool,
+}
+
+/// Measure one directory, not its descendants. Reuse the walk pool to overlap
+/// metadata reads in wide compiler-output directories. At most 256 entries per
+/// worker are materialized; no per-file measurements survive the call.
+pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasurement> {
+    let entries = Mutex::new(fs::read_dir(path)?);
+    let result = Mutex::new(DirectoryMeasurement::default());
+    let error = Mutex::new(None);
+    let pool = Arc::new(Pool::new());
+    let workers = worker_count();
+    for _ in 0..workers {
+        pool.push(());
+    }
+    pool.drain(workers, |_| {
+        let mut local = DirectoryMeasurement::default();
+        loop {
+            let batch: Vec<_> = entries.lock().unwrap().by_ref().take(256).collect();
+            if batch.is_empty() {
+                break;
+            }
+            for entry in batch {
+                let entry = entry.and_then(|e| e.file_type().map(|ft| (e, ft)));
+                let (entry, ft) = match entry {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        *error.lock().unwrap() = Some(e);
+                        continue;
+                    }
+                };
+                if ft.is_symlink() {
+                    local.symlinks += 1;
+                    continue;
+                }
+                if ft.is_dir() {
+                    local
+                        .children
+                        .push(entry.file_name().to_string_lossy().into_owned());
+                } else if ft.is_file() {
+                    let m = match fs::symlink_metadata(entry.path()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            *error.lock().unwrap() = Some(e);
+                            continue;
+                        }
+                    };
+                    if m.is_file() {
+                        local.files += 1;
+                        local.allocated += allocated_bytes(&m);
+                        local.mtime = local.mtime.max(m.mtime());
+                        local.hardlinked |= m.nlink() > 1;
+                    }
+                }
+            }
+        }
+        let mut out = result.lock().unwrap();
+        out.allocated += local.allocated;
+        out.files += local.files;
+        out.symlinks += local.symlinks;
+        out.children.extend(local.children);
+        out.mtime = out.mtime.max(local.mtime);
+        out.hardlinked |= local.hardlinked;
+    });
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(result.into_inner().unwrap())
+}
+
+#[test]
+fn shallow_parallel_measurement_counts_allocations_without_following_links_or_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("measured");
+    fs::create_dir(&root).unwrap();
+    let mut expected = 0;
+    for i in 0..513 {
+        let path = root.join(format!("{i}.o"));
+        fs::write(&path, vec![1u8; 4096]).unwrap();
+        expected += fs::symlink_metadata(path).unwrap().blocks() * 512;
+    }
+    fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
+    expected += fs::symlink_metadata(root.join("0.o")).unwrap().blocks() * 512;
+    fs::create_dir(root.join("child")).unwrap();
+    fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
+    std::os::unix::fs::symlink(root.join("child"), root.join("symlink")).unwrap();
+    let measured = measure_directory(&root).unwrap();
+    assert_eq!(measured.allocated, expected);
+    assert_eq!(measured.files, 514);
+    assert_eq!(measured.children, vec!["child"]);
+    assert_eq!(measured.symlinks, 1);
+    assert!(measured.hardlinked);
+}
+
 /// Parallel equivalent of `git::discover`: same stop conditions
 /// (`STOP_DIRS` plus `.git`), same per-directory `.git` identity
 /// resolution, same device/symlink guards. Order of the returned rows is
@@ -511,6 +612,9 @@ fn attribute_parallel_inner(
                 mtime_max: 0,
                 ecosystem: None,
                 hardlinked: source_hardlinked,
+                dedup_stale: false,
+                allocated_bytes: None,
+                allocated_growth_bytes: None,
                 local_bytes,
                 track: None,
                 growth_bytes: None,
@@ -902,6 +1006,9 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     mtime_max: group.mtime_max.load(Ordering::Acquire),
                     ecosystem: None,
                     hardlinked: !group.local_seen.lock().unwrap().is_empty(),
+                    dedup_stale: false,
+                    allocated_bytes: None,
+                    allocated_growth_bytes: None,
                     local_bytes: group.local_total.load(Ordering::Acquire),
                     track: None,
                     growth_bytes: None,
@@ -1075,6 +1182,9 @@ pub fn resize_artifact_with_dirs(
         mtime_max: 0,
         ecosystem: None,
         hardlinked: false,
+        dedup_stale: false,
+        allocated_bytes: None,
+        allocated_growth_bytes: None,
         local_bytes: 0,
         track: None,
         growth_bytes: None,

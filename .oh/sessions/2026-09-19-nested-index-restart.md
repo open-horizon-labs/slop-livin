@@ -16,6 +16,52 @@ group and evidence. The replay checkpoint publication fix is retained.
 
 Learning: [manage ecosystems, not filesystem audits](../metis/manage-ecosystems-not-filesystem-audits.md).
 
+### Incremental hardlink update — subsequent execution
+
+User selected faster incremental artifact updates with explicit measurement limits.
+The shared walker now relists affected directories even when an artifact contains
+hardlinks. Path allocations stay current; unique-byte totals retain their last
+measurement with a persisted `dedup_stale` flag until a full scan reconciles them.
+Unique-byte history has a gap while stale. Allocated size/growth is surfaced on
+artifact rows; CLI/TUI label stale totals. This is not a reclaimable-space estimate.
+
+Wide directories use the existing walk worker pool with at most 256 temporary
+entries per worker; no file inventory is persisted. Native directory-level events
+still require relisting all siblings in an affected directory. On this checkout,
+`target/debug/deps` alone held 186,493 entries. Removing the whole-target walk
+does not make that directory free to measure.
+
+Read-only benchmark, debug build, isolated store, injected notifications (not OS
+delivery timing or actual source/build mutations), three samples per case:
+
+- unchanged report: 189–195 ms;
+- source directory notification: 207–213 ms;
+- huge Cargo deps directory: 761–819 ms, down from 1.48–1.50 s;
+- small Cargo incremental group: 278–283 ms.
+
+The unchanged-report fixed overhead remains; this execution targets the dominant
+hardlink fallback, not a wholesale cache/enrichment redesign.
+
+Review: existing/new hardlinks use allocation rollups without double-charging
+unique totals; stale status survives persistence and clears on full observation;
+untouched unreadable subtrees retain measurements; history gaps and stale-baseline
+growth are tested; parallel measurement skips symlinks and descendants. Cleanup
+retains fresh selected-group checks. Stale estimates cannot spend standing-grant
+budgets; explicit human plan approval remains possible with a warning. No live
+user-store rewrite, real cleanup, push, merge, or release is authorized here.
+
+Remaining human verification: whether the stale/allocation labels make the intended
+decision clear in daily use. Synthetic events verify processing cost, not native
+event-delivery latency. Full scans remain the reconciliation mechanism.
+
+Final verification: 245 tests passed with `cargo test --workspace --quiet --
+--test-threads=1` (two opt-in diagnostics ignored); all 19 source audits and
+`git diff --check` passed. A parallel run had one lock-acquisition fixture failure
+at proposal time; the test passed on its own and in the full serial suite. Cause
+not established; no lock checks were relaxed. The existing raw zero local-charge
+value is now preserved when reading Parquet, avoiding repeated no-op rewrites of
+folded annotation rows whose unknown subgroup charge is represented by zero.
+
 ## Historical exploration (superseded)
 
 The following execution/review is current; the older exploration resumes after it.

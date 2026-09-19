@@ -495,6 +495,81 @@ fn cleanup_rechecks_fingerprint_but_not_unrelated_build_trees() {
 }
 
 #[test]
+fn hardlinked_updates_skip_untouched_interiors_and_keep_allocated_sizes_current() {
+    use swamp_core::fs_events::{FsEventsPlan, FsEventsRequest, FsEventsSource};
+    struct Live(Vec<PathBuf>);
+    impl FsEventsSource for Live {
+        fn replay(&self, _: &FsEventsRequest) -> FsEventsPlan {
+            FsEventsPlan::from_live(self.0.clone(), 1000, None)
+        }
+    }
+    for initially_linked in [false, true] {
+        let (_tmp, root, target) = fixture();
+        let store = tempfile::tempdir().unwrap();
+        let original = target.join("debug/deps/libdependency.rlib");
+        let alias = target.join("debug/deps/alias.rlib");
+        if initially_linked {
+            fs::hard_link(&original, &alias).unwrap();
+        }
+        let untouched = target.join("debug/incremental/kept/session");
+        fs::create_dir_all(&untouched).unwrap();
+        fs::write(untouched.join("kept"), vec![1u8; 8192]).unwrap();
+        let first = report(&root, store.path());
+        if !initially_linked {
+            fs::hard_link(&original, &alias).unwrap();
+        }
+        fs::write(&original, vec![2u8; 32768]).unwrap();
+        fs::set_permissions(&untouched, fs::Permissions::from_mode(0o000)).unwrap();
+        let next = swamp_core::report::report_full_mode_with_source(
+            &root,
+            None,
+            false,
+            Some(store.path()),
+            Some("1h"),
+            true,
+            false,
+            false,
+            false,
+            &Live(vec![target.join("debug/deps")]),
+        );
+        fs::set_permissions(&untouched, fs::Permissions::from_mode(0o755)).unwrap();
+        let next = next.unwrap();
+        let row = |r: &swamp_core::Report| {
+            r.projects
+                .iter()
+                .flat_map(|p| &p.worktrees)
+                .flat_map(|w| &w.artifacts)
+                .find(|a| a.path == target)
+                .unwrap()
+                .clone()
+        };
+        assert!(row(&next).dedup_stale);
+        assert_eq!(row(&next).bytes, row(&first).bytes);
+        assert!(row(&next).allocated_bytes > row(&first).allocated_bytes);
+        assert_eq!(row(&next).growth_bytes, None);
+        let kept_size = |r: &swamp_core::Report| {
+            r.nested_artifacts
+                .iter()
+                .find(|u| u.path == target.join("debug/incremental/kept"))
+                .unwrap()
+                .bytes
+        };
+        assert_eq!(
+            kept_size(&first),
+            kept_size(&next),
+            "untouched unreadable subtree must be carried, not rewalked"
+        );
+        assert!(
+            swamp_core::render::render_view_builds(&next, None).contains("unique stale; allocated")
+        );
+        let full = report(&root, store.path());
+        assert!(!row(&full).dedup_stale);
+        assert_eq!(row(&full).allocated_bytes, row(&next).allocated_bytes);
+        assert!(row(&full).bytes > row(&first).bytes);
+    }
+}
+
+#[test]
 fn trusted_unchanged_container_reuses_units_without_reading_fingerprints() {
     use swamp_core::fs_events::{FsEventsPlan, FsEventsRequest, FsEventsSource};
     struct Unchanged;

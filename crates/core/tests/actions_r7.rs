@@ -230,6 +230,43 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
 }
 
 #[test]
+fn stale_unique_bytes_do_not_spend_a_standing_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let trash = set_trash(store.path());
+    let mut r = report_for(&fx.root, store.path());
+    let nm = row_path(&r, ArtifactKind::DependencyTree, "/node_modules");
+    for a in r
+        .projects
+        .iter_mut()
+        .flat_map(|p| &mut p.worktrees)
+        .flat_map(|w| &mut w.artifacts)
+    {
+        if a.path == nm {
+            a.dedup_stale = true;
+        }
+    }
+    let plan = propose(&r, None, std::slice::from_ref(&nm), "test").unwrap();
+    assert!(plan.units[0].dedup_stale);
+    assert!(plan.units[0].warnings.iter().any(|w| w.contains("stale")));
+    save_plan(store.path(), &plan).unwrap();
+    add_standing_grant(
+        store.path(),
+        "kind:DependencyTree",
+        1 << 30,
+        None,
+        3600,
+        "human:test",
+    )
+    .unwrap();
+    let result = execute_with_trash(store.path(), &plan.id, "test", &trash).unwrap();
+    assert_eq!(result.state, "awaiting-authorization");
+    assert!(nm.exists());
+    assert_eq!(list_grants(store.path()).unwrap()[0].spent_bytes, 0);
+}
+
+#[test]
 fn standing_grant_covers_by_predicate_and_budget_refuses_overrun() {
     let tmp = tempfile::tempdir().unwrap();
     let fx = fixture::build(tmp.path());

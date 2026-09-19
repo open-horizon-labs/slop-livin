@@ -90,6 +90,13 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn header_line(app: &App, width: usize) -> String {
+    let stale = app
+        .report
+        .projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.artifacts)
+        .any(|a| a.dedup_stale);
     let projects = app.report.projects.len();
     let attributed: u64 = app
         .report
@@ -136,7 +143,11 @@ fn header_line(app: &App, width: usize) -> String {
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
-        app.root.display().to_string(),
+        if stale {
+            format!("unique totals stale · {}", app.root.display())
+        } else {
+            app.root.display().to_string()
+        },
         format!("{obs}{since}"),
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
