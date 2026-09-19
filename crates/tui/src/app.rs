@@ -626,7 +626,10 @@ impl App {
             let Some(kind) = row.kind.clone() else {
                 // Projects view: each row stands for a whole project.
                 if let Some(project) = row.project.clone() {
-                    let n = self.mark_project(&project);
+                    // Bulk marking never reaches for a checkout: `A` over
+                    // a screen of projects would otherwise queue every
+                    // checkout under the root behind one Enter.
+                    let n = self.mark_project(&project, false);
                     if n == 0 {
                         refused = refused.or(Some("nothing reclaimable in this project"));
                     }
@@ -669,22 +672,38 @@ impl App {
     /// on the whole project rather than on whatever the current filter
     /// happens to show. Returns how many units it newly marked; a second
     /// press on a fully marked project clears it and returns 0.
-    fn mark_project(&mut self, project: &str) -> usize {
-        let units: Vec<Row> = model::tree_rows(
+    fn mark_project(&mut self, project: &str, include_checkouts: bool) -> usize {
+        let rows = model::tree_rows(
             &self.report,
             project,
             &Filter::default(),
             &std::collections::HashSet::new(),
             &self.track,
-        )
-        .into_iter()
-        .filter(|r| {
-            r.unit.is_some()
-                && r.kind
-                    .as_ref()
-                    .is_some_and(|k| crate::units::markable(k).is_ok())
-        })
-        .collect();
+        );
+        let mut units: Vec<Row> = rows
+            .iter()
+            .filter(|r| {
+                r.unit.is_some()
+                    && r.kind
+                        .as_ref()
+                        .is_some_and(|k| crate::units::markable(k).is_ok())
+            })
+            .cloned()
+            .collect();
+        if units.is_empty() && include_checkouts {
+            // A project with nothing rebuildable in it -- a checkout and
+            // its source, and that is all. Refusing here was the whole
+            // complaint: the row is not actionable and the human has to
+            // open it to reach the only thing there is. So the row
+            // offers the checkouts themselves, each carrying its own
+            // dirty / unpushed / untracked-content warnings onto the
+            // confirm line.
+            units = rows
+                .iter()
+                .filter(|r| r.worktree.is_some() && r.unit.is_some())
+                .cloned()
+                .collect();
+        }
         if units.is_empty() {
             return 0;
         }
@@ -726,7 +745,7 @@ impl App {
             // path. Marking it means marking what that project can give
             // back, so the human does not have to open it first.
             if let Some(project) = row.project.clone() {
-                if self.mark_project(&project) == 0 {
+                if self.mark_project(&project, true) == 0 {
                     self.set_refusal("nothing reclaimable in this project");
                 }
                 return;
@@ -1267,6 +1286,49 @@ mod tests {
         // A second press clears the project rather than re-marking it.
         app.mark_selected();
         assert!(app.marked.is_empty());
+    }
+
+    /// The same report with every rebuildable artifact removed: a
+    /// checkout, its source and nothing else.
+    fn report_with_only_source() -> Report {
+        let mut report = fixture_report();
+        for p in report.projects.iter_mut() {
+            for wt in p.worktrees.iter_mut() {
+                wt.artifacts
+                    .retain(|a| a.kind == slop_livin_core::report::ArtifactKind::Source);
+            }
+        }
+        report
+    }
+
+    #[test]
+    fn a_project_with_nothing_rebuildable_offers_its_checkout() {
+        let mut app = App::new(report_with_only_source(), "/root".into());
+        app.clear_filter();
+        app.selected = 0;
+        app.mark_selected();
+        assert!(
+            app.refusal_active().is_none(),
+            "the row must do something rather than refuse"
+        );
+        assert!(
+            app.marked.contains_key("/root/mole"),
+            "the checkout is the only thing this project has: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mark_all_never_reaches_for_a_checkout() {
+        let mut app = App::new(report_with_only_source(), "/root".into());
+        app.clear_filter();
+        app.mark_all_in_view();
+        assert!(
+            app.marked.is_empty(),
+            "A over a screen of projects must not queue checkouts: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        assert!(app.refusal_active().is_some());
     }
 
     #[test]
