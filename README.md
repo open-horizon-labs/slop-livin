@@ -5,30 +5,32 @@ Find out what grew on your disk, by project, and delete it from where you're sta
 `slop-livin` is for developers who run many coding agents at once. Every agent builds, installs, and caches, and a week later the disk is full and nobody remembers which project did it. `du` tells you what is big. `slop-livin` tells you what **grew**, attributes it to a git project → checkout/worktree → artifact, and lets you (or your agent) act on it with the facts in front of you.
 
 ```
-~/src · observed just now · 56 projects · 44.7GB attributed · 202.9MB unowned · docker 15.8GB unowned
-view: projects · filter: none · sort: growth
-open-horizon-labs/slop-livin  🦀🔨                      16.3GB    +10.5GB ██████████████████████   ▂   ▁▂  ▇ █
-open-horizon-labs/unified-hifi-control  🦀⬢🐍🔨⎇1        5.5GB     -1.5GB ███▎                             █
-open-horizon-labs/governed-compositional-etl  🔨         2.0GB   +266.6MB ▌                                 █
-muness/roon-knob  🔨                                     5.2GB   +221.5MB ▌                                 █
-open-horizon-labs/northwoods  ⬢🐳🔨                      1.2GB   -126.8MB ▎
+~/src · observed just now · since 24h · 46 projects · 39.6GB attributed · 202.9MB unowned · docker 11.1GB unowned
+view: projects · filter: none
+open-horizon-labs/slop-livin  🦀🔨                      20.4GB    +14.6GB             │█████████████▏
+obsidian-am  ⬢                                         81.2MB         0B             │
+hiphi-repos/hiphi  ⎇1                                  72.6MB         0B             │
+…
+open-horizon-labs/agent-surface  ⬢🔨                     4.4GB     -1.9GB  ██████████▌│
+open-horizon-labs/governed-compositional-etl  🐍🔨     972.2MB     -2.1GB  ██████████▊│
+hiphi-repos/roon-knob  🔨                               5.2GB     -3.2GB ███████████▍│
 ```
 
-Each row is a `git diff --stat` line for a project: size, then the signed change over the window with its bar (red grew, green shrank), then *when* it moved, then facts. Enter opens the project:
+Each row is a `git diff --stat` line for a project: size, then the signed change over the window, then its bar. The bar diverges around a dim axis — bytes that arrived grow right in red, bytes that left grow left in green — so direction is geometry rather than colour alone, and its length is logarithmic, so a 100 MB change and a 3 MB change do not look alike. What arrived sorts first and what left sorts last, because the question is what grew. Enter opens the project:
 
 ```
-view: tree of governed-compositional-etl  (Esc back) · filter: none
-└─ ▾ main ~/src/open-horizon-labs/governed-compositional-etl        2.0GB   +266.6MB ██████████████████████
-   ├─ ▸ source .  [tracked]                                          1.4GB   +266.3MB ██████████████████████
-   │     ├─ dir raw  [untracked]                                     1.1GB
-   │     └─ … 10 more directories
-   ├─ git .git                                                       5.6MB   +217.1KB ▏
-   ├─ cache .cache  [ignored]                                      290.9MB         0B
-   ├─ deps .venv  🐍  [ignored]                                    251.5MB         0B
-   └─ artifacts scripts/__pycache__  [ignored]                     274.4KB         0B
+view: tree of agent-surface  (Esc back) · filter: none
+└─ ▾ main ~/src/open-horizon-labs/agent-surface                      4.4GB     -1.9GB  ██████████▌│  dirty · 0 unpushed
+   ├─ untracked .                                                   39.2MB     +1.1MB             │█████████▎
+   ├─ artifacts firmware/agent_surface_stackchan (x2)                1.3GB         0B             │
+   ├─ artifacts firmware/agent_surface_atom (x2)                     1.3GB         0B             │
+   ├─ git .git                                                     302.1MB         0B             │
+   ├─ build emulator/build                                          73.9MB         0B             │
+   ├─ deps node_modules                                             45.3MB         0B             │
+   └─ source .                                                      23.8MB         0B             │
 ```
 
-That `raw/` line is the point. It is 1.1 GB, it is not in git, and no `.gitignore` covers it. Nothing would bring it back. The tool says so before you press Backspace; it does not decide for you.
+That `untracked` line is the point. It is 39.2 MB, it is growing, it is in no index and no `.gitignore` covers it, so nothing would bring it back. It is listed apart from `source`, which is the 23.8 MB git actually tracks, and apart from `ignored`, which is what a gitignore rule matches. One row called "source" would have hidden all three in a single number. The tool states which is which before you press Backspace; it does not decide for you.
 
 macOS only for now (FSEvents, LaunchAgent, Trash).
 
@@ -37,7 +39,7 @@ macOS only for now (FSEvents, LaunchAgent, Trash).
 Apple silicon macOS. Each release ships a tarball and its checksum.
 
 ```bash
-v=0.2.0
+v=0.4.0
 curl -fsSLO "https://github.com/open-horizon-labs/slop-livin/releases/download/v$v/slop-livin-$v-aarch64-apple-darwin.tar.gz"
 curl -fsSLO "https://github.com/open-horizon-labs/slop-livin/releases/download/v$v/slop-livin-$v-aarch64-apple-darwin.tar.gz.sha256"
 shasum -a 256 -c "slop-livin-$v-aarch64-apple-darwin.tar.gz.sha256"
@@ -86,9 +88,10 @@ Opens in milliseconds from the last observation and refreshes in the background;
 | Key | Does |
 |---|---|
 | `↑` `↓` | move |
-| `→` `←` | expand / collapse a worktree or a `source` row |
+| `→` `←` | in / out: open or expand · collapse or go back |
 | `Enter` | open a project (in the projects view); confirm a delete |
-| `Space` | mark / unmark the row |
+| `Space` | mark / unmark the row. On a project row, that is every artifact it holds |
+| `A` | mark every row in this view the tool can act on, for one confirm |
 | `⌫` | delete what is under the cursor (or the marked rows), after one confirm |
 | `k` | keep executables: before trashing `target/`, copy `release/`/`debug/` binaries to `bin/` (Python: `dist/*.whl`, `build/**/*.so`) |
 | `/` | filter form: growth, window, kind, project, idle, merge-complete, PR, type, size, age |
@@ -99,19 +102,62 @@ Opens in milliseconds from the last observation and refreshes in the background;
 | `Esc` | back to projects |
 | `?` | help |
 
-**Columns.** bytes · signed growth in the window with its bar, red for bytes arriving and green for bytes leaving, scaled to the largest change on screen · a sparkline of *when* it moved, one bar per time bucket, `·` before the row was first observed · facts (`last commit 1h · dirty · 26 unpushed`, `[tracked]` / `[ignored]` / `[untracked]`).
+**Columns.** bytes · the signed change over the window · a diverging bar around a dim axis, shrink left in green and growth right in red, logarithmic so four orders of magnitude are all legible, with a change under 1 MB drawn as one tick against the axis and its number dimmed · facts (`last commit 1h · dirty · 26 unpushed`). Sorting by growth ranks what arrived first and what left last, because the question is what grew.
+
+**Row kinds** under a worktree are what the bytes are, not where they sit: `build`, `deps`, `cache`, `artifacts` and `git` for folded directories, `docker-image` / `docker-volume` for objects joined to the project, then the three that split the rest of the checkout by what git says about it — `source` for what git tracks, `ignored` for what a gitignore rule matches, `untracked` for what is in no version control at all. The last two are aggregates over many scattered paths, so they are reported, never deleted as a unit.
 
 **Badges** after a project's name are its ecosystems, from the markers at the checkout root: 🦀 Rust · ⬢ Node · 🦕 Deno · 🐍 Python · 🐹 Go · ☕ JVM · 🔺 Scala · 🔧 C/C++ · 🐦 Swift · 🟣 .NET · 💎 Ruby · 💧 Elixir · 🐘 PHP · λ Haskell · 🎯 Dart · ⚡ Zig · 🌍 Terraform · 🐳 Docker · 🎲 Unity · 🎮 Unreal, plus 🔨 when it holds build output and ⎇N for N linked worktrees. A checkout can be several at once.
 
 **Deleting.** Backspace asks once, and the question states what the tool knows:
 
 ```
-delete governed-compositional-etl ⚠ dirty · 26 unpushed · raw untracked 1.1GB (2.0GB) → Trash?  Enter yes · Esc no · k keep executables
+delete node_modules ⚠ dirty · 26 unpushed (331.0MB) → Trash?  Enter yes · Esc no · k keep executables
 ```
 
-Everything goes to Trash. The row and everything under it leave the screen at once, the totals drop by what left, and an incremental re-observe runs in the background. The ledger (`~/.local/share/slop-livin/ledger.jsonl`) records what was removed, by whom, and which warnings were on screen.
+You do not have to open a project to act on it. Space or Backspace on a projects row takes every artifact that project holds — dependency trees, build output, caches and its Docker objects — behind one confirm. The checkout, its `.git` and its source tree are not in that set; removing those stays a deliberate act one level in, on the row that names the worktree and carries its warnings. A project with nothing rebuildable in it offers the checkout itself, because that is the only thing it has.
+
+Anything that cannot be restored is named on the confirm line, not just counted:
+
+```
+delete node_modules, target, .cache +2 more (2.1GB) → 1.6GB to Trash, 501.0MB removed permanently (docker, no Trash) · gone for good: app-data (docker volume), slop-app:latest (docker image)?  Enter yes · Esc no · k keep executables
+```
+
+Paths go to Trash. Docker objects do not: the daemon removes them and there is no copy anywhere, so they are listed by name. The row and everything under it leave the screen at once, the totals drop by what left, and an incremental re-observe runs in the background. The ledger (`~/.local/share/slop-livin/ledger.jsonl`) records what was removed, by whom, and which warnings were on screen.
 
 Filter, sort and the keep-executables setting persist between sessions. The growth window can only be as long as the history the store holds; the header says `since 4h (asked 1w; history is 4h)` rather than pretending.
+
+### Docker
+
+Images, build cache and volumes are part of the same answer, and can be removed from the same keystroke. The docker view (`5` in the TUI, `--view docker` on the command line) lists every object, joined to a project or not. From the command line:
+
+```
+project        object                      kind            bytes   shared  facts (trimmed)
+slop-fixture   slop-fixture-app:latest     docker-image   43.9MB        —  created 22:40 · no containers reference it
+slop-fixture   slop-fixture-worker:latest  docker-image   18.7MB        —  created 22:40 · containers=slop-fixture-held (created)
+slop-fixture   slop-fixture-app-data       docker-volume  33.5MB        —  created 22:40 · no containers reference it
+               slop-fixture-orphan:latest  image          27.1MB   4.2MB  created 22:40 · no containers reference it
+               sha256:0bb6d5b540a1…        image          14.5MB   4.2MB  created 23:07 · dangling
+```
+
+The first three are joined to a project on evidence; the last two are unowned, and the report says so rather than guessing an owner. `Space` marks, `⌫` asks once, and the daemon does the removal: `docker image rm` or `docker volume rm`. Four things are worth knowing before you press Enter.
+
+| | |
+|---|---|
+| **Nothing reaches Trash** | A path can be dragged back out of Trash; a Docker object cannot. Removal is permanent and the confirm line names each object rather than only counting its bytes. |
+| **The recovery contract is per kind** | An image is `pull_or_rebuild (permanent: no Trash)`. A volume is `irrecoverable (permanent: no Trash, no copy anywhere)` — its contents exist in exactly one place. Build cache is `local_rebuild (permanent: no Trash)`. |
+| **Build cache is refused per entry** | Docker exposes no per-record removal for it, only `docker builder prune`, which acts on everything reclaimable at once. That is a different unit of action than a plan unit, so the tool reports build cache and refuses to pretend it can remove one entry. |
+| **A refusal comes back in the daemon's own words** | An image a container still holds is refused by Docker, and the outcome says what Docker said, not a guess. |
+
+Orphans are removable too. An image with no join evidence, a dangling layer or a volume no project claims appears under `unowned` (view `7`) with the reason it is unowned, and marks like anything else. Nothing is joined to a project on name similarity, so an orphan says "no project claims these bytes" rather than guessing at one.
+
+From the command line the same objects go through propose → approve → execute:
+
+```bash
+slop-livin report ~/src --view docker                            # joined and unowned together
+slop-livin propose ~/src --filter 'kind:DockerImage project:my-app'
+slop-livin approve <plan-id>                                     # prints each unit's warnings and recovery contract
+slop-livin execute <plan-id>                                     # refused units name the fact that refused them
+```
 
 ### Command line
 
@@ -330,7 +376,7 @@ Plus ESP-IDF (📟, from `sdkconfig`), Godot (🤖), Jekyll (📄), Elm (🌳), 
 
 **Activity as facts.** Last commit age, dirty, unpushed count, locked, idle time, computed in-process at walk time. With `gh` available, every GitHub-remote worktree is enriched with its PR (number, state, review) and whether the branch is merged into the default branch, one GraphQL call per repository, cached six hours. The composite `merge-complete` is always shown with its terms; the tool never says "safe" or "stale".
 
-**Docker as part of the same answer.** Images, build cache and volumes are joined to projects only on explicit evidence: a compose label, a compose file's `name:` inside a worktree, or `org.opencontainers.image.source` matching a remote. Everything else is listed as unowned with the reason. Name similarity never attributes. Docker bytes are reported next to, not inside, the filesystem total.
+**Docker as part of the same answer.** Images, build cache and volumes are joined to projects only on explicit evidence: a compose label, a compose file's `name:` inside a worktree, or `org.opencontainers.image.source` matching a remote. Everything else is listed as unowned with the reason. Name similarity never attributes. Docker bytes are reported next to, not inside, the filesystem total. Images and volumes are removable from the same keystroke as a directory, through the daemon rather than Trash, which is why their recovery contract is stated and each object is named on the confirm; build cache is reported and refused per entry, because Docker has no per-record removal for it.
 
 **Honest totals.** `attributed + unowned = walked`, to the byte, on every report. `--verify-du` runs `du -skPx` as an independent oracle. Coverage names permission-denied directories rather than hiding them.
 
