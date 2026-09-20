@@ -526,49 +526,11 @@ impl App {
         if self.view != ViewKind::Tree {
             return;
         }
-        if let Some(row) = self.selected_row()
-            && row.expandable
-        {
-            // The label carries the path for worktree rows; reconstruct
-            // the key the same way tree_rows does, from the report.
-            let name = self
-                .selected_project
-                .clone()
-                .or_else(|| self.report.projects.first().map(|p| p.name.clone()));
-            if let Some(name) = name
-                && let Some(p) = self.report.projects.iter().find(|p| p.name == name)
-            {
-                // Selected index among tree rows maps to worktree rows at depth 1.
-                let rows = self.rows();
-                if let Some(sel) = rows.get(self.selected) {
-                    let idx = rows
-                        .iter()
-                        .take(self.selected + 1)
-                        .filter(|r| r.depth == 1)
-                        .count()
-                        .saturating_sub(1);
-                    if sel.depth == 1
-                        && let Some(wt) = p.worktrees.get(idx)
-                    {
-                        let key = wt.path.display().to_string();
-                        if self.collapsed.contains(&key) {
-                            self.collapsed.remove(&key);
-                        } else {
-                            self.collapsed.insert(key);
-                        }
-                    } else if sel.depth == 2
-                        && let Some(wt) = p.worktrees.get(idx)
-                    {
-                        // A Source row: expand it into its own directories.
-                        let key = format!("source:{}", wt.path.display());
-                        if self.collapsed.contains(&key) {
-                            self.collapsed.remove(&key);
-                        } else {
-                            self.collapsed.insert(key);
-                        }
-                    }
-                }
+        if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
+            if !self.collapsed.remove(&key) {
+                self.collapsed.insert(key);
             }
+            self.selected = self.selected.min(self.rows().len().saturating_sub(1));
         }
     }
 
@@ -607,6 +569,20 @@ impl App {
                 }
             }
             self.annotate_project(&name);
+            // Show profiles and categories immediately, with individual groups
+            // available inside the same tree rather than a separate view.
+            for unit in &self.report.nested_artifacts {
+                if unit.is_dir
+                    && !matches!(
+                        unit.role,
+                        swamp_core::artifact::ArtifactRole::Container
+                            | swamp_core::artifact::ArtifactRole::Profile
+                    )
+                {
+                    self.collapsed
+                        .insert(format!("cargo:{}", unit.path.display()));
+                }
+            }
             self.selected_project = Some(name);
             self.set_view(ViewKind::Tree);
         }

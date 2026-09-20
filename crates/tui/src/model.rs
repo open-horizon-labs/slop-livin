@@ -17,16 +17,29 @@ pub use swamp_core::render::human_bytes_signed as human_signed_bytes;
 /// than `foo…`, per DESIGN.md ("truncated with `…` in the middle,
 /// keeping the tail").
 pub fn truncate_middle(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width || width < 4 {
+    use unicode_segmentation::UnicodeSegmentation;
+    if display_width(s) <= width {
         return s.to_string();
     }
-    // Paths are recognised by their tail (`…/hiphi-repos/roon-knob`), so
-    // keep almost all of the budget for it.
-    let keep_tail = width - 1 - (width / 8).min(6);
-    let keep_head = width - keep_tail - 1;
-    let head: String = chars[..keep_head].iter().collect();
-    let tail: String = chars[chars.len() - keep_tail..].iter().collect();
+    if width == 0 {
+        return String::new();
+    }
+    let head_budget = (width.saturating_sub(1) / 8).min(6);
+    let mut head = String::new();
+    for g in s.graphemes(true) {
+        if display_width(&head) + display_width(g) > head_budget {
+            break;
+        }
+        head.push_str(g);
+    }
+    let tail_budget = width - display_width(&head) - 1;
+    let mut tail = String::new();
+    for g in s.graphemes(true).rev() {
+        if display_width(&tail) + display_width(g) > tail_budget {
+            break;
+        }
+        tail.insert_str(0, g);
+    }
     format!("{head}…{tail}")
 }
 
@@ -119,6 +132,7 @@ pub struct Row {
     /// because the row is collapsed.
     pub collapsed_children: Option<usize>,
     pub expandable: bool,
+    pub expansion_key: Option<String>,
     /// Set on a projects-view row: the project's own name (not its
     /// display name), so marking can expand the row into that project's
     /// artifacts without parsing the rendered label back into an
@@ -145,6 +159,7 @@ impl Row {
             mtime_max: 0,
             collapsed_children: None,
             expandable: false,
+            expansion_key: None,
             project: None,
         }
     }
@@ -158,22 +173,8 @@ pub fn display_width(s: &str) -> usize {
 
 /// Pads or truncates `s` to exactly `width` display cells.
 pub fn pad_display(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width {
-        let mut out = String::new();
-        let mut used = 0;
-        for ch in s.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + cw > width {
-                break;
-            }
-            out.push(ch);
-            used += cw;
-        }
-        out.push_str(&" ".repeat(width - used));
-        return out;
-    }
-    format!("{s}{}", " ".repeat(width - w))
+    let s = truncate_middle(s, width);
+    format!("{s}{}", " ".repeat(width.saturating_sub(display_width(&s))))
 }
 
 /// The badge string for a set of ecosystem tags plus project facts.
@@ -187,11 +188,18 @@ pub fn badges(
         .iter()
         .take(3)
         .map(|t| swamp_core::ecosystem::glyph_for(t))
-        .collect();
+        .collect::<Vec<_>>()
+        .join(" ");
     if docker && !ecosystems.iter().any(|t| t == "docker") {
+        if !b.is_empty() {
+            b.push(' ');
+        }
         b.push('🐳');
     }
     if builds {
+        if !b.is_empty() {
+            b.push(' ');
+        }
         b.push('🔨');
     }
     if linked_worktrees > 0 {
@@ -519,6 +527,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             mtime_max,
             collapsed_children: None,
             expandable: true,
+            expansion_key: None,
             project: Some(p.name.clone()),
         });
     }
@@ -617,6 +626,7 @@ pub fn tree_rows(
             mtime_max: 0,
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
+            expansion_key: Some(wt_key.clone()),
             project: None,
         });
         if is_collapsed {
@@ -686,13 +696,46 @@ pub fn tree_rows(
                 .then(|| track.get(&abs).copied())
                 .flatten();
             out_row.expandable = is_source && !children.is_empty();
+            out_row.expansion_key = out_row.expandable.then_some(source_key.clone());
             out_row.collapsed_children = (is_source && source_collapsed).then_some(children.len());
             // A folded group of several artifacts has no single owning
             // path to mark; only an unfolded row is markable.
             if row.folded_count == 1 {
                 out_row.unit = Some(UnitId::for_artifact(&abs));
             }
-            out.push(out_row);
+            let cargo_children = if row.kind == Some(ArtifactKind::BuildOutput)
+                || (row.folded_count == 1
+                    && report.nested_artifacts.iter().any(|u| {
+                        u.path == abs && u.role == swamp_core::artifact::ArtifactRole::Container
+                    })) {
+                cargo_tree_children(
+                    report,
+                    &abs,
+                    3,
+                    &format!("{child_prefix}{}", if r_last { "   " } else { "│  " }),
+                    collapsed,
+                )
+            } else {
+                Vec::new()
+            };
+            if !cargo_children.is_empty() {
+                let key = format!("cargo:{}", abs.display());
+                let closed = collapsed.contains(&key);
+                out_row.expandable = true;
+                out_row.expansion_key = Some(key);
+                out_row.rail = format!(
+                    "{child_prefix}{connector}{} ",
+                    if closed { "▸" } else { "▾" }
+                );
+                out_row.collapsed_children = closed.then_some(cargo_children.len());
+                out_row.signals = vec!["build groups below · allocated, not freeable bytes".into()];
+                out.push(out_row);
+                if !closed {
+                    out.extend(cargo_children);
+                }
+            } else {
+                out.push(out_row);
+            }
             // A Source tree is one row only because nothing inside it is a
             // classified artifact -- which is exactly when its contents are
             // worth seeing. Expanded, it lists its own top-level
@@ -729,6 +772,83 @@ pub fn tree_rows(
 }
 
 pub use swamp_core::render::project_display_name;
+
+fn cargo_tree_children(
+    report: &Report,
+    parent: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut by_parent: BTreeMap<&std::path::Path, Vec<&swamp_core::artifact::NestedArtifact>> =
+        BTreeMap::new();
+    for unit in report.nested_artifacts.iter().filter(|u| u.present) {
+        if let Some(parent) = unit.path.parent() {
+            by_parent.entry(parent).or_default().push(unit);
+        }
+    }
+    cargo_children_from_index(&by_parent, parent, depth, prefix, collapsed)
+}
+
+fn cargo_children_from_index(
+    by_parent: &BTreeMap<&std::path::Path, Vec<&swamp_core::artifact::NestedArtifact>>,
+    parent: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut children = by_parent.get(parent).cloned().unwrap_or_default();
+    children.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    let mut rows = Vec::new();
+    for (index, unit) in children.iter().enumerate() {
+        let last = index + 1 == children.len();
+        let key = format!("cargo:{}", unit.path.display());
+        let count = by_parent.get(unit.path.as_path()).map_or(0, Vec::len);
+        let has_children = count > 0;
+        let closed = has_children && collapsed.contains(&key);
+        let name = unit.path.file_name().unwrap_or_default().to_string_lossy();
+        let mut row = Row::leaf(
+            depth,
+            if name == unit.role.label() {
+                name.into_owned()
+            } else {
+                format!("{} {name}", unit.role.label())
+            },
+            unit.bytes,
+            unit.growth_bytes,
+        );
+        row.rail = format!(
+            "{prefix}{}{}",
+            if last { "└─ " } else { "├─ " },
+            if has_children {
+                if closed { "▸ " } else { "▾ " }
+            } else {
+                ""
+            }
+        );
+        row.expandable = has_children;
+        row.expansion_key = has_children.then_some(key);
+        row.collapsed_children = closed.then_some(count);
+        let guidance = swamp_core::cargo_cleanup::guidance(unit);
+        row.signals = vec![guidance.recommendation.into(), guidance.consequence.into()];
+        row.mtime_max = unit.mtime_max;
+        if swamp_core::cargo_cleanup::candidate(unit) {
+            row.unit = Some(UnitId::for_artifact(&unit.path));
+            row.kind = Some(ArtifactKind::BuildOutput);
+        }
+        rows.push(row);
+        if has_children && !closed {
+            rows.extend(cargo_children_from_index(
+                by_parent,
+                &unit.path,
+                depth + 1,
+                &format!("{prefix}{}", if last { "   " } else { "│  " }),
+                collapsed,
+            ));
+        }
+    }
+    rows
+}
 
 /// Top-level directories of a worktree's Source tree, biggest first.
 /// Empty when the report was built without directory rollups.
@@ -784,6 +904,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             mtime_max: 0,
             collapsed_children: None,
             expandable: false,
+            expansion_key: None,
             project: None,
         })
         .collect()
@@ -973,28 +1094,13 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         let mut row = Row::leaf(
                             1,
                             format!(
-                                "  {} · {} · {} (unique {}){}",
+                                "{} · {}",
                                 match swamp_core::cargo_cleanup::guidance(u).next_action {
                                     "inspect_groups" => "category",
                                     "review_cleanup" => "unchecked",
                                     _ => "inspection-only",
                                 },
-                                u.role.label(),
-                                u.path.display(),
-                                if matches!(
-                                    u.membership,
-                                    swamp_core::artifact::Membership::Unknown
-                                        | swamp_core::artifact::Membership::SharedHardlink
-                                ) {
-                                    "unknown".into()
-                                } else {
-                                    human_bytes(u.physical_total)
-                                },
-                                if u.variant.unknowns.is_empty() {
-                                    String::new()
-                                } else {
-                                    " · unknowns".to_string()
-                                }
+                                u.path.strip_prefix(&a.path).unwrap_or(&u.path).display(),
                             ),
                             u.bytes,
                             u.growth_bytes,
@@ -1007,7 +1113,12 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         if swamp_core::cargo_cleanup::guidance(u).check_status == "unchecked" {
                             row.unit = Some(UnitId::for_artifact(&u.path));
                             row.kind = Some(ArtifactKind::BuildOutput);
-                            row.signals = vec!["unchecked".into()];
+                            let guidance = swamp_core::cargo_cleanup::guidance(u);
+                            row.signals = vec![
+                                guidance.recommendation.into(),
+                                guidance.consequence.into(),
+                                "review required".into(),
+                            ];
                         } else {
                             row.signals = if u.coverage.supported {
                                 vec![
@@ -1022,6 +1133,15 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 vec!["coverage-limited".into()]
                             };
                         }
+                        let guidance = swamp_core::cargo_cleanup::guidance(u);
+                        if guidance.check_status != "unchecked" {
+                            row.signals.extend([
+                                guidance.recommendation.into(),
+                                guidance.consequence.into(),
+                            ]);
+                        }
+                        row.signals
+                            .push("allocated bytes; reclaimable space unknown".into());
                         row
                     })
                     .collect();
@@ -1322,6 +1442,18 @@ mod tests {
     #[test]
     fn truncate_middle_leaves_short_strings_alone() {
         assert_eq!(truncate_middle("short", 20), "short");
+    }
+
+    #[test]
+    fn unicode_columns_are_cell_bounded_even_at_tiny_widths() {
+        for text in ["project 🦀 🔨 ⎇ 123", "工程/長い名前", "a👩‍💻b e\u{301} tail"]
+        {
+            for width in 0..80 {
+                assert!(display_width(&truncate_middle(text, width)) <= width);
+                assert_eq!(display_width(&pad_display(text, width)), width);
+            }
+        }
+        assert!(badges(&["rust".into()], false, true, 12).contains(" ⎇ 12"));
     }
 
     #[test]

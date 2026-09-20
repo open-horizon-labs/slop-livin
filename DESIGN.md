@@ -6,6 +6,18 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
+Column headings identify name, size, change, and cleanup/facts. Name truncation
+and padding use grapheme-aware terminal-cell widths. Badges have separating
+spaces. Below 140 columns, hide the change bar; below 100, show facts in the
+selected-row detail area instead of squeezing them into a column. Zero and
+unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+
+Opening a project shows Cargo profiles and categories inside its build target.
+Categories expand into exact groups in the same tree; category rows are navigation,
+not selective cleanup units. The selected-row detail area shows recommendations
+and rebuilding consequences. Compiler caches are a suggested starting point,
+not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
+
 The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to visible changes. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
 
 Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.

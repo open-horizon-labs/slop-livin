@@ -57,6 +57,8 @@ pub struct CargoGroup {
 /// Derived from existing facts only. Never performs I/O or implies authorization.
 #[derive(Debug, Serialize)]
 pub struct Guidance {
+    pub recommendation: &'static str,
+    pub consequence: &'static str,
     pub scope: &'static str,
     pub check_status: &'static str,
     pub reason_code: &'static str,
@@ -100,11 +102,49 @@ pub fn guidance(unit: &NestedArtifact) -> Guidance {
             )
         };
     Guidance {
+        recommendation: recommendation(unit).0,
+        consequence: recommendation(unit).1,
         scope,
         check_status: status,
         reason_code: code,
         message,
         next_action: next,
+    }
+}
+
+/// Decision support, not eligibility or authorization. No age-based disuse claim.
+pub fn recommendation(unit: &NestedArtifact) -> (&'static str, &'static str) {
+    if !unit.coverage.complete || !unit.coverage.supported {
+        return (
+            "Inspect coverage",
+            "Incomplete evidence; refresh before cleanup",
+        );
+    }
+    match unit.role {
+        ArtifactRole::Incremental => (
+            "Start here: compiler cache",
+            "Remove to trade cached compilation work for space; next build may be slower",
+        ),
+        ArtifactRole::TestExecutable | ArtifactRole::Example => (
+            "Review compiled executable",
+            "Remove if no longer needed; rerunning requires rebuilding with source and toolchain",
+        ),
+        ArtifactRole::BuildScriptOutput => (
+            "Review generated output",
+            "Rebuild reruns build scripts and may need external tools or network access",
+        ),
+        ArtifactRole::Dependency => (
+            "Compiled dependencies",
+            "Folded aggregate; selective dependency cleanup is not implemented",
+        ),
+        ArtifactRole::Container | ArtifactRole::Profile => (
+            "Inspect build groups",
+            "Includes children; sizes are allocation, not guaranteed free space",
+        ),
+        _ => (
+            "Inspect purpose",
+            "No supported cleanup recommendation for this output",
+        ),
     }
 }
 

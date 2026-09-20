@@ -17,6 +17,83 @@ use swamp_core::report::{
 use swamp_tui::app::{App, ViewKind};
 use swamp_tui::ui;
 
+#[test]
+fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let target = root.join("target");
+    std::fs::create_dir_all(target.join("debug/incremental/crate-a")).unwrap();
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(target.join("debug/incremental/crate-a/state"), b"data").unwrap();
+    for index in 0..40 {
+        std::fs::create_dir_all(target.join(format!("debug/incremental/group-{index:02}")))
+            .unwrap();
+    }
+    let mut report = fixture_report();
+    report.projects.truncate(1);
+    report.root = root.clone();
+    let project = &mut report.projects[0];
+    project.worktrees.truncate(1);
+    project.worktrees[0].path = root.clone();
+    project.worktrees[0].artifacts = vec![art(
+        ArtifactKind::BuildOutput,
+        target.to_str().unwrap(),
+        4096,
+        Some(0),
+    )];
+    report.nested_artifacts =
+        swamp_core::cargo_artifacts::inspect_target(&target, Some(&target)).units;
+    let mut app = App::new(report, root);
+    app.clear_filter();
+    app.drill_into_selected();
+    assert_eq!(app.view, ViewKind::Tree);
+    let rows = app.rows();
+    assert!(rows.iter().any(|r| r.label == "profile debug"));
+    let incremental = rows.iter().position(|r| r.label == "incremental").unwrap();
+    assert!(rows[incremental].collapsed_children.is_some());
+    assert!(
+        rows[incremental].unit.is_none(),
+        "category must not become an exact cleanup selection"
+    );
+    assert!(!rows.iter().any(|r| r.label.contains("crate-a")));
+    app.selected = incremental;
+    for (width, height) in [(80, 24), (120, 30), (200, 60)] {
+        let rendered = capture(&app, width, height);
+        assert!(
+            rendered.contains("Start here: compiler cache"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("slower"),
+            "selected consequence should remain visible: {rendered}"
+        );
+        assert!(rendered.contains("Change"));
+    }
+    app.enter_row();
+    let rows = app.rows();
+    let leaf = rows.iter().find(|r| r.label.contains("crate-a")).unwrap();
+    assert_eq!(
+        leaf.unit.as_ref().unwrap().0,
+        target
+            .join("debug/incremental/crate-a")
+            .display()
+            .to_string()
+    );
+    let last_group = rows
+        .iter()
+        .rposition(|r| r.label.contains("group-"))
+        .unwrap();
+    app.selected = last_group;
+    let rendered = capture(&app, 80, 24);
+    assert!(
+        rendered.contains("group-39"),
+        "selection must scroll into view: {rendered}"
+    );
+    app.selected = incremental;
+    app.leave_row();
+    assert!(!app.rows().iter().any(|r| r.label.contains("crate-a")));
+}
+
 fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> ArtifactRow {
     ArtifactRow {
         kind,
@@ -174,6 +251,8 @@ fn cargo_cleanup_guidance_frames() {
     let mut report = fixture_report();
     let root = "/Users/dev/src/mole/target";
     for (rel, role, is_dir) in [
+        ("debug", "Profile", true),
+        ("debug/deps", "Dependency", true),
         ("debug/incremental", "Incremental", true),
         ("debug/incremental/crate-a", "Incremental", true),
         ("debug/deps/test-a", "TestExecutable", false),
@@ -194,6 +273,16 @@ fn cargo_cleanup_guidance_frames() {
         assert!(frame.contains("category"), "{frame}");
         assert!(frame.contains("unchecked"), "{frame}");
         check(&format!("cargo_cleanup_{w}x{h}"), &frame);
+        app.selected_project = Some("mole".into());
+        app.set_view(ViewKind::Tree);
+        app.collapsed
+            .insert(format!("cargo:{root}/debug/incremental"));
+        app.selected = app
+            .rows()
+            .iter()
+            .position(|r| r.label == "incremental")
+            .unwrap();
+        check(&format!("cargo_tree_{w}x{h}"), &capture(&app, w, h));
     }
 }
 
@@ -441,6 +530,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         mtime_max: 0,
         collapsed_children: None,
         expandable: false,
+        expansion_key: None,
         project: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));

@@ -158,7 +158,7 @@ fn header_line(app: &App, width: usize) -> String {
 }
 
 /// Joins clauses with " · " while the result fits in `width`; always keeps
-/// the first clause.
+/// the first clause, truncated to terminal cells if necessary.
 pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     let mut out = String::new();
     for (i, c) in clauses.iter().filter(|c| !c.is_empty()).enumerate() {
@@ -167,12 +167,12 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
         } else {
             format!("{out} · {c}")
         };
-        if i > 0 && width > 0 && candidate.chars().count() > width {
+        if i > 0 && width > 0 && crate::model::display_width(&candidate) > width {
             break;
         }
         out = candidate;
     }
-    out
+    truncate_middle(&out, width)
 }
 
 fn footer_line() -> &'static str {
@@ -390,17 +390,28 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let narrow = width < 120;
     // Half the diverging bar, each side; plus one cell for the axis.
-    let half: usize = ((width.saturating_sub(90)) / 8).clamp(6, 20);
+    let half: usize = if width >= 140 { 6 } else { 0 };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
-    let fixed = 10 + 1 + 10 + 1 + (half * 2 + 1) + 1;
-    let flexible = width.saturating_sub(fixed).max(40);
-    let signals_width: usize = if narrow {
-        flexible / 4
-    } else {
-        (flexible * 2 / 5).min(70)
-    };
-    let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    let bar_width = if half > 0 { half * 2 + 2 } else { 0 };
+    let fixed = 24 + bar_width;
+    let flexible = width.saturating_sub(fixed);
+    let signals_width = if width >= 100 { flexible / 3 } else { 0 };
+    let name_width = flexible.saturating_sub(signals_width);
+    let heading = format!(
+        "{}{:>10} {:>10} {} {}",
+        pad_display("Name", name_width),
+        "Size",
+        "Change",
+        pad_display(
+            if half > 0 { "Change bar" } else { "" },
+            bar_width.saturating_sub(1)
+        ),
+        pad_display("Cleanup / facts", signals_width)
+    );
+    let mut lines: Vec<Line> = vec![Line::styled(
+        heading,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
     for (i, row) in rows.iter().enumerate() {
         let marked = row
             .unit
@@ -470,6 +481,13 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        let bar = if half == 0 {
+            String::new()
+        } else if row.growth.is_none_or(|g| g == 0) {
+            " ".repeat(bar_width)
+        } else {
+            format!("{bar_left}{axis}{bar_right} ")
+        };
         let spans = vec![
             Span::styled(pad_display(&name, name_width), name_style),
             Span::raw(bytes),
@@ -478,20 +496,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             // colour, number flush against the bar it measures.
             Span::styled(growth, bar_style),
             Span::raw(" "),
-            Span::styled(bar_left, bar_style),
+            Span::styled(bar, bar_style),
             Span::styled(
-                axis.to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(bar_right, bar_style),
-            Span::raw(" "),
-            Span::styled(
-                format!(" {signals_text}"),
+                pad_display(&format!("{signals_text}{hidden}"), signals_width),
                 Style::default().add_modifier(Modifier::DIM),
             ),
-            Span::styled(hidden, Style::default().add_modifier(Modifier::DIM)),
         ];
 
         let mut line = Line::from(spans);
@@ -504,7 +513,32 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(line);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    // Keep the selection visible even in projects with hundreds of build groups.
+    let detail_height = 2.min(area.height.saturating_sub(2));
+    let table_height = area.height.saturating_sub(detail_height);
+    let visible = table_height.saturating_sub(1) as usize;
+    let offset = app.selected.saturating_sub(visible.saturating_sub(1));
+    let header = lines.remove(0);
+    let shown = std::iter::once(header)
+        .chain(lines.into_iter().skip(offset).take(visible))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(shown),
+        Rect {
+            height: table_height,
+            ..area
+        },
+    );
+    if let Some(row) = rows.get(app.selected) {
+        frame.render_widget(
+            Paragraph::new(row.signals.join(" · ")).wrap(ratatui::widgets::Wrap { trim: true }),
+            Rect {
+                y: area.y + table_height,
+                height: detail_height,
+                ..area
+            },
+        );
+    }
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {

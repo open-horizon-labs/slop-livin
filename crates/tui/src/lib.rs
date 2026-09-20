@@ -412,8 +412,8 @@ mod tests {
         assert!(!narrow.contains("docker"));
         assert_eq!(
             ui::fit_clauses(&clauses, 3),
-            "/root",
-            "first clause always kept"
+            "…ot",
+            "first clause is retained within the terminal-cell budget"
         );
     }
 
