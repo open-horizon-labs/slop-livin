@@ -31,7 +31,7 @@ Folded groups show allocated totals, not an inferred reclaimable size. Subgroup 
 
 Path layout identifies profiles, dependencies, examples, build-script output, incremental state, and companion metadata. Existing Cargo fingerprints identify test executables and supply feature/compiler evidence where available. A fingerprint is not proof of last execution or obsolescence. Unknown variants stay unknown; historical compiler-message evidence does not establish freshness. Scanning never runs Cargo or build scripts.
 
-Selective cleanup uses the existing plan, explicit approval, and ledger boundary. Supported selections are evidenced test/example executables with their dep-info/debug-symbol companions, or individual incremental/build-script directories. Execution holds existing Cargo profile locks and rechecks the selected group's role, fingerprint evidence, membership, identity, content, and occupancy—not the whole build tree. It then moves members into a same-filesystem Trash envelope with a restore manifest. Unsupported layouts, shared hardlinks, missing locks, and uncertain occupancy refuse cleanup. Locks are advisory: manual writers must be stopped. Shared dependency groups remain inspection-only.
+Selective cleanup uses the existing plan, explicit approval, and ledger boundary. Supported selections are evidenced test/example executables with their dep-info/debug-symbol companions, or individual incremental/build-script directories. Execution holds existing Cargo profile locks and rechecks the selected group's role, fingerprint evidence, membership, identity, content, and occupancy—not the whole build tree. It then moves members into a same-filesystem Trash envelope with a restore manifest. Hardlinks do not prevent that move: unselected links remain intact, and reclaimable space stays unknown. The selected-group snapshot records link evidence without building a global alias inventory. Unsupported layouts, missing locks, and uncertain occupancy refuse cleanup. Locks are advisory: manual writers must be stopped. Shared dependency groups remain inspection-only.
 
 Files outside classified artifacts are split into tracked, ignored, and untracked remainder buckets. The [ignore lens](../crates/core/src/ignore.rs) uses Git's index and exclude rules through gitoxide. Byte totals are apportioned using directory observations, with corrections for individually recorded large files. This preserves the measured total but is not an exhaustive per-file accounting of Git status.
 
@@ -117,7 +117,7 @@ The optional LaunchAgent starts `swamp observe` at an interval and lets it exit.
 
 ### Current values and reverse deltas
 
-The report history lives under `~/.local/share/swamp/<volume-id>/`, or the directory selected by `SWAMP_DIR`.
+The report history lives under `~/.local/share/swamp/<root-scope-id>/`, or the directory selected by `SWAMP_DIR`. The scope ID hashes the device and canonical scan root. Current measurements, reverse deltas, topology, and event checkpoints are isolated by root, so a project observation cannot replace its parent's state. Root aliases share a scope. GitHub enrichment remains a separate device-scoped cache keyed by worktree and Git evidence.
 
 | Stored data | Purpose |
 |---|---|
@@ -190,7 +190,7 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
 - Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.
 - Worktree identity is path-derived. Relative artifact paths do not make history portable across arbitrary moves or renamed remotes.
 - Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI/MCP `since` values for window comparisons.
-- The store is partitioned by volume; topology and current-row replacement are not independently namespaced for every overlapping root. Prefer one common development root per store. Use separate stores when independently observing different roots on the same volume.
+- Overlapping scan roots have independent histories. Their totals must not be added together; scanning both also retains measurements for both scopes.
 - Filesystem events may require a full scan. Hardlinks can make an artifact update much more expensive than the changed directory alone suggests.
 - The report covers what swamp measured under the requested root. It is not a complete accounting of volume free space, snapshots, backups, or Docker's physical storage.
 - GitHub and Docker context can lag local measurements. Check observation times and notes before acting.

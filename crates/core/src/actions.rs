@@ -335,6 +335,10 @@ pub fn propose(
                         unit.verb = "cargo-group".into();
                         unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
                         unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
+                        unit.warnings.push("size is selected allocation, not promised free space; moving to Trash does not free these bytes immediately".into());
+                        if group.shared_storage {
+                            unit.warnings.push("selected files have hardlinks; any links outside the selection remain intact and reclaimable space is unknown".into());
+                        }
                         unit.warnings.extend(
                             group
                                 .members
@@ -410,13 +414,12 @@ pub fn propose(
                         "overlapping cleanup selections; select either parent or child, not both"
                     );
                 }
-                if let (Some(a), Some(b)) = (&a.cargo_group, &b.cargo_group) {
-                    if a.members
+                if let (Some(a), Some(b)) = (&a.cargo_group, &b.cargo_group)
+                    && a.members
                         .iter()
                         .any(|x| b.members.iter().any(|y| x.path == y.path))
-                    {
-                        bail!("overlapping Cargo companion selections");
-                    }
+                {
+                    bail!("overlapping Cargo companion selections");
                 }
             }
         }

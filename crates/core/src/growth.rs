@@ -2,7 +2,7 @@
 //!
 //! Reuses the existing zstd/Parquet `Store` (see `store.rs`) rather than
 //! adding a second persistence layer. Layout under
-//! `${SWAMP_DIR}/<volume-id>/`:
+//! `${SWAMP_DIR}/<root-scope-id>/`:
 //!
 //! - `current.parquet`: one row per known artifact key, holding its most
 //!   recently observed value (including tombstones for keys that are no
@@ -42,6 +42,7 @@ use parquet::file::properties::{WriterProperties, WriterVersion};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -387,6 +388,31 @@ fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanAr
 fn volume_dir(swamp_dir: &Path, volume_id: u64) -> PathBuf {
     swamp_dir.join(volume_id.to_string())
 }
+
+/// Returns the stable store key for one observed root.
+///
+/// A device is not a sufficient scope: several checkouts (and linked
+/// worktrees) commonly share one volume.  The canonical root makes aliases
+/// such as `/tmp/work` and `/private/tmp/work` share history while keeping
+/// sibling roots independent.  Hashing keeps the existing compact directory
+/// layout and avoids putting user paths into the store name.
+pub fn root_scoped_volume_id(root: &Path) -> u64 {
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let device = fs::metadata(&canonical)
+        .map(|m| m.dev())
+        .unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&device.to_le_bytes());
+    // The canonical path is identity data, not display text. Lossy UTF-8
+    // conversion can collapse distinct non-UTF-8 roots into one store.
+    hasher.update(canonical.as_os_str().as_bytes());
+    let digest = hasher.finalize();
+    u64::from_le_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 digest is 32 bytes"),
+    )
+}
 fn current_path(dir: &Path) -> PathBuf {
     dir.join("current.parquet")
 }
@@ -557,8 +583,7 @@ pub fn annotate_readonly(
 /// `since_secs` ago) and `regrowth_count`.
 ///
 /// `swamp_dir` is the top-level store root (e.g.
-/// `${SWAMP_DIR}`); the volume-keyed subdirectory is derived from
-/// `volume_id`.
+/// `${SWAMP_DIR}`); the caller supplies the root-scope key in `volume_id`.
 pub fn observe_and_annotate(
     swamp_dir: &Path,
     volume_id: u64,
@@ -887,8 +912,8 @@ pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
     oldest.map(|o| now.saturating_sub(o))
 }
 
-/// `history_span_secs` for the volume `root` lives on (the store is keyed
-/// by device id), so every surface bounds its growth windows identically.
+/// `history_span_secs` for `root`, so every surface bounds its growth windows
+/// identically without mixing roots on the same device.
 /// One bucketed byte history: `None` before the first observation.
 pub type Series = Vec<Option<u64>>;
 
@@ -970,17 +995,13 @@ pub fn series_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &st
     row_key(project_id, worktree_id, kind, rel_path)
 }
 
-/// The volume-keyed store directory for the volume `root` lives on.
+/// The root-scoped store directory for `root`.
 pub fn volume_store_dir(swamp_dir: &Path, root: &Path) -> PathBuf {
-    use std::os::unix::fs::MetadataExt;
-    let dev = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
-    volume_dir(swamp_dir, dev)
+    volume_dir(swamp_dir, root_scoped_volume_id(root))
 }
 
 pub fn history_span_for_root(store: &Path, root: &Path, now: u64) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let dev = fs::metadata(root).ok()?.dev();
-    history_span_secs(&store.join(dev.to_string()), now)
+    history_span_secs(&store.join(root_scoped_volume_id(root).to_string()), now)
 }
 
 pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
@@ -2023,22 +2044,14 @@ pub fn stage_tracked_with_source(
     observe: bool,
     source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
-    let volume_id = fs::metadata(root).map(|m| m.dev()).unwrap_or(0);
+    // This public lower-level entry point must be safe for direct callers;
+    // never persist alias-form topology into a canonical root scope.
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let volume_id = root_scoped_volume_id(&root);
     let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
 
-    // FSEvents always answers in canonical paths (ask about `/tmp/x` on
-    // macOS and it replies about `/private/tmp/x`); everything else this
-    // module stores or matches against (topology, artifact/dir/file
-    // rows) is expressed in whatever form the caller's `root` already
-    // was, unchanged from every walk before this feature existed. Rather
-    // than canonicalize the whole walk (which would change every path
-    // this crate has ever returned whenever the caller's root sits under
-    // a symlink -- macOS's own default temp dir is exactly this shape),
-    // [`rebase_from_canonical`] translates each `changed_dirs` entry back
-    // into the caller's original root form immediately after the
-    // replay, so every path downstream of this point stays in the one
-    // form the rest of the crate already assumes.
+    // FSEvents and persisted topology use the canonical root namespace.
     let prev_state = read_fsevents_state(&dir);
 
     // `force_full` (`--full`, and every pre-#29 caller: `report_full`,
@@ -2062,7 +2075,7 @@ pub fn stage_tracked_with_source(
         } else {
             "full_rules_changed"
         };
-        let result = full_walk(root, observed_at, large_file_min_bytes, reason)?;
+        let result = full_walk(&root, observed_at, large_file_min_bytes, reason)?;
         let checkpoint = observe.then(|| ObservationCheckpoint {
             dir,
             topology: to_stored_worktrees(&result.discovered),
@@ -2081,19 +2094,6 @@ pub fn stage_tracked_with_source(
         return Ok((result, checkpoint));
     }
 
-    // FSEvents always answers in canonical paths (ask about `/tmp/x` on
-    // macOS and it replies about `/private/tmp/x`); everything else this
-    // module stores or matches against (topology, artifact/dir/file
-    // rows) is expressed in whatever form the caller's `root` already
-    // was, unchanged from every walk before this feature existed. Rather
-    // than canonicalize the whole walk (which would change every path
-    // this crate has ever returned whenever the caller's root sits under
-    // a symlink -- macOS's own default temp dir is exactly this shape),
-    // [`rebase_from_canonical`] translates each `changed_dirs` entry back
-    // into the caller's original root form immediately after the
-    // replay, so every path downstream of this point stays in the one
-    // form the rest of the crate already assumes.
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // FSEvents' own persisted log can lag a write by longer than the
     // growth store's whole-second timestamp granularity, so a replay
     // requested this soon after the baseline cannot yet distinguish
@@ -2110,8 +2110,8 @@ pub fn stage_tracked_with_source(
         .last_observed_at
         .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
     let t_replay = std::time::Instant::now();
-    let mut plan = source.replay(&FsEventsRequest {
-        root: canonical_root.clone(),
+    let plan = source.replay(&FsEventsRequest {
+        root: root.clone(),
         since: prev_state,
     });
     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
@@ -2122,27 +2122,21 @@ pub fn stage_tracked_with_source(
             plan.changed_dirs.len()
         );
     }
-    plan.changed_dirs = plan
-        .changed_dirs
-        .iter()
-        .map(|p| rebase_from_canonical(&canonical_root, root, p))
-        .collect();
-
     let prev_topology = read_topology(&dir);
 
     let result = if too_soon && !plan.live {
         full_walk(
-            root,
+            &root,
             observed_at,
             large_file_min_bytes,
             crate::fs_events::RefreshRefusal::TooSoon.as_str(),
         )?
     } else if !plan.incremental {
-        full_walk(root, observed_at, large_file_min_bytes, plan.reason_str())?
+        full_walk(&root, observed_at, large_file_min_bytes, plan.reason_str())?
     } else {
         match prev_topology {
             None => full_walk(
-                root,
+                &root,
                 observed_at,
                 large_file_min_bytes,
                 "no_stored_event_id",
@@ -2155,7 +2149,7 @@ pub fn stage_tracked_with_source(
                 // fraction is the meaningful signal.
                 let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
                 if plan.changed_dirs.len() as f64 > TOO_MANY_CHANGES_FRACTION * known_dirs as f64 {
-                    full_walk(root, observed_at, large_file_min_bytes, "too_many_changes")?
+                    full_walk(&root, observed_at, large_file_min_bytes, "too_many_changes")?
                 } else {
                     apply_incremental(
                         topo,
@@ -2183,21 +2177,6 @@ pub fn stage_tracked_with_source(
     });
 
     Ok((result, checkpoint))
-}
-
-/// Translates a canonical path (as FSEvents reports it) back into the
-/// caller's original root form, so every path this module compares
-/// against `changed_dirs` afterward is in the same non-canonical form
-/// every other walk in this crate already uses. A path outside
-/// `canonical_root` (should not happen -- the replay was scoped to that
-/// root) is left as-is rather than dropped, matching this module's
-/// general rule of keeping an uncertain path rather than silently
-/// discarding it.
-fn rebase_from_canonical(canonical_root: &Path, original_root: &Path, p: &Path) -> PathBuf {
-    match p.strip_prefix(canonical_root) {
-        Ok(rel) => original_root.join(rel),
-        Err(_) => p.to_path_buf(),
-    }
 }
 
 fn to_stored_worktrees(discovered: &[DiscoveredWorktree]) -> Vec<StoredWorktree> {

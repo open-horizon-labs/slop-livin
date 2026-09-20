@@ -83,14 +83,25 @@ fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
         .unwrap();
     assert_eq!(guidance(category).scope, "summary");
     assert_eq!(guidance(category).next_action, "inspect_groups");
-    let categories = check(&r, store.path(), &[category.path.clone()], None, 1).unwrap();
+    let categories = check(
+        &r,
+        store.path(),
+        std::slice::from_ref(&category.path),
+        None,
+        1,
+    )
+    .unwrap();
     assert_eq!(categories[0].check_status, "not_applicable");
     assert!(categories[0].plan_id.is_none());
-    let blocked = check(&r, store.path(), &[group.clone()], None, 1).unwrap();
-    assert_eq!(blocked[0].reason_code, "shared_hardlink");
-    assert!(blocked[0].plan_id.is_none());
+    let shared = check(&r, store.path(), std::slice::from_ref(&group), None, 1).unwrap();
+    assert_eq!(shared[0].check_status, "ready_for_review");
+    let shared_plan =
+        actions::load_plan(store.path(), shared[0].plan_id.as_ref().unwrap()).unwrap();
+    let shared_group = shared_plan.units[0].cargo_group.as_ref().unwrap();
+    assert!(shared_group.shared_storage);
+    assert_eq!(shared_group.reclaimable_bytes, None);
     let selected = target.join("debug/deps/fixture-aaa");
-    let checked = check(&r, store.path(), &[selected.clone()], None, 1).unwrap();
+    let checked = check(&r, store.path(), std::slice::from_ref(&selected), None, 1).unwrap();
     assert_eq!(checked[0].check_status, "ready_for_review");
     let id = checked[0].plan_id.as_ref().unwrap();
     let plan = actions::load_plan(store.path(), id).unwrap();
@@ -106,7 +117,7 @@ fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
     assert!(group.join("state.o").exists());
     let lock = fs::File::open(target.join("debug/.cargo-lock")).unwrap();
     lock.try_lock().unwrap();
-    let busy = check(&r, store.path(), &[selected.clone()], None, 1).unwrap();
+    let busy = check(&r, store.path(), std::slice::from_ref(&selected), None, 1).unwrap();
     assert_eq!(busy[0].reason_code, "lock_unavailable");
     assert_eq!(busy[0].next_action, "retry_after_builds");
     assert!(
@@ -133,7 +144,8 @@ fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
     assert_eq!(decoded.nested_artifacts.len(), r.nested_artifacts.len());
     let text = swamp_core::render::render_view_rust_with_limit(&r, None, Some(2));
     assert!(text.contains("Showing 2 of"));
-    assert!(text.contains("do not sum rows"));
+    assert!(text.contains("do not add a parent to its descendants"));
+    assert!(text.contains("Disjoint paths can be summed as allocation"));
     assert!(text.contains("cleanup-check"));
 }
 
@@ -185,7 +197,7 @@ fn native_cargo_rebuilds_after_reviewed_test_cleanup() {
         .expect("native Cargo test identified")
         .path
         .clone();
-    let plan = actions::propose(&r, None, &[selected.clone()], "native-test").unwrap();
+    let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "native-test").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
     let result = actions::execute_with_trash(
@@ -238,7 +250,7 @@ fn folded_reports_include_final_outputs_without_unfolding_dependencies() {
             assert_eq!(u.role, ArtifactRole::FinalOutput);
             assert!(u.bytes > 0);
             assert!(
-                actions::propose(&r, None, &[u.path.clone()], "test").is_err(),
+                actions::propose(&r, None, std::slice::from_ref(&u.path), "test").is_err(),
                 "identification must not enable unreviewed cleanup roles"
             );
         }
@@ -291,7 +303,7 @@ fn normal_report_identifies_tests_and_exact_cleanup_preserves_neighbors() {
             .role,
         ArtifactRole::TestExecutable
     );
-    let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+    let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
     assert_eq!(plan.units[0].cargo_group.as_ref().unwrap().members.len(), 2);
     actions::save_plan(store.path(), &plan).unwrap();
     let trash = store.path().join("trash");
@@ -333,7 +345,7 @@ fn stale_same_size_member_refuses_entire_group() {
     let store = tempfile::tempdir().unwrap();
     let r = report(&root, store.path());
     let selected = target.join("debug/deps/fixture-aaa");
-    let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+    let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
     fs::write(selected.with_extension("d"), vec![2u8; 8192]).unwrap();
@@ -357,7 +369,7 @@ fn cargo_lock_and_overlapping_selection_refuse() {
             .to_string()
             .contains("overlapping")
     );
-    let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+    let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
     let lock = fs::File::open(target.join("debug/.cargo-lock")).unwrap();
@@ -369,18 +381,16 @@ fn cargo_lock_and_overlapping_selection_refuse() {
     assert!(selected.exists());
 }
 #[test]
-fn shared_hardlink_never_becomes_cleanup_candidate() {
+fn shared_hardlink_remains_reviewable_with_unknown_reclaim() {
     let (_tmp, root, target) = fixture();
     let store = tempfile::tempdir().unwrap();
     let selected = target.join("debug/deps/fixture-aaa");
     fs::hard_link(&selected, target.join("retained-alias")).unwrap();
     let r = report(&root, store.path());
-    assert!(
-        actions::propose(&r, None, &[selected], "test")
-            .unwrap_err()
-            .to_string()
-            .contains("hardlink")
-    );
+    let plan = actions::propose(&r, None, &[selected], "test").unwrap();
+    let group = plan.units[0].cargo_group.as_ref().unwrap();
+    assert!(group.shared_storage);
+    assert_eq!(group.reclaimable_bytes, None);
 }
 #[test]
 fn incremental_same_size_rename_and_metadata_change_match_full() {
@@ -474,7 +484,7 @@ fn new_companion_and_symlink_substitution_refuse() {
         let selected = target.join("debug/deps/fixture-aaa");
         fs::remove_file(selected.with_extension("d")).unwrap();
         let r = report(&root, store.path());
-        let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+        let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
         actions::save_plan(store.path(), &plan).unwrap();
         actions::approve(store.path(), &plan.id, "human:test").unwrap();
         if symlink {
@@ -531,7 +541,7 @@ fn incremental_and_build_script_entries_are_exact_directory_groups() {
             fs::write(path.join("cache"), vec![1u8; 4096]).unwrap();
         }
         let r = report(&root, store.path());
-        let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+        let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
         actions::save_plan(store.path(), &plan).unwrap();
         actions::approve(store.path(), &plan.id, "human:test").unwrap();
         let result = actions::execute_with_trash(
@@ -559,7 +569,7 @@ fn directory_group_new_member_is_stale_not_silently_included() {
     fs::create_dir_all(&selected).unwrap();
     fs::write(selected.join("a"), "a").unwrap();
     let r = report(&root, store.path());
-    let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+    let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
     fs::write(selected.join("b"), "new").unwrap();
@@ -661,7 +671,7 @@ fn cleanup_rechecks_fingerprint_but_not_unrelated_build_trees() {
         let store = tempfile::tempdir().unwrap();
         let selected = target.join("debug/deps/fixture-aaa");
         let r = report(&root, store.path());
-        let plan = actions::propose(&r, None, &[selected.clone()], "test").unwrap();
+        let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
         actions::save_plan(store.path(), &plan).unwrap();
         actions::approve(store.path(), &plan.id, "human:test").unwrap();
         // An unrelated unreadable tree must not block scoped cleanup.

@@ -2,8 +2,9 @@ mod schedule;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use swamp_core::{
+    artifact::{ArtifactRole, NestedArtifact},
     filter,
     render::{
         OverviewSort, render_kinds, render_overview_sorted, render_project_tree, render_types,
@@ -86,6 +87,12 @@ enum Command {
         /// Maximum groups to check (1–20). This is not an exhaustive cleanup search.
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        /// Skip this many size-ranked candidates. Pages may shift after a rebuild.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Review individual groups within this directory, never the directory itself.
+        #[arg(long)]
+        within: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -212,15 +219,20 @@ enum Command {
         off: bool,
         roots: Vec<PathBuf>,
     },
-    /// Propose cleanup for exact paths or a filter. Review paths, sizes,
-    /// warnings and recovery before authorizing. For individual Cargo builds,
-    /// start with cleanup-check. Nothing is deleted by this command.
+    /// Propose cleanup for exact artifact, Cargo group, or worktree paths, or
+    /// a filter. Review paths, sizes, warnings and recovery before
+    /// authorizing. Use report --view worktrees for worktree signals; for
+    /// individual Cargo builds, start with cleanup-check. Nothing is deleted
+    /// by this command.
+    #[command(
+        after_help = "Whole-worktree example:\n  swamp report ~/src --view worktrees\n  swamp propose ~/src --path /absolute/path/to/a-worktree\nReview the plan; proposing never authorizes removal."
+    )]
     Propose {
         root: PathBuf,
         /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
         #[arg(long)]
         filter: Option<String>,
-        /// Restrict to these exact artifact paths.
+        /// Exact artifact, Cargo group, or worktree paths from a report.
         #[arg(long = "path")]
         paths: Vec<PathBuf>,
         #[arg(long)]
@@ -357,6 +369,80 @@ fn swamp_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/swamp")
 }
+
+const CLEANUP_COVERAGE_DETAIL_ROWS: usize = 20;
+const CLEANUP_COVERAGE_DETAIL_LIMITS: usize = 8;
+
+#[derive(Debug, PartialEq, Eq)]
+struct CleanupCoverageDetail {
+    path: PathBuf,
+    limits: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CleanupScopeSummary {
+    nested_row_count: usize,
+    coverage_limited_count: usize,
+    unknown_or_residual_count: usize,
+    coverage_limited_details: Vec<CleanupCoverageDetail>,
+}
+
+fn cleanup_path_in_scope(path: &Path, within: Option<&Path>) -> bool {
+    within.is_none_or(|scope| path != scope && path.starts_with(scope))
+}
+
+fn cleanup_path_at_or_below_scope(path: &Path, within: Option<&Path>) -> bool {
+    within.is_none_or(|scope| path == scope || path.starts_with(scope))
+}
+
+fn cleanup_scope_summary(
+    nested_artifacts: &[NestedArtifact],
+    within: Option<&Path>,
+) -> CleanupScopeSummary {
+    let mut summary = CleanupScopeSummary {
+        nested_row_count: 0,
+        coverage_limited_count: 0,
+        unknown_or_residual_count: 0,
+        coverage_limited_details: Vec::new(),
+    };
+    for unit in nested_artifacts {
+        let in_scope = cleanup_path_at_or_below_scope(&unit.path, within);
+        // An incomplete Cargo container above `within` limits what can be
+        // established inside the requested scope, so retain that evidence
+        // without counting the ancestor as a row inside the scope.
+        let relevant_ancestor = within.is_some_and(|scope| {
+            unit.path != scope
+                && scope.starts_with(&unit.path)
+                && (!unit.coverage.complete || !unit.coverage.supported)
+        });
+        if in_scope {
+            summary.nested_row_count += 1;
+            if matches!(unit.role, ArtifactRole::Unknown | ArtifactRole::Residual) {
+                summary.unknown_or_residual_count += 1;
+            }
+        }
+        if (in_scope || relevant_ancestor) && (!unit.coverage.complete || !unit.coverage.supported)
+        {
+            summary.coverage_limited_count += 1;
+            if summary.coverage_limited_details.len() < CLEANUP_COVERAGE_DETAIL_ROWS {
+                summary
+                    .coverage_limited_details
+                    .push(CleanupCoverageDetail {
+                        path: unit.path.clone(),
+                        limits: unit
+                            .coverage
+                            .limits
+                            .iter()
+                            .take(CLEANUP_COVERAGE_DETAIL_LIMITS)
+                            .cloned()
+                            .collect(),
+                    });
+            }
+        }
+    }
+    summary
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Ui {
@@ -535,10 +621,23 @@ fn main() -> Result<()> {
             paths,
             role,
             limit,
+            offset,
+            within,
             json,
         } => {
             anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
             let root = std::fs::canonicalize(root)?;
+            anyhow::ensure!(
+                paths.is_empty() || (offset == 0 && within.is_none()),
+                "--path is an exact selection; do not combine it with --offset or --within"
+            );
+            let within = within.map(std::fs::canonicalize).transpose()?;
+            if let Some(within) = &within {
+                anyhow::ensure!(
+                    within.is_dir() && within.starts_with(&root),
+                    "--within must be a directory inside the scan root"
+                );
+            }
             let store = swamp_dir();
             let start = std::time::Instant::now();
             let report = report_full_mode(
@@ -553,20 +652,96 @@ fn main() -> Result<()> {
                 false,
             )?;
             let report_ms = start.elapsed().as_millis();
+            let scope_summary = cleanup_scope_summary(&report.nested_artifacts, within.as_deref());
+            let mut candidates: Vec<_> = report
+                .nested_artifacts
+                .iter()
+                .filter(|u| {
+                    swamp_core::cargo_cleanup::candidate(u)
+                        && role.as_deref().is_none_or(|r| u.role.label() == r)
+                        && cleanup_path_in_scope(&u.path, within.as_deref())
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+            let candidate_count = candidates.len();
+            let candidate_allocated_bytes: u64 = candidates.iter().map(|u| u.bytes).sum();
+            let selected: Vec<_> = if paths.is_empty() {
+                candidates
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|u| u.path.clone())
+                    .collect()
+            } else {
+                paths.clone()
+            };
+            let next_offset = (paths.is_empty()
+                && offset.saturating_add(selected.len()) < candidate_count)
+                .then_some(offset.saturating_add(selected.len()));
+            let next_page = next_offset.map(|next| {
+                let mut args = vec![
+                    "swamp".to_string(),
+                    "cleanup-check".into(),
+                    root.display().to_string(),
+                    "--offset".into(),
+                    next.to_string(),
+                    "--limit".into(),
+                    limit.to_string(),
+                ];
+                if let Some(role) = &role {
+                    args.extend(["--role".into(), role.clone()]);
+                }
+                if let Some(within) = &within {
+                    args.extend(["--within".into(), within.display().to_string()]);
+                }
+                if json {
+                    args.push("--json".into());
+                }
+                args
+            });
             if !json {
                 eprintln!(
-                    "Checking at most {limit} Cargo groups. Larger categories are not deletion selections; checks may read group contents."
+                    "{} candidate groups in scope ({} allocated, not reclaimable space). Checking {} on this page; checks read group contents.",
+                    candidate_count,
+                    swamp_core::render::human_bytes_pub(candidate_allocated_bytes),
+                    selected.len()
                 );
             }
-            let results =
-                swamp_core::cargo_cleanup::check(&report, &store, &paths, role.as_deref(), limit)?;
+            // Empty pages must not silently restart the default selection.
+            let results = if selected.is_empty() {
+                Vec::new()
+            } else {
+                swamp_core::cargo_cleanup::check(
+                    &report,
+                    &store,
+                    &selected,
+                    role.as_deref(),
+                    limit,
+                )?
+            };
+            let considered = candidates
+                .iter()
+                .filter(|u| results.iter().any(|r| r.path == u.path))
+                .count();
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "root": root, "store": store, "report_ms": report_ms,
                         "limit": limit, "checked_count": results.len(), "exhaustive": false,
-                        "note": "Allocated bytes are not guaranteed reclaimable. Checks are not evidence of disuse. No cleanup authorized or executed.",
+                        "offset": offset, "within": within,
+                        "observed_candidate_count": candidate_count,
+                        "candidate_allocated_bytes": candidate_allocated_bytes,
+                        "scoped_nested_row_count": scope_summary.nested_row_count,
+                        "coverage_limited_count": scope_summary.coverage_limited_count,
+                        "unknown_or_residual_count": scope_summary.unknown_or_residual_count,
+                        "coverage_limited_details": scope_summary.coverage_limited_details.iter().map(|d| serde_json::json!({
+                            "path": d.path,
+                            "limits": d.limits,
+                        })).collect::<Vec<_>>(),
+                        "not_checked_in_this_run": candidate_count.saturating_sub(considered),
+                        "next_offset": next_offset, "next_page": next_page,
+                        "note": "This is a bounded review of candidate groups, not a measure of total cleanup opportunity. A zero candidate count does not mean no cleanup opportunity; coverage-limited rows affecting the scope, including relevant ancestors, and noncandidate rows are reported separately. Allocated bytes are not guaranteed reclaimable. Checks are not evidence of disuse. No cleanup authorized or executed.",
                         "results": results
                     }))?
                 );
@@ -584,6 +759,9 @@ fn main() -> Result<()> {
                         r.path.display(),
                         r.message
                     );
+                    for warning in r.warnings {
+                        println!("  {warning}");
+                    }
                     if let Some(id) = r.plan_id {
                         println!("  Unapproved plan: {id} (store {})", store.display());
                     }
@@ -592,6 +770,33 @@ fn main() -> Result<()> {
                 println!(
                     "Bounded review, not an exhaustive search. Use --role test-executable or --path <exact-group> to narrow it. Allocated bytes are not guaranteed free space. Nothing approved or deleted."
                 );
+                println!(
+                    "{} of {candidate_count} candidate groups were not checked in this run.",
+                    candidate_count.saturating_sub(considered)
+                );
+                println!(
+                    "Scope contains {} nested Cargo rows: {} coverage-limited rows affecting scope (including ancestors) and {} unknown/residual non-candidates.",
+                    scope_summary.nested_row_count,
+                    scope_summary.coverage_limited_count,
+                    scope_summary.unknown_or_residual_count
+                );
+                if scope_summary.coverage_limited_count > 0 {
+                    println!(
+                        "Coverage-limited rows are not cleanup evidence; refresh before treating this scope as complete."
+                    );
+                    println!("Coverage-limited details (bounded):");
+                    for detail in &scope_summary.coverage_limited_details {
+                        let limits = if detail.limits.is_empty() {
+                            "limits not recorded".to_string()
+                        } else {
+                            detail.limits.join(" · ")
+                        };
+                        println!("  {} — {limits}", detail.path.display());
+                    }
+                }
+                if let Some(args) = next_page {
+                    println!("Next page (same SWAMP_DIR, arguments): {args:?}");
+                }
             }
         }
         Command::Propose {
@@ -992,5 +1197,130 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
     ProgressLine {
         stop,
         handle: Some(handle),
+    }
+}
+
+#[cfg(test)]
+mod cleanup_check_tests {
+    use super::{
+        ArtifactRole, CLEANUP_COVERAGE_DETAIL_LIMITS, CLEANUP_COVERAGE_DETAIL_ROWS, Path, PathBuf,
+        cleanup_scope_summary,
+    };
+    use swamp_core::artifact::{ArtifactCoverage, Membership, NestedArtifact};
+
+    fn synthetic(
+        path: impl Into<PathBuf>,
+        role: ArtifactRole,
+        supported: bool,
+        complete: bool,
+        limits: Vec<String>,
+    ) -> NestedArtifact {
+        let path = path.into();
+        NestedArtifact {
+            id: path.display().to_string(),
+            relative_path: path.display().to_string(),
+            path,
+            parent_id: None,
+            container_id: None,
+            role,
+            membership: Membership::Unknown,
+            is_dir: false,
+            device: 0,
+            inode: 0,
+            logical_bytes: 1,
+            bytes: 1,
+            physical_bytes: 1,
+            physical_total: 1,
+            mtime_max: 0,
+            variant: Default::default(),
+            producer_evidence: Vec::new(),
+            consumer_evidence: Vec::new(),
+            coverage: ArtifactCoverage {
+                supported,
+                complete,
+                limits,
+            },
+            action_group: None,
+            present: true,
+            growth_bytes: None,
+            regrowth_count: 0,
+        }
+    }
+
+    #[test]
+    fn cleanup_scope_summary_keeps_unknown_coverage_visible_and_bounded() {
+        let mut rows = vec![
+            synthetic(
+                "/root/target",
+                ArtifactRole::Container,
+                false,
+                false,
+                vec!["root coverage".into()],
+            ),
+            synthetic(
+                "/root/target/debug/deps/unknown",
+                ArtifactRole::Unknown,
+                false,
+                false,
+                vec!["unknown coverage".into()],
+            ),
+            synthetic(
+                "/root/target/debug/deps/residual",
+                ArtifactRole::Residual,
+                true,
+                true,
+                Vec::new(),
+            ),
+            synthetic(
+                "/root/target/debug/incremental/group",
+                ArtifactRole::Incremental,
+                true,
+                true,
+                Vec::new(),
+            ),
+            synthetic(
+                "/root/target/debug/incremental/group/child",
+                ArtifactRole::Residual,
+                true,
+                true,
+                Vec::new(),
+            ),
+        ];
+        for index in 0..25 {
+            rows.push(synthetic(
+                format!("/root/target/debug/deps/unknown-{index}"),
+                ArtifactRole::Unknown,
+                false,
+                false,
+                (0..10).map(|n| format!("limit-{n}")).collect(),
+            ));
+        }
+
+        let summary = cleanup_scope_summary(&rows, Some(Path::new("/root/target/debug")));
+        assert_eq!(summary.nested_row_count, rows.len() - 1);
+        assert_eq!(summary.coverage_limited_count, 27);
+        assert_eq!(summary.unknown_or_residual_count, 28);
+        assert_eq!(
+            summary.coverage_limited_details.len(),
+            CLEANUP_COVERAGE_DETAIL_ROWS
+        );
+        assert!(
+            summary
+                .coverage_limited_details
+                .iter()
+                .all(|detail| detail.limits.len() <= CLEANUP_COVERAGE_DETAIL_LIMITS)
+        );
+
+        let group_scope = cleanup_scope_summary(
+            &rows,
+            Some(Path::new("/root/target/debug/incremental/group")),
+        );
+        assert_eq!(group_scope.nested_row_count, 2);
+        assert_eq!(group_scope.coverage_limited_count, 1);
+        assert_eq!(
+            group_scope.coverage_limited_details[0].path,
+            PathBuf::from("/root/target")
+        );
+        assert_eq!(group_scope.unknown_or_residual_count, 1);
     }
 }

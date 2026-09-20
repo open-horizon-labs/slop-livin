@@ -88,10 +88,10 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
         layout.build_dir = Some(p.into());
     }
     for p in [&mut layout.target_dir, &mut layout.build_dir] {
-        if let Some(path) = p.as_mut() {
-            if path.is_relative() {
-                *path = worktree.join(&*path);
-            }
+        if let Some(path) = p.as_mut()
+            && path.is_relative()
+        {
+            *path = worktree.join(&*path);
         }
     }
     if layout.target_dir.is_none() {
@@ -155,10 +155,10 @@ pub fn inspect_target_incremental(
         cached.iter().map(|u| (u.path.clone(), u)).collect();
     let mut children: HashMap<PathBuf, Vec<&NestedArtifact>> = HashMap::new();
     for u in cached {
-        if u.path != target_dir {
-            if let Some(p) = u.path.parent() {
-                children.entry(p.to_path_buf()).or_default().push(u);
-            }
+        if u.path != target_dir
+            && let Some(p) = u.path.parent()
+        {
+            children.entry(p.to_path_buf()).or_default().push(u);
         }
     }
     fn copy_tree(
@@ -182,6 +182,8 @@ pub fn inspect_target_incremental(
             }
         }
     }
+    // Existing recursive scanner helper keeps traversal state explicit across calls.
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         path: &Path,
         root: &Path,
@@ -196,15 +198,14 @@ pub fn inspect_target_incremental(
             limits.push("non-UTF8 Cargo path unsupported; observation incomplete".into());
             return;
         }
-        if let Some(changed) = changed {
-            if old.contains_key(path)
-                && !changed
-                    .iter()
-                    .any(|c| c.starts_with(path) || c == path.parent().unwrap_or(path))
-            {
-                copy_tree(path, old, children, out);
-                return;
-            }
+        if let Some(changed) = changed
+            && old.contains_key(path)
+            && !changed
+                .iter()
+                .any(|c| c.starts_with(path) || c == path.parent().unwrap_or(path))
+        {
+            copy_tree(path, old, children, out);
+            return;
         }
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -684,6 +685,8 @@ fn looks_like_target_triple(name: &str) -> bool {
     name.matches('-').count() >= 2 && !name.contains('.')
 }
 
+// Existing node-construction helper centralizes the full artifact record shape.
+#[allow(clippy::too_many_arguments)]
 fn node(
     path: &Path,
     root: &Path,
@@ -792,10 +795,9 @@ pub fn charge_physical(units: &mut [NestedArtifact]) {
             .as_ref()
             .and_then(|p| indexes.get(p))
             .copied()
+            && parent != i
         {
-            if parent != i {
-                units[parent].physical_total += units[i].physical_total;
-            }
+            units[parent].physical_total += units[i].physical_total;
         }
     }
 }

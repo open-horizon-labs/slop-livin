@@ -104,7 +104,13 @@ fn run_git(dir: &Path, args: &[&str]) {
 /// Builds the full fixture tree under `tmp` and returns its paths and
 /// exact byte sizes.
 pub fn build(tmp: &Path) -> Fixture {
-    fs::create_dir_all(tmp).expect("mkdir tmp root");
+    // Production report paths are canonicalized at the public boundary.
+    // Normalize the fixture once so every expected path (including linked
+    // worktrees and nested repositories) uses the same namespace on macOS,
+    // where temporary directories are commonly reachable as both /var and
+    // /private/var.
+    let tmp = fs::canonicalize(tmp).unwrap_or_else(|_| tmp.to_path_buf());
+    fs::create_dir_all(&tmp).expect("mkdir tmp root");
 
     // --- main checkout ---
     let checkout = tmp.join("checkout");
