@@ -144,3 +144,34 @@ Changes are local on `cleanup-capability-fixes`, with an unreleased CLI build in
 `target/release/swamp`. No release, install replacement, real cleanup, or real
 authorization was performed. All trial plans remain unapproved and may expire;
 propose again before any later human-authorized cleanup.
+
+## Ship
+
+Shipped v0.6.2 for macOS Apple Silicon through PR #110 (squash merge
+17de2786f26b8b9cb45b6bd8fe38455e4ce2ee94), tag v0.6.2, and the existing
+`.github/workflows/release.yml` pipeline. Release:
+https://github.com/open-horizon-labs/swamp/releases/tag/v0.6.2
+
+Release run 35509638675 passed, including release-profile workspace tests and
+archive smoke tests. Delivery tax: about 4m32s in CI, plus manual archive
+verification and installation; no unexpected approval or environment blockers.
+
+Downloaded published assets, verified SHA-256
+`39f20f211d3e3ebd521f5738a72c427b069ddd043997734305f18a128f643dae`,
+and replaced `~/.local/bin/swamp` and `swamp-mcp` without retaining old binaries.
+PATH resolves to that CLI; it reports `swamp 0.6.2`. Installed MCP tools/list
+smoke test also passed.
+
+Installed CLI trial on the main Swamp checkout, using the isolated review store:
+535 incremental candidates, 9,834,860,544 allocated bytes (not guaranteed
+reclaimable), five hardlinked groups ready for review, 530 explicitly unchecked.
+The first page's report phase took 589ms; this is not total command latency or
+a performance guarantee. Offset 5 returned another ready-for-review group and
+next offset 6. Published behavior therefore confirms hardlinks no longer block
+review and pagination exposes the remaining candidates.
+
+All generated plans remain unapproved. No user builds or worktrees were deleted.
+Frame match: matched; no new hidden constraints or ownership failures encountered.
+Learning route: none. Installation and published behavior verified; history scopes
+retain the documented fresh-baseline behavior. This post-release handoff records
+verification after the tagged code, not an additional product change.
