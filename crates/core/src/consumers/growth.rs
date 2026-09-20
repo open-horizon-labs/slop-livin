@@ -28,9 +28,10 @@ impl Consumer for GrowthConsumer {
         let nested_shadow_paths =
             add_nested_history_rows(&mut d.projects, &d.nested_artifacts, ctx.observed_at);
         if let Some(dir) = &ctx.store_dir {
-            let volume_id = std::fs::metadata(&ctx.root)
-                .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-                .unwrap_or(0);
+            // The store is scoped to the canonical requested root, not just
+            // the device. Multiple roots on one volume must never share
+            // current state or reverse-delta history.
+            let volume_id = crate::growth::root_scoped_volume_id(&ctx.root);
             let config = crate::growth::load_config(dir);
             let since_secs = ctx
                 .since_override

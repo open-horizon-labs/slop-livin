@@ -2,6 +2,8 @@
 
 Reviewed 2026-09-19 against the source tree at `fa66177`, the documentation changes, and the artifact-history fix prepared during this review. Installation instructions were subsequently updated for v0.5.0.
 
+Follow-up, 2026-09-20: the root-namespace claim below was rechecked against the unreleased cleanup fixes. Other rows retain their original review scope.
+
 The editorial sequence was structure, factual verification, then plain-language editing. The reader is a developer deciding whether to use swamp or understand its implementation. The rewrite preserves concrete commands, the project/worktree/artifact model, history, and recovery distinctions. It removes unsupported exclusivity, generic speed promises, and duplicated reference material.
 
 ## Claim checks
@@ -27,7 +29,7 @@ Quoted legacy wording identifies claims corrected or removed. Other rows state t
 | The history store is always a few hundred KiB | Unsupported | Previous README supplied a single-tree figure without a reproducible measurement procedure. | Explain representation and compression; omit the size guarantee. |
 | All windows correspond to an exact historical snapshot | Misleading/context missing | [Nearest-time growth lookup](../crates/core/src/growth.rs) | Explain observation granularity and unavailable baselines. |
 | History survives arbitrary worktree and remote renames | Incorrect | [Project/worktree IDs](../crates/core/src/consumers/projects.rs), [Git fallback identity](../crates/core/src/git.rs) | Worktree IDs are path-derived; changed paths or remote identity can split history. |
-| Every root has an independent history namespace | Incorrect | [Volume storage, topology, and row replacement](../crates/core/src/growth.rs) | Prefer one common root per store; separate stores for independent roots on the same volume. |
+| Every root has an independent history namespace | Corrected in unreleased source | [Root-scoped storage](../crates/core/src/growth.rs), [alternating-root report/proposal regression](../crates/core/tests/fsevents_incremental.rs), [root identity tests](../crates/core/tests/root_scope.rs) | Canonical roots now have separate current/history/topology/checkpoints in one store; aliases share a scope. Old ambiguous device-only history is not imported. |
 | Independent consumer futures make all enrichment nonblocking | Misleading/context missing | [Dispatch loop](../crates/core/src/bus/mod.rs), synchronous calls in [GitHub](../crates/core/src/github.rs) and [Docker](../crates/core/src/docker.rs) | State current-thread polling, blocking-call limits, and separate worker concurrency. |
 | Tracking and history form a serial chain | Incorrect | [Subscriptions](../crates/core/src/consumers/tracking.rs), [history](../crates/core/src/consumers/history.rs), [assembler](../crates/core/src/consumers/assemble.rs) | Both subscribe to growth annotation; final assembly waits for both. |
 | A new fact source always needs only one file and one registration line | Misleading/context missing | [Event definitions](../crates/core/src/bus/mod.rs), [assembly gate](../crates/core/src/consumers/gate.rs) | New data contracts can require payload, gate, report, and interface changes. |

@@ -138,7 +138,7 @@ impl NestedArtifact {
         hash.update(b"nested-storage:v2\0");
         hash.update(root.as_os_str().as_bytes());
         hash.update(b"\0");
-        Self::within(&hash.finalize().to_hex().to_string(), relative)
+        Self::within(hash.finalize().to_hex().as_ref(), relative)
     }
     pub fn within(container_id: &str, relative: &str) -> String {
         if relative.is_empty() {

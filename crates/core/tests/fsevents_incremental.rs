@@ -21,10 +21,12 @@ mod fixture;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Once;
+use swamp_core::actions;
 use swamp_core::fs_events::{
     FsEventsPlan, FsEventsRequest, FsEventsSource, RefreshRefusal, testing::CannedSource,
 };
-use swamp_core::report::{ArtifactKind, report_full_mode_with_source};
+use swamp_core::growth::volume_store_dir;
+use swamp_core::report::{ArtifactKind, load_last_report, report_full_mode_with_source};
 
 /// Disables the `TooSoon` floor for this process. Idempotent and safe to
 /// call from every test regardless of thread-parallel execution: every
@@ -539,13 +541,7 @@ fn stored_event_id_is_recorded_after_an_observation() {
     )
     .expect("report");
 
-    let volume_id = fs::metadata(&fx.root)
-        .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-        .unwrap_or(0);
-    let sidecar = store
-        .path()
-        .join(volume_id.to_string())
-        .join("fsevents.json");
+    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
     let text =
         fs::read_to_string(&sidecar).unwrap_or_else(|e| panic!("read {}: {e}", sidecar.display()));
     assert!(
@@ -573,8 +569,7 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         &no_op_source(),
     )
     .expect("baseline");
-    let device = std::os::unix::fs::MetadataExt::dev(&fs::metadata(&fx.root).unwrap());
-    let sidecar = store.path().join(device.to_string()).join("fsevents.json");
+    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
     let before = fs::read(&sidecar).unwrap();
     let cache = fs::read_dir(store.path())
         .unwrap()
@@ -624,6 +619,139 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
     assert_eq!(after["event_id"], 77);
 }
 
+#[test]
+fn switching_roots_preserves_history_and_alias_replay_namespace() {
+    disable_too_soon_floor();
+    let tmp = tempfile::tempdir().expect("tmp root");
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().expect("one shared store");
+    let canonical_checkout = std::fs::canonicalize(&fx.checkout).unwrap();
+    let canonical_linked = std::fs::canonicalize(&fx.linked_worktree).unwrap();
+    let canonical_node_modules = std::fs::canonicalize(&fx.node_modules).unwrap();
+    let alias = tmp.path().join("root-alias");
+    std::os::unix::fs::symlink(&fx.root, &alias).expect("root alias");
+
+    // Observe the parent through an alias. The public report boundary
+    // canonicalizes the root, so topology and report paths share one
+    // namespace with later canonical-root calls.
+    let parent = report_full_mode_with_source(
+        &alias,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("parent baseline");
+    assert_eq!(parent.root, std::fs::canonicalize(&fx.root).unwrap());
+    assert!(
+        load_last_report(store.path(), &alias).is_some(),
+        "alias and canonical root must load the same cached report"
+    );
+
+    // A child/root switch uses the same physical store but must select a
+    // different root scope. Its full observation must not replace the
+    // parent's topology or current/history files.
+    report_full_mode_with_source(
+        &fx.checkout,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &no_op_source(),
+    )
+    .expect("child observation");
+
+    fs::write(
+        fx.node_modules.join("alias-replay-probe"),
+        vec![b'x'; 1024 * 1024],
+    )
+    .expect("parent growth");
+    let changed = std::fs::canonicalize(&fx.node_modules).unwrap();
+    let parent_readonly = report_full_mode_with_source(
+        &fx.root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        false,
+        false,
+        false,
+        false,
+        &CannedSource(incremental_plan(vec![changed], 123)),
+    )
+    .expect("canonical parent no-observe replay");
+
+    assert!(
+        parent_readonly
+            .notes
+            .iter()
+            .any(|note| note.contains("mode=incremental")),
+        "alias baseline must support canonical incremental replay: {:?}",
+        parent_readonly.notes
+    );
+    let parent_checkout = parent_readonly
+        .projects
+        .iter()
+        .find(|p| p.name == fx.checkout_name)
+        .expect("parent checkout");
+    assert!(
+        parent_checkout
+            .worktrees
+            .iter()
+            .any(|w| w.path == canonical_linked),
+        "parent report/propose scope must still expose the visible linked worktree: {:?}",
+        parent_checkout
+            .worktrees
+            .iter()
+            .map(|w| &w.path)
+            .collect::<Vec<_>>()
+    );
+    let proposal = actions::propose(
+        &parent_readonly,
+        None,
+        std::slice::from_ref(&canonical_linked),
+        "root-switch-test",
+    )
+    .expect("visible linked worktree should produce a proposal");
+    assert_eq!(
+        proposal.units.len(),
+        1,
+        "proposal must contain exactly the selected worktree"
+    );
+    assert_eq!(proposal.units[0].path, canonical_linked);
+    assert_eq!(proposal.units[0].worktree_path, canonical_linked);
+    assert_eq!(proposal.units[0].verb, "remove-worktree");
+    let main = parent_checkout
+        .worktrees
+        .iter()
+        .find(|w| w.path == canonical_checkout)
+        .expect("parent main worktree");
+    let node_modules = main
+        .artifacts
+        .iter()
+        .find(|a| a.path == canonical_node_modules)
+        .expect("parent node_modules");
+    assert!(
+        node_modules.growth_bytes.is_some_and(|growth| growth > 0),
+        "parent history must survive the child observation: {node_modules:?}"
+    );
+
+    assert_ne!(
+        volume_store_dir(store.path(), &fx.root),
+        volume_store_dir(store.path(), &fx.checkout),
+        "parent and child must retain independent current/history stores"
+    );
+}
+
 /// Regression for a live-run bug against `~/src`: a project whose linked
 /// worktrees live *inside* the main checkout's own directory tree (e.g.
 /// `.worktrees/<name>`, the real shape `swamp` itself uses), each
@@ -665,7 +793,7 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
     }
 
     let tmp = tempfile::tempdir().expect("tmp root");
-    let root = tmp.path().join("project");
+    let root = fs::canonicalize(tmp.path()).unwrap().join("project");
     fs::create_dir_all(&root).expect("mkdir root");
     run_git(&root, &["init", "-q", "-b", "main"]);
     run_git(&root, &["config", "commit.gpgsign", "false"]);

@@ -38,7 +38,7 @@ History starts when swamp observes a root. `--since` selects a comparison window
 
 Use `--full` to force a full filesystem walk. A normal observation can also fall back to a full walk when event history is insufficient; the report notes explain why.
 
-The store currently partitions observations by volume. Prefer one common root such as `~/src`; use a separate `SWAMP_DIR` for independent roots on the same volume. See [storage limits](architecture.md#limits-of-the-current-implementation).
+Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
 
 ## Terminal controls
 
@@ -98,14 +98,18 @@ Review a bounded selection before deciding what to remove:
 ```sh
 swamp cleanup-check ~/src/my-project --role test-executable --limit 3
 swamp cleanup-check ~/src/my-project --role incremental --limit 5 --json
+swamp cleanup-check ~/src/my-project --role incremental --limit 5 --offset 5 --json
+swamp cleanup-check ~/src --within ~/src/my-project/target --role incremental --limit 5
 swamp cleanup-check ~/src/my-project --path /absolute/path/to/target/debug/incremental/crate-group
 ```
 
-This command observes the root, then checks selected groups (five by default, at most twenty). Checks can read the group's contents and create **unapproved** plans; they never authorize or execute cleanup. Results distinguish `blocked`, `unchecked`, and `ready_for_review`, with reason codes, exact members for successful checks, recovery details and timings. A reviewed group is not confirmed unused. A failed group never expands into removal of its parent. A bounded search does not establish that no other candidate exists.
+This command observes the root, then checks selected groups (five by default, at most twenty). Checks can read the group's contents and create **unapproved** plans; they never authorize or execute cleanup. Results distinguish `blocked`, `unchecked`, and `ready_for_review`, with reason codes, exact members for successful checks, recovery details and timings. A reviewed group is not confirmed unused. A failed group never expands into removal of its parent.
 
-Hardlinked groups remain blocked by the current selective-cleanup implementation. Lock failures distinguish unavailable locks from missing lock files; retry after builds finish, not by widening scope. Allocated bytes are not promised free space, and moving files to Trash does not necessarily free space immediately. JSON `next_command` is an argument array, not a shell string; retain the same `SWAMP_DIR` to find the created plans.
+The result shows the number and allocated size of all observed candidates in scope, how many were not checked in this run, and arguments for the next size-ranked page. It also counts coverage-limited and unidentified Cargo rows separately; zero candidates does not establish that there is no cleanup opportunity. These coverage counts ignore `--role`, because an unknown row cannot reliably match a requested role. Pages can shift if builds change between calls. `--within` narrows candidate discovery to groups strictly below a directory; use `--path` to review that exact directory if it is a selectable group. A five-group result is not a measure of the total cleanup opportunity, and candidate bytes are not a promise of reclaimable space.
 
-Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, hardlinks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
+Hardlinked groups can be reviewed and moved to Trash. Links outside the selected group remain intact; reclaimable space is unknown. Lock failures distinguish unavailable locks from missing lock files; retry after builds finish, not by widening scope. Allocated bytes are not promised free space, and moving files to Trash does not free those bytes immediately. JSON `next_command` and `next_page` are argument arrays, not shell strings; retain the same `SWAMP_DIR` to find the created plans.
+
+Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
 
 The CLI currently applies `report --filter` only to the root `--view worktrees` output. It does not filter the builds view, project drill-down, overview, or JSON. For artifact filters use the TUI, MCP `report`, or `propose --filter`. `--project` scopes the project tree and supported artifact views; it does not scope every summary view.
 
@@ -167,7 +171,10 @@ The CLI separates proposal, approval, and execution:
 
 ```bash
 swamp propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
+swamp propose ~/src --path /absolute/path/to/a-worktree
 ```
+
+For a worktree, first inspect `swamp report <root> --view worktrees` for dirty, unpushed and merge evidence. Use its exact reported path in `propose --path`; the scan root must cover that worktree. You can use the same store when switching between a project root and a parent containing related worktrees.
 
 Inspect the printed units and warnings, then use the returned ID:
 
@@ -177,6 +184,8 @@ swamp execute <plan-id> --keep-executables
 ```
 
 Proposing does not remove anything. CLI/MCP plans expire after 30 minutes and are single-use. Execution returns per-unit results; inspect refusals and failures as well as successful units.
+
+The plan's `created_at` is its review time. A unit's `observed_at` can be older when incremental replay reused an unchanged measurement; it is not restamped to pretend the data was remeasured.
 
 For repeated work, a human can create and revoke a bounded standing grant:
 

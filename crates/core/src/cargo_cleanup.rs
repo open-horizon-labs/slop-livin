@@ -19,6 +19,10 @@ pub struct Member {
     pub path: PathBuf,
     pub device: u64,
     pub inode: u64,
+    #[serde(default)]
+    pub nlink: u64,
+    #[serde(default)]
+    pub hardlink_members: u64,
     pub bytes: u64,
     pub digest: String,
 }
@@ -32,6 +36,22 @@ pub struct CargoGroup {
     pub members: Vec<Member>,
     pub lock_paths: Vec<PathBuf>,
     pub evidence: Vec<Member>,
+    /// Bytes allocated by the selected directory entries. This is not a
+    /// promise about bytes reclaimed: an inode may still have aliases.
+    #[serde(default)]
+    pub allocated_bytes: u64,
+    /// Reserved for a conservative allocation-based potential estimate.
+    /// Currently always `None`: APFS clones, snapshots, and same-device
+    /// Trash make any reclaimed-space value unknowable, so this never becomes
+    /// an immediate-free-space promise or an execution gate.
+    #[serde(default)]
+    pub reclaimable_bytes: Option<u64>,
+    /// Compact per-plan evidence for the action/UI layers. We deliberately do
+    /// not retain or build a filesystem-wide alias index.
+    #[serde(default)]
+    pub hardlink_members: u64,
+    #[serde(default)]
+    pub shared_storage: bool,
 }
 
 /// Derived from existing facts only. Never performs I/O or implies authorization.
@@ -45,26 +65,16 @@ pub struct Guidance {
 }
 
 pub fn guidance(unit: &NestedArtifact) -> Guidance {
-    let (scope, status, code, message, next) = if !unit.coverage.complete
-        || !unit.coverage.supported
-    {
-        (
-            "unknown",
-            "blocked",
-            "coverage_limited",
-            "Coverage is incomplete; refresh before reviewing cleanup.",
-            "refresh",
-        )
-    } else if candidate(unit) {
-        if unit.membership == crate::artifact::Membership::SharedHardlink {
+    let (scope, status, code, message, next) =
+        if !unit.coverage.complete || !unit.coverage.supported {
             (
-                "group",
+                "unknown",
                 "blocked",
-                "shared_hardlink",
-                "Swamp currently blocks selective cleanup of hardlinked files; reclaimable space is unknown.",
-                "inspect",
+                "coverage_limited",
+                "Coverage is incomplete; refresh before reviewing cleanup.",
+                "refresh",
             )
-        } else {
+        } else if candidate(unit) {
             (
                 "group",
                 "unchecked",
@@ -72,24 +82,23 @@ pub fn guidance(unit: &NestedArtifact) -> Guidance {
                 "Cleanup checks not run. Identification does not establish disuse.",
                 "review_cleanup",
             )
-        }
-    } else if unit.is_dir {
-        (
-            "summary",
-            "not_applicable",
-            "summary_row",
-            "Category total, not a selective cleanup unit. Inspect individual groups.",
-            "inspect_groups",
-        )
-    } else {
-        (
-            "output",
-            "blocked",
-            "unsupported_role",
-            "This output is inspection-only; selective cleanup is not supported.",
-            "inspect",
-        )
-    };
+        } else if unit.is_dir {
+            (
+                "summary",
+                "not_applicable",
+                "summary_row",
+                "Category total, not a selective cleanup unit. Inspect individual groups.",
+                "inspect_groups",
+            )
+        } else {
+            (
+                "output",
+                "blocked",
+                "unsupported_role",
+                "This output is inspection-only; selective cleanup is not supported.",
+                "inspect",
+            )
+        };
     Guidance {
         scope,
         check_status: status,
@@ -133,6 +142,8 @@ pub struct CheckResult {
     /// Argument vector, never shell-interpolated. Caller must retain its store.
     pub next_command: Vec<String>,
     pub members: Vec<PathBuf>,
+    /// Human-facing plan warnings, including shared-storage uncertainty.
+    pub warnings: Vec<String>,
     pub recovery: Option<String>,
     pub checked_at: u64,
     pub elapsed_ms: u128,
@@ -197,12 +208,18 @@ pub fn check(
                 "--all".into(),
             ],
             members: Vec::new(),
+            warnings: Vec::new(),
             recovery: None,
             checked_at,
             elapsed_ms: 0,
         };
         if g.check_status == "unchecked" {
-            match crate::actions::propose(report, None, &[unit.path.clone()], "cleanup-check") {
+            match crate::actions::propose(
+                report,
+                None,
+                std::slice::from_ref(&unit.path),
+                "cleanup-check",
+            ) {
                 Ok(plan) => {
                     crate::actions::save_plan(store, &plan)?;
                     result.members = plan
@@ -212,6 +229,11 @@ pub fn check(
                         .flat_map(|g| g.members.iter().map(|m| m.path.clone()))
                         .collect();
                     result.recovery = plan.units.first().map(|u| u.recovery.clone());
+                    result.warnings = plan
+                        .units
+                        .iter()
+                        .flat_map(|u| u.warnings.iter().cloned())
+                        .collect();
                     result.check_status = "ready_for_review";
                     result.reason_code = "checks_passed";
                     result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Not confirmed unused. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
@@ -223,9 +245,8 @@ pub fn check(
                 Err(error) => {
                     result.check_status = "blocked";
                     let message = error.to_string();
-                    result.reason_code = if message.contains("shared hardlink") {
-                        "shared_hardlink"
-                    } else if message.contains("Cargo build busy or lock unavailable") {
+                    result.reason_code = if message.contains("Cargo build busy or lock unavailable")
+                    {
                         "lock_unavailable"
                     } else if message.contains("no established Cargo build lock") {
                         "missing_lock"
@@ -243,8 +264,6 @@ pub fn check(
                             "--path".into(),
                             unit.path.display().to_string(),
                         ];
-                    } else if result.reason_code == "shared_hardlink" {
-                        result.next_action = "inspect_other_groups";
                     } else {
                         result.next_action = "inspect";
                     }
@@ -295,6 +314,13 @@ fn snapshot(path: &Path) -> Result<Member> {
     snapshot_at(path, 0, &mut 0)
 }
 
+/// Authorization identity for a selected path. Link counts and allocation
+/// accounting are observations, not safety facts: aliases outside the
+/// selection may change without changing the selected content or membership.
+fn same_safety(a: &Member, b: &Member) -> bool {
+    a.path == b.path && a.device == b.device && a.inode == b.inode && a.digest == b.digest
+}
+
 fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member> {
     *visited += 1;
     if depth > 128 || *visited > 100_000 {
@@ -312,27 +338,32 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         paths.sort();
         let mut hash = blake3::Hasher::new();
         let mut bytes = 0;
+        let mut hardlink_members = 0;
         for p in paths {
             let m = snapshot_at(&p, depth + 1, visited)?;
             bytes += m.bytes;
-            hash.update(&serde_json::to_vec(&m)?);
+            hardlink_members += m.hardlink_members;
+            // The safety identity deliberately excludes allocation/link
+            // accounting. External aliases may appear or disappear without
+            // changing this selected group's membership or content.
+            hash.update(&serde_json::to_vec(&(
+                &m.path, m.device, m.inode, &m.digest,
+            ))?);
         }
         return Ok(Member {
             path: path.into(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            // Directory link counts describe `.`/`..`, not aliases of the
+            // directory's contents. Child file counts are aggregated above.
+            nlink: 1,
+            hardlink_members,
             bytes,
             digest: hash.finalize().to_hex().to_string(),
         });
     }
     let mut file = regular(path)?;
     let before = file.metadata()?;
-    if before.nlink() != 1 {
-        bail!(
-            "shared hardlink: Swamp currently blocks selective cleanup of this group because a file has multiple directory entries: {}. Nothing changed; reclaimable space is unknown. Inspect another group; do not widen the selection automatically.",
-            path.display()
-        );
-    }
     let mut hash = blake3::Hasher::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -362,6 +393,8 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         path: path.into(),
         device: before.dev(),
         inode: before.ino(),
+        nlink: before.nlink(),
+        hardlink_members: u64::from(before.nlink() > 1),
         bytes: before.blocks() * 512,
         digest: hash.finalize().to_hex().to_string(),
     })
@@ -447,10 +480,10 @@ fn explicit_unlock_releases_even_with_a_duplicated_description() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(".cargo-lock");
     fs::write(&path, b"").unwrap();
-    let held = acquire(&[path.clone()]).unwrap();
+    let held = acquire(std::slice::from_ref(&path)).unwrap();
     let duplicate = held.0[0].try_clone().unwrap();
     assert!(
-        acquire(&[path.clone()]).is_err(),
+        acquire(std::slice::from_ref(&path)).is_err(),
         "live guard must exclude another holder"
     );
     drop(held);
@@ -539,6 +572,8 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
         paths.push(dsym);
     }
     let members: Vec<_> = paths.iter().map(|p| snapshot(p)).collect::<Result<_>>()?;
+    let allocated_bytes = members.iter().map(|m| m.bytes).sum();
+    let hardlink_members = members.iter().map(|m| m.hardlink_members).sum();
     Ok(CargoGroup {
         container,
         selected,
@@ -547,6 +582,10 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
         members,
         lock_paths,
         evidence,
+        allocated_bytes,
+        reclaimable_bytes: None,
+        hardlink_members,
+        shared_storage: hardlink_members > 0,
     })
 }
 
@@ -559,7 +598,7 @@ pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf>
     }
     let _held = acquire(&group.lock_paths)?;
     for evidence in &group.evidence {
-        if snapshot(&evidence.path)? != *evidence {
+        if !same_safety(&snapshot(&evidence.path)?, evidence) {
             bail!("Cargo role/evidence changed; propose again");
         }
     }
@@ -587,7 +626,7 @@ pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf>
         bail!("companion membership changed; propose again");
     }
     for m in &group.members {
-        if snapshot(&m.path)? != *m {
+        if !same_safety(&snapshot(&m.path)?, m) {
             bail!("stale Cargo member {}; propose again", m.path.display());
         }
         if occupied(&m.path) {

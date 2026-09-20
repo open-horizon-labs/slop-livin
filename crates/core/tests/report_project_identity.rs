@@ -31,10 +31,11 @@ fn run_git(dir: &Path, args: &[&str]) {
 #[test]
 fn two_clones_of_the_same_remote_are_one_project_with_two_main_checkouts() {
     let tmp = tempfile::tempdir().expect("tmp root");
+    let tmp_root = fs::canonicalize(tmp.path()).expect("canonical tmp root");
     let remote = "https://example.com/fixture-org/shared-repo.git";
 
     // First clone: a normal checkout plus a linked worktree.
-    let clone_a = tmp.path().join("shared-repo");
+    let clone_a = tmp_root.join("shared-repo");
     fs::create_dir_all(&clone_a).unwrap();
     run_git(&clone_a, &["init", "-q", "-b", "main"]);
     run_git(&clone_a, &["config", "commit.gpgsign", "false"]);
@@ -43,7 +44,7 @@ fn two_clones_of_the_same_remote_are_one_project_with_two_main_checkouts() {
     run_git(&clone_a, &["commit", "-q", "-m", "init"]);
     run_git(&clone_a, &["remote", "add", "origin", remote]);
 
-    let linked = tmp.path().join("shared-repo-linked");
+    let linked = tmp_root.join("shared-repo-linked");
     run_git(
         &clone_a,
         &[
@@ -57,7 +58,7 @@ fn two_clones_of_the_same_remote_are_one_project_with_two_main_checkouts() {
     );
 
     // Second clone: an entirely separate object store, same remote.
-    let clone_b = tmp.path().join("shared-repo-second-clone");
+    let clone_b = tmp_root.join("shared-repo-second-clone");
     fs::create_dir_all(&clone_b).unwrap();
     run_git(&clone_b, &["init", "-q", "-b", "main"]);
     run_git(&clone_b, &["config", "commit.gpgsign", "false"]);
@@ -66,7 +67,24 @@ fn two_clones_of_the_same_remote_are_one_project_with_two_main_checkouts() {
     run_git(&clone_b, &["commit", "-q", "-m", "init"]);
     run_git(&clone_b, &["remote", "add", "origin", remote]);
 
-    let r = report(tmp.path(), None).expect("report should not error");
+    let r = report(&tmp_root, None).expect("report should not error");
+    let detail =
+        swamp_core::render::render_worktree_signals(&r, &clone_a).expect("worktree detail");
+    let measured: u64 = r
+        .projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .find(|w| w.path == clone_a)
+        .unwrap()
+        .artifacts
+        .iter()
+        .map(|a| a.bytes)
+        .sum();
+    assert!(detail.contains(&format!(
+        "measured size: {}",
+        swamp_core::render::human_bytes_pub(measured)
+    )));
+    assert!(detail.contains("not a free-space estimate"));
 
     let matching: Vec<_> = r
         .projects

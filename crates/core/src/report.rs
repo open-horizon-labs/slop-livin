@@ -672,10 +672,16 @@ pub fn report_full_mode_with_source(
     force_full: bool,
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<Report> {
+    // Store topology, replay paths, and report paths under one canonical
+    // representation. This is essential when one invocation uses a symlink
+    // alias and the next uses its canonical spelling: FSEvents is canonical,
+    // while a caller-form topology would otherwise make incremental replay
+    // compare different path namespaces.
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // The pipeline is consumers on the event bus (ADR 001); this function
     // only translates its arguments into the run context.
     let ctx = crate::bus::ctx_for(
-        root,
+        &root,
         docker_facts,
         verify_du,
         store_dir,
@@ -756,6 +762,7 @@ pub fn annotate_tracking(
 }
 
 fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     store_dir.join(format!(
         "last_report-{}.json.zst",
         &crate::entities::id_for(&root.display().to_string())[..16]

@@ -884,7 +884,7 @@ pub fn render_view_rust_with_limit(
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Cargo storage: category totals include children; do not sum rows. Allocated and unique charges are not guaranteed reclaimable space."
+        "Cargo storage: category totals include children; do not add a parent to its descendants. Disjoint paths can be summed as allocation, not guaranteed reclaimable space."
     );
     let _ = writeln!(
         out,
@@ -1224,6 +1224,17 @@ pub fn render_worktree_signals(report: &Report, path: &Path) -> Option<String> {
     })?;
     let mut out = String::new();
     let _ = writeln!(out, "worktree: {}", worktree.path.display());
+    let bytes: u64 = worktree.artifacts.iter().map(|a| a.bytes).sum();
+    let stale = if worktree.artifacts.iter().any(|a| a.dedup_stale) {
+        "; unique-byte estimate needs reconciliation, use --full"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        "  measured size: {} (not a free-space estimate{stale})",
+        human_bytes(bytes)
+    );
     if worktree.signals.is_empty() {
         let _ = writeln!(out, "  (no signals)");
     } else {
