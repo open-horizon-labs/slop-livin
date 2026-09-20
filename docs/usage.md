@@ -4,32 +4,23 @@ For the product overview, start with the [README](../README.md).
 
 ## Installing a release
 
-The supported release target is Apple silicon macOS. These commands resolve the latest [release](https://github.com/open-horizon-labs/swamp/releases/latest), then download its `swamp` and `swamp-mcp` binaries. They run in a temporary directory and stop on failure without closing your shell:
+On Apple silicon macOS, install with [Homebrew](https://brew.sh). The formula installs `swamp` and `swamp-mcp` and verifies the release archive's checksum:
 
 ```bash
-(
-set -eu
-release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/open-horizon-labs/swamp/releases/latest)"
-tag="${release_url##*/}"
-case "$tag" in
-  v[0-9]*) version="${tag#v}" ;;
-  *) echo "Could not resolve the latest release: $release_url" >&2; exit 1 ;;
-esac
-archive="swamp-$version-aarch64-apple-darwin"
-download_dir="$(mktemp -d)"
-cd "$download_dir"
-base="https://github.com/open-horizon-labs/swamp/releases/download/v$version"
-curl -fLO "$base/$archive.tar.gz"
-curl -fLO "$base/$archive.tar.gz.sha256"
-shasum -a 256 -c "$archive.tar.gz.sha256"
-tar -xzf "$archive.tar.gz"
-mkdir -p "$HOME/.local/bin"
-install -m 755 "$archive/swamp" "$archive/swamp-mcp" "$HOME/.local/bin/"
-"$HOME/.local/bin/swamp" --version
-)
+brew install open-horizon-labs/tap/swamp
+swamp --version
 ```
 
-Release binaries are unsigned. If macOS blocks a downloaded binary with a quarantine warning, verify its checksum and source before deciding whether to clear that flag for the specific binary. You can also [build from source](../README.md#build-from-source).
+Update with `brew upgrade swamp`; uninstall with `brew uninstall swamp`.
+The tap checks for new releases every 15 minutes; GitHub may delay scheduled updates.
+
+If you installed manually before, run `type -a swamp`. A copy in
+`~/.local/bin` may take precedence over Homebrew. Remove that manually installed
+copy after verifying `"$(brew --prefix)/bin/swamp" --version`; check
+`swamp-mcp` for the same conflict.
+
+Release archives remain available on the [releases page](https://github.com/open-horizon-labs/swamp/releases).
+You can also [build from source](../README.md#build-from-source).
 
 ## Observations and history
 

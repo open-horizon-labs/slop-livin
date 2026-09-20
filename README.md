@@ -37,32 +37,14 @@ History begins with the first observation. Swamp records sizes and metadata; it 
 
 ## Install
 
-The supported platform is Apple silicon macOS. These commands install the latest [release](https://github.com/open-horizon-labs/swamp/releases/latest):
+On Apple silicon macOS, install with [Homebrew](https://brew.sh):
 
 ```bash
-(
-set -eu
-release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/open-horizon-labs/swamp/releases/latest)"
-tag="${release_url##*/}"
-case "$tag" in
-  v[0-9]*) version="${tag#v}" ;;
-  *) echo "Could not resolve the latest release: $release_url" >&2; exit 1 ;;
-esac
-archive="swamp-$version-aarch64-apple-darwin"
-download_dir="$(mktemp -d)"
-cd "$download_dir"
-base="https://github.com/open-horizon-labs/swamp/releases/download/v$version"
-curl -fLO "$base/$archive.tar.gz"
-curl -fLO "$base/$archive.tar.gz.sha256"
-shasum -a 256 -c "$archive.tar.gz.sha256"
-tar -xzf "$archive.tar.gz"
-mkdir -p "$HOME/.local/bin"
-install -m 755 "$archive/swamp" "$archive/swamp-mcp" "$HOME/.local/bin/"
-"$HOME/.local/bin/swamp" --version
-)
+brew install open-horizon-labs/tap/swamp
+swamp --version
 ```
 
-Add `~/.local/bin` to your `PATH` if needed. The binaries are unsigned; see the [installation guide](docs/usage.md#installing-a-release) for quarantine guidance.
+Update with `brew upgrade swamp`. See the [installation guide](docs/usage.md#installing-a-release) if you previously installed manually.
 
 ### Build from source
 
