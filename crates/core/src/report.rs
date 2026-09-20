@@ -438,7 +438,11 @@ pub struct Report {
     /// Nested Cargo/build-artifact facts. These are identification units
     /// inside existing artifact rows; their physical bytes are not added to
     /// reconciliation totals a second time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "crate::cargo_cleanup::serialize_units"
+    )]
     pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
 }
 

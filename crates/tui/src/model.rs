@@ -973,7 +973,12 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         let mut row = Row::leaf(
                             1,
                             format!(
-                                "  cargo · {} · {} (physical {}){}",
+                                "  {} · {} · {} (unique {}){}",
+                                match swamp_core::cargo_cleanup::guidance(u).next_action {
+                                    "inspect_groups" => "category",
+                                    "review_cleanup" => "unchecked",
+                                    _ => "inspection-only",
+                                },
                                 u.role.label(),
                                 u.path.display(),
                                 if matches!(
@@ -999,13 +1004,20 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                             .series_by_key
                             .get(&format!("Nested:{}", u.id))
                             .cloned();
-                        if swamp_core::cargo_cleanup::candidate(u) {
+                        if swamp_core::cargo_cleanup::guidance(u).check_status == "unchecked" {
                             row.unit = Some(UnitId::for_artifact(&u.path));
                             row.kind = Some(ArtifactKind::BuildOutput);
-                            row.signals = vec!["review exact group".into()];
+                            row.signals = vec!["unchecked".into()];
                         } else {
                             row.signals = if u.coverage.supported {
-                                vec!["inspection-only".into()]
+                                vec![
+                                    if swamp_core::cargo_cleanup::guidance(u).scope == "summary" {
+                                        "category"
+                                    } else {
+                                        "blocked"
+                                    }
+                                    .into(),
+                                ]
                             } else {
                                 vec!["coverage-limited".into()]
                             };

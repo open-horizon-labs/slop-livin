@@ -67,6 +67,77 @@ fn report(root: &Path, store: &Path) -> swamp_core::Report {
     .unwrap()
 }
 #[test]
+fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
+    use swamp_core::cargo_cleanup::{check, guidance};
+    let (_tmp, root, target) = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let group = target.join("debug/incremental/crate-a");
+    fs::create_dir_all(&group).unwrap();
+    fs::write(group.join("state.o"), vec![1u8; 8192]).unwrap();
+    fs::hard_link(group.join("state.o"), target.join("alias.o")).unwrap();
+    let r = report(&root, store.path());
+    let category = r
+        .nested_artifacts
+        .iter()
+        .find(|u| u.path == target.join("debug/incremental"))
+        .unwrap();
+    assert_eq!(guidance(category).scope, "summary");
+    assert_eq!(guidance(category).next_action, "inspect_groups");
+    let categories = check(&r, store.path(), &[category.path.clone()], None, 1).unwrap();
+    assert_eq!(categories[0].check_status, "not_applicable");
+    assert!(categories[0].plan_id.is_none());
+    let blocked = check(&r, store.path(), &[group.clone()], None, 1).unwrap();
+    assert_eq!(blocked[0].reason_code, "shared_hardlink");
+    assert!(blocked[0].plan_id.is_none());
+    let selected = target.join("debug/deps/fixture-aaa");
+    let checked = check(&r, store.path(), &[selected.clone()], None, 1).unwrap();
+    assert_eq!(checked[0].check_status, "ready_for_review");
+    let id = checked[0].plan_id.as_ref().unwrap();
+    let plan = actions::load_plan(store.path(), id).unwrap();
+    assert_eq!(plan.units.len(), 1);
+    assert_eq!(plan.units[0].path, selected);
+    assert_eq!(
+        actions::execute_with_trash(store.path(), id, "test", &store.path().join("trash"))
+            .unwrap()
+            .state,
+        "awaiting-authorization"
+    );
+    assert!(selected.exists());
+    assert!(group.join("state.o").exists());
+    let lock = fs::File::open(target.join("debug/.cargo-lock")).unwrap();
+    lock.try_lock().unwrap();
+    let busy = check(&r, store.path(), &[selected.clone()], None, 1).unwrap();
+    assert_eq!(busy[0].reason_code, "lock_unavailable");
+    assert_eq!(busy[0].next_action, "retry_after_builds");
+    assert!(
+        busy[0]
+            .next_command
+            .contains(&selected.display().to_string())
+    );
+    assert!(busy[0].plan_id.is_none());
+    lock.unlock().unwrap();
+    assert!(check(&r, store.path(), &[target.join("no-such-group")], None, 1).is_err());
+    assert!(check(&r, store.path(), &[], None, 0).is_err());
+    let json = serde_json::to_value(&r).unwrap();
+    let u = json["nested_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["path"] == selected.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        u["cleanup"]["check_status"], "unchecked",
+        "report facts never inherit a previous plan's authorization or check result"
+    );
+    let decoded: swamp_core::Report = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.nested_artifacts.len(), r.nested_artifacts.len());
+    let text = swamp_core::render::render_view_rust_with_limit(&r, None, Some(2));
+    assert!(text.contains("Showing 2 of"));
+    assert!(text.contains("do not sum rows"));
+    assert!(text.contains("cleanup-check"));
+}
+
+#[test]
 fn native_cargo_rebuilds_after_reviewed_test_cleanup() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap().join("repo");
