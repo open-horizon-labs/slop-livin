@@ -4,12 +4,17 @@ For the product overview, start with the [README](../README.md).
 
 ## Installing a release
 
-The supported release target is Apple silicon macOS. Install v0.6.2 below, or set `version` to another published [release](https://github.com/open-horizon-labs/swamp/releases). Each versioned archive contains `swamp` and `swamp-mcp`. The commands run in a temporary directory and stop on failure without closing your shell:
+The supported release target is Apple silicon macOS. These commands resolve the latest [release](https://github.com/open-horizon-labs/swamp/releases/latest), then download its `swamp` and `swamp-mcp` binaries. They run in a temporary directory and stop on failure without closing your shell:
 
 ```bash
 (
 set -eu
-version=0.6.2
+release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/open-horizon-labs/swamp/releases/latest)"
+tag="${release_url##*/}"
+case "$tag" in
+  v[0-9]*) version="${tag#v}" ;;
+  *) echo "Could not resolve the latest release: $release_url" >&2; exit 1 ;;
+esac
 archive="swamp-$version-aarch64-apple-darwin"
 download_dir="$(mktemp -d)"
 cd "$download_dir"
