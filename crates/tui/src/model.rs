@@ -133,6 +133,8 @@ pub struct Row {
     pub collapsed_children: Option<usize>,
     pub expandable: bool,
     pub expansion_key: Option<String>,
+    pub cleanup_summary: Option<String>,
+    pub allocated: bool,
     /// Set on a projects-view row: the project's own name (not its
     /// display name), so marking can expand the row into that project's
     /// artifacts without parsing the rendered label back into an
@@ -160,6 +162,8 @@ impl Row {
             collapsed_children: None,
             expandable: false,
             expansion_key: None,
+            cleanup_summary: None,
+            allocated: false,
             project: None,
         }
     }
@@ -528,6 +532,8 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             collapsed_children: None,
             expandable: true,
             expansion_key: None,
+            cleanup_summary: None,
+            allocated: false,
             project: Some(p.name.clone()),
         });
     }
@@ -627,6 +633,8 @@ pub fn tree_rows(
             collapsed_children: is_collapsed.then_some(wt.rows.len()),
             expandable: !wt.rows.is_empty(),
             expansion_key: Some(wt_key.clone()),
+            cleanup_summary: None,
+            allocated: false,
             project: None,
         });
         if is_collapsed {
@@ -848,6 +856,45 @@ fn cargo_children_from_index(
         row.collapsed_children = closed.then_some(count);
         let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
         row.signals = vec![guidance.recommendation, guidance.consequence.into()];
+        row.allocated = true;
+        let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
+        row.cleanup_summary = Some(if unit.bytes == 0 {
+            "Empty".into()
+        } else if swamp_core::cargo_cleanup::candidate(unit) {
+            format!(
+                "Candidate · modified {}",
+                age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                    unit,
+                    observed_at
+                ))
+            )
+        } else if candidates > 0 {
+            row.signals.push(format!("{candidates} reviewable groups · {} allocated · oldest modification {}. Expand to select groups; not guaranteed freed space.", human_bytes(bytes), age_label(oldest)));
+            format!(
+                "{candidates} {} · {} · {}",
+                if candidates == 1 {
+                    "candidate"
+                } else {
+                    "candidates"
+                },
+                human_bytes(bytes),
+                age_label(oldest)
+            )
+        } else if unit.role == swamp_core::artifact::ArtifactRole::FinalOutput {
+            row.signals.insert(
+                0,
+                "Compiled output: review manually; selective removal not supported here".into(),
+            );
+            format!(
+                "Manual · modified {}",
+                age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                    unit,
+                    observed_at
+                ))
+            )
+        } else {
+            "No selectable groups".into()
+        });
         row.mtime_max = unit.mtime_max;
         if swamp_core::cargo_cleanup::candidate(unit) {
             row.unit = Some(UnitId::for_artifact(&unit.path));
@@ -866,6 +913,43 @@ fn cargo_children_from_index(
         }
     }
     rows
+}
+
+pub(crate) fn age_label(age: Option<u64>) -> String {
+    match age {
+        Some(s) if s >= 86400 => format!("{}d", s / 86400),
+        Some(s) if s >= 3600 => format!("{}h", s / 3600),
+        Some(s) if s >= 60 => format!("{}m", s / 60),
+        Some(_) => "<1m".into(),
+        None => "?".into(),
+    }
+}
+
+/// Count only disjoint, selectable descendants. Stop at a candidate directory,
+/// so neither summaries nor nested members count the same selected scope twice.
+fn candidate_summary(
+    by_parent: &BTreeMap<&std::path::Path, Vec<&swamp_core::artifact::NestedArtifact>>,
+    parent: &std::path::Path,
+    now: u64,
+) -> (usize, u64, Option<u64>) {
+    let mut result = (0, 0u64, None);
+    for child in by_parent.get(parent).into_iter().flatten() {
+        let next = if swamp_core::cargo_cleanup::candidate(child) {
+            (
+                usize::from(child.bytes > 0),
+                child.bytes,
+                (child.bytes > 0)
+                    .then(|| swamp_core::cargo_cleanup::modified_age_secs(child, now))
+                    .flatten(),
+            )
+        } else {
+            candidate_summary(by_parent, &child.path, now)
+        };
+        result.0 += next.0;
+        result.1 = result.1.saturating_add(next.1);
+        result.2 = result.2.max(next.2);
+    }
+    result
 }
 
 /// Top-level directories of a worktree's Source tree, biggest first.
@@ -923,6 +1007,8 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             collapsed_children: None,
             expandable: false,
             expansion_key: None,
+            cleanup_summary: None,
+            allocated: false,
             project: None,
         })
         .collect()

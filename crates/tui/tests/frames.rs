@@ -43,6 +43,15 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     )];
     report.nested_artifacts =
         swamp_core::cargo_artifacts::inspect_target(&target, Some(&target)).units;
+    let mut unsupported = report
+        .nested_artifacts
+        .iter()
+        .find(|u| u.path.ends_with("crate-a"))
+        .unwrap()
+        .clone();
+    unsupported.path = target.join("debug/incremental/unsupported");
+    unsupported.coverage.complete = false;
+    report.nested_artifacts.push(unsupported);
     let mut app = App::new(report, root);
     app.clear_filter();
     app.drill_into_selected();
@@ -51,6 +60,14 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     assert!(rows.iter().any(|r| r.label == "profile debug"));
     let incremental = rows.iter().position(|r| r.label == "incremental").unwrap();
     assert!(rows[incremental].collapsed_children.is_some());
+    assert!(
+        rows[incremental]
+            .cleanup_summary
+            .as_ref()
+            .unwrap()
+            .starts_with("1 candidate ·"),
+        "empty and unsupported groups are not cleanup opportunities"
+    );
     assert!(
         rows[incremental].unit.is_none(),
         "category must not become an exact cleanup selection"
@@ -67,7 +84,13 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             rendered.contains("slower"),
             "selected consequence should remain visible: {rendered}"
         );
-        assert!(rendered.contains("Change"));
+        assert!(rendered.contains("Size*"));
+        assert!(rendered.contains("candidate"));
+        if width >= 100 {
+            assert!(rendered.contains("Change"));
+        }
+        assert!(rendered.contains("Oldest candidates"));
+        assert!(rendered.contains("showing 1 of 1"));
     }
     app.enter_row();
     let rows = app.rows();
@@ -260,8 +283,8 @@ fn cargo_cleanup_guidance_frames() {
         report.nested_artifacts.push(serde_json::from_value(serde_json::json!({
             "id":rel,"path":format!("{root}/{rel}"),"relative_path":rel,
             "parent_id":null,"container_id":"target","role":role,"membership":"Unknown",
-            "is_dir":is_dir,"logical_bytes":0,"bytes":64000000,"physical_bytes":0,
-            "mtime_max":0,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
+            "is_dir":is_dir,"logical_bytes":0,"bytes":if role == "Profile" {128000000} else {64000000},"physical_bytes":0,
+            "mtime_max":report.observed_at - 21 * 86400,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
             "action_group":null,"present":true
         })).unwrap());
     }
@@ -531,6 +554,8 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         collapsed_children: None,
         expandable: false,
         expansion_key: None,
+        cleanup_summary: None,
+        allocated: false,
         project: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));

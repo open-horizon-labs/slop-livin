@@ -97,3 +97,24 @@ larger recent group; the recent group still qualifies; zero/future times are not
 treated as ancient; incomplete coverage keeps existing action checks. This does
 not claim last execution or certainty of obsolescence. That uncertainty is an
 accepted advisory trade-off, not a blocker for useful recommendations.
+
+## Candidate visibility / available-space iteration
+
+Compared three presentations: prose in the facts column (observed failure),
+separate age/status columns (too much fixed-column overhead at 80 columns), and
+compact category summaries plus selected-category previews (selected). Initial
+rendered summary variant still spent too much width padding paths; capped names
+at 64 cells and rendered candidate evidence in the unused lower area.
+
+Collapsed rows now show count, allocated candidate bytes and oldest modification;
+individual rows show candidate/manual status and age. Zero-byte and unsupported
+groups are excluded from opportunity summaries. Summary traversal stops at each
+selectable group, avoiding parent/descendant double counting. Stars and a visible
+legend distinguish nested allocation from report totals. Advice never changes
+selection/approval rules.
+
+Verification: 49 TUI unit tests, 19 frame/integration tests and strict workspace
+Clippy passed. Batched frames at 80 and 200 columns checked; integration asserts
+120-column behavior too. New assertions prove empty/unsupported groups do not
+inflate the count and spare space contains an oldest-candidate preview. Actual
+terminal/font review remains with the user; no cleanup performed.

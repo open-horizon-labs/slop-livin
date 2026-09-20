@@ -390,28 +390,58 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let narrow = width < 120;
     // Half the diverging bar, each side; plus one cell for the axis.
-    let half: usize = if width >= 140 { 6 } else { 0 };
+    let cleanup_view = rows.iter().any(|r| r.cleanup_summary.is_some());
+    let show_growth = !cleanup_view || width >= 100;
+    let half: usize = if width >= 140 && !cleanup_view { 6 } else { 0 };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
     let bar_width = if half > 0 { half * 2 + 2 } else { 0 };
-    let fixed = 24 + bar_width;
+    let fixed = if show_growth { 24 + bar_width } else { 13 };
     let flexible = width.saturating_sub(fixed);
-    let signals_width = if width >= 100 { flexible / 3 } else { 0 };
-    let name_width = flexible.saturating_sub(signals_width);
+    let signals_width = if cleanup_view {
+        (flexible / 2).min(64)
+    } else if width >= 100 {
+        flexible / 3
+    } else {
+        0
+    };
+    let name_width = if cleanup_view {
+        flexible.saturating_sub(signals_width).min(64)
+    } else {
+        flexible.saturating_sub(signals_width)
+    };
+    let signals_width = if cleanup_view {
+        flexible.saturating_sub(name_width)
+    } else {
+        signals_width
+    };
     let heading = format!(
-        "{}{:>10} {:>10} {} {}",
+        "{}{:>10} {}{}{}",
         pad_display("Name", name_width),
-        "Size",
-        "Change",
+        if cleanup_view { "Size*" } else { "Size" },
+        if show_growth {
+            format!("{:>10} ", "Change")
+        } else {
+            String::new()
+        },
+        pad_display(if half > 0 { "Change bar" } else { "" }, bar_width),
         pad_display(
-            if half > 0 { "Change bar" } else { "" },
-            bar_width.saturating_sub(1)
-        ),
-        pad_display("Cleanup / facts", signals_width)
+            if cleanup_view {
+                "Candidates / oldest modified"
+            } else {
+                "Cleanup / facts"
+            },
+            signals_width
+        )
     );
     let mut lines: Vec<Line> = vec![Line::styled(
         heading,
         Style::default().add_modifier(Modifier::BOLD),
     )];
+    if cleanup_view {
+        lines.push(Line::raw(
+            "* allocated incl. shared links; not additive with report totals. Age = modified",
+        ));
+    }
     for (i, row) in rows.iter().enumerate() {
         let marked = row
             .unit
@@ -430,7 +460,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         };
         let raw_name = format!("{}{mark_prefix}{}{badge}{track}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
-        let bytes = format!("{:>10}", human_bytes(row.bytes));
+        let bytes = format!(
+            "{:>10}",
+            format!(
+                "{}{}",
+                human_bytes(row.bytes),
+                if row.allocated { "*" } else { "" }
+            )
+        );
         let growth = format!(
             "{:>10}",
             row.growth
@@ -457,14 +494,16 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         // uses width up to 200 ... signals spell out."
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
-        let mut signals_text = if row.signals.is_empty() {
+        let mut signals_text = if let Some(summary) = &row.cleanup_summary {
+            summary.clone()
+        } else if row.signals.is_empty() {
             String::new()
         } else if narrow {
             pick_signals(&row.signals, 2).join(" · ")
         } else {
             row.signals.join(" · ")
         };
-        if signals_text.chars().count() > signals_width {
+        if row.cleanup_summary.is_none() && signals_text.chars().count() > signals_width {
             // Never overflow the row: prefer the loud signals, then cut.
             signals_text = pick_signals(&row.signals, 3).join(" · ");
             if signals_text.chars().count() > signals_width {
@@ -494,12 +533,23 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             // The signed number and its bar are one diffstat token: same
             // colour, number flush against the bar it measures.
-            Span::styled(growth, bar_style),
-            Span::raw(" "),
+            Span::styled(if show_growth { growth } else { String::new() }, bar_style),
+            Span::raw(if show_growth { " " } else { "" }),
             Span::styled(bar, bar_style),
             Span::styled(
-                pad_display(&format!("{signals_text}{hidden}"), signals_width),
-                Style::default().add_modifier(Modifier::DIM),
+                pad_display(
+                    &if row.cleanup_summary.is_some() {
+                        signals_text
+                    } else {
+                        format!("{signals_text}{hidden}")
+                    },
+                    signals_width,
+                ),
+                Style::default().add_modifier(if row.cleanup_summary.is_some() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::DIM
+                }),
             ),
         ];
 
@@ -514,14 +564,17 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
     // Keep the selection visible even in projects with hundreds of build groups.
-    let detail_height = 2.min(area.height.saturating_sub(2));
+    let detail_height = (if cleanup_view { 3 } else { 2 }).min(area.height.saturating_sub(2));
     let table_height = area.height.saturating_sub(detail_height);
-    let visible = table_height.saturating_sub(1) as usize;
+    let header_count = if cleanup_view { 2 } else { 1 };
+    let visible = table_height.saturating_sub(header_count) as usize;
     let offset = app.selected.saturating_sub(visible.saturating_sub(1));
-    let header = lines.remove(0);
-    let shown = std::iter::once(header)
+    let headers: Vec<_> = lines.drain(..header_count as usize).collect();
+    let shown = headers
+        .into_iter()
         .chain(lines.into_iter().skip(offset).take(visible))
         .collect::<Vec<_>>();
+    let shown_count = shown.len() as u16;
     frame.render_widget(
         Paragraph::new(shown),
         Rect {
@@ -529,6 +582,80 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             ..area
         },
     );
+    // Use blank space to preview concrete candidates without expanding the category.
+    let spare = table_height.saturating_sub(shown_count + 1);
+    if spare >= 4
+        && let Some(path) = rows
+            .get(app.selected)
+            .and_then(|r| r.expansion_key.as_deref())
+            .and_then(|key| key.strip_prefix("cargo:"))
+    {
+        let parent = std::path::Path::new(path);
+        let mut candidates: Vec<_> = app
+            .report
+            .nested_artifacts
+            .iter()
+            .filter(|u| {
+                u.present
+                    && u.bytes > 0
+                    && u.path != parent
+                    && u.path.starts_with(parent)
+                    && swamp_core::cargo_cleanup::candidate(u)
+            })
+            .collect();
+        candidates
+            .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, app.report.observed_at));
+        if !candidates.is_empty() {
+            let capacity = spare.saturating_sub(2) as usize;
+            let mut preview = vec![Line::styled(
+                format!(
+                    "Oldest candidates · showing {} of {} · → expand to select",
+                    candidates.len().min(capacity),
+                    candidates.len()
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            let path_width = (width / 3).min(64);
+            preview.push(Line::raw(format!(
+                "{}{:>12}  {:8}  Effect of removal",
+                pad_display("Path within category", path_width),
+                "Allocated",
+                "Modified"
+            )));
+            preview.extend(candidates.iter().take(capacity).map(|u| {
+                Line::raw(format!(
+                    "{}{:>12}  {:8}  {}",
+                    pad_display(
+                        &u.path
+                            .strip_prefix(parent)
+                            .unwrap_or(&u.path)
+                            .display()
+                            .to_string(),
+                        path_width
+                    ),
+                    human_bytes(u.bytes),
+                    crate::model::age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                        u,
+                        app.report.observed_at
+                    )),
+                    match u.role {
+                        swamp_core::artifact::ArtifactRole::Incremental => "slower next build",
+                        swamp_core::artifact::ArtifactRole::BuildScriptOutput =>
+                            "rerun build script",
+                        _ => "rebuild before rerunning",
+                    }
+                ))
+            }));
+            frame.render_widget(
+                Paragraph::new(preview),
+                Rect {
+                    y: area.y + shown_count + 1,
+                    height: spare,
+                    ..area
+                },
+            );
+        }
+    }
     if let Some(row) = rows.get(app.selected) {
         frame.render_widget(
             Paragraph::new(row.signals.join(" · ")).wrap(ratatui::widgets::Wrap { trim: true }),

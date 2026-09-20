@@ -2,7 +2,7 @@
 "view: builds  (Esc back) · filter: none                                         "
 "Name                                                          Size     Change   "
 "mole · build /Users/dev/src/mole/target                      2.1GB     +1.1GB   "
-"category · debug                                            64.0MB          —   "
+"category · debug                                           128.0MB          —   "
 "category · debug/deps                                       64.0MB          —   "
 "category · debug/incremental                                64.0MB          —   "
 "unchecked · debug/deps/test-a                               64.0MB          —   "

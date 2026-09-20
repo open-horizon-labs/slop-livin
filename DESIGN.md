@@ -8,9 +8,20 @@ Each row contains a name, bytes, signed growth, a change bar, and any visible fa
 
 Column headings identify name, size, change, and cleanup/facts. Name truncation
 and padding use grapheme-aware terminal-cell widths. Badges have separating
-spaces. Below 140 columns, hide the change bar; below 100, show facts in the
-selected-row detail area instead of squeezing them into a column. Zero and
+spaces. Build drilldowns reserve a compact candidates/oldest-modified column even
+at 80 columns, hide the change bar, and hide numeric change below 100 columns.
+Their name column caps at 64 cells. Other views hide bars below 140 columns and
+show facts only in selected-row details below 100 columns. Zero and
 unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+
+Collapsed build categories summarize nonempty, supported candidate groups with
+count, allocated size, and oldest known modification age. Unknown age is `?`.
+Candidate directory descendants are not counted again. Final outputs say
+`Manual` with modification age, without suggesting a supported selective action.
+Nested allocated sizes have a `*` suffix and a persistent accounting legend.
+When space remains below the tree, preview the selected category's oldest
+candidates with paths, allocated sizes, ages, and rebuilding effects. This preview
+is read-only: expand the category to select exact groups.
 
 Opening a project shows Cargo profiles and categories inside its build target.
 Categories expand into exact groups in the same tree; category rows are navigation,
