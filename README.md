@@ -37,17 +37,24 @@ History begins with the first observation. Swamp records sizes and metadata; it 
 
 ## Install
 
-The supported platform is Apple silicon macOS. Download the latest [swamp release](https://github.com/open-horizon-labs/swamp/releases/latest):
+The supported platform is Apple silicon macOS. Install v0.6.2 below, or set `version` to another published [release](https://github.com/open-horizon-labs/swamp/releases). Downloads are versioned; there is no unversioned archive.
 
 ```bash
-archive=swamp-aarch64-apple-darwin
-curl -fLO "https://github.com/open-horizon-labs/swamp/releases/latest/download/$archive.tar.gz"
-curl -fLO "https://github.com/open-horizon-labs/swamp/releases/latest/download/$archive.tar.gz.sha256"
+(
+set -eu
+version=0.6.2
+archive="swamp-$version-aarch64-apple-darwin"
+download_dir="$(mktemp -d)"
+cd "$download_dir"
+base="https://github.com/open-horizon-labs/swamp/releases/download/v$version"
+curl -fLO "$base/$archive.tar.gz"
+curl -fLO "$base/$archive.tar.gz.sha256"
 shasum -a 256 -c "$archive.tar.gz.sha256"
 tar -xzf "$archive.tar.gz"
-mkdir -p ~/.local/bin
-install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/
-~/.local/bin/swamp --version
+mkdir -p "$HOME/.local/bin"
+install -m 755 "$archive/swamp" "$archive/swamp-mcp" "$HOME/.local/bin/"
+"$HOME/.local/bin/swamp" --version
+)
 ```
 
 Add `~/.local/bin` to your `PATH` if needed. The binaries are unsigned; see the [installation guide](docs/usage.md#installing-a-release) for quarantine guidance.
