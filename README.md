@@ -37,12 +37,17 @@ History begins with the first observation. Swamp records sizes and metadata; it 
 
 ## Install
 
-The supported platform is Apple silicon macOS. Install v0.6.2 below, or set `version` to another published [release](https://github.com/open-horizon-labs/swamp/releases). Downloads are versioned; there is no unversioned archive.
+The supported platform is Apple silicon macOS. These commands install the latest [release](https://github.com/open-horizon-labs/swamp/releases/latest):
 
 ```bash
 (
 set -eu
-version=0.6.2
+release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/open-horizon-labs/swamp/releases/latest)"
+tag="${release_url##*/}"
+case "$tag" in
+  v[0-9]*) version="${tag#v}" ;;
+  *) echo "Could not resolve the latest release: $release_url" >&2; exit 1 ;;
+esac
 archive="swamp-$version-aarch64-apple-darwin"
 download_dir="$(mktemp -d)"
 cd "$download_dir"
