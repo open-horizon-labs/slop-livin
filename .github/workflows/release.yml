@@ -133,21 +133,10 @@ jobs:
             echo
             echo "### Install (macOS, Apple silicon)"
             echo '```bash'
-            echo '('
-            echo 'set -eu'
-            echo 'download_dir="$(mktemp -d)"'
-            echo 'cd "$download_dir"'
-            echo "archive=swamp-${v#v}-aarch64-apple-darwin"
-            echo "curl -fLO \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/\$archive.tar.gz\""
-            echo "curl -fLO \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${v}/\$archive.tar.gz.sha256\""
-            echo 'shasum -a 256 -c "$archive.tar.gz.sha256"'
-            echo 'tar -xzf "$archive.tar.gz"'
-            echo 'mkdir -p ~/.local/bin'
-            echo 'install -m 755 "$archive/swamp" "$archive/swamp-mcp" ~/.local/bin/'
-            echo '~/.local/bin/swamp --version'
-            echo ')'
+            echo 'brew install open-horizon-labs/tap/swamp'
+            echo 'swamp --version'
             echo '```'
-            echo "The binaries are unsigned. If macOS blocks them, verify the checksum and source before deciding whether to clear their quarantine flags. See https://github.com/${GITHUB_REPOSITORY}/blob/${v}/docs/usage.md#installing-a-release."
+            echo 'Update with `brew upgrade swamp`. The tap checks for new releases every 15 minutes; GitHub may delay scheduled updates. Versioned archives are also attached below.'
           } >> release-notes.md
 
       - name: Release
