@@ -34,6 +34,229 @@ pub struct CargoGroup {
     pub evidence: Vec<Member>,
 }
 
+/// Derived from existing facts only. Never performs I/O or implies authorization.
+#[derive(Debug, Serialize)]
+pub struct Guidance {
+    pub scope: &'static str,
+    pub check_status: &'static str,
+    pub reason_code: &'static str,
+    pub message: &'static str,
+    pub next_action: &'static str,
+}
+
+pub fn guidance(unit: &NestedArtifact) -> Guidance {
+    let (scope, status, code, message, next) = if !unit.coverage.complete
+        || !unit.coverage.supported
+    {
+        (
+            "unknown",
+            "blocked",
+            "coverage_limited",
+            "Coverage is incomplete; refresh before reviewing cleanup.",
+            "refresh",
+        )
+    } else if candidate(unit) {
+        if unit.membership == crate::artifact::Membership::SharedHardlink {
+            (
+                "group",
+                "blocked",
+                "shared_hardlink",
+                "Swamp currently blocks selective cleanup of hardlinked files; reclaimable space is unknown.",
+                "inspect",
+            )
+        } else {
+            (
+                "group",
+                "unchecked",
+                "checks_not_run",
+                "Cleanup checks not run. Identification does not establish disuse.",
+                "review_cleanup",
+            )
+        }
+    } else if unit.is_dir {
+        (
+            "summary",
+            "not_applicable",
+            "summary_row",
+            "Category total, not a selective cleanup unit. Inspect individual groups.",
+            "inspect_groups",
+        )
+    } else {
+        (
+            "output",
+            "blocked",
+            "unsupported_role",
+            "This output is inspection-only; selective cleanup is not supported.",
+            "inspect",
+        )
+    };
+    Guidance {
+        scope,
+        check_status: status,
+        reason_code: code,
+        message,
+        next_action: next,
+    }
+}
+
+/// Add derived guidance to report JSON without persisting a second action model.
+pub fn serialize_units<S: serde::Serializer>(
+    units: &[NestedArtifact],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    #[derive(Serialize)]
+    struct View<'a> {
+        #[serde(flatten)]
+        unit: &'a NestedArtifact,
+        cleanup: Guidance,
+    }
+    let mut seq = serializer.serialize_seq(Some(units.len()))?;
+    for unit in units {
+        seq.serialize_element(&View {
+            unit,
+            cleanup: guidance(unit),
+        })?;
+    }
+    seq.end()
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckResult {
+    pub path: PathBuf,
+    pub allocated_bytes: u64,
+    pub check_status: &'static str,
+    pub reason_code: &'static str,
+    pub message: String,
+    pub next_action: &'static str,
+    pub plan_id: Option<String>,
+    /// Argument vector, never shell-interpolated. Caller must retain its store.
+    pub next_command: Vec<String>,
+    pub members: Vec<PathBuf>,
+    pub recovery: Option<String>,
+    pub checked_at: u64,
+    pub elapsed_ms: u128,
+}
+
+/// Explicit bounded review; no approval, execution, or automatic scope expansion.
+pub fn check(
+    report: &crate::report::Report,
+    store: &Path,
+    paths: &[PathBuf],
+    role: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CheckResult>> {
+    anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
+    let mut selected: Vec<_> = report
+        .nested_artifacts
+        .iter()
+        .filter(|u| {
+            (if paths.is_empty() {
+                candidate(u)
+            } else {
+                paths.contains(&u.path)
+            }) && role.is_none_or(|r| u.role.label() == r)
+        })
+        .collect();
+    if !paths.is_empty() {
+        for path in paths {
+            anyhow::ensure!(
+                selected.iter().any(|u| &u.path == path),
+                "No matching Cargo row for {}. Use an exact path from report JSON; selection was not widened.",
+                path.display()
+            );
+        }
+        anyhow::ensure!(
+            selected.len() <= limit,
+            "Selection exceeds limit; increase --limit (maximum 20) or select fewer paths"
+        );
+    }
+    selected.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    selected.truncate(limit);
+    let mut results = Vec::new();
+    for unit in selected {
+        let start = std::time::Instant::now();
+        let checked_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let g = guidance(unit);
+        let mut result = CheckResult {
+            path: unit.path.clone(),
+            allocated_bytes: unit.bytes,
+            check_status: g.check_status,
+            reason_code: g.reason_code,
+            message: g.message.into(),
+            next_action: g.next_action,
+            plan_id: None,
+            next_command: vec![
+                "swamp".into(),
+                "report".into(),
+                report.root.display().to_string(),
+                "--view".into(),
+                "rust".into(),
+                "--all".into(),
+            ],
+            members: Vec::new(),
+            recovery: None,
+            checked_at,
+            elapsed_ms: 0,
+        };
+        if g.check_status == "unchecked" {
+            match crate::actions::propose(report, None, &[unit.path.clone()], "cleanup-check") {
+                Ok(plan) => {
+                    crate::actions::save_plan(store, &plan)?;
+                    result.members = plan
+                        .units
+                        .iter()
+                        .filter_map(|u| u.cargo_group.as_ref())
+                        .flat_map(|g| g.members.iter().map(|m| m.path.clone()))
+                        .collect();
+                    result.recovery = plan.units.first().map(|u| u.recovery.clone());
+                    result.check_status = "ready_for_review";
+                    result.reason_code = "checks_passed";
+                    result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Not confirmed unused. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
+                    result.next_action = "review_plan";
+                    result.next_command = vec!["swamp".into(), "plans".into(), "--json".into()];
+                    result.plan_id = Some(plan.id);
+                    result.allocated_bytes = plan.units.iter().map(|u| u.bytes).sum();
+                }
+                Err(error) => {
+                    result.check_status = "blocked";
+                    let message = error.to_string();
+                    result.reason_code = if message.contains("shared hardlink") {
+                        "shared_hardlink"
+                    } else if message.contains("Cargo build busy or lock unavailable") {
+                        "lock_unavailable"
+                    } else if message.contains("no established Cargo build lock") {
+                        "missing_lock"
+                    } else {
+                        "review_refused"
+                    };
+                    result.message = message;
+                    if result.reason_code == "lock_unavailable" {
+                        result.message.push_str(" A build may hold the lock, or locking may be unavailable. Wait for builds to finish, then retry this exact selection. Nothing changed.");
+                        result.next_action = "retry_after_builds";
+                        result.next_command = vec![
+                            "swamp".into(),
+                            "cleanup-check".into(),
+                            report.root.display().to_string(),
+                            "--path".into(),
+                            unit.path.display().to_string(),
+                        ];
+                    } else if result.reason_code == "shared_hardlink" {
+                        result.next_action = "inspect_other_groups";
+                    } else {
+                        result.next_action = "inspect";
+                    }
+                }
+            }
+        }
+        result.elapsed_ms = start.elapsed().as_millis();
+        results.push(result);
+    }
+    Ok(results)
+}
+
 pub fn candidate(unit: &NestedArtifact) -> bool {
     if !unit.coverage.complete || !unit.coverage.supported {
         return false;
@@ -105,7 +328,10 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
     let mut file = regular(path)?;
     let before = file.metadata()?;
     if before.nlink() != 1 {
-        bail!("shared hardlink is inspection-only: {}", path.display());
+        bail!(
+            "shared hardlink: Swamp currently blocks selective cleanup of this group because a file has multiple directory entries: {}. Nothing changed; reclaimable space is unknown. Inspect another group; do not widen the selection automatically.",
+            path.display()
+        );
     }
     let mut hash = blake3::Hasher::new();
     let mut buf = [0u8; 65536];
@@ -243,6 +469,12 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
         .context("no nested artifact at selection")?;
     if !unit.coverage.complete || !unit.coverage.supported {
         bail!("incomplete/unsupported Cargo coverage");
+    }
+    if !candidate(unit) {
+        bail!(
+            "{} Nothing changed. Use report --view rust to inspect individual groups, then cleanup-check --path with an exact group path.",
+            guidance(unit).message
+        );
     }
     let directory_group = unit.is_dir
         && matches!(

@@ -170,6 +170,34 @@ fn check(name: &str, got: &str) {
 }
 
 #[test]
+fn cargo_cleanup_guidance_frames() {
+    let mut report = fixture_report();
+    let root = "/Users/dev/src/mole/target";
+    for (rel, role, is_dir) in [
+        ("debug/incremental", "Incremental", true),
+        ("debug/incremental/crate-a", "Incremental", true),
+        ("debug/deps/test-a", "TestExecutable", false),
+    ] {
+        report.nested_artifacts.push(serde_json::from_value(serde_json::json!({
+            "id":rel,"path":format!("{root}/{rel}"),"relative_path":rel,
+            "parent_id":null,"container_id":"target","role":role,"membership":"Unknown",
+            "is_dir":is_dir,"logical_bytes":0,"bytes":64000000,"physical_bytes":0,
+            "mtime_max":0,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
+            "action_group":null,"present":true
+        })).unwrap());
+    }
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(report.clone(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Builds);
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("category"), "{frame}");
+        assert!(frame.contains("unchecked"), "{frame}");
+        check(&format!("cargo_cleanup_{w}x{h}"), &frame);
+    }
+}
+
+#[test]
 fn projects_view() {
     for (w, h) in [(80, 24), (200, 60)] {
         let app = App::new(fixture_report(), "/Users/dev/src".into());

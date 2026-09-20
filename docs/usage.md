@@ -91,6 +91,20 @@ Replace `api` with a project name from your report. Additional views include `ki
 
 Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. In the TUI Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. CLI plans can select the same exact paths. Executable groups include existing dep-info and debug-symbol companions. Approval applies only to the reviewed group, not future files at that path.
 
+The Rust text view shows the largest 30 rows by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. `unchecked` means checks have not run, not that the group is unused. Report JSON includes the same guidance under each nested row's `cleanup` field.
+
+Review a bounded selection before deciding what to remove:
+
+```sh
+swamp cleanup-check ~/src/my-project --role test-executable --limit 3
+swamp cleanup-check ~/src/my-project --role incremental --limit 5 --json
+swamp cleanup-check ~/src/my-project --path /absolute/path/to/target/debug/incremental/crate-group
+```
+
+This command observes the root, then checks selected groups (five by default, at most twenty). Checks can read the group's contents and create **unapproved** plans; they never authorize or execute cleanup. Results distinguish `blocked`, `unchecked`, and `ready_for_review`, with reason codes, exact members for successful checks, recovery details and timings. A reviewed group is not confirmed unused. A failed group never expands into removal of its parent. A bounded search does not establish that no other candidate exists.
+
+Hardlinked groups remain blocked by the current selective-cleanup implementation. Lock failures distinguish unavailable locks from missing lock files; retry after builds finish, not by widening scope. Allocated bytes are not promised free space, and moving files to Trash does not necessarily free space immediately. JSON `next_command` is an argument array, not a shell string; retain the same `SWAMP_DIR` to find the created plans.
+
 Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, hardlinks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
 
 The CLI currently applies `report --filter` only to the root `--view worktrees` output. It does not filter the builds view, project drill-down, overview, or JSON. For artifact filters use the TUI, MCP `report`, or `propose --filter`. `--project` scopes the project tree and supported artifact views; it does not scope every summary view.

@@ -741,6 +741,18 @@ impl App {
     /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
         let Some(unit_id) = row.unit.clone() else {
+            if row.signals.iter().any(|s| s == "category") {
+                self.set_refusal(
+                    "Category total: select an unchecked child group. Nothing changed.",
+                );
+                return;
+            }
+            if row.signals.iter().any(|s| s == "blocked") {
+                self.set_refusal(
+                    "Inspection-only: this output cannot be selected for cleanup. Nothing changed.",
+                );
+                return;
+            }
             // A projects-view row is a whole project rather than one
             // path. Marking it means marking what that project can give
             // back, so the human does not have to open it first.

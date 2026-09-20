@@ -850,11 +850,15 @@ pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
 /// (or the whole root when `only_project` is `None`), sorted by bytes
 /// desc.
 pub fn render_view_builds(report: &Report, only_project: Option<&str>) -> String {
-    render_kind_view(
+    let mut out = String::from(
+        "Build bytes are inode-deduplicated charges; Rust drilldown uses path allocations, which may count hardlinks more than once. Neither guarantees reclaimed space.\n",
+    );
+    out.push_str(&render_kind_view(
         report,
         only_project,
         &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
-    )
+    ));
+    out
 }
 
 /// `--view deps`: every `DependencyTree` row across the project (or
@@ -869,7 +873,23 @@ pub fn render_view_deps(report: &Report, only_project: Option<&str>) -> String {
 /// Aggregate rows show logical bytes while leaves show physically charged
 /// bytes, making hardlink and residual limits visible.
 pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
+    render_view_rust_with_limit(report, only_project, Some(30))
+}
+
+pub fn render_view_rust_with_limit(
+    report: &Report,
+    only_project: Option<&str>,
+    limit: Option<usize>,
+) -> String {
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Cargo storage: category totals include children; do not sum rows. Allocated and unique charges are not guaranteed reclaimable space."
+    );
+    let _ = writeln!(
+        out,
+        "inspect-groups = category; unchecked = review required, not proven unused. Run swamp cleanup-check <root> --role test-executable to check a bounded selection."
+    );
     let _ = writeln!(
         out,
         "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  path / evidence",
@@ -910,7 +930,10 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
         let _ = writeln!(out, "0 (no Cargo target rows or no supported nested facts)");
         return out;
     }
-    for (project, role, profile, bytes, charged, unit, evidence) in rows {
+    let count = rows.len();
+    for (project, role, profile, bytes, charged, unit, evidence) in
+        rows.into_iter().take(limit.unwrap_or(usize::MAX))
+    {
         let unknown = if unit.variant.unknowns.is_empty() {
             String::new()
         } else {
@@ -918,7 +941,7 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
         };
         let _ = writeln!(
             out,
-            "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  {} [{}{}]",
+            "{:<18} {:<20} {:<10} {:>10} {:>10} {:>10}  {} · {} [{}{}]",
             project,
             role,
             profile,
@@ -934,9 +957,21 @@ pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
             unit.growth_bytes
                 .map(human_bytes_signed)
                 .unwrap_or_else(|| "—".into()),
-            unit.relative_path,
+            match crate::cargo_cleanup::guidance(unit).next_action {
+                "inspect_groups" => "inspect-groups",
+                "review_cleanup" => "unchecked",
+                _ => "inspection-only",
+            },
+            unit.path.display(),
             evidence,
             unknown
+        );
+    }
+    if limit.is_some_and(|n| count > n) {
+        let _ = writeln!(
+            out,
+            "Showing {} of {count} rows, largest first. Use --all for all rows, --json for structured cleanup guidance, or cleanup-check for a bounded review.",
+            limit.unwrap()
         );
     }
     let _ = writeln!(

@@ -73,6 +73,22 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Review a few Cargo cleanup groups, largest first. Creates unapproved plans;
+    /// never authorizes or deletes. Reports blocked groups without widening scope.
+    CleanupCheck {
+        root: PathBuf,
+        /// Exact Cargo group paths from a Rust report. Categories are not expanded.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Restrict to one role, for example test-executable or incremental.
+        #[arg(long, value_parser = ["test-executable", "example", "incremental", "build-script-output"])]
+        role: Option<String>,
+        /// Maximum groups to check (1–20). This is not an exhaustive cleanup search.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Diffstat-ledger terminal UI (ratatui). Default when no
     /// subcommand is given.
     Ui {
@@ -196,10 +212,9 @@ enum Command {
         off: bool,
         roots: Vec<PathBuf>,
     },
-    /// Propose a plan from the report: folded artifact rows only, each
-    /// with project, worktree, kind, bytes, growth, recovery contract and
-    /// signals. Nothing is deleted. Prints the plan id and the approve
-    /// command (R7, #26).
+    /// Propose cleanup for exact paths or a filter. Review paths, sizes,
+    /// warnings and recovery before authorizing. For individual Cargo builds,
+    /// start with cleanup-check. Nothing is deleted by this command.
     Propose {
         root: PathBuf,
         /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
@@ -473,7 +488,14 @@ fn main() -> Result<()> {
                     Some(View::Kinds) => print!("{}", render_kinds(&r)),
                     Some(View::Types) => print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!("{}", swamp_core::render::render_view_rust(&r, Some(&name)))
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_rust_with_limit(
+                                &r,
+                                Some(&name),
+                                if all { None } else { Some(30) }
+                            )
+                        )
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
@@ -490,7 +512,14 @@ fn main() -> Result<()> {
                     Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
                     Some(View::Types) => print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!("{}", swamp_core::render::render_view_rust(&r, None))
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_rust_with_limit(
+                                &r,
+                                None,
+                                if all { None } else { Some(30) }
+                            )
+                        )
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
@@ -499,6 +528,70 @@ fn main() -> Result<()> {
                         render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
                     ),
                 }
+            }
+        }
+        Command::CleanupCheck {
+            root,
+            paths,
+            role,
+            limit,
+            json,
+        } => {
+            anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
+            let root = std::fs::canonicalize(root)?;
+            let store = swamp_dir();
+            let start = std::time::Instant::now();
+            let report = report_full_mode(
+                &root,
+                None,
+                false,
+                Some(&store),
+                None,
+                true,
+                false,
+                false,
+                false,
+            )?;
+            let report_ms = start.elapsed().as_millis();
+            if !json {
+                eprintln!(
+                    "Checking at most {limit} Cargo groups. Larger categories are not deletion selections; checks may read group contents."
+                );
+            }
+            let results =
+                swamp_core::cargo_cleanup::check(&report, &store, &paths, role.as_deref(), limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "root": root, "store": store, "report_ms": report_ms,
+                        "limit": limit, "checked_count": results.len(), "exhaustive": false,
+                        "note": "Allocated bytes are not guaranteed reclaimable. Checks are not evidence of disuse. No cleanup authorized or executed.",
+                        "results": results
+                    }))?
+                );
+            } else {
+                println!(
+                    "Cargo cleanup review · {} groups · report {report_ms} ms",
+                    results.len()
+                );
+                for r in results {
+                    println!(
+                        "{} · {} allocated · {} ms\n  {}\n  {}",
+                        r.check_status,
+                        swamp_core::render::human_bytes_pub(r.allocated_bytes),
+                        r.elapsed_ms,
+                        r.path.display(),
+                        r.message
+                    );
+                    if let Some(id) = r.plan_id {
+                        println!("  Unapproved plan: {id} (store {})", store.display());
+                    }
+                    println!("  Next (arguments): {:?}", r.next_command);
+                }
+                println!(
+                    "Bounded review, not an exhaustive search. Use --role test-executable or --path <exact-group> to narrow it. Allocated bytes are not guaranteed free space. Nothing approved or deleted."
+                );
             }
         }
         Command::Propose {
