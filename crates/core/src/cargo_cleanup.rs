@@ -57,7 +57,8 @@ pub struct CargoGroup {
 /// Derived from existing facts only. Never performs I/O or implies authorization.
 #[derive(Debug, Serialize)]
 pub struct Guidance {
-    pub recommendation: &'static str,
+    pub recommendation: String,
+    pub modified_age_secs: Option<u64>,
     pub consequence: &'static str,
     pub scope: &'static str,
     pub check_status: &'static str,
@@ -67,6 +68,10 @@ pub struct Guidance {
 }
 
 pub fn guidance(unit: &NestedArtifact) -> Guidance {
+    guidance_at(unit, crate::entities::now())
+}
+
+pub fn guidance_at(unit: &NestedArtifact, now: u64) -> Guidance {
     let (scope, status, code, message, next) =
         if !unit.coverage.complete || !unit.coverage.supported {
             (
@@ -81,7 +86,7 @@ pub fn guidance(unit: &NestedArtifact) -> Guidance {
                 "group",
                 "unchecked",
                 "checks_not_run",
-                "Cleanup checks not run. Identification does not establish disuse.",
+                "Cleanup candidate; review rebuilding cost and run exact-selection checks.",
                 "review_cleanup",
             )
         } else if unit.is_dir {
@@ -101,8 +106,22 @@ pub fn guidance(unit: &NestedArtifact) -> Guidance {
                 "inspect",
             )
         };
+    let age = modified_age_secs(unit, now);
+    let advice = if candidate(unit) {
+        let modified = match age {
+            Some(seconds) if seconds >= 86400 => format!("{}d ago", seconds / 86400),
+            Some(seconds) if seconds >= 3600 => format!("{}h ago", seconds / 3600),
+            Some(seconds) if seconds >= 60 => format!("{}m ago", seconds / 60),
+            Some(_) => "just now".into(),
+            None => "unknown".into(),
+        };
+        format!("Cleanup candidate · last modified {modified}")
+    } else {
+        recommendation(unit).0.into()
+    };
     Guidance {
-        recommendation: recommendation(unit).0,
+        recommendation: advice,
+        modified_age_secs: age,
         consequence: recommendation(unit).1,
         scope,
         check_status: status,
@@ -110,6 +129,20 @@ pub fn guidance(unit: &NestedArtifact) -> Guidance {
         message,
         next_action: next,
     }
+}
+
+/// Modification age is a useful heuristic, not evidence of last execution.
+/// Missing and future timestamps must not look like extremely old artifacts.
+pub fn modified_age_secs(unit: &NestedArtifact, now: u64) -> Option<u64> {
+    (unit.mtime_max > 0 && unit.mtime_max <= now).then(|| now - unit.mtime_max)
+}
+
+/// Oldest known candidates first; size breaks ties, unknown ages come last.
+pub fn cleanup_order(a: &NestedArtifact, b: &NestedArtifact, now: u64) -> std::cmp::Ordering {
+    modified_age_secs(b, now)
+        .cmp(&modified_age_secs(a, now))
+        .then_with(|| b.bytes.cmp(&a.bytes))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 /// Decision support, not eligibility or authorization. No age-based disuse claim.
@@ -172,6 +205,9 @@ pub fn serialize_units<S: serde::Serializer>(
 
 #[derive(Debug, Serialize)]
 pub struct CheckResult {
+    pub recommendation: String,
+    pub consequence: &'static str,
+    pub modified_age_secs: Option<u64>,
     pub path: PathBuf,
     pub allocated_bytes: u64,
     pub check_status: &'static str,
@@ -222,7 +258,7 @@ pub fn check(
             "Selection exceeds limit; increase --limit (maximum 20) or select fewer paths"
         );
     }
-    selected.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    selected.sort_by(|a, b| cleanup_order(a, b, report.observed_at));
     selected.truncate(limit);
     let mut results = Vec::new();
     for unit in selected {
@@ -232,6 +268,9 @@ pub fn check(
             .as_secs();
         let g = guidance(unit);
         let mut result = CheckResult {
+            recommendation: g.recommendation,
+            consequence: g.consequence,
+            modified_age_secs: g.modified_age_secs,
             path: unit.path.clone(),
             allocated_bytes: unit.bytes,
             check_status: g.check_status,

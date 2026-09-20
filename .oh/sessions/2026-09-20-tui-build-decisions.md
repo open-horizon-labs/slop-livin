@@ -81,3 +81,19 @@ supports the user's retention decision. Verification results follow below.
 Review verdict: layout/navigation corrections and consequence-based guidance are
 implemented. Reliable superseded-variant detection remains absent, not completed
 by relabeling rows. This delivery contributes to BA1/BA2/BA3, not full epic closure.
+
+## Aim correction: aid cleanup, not perfect advice
+
+User explicitly clarified that merely old is sufficient evidence for a cleanup
+suggestion. The prior framing over-weighted proof of supersession. Now supported
+groups receive a cleanup-candidate recommendation with measured modification age.
+Both in-tree groups and CLI candidate pages rank oldest-known modification first,
+then size, with unknown/future timestamps last. No minimum age or access-time
+dependency, no additional filesystem walk, no automatic deletion. Recent groups
+remain reviewable. Role-specific rebuilding consequences stay alongside advice.
+
+Tests distinguish ranking from eligibility: a 21-day-old smaller group outranks a
+larger recent group; the recent group still qualifies; zero/future times are not
+treated as ancient; incomplete coverage keeps existing action checks. This does
+not claim last execution or certainty of obsolescence. That uncertainty is an
+accepted advisory trade-off, not a blocker for useful recommendations.

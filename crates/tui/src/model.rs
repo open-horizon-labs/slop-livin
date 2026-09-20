@@ -787,7 +787,14 @@ fn cargo_tree_children(
             by_parent.entry(parent).or_default().push(unit);
         }
     }
-    cargo_children_from_index(&by_parent, parent, depth, prefix, collapsed)
+    cargo_children_from_index(
+        &by_parent,
+        parent,
+        depth,
+        prefix,
+        collapsed,
+        report.observed_at,
+    )
 }
 
 fn cargo_children_from_index(
@@ -796,9 +803,19 @@ fn cargo_children_from_index(
     depth: usize,
     prefix: &str,
     collapsed: &std::collections::HashSet<String>,
+    observed_at: u64,
 ) -> Vec<Row> {
     let mut children = by_parent.get(parent).cloned().unwrap_or_default();
-    children.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    children.sort_by(|a, b| {
+        if swamp_core::cargo_cleanup::candidate(a) && swamp_core::cargo_cleanup::candidate(b) {
+            swamp_core::cargo_cleanup::cleanup_order(a, b, observed_at)
+        } else {
+            swamp_core::cargo_cleanup::candidate(b)
+                .cmp(&swamp_core::cargo_cleanup::candidate(a))
+                .then_with(|| b.bytes.cmp(&a.bytes))
+                .then_with(|| a.path.cmp(&b.path))
+        }
+    });
     let mut rows = Vec::new();
     for (index, unit) in children.iter().enumerate() {
         let last = index + 1 == children.len();
@@ -829,8 +846,8 @@ fn cargo_children_from_index(
         row.expandable = has_children;
         row.expansion_key = has_children.then_some(key);
         row.collapsed_children = closed.then_some(count);
-        let guidance = swamp_core::cargo_cleanup::guidance(unit);
-        row.signals = vec![guidance.recommendation.into(), guidance.consequence.into()];
+        let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
+        row.signals = vec![guidance.recommendation, guidance.consequence.into()];
         row.mtime_max = unit.mtime_max;
         if swamp_core::cargo_cleanup::candidate(unit) {
             row.unit = Some(UnitId::for_artifact(&unit.path));
@@ -844,6 +861,7 @@ fn cargo_children_from_index(
                 depth + 1,
                 &format!("{prefix}{}", if last { "   " } else { "│  " }),
                 collapsed,
+                observed_at,
             ));
         }
     }
@@ -1113,9 +1131,10 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         if swamp_core::cargo_cleanup::guidance(u).check_status == "unchecked" {
                             row.unit = Some(UnitId::for_artifact(&u.path));
                             row.kind = Some(ArtifactKind::BuildOutput);
-                            let guidance = swamp_core::cargo_cleanup::guidance(u);
+                            let guidance =
+                                swamp_core::cargo_cleanup::guidance_at(u, report.observed_at);
                             row.signals = vec![
-                                guidance.recommendation.into(),
+                                guidance.recommendation,
                                 guidance.consequence.into(),
                                 "review required".into(),
                             ];
@@ -1135,10 +1154,8 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         }
                         let guidance = swamp_core::cargo_cleanup::guidance(u);
                         if guidance.check_status != "unchecked" {
-                            row.signals.extend([
-                                guidance.recommendation.into(),
-                                guidance.consequence.into(),
-                            ]);
+                            row.signals
+                                .extend([guidance.recommendation, guidance.consequence.into()]);
                         }
                         row.signals
                             .push("allocated bytes; reclaimable space unknown".into());

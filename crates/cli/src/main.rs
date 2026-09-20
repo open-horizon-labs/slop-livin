@@ -74,7 +74,7 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Review a few Cargo cleanup groups, largest first. Creates unapproved plans;
+    /// Review Cargo cleanup groups, oldest modified first, then largest. Creates unapproved plans;
     /// never authorizes or deletes. Reports blocked groups without widening scope.
     CleanupCheck {
         root: PathBuf,
@@ -87,7 +87,7 @@ enum Command {
         /// Maximum groups to check (1–20). This is not an exhaustive cleanup search.
         #[arg(long, default_value_t = 5)]
         limit: usize,
-        /// Skip this many size-ranked candidates. Pages may shift after a rebuild.
+        /// Skip this many age-ranked candidates. Pages may shift after a rebuild.
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Review individual groups within this directory, never the directory itself.
@@ -662,7 +662,8 @@ fn main() -> Result<()> {
                         && cleanup_path_in_scope(&u.path, within.as_deref())
                 })
                 .collect();
-            candidates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+            candidates
+                .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, report.observed_at));
             let candidate_count = candidates.len();
             let candidate_allocated_bytes: u64 = candidates.iter().map(|u| u.bytes).sum();
             let selected: Vec<_> = if paths.is_empty() {
@@ -751,6 +752,7 @@ fn main() -> Result<()> {
                     results.len()
                 );
                 for r in results {
+                    println!("{} · {}", r.recommendation, r.consequence);
                     println!(
                         "{} · {} allocated · {} ms\n  {}\n  {}",
                         r.check_status,

@@ -5,7 +5,7 @@
 "   ├─ ▾ build target                                                                                             2.1GB     +1.1GB       │█████▉ build groups below · allocated, not freeable bytes      "
 "   │  └─ ▾ profile debug                                                                                        64.0MB          —               Inspect build groups · Includes children; sizes are a…  "
 "   │     ├─ ▾ dependency deps                                                                                   64.0MB          —               Compiled dependencies · Folded aggregate; selective d…  "
-"   │     │  └─ test-executable test-a                                                                           64.0MB          —               Review compiled executable · Remove if no longer need…  "
+"   │     │  └─ test-executable test-a                                                                           64.0MB          —               Cleanup candidate · last modified unknown · Remove if…  "
 "   │     └─ ▸ incremental                                                                                       64.0MB          —               Start …ler cache · Remove to trade cached c…  ▸ 1 more  "
 "   ├─ deps node_modules                                                                                        440.4MB   +188.7MB       │████▍                                                          "
 "   └─ source src                                                                                                12.6MB     +2.0KB       │▏                                                              "

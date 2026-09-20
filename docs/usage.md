@@ -43,6 +43,16 @@ Use `--full` to force a full filesystem walk. A normal observation can also fall
 
 Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
 
+## Cleanup recommendations
+
+Age is a cleanup signal, not a proof requirement. Supported Cargo cleanup groups
+are ranked oldest-modified first, then largest when ages match. Missing or future
+timestamps sort last. There is no minimum-age gate: recent builds remain reviewable.
+The project tree and `cleanup-check` show modification age and rebuilding cost.
+Modification age is not last execution or access time. Existing project/worktree
+activity signals provide additional context; they are not required to suggest a
+build cleanup candidate. Exact-selection checks and human approval still apply.
+
 ## Terminal controls
 
 ```bash
@@ -110,7 +120,7 @@ swamp cleanup-check ~/src/my-project --path /absolute/path/to/target/debug/incre
 
 This command observes the root, then checks selected groups (five by default, at most twenty). Checks can read the group's contents and create **unapproved** plans; they never authorize or execute cleanup. Results distinguish `blocked`, `unchecked`, and `ready_for_review`, with reason codes, exact members for successful checks, recovery details and timings. A reviewed group is not confirmed unused. A failed group never expands into removal of its parent.
 
-The result shows the number and allocated size of all observed candidates in scope, how many were not checked in this run, and arguments for the next size-ranked page. It also counts coverage-limited and unidentified Cargo rows separately; zero candidates does not establish that there is no cleanup opportunity. These coverage counts ignore `--role`, because an unknown row cannot reliably match a requested role. Pages can shift if builds change between calls. `--within` narrows candidate discovery to groups strictly below a directory; use `--path` to review that exact directory if it is a selectable group. A five-group result is not a measure of the total cleanup opportunity, and candidate bytes are not a promise of reclaimable space.
+The result shows the number and allocated size of all observed candidates in scope, how many were not checked in this run, and arguments for the next age-ranked page. It also counts coverage-limited and unidentified Cargo rows separately; zero candidates does not establish that there is no cleanup opportunity. These coverage counts ignore `--role`, because an unknown row cannot reliably match a requested role. Pages can shift if builds change between calls. `--within` narrows candidate discovery to groups strictly below a directory; use `--path` to review that exact directory if it is a selectable group. A five-group result is not a measure of the total cleanup opportunity, and candidate bytes are not a promise of reclaimable space.
 
 Hardlinked groups can be reviewed and moved to Trash. Links outside the selected group remain intact; reclaimable space is unknown. Lock failures distinguish unavailable locks from missing lock files; retry after builds finish, not by widening scope. Allocated bytes are not promised free space, and moving files to Trash does not free those bytes immediately. JSON `next_command` and `next_page` are argument arrays, not shell strings; retain the same `SWAMP_DIR` to find the created plans.
 
