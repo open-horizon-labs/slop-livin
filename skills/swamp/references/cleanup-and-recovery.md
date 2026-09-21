@@ -15,12 +15,28 @@ inspectable:
 4. **Recover** -- filesystem removals go to Trash with a restore
    manifest; Docker removals do not (see the table below).
 
-## `swamp propose <root> [--filter F] [--path P ...] [--since S] [--json]`
+## `swamp propose [root] [--filter F] [--path P ...] [--since S] [--json] [--external]`
 
 ```sh
 swamp propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
 swamp propose ~/src --path /absolute/path/to/a-worktree
+
+# No root: --path is resolved as an agent-storage unit (see
+# references/agent-storage.md), then as an external unit, in that
+# order. Neither matched is refused by name, never guessed as a
+# filesystem path without a root.
+swamp propose --path /absolute/path/to/a/session/or/agent-cache
+swamp propose --external --path /absolute/path/to/an/external/unit
 ```
+
+`root` is optional: omit it only when every `--path` names an
+agent-storage or external unit, never a filesystem artifact/Cargo
+group/worktree (those always need a `root` to have been walked at
+all). `--external` forces the external-unit route explicitly --
+inspection only, `execute` always refuses it (see
+`references/commands-and-json.md`'s `external` view). `swamp
+propose-agents --path <unit-path>` still works as a deprecated alias
+into the same agent-storage route `propose --path` (no root) uses.
 
 For a worktree, first inspect `swamp report <root> --view worktrees
 --json` for dirty/unpushed/merge evidence, then pass its exact reported

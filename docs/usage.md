@@ -243,12 +243,27 @@ today vs. named-and-planned). In short:
   `swamp protect add <path>` / `swamp protect list [--json]` /
   `swamp protect remove <path>` -- independent of, and never overridden
   by, anything observation infers.
-- **Supported actions:** `swamp propose-agents --path <unit-path>
-  [--json]` builds a real plan (or a named refusal) for a selected
+- **Supported actions:** `swamp propose --path <unit-path> [--json]`
+  (no `root`) builds a real plan (or a named refusal) for a selected
   unit, then the same `swamp approve <plan-id>` / `swamp execute
-  <plan-id>` every other plan uses. Nothing wider than the exact
-  selected unit is ever affected; occupancy, references and identity
-  are all re-checked at execution, not assumed from the plan.
+  <plan-id>` every other plan uses. `swamp propose` is the one entry
+  point for every proposal kind: with no `root`, a `--path` routes
+  automatically to the agent-storage proposer or the external-unit
+  proposer (`--external` forces the latter, inspection-only route
+  explicitly); only a filesystem artifact/Cargo-group/worktree needs a
+  `root`. `swamp propose-agents --path <unit-path>` still works too, as
+  a deprecated alias into the identical code path. Nothing wider than
+  the exact selected unit is ever affected; occupancy, references and
+  identity are all re-checked at execution, not assumed from the plan.
+  A session removal that partially fails (some members moved, then a
+  later one could not be) leaves a `restore.json` recovery manifest
+  inside its Trash envelope, and the execute result names the envelope
+  and the bytes that really did move.
+- **Project-linked view:** `swamp report --project <name>` (text or
+  `--json`, no `--view` needed) includes this project's own linked
+  agent storage -- a collapsed "Agent storage (linked)" summary row per
+  contributing tool in the text tree, and an `agent_storage: {units,
+  total_bytes}` object in JSON.
 
 The TUI has a dedicated Agents view (`v`, no digit -- `0` is "clear
 filter"): the same per-unit facts as `--view agents`. `Space`/
@@ -260,7 +275,9 @@ thread. A protected or unsupported row cannot be marked; the footer
 names the exact reason. Bulk marking (`Shift+A`) reaches the Agents
 view too: it marks every actionable row on screen the same way,
 skipping protected/unsupported/active ones and naming the skip in the
-footer.
+footer. The project tree's own Tree view also shows the collapsed
+"Agent storage (linked)" summary row (informational; marking a specific
+unit still happens in the Agents view).
 
 ## Cleanup recommendations
 

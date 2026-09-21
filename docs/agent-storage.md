@@ -648,9 +648,10 @@ tools this chunk added.
 | TUI (read) | `v` (cycle) reaches the Agents view; no dedicated digit (`0` is "clear filter") |
 | TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every actionable row in the Agents view the same way, skipping protected/unsupported/active ones and naming the skip in the footer; `Enter` executes through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected/unsupported row cannot be marked; the footer names `propose_agents`'s own refusal reason. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
-| Propose | `swamp propose-agents --path <unit-path> [--json]` |
+| Propose | `swamp propose --path <unit-path> [--json]` (no `root`) -- the unified entry point (#101): routes to the agent-storage proposer when a path matches a discovered agent unit, else to the external-unit proposer, else (only with a `root`) the ordinary filesystem proposer. `swamp propose --external [--path <unit-path>] [--json]` forces the inspection-only external-unit route explicitly. `swamp propose-agents --path <unit-path> [--json]` still works, as a thin, deprecated alias into the exact same code path (prints a one-line deprecation note to stderr). |
 | Approve/execute | `swamp approve <plan-id>` / `swamp execute <plan-id> [--json]` (unchanged -- already generic over any plan) |
 | Skill | `skills/swamp/references/agent-storage.md` |
+| Project tree | `swamp report --project <name>` (text) and `--project <name> --json` (no `--view` needed) both include this project's linked agent storage: a collapsed "Agent storage (linked)" row per contributing tool in the text tree (`crate::tree::agent_rows_for_project`, shared by the CLI drill and the TUI's own Tree view), and an `agent_storage: {units, total_bytes}` object in the JSON envelope. |
 
 ## Known gaps, recorded rather than hidden
 
@@ -665,16 +666,19 @@ tools this chunk added.
   when at least one was. Marking one agent unit at a time
   (`Space`/`Backspace` on the selected row) still works exactly as
   before.
-- `swamp propose-agents --path` does not compute a full `Report`
-  (deliberately, to stay fast for an already-known exact path), so
-  Aider's per-repo units are supplied to it by walking upward from each
-  requested path for its own worktree root
-  (`crate::agents::worktree_root_containing`) rather than from a
-  whole-scope walk -- exact for the paths actually asked about, but a
-  path whose worktree root was not itself part of the request will not
-  independently surface Aider units this way. `swamp report --view
-  agents` and the TUI (which both already compute a `Report`) have no
-  such limitation.
+- **Resolved this chunk:** `swamp propose --path` (and the deprecated
+  `propose-agents` alias) used to skip computing a full `Report` for
+  speed, discovering Aider's per-repo units only by walking upward from
+  each requested path's own worktree root
+  (`crate::agents::worktree_root_containing`). That meant a path whose
+  worktree root was not itself part of the request could not surface an
+  Aider unit at all. The unified `propose --path` route now runs the
+  same real report walk `swamp report --view agents` does (every known
+  project worktree, not just the ones implied by the requested paths)
+  before resolving agent units, closing this gap at the cost of a full
+  scope walk instead of a handful of `stat`s -- deliberate, since
+  `propose` without a `root` is not a hot path. See
+  `discover_agent_units_for_propose` in `crates/cli/src/main.rs`.
 - Windsurf's editor-profile shape and the `task_metadata.json`
   `workspace` field Cline/Roo Code use for project linkage are this
   chunk's own best-available research, not independently re-confirmed
@@ -684,11 +688,12 @@ tools this chunk added.
 - Cursor, Windsurf, Cline and Roo Code are macOS-only this chunk; their
   Linux paths are the independent Linux track's job (#77-#89), not
   re-derived here as a guess.
-- `swamp propose`'s CLI (the original, walked-report-root command) has
-  no `--agent` mode; `propose-agents` is a separate, dedicated
-  subcommand instead (mirrors the same reasoning the External chunk
-  recorded for its own CLI gap: relaxing `Propose`'s required `root:
-  PathBuf` is a larger, riskier change than an additive new command).
+- **Resolved this chunk:** `swamp propose`'s `root` is now `Option<PathBuf>`.
+  Omitting it and passing `--path` routes to the agent-storage proposer
+  or the external-unit proposer automatically (see the Interfaces table
+  above); `--external` forces the latter explicitly. `propose-agents`
+  remains only as a thin, deprecated alias so existing scripts keep
+  working.
 - Plugins/marketplace removal beyond the `.trash` staging directories
   is not supported; native marketplace-aware removal is the preferred
   future mechanism, not a guessed directory delete.
@@ -716,3 +721,151 @@ tools this chunk added.
   lock file with no documented idle signal; the latter: simply out of
   named scope) -- an explicit `None` action, not a missing feature
   disguised as empty.
+
+## #100/#101 completion and #102 validation (this chunk)
+
+This chunk audited every #100/#101 acceptance line against the
+implementation left by the prior four chunks (Claude Code; Codex/Oh My
+Pi/OpenCode; the remaining nine tools), fixed the gaps it found, and
+added the independent #102 validation pass. Landed:
+
+- **Project-tree agent linkage (#100 gap).** `crate::tree::ProjectTree`
+  gained `agent_rows: Vec<ProjectAgentToolRow>` (`crate::tree::
+  agent_rows_for_project`), a per-tool collapsed summary of the agent
+  storage linked to one project. `render_project_tree_with_agents`
+  (CLI text) and `model::tree_rows_with_agents` (TUI Tree view) both
+  render one "Agent storage (linked)" line per contributing tool,
+  informational only (`unit: None` in the TUI -- acting on a specific
+  unit stays the dedicated Agents view's job, with its own per-unit
+  protections/occupancy checks). Previously this information existed
+  only in the flat `--view agents` list, with no way to see "does this
+  project have any linked agent storage" from the project drill itself.
+- **`report --project NAME --json` agent linkage (#100 gap).** The
+  project-scoped JSON envelope (the `None`-view branch of
+  `report_json_envelope`) now includes an `agent_storage: {units,
+  total_bytes}` object whenever agent units were computed, not only
+  when `--view agents` was also passed. `agent_units` is now computed
+  whenever `view == Some(View::Agents) || project.is_some()`.
+- **Unified `propose` entry point (#101).** `swamp propose`'s `root` is
+  now `Option<PathBuf>`; a `--path` with no `root` is routed to the
+  agent-storage proposer (if it matches a discovered agent unit), else
+  the external-unit proposer, else refused by name (never silently
+  falling through to a filesystem interpretation it cannot support
+  without a root). `--external` forces the external-unit route
+  explicitly, satisfying the "propose --external ... inspection-only
+  refusal at execution" requirement B2 had left at the Rust API level
+  with no CLI surface. `propose-agents` is now a thin, deprecated alias
+  that delegates into the identical routing function
+  (`propose_unified` in `crates/cli/src/main.rs`) and prints a one-line
+  deprecation note.
+- **Aider discovery fixed in the unified route (chunk E follow-up).**
+  The old `propose-agents --path` fast path discovered Aider's per-repo
+  units only by walking upward from the requested paths themselves,
+  which could not find an Aider unit whose worktree root was not
+  implied by the request. The unified route now runs the same real
+  report walk `report --view agents` uses to supply every known project
+  worktree first.
+- **Refusal matrix hardening (#101).** `propose_agents` now refuses an
+  agent-storage plan whose selected units' own paths nest (parent/child
+  overlap), the same discipline `propose`'s Cargo-group check already
+  applied to filesystem units -- previously nothing enforced this for
+  agent units. A table-driven test
+  (`crates/core/tests/agent_refusal_matrix.rs`) exercises every named
+  refusal reason (protected category, human protect flag, unsupported
+  action, database-like path, active session, whole-home/whole-
+  projects-dir path, overlap, plan scope drift at execution) across all
+  14 named tool ids.
+- **Recoverable moves and partial-failure accounting (#101).** Session
+  removal now writes a `restore.json` recovery manifest into its Trash
+  envelope before any member moves, and rewrites it after each
+  successful move -- so a partial failure (some members moved, then a
+  later rename fails) leaves an accurate, on-disk record of exactly
+  what happened, and `execute`'s own outcome now names the envelope and
+  the bytes that really did move (`PartialAgentRemoval` in
+  `crates/core/src/actions.rs`) instead of only a bare error string. All
+  agent-storage actions remain Trash moves (recoverable), never a
+  permanent native operation.
+- **#102 validation suite.** `crates/core/tests/agent_storage_validation.rs`
+  (custom-root redirection, malformed/truncated metadata across three
+  adapters, unknown-schema-never-actionable across three adapters,
+  shared-blob reference-state correctness, an integrated canary sweep
+  across render text/JSON/plan/execute-result/ledger for two
+  differently-shaped adapters, nested-accounting agreement between the
+  flat Agents view and the project tree, incremental/unchanged-refresh
+  growth history, and stable history after relinking a session to a
+  different project) and
+  `crates/tui/tests/agent_storage_validation.rs` (a real, on-disk
+  fixture run through real identification into the TUI's own rendered
+  frames -- both the Agents view and the new project-tree row -- to
+  prove real session content never reaches what a human actually sees,
+  not just the JSON/plan/ledger surfaces the prior chunks' tests
+  already covered).
+- **Benchmarks** (recorded in
+  `.oh/sessions/2026-09-21-agent-storage-validation.md`): 300 synthetic
+  Claude Code sessions (each padded past 200 KB so only a bounded read
+  is ever exercised) scan in tens of milliseconds; an unchanged refresh
+  and a one-session append cost about the same as the initial scan
+  (this adapter re-scans its tool home each call rather than
+  incrementally diffing it -- see that session note for why this is an
+  honest, not-yet-optimized fact, not a regression).
+
+## Human review still needed
+
+Per this chunk's own instruction not to claim human review happened:
+**no human has reviewed any of the following.** They are exactly what
+Muness (or another maintainer) should check before treating this
+feature as fully validated, carried forward from prior chunks' session
+notes and `FOLLOWUPS.md` rather than silently resolved by guessing:
+
+- **Retention-consequence wording.** Do the loss-of-resume/rewind
+  warnings (`unit_from_agent`'s `warnings` in `crates/core/src/actions.rs`,
+  and this doc's own "Session removal" section) actually read as clear
+  and honest to a human deciding whether to delete a session, or are
+  they too technical, too reassuring, or missing a consequence a real
+  user would care about? Not evaluated by any automated test.
+- **Unresolved format assumptions**, verbatim from
+  `FOLLOWUPS.md`'s own tracking note (chunk E): "Windsurf layout
+  assumed; Cline/Roo Code `task_metadata.json` workspace field
+  unconfirmed; Gemini OAuth credential filename unconfirmed;
+  Cursor/Windsurf/Cline/Roo Code macOS-only paths (Linux track)." None
+  of these were resolved this chunk -- each still degrades to an honest
+  "unresolved"/"(unsupported layout version)" outcome rather than a
+  wrong guess when a real installation does not match, but whether the
+  *assumption itself* is correct needs a maintainer with an actual
+  installation of the tool in question (or a reachable primary-source
+  layout doc this chunk could not find) to confirm.
+- **Other named unknowns, verbatim from `FOLLOWUPS.md`**: "`~/.claude.json`
+  sibling file and `todos/` prefix heuristic are named unknowns"
+  (Claude Code); "Codex `skills/`/`log/` names + `CODEX_SQLITE_HOME`;
+  OpenCode `OPENCODE_DATA_DIR` env var name" are unverified; "Oh My Pi
+  blob GC and OpenCode snapshot/`storage/part` removal deliberately not
+  offered (complete-reference requirement)" remains a scope boundary,
+  not a bug.
+- **No real installed tool has ever been checked.** Every fixture in
+  this entire feature (all four chunks plus this one) is synthetic, by
+  the hard privacy rule the handoff sets. That means no adapter's
+  format assumptions have been verified against an *actual* `~/.claude`,
+  `~/.codex`, `~/.omp`, or any other real tool home on any real machine
+  -- only against primary-source documentation/code and this project's
+  own hand-built fixtures. Whether the real, currently-installed version
+  of each tool on Muness's own machine actually matches what this
+  adapter expects is exactly the kind of outside check the handoff asks
+  to be surfaced, not fabricated. A reasonable first step: run `swamp
+  report --view agents` against a real machine with one or two of these
+  tools installed and compare the reported categories/sizes against
+  what `du`/`ls` show by hand for the same directory -- without ever
+  feeding a real transcript's content into a bug report, fixture, or
+  test.
+- **Linux paths** for Cursor/Windsurf/Cline/Roo Code (and re-verification
+  of every other adapter's Linux path) are explicitly out of scope for
+  this macOS-only chunk; the independent Linux track (#77-#89) owns
+  that work, not a guess made here.
+- **Whether the epic can actually close.** #90/#102's own acceptance
+  requires every named tool tested *and* independent validation *and*
+  human review of usefulness. The first two are now substantially
+  covered (the per-adapter test files, this chunk's refusal-matrix and
+  validation suites); the third -- an actual human reading actual
+  output and judging whether it is useful, not vague, not overwhelming
+  with caveats, and not misleading -- has not happened and cannot be
+  simulated by an agent. This is the honest remaining blocker to
+  closing #90, not a technical gap.

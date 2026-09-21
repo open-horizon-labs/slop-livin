@@ -110,6 +110,38 @@ Release notes describe behavior at the named version. See the [README](README.md
   every explicit remaining unknown (Windsurf's assumed layout, the
   `task_metadata.json` `workspace` field, macOS-only coverage for the
   editor-family tools this chunk).
+- **Completed #100/#101 project-linkage/action acceptance and unified
+  `propose`, plus independent #102 validation** across all 14 named
+  agent-tool ids. `swamp report --project <name>` (text or `--json`, no
+  `--view` needed) now includes this project's own linked agent storage
+  -- a collapsed "Agent storage (linked)" row per contributing tool in
+  the text/TUI tree (`crate::tree::agent_rows_for_project`), and an
+  `agent_storage: {units, total_bytes}` object in JSON -- previously
+  visible only via `--view agents`. `swamp propose`'s `root` is now
+  optional: a bare `--path` (no root) routes to the agent-storage
+  proposer, then the external-unit proposer, refusing by name if
+  neither matches; `--external` forces the latter, inspection-only
+  route explicitly (closing a gap left at the Rust API level).
+  `propose-agents` remains as a thin, deprecated alias into the same
+  code. `propose_agents` now refuses an agent-storage plan whose
+  selected units' own paths nest (parent/child overlap), the same
+  discipline the Cargo-group check already applied to filesystem units.
+  A partially-failed session removal (some members moved, then a later
+  rename fails) now writes a `restore.json` recovery manifest into its
+  Trash envelope and reports the envelope/moved bytes in the execute
+  result, instead of only a bare error string. New independent test
+  suites: `crates/core/tests/agent_refusal_matrix.rs` (every named
+  refusal reason, across all 14 tool ids), `crates/core/tests/
+  agent_storage_validation.rs` and `crates/tui/tests/
+  agent_storage_validation.rs` (custom-root redirection, malformed
+  metadata, unknown-schema-never-actionable, shared-resource reference
+  states, a canary sweep across render text/JSON/plan/execute/ledger
+  *and* real TUI frames, nested-accounting agreement, incremental
+  growth history, and stable history after relinking a session to a
+  different project). See `docs/agent-storage.md`'s new "#100/#101
+  completion and #102 validation" and "Human review still needed"
+  sections for exactly what changed and what remains for a human to
+  check.
 - **Made multi-root observation coverage-aware** (#42). `report`,
   `observe`, and `ui` with no explicit root now observe the whole
   configured scope coherently in one call, not just its first present

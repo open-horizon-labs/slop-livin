@@ -21,7 +21,7 @@ just similar in spirit.
 | `list_projects` (root, since) | `swamp report <root> --view projects --json [--since S]` |
 | `list_worktrees` (root, since, filter) | `swamp report <root> --view worktrees --json [--filter F]` |
 | `docker_objects` (root, unowned_only, project) | `swamp report <root> --view docker --json [--unowned-only] [--project P]` |
-| `propose` (root, since, filter, paths) | `swamp propose <root> --json [--since S] [--filter F] [--path P ...]` |
+| `propose` (root, since, filter, paths) | `swamp propose [root] --json [--since S] [--filter F] [--path P ...] [--external]` -- `root` is optional: omitted only when every `--path` names an agent-storage or external unit (see `agent-storage.md`, and the `external` view below) |
 | `execute` (plan_id, keep_executables) | `swamp execute <plan_id> --json [--keep-executables]` |
 | `plans` | `swamp plans --json` |
 | `grants` (read-only) | `swamp grant list --json` |
@@ -86,7 +86,11 @@ agree on what rows exist. `--project` scopes to one project (matched by
 name or `owner/repo` display name). Without `--view`, prints the full
 report structure with `since`/`index_refreshed`/`total`/`truncated`
 added and the top-level `projects` array bounded by `--limit`/
-`--offset`.
+`--offset`. With `--project`, the envelope also gains `agent_storage:
+{units, total_bytes}` -- this project's own linked agent-storage units
+(see `agent-storage.md`), the same linkage `--view agents --project
+NAME` reports, present here too so a project-scoped query never has to
+also pass `--view agents` to see it.
 
 ### `--view <name> --json`
 
@@ -135,7 +139,7 @@ Views:
 | `unowned` | array: `{path_or_object, bytes, reason, shared_bytes, docker_kind, note}` | |
 | `reconciliation` | object: `{attributed, unowned, walked_total, du_total, docker_attributed, docker_unowned}` | |
 | `rust` | array of nested Cargo artifacts | Inspection only; not project-scoped by `--project` yet. |
-| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: the action layer can name a unit in a plan but execution always refuses it. `propose`'s CLI has no `--external` selection mode yet -- this view is read-only from the CLI today. |
+| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: `swamp propose --external [--path P]` (or a bare `swamp propose --path P` when `P` matches an external unit, not an agent-storage one) builds a plan naming it, but `execute` always refuses it unconditionally. |
 
 `--view grown` additionally has a top-level `coverage` block:
 
@@ -167,7 +171,7 @@ top-level `projects` array with no `--view`). Both are only consulted
 with `--json`. A truncated page still reports the true `total`; never
 treat a `--limit`-bounded call as an exhaustive inventory.
 
-## `swamp propose <root> --json`
+## `swamp propose [root] --json`
 
 ```json
 {

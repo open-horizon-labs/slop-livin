@@ -104,6 +104,18 @@ chunk; all three now ship:
   counts a skip instead of a hard stop. The footer names how many agent
   rows were skipped and why whenever at least one row *was* marked,
   never silently proceeding as if the skipped rows were not on screen.
+- **Project tree's collapsed "Agent storage (linked)" row (#100
+  completion).** `ViewKind::Tree`'s own drill (`model::tree_rows_with_agents`,
+  built from the same `crate::tree::build_project_tree` the CLI's
+  `--project` text drill uses) now appends one row per tool
+  contributing linked agent storage to the selected project, after the
+  project's own worktrees. It is informational only (`unit: None`):
+  the row exists so "does this project have any linked agent storage,
+  from which tools, how much" is visible from the project drill itself
+  without also opening the separate Agents view -- acting on a specific
+  unit still happens there, where per-unit protections/occupancy are
+  checked. Absence of any linked unit means no row at all, never a
+  zero-byte placeholder.
 - **Scope-coverage header clause.** `App::set_scope_note` adds one
   short header clause when the TUI's own root is not simply present
   (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible: permission

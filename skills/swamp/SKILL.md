@@ -83,7 +83,7 @@ enough for read-only investigation.
 | `references/trust-model.md` | The real authorization boundary: what the sink enforces vs. what is only behavioral convention | 4.6 KB |
 | `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 6.8 KB |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
-| `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect`, `swamp propose-agents` | 3.4 KB |
+| `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect`, `swamp propose --path` | 3.4 KB |
 
 This file is 5.8 KB (roughly 1,400 tokens at ~4 bytes/token). Each
 reference loads independently -- none requires another to make sense,

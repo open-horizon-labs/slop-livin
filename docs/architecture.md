@@ -376,11 +376,37 @@ both deliberately narrow rather than a general redesign:
   home a `locations` detector could resolve. `discover_and_measure`
   gained a `project_worktrees: &[PathBuf]` parameter, populated by each
   caller from a `Report` it already has (`swamp report --view agents`,
-  the TUI startup path) or, for `swamp propose-agents --path` (which
-  deliberately computes no `Report`, to stay fast for an already-known
-  exact path), by walking upward from each requested path for its own
-  worktree root (`agents::worktree_root_containing`). Every other
-  adapter ignores this parameter entirely.
+  the TUI startup path, and, as of the #101-completion chunk, the
+  unified `swamp propose --path`'s agent-storage route too --
+  `discover_agent_units_for_propose` in `crates/cli/src/main.rs` runs
+  the same real report walk `report --view agents` does, rather than
+  the narrower "walk upward from each requested path" fast path an
+  earlier chunk's `propose-agents` used, which could not discover an
+  Aider unit whose worktree root was not itself implied by the
+  request). Every other adapter ignores this parameter entirely.
+- **Unified `propose` entry point (#101 completion):** `swamp propose`'s
+  `root` is `Option<PathBuf>`. With a `root`, behavior is unchanged
+  (the ordinary filesystem proposer). Without one, `--path` is resolved
+  against a freshly-discovered agent-unit catalog first, then an
+  external-unit catalog, refusing by name if neither matches (never
+  silently guessing a filesystem interpretation with no root to walk).
+  `--external` forces the external-unit route unconditionally. The
+  handler is one function (`propose_unified` in `crates/cli/src/main.rs`)
+  shared verbatim by `Command::Propose` and the now-deprecated
+  `Command::ProposeAgents` alias, so the two can never drift.
+- **Agent-storage refusal hardening:** `actions::propose_agents` now
+  refuses a plan whose selected units' own paths nest (parent/child
+  overlap), mirroring the Cargo-group overlap check `propose` already
+  had for filesystem units -- nothing previously enforced this for
+  agent units, and a real (test-fixture) duplicate-identification case
+  (Pi and Oh My Pi both matching the same session file when
+  `PI_CODING_AGENT_DIR` points both at the same directory, a disclosed
+  collision risk) surfaced exactly why this check earns its place.
+  Session removal's Trash envelope also now carries a `restore.json`
+  recovery manifest (written before any member moves, rewritten after
+  each successful one), and a partial failure
+  (`actions::PartialAgentRemoval`) still reports the envelope and the
+  bytes that really moved instead of only a bare error string.
 
 See `docs/agent-storage.md` for the rendered table, category/linkage
 semantics, and documented gaps (`~/.claude.json` living outside the
