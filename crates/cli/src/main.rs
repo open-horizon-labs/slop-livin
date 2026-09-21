@@ -1192,19 +1192,17 @@ fn main() -> Result<()> {
         no_observe: false,
     }) {
         Command::Ui { root, no_observe } => {
-            let root = if let Some(explicit) = root {
-                explicit
+            if let Some(explicit) = root {
+                swamp_tui::run(&explicit, no_observe)?;
             } else {
-                // No explicit root: observe the *whole* configured scope
-                // coherently (#42/#50) before the TUI opens, so every
-                // root's growth store and coverage protection stay
-                // correct even though the TUI itself still renders one
-                // primary root's report (#51 expands multi-root TUI
-                // presentation; #42's job is making the underlying
-                // observation and coverage honest, not the rendering).
+                // No explicit root: the TUI opens the *whole* configured
+                // multi-root scope (#51) -- project/shared/external/
+                // agent-tool storage from every present root at once,
+                // including a root with no Git checkout in it at all,
+                // not just the first present root the CLI used to pick
+                // before the TUI even started.
                 let scope = resolve_scope(&[])?;
-                let present = scope.scan_paths();
-                if present.is_empty() {
+                if scope.scan_paths().is_empty() {
                     if scope.is_empty_scope() {
                         anyhow::bail!(
                             "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
@@ -1214,25 +1212,11 @@ fn main() -> Result<()> {
                         "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
                     );
                 }
-                let store_dir = swamp_dir();
                 if !no_observe {
-                    note_and_persist_scope(&store_dir, &scope);
+                    note_and_persist_scope(&swamp_dir(), &scope);
                 }
-                let (_, coverage) = swamp_core::report::report_scope(
-                    &scope,
-                    None,
-                    false,
-                    Some(&store_dir),
-                    None,
-                    !no_observe,
-                    false,
-                    false,
-                    false,
-                )?;
-                print_scope_coverage_note(&coverage);
-                present[0].clone()
-            };
-            swamp_tui::run(&root, no_observe)?;
+                swamp_tui::run_scope(&scope, no_observe)?;
+            }
         }
         Command::Scan { root, store } => {
             let obs = observation(&ScanOptions {

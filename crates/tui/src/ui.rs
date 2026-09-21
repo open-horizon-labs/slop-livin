@@ -134,7 +134,11 @@ fn header_line(app: &App, width: usize) -> String {
         format!(
             "observed {}{}",
             app.observed_label,
-            if app.watch.is_some() { " · live" } else { "" }
+            if !app.watches.is_empty() {
+                " · live"
+            } else {
+                ""
+            }
         )
     };
     let since = since_label(app)

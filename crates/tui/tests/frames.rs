@@ -757,30 +757,16 @@ fn agents_view_mark_all_marks_actionable_and_skips_protected() {
 fn header_shows_scope_coverage_clause_for_a_missing_root() {
     for (w, h) in [(80, 24), (200, 60)] {
         let mut app = App::new(fixture_report(), "/Users/dev/src".into());
-        app.set_scope_note(&swamp_core::scope::EffectiveScope {
-            catalog_version: "test".into(),
-            generated_at: 0,
-            defaults_enabled: true,
-            disabled_detectors: Vec::new(),
-            configured_include: Vec::new(),
-            configured_exclude: Vec::new(),
-            explicit: false,
-            roots: vec![
-                swamp_core::scope::ScopeRoot {
-                    path: "/Users/dev/src".into(),
-                    reasons: Vec::new(),
-                    status: swamp_core::scope::RootStatus::Present,
-                },
-                swamp_core::scope::ScopeRoot {
-                    path: "/Users/dev/other".into(),
-                    reasons: Vec::new(),
-                    status: swamp_core::scope::RootStatus::Missing,
-                },
-            ],
-            detectors: Vec::new(),
-            pruned_subtrees: Vec::new(),
-            external_pruned_subtrees: Vec::new(),
-        });
+        app.set_scope_note(&[
+            swamp_core::coverage::RootCoverage {
+                path: "/Users/dev/src".into(),
+                status: swamp_core::coverage::RegionStatus::Complete,
+                walked_total: 0,
+                projects: 0,
+                mode: String::new(),
+            },
+            swamp_core::coverage::RootCoverage::missing("/Users/dev/other".into()),
+        ]);
         check(
             &format!("scope_coverage_header_{w}x{h}"),
             &capture(&app, w, h),

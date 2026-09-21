@@ -179,7 +179,6 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     // the background and swap the result in. With no cache yet, the first
     // observation has to happen before there is anything to show.
     let cached = swamp_core::report::load_last_report(&store, &root);
-    let (tx, rx) = std::sync::mpsc::channel::<Result<swamp_core::Report>>();
     let mut app = match cached {
         Some(r) if no_observe => {
             let mut a = App::new(r, root.clone());
@@ -190,6 +189,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             let mut a = App::new(r, root.clone());
             a.observed_label = "from last observation".into();
             a.observing = Some((0, 0));
+            let (tx, rx) = std::sync::mpsc::channel();
             let (root2, store2) = (root.clone(), store.clone());
             std::thread::spawn(move || {
                 // include_dirs: the Source row expands into its own
@@ -202,9 +202,11 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                     Some(&store2),
                     None,
                     true,
-                );
+                )
+                .map(|r| vec![(root2.clone(), r)]);
                 let _ = tx.send(res);
             });
+            a.pending = Some(rx);
             a
         }
         None => {
@@ -222,14 +224,134 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             App::new(report, root.clone())
         }
     };
-    app.pending = Some(rx);
-    app.store_dir = Some(store.clone());
+    // The header's coverage clause is about *this report's own* root,
+    // not the wider configured-scope catalog `finish_startup` resolves
+    // for external/agent-unit discovery (same split the CLI's `report
+    // --view external/agents` already has: "works the same whether
+    // report is scoped to the configured catalog or an explicit root").
+    // `run` always has exactly one explicit root ("explicit roots
+    // replace defaults/detectors entirely", #41), so this note is about
+    // that one root's own current status, resolved fresh (it can have
+    // changed between the walk above and now) rather than reused from
+    // `finish_startup`'s wider catalog scope.
+    let coverage = swamp_core::growth::load_config_checked(&store)
+        .ok()
+        .map(|cfg| {
+            let env = swamp_core::locations::Environment::from_process();
+            let registry = swamp_core::locations::Registry::with_builtins();
+            let scope = swamp_core::scope::resolve_effective_scope(
+                &env,
+                &cfg.scan,
+                std::slice::from_ref(&root),
+                &registry,
+                swamp_core::entities::now(),
+            );
+            coverage_from_scope(&scope)
+        });
+    finish_startup(&mut app, &store, no_observe, coverage.as_deref());
+    run_terminal_loop(&mut app)
+}
+
+/// Runs the interactive UI over every root a resolved `EffectiveScope`
+/// currently walks (#51): `swamp ui` with no explicit root, so
+/// project/shared/external/agent-tool storage from any included root
+/// is all in one report at once -- including a root with no Git
+/// checkout in it at all, which the single-root `run` above (and the
+/// pre-#51 `swamp ui` that always picked exactly one present root
+/// before even starting the TUI) could never show alongside another
+/// root's projects.
+///
+/// Unlike `run`, this always observes every present root synchronously
+/// before opening the TUI (via `report::report_scope_with_parts`, the
+/// same coherent multi-root entry point `report`/`observe` use) rather
+/// than painting a cached report and refreshing in the background --
+/// a deliberate simplification: `report_scope_with_parts` already picks
+/// the cheap incremental path per root when nothing changed, so an
+/// unchanged multi-root scope opens about as fast as a cached paint
+/// would have, without needing a second, parallel "merge fresh results
+/// into a cached multi-root report" bootstrap path.
+pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) -> Result<()> {
+    let store = store_dir();
+    let present_roots = scope.scan_paths();
+    anyhow::ensure!(
+        !present_roots.is_empty(),
+        "swamp_tui::run_scope requires at least one present root in scope"
+    );
+    let (merged, coverage, per_root) = swamp_core::report::report_scope_with_parts(
+        scope,
+        None,
+        false,
+        Some(&store),
+        None,
+        !no_observe,
+        true, // include_dirs: Source rows expand into their own directories
+        false,
+        false,
+        swamp_core::fs_events::platform_source().as_ref(),
+    )?;
+    let mut app = App::new_multi_root(merged, present_roots);
+    app.reports_by_root = per_root;
+    app.observed_label = "just now".into();
+    finish_startup(&mut app, &store, no_observe, Some(&coverage));
+    run_terminal_loop(&mut app)
+}
+
+/// Maps a resolved `EffectiveScope` to the same `coverage::RootCoverage`
+/// shape `report_scope` returns, for the one caller (`run`'s single
+/// explicit root) that has a scope but never actually calls
+/// `report_scope` itself. `RootStatus::Present` becomes `Complete`
+/// (this function has no walk outcome to draw `Partial` from -- an
+/// explicit-root `run` never distinguishes that today); every other
+/// status maps onto its `RegionStatus` equivalent one-for-one. Nested
+/// roots produce no row, matching `report_scope`'s own contract.
+fn coverage_from_scope(
+    scope: &swamp_core::scope::EffectiveScope,
+) -> Vec<swamp_core::coverage::RootCoverage> {
+    use swamp_core::coverage::{RegionStatus, RootCoverage};
+    use swamp_core::scope::RootStatus;
+    scope
+        .roots
+        .iter()
+        .filter_map(|r| {
+            let status = match &r.status {
+                RootStatus::Present => RegionStatus::Complete,
+                RootStatus::Missing => return Some(RootCoverage::missing(r.path.clone())),
+                RootStatus::Unreadable { reason } => {
+                    return Some(RootCoverage::inaccessible(r.path.clone(), reason.clone()));
+                }
+                RootStatus::Excluded { .. } => return Some(RootCoverage::excluded(r.path.clone())),
+                RootStatus::SkippedAsNested { .. } => return None,
+            };
+            Some(RootCoverage {
+                path: r.path.clone(),
+                status,
+                walked_total: 0,
+                projects: 0,
+                mode: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// Everything after an `App` has its initial `report`/`roots` set:
+/// external/agent-tool storage discovery, the header's coverage note,
+/// starting the live watch(es), and restoring persisted UI state.
+/// Shared by `run` and `run_scope` so this bookkeeping is never
+/// duplicated (or allowed to drift) between the single- and multi-root
+/// startup paths.
+fn finish_startup(
+    app: &mut App,
+    store: &Path,
+    no_observe: bool,
+    coverage: Option<&[swamp_core::coverage::RootCoverage]>,
+) {
+    app.store_dir = Some(store.to_path_buf());
     // External/agent-tool storage (#43/#91/#100): resolved once here, at
     // startup, alongside the initial report load above -- never on the
     // event/render loop this function is about to enter. Detector
     // resolution and measurement are disk I/O with the same cost shape
     // as the report observation just above it.
-    if let Ok(cfg) = swamp_core::growth::load_config_checked(&store) {
+    if let Ok(cfg) = swamp_core::growth::load_config_checked(store) {
         let env = swamp_core::locations::Environment::from_process();
         let registry = swamp_core::locations::Registry::with_builtins();
         let detector_scope = swamp_core::scope::resolve_effective_scope(
@@ -242,7 +364,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         let retention_days = cfg.retention_days;
         if let Ok(units) = swamp_core::external::discover_and_measure(
             &detector_scope,
-            Some(&store),
+            Some(store),
             !no_observe,
             swamp_core::entities::now(),
             retention_days,
@@ -263,7 +385,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         if let Ok(units) = swamp_core::agents::discover_and_measure(
             &detector_scope,
             &project_worktrees,
-            Some(&store),
+            Some(store),
             !no_observe,
             swamp_core::entities::now(),
             retention_days,
@@ -271,31 +393,20 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         ) {
             app.set_agent_units(units);
         }
-        // The header's coverage clause is about *this report's own*
-        // root(s), not the wider configured-scope catalog `detector_scope`
-        // above resolves for external/agent-unit discovery (same split
-        // the CLI's `report --view external/agents` already has: "works
-        // the same whether report is scoped to the configured catalog or
-        // an explicit root"). `run` always has exactly one explicit root
-        // (no multi-root TUI report yet -- #50), so resolve *that* root
-        // specifically ("explicit roots replace defaults/detectors
-        // entirely", #41) rather than reusing `detector_scope`, which
-        // would show the wrong roots' status for a report that only
-        // ever walks one of them.
-        let report_scope = swamp_core::scope::resolve_effective_scope(
-            &env,
-            &cfg.scan,
-            std::slice::from_ref(&root),
-            &registry,
-            swamp_core::entities::now(),
-        );
-        app.set_scope_note(&report_scope);
+    }
+    if let Some(c) = coverage {
+        app.set_scope_note(c);
     }
     if !no_observe {
         app.start_watch();
     }
-    app.history_secs = history_span(&store, &root);
-    let saved = app::load_ui_state(&store);
+    // Multi-root history windows are bounded by the *primary* root's own
+    // history for now (`App::root`, `roots[0]`) -- a per-root history
+    // bound is a real, named simplification (see this chunk's session
+    // note), not a silent one: a multi-root picker can currently offer
+    // a window longer than a non-primary root's own store actually has.
+    app.history_secs = history_span(store, &app.root);
+    let saved = app::load_ui_state(store);
     if !saved.filter.is_empty() {
         app.filter_text = saved.filter;
         app.commit_filter();
@@ -305,13 +416,15 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     }
     app.reverse = saved.reverse;
     app.keep_executables = saved.keep_executables;
+}
 
+fn run_terminal_loop(app: &mut App) -> Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, app);
 
     // Terminal failure must not abandon an in-flight filesystem move.
     if app.operation.is_some() {
@@ -340,8 +453,13 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             app.pending = None;
             app.observing = None;
             match res {
-                Ok(r) => {
-                    app.replace_report(r);
+                Ok(pairs) => {
+                    // Each pair replaces exactly its own root's entry
+                    // (#51): a live/background refresh of one or more
+                    // roots never touches any other root's rows.
+                    for (root, r) in pairs {
+                        app.replace_report_for_root(root, r);
+                    }
                     app.observed_label = "just now".into();
                 }
                 Err(e) => app.status = Some(format!("observation failed: {e}")),

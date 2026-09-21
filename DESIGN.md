@@ -116,22 +116,74 @@ chunk; all three now ship:
   unit still happens there, where per-unit protections/occupancy are
   checked. Absence of any linked unit means no row at all, never a
   zero-byte placeholder.
-- **Scope-coverage header clause.** `App::set_scope_note` adds one
-  short header clause when the TUI's own root is not simply present
-  (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible: permission
-  denied)`), dropped last by the existing "fit clauses to width" rule
-  like every other trailing clause -- never silently hidden, just
-  lower priority than size/growth facts on a narrow terminal. This is
-  scoped down from the full vision below: it reflects
-  `scope::RootStatus` (resolved without walking anything, for exactly
-  the one explicit root `swamp ui <root>` was given), not
-  `coverage::RegionStatus` (the actual per-root *walk* outcome
-  `report_scope`/`report --json`'s `scope_coverage` field shows) --
-  producing that would mean making the TUI's own rendered report
-  multi-root, which is #50's still-open job, not this chunk's. The
-  common case (one present root) shows no clause at all, matching
-  today's real usage; the mechanism and header slot exist for #50 to
-  extend, not re-derive.
+- **Scope-coverage header clause, now driven by real observation
+  outcome (#51).** `App::set_scope_note` adds one short header clause
+  when there is more than one region or the one region is not simply
+  `Complete` (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible:
+  permission denied)`, `2 roots (1 partial: 2 path(s) unreadable
+  during this walk)`), dropped last by the existing "fit clauses to
+  width" rule like every other trailing clause -- never silently
+  hidden, just lower priority than size/growth facts on a narrow
+  terminal. It now takes `&[coverage::RootCoverage]` -- this pass's
+  *actual* per-root walk outcome (`RegionStatus`), the same shape
+  `report_scope`/`report --json`'s `scope_coverage` field shows --
+  instead of the pre-walk `scope::RootStatus` snapshot an earlier
+  chunk shipped, which could not distinguish "part of a present root
+  was unreadable during the walk itself" (`Partial`) from a clean
+  `Complete` region. The common case (one `Complete` region) shows no
+  clause at all, matching ordinary single-project usage.
+
+### Multi-root reports, coverage inspection, and live refresh (#51)
+
+`swamp ui` with no explicit root opens the TUI over the *whole*
+configured scope, not just its first present root: `swamp_tui::run_scope`
+calls `report::report_scope_with_parts` (the same coherent multi-root
+entry point `report`/`observe` use) once at startup, giving the `App`
+every present root's own report (`App::reports_by_root`) plus one merged
+`Report` (`App::report`) built by folding them together
+(`report::merge_reports`). This is what makes project/shared/external/
+agent-tool storage from *any* included root show up together, including
+a root with no Git checkout in it at all (previously invisible: the CLI
+used to resolve the whole scope only to throw it away and hand the TUI
+exactly one present root, which is all `swamp_tui::run` -- kept as-is
+for the `swamp ui <explicit-root>` case -- has ever rendered).
+
+Live refresh preserves this per-root separation instead of ever
+replacing the whole merged report at once:
+
+- `App::start_watch` opens one FSEvents stream per root in `App::roots`,
+  all feeding one shared channel through cloned senders (`App::watches`
+  is a `Vec`, not a single `Option<Watcher>`).
+- `App::observe_live` handles one root's pending changes per call --
+  whichever root owns the first pending changed path -- draining only
+  that root's paths from `live_changes` and leaving any other root's
+  changes queued for the next tick, so two roots going quiet in the
+  same beat are never merged into one re-walk.
+- `App::observe_in_background` (the cached-startup and post-delete
+  refresh path) re-observes every root in `App::roots`, sequentially,
+  in one worker thread.
+- Both report their result(s) as `(root, Report)` pairs; `App::
+  replace_report_for_root` updates exactly that root's entry in
+  `reports_by_root` and rebuilds `report` from the *whole* map
+  (`report::merge_reports`) -- a refresh of one root can never erase,
+  stale-mark, or duplicate another root's rows, because that root's own
+  cached entry is never touched.
+
+Selection/filters/sort keep working unchanged: they operate on the one
+merged `Report` exactly as a single-root report always has. A unit
+shared across projects (an external unit's `consumers`, or agent
+storage linked from more than one project's tree row) was already
+counted once by `external.rs`/`agents.rs`'s own identity model (#43/
+#91); multi-root scope does not change that -- merging per-root reports
+only concatenates each root's own `projects`/`unowned` rows, it never
+re-derives external/agent-unit identity.
+
+Known, named simplification: `App::history_secs` (the growth-window
+picker's bound) is still derived from the *primary* root (`App::root`,
+`roots[0]`) only, not the narrowest history among every included root
+-- a multi-root picker can currently offer a window longer than a
+non-primary root's own store actually has. Revisit alongside #62's cost
+validation.
 
 ## Actions
 

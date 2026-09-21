@@ -86,6 +86,11 @@ impl ViewKind {
     }
 }
 
+/// One background observation's outcome: every `(root, report)` pair it
+/// managed to produce (#51 -- a live/cached refresh can cover more than
+/// one root per worker thread; see `App::pending`'s doc comment).
+type PendingObservation = anyhow::Result<Vec<(PathBuf, Report)>>;
+
 pub struct App {
     pub operation: Option<Operation>,
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
@@ -94,7 +99,33 @@ pub struct App {
     reviewed: usize,
     review_total: usize,
     pub report: Report,
+    /// Primary root: the first entry of `roots`, kept for every call
+    /// site that only ever needed one representative path (a "resize
+    /// this one thing" worker sub-`App`, a device lookup for an FSEvents
+    /// plan). Never the sole scan target once `roots.len() > 1` --
+    /// `report` and the live-refresh machinery below always operate
+    /// over the whole `roots` list.
     pub root: PathBuf,
+    /// Every root this report covers (#51): a single-root `swamp ui
+    /// <path>` invocation gets exactly one entry; the configured-scope
+    /// invocation (`swamp ui` with no explicit root) gets every present
+    /// root the resolved `EffectiveScope` walked, so project/shared/
+    /// external units from any of them are all in `report` at once --
+    /// including a root with no Git checkout in it at all (only
+    /// external/agent-tool storage), which used to be invisible because
+    /// the CLI picked exactly one present root before the TUI even
+    /// started.
+    pub roots: Vec<PathBuf>,
+    /// Each root's own last-observed single-root report, keyed by its
+    /// walked path -- the input to `report::merge_reports`, which
+    /// rebuilds `report` from this map. A live refresh or cached-startup
+    /// re-observation of one root replaces exactly that root's entry
+    /// and re-merges, so it can never erase or stale-mark any other
+    /// root's rows (#51's "updating one root does not erase/stale-mark
+    /// unrelated measured roots"). Empty for a fixture `App` built
+    /// directly from a `Report` (tests): `replace_report_for_root` still
+    /// works in that case, it just starts from one entry.
+    pub reports_by_root: std::collections::HashMap<PathBuf, Report>,
     pub view: ViewKind,
     pub filter_text: String,
     pub filter: Filter,
@@ -102,8 +133,20 @@ pub struct App {
     pub editing_filter: bool,
     /// Filter text as it was when editing began; restored on Esc.
     pub filter_before_edit: String,
-    /// Background observation result, when one is in flight.
-    pub pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Report>>>,
+    /// Background observation result, when one is in flight: one or more
+    /// `(root, report)` pairs (a live refresh touches whichever one root
+    /// owned the changed paths; a cached-startup refresh re-observes
+    /// every root in one worker thread), each applied via
+    /// `replace_report_for_root` so it updates exactly that root's entry
+    /// in `reports_by_root` regardless of how many roots this `App`
+    /// covers. `Err` is scope-wide (the worker thread itself failed
+    /// before producing any per-root result, e.g. a channel/panic
+    /// issue) rather than naming one root, since a single-root failure
+    /// is instead represented as that root simply being absent from an
+    /// `Ok` vec (its previous `reports_by_root` entry is left as-is,
+    /// same "coverage change is not a storage change" contract as
+    /// `report_scope`'s own per-root `Inaccessible` handling).
+    pub pending: Option<std::sync::mpsc::Receiver<PendingObservation>>,
     /// One-line status shown in the footer slot (errors, notices).
     pub status: Option<String>,
     pub selected: usize,
@@ -140,10 +183,15 @@ pub struct App {
     /// Store dir, when known: the applied filter is persisted there so it
     /// survives relaunch (`ui_filter.txt`).
     pub store_dir: Option<PathBuf>,
-    /// The live FSEvents stream on the root, running for the TUI's
-    /// lifetime. Every change under the root, including our own deletes,
-    /// arrives here; nothing "asks" for a refresh.
-    pub watch: Option<swamp_core::fs_events::Watcher>,
+    /// The live FSEvents streams covering every root in `roots` (#51):
+    /// one `Watcher` per root, all feeding the single `watch_rx` below
+    /// through cloned senders, so a change under *any* included root,
+    /// including our own deletes, arrives here -- nothing "asks" for a
+    /// refresh. Kept as a `Vec` (not one merged stream) because
+    /// `fs_events::watch` is a per-path platform call; two roots on
+    /// different volumes are two independent FSEvents streams no matter
+    /// how this struct stores their handles.
+    pub watches: Vec<swamp_core::fs_events::Watcher>,
     pub watch_rx: Option<std::sync::mpsc::Receiver<swamp_core::fs_events::WatchBatch>>,
     /// Changed directories received and not yet observed.
     pub live_changes: std::collections::HashSet<PathBuf>,
@@ -255,7 +303,21 @@ pub fn sort_to_str(s: Sort) -> &'static str {
 
 impl App {
     pub fn new(report: Report, root: PathBuf) -> Self {
+        Self::new_multi_root(report, vec![root])
+    }
+
+    /// Same as [`App::new`], for a report covering more than one root
+    /// (#51). `roots` must be non-empty; `roots[0]` becomes `self.root`
+    /// (the "one representative path" a handful of call sites still
+    /// need -- see `root`'s doc comment). `reports_by_root` starts
+    /// empty: a caller that already has each root's own report (the
+    /// ordinary startup path, via `report::report_scope_with_parts`)
+    /// should populate it directly on the returned `App` before the
+    /// first live refresh, so that refresh re-merges from real per-root
+    /// data instead of a single placeholder entry.
+    pub fn new_multi_root(report: Report, roots: Vec<PathBuf>) -> Self {
         let filter = filter::default_filter();
+        let root = roots.first().cloned().unwrap_or_default();
         App {
             operation: None,
             operation_rx: None,
@@ -265,6 +327,8 @@ impl App {
             review_total: 0,
             report,
             root,
+            roots,
+            reports_by_root: std::collections::HashMap::new(),
             view: ViewKind::Projects,
             filter_text: filter::default_filter_text().to_string(),
             filter,
@@ -292,7 +356,7 @@ impl App {
             quit: false,
             width: 0,
             store_dir: None,
-            watch: None,
+            watches: Vec::new(),
             watch_rx: None,
             live_changes: std::collections::HashSet::new(),
             live_last_event_id: 0,
@@ -318,49 +382,62 @@ impl App {
         self.agent_units = units;
     }
 
-    /// Sets `scope_note` from a resolved `EffectiveScope`, called once
-    /// at startup. `None` when the scope is a single `Present` root (the
-    /// ordinary case): every other case -- more than one root in scope,
-    /// or the one root not simply `Present` -- gets one short clause,
-    /// worst status first, e.g. `"3 roots (1 missing)"` or `"2 roots (1
-    /// inaccessible: permission denied)"`. Roots folded into a parent
-    /// (`RootStatus::SkippedAsNested`) are not counted as separate roots.
-    pub fn set_scope_note(&mut self, scope: &swamp_core::scope::EffectiveScope) {
-        use swamp_core::scope::RootStatus;
-        let roots: Vec<&swamp_core::scope::ScopeRoot> = scope
-            .roots
-            .iter()
-            .filter(|r| !matches!(r.status, RootStatus::SkippedAsNested { .. }))
-            .collect();
-        if roots.len() <= 1 && roots.iter().all(|r| r.status == RootStatus::Present) {
+    /// Sets `scope_note` from this pass's actual per-root observation
+    /// outcome (#51 -- replaces the pre-walk, `scope::RootStatus`-only
+    /// version #50's chunk shipped): `RegionStatus` reflects what
+    /// `report_scope` actually managed to observe this time (e.g.
+    /// `Partial` when part of a `Present` root could not be read during
+    /// the walk itself), which a resolved `EffectiveScope` alone cannot
+    /// -- that only knows what existed *before* walking. `None` when
+    /// there is exactly one region and it is `Complete` (the ordinary
+    /// case): every other case -- more than one region, or the one
+    /// region not simply `Complete` -- gets one short clause, worst
+    /// status first, e.g. `"3 roots (1 missing)"` or `"2 roots (1
+    /// inaccessible: permission denied)"`. A `SkippedAsNested` root gets
+    /// no `RootCoverage` row at all (`report_scope_with_source` folds it
+    /// into its parent's own region), so it is naturally never counted
+    /// here either.
+    pub fn set_scope_note(&mut self, coverage: &[swamp_core::coverage::RootCoverage]) {
+        use swamp_core::coverage::RegionStatus;
+        if coverage.len() <= 1
+            && coverage
+                .iter()
+                .all(|c| matches!(c.status, RegionStatus::Complete))
+        {
             self.scope_note = None;
             return;
         }
-        let total = roots.len();
-        let not_present = roots
+        let total = coverage.len();
+        let not_complete = coverage
             .iter()
-            .filter(|r| r.status != RootStatus::Present)
+            .filter(|c| !matches!(c.status, RegionStatus::Complete))
             .count();
-        let worst = roots
+        let worst = coverage
             .iter()
-            .find_map(|r| match &r.status {
-                RootStatus::Unreadable { reason } => Some(format!("inaccessible: {reason}")),
+            .find_map(|c| match &c.status {
+                RegionStatus::Inaccessible { reason } => Some(format!("inaccessible: {reason}")),
                 _ => None,
             })
             .or_else(|| {
-                roots
+                coverage.iter().find_map(|c| match &c.status {
+                    RegionStatus::Partial { reason } => Some(format!("partial: {reason}")),
+                    _ => None,
+                })
+            })
+            .or_else(|| {
+                coverage
                     .iter()
-                    .any(|r| matches!(r.status, RootStatus::Excluded { .. }))
+                    .any(|c| matches!(c.status, RegionStatus::Excluded))
                     .then(|| "excluded".to_string())
             })
             .or_else(|| {
-                roots
+                coverage
                     .iter()
-                    .any(|r| r.status == RootStatus::Missing)
+                    .any(|c| matches!(c.status, RegionStatus::Missing))
                     .then(|| "missing".to_string())
             });
         self.scope_note = Some(match worst {
-            Some(w) if not_present > 0 => format!("{total} roots ({not_present} {w})"),
+            Some(w) if not_complete > 0 => format!("{total} roots ({not_complete} {w})"),
             _ => format!("{total} roots"),
         });
     }
@@ -407,6 +484,20 @@ impl App {
         // the new report sorts it.
         let anchor = self.selected_row_key();
         self.report = report;
+        self.restore_selection(anchor);
+    }
+
+    /// Replaces exactly one root's contribution to `self.report` (#51):
+    /// updates `reports_by_root[root]`, then rebuilds `self.report` from
+    /// every root's latest cached report (`report::merge_reports`).
+    /// Every other root's rows are re-folded unchanged from their own
+    /// cached entry -- a refresh of one root can never erase, stale-mark,
+    /// or duplicate another root's data, because that data is never
+    /// touched, only re-read from `reports_by_root`.
+    pub fn replace_report_for_root(&mut self, root: PathBuf, report: Report) {
+        let anchor = self.selected_row_key();
+        self.reports_by_root.insert(root, report);
+        self.report = swamp_core::report::merge_reports(&self.roots, &self.reports_by_root);
         self.restore_selection(anchor);
     }
 
@@ -1498,7 +1589,7 @@ impl App {
         // The screen is right now; the store follows through the live
         // FSEvents stream, which sees the move to Trash like any change.
         self.prune_removed(&results);
-        if self.watch.is_none() {
+        if self.watches.is_empty() {
             self.observe_in_background();
         }
     }
@@ -1582,17 +1673,41 @@ impl App {
     /// build writing thousands of files) land as one observation.
     pub const LIVE_QUIET: Duration = Duration::from_millis(400);
 
-    /// Starts the live FSEvents stream. `None` (no store, or no FSEvents
-    /// on this platform) leaves the TUI on the scheduled observer alone.
+    /// Starts one live FSEvents stream per root in `self.roots` (#51),
+    /// all feeding the same `watch_rx` through cloned senders. A root
+    /// whose stream fails to start (no FSEvents on this platform, or the
+    /// path itself is gone) simply contributes no watcher -- the others
+    /// still run; this is never fatal to the TUI, only to that root's
+    /// live updates (it still gets refreshed by the scheduled/cached
+    /// path). No-op if watches are already running.
     pub fn start_watch(&mut self) {
-        if self.store_dir.is_none() || self.watch.is_some() {
+        if self.store_dir.is_none() || !self.watches.is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(w) = swamp_core::fs_events::watch(&self.root, tx) {
-            self.watch = Some(w);
+        for root in self.roots.clone() {
+            if let Some(w) = swamp_core::fs_events::watch(&root, tx.clone()) {
+                self.watches.push(w);
+            }
+        }
+        if !self.watches.is_empty() {
             self.watch_rx = Some(rx);
         }
+    }
+
+    /// The root in `self.roots` that owns `path` (the longest matching
+    /// prefix, so a nested root -- were one ever present -- would not be
+    /// shadowed by a shorter ancestor). `None` for a path outside every
+    /// known root, which a stream should not be able to report but is
+    /// handled as "ignore this change" rather than a panic if it ever
+    /// does (a root removed from scope between watch-start and now, for
+    /// instance).
+    fn root_for_path(&self, path: &std::path::Path) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .cloned()
     }
 
     /// Consumes every batch the stream has delivered so far.
@@ -1621,6 +1736,18 @@ impl App {
     /// thread, through the same pipeline as everything else: the plan is
     /// the live batch, so the store re-walks those subtrees and carries
     /// every other row forward.
+    ///
+    /// A live batch can name changes under more than one root (two
+    /// watchers can both go quiet in the same tick); this call handles
+    /// exactly *one* root per invocation -- the first, in `self.roots`
+    /// order, that has any pending change -- draining only that root's
+    /// changed paths from `live_changes` and leaving any other root's
+    /// changes in place. `live_observe_due` stays true afterward as long
+    /// as changes remain, so `event_loop` simply calls this again on its
+    /// next tick to pick up the next root; no root's changes are ever
+    /// silently dropped, and no two roots are ever re-walked by the same
+    /// worker thread (keeping the existing single-root incremental path
+    /// untouched per root).
     pub fn observe_live(&mut self) {
         let Some(store) = self.store_dir.clone() else {
             return;
@@ -1628,8 +1755,21 @@ impl App {
         if self.pending.is_some() || self.live_changes.is_empty() {
             return;
         }
-        let changed: Vec<PathBuf> = self.live_changes.drain().collect();
-        let device = std::fs::metadata(&self.root)
+        let Some(root) = self.live_changes.iter().find_map(|p| self.root_for_path(p)) else {
+            // Every pending change is outside every known root (a root
+            // was removed from scope since the watcher was started);
+            // drop them rather than looping forever on changes nothing
+            // will ever claim.
+            self.live_changes.clear();
+            return;
+        };
+        let (mine, rest): (HashSet<PathBuf>, HashSet<PathBuf>) = self
+            .live_changes
+            .drain()
+            .partition(|p| p.starts_with(&root));
+        self.live_changes = rest;
+        let changed: Vec<PathBuf> = mine.into_iter().collect();
+        let device = std::fs::metadata(&root)
             .ok()
             .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
         let plan = swamp_core::fs_events::FsEventsPlan::from_live(
@@ -1638,7 +1778,6 @@ impl App {
             device,
         );
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = self.root.clone();
         std::thread::spawn(move || {
             let source = swamp_core::fs_events::testing::CannedSource(plan);
             let res = swamp_core::report::report_full_mode_with_source(
@@ -1652,16 +1791,24 @@ impl App {
                 false,
                 false,
                 &source,
-            );
+            )
+            .map(|r| vec![(root.clone(), r)]);
             let _ = tx.send(res);
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
     }
 
-    /// Starts an incremental observation of the root on a worker thread;
-    /// `event_loop` swaps the result in when it arrives. No-op without a
-    /// store (fixture apps in tests) or while one is already running.
+    /// Starts an incremental observation of every root in `self.roots`
+    /// on one worker thread (sequentially -- root re-walks already run
+    /// each worker pool to saturation on their own, so parallelizing
+    /// across roots too would only contend with itself); `event_loop`
+    /// applies each root's fresh report as it would any other pending
+    /// result. No-op without a store (fixture apps in tests) or while
+    /// one is already running. A root whose own re-observation fails is
+    /// simply absent from the returned vec -- its last-known entry in
+    /// `reports_by_root` (and therefore its rows in `report`) is left
+    /// exactly as it was, never erased by another root's refresh.
     pub fn observe_in_background(&mut self) {
         let Some(store) = self.store_dir.clone() else {
             return;
@@ -1670,11 +1817,22 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = self.root.clone();
+        let roots = self.roots.clone();
         std::thread::spawn(move || {
-            let res =
-                swamp_core::report::report_with_dirs(&root, None, false, Some(&store), None, true);
-            let _ = tx.send(res);
+            let mut fresh = Vec::new();
+            for root in roots {
+                if let Ok(r) = swamp_core::report::report_with_dirs(
+                    &root,
+                    None,
+                    false,
+                    Some(&store),
+                    None,
+                    true,
+                ) {
+                    fresh.push((root, r));
+                }
+            }
+            let _ = tx.send(Ok(fresh));
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
@@ -2362,89 +2520,93 @@ mod tests {
         assert!(app.filter_error.is_some());
     }
 
-    fn scope_of(roots: Vec<swamp_core::scope::ScopeRoot>) -> swamp_core::scope::EffectiveScope {
-        swamp_core::scope::EffectiveScope {
-            catalog_version: "test".into(),
-            generated_at: 0,
-            defaults_enabled: true,
-            disabled_detectors: Vec::new(),
-            configured_include: Vec::new(),
-            configured_exclude: Vec::new(),
-            explicit: true,
-            roots,
-            detectors: Vec::new(),
-            pruned_subtrees: Vec::new(),
-            external_pruned_subtrees: Vec::new(),
-        }
-    }
-
-    fn scope_root(
+    fn region(
         path: &str,
-        status: swamp_core::scope::RootStatus,
-    ) -> swamp_core::scope::ScopeRoot {
-        swamp_core::scope::ScopeRoot {
+        status: swamp_core::coverage::RegionStatus,
+    ) -> swamp_core::coverage::RootCoverage {
+        swamp_core::coverage::RootCoverage {
             path: path.into(),
-            reasons: Vec::new(),
             status,
+            walked_total: 0,
+            projects: 0,
+            mode: String::new(),
         }
     }
 
     #[test]
-    fn scope_note_is_none_for_one_present_root() {
-        use swamp_core::scope::RootStatus;
+    fn scope_note_is_none_for_one_complete_region() {
+        use swamp_core::coverage::RegionStatus;
         let mut app = App::new(fixture_report(), "/root".into());
-        app.set_scope_note(&scope_of(vec![scope_root("/root", RootStatus::Present)]));
+        app.set_scope_note(&[region("/root", RegionStatus::Complete)]);
         assert_eq!(app.scope_note, None);
     }
 
     #[test]
     fn scope_note_names_count_and_worst_status_for_a_missing_root() {
-        use swamp_core::scope::RootStatus;
+        use swamp_core::coverage::RegionStatus;
         let mut app = App::new(fixture_report(), "/root".into());
-        app.set_scope_note(&scope_of(vec![
-            scope_root("/root", RootStatus::Present),
-            scope_root("/gone", RootStatus::Missing),
-        ]));
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/gone", RegionStatus::Missing),
+        ]);
         assert_eq!(app.scope_note.as_deref(), Some("2 roots (1 missing)"));
     }
 
     #[test]
-    fn scope_note_prioritizes_unreadable_over_missing_and_names_the_reason() {
-        use swamp_core::scope::RootStatus;
+    fn scope_note_prioritizes_inaccessible_over_missing_and_names_the_reason() {
+        use swamp_core::coverage::RegionStatus;
         let mut app = App::new(fixture_report(), "/root".into());
-        app.set_scope_note(&scope_of(vec![
-            scope_root("/root", RootStatus::Present),
-            scope_root("/gone", RootStatus::Missing),
-            scope_root(
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/gone", RegionStatus::Missing),
+            region(
                 "/denied",
-                RootStatus::Unreadable {
+                RegionStatus::Inaccessible {
                     reason: "permission denied".into(),
                 },
             ),
-        ]));
+        ]);
         assert_eq!(
             app.scope_note.as_deref(),
             Some("3 roots (2 inaccessible: permission denied)")
         );
     }
 
+    /// `RegionStatus::Partial` (part of a `Present` root was unreadable
+    /// *during this walk*) is a real outcome `scope::RootStatus` alone
+    /// never had -- the whole reason `set_scope_note` moved from
+    /// `EffectiveScope` to post-walk `RootCoverage` (#51).
     #[test]
-    fn scope_note_ignores_roots_folded_into_a_parent() {
-        use swamp_core::scope::RootStatus;
+    fn scope_note_reports_a_partial_region_with_its_reason() {
+        use swamp_core::coverage::RegionStatus;
         let mut app = App::new(fixture_report(), "/root".into());
-        app.set_scope_note(&scope_of(vec![
-            scope_root("/root", RootStatus::Present),
-            scope_root(
-                "/root/nested",
-                RootStatus::SkippedAsNested {
-                    parent: "/root".into(),
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region(
+                "/flaky",
+                RegionStatus::Partial {
+                    reason: "2 path(s) unreadable during this walk".into(),
                 },
             ),
-        ]));
+        ]);
         assert_eq!(
-            app.scope_note, None,
-            "a folded-nested root is not a separate root"
+            app.scope_note.as_deref(),
+            Some("2 roots (1 partial: 2 path(s) unreadable during this walk)")
         );
+    }
+
+    /// A root a config `exclude` pruned still gets its own coverage
+    /// row (`RootCoverage::excluded`) -- never silently absent, and
+    /// never labelled "deleted".
+    #[test]
+    fn scope_note_names_an_excluded_region() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/scratch", RegionStatus::Excluded),
+        ]);
+        assert_eq!(app.scope_note.as_deref(), Some("2 roots (1 excluded)"));
     }
 
     #[test]
@@ -2473,5 +2635,231 @@ mod tests {
             v = v.next();
         }
         assert!(seen.contains(&ViewKind::Agents));
+    }
+
+    // -----------------------------------------------------------------
+    // #51: multi-root reports, coverage inspection, and live refresh.
+    // -----------------------------------------------------------------
+
+    fn minimal_report(root: &str, project_name: &str, worktree_path: &str) -> Report {
+        Report {
+            observed_at: 1000,
+            root: root.into(),
+            projects: vec![ProjectRow {
+                project_id: format!("{project_name}-id"),
+                name: project_name.into(),
+                remote: None,
+                ecosystems: Vec::new(),
+                worktrees: vec![WorktreeRow {
+                    worktree_id: format!("{project_name}-wt"),
+                    path: worktree_path.into(),
+                    kind: WorktreeKind::Main,
+                    artifacts: Vec::new(),
+                    signals: Vec::new(),
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
+                }],
+            }],
+            unowned: vec![],
+            reconciliation: Reconciliation {
+                attributed: 0,
+                unowned: 0,
+                walked_total: 0,
+                du_total: None,
+                docker_attributed: 0,
+                docker_unowned: 0,
+            },
+            notes: vec![],
+            series_by_key: Default::default(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
+            summary: Default::default(),
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+            github_enrichment: None,
+            nested_artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_multi_root_covers_every_root_and_picks_the_first_as_primary() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let app = App::new_multi_root(a, vec!["/roots/a".into(), "/roots/b".into()]);
+        assert_eq!(app.root, PathBuf::from("/roots/a"));
+        assert_eq!(
+            app.roots,
+            vec![PathBuf::from("/roots/a"), PathBuf::from("/roots/b")]
+        );
+    }
+
+    /// The core #51 guarantee: refreshing one root's report must not
+    /// erase, stale-mark, or duplicate another root's rows. This is the
+    /// adversarial case a naive "just replace `self.report` wholesale"
+    /// implementation would fail immediately.
+    #[test]
+    fn replacing_one_roots_report_leaves_every_other_root_untouched() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let b = minimal_report("/roots/b", "proj-b", "/roots/b/proj-b");
+        let mut app = App::new_multi_root(a.clone(), vec!["/roots/a".into(), "/roots/b".into()]);
+        app.reports_by_root
+            .insert(PathBuf::from("/roots/a"), a.clone());
+        app.reports_by_root.insert(PathBuf::from("/roots/b"), b);
+        app.report = swamp_core::report::merge_reports(&app.roots, &app.reports_by_root);
+        assert_eq!(app.report.projects.len(), 2, "{:?}", app.report.projects);
+
+        // A fresh observation of root A only -- root B's cached entry is
+        // never read or written by this call.
+        let mut a2 = a;
+        a2.projects[0].worktrees[0].artifacts = Vec::new();
+        a2.reconciliation.walked_total = 999;
+        app.replace_report_for_root(PathBuf::from("/roots/a"), a2);
+
+        assert_eq!(
+            app.report.projects.len(),
+            2,
+            "root B's project must still be present after only root A refreshed: {:?}",
+            app.report.projects
+        );
+        assert!(
+            app.report.projects.iter().any(|p| p.name == "proj-b"),
+            "{:?}",
+            app.report.projects
+        );
+        assert!(app.report.projects.iter().any(|p| p.name == "proj-a"));
+    }
+
+    /// A root that stops being observable (removed from scope, access
+    /// lost) simply keeps its last entry in `reports_by_root` -- nothing
+    /// ever deletes an entry on its own, so its rows survive in `report`
+    /// until a caller deliberately narrows `roots`/`reports_by_root`.
+    /// This mirrors `coverage-changes-are-not-storage-changes`: losing
+    /// *coverage* of a root is never treated as that root's data having
+    /// been deleted.
+    #[test]
+    fn a_root_no_longer_refreshed_keeps_its_last_known_rows() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let b = minimal_report("/roots/b", "proj-b", "/roots/b/proj-b");
+        let mut app = App::new_multi_root(a.clone(), vec!["/roots/a".into(), "/roots/b".into()]);
+        app.reports_by_root.insert(PathBuf::from("/roots/a"), a);
+        app.reports_by_root
+            .insert(PathBuf::from("/roots/b"), b.clone());
+        app.report = swamp_core::report::merge_reports(&app.roots, &app.reports_by_root);
+
+        // Root B "loses access" (its watcher/observer never fires again,
+        // e.g. an unmounted volume) -- only root A ever refreshes again.
+        let mut a2 = app.reports_by_root[&PathBuf::from("/roots/a")].clone();
+        a2.reconciliation.walked_total = 42;
+        app.replace_report_for_root(PathBuf::from("/roots/a"), a2);
+        assert!(app.report.projects.iter().any(|p| p.name == "proj-b"));
+        assert_eq!(
+            app.reports_by_root[&PathBuf::from("/roots/b")]
+                .projects
+                .len(),
+            b.projects.len(),
+            "root B's cached entry itself must be untouched"
+        );
+    }
+
+    /// A report with zero projects (no Git checkout anywhere in scope)
+    /// still renders and still carries external/agent units -- the
+    /// concrete #51 acceptance case "project/shared/external units
+    /// available even when no Git checkout exists". Rendering must not
+    /// panic on an all-unowned, project-free report.
+    #[test]
+    fn external_only_report_with_no_projects_still_renders() {
+        let mut report = minimal_report("/roots/a", "unused", "/roots/a/unused");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_external_units(vec![swamp_core::external::ExternalUnit {
+            detector_id: "homebrew".into(),
+            detector_name: "Homebrew".into(),
+            category: swamp_core::locations::StorageCategory::Downloads,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: "/roots/a/.brew-cache".into(),
+            bytes: 12_345,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1000,
+            consumers: Vec::new(),
+            note: None,
+        }]);
+        assert!(app.rows().is_empty(), "no projects, no project rows");
+        app.set_view(ViewKind::External);
+        assert_eq!(app.external_units.len(), 1);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+    }
+
+    /// `start_watch` opens one FSEvents stream per root in `self.roots`
+    /// (#51), not just the primary one -- the concrete "multiple
+    /// watchers" acceptance case. Uses real temp directories since
+    /// `fs_events::watch` is a real platform call; skipped gracefully
+    /// (rather than failing) if this sandbox's FSEvents access itself is
+    /// unavailable, since that is an environment property this test does
+    /// not exist to re-verify.
+    #[test]
+    fn start_watch_opens_one_stream_per_root() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report(
+            dir_a.path().to_str().unwrap(),
+            "proj-a",
+            dir_a.path().join("proj-a").to_str().unwrap(),
+        );
+        let mut app = App::new_multi_root(
+            report,
+            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        app.start_watch();
+        if app.watches.is_empty() {
+            eprintln!(
+                "skipping: FSEvents watch unavailable in this sandbox (0 watches for 2 roots)"
+            );
+            return;
+        }
+        assert_eq!(
+            app.watches.len(),
+            2,
+            "one watcher per root, not one shared watcher for the whole App"
+        );
+        assert!(app.watch_rx.is_some());
+    }
+
+    /// A live batch naming changes under two different roots is handled
+    /// one root at a time: `observe_live` drains only the changed paths
+    /// under the root it picks, leaving the other root's changes intact
+    /// for the next call -- never silently dropped, never merged into
+    /// the wrong root's re-walk.
+    #[test]
+    fn observe_live_handles_one_roots_changes_at_a_time() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report(
+            dir_a.path().to_str().unwrap(),
+            "proj-a",
+            dir_a.path().join("proj-a").to_str().unwrap(),
+        );
+        let mut app = App::new_multi_root(
+            report,
+            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        app.live_changes.insert(dir_a.path().join("changed-a"));
+        app.live_changes.insert(dir_b.path().join("changed-b"));
+        app.live_last_batch = Some(Instant::now() - App::LIVE_QUIET - Duration::from_millis(10));
+        assert!(app.live_observe_due());
+        app.observe_live();
+        assert!(app.pending.is_some(), "one root's re-walk was started");
+        // Exactly one root's change was drained; the other is still
+        // pending for a subsequent call.
+        assert_eq!(app.live_changes.len(), 1, "{:?}", app.live_changes);
     }
 }
