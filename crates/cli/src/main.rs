@@ -1017,7 +1017,14 @@ fn propose_unified(
             }
             None => None,
         };
-        let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
+        let protected = swamp_core::agents::protect_list(&store_dir).unwrap_or_default();
+        let plan = swamp_core::actions::propose_checking_protection(
+            &r,
+            parsed.as_ref(),
+            &paths,
+            "human:cli",
+            &protected,
+        )?;
         return save_and_print_plan(&store_dir, &plan, r.observed_at, json);
     }
     anyhow::ensure!(

@@ -1349,6 +1349,9 @@ pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
             u.detector_id,
             consumers,
         );
+        for line in render_evidence_lines(&u.evidence) {
+            let _ = writeln!(out, "    {line}");
+        }
     }
     let _ = writeln!(
         out,
@@ -1378,6 +1381,63 @@ fn age_label(mtime_max: u64, now: u64) -> String {
     } else {
         format!("{}d ago", secs / 86_400)
     }
+}
+
+/// One short, source-qualified line per decision-evidence fact (#60):
+/// what kind of fact, its value or its explicit unknown/unavailable/
+/// conflicting reason, and where it came from. Never a verdict word --
+/// `agent_interface_facts_not_verdicts` audits this file for exactly
+/// that.
+pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<String> {
+    use crate::evidence::{FactKind, FactStatus, FactValue};
+    evidence
+        .iter()
+        .map(|e| {
+            let kind = match e.kind {
+                FactKind::Activity => "activity",
+                FactKind::Consumer => "consumer",
+                FactKind::CurrentUse => "current-use",
+                FactKind::Recovery => "recovery",
+                FactKind::Reclaimability => "reclaimability",
+            };
+            let value = match &e.status {
+                FactStatus::Known(FactValue::Timestamp(t)) => age_label(*t, e.observed_at),
+                FactStatus::Known(FactValue::Bool(b)) => b.to_string(),
+                FactStatus::Known(FactValue::Text(t)) => t.clone(),
+                FactStatus::Known(FactValue::Bytes(b)) => human_bytes(*b),
+                FactStatus::Known(FactValue::SignedBytes(b)) => human_bytes_signed(*b),
+                FactStatus::Known(FactValue::Count(c)) => c.to_string(),
+                FactStatus::Known(FactValue::List(l)) => l.join(", "),
+                FactStatus::Unknown { reason } => format!("unknown ({reason})"),
+                FactStatus::Unavailable { reason } => format!("unavailable ({reason})"),
+                FactStatus::Conflicting { candidates, reason } => format!(
+                    "conflicting [{}] ({reason})",
+                    candidates
+                        .iter()
+                        .map(|c| match c {
+                            FactValue::Text(t) => t.clone(),
+                            FactValue::Bytes(b) => human_bytes(*b),
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            let source = format!("{:?}", e.source);
+            let coverage = e
+                .freshness
+                .coverage_note
+                .as_deref()
+                .map(|n| format!("; coverage: {n}"))
+                .unwrap_or_default();
+            let note = e
+                .note
+                .as_deref()
+                .map(|n| format!("; note: {n}"))
+                .unwrap_or_default();
+            format!("{kind}: {value}  [source: {source}]{coverage}{note}")
+        })
+        .collect()
 }
 
 fn agent_link_label(link: &crate::agents::ProjectLinkState) -> String {

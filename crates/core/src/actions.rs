@@ -489,6 +489,53 @@ pub fn propose(
     })
 }
 
+/// Same as [`propose`], additionally refusing any matched unit whose
+/// path is human-protected (`swamp protect`, #60): a scanned project
+/// file or an agent observation can never add or remove a protection --
+/// only this explicit, human-controlled list (`agents::protect_add`/
+/// `protect_remove`, itself callable only from the CLI's own `protect`
+/// subcommand) does. A protected unit still appears in the plan's
+/// `refused` list with a named cause, never silently dropped.
+pub fn propose_checking_protection(
+    report: &Report,
+    filter: Option<&Filter>,
+    paths: &[PathBuf],
+    proposed_by: &str,
+    protected: &[PathBuf],
+) -> Result<Plan> {
+    let mut plan = propose(report, filter, paths, proposed_by)?;
+    if protected.is_empty() {
+        return Ok(plan);
+    }
+    let mut kept = Vec::new();
+    for u in plan.units {
+        if protected
+            .iter()
+            .any(|p| u.path == *p || u.path.starts_with(p))
+        {
+            plan.refused.push(Refused {
+                path: u.path.clone(),
+                cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
+            });
+        } else {
+            kept.push(u);
+        }
+    }
+    plan.units = kept;
+    if plan.units.is_empty() {
+        bail!(
+            "nothing to propose: every matched unit is human-protected ({} refused: {})",
+            plan.refused.len(),
+            plan.refused
+                .iter()
+                .map(|r| format!("{} — {}", r.path.display(), r.cause))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(plan)
+}
+
 /// Builds an inspection-only plan naming selected external units (#43).
 /// Every resulting unit carries `external_category`, so `execute` refuses
 /// all of them unconditionally: this exists so a human/agent can review

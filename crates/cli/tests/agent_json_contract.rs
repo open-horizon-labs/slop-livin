@@ -79,6 +79,46 @@ fn make_checkout(root: &Path, name: &str, seed_bytes: usize) -> PathBuf {
     dir
 }
 
+/// #53/#54/#60: the default `report --json` (no `--view`) carries each
+/// artifact row's decision evidence -- populated by
+/// `report::attach_decision_evidence` and passed straight through by
+/// `serde_json::to_value(&rr)` -- not just bytes/kind. This is the
+/// "fields populated end-to-end" contract check from the CLI JSON
+/// transport's own point of view (`crates/core/tests/evidence.rs`
+/// unit-tests the contract type itself; this exercises the real
+/// binary's JSON output).
+#[test]
+fn report_json_carries_decision_evidence_on_artifact_rows() {
+    let root = tempfile::tempdir().unwrap();
+    make_checkout(root.path(), "repo", 4096);
+    let store = tempfile::tempdir().unwrap();
+
+    let v = run_json(
+        store.path(),
+        &["report", root.path().to_str().unwrap(), "--json"],
+    );
+    let artifacts = v["projects"][0]["worktrees"][0]["artifacts"]
+        .as_array()
+        .expect("artifacts array");
+    let dep_row = artifacts
+        .iter()
+        .find(|a| {
+            a["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("node_modules")
+        })
+        .expect("a node_modules dependency-tree row");
+    let evidence = dep_row["evidence"].as_array().expect("evidence array");
+    assert!(
+        !evidence.is_empty(),
+        "row must carry evidence, not an empty/absent field: {dep_row:#}"
+    );
+    let kinds: Vec<&str> = evidence.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"activity"), "{kinds:?}");
+    assert!(kinds.contains(&"reclaimability"), "{kinds:?}");
+}
+
 /// A fresh `report --json` call (no prior observation) is a coherent
 /// no-growth baseline, not an error: the grown view is empty and the
 /// coverage block says plainly that there is no history yet instead of

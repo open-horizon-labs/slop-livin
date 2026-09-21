@@ -173,3 +173,44 @@ fn without_new_occupancy_the_same_plan_still_executes_normally() {
     assert_eq!(outcome.status, "completed", "cause: {:?}", outcome.cause);
     assert!(!fx.target_dir.exists());
 }
+
+/// #60: human keep/protect intent, extended beyond agent-storage units
+/// to an ordinary filesystem artifact row. A scanned project file or an
+/// agent observation must never be able to add or remove this
+/// protection -- only the explicit `protected` list this test builds
+/// by hand (standing in for `agents::protect_add`, itself reachable
+/// only from the CLI's `protect` subcommand) does.
+#[test]
+fn human_protected_ordinary_artifact_is_refused_at_proposal_not_silently_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let r = report_for(&fx.root, store.path());
+
+    let protected = vec![fx.target_dir.clone()];
+    let plan = actions::propose_checking_protection(
+        &r,
+        None,
+        std::slice::from_ref(&fx.target_dir),
+        "test",
+        &protected,
+    );
+    let err = plan.unwrap_err();
+    assert!(err.to_string().contains("human-protected"), "{err}");
+
+    // The tempting shortcut this rejects: silently omitting the
+    // protected path from the plan instead of naming it in `refused`.
+    let unfiltered = actions::propose(&r, None, &[], "test").expect("broad plan");
+    let plan = actions::propose_checking_protection(&r, None, &[], "test", &protected)
+        .expect("other unprotected units remain plannable");
+    assert!(
+        plan.refused
+            .iter()
+            .any(|r| r.path == fx.target_dir && r.cause.contains("human-protected"))
+    );
+    assert!(
+        plan.units.len() < unfiltered.units.len(),
+        "the protected unit must be removed from the plannable set"
+    );
+    assert!(!plan.units.iter().any(|u| u.path == fx.target_dir));
+}
