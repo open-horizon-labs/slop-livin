@@ -91,6 +91,36 @@ pub struct PlanUnit {
     /// supported selective action for any external category.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_category: Option<String>,
+    /// Set only for a unit built from `agents::AgentUnit` (#101): the
+    /// facts `execute` needs to recheck occupancy/references and
+    /// perform the one or two supported agent-storage actions (a
+    /// single-path cache/log Trash move, or a multi-member session
+    /// removal). Every other agent-storage unit (protected categories,
+    /// unsupported categories, and anything reachable only via
+    /// inspection) never reaches a `Plan` at all -- see
+    /// `propose_agents`, which refuses those at proposal time rather
+    /// than naming them here as inspection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_meta: Option<AgentPlanMeta>,
+}
+
+/// See `PlanUnit::agent_meta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPlanMeta {
+    pub tool_id: String,
+    /// The tool's home directory, rechecked for occupancy immediately
+    /// before acting (never assumed unchanged from proposal time).
+    pub tool_home: PathBuf,
+    pub category: String,
+    /// `None`: a single-path Trash move of the unit's own `path` (a
+    /// cache/log category directory). `Some`: a session removal --
+    /// every listed member is moved together into one Trash envelope,
+    /// after `execute` re-verifies each member still exists and belongs
+    /// only to this session (see `crate::agents::claude_code`'s
+    /// grouping rules, re-run fresh at execution rather than trusted
+    /// from the plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_members: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +567,7 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         track: a.track,
         warnings: warnings_for(wt, a, None),
         external_category: None,
+        agent_meta: None,
     }
 }
 
@@ -575,7 +606,310 @@ pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
             "external unit ({category}): identification only, never authorization"
         )],
         external_category: Some(category),
+        agent_meta: None,
     }
+}
+
+// ---------------------------------------------------------------------
+// Agent-storage actions (#101): cache/log Trash moves and explicit
+// session removal, both through this same plan/grant/ledger/Trash path.
+// Unlike `propose_external`, a supported unit here becomes a real,
+// actionable `PlanUnit` -- but only after `agent_refusal` clears it, and
+// `execute` re-derives occupancy/references/identity fresh rather than
+// trusting anything set at proposal time.
+// ---------------------------------------------------------------------
+
+/// A file whose name suggests a SQLite database or one of its sidecar
+/// files. Refused unconditionally (guardrail: "no individual WAL/SHM
+/// deletion, no guessed SQLite cleanup") even though no named Claude
+/// Code path is currently documented as SQLite -- defense in depth for
+/// a future path this adapter has not been told about.
+fn is_sqlite_like(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".db")
+        || lower.ends_with(".db-wal")
+        || lower.ends_with(".db-shm")
+        || lower.ends_with("-wal")
+        || lower.ends_with("-shm")
+}
+
+/// Why `unit` cannot be proposed as an actionable agent-storage plan
+/// unit, or `None` if it can. Checked again, independently, at
+/// `execute` (occupancy and reference/identity re-derivation) -- this
+/// function is the proposal-time gate, not a substitute for that recheck.
+fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
+    if u.protected {
+        let reason = u
+            .protect_reason
+            .clone()
+            .unwrap_or_else(|| format!("{} is protected by default", u.category.label()));
+        return Some(format!("protected: {reason}"));
+    }
+    if u.action == crate::agents::AgentActionCapability::None {
+        return Some(format!(
+            "no supported selective action for {} yet",
+            u.category.label()
+        ));
+    }
+    let touches_db_like = std::iter::once(&u.path)
+        .chain(u.members.iter().map(|m| &m.path))
+        .any(|p| is_sqlite_like(p));
+    if touches_db_like {
+        return Some(
+            "touches a database-like (SQLite/WAL/SHM) file; never deleted individually".into(),
+        );
+    }
+    if crate::agents::is_active(&u.path) {
+        return Some(
+            "refused: an active process holds this path open (session may be running)".into(),
+        );
+    }
+    None
+}
+
+/// Builds a real, actionable plan from selected `AgentUnit`s (#101).
+/// Every unit that reaches the plan carries `agent_meta`; anything
+/// `agent_refusal` names is refused here, at proposal time, never
+/// silently downgraded to an inspection-only row (that would be
+/// `propose_external`'s contract, not this one's -- an agent-storage
+/// plan either names a real, supported action or refuses).
+pub fn propose_agents(
+    units: &[crate::agents::AgentUnit],
+    tool_home: &Path,
+    paths: &[PathBuf],
+    proposed_by: &str,
+) -> Result<Plan> {
+    let mut plan_units = Vec::new();
+    let mut refused = Vec::new();
+    for u in units {
+        if !paths.is_empty() && !paths.iter().any(|p| p == &u.path) {
+            continue;
+        }
+        match agent_refusal(u) {
+            Some(cause) => refused.push(Refused {
+                path: u.path.clone(),
+                cause,
+            }),
+            None => plan_units.push(unit_from_agent(u, tool_home)),
+        }
+    }
+    for p in paths {
+        if !plan_units.iter().any(|u| &u.path == p) && !refused.iter().any(|r| &r.path == p) {
+            refused.push(Refused {
+                path: p.clone(),
+                cause: "no agent-storage unit at this exact path in the current scope".to_string(),
+            });
+        }
+    }
+    if plan_units.is_empty() {
+        bail!(
+            "nothing to propose: no actionable agent-storage unit matched{}",
+            if refused.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} refused: {})",
+                    refused.len(),
+                    refused
+                        .iter()
+                        .map(|r| format!("{} — {}", r.path.display(), r.cause))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        );
+    }
+    let created_at = now();
+    Ok(Plan {
+        id: crate::entities::new_id(),
+        root: tool_home.to_path_buf(),
+        created_at,
+        expires_at: created_at + PLAN_TTL_SECS,
+        proposed_by: proposed_by.to_string(),
+        status: PlanStatus::Proposed,
+        units: plan_units,
+        refused,
+    })
+}
+
+fn unit_from_agent(u: &crate::agents::AgentUnit, tool_home: &Path) -> PlanUnit {
+    use crate::agents::{AgentActionCapability, ProjectLinkState};
+    let category = u.category.label().to_string();
+    let session_members = if u.action == AgentActionCapability::SessionRemoval {
+        Some(u.members.iter().map(|m| m.path.clone()).collect())
+    } else {
+        None
+    };
+    let mut warnings = vec![format!(
+        "agent-storage unit ({category}, tool {})",
+        u.tool_name
+    )];
+    match u.action {
+        AgentActionCapability::SessionRemoval => {
+            warnings.push(
+                "removes this session's resume/rewind/checkpoint history; the linked project's \
+                 own files are untouched"
+                    .into(),
+            );
+            if let ProjectLinkState::Linked { project_name, .. } = &u.project_link {
+                warnings.push(format!("linked project: {project_name}"));
+            }
+            for m in &u.members {
+                warnings.push(format!("member: {} ({:?})", m.path.display(), m.kind));
+            }
+        }
+        AgentActionCapability::CacheOrLogTrash => {
+            warnings.push(
+                "recoverable Trash move; this category is regenerated automatically by the tool"
+                    .into(),
+            );
+        }
+        AgentActionCapability::None => {}
+    }
+    PlanUnit {
+        cargo_group: None,
+        path: u.path.clone(),
+        rel_path: u.relative_path.clone(),
+        project: match &u.project_link {
+            ProjectLinkState::Linked { project_name, .. } => project_name.clone(),
+            _ => format!("(agent: {})", u.tool_name),
+        },
+        project_id: format!("agent:{}", u.tool_id),
+        worktree_id: format!("agent:{}:{}", u.tool_id, u.id),
+        worktree_path: u.path.clone(),
+        kind: ArtifactKind::Unknown,
+        bytes: u.bytes,
+        dedup_stale: false,
+        growth_bytes: u.growth_bytes,
+        regrowth_count: u.regrowth_count,
+        observed_at: u.observed_at,
+        recovery: match u.action {
+            AgentActionCapability::CacheOrLogTrash => {
+                "local_rebuild (regenerated by the tool)".to_string()
+            }
+            AgentActionCapability::SessionRemoval => {
+                "irrecoverable outside Trash: unique conversation/checkpoint history".to_string()
+            }
+            AgentActionCapability::None => "inspection only".to_string(),
+        },
+        idle_secs: None,
+        merge_complete: false,
+        signals: Vec::new(),
+        verb: "delete".into(),
+        track: None,
+        warnings,
+        external_category: None,
+        agent_meta: Some(AgentPlanMeta {
+            tool_id: u.tool_id.clone(),
+            tool_home: tool_home.to_path_buf(),
+            category,
+            session_members,
+        }),
+    }
+}
+
+/// A single-path Trash move of a cache/log category directory. Re-stats
+/// the path fresh (never trusts the plan's byte count as proof the path
+/// still exists or is still a directory).
+fn execute_agent_cache_trash(path: &Path, trash: &Path, at: u64) -> Result<(PathBuf, u64)> {
+    let meta = fs::symlink_metadata(path).context("path no longer exists")?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        bail!("path is no longer a directory (or is a symlink)");
+    }
+    let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agent-cache");
+    let dest = trash.join(format!("agent-cache-{basename}-{at}"));
+    fs::rename(path, &dest).context("rename to Trash failed")?;
+    Ok((dest, bytes))
+}
+
+/// Moves a session's exact member set into one Trash envelope, after
+/// re-deriving the session's current membership from scratch (never
+/// trusting `planned_members`) and refusing on any drift: a member now
+/// missing, a new member the plan did not know about, or membership
+/// that no longer matches at all (the session was already removed,
+/// re-created, or reclassified since the plan was proposed).
+fn execute_agent_session_removal(
+    meta: &AgentPlanMeta,
+    session_path: &Path,
+    planned_members: &[PathBuf],
+    trash: &Path,
+    at: u64,
+) -> Result<(PathBuf, u64)> {
+    let fresh = match meta.tool_id.as_str() {
+        crate::agents::claude_code::CLAUDE_CODE_TOOL_ID => {
+            crate::agents::claude_code::identify(&meta.tool_home, at)
+        }
+        other => bail!("no session-removal re-identification implemented for tool {other}"),
+    };
+    let current = fresh
+        .iter()
+        .find(|c| c.path == session_path)
+        .ok_or_else(|| anyhow!("session no longer identifiable at this path; propose again"))?;
+    let mut current_members: Vec<PathBuf> =
+        current.members.iter().map(|m| m.path.clone()).collect();
+    let mut planned: Vec<PathBuf> = planned_members.to_vec();
+    current_members.sort();
+    planned.sort();
+    if current_members != planned {
+        bail!(
+            "session membership changed since the plan was proposed (references drifted); \
+             propose again"
+        );
+    }
+    // Pre-flight: stat every member *before* moving any of them, so the
+    // common failure (a member vanished between proposal and execution)
+    // is caught before this session is left half-moved. This does not
+    // make the multi-file move fully atomic (a concurrent deletion or a
+    // cross-device rename can still fail mid-loop), but it removes the
+    // most likely partial-failure cause outright.
+    let mut sized_members: Vec<(PathBuf, u64, bool)> = Vec::with_capacity(current_members.len());
+    for member in &current_members {
+        let member_meta = fs::symlink_metadata(member)
+            .with_context(|| format!("member no longer exists: {}", member.display()))?;
+        let is_dir = member_meta.is_dir();
+        let bytes = if is_dir {
+            crate::agents::folded_bytes(member, 2_000_000).0
+        } else {
+            member_meta.len()
+        };
+        sized_members.push((member.clone(), bytes, is_dir));
+    }
+
+    let slug = session_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let envelope = trash.join(format!("agent-session-{slug}-{at}"));
+    fs::create_dir_all(&envelope).context("could not create Trash envelope")?;
+    let mut moved_bytes = 0u64;
+    for (i, (member, bytes, _is_dir)) in sized_members.iter().enumerate() {
+        let name = member
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("member");
+        let dest = envelope.join(format!("{i}-{name}"));
+        fs::rename(member, &dest).with_context(|| {
+            format!(
+                "rename to Trash failed for {} ({} of {} members already moved into {})",
+                member.display(),
+                i,
+                sized_members.len(),
+                envelope.display()
+            )
+        })?;
+        moved_bytes += bytes;
+    }
+    Ok((envelope, moved_bytes))
 }
 
 /// A whole worktree (linked → `remove-worktree`) or checkout (→ `archive`)
@@ -1206,6 +1540,64 @@ pub fn execute_with_trash_opts(
             && used + 1 > mu
         {
             outcome.cause = Some(format!("grant unit cap reached ({mu})"));
+            outcomes.push(outcome);
+            continue;
+        }
+        // Agent-storage action (#101): occupancy, reference and identity
+        // are all rechecked fresh here, never trusted from the plan.
+        if let Some(meta) = &unit.agent_meta {
+            if crate::agents::is_active(&unit.path) {
+                outcome.cause = Some(
+                    "refused: an active process holds this path open (session may be running)"
+                        .into(),
+                );
+                outcomes.push(outcome);
+                continue;
+            }
+            let agent_result = match &meta.session_members {
+                Some(planned_members) => {
+                    execute_agent_session_removal(meta, &unit.path, planned_members, trash, at)
+                }
+                None => execute_agent_cache_trash(&unit.path, trash, at),
+            };
+            match agent_result {
+                Ok((dest, moved_bytes)) => {
+                    outcome.status = "completed".into();
+                    outcome.recovery_location = Some(dest);
+                    trashed += moved_bytes;
+                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
+                }
+                Err(e) => {
+                    outcome.status = "failed".into();
+                    outcome.cause = Some(e.to_string());
+                }
+            }
+            ledger.append(&ActionRecord {
+                id: crate::entities::new_id(),
+                verb: crate::grants::Verb::Delete,
+                entity_id: crate::entities::id_for(&unit.path.display().to_string()),
+                evidence: serde_json::json!({
+                    "plan_id": plan.id,
+                    "tool_id": meta.tool_id,
+                    "category": meta.category,
+                    "session_removal": meta.session_members.is_some(),
+                    "member_count": meta.session_members.as_ref().map(|m| m.len()),
+                    "bytes": unit.bytes,
+                    "recovery": unit.recovery,
+                    "cause": outcome.cause,
+                }),
+                grant_id: g.id.clone(),
+                actor: actor.into(),
+                outcome: outcome.status.clone(),
+                recovery_location: outcome.recovery_location.clone(),
+                measured_free_space_delta: None,
+                observed_path_state: Some(if outcome.status == "completed" {
+                    "trashed".into()
+                } else {
+                    "unchanged".into()
+                }),
+                recorded_at: at,
+            })?;
             outcomes.push(outcome);
             continue;
         }
