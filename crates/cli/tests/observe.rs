@@ -109,7 +109,7 @@ fn observe_with_empty_scope_fails_visibly_never_falls_back_to_cwd() {
     let store = tempfile::tempdir().expect("store");
     std::fs::write(
         store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\", \"claude-code\", \"codex\", \"codex-desktop\", \"oh-my-pi\", \"opencode\"]\n",
+        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\", \"claude-code\", \"codex\", \"codex-desktop\", \"oh-my-pi\", \"opencode\", \"gemini-cli\", \"pi\", \"aider\", \"github-copilot-cli\", \"cursor\", \"windsurf\", \"cline\", \"roo-code\", \"continue\"]\n",
     )
     .unwrap();
 

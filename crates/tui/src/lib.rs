@@ -250,8 +250,19 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         ) {
             app.set_external_units(units);
         }
+        // Aider's per-repo units (#96) need every known worktree root;
+        // `app.report` is already loaded above, at this same startup
+        // point, so no extra walk is needed to supply them.
+        let project_worktrees: Vec<std::path::PathBuf> = app
+            .report
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .map(|wt| wt.path.clone())
+            .collect();
         if let Ok(units) = swamp_core::agents::discover_and_measure(
             &detector_scope,
+            &project_worktrees,
             Some(&store),
             !no_observe,
             swamp_core::entities::now(),

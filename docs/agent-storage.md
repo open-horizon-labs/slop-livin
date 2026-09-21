@@ -1,12 +1,15 @@
 # Agent-tool storage
 
 Coding-agent CLIs and editor extensions (Claude Code, Codex, Oh My Pi,
-OpenCode, and others) keep session transcripts, caches, logs,
-checkpoints and configuration under their own home directory. This
-document is the reference for how `swamp` discovers, models, presents
-and selectively cleans up that storage
-(#90/#91/#92/#93/#94/#95/#100/#101), and what is deliberately not done
-yet.
+OpenCode, Gemini CLI, Pi, Aider, GitHub Copilot CLI, Cursor, Windsurf,
+Cline, Roo Code, Continue, and others) keep session transcripts,
+caches, logs, checkpoints and configuration under their own home
+directory (or, for Aider, partly inside each project checkout instead).
+This document is the reference for how `swamp` discovers, models,
+presents and selectively cleans up that storage
+(#90/#91/#92/#93/#94/#95/#96/#97/#98/#99/#100/#101), and what is
+deliberately not done yet. Every named tool in the required matrix now
+has real identification code -- see "Required tool matrix" below.
 
 **The aim:** help a developer understand where agentic coding tools
 consume disk, what grew, which project (if any) it belongs to, and what
@@ -29,7 +32,16 @@ This is the hard rule everything else in this document sits on top of:
   that reads further into a session body (bounded to 64 KiB per
   session), and only to extract opaque `blob:sha256:<hash>` reference
   tokens -- never any other content, never persisted as text anywhere.
-  Nothing else, in any adapter, is ever read.
+  #96-#99's nine adapters follow the same discipline: Pi tries its own
+  offset-zero header, then Oh My Pi's title-slot shape, for one `cwd`
+  field, exactly like the tools it shares lineage with; Aider,
+  Cursor/Windsurf and GitHub Copilot CLI's `session-store.db` never read
+  transcript content at all (declared metadata or a protected,
+  never-opened database); GitHub Copilot CLI's `session-state/` and
+  Cline/Roo Code/Cursor/Windsurf's `workspace.json`/`task_metadata.json`
+  linkage each read one small, bounded metadata file (never the
+  conversation body) looking for one declared path field. Nothing else,
+  in any adapter, is ever read.
 - No prompt, response, attachment, tool-output, or credential *content*
   is put into a report, a plan, the ledger, a log, or a test fixture.
   Every fixture used to build and test this feature is synthetic:
@@ -43,7 +55,11 @@ This is the hard rule everything else in this document sits on top of:
   ledger entry (`crates/core/src/agents/claude_code.rs`'s
   `a_session_is_identified_with_its_companion_members`,
   `crates/core/tests/agent_units_actions.rs`'s
-  `plan_and_ledger_never_contain_the_canary_prompt_content`).
+  `plan_and_ledger_never_contain_the_canary_prompt_content`, and, for
+  the nine #96-#99 adapters,
+  `crates/core/tests/agent_units_actions_remaining_tools.rs`'s
+  `no_canary_anywhere` helper, applied after every execute in that
+  file).
 
 ## Required tool matrix
 
@@ -59,24 +75,28 @@ that every one of the required tools has exactly one row.
 | Codex desktop app | **Supported** (log directory only) | macOS `~/Library/Logs/com.openai.codex`; settings/session storage beyond logs is unconfirmed and not modeled | [doctor/desktop.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop.rs), [desktop/platform.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop/platform.rs) |
 | Oh My Pi | **Supported** | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set (user-confirmed identity: a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md), [docs/settings.md](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) |
 | OpenCode | **Supported** | data: `OPENCODE_DATA_DIR` (unconfirmed env var name, honored defensively), else `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode` and cache `${XDG_CACHE_HOME:-~/.cache}/opencode` reported as opaque external units, not decomposed | [opencode.ai/docs/troubleshooting](https://opencode.ai/docs/troubleshooting/), [opencode#6669](https://github.com/anomalyco/opencode/issues/6669), [opencode#18633](https://github.com/anomalyco/opencode/issues/18633), [storage.ts](https://github.com/sst/opencode/blob/dev/packages/opencode/src/storage/storage.ts), [DeepWiki storage-and-database](https://deepwiki.com/sst/opencode/2.9-storage-and-database) |
-| Gemini CLI | Planned | `~/.gemini` (`settings.json`, `GEMINI.md`, `extensions/`, `tmp/`, `chats/`); root overridable via `GEMINI_CONFIG_HOME` | [gemini-cli configuration.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md) |
-| Pi | Planned | `~/.pi/agent/`, overridable via `PI_AGENT_DIR` (`badlogic/pi-mono`, distinct from Oh My Pi, which forks it) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md), [development.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/development.md) |
-| Aider | Planned | `~/.aider` (`~/.aider/caches`); per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v<N>/` are project-local, not under the home directory | [aider config.html](https://aider.chat/docs/config.html), [usage/caching.html](https://aider.chat/docs/usage/caching.html), [Aider-AI/aider](https://github.com/Aider-AI/aider) |
-| GitHub Copilot CLI | Planned | `~/.copilot`, overridable via `COPILOT_HOME` | [cli-config-dir-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference) |
-| Cursor | Planned | editor-profile storage, not one directory: macOS `~/Library/Application Support/Cursor/User/{globalStorage,workspaceStorage}`, plus `~/.cursor/` (chats/projects/CLI) | community-sourced (no official layout doc found): [cursor-chat-browser](https://github.com/thomas-pedersen/cursor-chat-browser), [cursaves](https://github.com/Callum-Ward/cursaves/blob/main/docs/how-cursor-stores-chats.md) |
-| Windsurf | Planned | `~/.codeium/windsurf` (MCP/agent config); editor chat/workspace storage layout unconfirmed | [docs.windsurf.com](https://docs.windsurf.com/), [coder module](https://registry.coder.com/modules/coder/windsurf) |
-| Cline | Planned | VS Code extension global storage: `.../globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/` | community-sourced: [cline#7101](https://github.com/cline/cline/issues/7101), [cline#14135](https://github.com/cline/cline/issues/14135) |
-| Roo Code | Planned | VS Code extension global storage: `.../globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` | community-sourced: [Roo-Code#4174](https://github.com/RooCodeInc/Roo-Code/issues/4174) |
-| Continue | Planned | `~/.continue` (`config.yaml`/`config.json`, `sessions/`) | [continue configuration](https://docs.continue.dev/customize/deep-dives/configuration), [reference](https://docs.continue.dev/reference) |
+| Gemini CLI | **Supported** | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `bin/`; `tmp/<hash>/{shell_history,checkpoints/,chats/}` and `history/<hash>/` shadow-Git repos, both keyed by `sha256(project root)`) | [configuration.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md), [checkpointing.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md), [session-management.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md), [paths.ts](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts) |
+| Pi | **Supported** | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (confirmed primary-source name, shared with Oh My Pi's own override; `badlogic/pi-mono`, distinct from Oh My Pi which forks it) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md), [README.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md) |
+| Aider | **Supported** | `~/.aider/caches` (model-price/version-check caches); per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v{3,4}/` at the git root -- project-local, attached to the worktree artifact model, not the tool home | [models.py](https://github.com/Aider-AI/aider/blob/main/aider/models.py), [versioncheck.py](https://github.com/Aider-AI/aider/blob/main/aider/versioncheck.py), [args.py](https://github.com/Aider-AI/aider/blob/main/aider/args.py), [repomap.py](https://github.com/Aider-AI/aider/blob/main/aider/repomap.py) |
+| GitHub Copilot CLI | **Supported** | `~/.copilot`, overridable via `COPILOT_HOME` (`config.json`, `settings.json`, `mcp-config.json`, `session-state/`, `command-history-state/`, `session-store.db`, `logs/`, ...); separate platform-conventional cache via `COPILOT_CACHE_HOME` | [cli-config-dir-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference) |
+| Cursor | **Supported** (macOS only) | editor-profile storage: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | community-sourced (no official layout doc found): [cursor-chat-browser](https://github.com/thomas-pedersen/cursor-chat-browser), [cursaves](https://github.com/Callum-Ward/cursaves/blob/main/docs/how-cursor-stores-chats.md) |
+| Windsurf | **Supported** (macOS only, lower confidence) | `~/.codeium/windsurf` (not decomposed), plus an *assumed* VS-Code-fork profile at `~/Library/Application Support/Windsurf` -- not independently confirmed | [coder module](https://registry.coder.com/modules/coder/windsurf) (docs.windsurf.com redirects to docs.devin.ai as of this chunk) |
+| Cline | **Supported** (macOS hosts) | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/` | community-sourced: [cline#7101](https://github.com/cline/cline/issues/7101), [cline#14135](https://github.com/cline/cline/issues/14135) |
+| Roo Code | **Supported** (macOS hosts) | Same per-host modeling as Cline: `globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` | community-sourced: [Roo-Code#4174](https://github.com/RooCodeInc/Roo-Code/issues/4174) |
+| Continue | **Supported** | `~/.continue` (`config.yaml`/`config.json`, `sessions/<id>` + a session index file, `index/` embeddings/tag caches, `dev_data/` usage events) | [continue configuration](https://docs.continue.dev/customize/deep-dives/configuration), [reference](https://docs.continue.dev/reference) |
 
-"Planned" means the home-path evidence above was researched from
-primary sources during this work, but no identification code exists
-for that tool yet -- never a silent omission, and never an empty
-adapter that claims support it does not have. Extending this list for
-a tool *beyond* the fourteen rows above (Codex and its desktop app
-count separately, per #93's "do not extrapolate one client's schema to
-all clients" acceptance) is ordinary catalog review, not a change to
-this contract.
+Every named tool in this matrix is now `Supported`; a test
+(`matrix::tests::every_named_tool_is_now_supported`) enforces it. Two
+rows are honestly narrower than the rest, stated rather than hidden:
+Windsurf's editor-profile shape is *assumed* (VS Code fork), not
+independently confirmed this chunk -- a real installation that differs
+surfaces as an explicit "(unsupported layout version)" residual, never
+a silent miscount; Cursor/Windsurf/Cline/Roo Code are macOS-only this
+chunk, with Linux paths deferred to the independent Linux track
+(#77-#89). Extending this list for a tool *beyond* the fourteen rows
+above (Codex and its desktop app count separately, per #93's "do not
+extrapolate one client's schema to all clients" acceptance) is ordinary
+catalog review, not a change to this contract.
 
 ## Categories
 
@@ -120,6 +140,16 @@ model only where a tool genuinely needs a new concept" clause:
   `storage/session_diff/<session-id>/`), matched to a session by the
   same exact-id-match discipline `claude_code::identify` uses for its
   own companion directories -- never a guess.
+
+#96/#97/#98/#99's nine adapters needed **no new `AgentMemberKind`
+variant**: Cursor/Windsurf's `state.vscdb` and GitHub Copilot CLI's
+`session-store.db` reuse `Database`; Cline/Roo Code's task directories
+and Copilot CLI's/Continue's directory-shaped session entries reuse
+`SessionData`; every single-file session (Gemini CLI's saved chats,
+Aider's per-repo history files, Pi's/Continue's per-session files, Copilot
+CLI's file-shaped session entries) reuses `Transcript` -- direct
+evidence that the shared model already covered these tools' shapes
+without needing to be widened.
 
 ### Cache/log Trash move
 
@@ -384,6 +414,200 @@ linkage.
   the separate config root).
 - **Logs (actionable):** `log/` (also directly under the data root).
 
+## Gemini CLI (#96)
+
+Layout researched from `google-gemini/gemini-cli`'s own docs and source
+(current `main` as of this chunk). The project-hash algorithm
+(`getProjectHash(projectRoot) = sha256(projectRoot).hex()`) is confirmed
+directly in `packages/core/src/utils/paths.ts` -- not guessed -- but it
+is one-way: this adapter has no candidate project-path catalog to hash
+and compare against, so every `tmp/<hash>`/`history/<hash>` unit's
+`project_link` is `unresolved`, naming the algorithm explicitly, rather
+than a fabricated match or a silently dropped fact.
+
+- **Protected config:** `settings.json`, `GEMINI.md`, `trustedFolders.json`,
+  `extensions/`. OAuth/account credential file names are not documented
+  on any reachable page this chunk (`docs/cli/authentication.md` and
+  `docs/get-started/authentication.md` both 404 against current `main`),
+  so any top-level file whose name contains `oauth`/`cred` is protected
+  defensively by filename pattern instead of an exact confirmed name.
+- **Caches (actionable):** `bin/` (downloaded runtime tools, e.g.
+  LiteRT-LM).
+- **Per-project-hash `tmp/<hash>/`:** `shell_history` (Logs, actionable),
+  `checkpoints/` (Checkpoints, not actionable -- tool-call recovery
+  state for `/restore`), `chats/*` (Sessions, one unit per saved chat
+  file, actionable -- `/chat save`/`/resume`).
+- **`history/<hash>/`:** a shadow Git repository, independent of the
+  project's own `.git`, backing the same `/restore` checkpoints. Unique
+  recovery state, identified and linked (honestly unresolved), never
+  offered a selective action this chunk.
+
+## Pi (#96)
+
+`badlogic/pi-mono`'s `coding-agent` package (also published as
+`earendil-works/pi`) -- **distinct from Oh My Pi**, which is a fork of
+it, even though both currently document the same override variable name
+(`PI_CODING_AGENT_DIR`, confirmed by this chunk's own primary-source
+read of Pi's README, correcting both this issue's own `PI_AGENT_DIR`
+guess and superseding reliance on Oh My Pi's docs alone). If a human
+sets that variable while both tools are installed, both detectors
+resolve to the same path -- a disclosed, not silently patched,
+limitation (see `crate::locations::pi`'s doc comment).
+
+- **Explicit format/version detection:** Pi's own README documents
+  session files only as JSONL with `id`/`parentId` tree structure -- it
+  does **not** document Oh My Pi's 256-byte title slot. This adapter
+  tries Pi's own offset-zero JSON header first, then Oh My Pi's
+  title-slot-skip shape as an explicit fallback (reused, not assumed),
+  and reports `unresolved` naming both shapes checked when neither
+  matches.
+- **Sessions:** `sessions/`, organized by working directory per Pi's own
+  docs; this adapter does not decode a directory name into a project
+  path (no encoding scheme is confirmed), relying only on each session
+  file's own declared `cwd`.
+- **Protected config:** `settings.json`, `trust.json`, `models.json`.
+- **Caches (actionable):** `npm/` (user-scoped package installs,
+  reinstallable).
+
+## Aider (#96)
+
+Materially different shape from every other tool in this catalog: most
+of Aider's storage is **not** under any tool home at all.
+`aider/args.py`/`repomap.py` (current `main` of `Aider-AI/aider`) place
+`.aider.chat.history.md`, `.aider.input.history` and
+`.aider.tags.cache.v{3,4}/` at each project's own git root. Per this
+issue's explicit acceptance, these are attached to the existing
+worktree/project model as an agent category -- **not** modeled as
+tool-home units -- via `crate::agents::aider::identify_repo_units`,
+called once per known project worktree root by
+`crate::agents::discover_and_measure`'s `project_worktrees` parameter
+(itself built from the already-loaded `Report`'s projects/worktrees at
+the two read call sites, or, for `swamp propose-agents --path` which
+computes no report, by walking upward from each requested path for its
+own `.git` root).
+
+- **Home-level (`~/.aider`):** `caches/model_prices_and_context_window.json`
+  and `caches/versioncheck` (both wholly re-downloadable, confirmed
+  directly in `aider/models.py`/`versioncheck.py`), plus an optional
+  home-level `.aider.conf.yml`.
+- **Per-repo (project-linked, `Sessions` category):**
+  `.aider.chat.history.md`, `.aider.input.history` -- unique, not
+  regenerated by re-running Aider.
+- **Per-repo (project-linked, `Caches` category):**
+  `.aider.tags.cache.v{3,4}/` (the version number reflects whether the
+  optional TSL pack is in use; both are checked directly, not guessed at
+  one fixed number) -- regenerated on the next Aider run.
+- Disabling the `aider` detector (`disabled_detectors`) turns off *both*
+  halves together, home-level and per-repo, so a human's "stop looking
+  at this tool" always means the whole tool.
+
+## GitHub Copilot CLI (#97)
+
+Layout sourced directly from GitHub's own reference page (current as of
+this chunk), correcting this issue's own guessed directory name
+(`history-session-state/`) to the real `session-state/` and
+`command-history-state/`.
+
+- **Protected config:** `config.json`, `settings.json`, `mcp-config.json`,
+  `lsp-config.json`, `permissions-config.json`, `providers.json`,
+  `copilot-instructions.md`, `instructions/`, `agents/`, `hooks/`,
+  `skills/`, `extensions/`, `installed-plugins/`, `plugin-data/`,
+  `mcp-oauth-config/`, `mcp-secrets/`.
+- **Sessions:** `session-state/` -- one unit per immediate child (file or
+  folded directory), linked via a bounded, small-JSON scan for a
+  `cwd`/`workspace`/`workspaceFolder` field in the child's own metadata
+  files; `unresolved` when none is found, never a guess at an
+  undocumented schema.
+- **`session-store.db`** (+ `-wal`/`-shm`): protected, non-actionable,
+  same discipline as every other tool's cross-session SQLite store.
+- **Caches (actionable):** `command-history-state/` (reverse-search
+  command recall, not conversation content).
+- **Logs (actionable):** `logs/`.
+- **`ide/`** (IDE integration state/lock files): identified but never
+  actionable this chunk -- a lock file backing an active integration is
+  a real corruption risk, and no documented signal distinguishes an idle
+  entry from a live one.
+- **Cache, separately:** platform-conventional (`~/Library/Caches/copilot`
+  on macOS), independent of `COPILOT_HOME`, overridable via
+  `COPILOT_CACHE_HOME`; reported as an opaque external unit.
+
+## Cursor and Windsurf (#98)
+
+Both use the shared `crate::agents::vscode_family` module (Cursor and
+Windsurf are VS Code forks with the same underlying storage
+conventions -- one real implementation, per the handoff's "extend the
+shared model only where a tool genuinely needs a new concept").
+Community-reverse-engineered (Cursor: corroborated by two independent
+sources; Windsurf: assumed, since `docs.windsurf.com` redirected to
+`docs.devin.ai` during this chunk's research and no primary
+documentation of its layout was reachable). Both are macOS-only this
+chunk; Linux is the independent Linux track's job (#77-#89).
+
+- **`User/globalStorage/state.vscdb`** (+ `-wal`/`-shm`): protected,
+  metadata-only, never opened while writable -- holds every project's
+  chat/composer content (`ItemTable`/`cursorDiskKV` key-value stores).
+- **`User/workspaceStorage/<id>/state.vscdb`**: a per-workspace index
+  (not the content itself), linked via the sibling `workspace.json`'s
+  `folder` field (a real `file://` URI the editor itself wrote, not a
+  basename guess) -- also protected and non-actionable, but carries real
+  project linkage as identification evidence.
+- **`User/History/`** (actionable): local file-history/undo snapshots,
+  unrelated to AI chat content.
+- **`Cache/`, `CachedData/`, `CachedExtensionVSIXs/`** (actionable
+  caches) and **`logs/`** (actionable log): Electron-conventional
+  siblings of `User/`.
+- **Unrecognized layout:** one explicit "(unsupported layout version)"
+  residual, never a guess -- this is how a Windsurf installation that
+  does not actually match the assumed VS-Code-fork shape shows up,
+  rather than a silent miscount.
+- Cursor's separate `~/.cursor/` and Windsurf's `~/.codeium/windsurf`
+  are reported as opaque external units, not decomposed (no confirmed
+  interior shape).
+
+## Cline, Roo Code and Continue (#99)
+
+Cline and Roo Code are VS Code **extensions** (not forks): the same
+extension id can be installed into several editor hosts at once, each
+with its own, genuinely separate, on-disk `globalStorage`. Per this
+issue's explicit acceptance, `crate::locations::vscode_hosts` proposes
+one location *per known host* (Code, Code Insiders, Cursor, Windsurf,
+plus `~/.vscode-server` for a remote/devcontainer target), and
+`crate::agents::discover_and_measure` decomposes *every* resolved
+location for these two tool ids (`multi_location_tool`), unlike every
+other tool in this catalog, which only decomposes the first. Both
+adapters reuse `crate::agents::vscode_family::identify_extension_globalstorage`,
+which tags every unit's `relative_path` with its host label (e.g.
+`"VS Code/tasks/<id>/..."`, `"Cursor/tasks/<id>/..."`) so two hosts'
+task directories -- which can share the exact same UUID-shaped name --
+never collide in identity or display.
+
+- **Sessions:** `globalStorage/<extension-id>/tasks/<task-id>/`, folded
+  as one unit per task. Linked via `task_metadata.json`'s `workspace`
+  field -- this chunk's own research (from the issue text), not
+  independently re-confirmed against a schema doc; `unresolved` when
+  missing, never a guess.
+- Roo Code's own community reports note a task directory can embed a
+  full Git checkpoint repository, so its folded byte total is not
+  necessarily small the way a Claude Code session usually is --
+  `SessionRemoval`'s existing generic loss warning already covers this.
+
+Continue is unrelated to the VS Code storage conventions above --
+its own `~/.continue` home, config confirmed by primary docs:
+
+- **Protected config:** `config.yaml`/`config.json`.
+- **Sessions (actionable):** `sessions/<id>` -- one unit per entry,
+  excluding index-like filenames (`sessions.json`/`index.json`), which
+  are protected separately instead (removing the index alongside a kept
+  session would otherwise corrupt it for every session that remains). No
+  confirmed per-session workspace-linkage field was found, so every
+  session carries an honest `unresolved` link rather than a guess from
+  the session id.
+- **Caches (actionable):** `index/` (embeddings/tag caches).
+- **Logs (actionable):** `dev_data/` (anonymized usage events).
+- `sessions/index/dev_data`'s presence is treated as a version marker
+  (this catalog's own prior research, not independently re-confirmed
+  this chunk) rather than an asserted schema.
+
 ## Scan cost
 
 Identification reads directory names and bounded metadata (file
@@ -397,15 +621,23 @@ completion in well under 10 seconds:
 
 | Adapter | Measured (this chunk's dev machine) |
 |---|---|
-| `claude_code` | ~75ms |
-| `codex` | ~68ms |
-| `oh_my_pi` | ~110ms (includes the bounded per-session blob-reference scan) |
-| `opencode` | ~8ms |
+| `claude_code` | ~215ms (500 synthetic sessions, 200KB bodies each) |
+| `codex` | ~209ms |
+| `oh_my_pi` | ~368ms (includes the bounded per-session blob-reference scan) |
+| `opencode` | ~6ms |
+| `gemini_cli` | ~161ms (300 synthetic project-hash directories) |
+| `pi` | ~203ms |
+| `aider` | ~6ms (`identify_repo_units` over a 2000-file tags cache) |
+| `copilot_cli` | ~172ms |
+| `vscode_family` (Cursor/Windsurf/Cline/Roo Code) | ~132ms (500 synthetic tasks) |
+| `continue_dev` | ~5ms |
 
 See `.oh/sessions/2026-09-21-agent-storage-claude-code.md` for the
-Claude Code number's original recording, and
-`.oh/sessions/2026-09-21-agent-storage-codex-omp-opencode.md` for the
-other three.
+Claude Code number's original recording,
+`.oh/sessions/2026-09-21-agent-storage-codex-omp-opencode.md` for
+Codex/Oh My Pi/OpenCode, and
+`.oh/sessions/2026-09-21-agent-storage-remaining-tools.md` for the nine
+tools this chunk added.
 
 ## Interfaces
 
@@ -414,7 +646,7 @@ other three.
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
 | TUI (read) | `v` (cycle) reaches the Agents view; no dedicated digit (`0` is "clear filter") |
-| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Enter` executes through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected/unsupported row cannot be marked; the footer names `propose_agents`'s own refusal reason. |
+| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every actionable row in the Agents view the same way, skipping protected/unsupported/active ones and naming the skip in the footer; `Enter` executes through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected/unsupported row cannot be marked; the footer names `propose_agents`'s own refusal reason. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
 | Propose | `swamp propose-agents --path <unit-path> [--json]` |
 | Approve/execute | `swamp approve <plan-id>` / `swamp execute <plan-id> [--json]` (unchanged -- already generic over any plan) |
@@ -422,15 +654,36 @@ other three.
 
 ## Known gaps, recorded rather than hidden
 
-- Five of the fourteen matrix rows have real identification code
-  (Claude Code, Codex, the Codex desktop app, Oh My Pi, OpenCode); the
-  remaining nine named tools are `Planned` (see the matrix above).
-- TUI bulk marking (`Shift+A`, `mark_all_in_view`) does not reach agent
-  rows yet -- it only recognizes a `row.kind`/`ArtifactKind` or a
-  projects-view `row.project`, neither of which an agent row sets.
-  Marking one agent unit at a time (`Space`/`Backspace` on the selected
-  row) works; a future worker can extend `mark_all_in_view` to agent
-  rows the same way it already handles projects-view rows.
+- Every named tool in the matrix now has real identification code (see
+  the matrix above) -- the epic's full-catalog acceptance is met at the
+  identification/project-linkage layer; independent validation (#102)
+  is still a separate, unchecked box.
+- TUI bulk marking (`Shift+A`, `mark_all_in_view`) now recognizes agent
+  rows too (reusing `App::mark_row`'s own per-row protected/unsupported/
+  active refusal, never a duplicated refusal path): the actionable rows
+  in view are marked, and a footer names how many were skipped and why
+  when at least one was. Marking one agent unit at a time
+  (`Space`/`Backspace` on the selected row) still works exactly as
+  before.
+- `swamp propose-agents --path` does not compute a full `Report`
+  (deliberately, to stay fast for an already-known exact path), so
+  Aider's per-repo units are supplied to it by walking upward from each
+  requested path for its own worktree root
+  (`crate::agents::worktree_root_containing`) rather than from a
+  whole-scope walk -- exact for the paths actually asked about, but a
+  path whose worktree root was not itself part of the request will not
+  independently surface Aider units this way. `swamp report --view
+  agents` and the TUI (which both already compute a `Report`) have no
+  such limitation.
+- Windsurf's editor-profile shape and the `task_metadata.json`
+  `workspace` field Cline/Roo Code use for project linkage are this
+  chunk's own best-available research, not independently re-confirmed
+  against an official schema/layout document -- both degrade to an
+  honest "unresolved"/"(unsupported layout version)" outcome rather than
+  a wrong guess when they do not match a real installation.
+- Cursor, Windsurf, Cline and Roo Code are macOS-only this chunk; their
+  Linux paths are the independent Linux track's job (#77-#89), not
+  re-derived here as a guess.
 - `swamp propose`'s CLI (the original, walked-report-root command) has
   no `--agent` mode; `propose-agents` is a separate, dedicated
   subcommand instead (mirrors the same reasoning the External chunk
@@ -451,4 +704,15 @@ other three.
   guarantees this chunk does not implement.
 - Codex's `CODEX_SQLITE_HOME` and OpenCode's `OPENCODE_DATA_DIR` exact
   env var name are both documented as unconfirmed/partially-followed in
-  their sections above, not silently treated as settled facts.
+  their sections above, not silently treated as settled facts. This
+  chunk corrected two more env var guesses against primary source:
+  Gemini CLI's real override is `GEMINI_CLI_HOME` (not
+  `GEMINI_CONFIG_HOME`), and Pi's real override is `PI_CODING_AGENT_DIR`
+  (not `PI_AGENT_DIR`, which is still honored defensively as an
+  unconfirmed secondary override).
+- GitHub Copilot CLI's `ide/` and Aider's home-level `.aider.conf.yml`/
+  residual entries are identified but never actionable this chunk (the
+  former: real corruption risk from touching an active integration's
+  lock file with no documented idle signal; the latter: simply out of
+  named scope) -- an explicit `None` action, not a missing feature
+  disguised as empty.

@@ -22,15 +22,25 @@
 //! reported on the location it would have resolved, never fatal to the
 //! rest of detection.
 
+pub mod aider;
 pub mod builtin;
 pub mod cargo_home;
 pub mod claude_code;
+pub mod cline;
 pub mod codex;
 pub mod codex_desktop;
+pub mod continue_dev;
+pub mod copilot_cli;
+pub mod cursor;
+pub mod gemini_cli;
 pub mod homebrew;
 pub mod oh_my_pi;
 pub mod opencode;
+pub mod pi;
+pub mod roo_code;
 pub mod rustup;
+pub mod vscode_hosts;
+pub mod windsurf;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,7 +53,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the set of detectors or their resolution semantics
 /// changes, so a persisted `EffectiveScope` (`crate::scope`) can show it
 /// was resolved under an older catalog than the one now running.
-pub const CATALOG_VERSION: &str = "2026-09-21.2";
+pub const CATALOG_VERSION: &str = "2026-09-21.3";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -432,6 +442,15 @@ impl Registry {
                 Box::new(codex_desktop::CodexDesktopDetector),
                 Box::new(oh_my_pi::OhMyPiDetector),
                 Box::new(opencode::OpenCodeDetector),
+                Box::new(gemini_cli::GeminiCliDetector),
+                Box::new(pi::PiDetector),
+                Box::new(aider::AiderDetector),
+                Box::new(copilot_cli::CopilotCliDetector),
+                Box::new(cursor::CursorDetector),
+                Box::new(windsurf::WindsurfDetector),
+                Box::new(cline::ClineDetector),
+                Box::new(roo_code::RooCodeDetector),
+                Box::new(continue_dev::ContinueDetector),
             ],
         }
     }

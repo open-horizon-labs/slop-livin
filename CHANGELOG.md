@@ -79,6 +79,37 @@ Release notes describe behavior at the named version. See the [README](README.md
   `propose_agents`'s own refusal reason. See `docs/agent-storage.md`
   for the full per-tool detail and remaining scope boundaries (blob
   GC, snapshot removal, TUI bulk marking, unconfirmed env var names).
+- **Identified the nine remaining named agent tools and closed the
+  full required-tool catalog** (#96, #97, #98, #99). `swamp report
+  --view agents` now identifies Gemini CLI (`~/.gemini`, per-project-
+  hash `tmp/`/`history/` state -- the hash is a confirmed one-way
+  `sha256(project root)`, so linkage is an honest `unresolved` rather
+  than a guessed reversal), Pi (`~/.pi/agent`, distinct from Oh My Pi
+  despite sharing an override variable name, with explicit two-shape
+  session-header detection), Aider (`~/.aider/caches` plus, uniquely,
+  per-repo `.aider.chat.history.md`/`.aider.input.history`/
+  `.aider.tags.cache.v{3,4}/` attached to each project worktree instead
+  of a tool home), GitHub Copilot CLI (`~/.copilot`, correcting this
+  catalog's own `history-session-state/` guess to the real
+  `session-state/`/`command-history-state/`), Cursor and Windsurf
+  (shared `state.vscdb`/`workspace.json` identification via a new
+  `agents::vscode_family` module, Windsurf's own layout assumed rather
+  than independently confirmed), and Cline/Roo Code/Continue (Cline and
+  Roo Code decompose *every* editor host their extension is installed
+  into -- Code, Code Insiders, Cursor, Windsurf, a remote
+  `~/.vscode-server` target -- never merging genuinely separate
+  storage). `discover_and_measure` gained a `project_worktrees`
+  parameter (for Aider's per-repo units, sourced from each caller's
+  already-loaded `Report` or, for `propose-agents --path`, a cheap
+  upward `.git` walk) and multi-location decomposition for Cline/Roo
+  Code, both narrow, opt-in extensions rather than a redesign. No new
+  `AgentMemberKind` variant was needed. The TUI's `Shift+A` bulk
+  marking now reaches the Agents view too, marking every actionable row
+  and naming any protected/unsupported/active skips in the footer. See
+  `docs/agent-storage.md` for full per-tool detail, sources and
+  every explicit remaining unknown (Windsurf's assumed layout, the
+  `task_metadata.json` `workspace` field, macOS-only coverage for the
+  editor-family tools this chunk).
 - **Made multi-root observation coverage-aware** (#42). `report`,
   `observe`, and `ui` with no explicit root now observe the whole
   configured scope coherently in one call, not just its first present

@@ -868,6 +868,33 @@ fn execute_agent_session_removal(
         crate::agents::opencode::OPENCODE_TOOL_ID => {
             crate::agents::opencode::identify(&meta.tool_home, at)
         }
+        crate::agents::gemini_cli::GEMINI_CLI_TOOL_ID => {
+            crate::agents::gemini_cli::identify(&meta.tool_home, at)
+        }
+        crate::agents::pi::PI_TOOL_ID => crate::agents::pi::identify(&meta.tool_home, at),
+        // Aider's per-repo units (#96): `tool_home` was set to the
+        // worktree root itself at proposal time (see
+        // `crate::agents::discover_and_measure`'s Aider handling), so
+        // re-identification calls the exact same function against it.
+        crate::agents::aider::AIDER_TOOL_ID => {
+            crate::agents::aider::identify_repo_units(&meta.tool_home, at)
+        }
+        crate::agents::copilot_cli::COPILOT_CLI_TOOL_ID => {
+            crate::agents::copilot_cli::identify(&meta.tool_home, at)
+        }
+        crate::agents::cursor::CURSOR_TOOL_ID => {
+            crate::agents::cursor::identify(&meta.tool_home, at)
+        }
+        crate::agents::windsurf::WINDSURF_TOOL_ID => {
+            crate::agents::windsurf::identify(&meta.tool_home, at)
+        }
+        crate::agents::cline::CLINE_TOOL_ID => crate::agents::cline::identify(&meta.tool_home, at),
+        crate::agents::roo_code::ROO_CODE_TOOL_ID => {
+            crate::agents::roo_code::identify(&meta.tool_home, at)
+        }
+        crate::agents::continue_dev::CONTINUE_TOOL_ID => {
+            crate::agents::continue_dev::identify(&meta.tool_home, at)
+        }
         other => bail!("no session-removal re-identification implemented for tool {other}"),
     };
     let current = fresh

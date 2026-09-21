@@ -6,16 +6,20 @@
 //! `~/.claude`-style directory on this machine).
 //!
 //! [`AgentToolId::ClaudeCode`] (#92), [`AgentToolId::Codex`] and
-//! [`AgentToolId::CodexDesktop`] (#93), [`AgentToolId::OhMyPi`] (#94) and
-//! [`AgentToolId::OpenCode`] (#95) are [`SupportLevel::Supported`] as of
-//! this chunk: `crate::agents::{claude_code, codex, codex_desktop,
-//! oh_my_pi, opencode}` each implement real identification. Every other
-//! row is [`SupportLevel::Planned`] -- its home-path note is real,
-//! sourced research (not a guess), but no identification code exists
-//! yet, and no adapter here claims otherwise. `docs/agent-storage.md`
-//! renders this same table as a doc; keep the two in sync by hand (this
-//! module is the single source of truth, generated into the doc, not the
-//! reverse).
+//! [`AgentToolId::CodexDesktop`] (#93), [`AgentToolId::OhMyPi`] (#94),
+//! [`AgentToolId::OpenCode`] (#95), [`AgentToolId::GeminiCli`],
+//! [`AgentToolId::Pi`], [`AgentToolId::Aider`] (#96),
+//! [`AgentToolId::GithubCopilotCli`] (#97), [`AgentToolId::Cursor`] and
+//! [`AgentToolId::Windsurf`] (#98), and [`AgentToolId::Cline`],
+//! [`AgentToolId::RooCode`] and [`AgentToolId::Continue`] (#99) are all
+//! [`SupportLevel::Supported`] as of this chunk: every row in this
+//! table now has a real identification adapter
+//! (`crate::agents::{claude_code, codex, codex_desktop, oh_my_pi,
+//! opencode, gemini_cli, pi, aider, copilot_cli, cursor, windsurf,
+//! cline, roo_code, continue_dev}`), completing the full named-tool
+//! catalog #90/#91 require. `docs/agent-storage.md` renders this same
+//! table as a doc; keep the two in sync by hand (this module is the
+//! single source of truth, generated into the doc, not the reverse).
 
 use serde::{Deserialize, Serialize};
 
@@ -196,128 +200,169 @@ pub const MATRIX: &[MatrixEntry] = &[
     MatrixEntry {
         id: AgentToolId::GeminiCli,
         display_name: "Gemini CLI",
-        support: SupportLevel::Planned,
-        home_note: "~/.gemini (settings.json, GEMINI.md, extensions/, tmp/, chats/); root \
-                     overridable via GEMINI_CONFIG_HOME",
+        support: SupportLevel::Supported,
+        home_note: "~/.gemini, or the whole of GEMINI_CLI_HOME when set (settings.json, \
+                     GEMINI.md, extensions/, trustedFolders.json, bin/); tmp/<project-hash>/ \
+                     (shell_history, checkpoints/, chats/) and history/<project-hash>/ (shadow \
+                     Git checkpoint repos), both keyed by sha256(project root path)",
         sources: &[
             "https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md",
+            "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md",
+            "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md",
+            "https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts",
         ],
-        note: "#96's job; not implemented in this chunk",
+        note: "#96; crate::agents::gemini_cli implements identification. GEMINI_CLI_HOME is the \
+               real override (correcting this row's own prior GEMINI_CONFIG_HOME guess); the \
+               project hash is a confirmed one-way sha256, so tmp/history directories carry an \
+               honest Unresolved linkage rather than a guess. OAuth/account credential file names \
+               are not documented upstream as of this chunk and are protected defensively by \
+               filename pattern instead of an exact confirmed name",
     },
     MatrixEntry {
         id: AgentToolId::Pi,
         display_name: "Pi",
-        support: SupportLevel::Planned,
-        home_note: "~/.pi/agent/ by default, overridable via PI_AGENT_DIR (badlogic/pi-mono, \
-                     also published as earendil-works/pi)",
+        support: SupportLevel::Supported,
+        home_note: "~/.pi/agent/ by default, overridable via PI_CODING_AGENT_DIR (confirmed \
+                     primary-source name, shared with Oh My Pi's own override -- see \
+                     crate::locations::pi; PI_AGENT_DIR, the issue text's name, is honored as an \
+                     unconfirmed secondary override); sessions/ (organized by working directory), \
+                     settings.json, trust.json, models.json, npm/ (badlogic/pi-mono, also \
+                     published as earendil-works/pi)",
         sources: &[
             "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md",
-            "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/development.md",
+            "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md",
         ],
-        note: "#96's job; not implemented in this chunk; distinct tool from Oh My Pi, which is \
-               a fork of it -- do not conflate the two identities",
+        note: "#96; crate::agents::pi implements identification, distinct from Oh My Pi (a fork \
+               of this project) even though the two share an override variable name -- see \
+               crate::locations::pi's doc comment for the disclosed collision risk. Session \
+               linkage tries Pi's own documented offset-zero JSON header first, then Oh My Pi's \
+               256-byte title-slot shape as an explicit fallback, never assumed",
     },
     MatrixEntry {
         id: AgentToolId::Aider,
         display_name: "Aider",
-        support: SupportLevel::Planned,
-        home_note: "~/.aider (~/.aider/caches for model-price/context-window/version-check \
-                     caches); per-repo .aider.chat.history.md / .aider.input.history at the \
-                     repo root, and .aider.tags.cache.v<N>/ at the git root -- these two are \
-                     project-local, not under the home directory",
+        support: SupportLevel::Supported,
+        home_note: "~/.aider/caches (model_prices_and_context_window.json, versioncheck; both \
+                     wholly re-downloadable), plus an optional home-level .aider.conf.yml; \
+                     per-repo .aider.chat.history.md / .aider.input.history and \
+                     .aider.tags.cache.v{3,4}/ at the git root -- project-local, not under the \
+                     home directory",
         sources: &[
-            "https://aider.chat/docs/config.html",
-            "https://aider.chat/docs/usage/caching.html",
-            "https://github.com/Aider-AI/aider",
+            "https://github.com/Aider-AI/aider/blob/main/aider/models.py",
+            "https://github.com/Aider-AI/aider/blob/main/aider/versioncheck.py",
+            "https://github.com/Aider-AI/aider/blob/main/aider/args.py",
+            "https://github.com/Aider-AI/aider/blob/main/aider/repomap.py",
         ],
-        note: "#96's job; not implemented in this chunk. Aider's storage is split between the \
-               home directory and each project checkout -- a materially different shape from \
-               the other tools in this matrix, worth flagging for whoever implements #96",
+        note: "#96; crate::agents::aider implements both halves: identify() for the home-level \
+               caches, and identify_repo_units() attached per known project worktree root (via \
+               crate::agents::discover_and_measure's project_worktrees parameter) for the \
+               per-repo files, per this issue's own explicit 'attach to the worktree artifact \
+               model' acceptance",
     },
     MatrixEntry {
         id: AgentToolId::GithubCopilotCli,
         display_name: "GitHub Copilot CLI",
-        support: SupportLevel::Planned,
-        home_note: "~/.copilot, overridable via COPILOT_HOME (mcp-config.json, config.json, \
-                     OAuth tokens, session/history data)",
+        support: SupportLevel::Supported,
+        home_note: "~/.copilot, overridable via COPILOT_HOME (config.json, settings.json, \
+                     mcp-config.json, permissions-config.json, providers.json, \
+                     copilot-instructions.md, agents/, hooks/, skills/, extensions/, \
+                     installed-plugins/, plugin-data/, mcp-oauth-config/, mcp-secrets/, ide/, \
+                     session-state/, command-history-state/, session-store.db, logs/); separate \
+                     platform-conventional cache (~/Library/Caches/copilot on macOS), \
+                     overridable via COPILOT_CACHE_HOME, independent of COPILOT_HOME",
         sources: &[
             "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference",
         ],
-        note: "#97's job; not implemented in this chunk",
+        note: "#97; crate::agents::copilot_cli implements identification. session-state/ and \
+               command-history-state/ are the real directory names, correcting this row's own \
+               prior history-session-state/ guess",
     },
     MatrixEntry {
         id: AgentToolId::Cursor,
         display_name: "Cursor",
-        support: SupportLevel::Planned,
-        home_note: "editor-profile storage, not one fixed directory: macOS ~/Library/Application \
-                     Support/Cursor/User/{globalStorage,workspaceStorage}, Linux \
-                     ~/.config/Cursor/User/..., plus a separate ~/.cursor/ (chats/, projects/, \
-                     CLI state)",
+        support: SupportLevel::Supported,
+        home_note: "editor-profile storage, macOS only this chunk: ~/Library/Application \
+                     Support/Cursor (User/globalStorage/state.vscdb, \
+                     User/workspaceStorage/<id>/{state.vscdb,workspace.json}, User/History, \
+                     Cache/CachedData/CachedExtensionVSIXs/logs), plus a separate ~/.cursor/ \
+                     (chats/, projects/, CLI state, not decomposed)",
         sources: &[
             "https://github.com/thomas-pedersen/cursor-chat-browser",
             "https://github.com/Callum-Ward/cursaves/blob/main/docs/how-cursor-stores-chats.md",
         ],
-        note: "#98's job; not implemented in this chunk. No single official Cursor documentation \
-               page describing this layout was found -- these are community-reverse-engineered \
-               sources, lower confidence than the other rows, and must be re-verified against \
-               an installed Cursor version before implementation",
+        note: "#98; crate::agents::cursor implements identification via the shared \
+               crate::agents::vscode_family module. No single official Cursor documentation \
+               page describing this layout was found -- community-reverse-engineered, lower \
+               confidence than primary-source-backed rows. Linux (~/.config/Cursor/...) is \
+               deferred to the independent Linux track (#77-#89)",
     },
     MatrixEntry {
         id: AgentToolId::Windsurf,
         display_name: "Windsurf",
-        support: SupportLevel::Planned,
-        home_note: "~/.codeium/windsurf (MCP config, agent config); editor chat/workspace \
-                     storage location unconfirmed -- Windsurf is a VS Code fork and likely \
-                     follows a similar Application Support/Windsurf/User/... layout, not \
-                     verified against primary documentation this chunk",
-        sources: &[
-            "https://docs.windsurf.com/",
-            "https://registry.coder.com/modules/coder/windsurf",
-        ],
-        note: "#98's job; not implemented in this chunk. Lower confidence than Claude Code/ \
-               Codex/Gemini CLI rows -- home_note's second clause is a documented unknown, not \
-               a researched fact",
+        support: SupportLevel::Supported,
+        home_note: "~/.codeium/windsurf (MCP/agent config, not decomposed) plus an assumed \
+                     VS-Code-fork editor profile at ~/Library/Application Support/Windsurf, \
+                     macOS only this chunk",
+        sources: &["https://registry.coder.com/modules/coder/windsurf"],
+        note: "#98; crate::agents::windsurf implements identification, reusing \
+               crate::agents::vscode_family. Lower confidence than every other row: \
+               docs.windsurf.com redirected to docs.devin.ai during this chunk's research, so \
+               the Application Support/Windsurf shape is assumed (VS Code fork), not \
+               independently confirmed -- an installation that differs surfaces as an honest \
+               '(unsupported layout version)' residual rather than a silent miscount",
     },
     MatrixEntry {
         id: AgentToolId::Cline,
         display_name: "Cline",
-        support: SupportLevel::Planned,
-        home_note: "VS Code extension global storage: macOS ~/Library/Application Support/Code/ \
-                     User/globalStorage/saoudrizwan.claude-dev/, Linux ~/.config/Code/User/ \
-                     globalStorage/saoudrizwan.claude-dev/, with tasks/<task-id>/ holding \
-                     api_conversation_history.json, ui_messages.json, task_metadata.json",
+        support: SupportLevel::Supported,
+        home_note: "VS Code extension global storage, one location per known editor host \
+                     (macOS: Code, Code - Insiders, Cursor, Windsurf, plus \
+                     ~/.vscode-server/data/... for a remote/devcontainer target): \
+                     globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/ holding \
+                     api_conversation_history.json, ui_messages.json, task_metadata.json, \
+                     checkpoints",
         sources: &[
             "https://github.com/cline/cline/issues/7101",
             "https://github.com/cline/cline/issues/14135",
         ],
-        note: "#99's job; not implemented in this chunk. No single official layout-reference doc \
-               found (community-documented via GitHub issue threads); also varies by which VS \
-               Code-family editor hosts the extension, not just by Cline's own version",
+        note: "#99; crate::agents::cline implements identification via \
+               crate::agents::vscode_family, decomposing every resolved host location rather \
+               than just the first (crate::agents::multi_location_tool). No single official \
+               layout-reference doc found (community-documented via GitHub issue threads); the \
+               task_metadata.json 'workspace' field used for project linkage is this chunk's \
+               own research, not independently re-confirmed against a schema doc",
     },
     MatrixEntry {
         id: AgentToolId::RooCode,
         display_name: "Roo Code",
-        support: SupportLevel::Planned,
-        home_note: "VS Code extension global storage: globalStorage/rooveterinaryinc.roo-cline/ \
-                     tasks/<task-id>/ (remote/server hosting: ~/.vscode-server/data/User/ \
-                     globalStorage/... instead of the local User/ path)",
+        support: SupportLevel::Supported,
+        home_note: "VS Code extension global storage, same per-host modeling as Cline: \
+                     globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/ (remote/server \
+                     hosting: ~/.vscode-server/data/User/globalStorage/... confirmed directly by \
+                     the cited issue)",
         sources: &["https://github.com/RooCodeInc/Roo-Code/issues/4174"],
-        note: "#99's job; not implemented in this chunk. Community-documented (GitHub issue), \
-               not an official layout-reference page; each task directory has been reported to \
-               embed a full git checkpoint repo, which this matrix note flags for whoever \
-               implements #99 as a reason the storage is not necessarily small per session",
+        note: "#99; crate::agents::roo_code implements identification via \
+               crate::agents::vscode_family. Community-documented (GitHub issue), not an \
+               official layout-reference page; a task directory has been reported to embed a \
+               full Git checkpoint repo, so its folded byte total is not necessarily small",
     },
     MatrixEntry {
         id: AgentToolId::Continue,
         display_name: "Continue",
-        support: SupportLevel::Planned,
+        support: SupportLevel::Supported,
         home_note: "~/.continue (config.yaml/config.json, sessions/<session-id> plus a session \
-                     index file, separate from the session bodies)",
+                     index file, separate from the session bodies; index/ embeddings/tag caches; \
+                     dev_data/ anonymized usage events)",
         sources: &[
             "https://docs.continue.dev/customize/deep-dives/configuration",
             "https://docs.continue.dev/reference",
         ],
-        note: "#99's job; not implemented in this chunk",
+        note: "#99; crate::agents::continue_dev implements identification. config.yaml's \
+               location is confirmed by primary docs; sessions/index/dev_data's presence is \
+               treated as a version marker (this catalog's own prior research, not \
+               independently re-confirmed this chunk) rather than an asserted schema. No \
+               confirmed per-session workspace-linkage field was found, so sessions carry an \
+               honest Unresolved link rather than a guess from the session id",
     },
 ];
 
@@ -362,21 +407,11 @@ mod tests {
     }
 
     #[test]
-    fn the_five_implemented_adapters_are_supported_the_rest_are_planned() {
-        let supported = [
-            AgentToolId::ClaudeCode,
-            AgentToolId::Codex,
-            AgentToolId::CodexDesktop,
-            AgentToolId::OhMyPi,
-            AgentToolId::OpenCode,
-        ];
+    fn every_named_tool_is_now_supported() {
+        // #96-#99 complete the full named-tool catalog #90/#91 require;
+        // no row is Planned any more.
         for e in MATRIX {
-            let expected = if supported.contains(&e.id) {
-                SupportLevel::Supported
-            } else {
-                SupportLevel::Planned
-            };
-            assert_eq!(e.support, expected, "{:?}", e.id);
+            assert_eq!(e.support, SupportLevel::Supported, "{:?}", e.id);
         }
     }
 

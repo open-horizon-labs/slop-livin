@@ -757,6 +757,15 @@ mod tests {
                 "codex-desktop".to_string(),
                 "oh-my-pi".to_string(),
                 "opencode".to_string(),
+                "gemini-cli".to_string(),
+                "pi".to_string(),
+                "aider".to_string(),
+                "github-copilot-cli".to_string(),
+                "cursor".to_string(),
+                "windsurf".to_string(),
+                "cline".to_string(),
+                "roo-code".to_string(),
+                "continue".to_string(),
             ],
             ..ScanConfig::default()
         };

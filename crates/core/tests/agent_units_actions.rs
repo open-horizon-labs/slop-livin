@@ -113,7 +113,7 @@ fn units_for(
     let env = env_at(home_dummy.path(), claude_home);
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_claude_code_config(), &[], &registry, 1);
-    let units = discover_and_measure(&scope, Some(store), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(&scope, &[], Some(store), true, 1_000, 30, 3600).unwrap();
     (units, home_dummy)
 }
 

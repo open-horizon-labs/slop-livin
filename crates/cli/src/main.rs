@@ -49,15 +49,17 @@ enum View {
     /// history and declared consumers. Inspection only -- see `propose
     /// --external`.
     External,
-    /// Agent-tool storage (#91/#92/#100): Claude Code sessions, caches,
-    /// logs, checkpoints and protected config, grouped tool → category →
-    /// unit with size/growth/age and project linkage. `--project`
-    /// filters to units linked to that project. Redaction-aware by
-    /// construction (this view never has session content to print).
-    /// Inspection only from this command; supported cleanup actions
-    /// (`actions::propose_agents`/`execute`) are implemented at the
-    /// Rust-API level for this chunk -- see `swamp protect` for the
-    /// human-keep-intent surface this view respects.
+    /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
+    /// checkpoints and protected config for every named coding-agent
+    /// tool (Claude Code, Codex, Oh My Pi, OpenCode, Gemini CLI, Pi,
+    /// Aider, GitHub Copilot CLI, Cursor, Windsurf, Cline, Roo Code,
+    /// Continue), grouped tool → category → unit with size/growth/age
+    /// and project linkage. `--project` filters to units linked to that
+    /// project. Redaction-aware by construction (this view never has
+    /// session content to print). Inspection only from this command;
+    /// supported cleanup actions go through `swamp propose-agents` (see
+    /// below) -- see `swamp protect` for the human-keep-intent surface
+    /// this view respects.
     Agents,
 }
 
@@ -1165,8 +1167,18 @@ fn main() -> Result<()> {
             // explicit root.
             let agent_units = if view == Some(View::Agents) {
                 let detector_scope = resolve_scope(&[])?;
+                // Aider's per-repo units (#96) need every known worktree
+                // root; `r` (this report) is already computed above, so
+                // no extra walk is needed to supply them.
+                let project_worktrees: Vec<std::path::PathBuf> = r
+                    .projects
+                    .iter()
+                    .flat_map(|p| p.worktrees.iter())
+                    .map(|wt| wt.path.clone())
+                    .collect();
                 swamp_core::agents::discover_and_measure(
                     &detector_scope,
+                    &project_worktrees,
                     Some(&store_dir),
                     !no_observe,
                     r.observed_at,
@@ -1567,8 +1579,21 @@ fn main() -> Result<()> {
             anyhow::ensure!(!paths.is_empty(), "--path is required (at least one)");
             let detector_scope = resolve_scope(&[])?;
             let observed_at = swamp_core::entities::now();
+            // This command deliberately never computes a full `Report`
+            // (it targets exact paths already known to the caller), so
+            // Aider's per-repo units (#96) are supplied by walking
+            // upward from each requested path for its own worktree root
+            // instead -- cheap, and exact for the paths actually asked
+            // about, rather than a whole-scope walk just to find them.
+            let mut project_worktrees: Vec<std::path::PathBuf> = paths
+                .iter()
+                .filter_map(|p| swamp_core::agents::worktree_root_containing(p))
+                .collect();
+            project_worktrees.sort();
+            project_worktrees.dedup();
             let units = swamp_core::agents::discover_and_measure(
                 &detector_scope,
+                &project_worktrees,
                 Some(&store_dir),
                 true,
                 observed_at,

@@ -317,7 +317,13 @@ occupancy again (authoritative, not informational) and dispatches to a
 single-path Trash move (a cache/log category directory) or
 `execute_agent_session_removal`, which re-derives fresh membership by
 dispatching on `meta.tool_id` to the matching adapter's own `identify`
-(`claude_code`/`codex`/`codex_desktop`/`oh_my_pi`/`opencode`), refuses
+-- all fourteen tool ids as of #96-#99:
+`claude_code`/`codex`/`codex_desktop`/`oh_my_pi`/`opencode`/
+`gemini_cli`/`pi`/`copilot_cli`/`cursor`/`windsurf`/`cline`/`roo_code`/
+`continue_dev` call their own `identify(tool_home, at)`; `aider` is the
+one exception, calling `identify_repo_units(tool_home, at)` instead,
+since `tool_home` for an Aider unit is a project worktree root, not a
+tool home directory (see below) -- refuses
 on any membership drift since the plan was proposed, then moves every
 member into one Trash envelope. Human keep/protect intent
 (`swamp protect add/list/remove`) is a small JSON sidecar
@@ -341,21 +347,49 @@ event/render thread, inside the same background-worker indirection
 `review_in_background` gives every other mark path -- no new
 `tui_nonblocking` guard entry was needed.
 
-Five tools are implemented as of #93/#94/#95: Claude Code (#92), Codex
-and its desktop app, Oh My Pi and OpenCode. `crate::agents::matrix` is
-the explicit, required 14-row matrix (#90/#91): every named tool (Codex
-and its desktop app count as separate rows, since the desktop app is a
-materially different client) has a row with a sourced home-path note,
-`Supported` or `Planned`, never a silent omission and never an empty
-placeholder adapter that claims support it does not have. See
-`docs/agent-storage.md` for the rendered table, category/linkage
+All fourteen matrix rows are implemented as of #96-#99: Claude Code
+(#92), Codex and its desktop app, Oh My Pi and OpenCode (#93/#94/#95),
+plus Gemini CLI/Pi/Aider (#96), GitHub Copilot CLI (#97), Cursor/
+Windsurf (#98) and Cline/Roo Code/Continue (#99). `crate::agents::matrix`
+is the explicit, required 14-row matrix (#90/#91): every named tool
+(Codex and its desktop app count as separate rows, since the desktop
+app is a materially different client) has a row with a sourced
+home-path note, now uniformly `Supported`, never a silent omission and
+never an empty placeholder adapter that claims support it does not
+have.
+
+Two orchestration extensions `discover_and_measure` needed for #96-#99,
+both deliberately narrow rather than a general redesign:
+
+- **Multi-location decomposition** (`agents::multi_location_tool`):
+  Cline and Roo Code are VS Code *extensions*, installable into several
+  editor hosts at once, each with genuinely separate on-disk storage
+  (`crate::locations::vscode_hosts` proposes one location per known
+  host). Every other tool in the catalog still only has its detector's
+  *first* resolved location decomposed (`OpenCode`/`copilot_cli`/
+  `cursor`/`windsurf`'s own secondary locations are deliberately
+  reported as opaque external units instead, per each one's own
+  doc comment) -- this is an opt-in exception per tool id, not a change
+  to the default one-home contract.
+- **`project_worktrees` parameter:** Aider's per-repo history/tags-cache
+  files (#96) live inside each project checkout, not under any tool
+  home a `locations` detector could resolve. `discover_and_measure`
+  gained a `project_worktrees: &[PathBuf]` parameter, populated by each
+  caller from a `Report` it already has (`swamp report --view agents`,
+  the TUI startup path) or, for `swamp propose-agents --path` (which
+  deliberately computes no `Report`, to stay fast for an already-known
+  exact path), by walking upward from each requested path for its own
+  worktree root (`agents::worktree_root_containing`). Every other
+  adapter ignores this parameter entirely.
+
+See `docs/agent-storage.md` for the rendered table, category/linkage
 semantics, and documented gaps (`~/.claude.json` living outside the
 home directory; `todos/` matching by filename-prefix heuristic since
 the naming convention is undocumented upstream; Codex's
-`CODEX_SQLITE_HOME` and OpenCode's `OPENCODE_DATA_DIR` env vars;
+`CODEX_SQLITE_HOME`, OpenCode's `OPENCODE_DATA_DIR`, Gemini CLI's
+project-hash reversal, and Windsurf's assumed-not-confirmed layout;
 Oh My Pi's blob-GC and OpenCode's snapshot/part actions both
-deliberately out of scope this chunk; TUI bulk marking not yet reaching
-agent rows).
+deliberately out of scope this chunk).
 
 ## Observation pipeline
 

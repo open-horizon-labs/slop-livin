@@ -38,12 +38,22 @@
 //! session bodies and assert it never appears in any `AgentUnit`,
 //! `Debug`, or JSON-serialized output.
 
+pub mod aider;
 pub mod claude_code;
+pub mod cline;
 pub mod codex;
 pub mod codex_desktop;
+pub mod continue_dev;
+pub mod copilot_cli;
+pub mod cursor;
+pub mod gemini_cli;
 pub mod matrix;
 pub mod oh_my_pi;
 pub mod opencode;
+pub mod pi;
+pub mod roo_code;
+pub mod vscode_family;
+pub mod windsurf;
 
 use crate::growth::{ObservedExternal, annotate_readonly_external, observe_and_annotate_external};
 use crate::scope::EffectiveScope;
@@ -445,6 +455,19 @@ pub(crate) fn resolve_declared_path(
     ProjectLinkState::NotAProject { path }
 }
 
+/// The worktree root containing `path`, if any -- reuses
+/// `resolve_declared_path`'s own upward `.git` search. Lets a caller
+/// that only has one exact target path (`swamp propose-agents --path`,
+/// which does not compute a full `Report`) still supply
+/// `discover_and_measure`'s `project_worktrees` for Aider's per-repo
+/// units, without a whole-scope walk.
+pub fn worktree_root_containing(path: &Path) -> Option<PathBuf> {
+    match resolve_declared_path(Some(path.display().to_string()), "") {
+        ProjectLinkState::Linked { project_path, .. } => Some(project_path),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Human keep/protect intent (#100's `swamp protect add/list/remove`):
 // a small JSON sidecar, deliberately decoupled from the growth store,
@@ -555,8 +578,32 @@ fn identify_for_tool(
         codex_desktop::CODEX_DESKTOP_TOOL_ID => Some(codex_desktop::identify(home, observed_at)),
         oh_my_pi::OH_MY_PI_TOOL_ID => Some(oh_my_pi::identify(home, observed_at)),
         opencode::OPENCODE_TOOL_ID => Some(opencode::identify(home, observed_at)),
+        gemini_cli::GEMINI_CLI_TOOL_ID => Some(gemini_cli::identify(home, observed_at)),
+        pi::PI_TOOL_ID => Some(pi::identify(home, observed_at)),
+        // aider::AIDER_TOOL_ID is dispatched here too (home-level caches/
+        // only); its per-repo units come from a separate code path -- see
+        // `discover_and_measure`'s `project_worktrees` handling below.
+        aider::AIDER_TOOL_ID => Some(aider::identify(home, observed_at)),
+        copilot_cli::COPILOT_CLI_TOOL_ID => Some(copilot_cli::identify(home, observed_at)),
+        cursor::CURSOR_TOOL_ID => Some(cursor::identify(home, observed_at)),
+        windsurf::WINDSURF_TOOL_ID => Some(windsurf::identify(home, observed_at)),
+        cline::CLINE_TOOL_ID => Some(cline::identify(home, observed_at)),
+        roo_code::ROO_CODE_TOOL_ID => Some(roo_code::identify(home, observed_at)),
+        continue_dev::CONTINUE_TOOL_ID => Some(continue_dev::identify(home, observed_at)),
         _ => None,
     }
+}
+
+/// Tool ids whose storage can be installed into more than one editor
+/// host at once (#99's explicit "model each host as a separate detector
+/// location, dedupe nothing that is genuinely separate storage"):
+/// `discover_and_measure` decomposes *every* `Resolved` location this
+/// detector proposes, not just the first, unlike every other tool in
+/// this catalog (including the multi-location `opencode`/`copilot-cli`/
+/// `cursor`/`windsurf` detectors, whose secondary locations are
+/// deliberately *not* decomposed -- see each one's own doc comment).
+fn multi_location_tool(tool_id: &str) -> bool {
+    matches!(tool_id, cline::CLINE_TOOL_ID | roo_code::ROO_CODE_TOOL_ID)
 }
 
 fn tool_name_for(tool_id: &str, scope: &EffectiveScope) -> String {
@@ -577,6 +624,7 @@ fn tool_name_for(tool_id: &str, scope: &EffectiveScope) -> String {
 /// and never reads past what each adapter's own bounded contract allows.
 pub fn discover_and_measure(
     scope: &EffectiveScope,
+    project_worktrees: &[PathBuf],
     swamp_dir: Option<&Path>,
     observe: bool,
     observed_at: u64,
@@ -590,31 +638,76 @@ pub fn discover_and_measure(
     let mut observed: Vec<ObservedExternal> = Vec::new();
 
     for summary in &scope.detectors {
-        let Some(loc) = summary
+        let resolved_locations = summary
             .locations
             .iter()
-            .find(|l| l.status == crate::locations::LocationStatus::Resolved)
-        else {
-            continue;
-        };
-        let Some(home) = &loc.path else { continue };
-        let Some(units) = identify_for_tool(&summary.detector_id, home, observed_at) else {
-            continue;
+            .filter(|l| l.status == crate::locations::LocationStatus::Resolved);
+        let homes: Vec<&Path> = if multi_location_tool(&summary.detector_id) {
+            resolved_locations
+                .filter_map(|l| l.path.as_deref())
+                .collect()
+        } else {
+            resolved_locations
+                .filter_map(|l| l.path.as_deref())
+                .take(1)
+                .collect()
         };
         let tool_name = tool_name_for(&summary.detector_id, scope);
-        let device = device_of(home);
-        for cand in units {
-            let key = unit_key(&summary.detector_id, cand.category, device, &cand.path);
-            observed.push(ObservedExternal {
-                key: key.clone(),
-                detector_id: summary.detector_id.clone(),
-                category: cand.category.key_str(),
-                device,
-                path: cand.path.display().to_string(),
-                bytes: cand.bytes,
-                hardlinked: true,
-            });
-            candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
+        for home in homes {
+            let Some(units) = identify_for_tool(&summary.detector_id, home, observed_at) else {
+                continue;
+            };
+            let device = device_of(home);
+            for cand in units {
+                let key = unit_key(&summary.detector_id, cand.category, device, &cand.path);
+                observed.push(ObservedExternal {
+                    key: key.clone(),
+                    detector_id: summary.detector_id.clone(),
+                    category: cand.category.key_str(),
+                    device,
+                    path: cand.path.display().to_string(),
+                    bytes: cand.bytes,
+                    hardlinked: true,
+                });
+                candidates_by_key
+                    .insert(key, (tool_name.clone(), home.to_path_buf(), cand, device));
+            }
+        }
+    }
+
+    // Aider's per-repo units (#96): materially different shape from
+    // every other tool in this catalog -- attached to each *known
+    // project worktree root* the caller supplies, never derived from a
+    // `crate::locations` detector home. Skipped entirely when the
+    // `aider` detector itself is disabled, so disabling a detector
+    // always turns off everything it would otherwise identify, home-
+    // level or project-local alike.
+    let aider_disabled = scope
+        .detectors
+        .iter()
+        .find(|d| d.detector_id == aider::AIDER_TOOL_ID)
+        .is_some_and(|d| {
+            d.locations
+                .iter()
+                .any(|l| l.status == crate::locations::LocationStatus::Disabled)
+        });
+    if !aider_disabled {
+        let tool_name = tool_name_for(aider::AIDER_TOOL_ID, scope);
+        for wt_path in project_worktrees {
+            let device = device_of(wt_path);
+            for cand in aider::identify_repo_units(wt_path, observed_at) {
+                let key = unit_key(aider::AIDER_TOOL_ID, cand.category, device, &cand.path);
+                observed.push(ObservedExternal {
+                    key: key.clone(),
+                    detector_id: aider::AIDER_TOOL_ID.to_string(),
+                    category: cand.category.key_str(),
+                    device,
+                    path: cand.path.display().to_string(),
+                    bytes: cand.bytes,
+                    hardlinked: true,
+                });
+                candidates_by_key.insert(key, (tool_name.clone(), wt_path.clone(), cand, device));
+            }
         }
     }
 
