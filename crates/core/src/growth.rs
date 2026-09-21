@@ -78,6 +78,9 @@ pub struct GrowthConfig {
     pub large_file_min_bytes: u64,
     /// Watchdog budget for one `observe` invocation (item 3 of #31).
     pub observe_timeout_sec: u64,
+    /// The `[scan]` table: built-in defaults, includes, excludes, and
+    /// disabled detectors (#41). See `crate::scope`.
+    pub scan: crate::scope::ScanConfig,
 }
 
 impl Default for GrowthConfig {
@@ -87,6 +90,7 @@ impl Default for GrowthConfig {
             since: DEFAULT_SINCE.to_string(),
             large_file_min_bytes: DEFAULT_LARGE_FILE_MIN_BYTES,
             observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
+            scan: crate::scope::ScanConfig::default(),
         }
     }
 }
@@ -105,50 +109,90 @@ retention_days = {}\n\
 # Files at least this large are tracked individually under --dirs.\n\
 large_file_min_bytes = {}\n\
 # Watchdog budget for one `observe` run, in seconds.\n\
-observe_timeout_sec = {}\n",
-            self.since, self.retention_days, self.large_file_min_bytes, self.observe_timeout_sec
+observe_timeout_sec = {}\n\
+{}",
+            self.since,
+            self.retention_days,
+            self.large_file_min_bytes,
+            self.observe_timeout_sec,
+            self.scan.to_toml_table(),
         )
     }
 }
 
-/// Reads `<swamp_dir>/config.toml` (`retention_days = 30`,
-/// `since = "24h"`, `observe_timeout_sec = 1800`). A missing file, or keys
-/// it does not recognize, fall back to defaults; this is a tiny
-/// hand-rolled reader so the crate does not need a full TOML dependency
-/// for a handful of scalar settings.
-pub fn load_config(swamp_dir: &Path) -> GrowthConfig {
-    let mut cfg = GrowthConfig::default();
-    let Ok(text) = fs::read_to_string(swamp_dir.join("config.toml")) else {
-        return cfg;
-    };
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        match key {
-            "retention_days" => {
-                if let Ok(n) = value.parse() {
-                    cfg.retention_days = n;
-                }
-            }
-            "since" => cfg.since = value.to_string(),
-            "large_file_min_bytes" => {
-                if let Ok(n) = value.parse() {
-                    cfg.large_file_min_bytes = n;
-                }
-            }
-            "observe_timeout_sec" => {
-                if let Ok(n) = value.parse() {
-                    cfg.observe_timeout_sec = n;
-                }
-            }
-            _ => {}
+/// Raw `config.toml` shape for `toml::from_str`. Every field optional so
+/// a config naming only a subset of keys still parses; unknown top-level
+/// keys are accepted (forward-compatible), but a key with the wrong
+/// *type* (a `[scan]` table where `defaults` is a string, `exclude` is
+/// not an array of strings, ...) is a real parse error, not silently
+/// discarded -- see `load_config_checked`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    since: String,
+    retention_days: u64,
+    large_file_min_bytes: u64,
+    observe_timeout_sec: u64,
+    scan: crate::scope::ScanConfig,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        let d = GrowthConfig::default();
+        Self {
+            since: d.since,
+            retention_days: d.retention_days,
+            large_file_min_bytes: d.large_file_min_bytes,
+            observe_timeout_sec: d.observe_timeout_sec,
+            scan: d.scan,
         }
     }
-    cfg
+}
+
+impl From<RawConfig> for GrowthConfig {
+    fn from(r: RawConfig) -> Self {
+        Self {
+            since: r.since,
+            retention_days: r.retention_days,
+            large_file_min_bytes: r.large_file_min_bytes,
+            observe_timeout_sec: r.observe_timeout_sec,
+            scan: r.scan,
+        }
+    }
+}
+
+/// Reads and validates `<swamp_dir>/config.toml` with a real TOML
+/// parser. A missing file is `Ok(GrowthConfig::default())` -- absent is
+/// not invalid. A file that exists but fails to parse (bad TOML syntax,
+/// or a `[scan]` field with the wrong type, e.g. `defaults = "yes"`
+/// instead of a bool) is `Err`: callers that determine scan scope from
+/// this must refuse to run rather than silently falling back to
+/// (broader) defaults. See `load_config` for the infallible variant used
+/// deep in the report pipeline, which only ever reads the four scalar
+/// keys and tolerates a malformed file the same way it always has.
+pub fn load_config_checked(swamp_dir: &Path) -> Result<GrowthConfig> {
+    let path = swamp_dir.join("config.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GrowthConfig::default()),
+        Err(e) => return Err(e).context(format!("reading {}", path.display())),
+    };
+    let raw: RawConfig =
+        toml::from_str(&text).with_context(|| format!("invalid config at {}", path.display()))?;
+    Ok(raw.into())
+}
+
+/// Infallible convenience wrapper around [`load_config_checked`] for the
+/// report pipeline's internal, scalar-only readers (retention/since/
+/// large-file-min-bytes/observe-timeout): a malformed file falls back to
+/// defaults for these settings exactly as before real-TOML parsing was
+/// added. Scope-resolving call sites (the CLI's `scope`/`report`/
+/// `observe`/`ui`/`schedule` commands and `config show`/`init`) must use
+/// [`load_config_checked`] instead so invalid `[scan]` config is a
+/// visible, nonzero-exit error rather than a silently broadened scope
+/// (#41's core requirement) -- see `crates/cli/src/main.rs`.
+pub fn load_config(swamp_dir: &Path) -> GrowthConfig {
+    load_config_checked(swamp_dir).unwrap_or_default()
 }
 
 /// Parses a duration like `"24h"`, `"30d"`, `"10m"`, `"45s"`, or a bare
@@ -3587,6 +3631,58 @@ mod tests {
         let cfg = load_config(tmp.path());
         assert_eq!(cfg.retention_days, 14);
         assert_eq!(cfg.since, "6h");
+    }
+
+    #[test]
+    fn checked_config_reads_the_scan_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            "[scan]\ndefaults = false\ninclude = [\"~/code\"]\nexclude = [\"~/code/scratch\"]\ndisabled_detectors = [\"homebrew\"]\n",
+        )
+        .unwrap();
+        let cfg = load_config_checked(tmp.path()).expect("valid config");
+        assert!(!cfg.scan.defaults);
+        assert_eq!(cfg.scan.include, vec!["~/code".to_string()]);
+        assert_eq!(cfg.scan.exclude, vec!["~/code/scratch".to_string()]);
+        assert_eq!(cfg.scan.disabled_detectors, vec!["homebrew".to_string()]);
+    }
+
+    /// #41's core requirement: invalid explicit scope config must fail
+    /// visibly, never silently broaden to the all-defaults scope. This
+    /// is the shortcut the acceptance criteria calls out by name --
+    /// falling back to `GrowthConfig::default()` on a parse error would
+    /// make a typo in `[scan]` silently re-enable everything.
+    #[test]
+    fn invalid_scan_table_fails_visibly_instead_of_broadening_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            "[scan]\ndefaults = \"yes\"\n", // wrong type: must be a bool
+        )
+        .unwrap();
+        let err =
+            load_config_checked(tmp.path()).expect_err("wrong-typed defaults must be rejected");
+        assert!(
+            err.to_string().contains("config.toml") || format!("{err:#}").contains("config.toml"),
+            "error should name the offending file: {err:#}"
+        );
+        // The infallible convenience wrapper used deep in the report
+        // pipeline still falls back to scalar defaults (unaffected
+        // pipeline behavior); only scope-resolving call sites are
+        // required to treat this as fatal (see `crates/cli/src/main.rs`'s
+        // `resolve_scope`).
+        assert_eq!(
+            load_config(tmp.path()).scan,
+            crate::scope::ScanConfig::default()
+        );
+    }
+
+    #[test]
+    fn malformed_toml_syntax_fails_visibly() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("config.toml"), "this is not [ valid toml\n").unwrap();
+        assert!(load_config_checked(tmp.path()).is_err());
     }
 
     use crate::entities::Confidence;
