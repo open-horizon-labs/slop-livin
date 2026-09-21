@@ -15,7 +15,7 @@ use std::path::Path;
 pub struct Ecosystem {
     /// Short tag shown in brackets: `rs`, `js`, `py`, …
     pub tag: &'static str,
-    /// Human name for help text and MCP output.
+    /// Human name for help text and JSON output.
     pub name: &'static str,
     /// Root markers. `*.ext` matches by extension; anything else is an
     /// exact file or directory name.
@@ -563,7 +563,7 @@ pub fn by_tag(tag: &str) -> Option<&'static Ecosystem> {
     ECOSYSTEMS.iter().find(|e| e.tag == tag)
 }
 
-/// Human name for a tag, for help text and MCP output.
+/// Human name for a tag, for help text and JSON output.
 pub fn name_for(tag: &str) -> Option<&'static str> {
     by_tag(tag).map(|e| e.name)
 }

@@ -1,5 +1,5 @@
-//! Filter grammar shared by the CLI `--filter` flag, the MCP `report`/
-//! `list_worktrees` tools, and (per #35) the TUI. Kept small and pure:
+//! Filter grammar shared by the CLI `--filter` flag (interactive and
+//! `--json`) and (per #35) the TUI. Kept small and pure:
 //! `parse` builds a `Filter`, `matches_worktree`/`matches_artifact`
 //! evaluate it against a report row. No verdict vocabulary lives here;
 //! predicates read facts (`merge-complete`, `idle`, `growth`, `kind`,

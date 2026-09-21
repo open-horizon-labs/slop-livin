@@ -2,8 +2,10 @@ name: Release
 
 # Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
 # or `gh release create`, which pushes the tag). One job: an optimized
-# aarch64-apple-darwin build of the CLI/TUI binary and the MCP server,
-# packaged as a tarball with a checksum, attached to the GitHub release.
+# aarch64-apple-darwin build of the CLI/TUI binary, packaged with the
+# skills/swamp/ agent skill as a tarball with a checksum, attached to the
+# GitHub release. There is no separate MCP server binary (removed #104):
+# the CLI's --json output plus the packaged skill is the agent interface.
 #
 # Runner: the org's local Apple-silicon builder when LOCAL_MACOS_CI_ENABLED
 # is set (same toggle unified-hifi-control uses), otherwise GitHub's hosted
@@ -64,7 +66,7 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
-        run: cargo build --release --locked --target aarch64-apple-darwin -p swamp -p swamp-mcp
+        run: cargo build --release --locked --target aarch64-apple-darwin -p swamp
 
       # Same profile and target as the build: the library and binary
       # crates are already compiled above, so only the test harnesses are
@@ -84,13 +86,15 @@ jobs:
           out="swamp-${v}-aarch64-apple-darwin"
           latest_out="swamp-aarch64-apple-darwin"
           mkdir -p "dist/${out}"
-          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${out}/"
+          cp target/aarch64-apple-darwin/release/swamp "dist/${out}/"
           cp README.md "dist/${out}/"
+          cp -R skills "dist/${out}/skills"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           (cd dist && shasum -a 256 "${out}.tar.gz" > "${out}.tar.gz.sha256")
           mkdir -p "dist/${latest_out}"
-          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${latest_out}/"
+          cp target/aarch64-apple-darwin/release/swamp "dist/${latest_out}/"
           cp README.md "dist/${latest_out}/"
+          cp -R skills "dist/${latest_out}/skills"
           tar -C dist -czf "dist/${latest_out}.tar.gz" "${latest_out}"
           (cd dist && shasum -a 256 "${latest_out}.tar.gz" > "${latest_out}.tar.gz.sha256")
           echo "tarball=dist/${out}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -103,7 +107,10 @@ jobs:
           ./target/aarch64-apple-darwin/release/swamp --help | head -3
           # The binary must report the version being released.
           test "$(./target/aarch64-apple-darwin/release/swamp --version)" = "swamp ${{ steps.v.outputs.version }}"
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/swamp-mcp | grep -q '"report"'
+          # The agent interface is the CLI's own --json output plus the
+          # packaged skill, not a separate server: exercise both.
+          test -f skills/swamp/SKILL.md
+          ./target/aarch64-apple-darwin/release/swamp report . --json --no-observe | grep -q '"projects"'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

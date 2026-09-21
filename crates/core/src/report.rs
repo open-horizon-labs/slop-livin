@@ -479,8 +479,8 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 /// what the golden test and `--no-observe` want. `since_override`
 /// overrides the store's configured `since` setting for this call only
 /// (`--since`). Kept at its existing 5-argument shape so callers outside
-/// this slice (the MCP surface) do not need to change; use
-/// [`report_with_dirs`] for the R4c `--dirs` opt-in.
+/// this slice do not need to change; use [`report_with_dirs`] for the
+/// R4c `--dirs` opt-in.
 pub fn report_with(
     root: &Path,
     docker_facts: Option<&Path>,
@@ -502,7 +502,7 @@ pub fn report_with(
 
 /// Same as [`report_with`], with explicit control over whether this call
 /// *persists* a new observation into the growth store (`observe = true`,
-/// the CLI/MCP default) or only *reads* it (`observe = false`, `--no-observe`).
+/// the CLI's default) or only *reads* it (`observe = false`, `--no-observe`).
 ///
 /// A read-only call still computes `growth_bytes`/`regrowth_count` from
 /// whatever history the store already has for each row: growth is a
@@ -877,9 +877,9 @@ pub(crate) fn aggregate_dir_totals(
 }
 
 /// `${SWAMP_DIR}` (or `~/.local/share/swamp`): the same
-/// resolution the CLI and MCP server use on their own, duplicated here
-/// only as a fallback for GitHub enrichment's cache when no `store_dir`
-/// was supplied (see the call site in `report_with`).
+/// resolution the CLI uses on its own, duplicated here only as a
+/// fallback for GitHub enrichment's cache when no `store_dir` was
+/// supplied (see the call site in `report_with`).
 pub(crate) fn default_github_cache_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("SWAMP_DIR") {
         return Some(PathBuf::from(dir));

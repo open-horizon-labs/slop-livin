@@ -305,9 +305,10 @@ enum Command {
         json: bool,
     },
     /// Standing grants: `grant add '<predicate>' --budget 5GB --expires 7d`,
-    /// `grant list`, `grant revoke <id>`. Predicates: kind:, project:,
-    /// idle > <dur>, merge-complete. Only a human at this keyboard should
-    /// add grants; MCP has no tool that can.
+    /// `grant list [--json]`, `grant revoke <id>`. Predicates: kind:,
+    /// project:, idle > <dur>, merge-complete. Reserved for a human at
+    /// this keyboard by convention, not by a technical wall: see
+    /// `.oh/guardrails/human-only-authorization.md`.
     Grant {
         #[command(subcommand)]
         cmd: GrantCmd,

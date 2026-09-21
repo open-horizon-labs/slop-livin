@@ -4,7 +4,7 @@ For the product overview, start with the [README](../README.md).
 
 ## Installing a release
 
-On Apple silicon macOS, install with [Homebrew](https://brew.sh). The formula installs `swamp` and `swamp-mcp` and verifies the release archive's checksum:
+On Apple silicon macOS, install with [Homebrew](https://brew.sh). The formula installs the `swamp` binary, the `skills/swamp/` agent skill, and verifies the release archive's checksum:
 
 ```bash
 brew install open-horizon-labs/tap/swamp
@@ -16,8 +16,7 @@ The tap checks for new releases every 15 minutes; GitHub may delay scheduled upd
 
 If you installed manually before, run `type -a swamp`. A copy in
 `~/.local/bin` may take precedence over Homebrew. Remove that manually installed
-copy after verifying `"$(brew --prefix)/bin/swamp" --version`; check
-`swamp-mcp` for the same conflict.
+copy after verifying `"$(brew --prefix)/bin/swamp" --version`.
 
 Release archives remain available on the [releases page](https://github.com/open-horizon-labs/swamp/releases).
 You can also [build from source](../README.md#build-from-source).
@@ -166,16 +165,19 @@ Hardlinked groups can be reviewed and moved to Trash. Links outside the selected
 
 Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
 
-The CLI currently applies `report --filter` only to the root `--view worktrees` output. It does not filter the builds view, project drill-down, overview, or JSON. For artifact filters use the TUI, MCP `report`, or `propose --filter`. `--project` scopes the project tree and supported artifact views; it does not scope every summary view.
+The CLI's *text* rendering applies `--filter` only to the root `--view worktrees` output; it does not filter the builds view, project drill-down, or overview text. For a filter that narrows every row, add `--json`: see below and [the agent interface](#agent-interface).
 
-`--json` returns the full report. Text-rendering options such as `--view`, `--project`, and `--depth` do not narrow that JSON:
+`--json`, with or without `--view`, applies `--filter` (when given) to the whole report before computing any output, and scopes to `--project` when given -- narrower than an unfiltered dump and consistent between the full report and every named view:
 
 ```bash
 swamp report ~/src --json --no-observe | jq '.summary.by_type'
 swamp report ~/src --json --no-observe | jq '.reconciliation'
+swamp report ~/src --view grown --json --since 24h --filter 'kind:BuildOutput' | jq '.result.grown'
 swamp report ~/src --json --no-observe |
   jq '[.projects[].worktrees[].artifacts[] | select(.growth_bytes > 1000000000) | {path, growth_bytes}]'
 ```
+
+Large results can be bounded with `--limit`/`--offset`; the envelope's `total`/`truncated` fields say whether a page is the whole answer. See `skills/swamp/references/commands-and-json.md` for the full schema.
 
 Filesystem reconciliation and Docker accounting are separate. `--verify-du` adds an independent `du -skPx` comparison and can take extra time.
 
@@ -183,7 +185,7 @@ Filesystem reconciliation and Docker accounting are separate. `--verify-du` adds
 
 Supported interfaces share the core parser, but apply predicates to their own row types. Combine predicates with spaces:
 
-Growth predicates filter the report's already-computed growth values. Their `in <duration>` clause does not currently recompute the baseline. For an explicit comparison, set CLI `--since` or MCP `since` to the same window. The TUI obtains its report window from configuration; changing the filter form's window can change the displayed label without changing those measurements. Use the CLI or MCP for an explicit window until that UI behavior is corrected.
+Growth predicates filter the report's already-computed growth values. Their `in <duration>` clause does not currently recompute the baseline. For an explicit comparison, set CLI `--since` to the same window. The TUI obtains its report window from configuration; changing the filter form's window can change the displayed label without changing those measurements. Use the CLI for an explicit window until that UI behavior is corrected.
 
 | Expression | Meaning |
 |---|---|
@@ -238,7 +240,7 @@ swamp approve <plan-id>
 swamp execute <plan-id> --keep-executables
 ```
 
-Proposing does not remove anything. CLI/MCP plans expire after 30 minutes and are single-use. Execution returns per-unit results; inspect refusals and failures as well as successful units.
+Proposing does not remove anything. Plans expire after 30 minutes and are single-use. Execution returns per-unit results; inspect refusals and failures as well as successful units.
 
 The plan's `created_at` is its review time. A unit's `observed_at` can be older when incremental replay reused an unchanged measurement; it is not restamped to pretend the data was remeasured.
 
@@ -266,32 +268,70 @@ The ledger lives at `~/.local/share/swamp/ledger.jsonl`. Trashed bytes, permanen
 
 ## Agent interface
 
-Configure the stdio server as shown in the [README](../README.md#use-it-from-an-agent). Use absolute root paths in requests.
+Through v0.6.x, agent access went through a separate `swamp-mcp` stdio
+server. That server is removed (#104): the CLI's `--json` output is now
+the sole supported machine interface, and `skills/swamp/` packages it
+as an installable agent skill. Use absolute root paths in commands.
 
-| Tool | Main inputs | Result |
+### Installing the skill
+
+Copy or symlink the skill directory into your agent client's skills
+location, without editing any other client configuration:
+
+```bash
+# Claude Code project-scoped skill, from a checkout of this repo:
+mkdir -p .claude/skills
+ln -s /absolute/path/to/swamp/skills/swamp .claude/skills/swamp
+
+# Or copy it in (e.g. for a user-level skills directory some clients read):
+cp -R /absolute/path/to/swamp/skills/swamp ~/.claude/skills/swamp
+```
+
+Consult your specific agent client's own documentation for where it
+looks for skills; swamp does not assume or silently modify a client's
+configuration file to register one. A release archive built from this
+repository includes `skills/swamp/` alongside the `swamp` binary so
+both ship together.
+
+### The JSON contract
+
+Every command below is noninteractive: it prints exactly one JSON
+document to stdout (with `--json`), diagnostics on stderr, a
+deterministic schema, and documented exit codes. Full schemas, the
+historical MCP-tool-to-CLI mapping, pagination, and the exit-code
+contract: `skills/swamp/references/commands-and-json.md`.
+
+| Command | Main flags | Result |
 |---|---|---|
-| `report` | `root`, `since`, `project`, `view`, `filter`, `dirs` | Full report or named view |
-| `what_grew` | Required `root` and `since` | Growing artifacts and coverage/history information |
-| `list_projects` | `root`, `since` | Ranked project summaries |
-| `list_worktrees` | `root`, `since`, `filter` | Worktree and GitHub facts |
-| `docker_objects` | `root`, `project`, `unowned_only` | Docker objects and attribution |
-| `propose` | Required `root`; optional `filter`, `paths`, `since` | Persisted action plan |
-| `execute` | Required `plan_id`; optional `keep_executables` | Execution results for an authorized plan |
-| `plans`, `grants` | None | Existing plans and grants |
+| `report <root> --json` | `--since`, `--project`, `--view`, `--filter`, `--dirs`, `--limit`/`--offset` | Full report or named view, bounded |
+| `report <root> --view grown --json` | Required `--since` for a meaningful window | Growing artifacts plus coverage/history information |
+| `report <root> --view projects --json` | `--since` | Ranked project summaries |
+| `report <root> --view worktrees --json` | `--filter` | Worktree and GitHub facts |
+| `report <root> --view docker --json` | `--project`, `--unowned-only` | Docker objects and attribution |
+| `propose <root> --json` | `--filter`, `--path`, `--since` | Persisted action plan, `awaiting-authorization` |
+| `execute <plan_id> --json` | `--keep-executables` | Execution results for an authorized plan |
+| `plans --json`, `grant list --json` | None | Existing plans and grants |
 
-Report tools can record new observations. They use cached GitHub facts and may refresh Docker's cache. Result metadata differs by tool; do not assume every response includes the same history fields.
+`report --json` can record new observations (skip with `--no-observe`).
+It uses cached GitHub facts and may refresh Docker's cache. Result
+metadata differs by view; do not assume every response includes the
+same history fields -- check `skills/swamp/references/commands-and-json.md`.
 
-Example tool-call payloads, with an illustrative root:
+Example calls, with an illustrative root:
 
-```json
-{"name":"what_grew","arguments":{"root":"/Users/you/src","since":"7d"}}
+```bash
+swamp report /Users/you/src --view grown --json --since 7d
+swamp report /Users/you/src --view builds --json --filter 'type:rust size > 1GB'
 ```
 
-```json
-{"name":"report","arguments":{"root":"/Users/you/src","view":"builds","filter":"type:rust size > 1GB"}}
-```
-
-There is no MCP tool to create grants. Human authorization is supplied through the CLI or TUI. An agent with unrestricted shell access can also invoke the CLI, so this interface design is not an operating-system security boundary.
+There is no CLI command that both an agent and a human can use to mint
+authorization silently -- `swamp approve`/`swamp grant add` exist for a
+human to run. An agent with unrestricted shell access can invoke those
+same commands, so this is a followed convention, not an
+operating-system security boundary. See
+[the trust model](../skills/swamp/references/trust-model.md) for what
+actually enforces safety (sink re-derivation, scoped/budgeted/expiring
+grants, the ledger).
 
 ## Configuration
 
@@ -310,7 +350,7 @@ large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
 ```
 
-The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give CLI, UI, and MCP the same value to share history. The schedule log defaults to `~/Library/Logs/swamp/observe.log`. The observation timeout applies to `observe`, not every interactive operation.
+The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. The schedule log defaults to `~/Library/Logs/swamp/observe.log`. The observation timeout applies to `observe`, not every interactive operation.
 
 For a trace of stage timings:
 

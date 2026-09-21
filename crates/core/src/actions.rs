@@ -5,7 +5,11 @@
 //! the volume's free space before and after, and appends to the ledger.
 //!
 //! What is structurally impossible here, on purpose:
-//! - no function in this module that an MCP tool can reach writes a grant;
+//! - the functions that write a grant (`approve`, `add_standing_grant`,
+//!   `revoke_grant`) are called only from the CLI's own approve/grant
+//!   command handling or the TUI's confirmed-execution path -- see
+//!   `.oh/guardrails/human-only-authorization.md` for the transport-
+//!   independent statement of what that boundary actually is;
 //! - a plan can only contain folded artifact rows (dependency trees, build
 //!   outputs, caches) — never a checkout, worktree, `.git`, Source tree,
 //!   unowned path or Docker object; a "prune Docker" plan cannot be built;
@@ -553,7 +557,8 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
 }
 
 // ---------------------------------------------------------------------
-// Grants — written only by the human-facing CLI, never by MCP.
+// Grants — minted only from the reviewed CLI approve/grant command
+// handling or the TUI's confirmed-execution path (human_only_authorization).
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2055,8 +2055,8 @@ pub fn stage_tracked_with_source(
     let prev_state = read_fsevents_state(&dir);
 
     // `force_full` (`--full`, and every pre-#29 caller: `report_full`,
-    // `report_with*`, the MCP surface, every test that predates this
-    // feature) must never touch the FSEvents source at all -- not the
+    // `report_with*`, every test that predates this feature) must never
+    // touch the FSEvents source at all -- not the
     // real one (this crate runs alongside dozens of other concurrent
     // test/CLI processes on a shared machine, where `fseventsd` itself
     // can become the bottleneck under combined load; a `source.replay`

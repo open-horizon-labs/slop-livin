@@ -53,9 +53,9 @@ Build the current `swamp` version from source with a recent stable Rust toolchai
 ```bash
 git clone https://github.com/open-horizon-labs/swamp
 cd swamp
-cargo build --release --locked -p swamp -p swamp-mcp
+cargo build --release --locked -p swamp
 mkdir -p ~/.local/bin
-install -m 755 target/release/swamp target/release/swamp-mcp ~/.local/bin/
+install -m 755 target/release/swamp ~/.local/bin/
 ~/.local/bin/swamp --version
 ```
 
@@ -89,19 +89,14 @@ The CLI also supports proposals, human approval, and execution. See [cleanup and
 
 ## Use it from an agent
 
-`swamp-mcp` exposes the report over stdio, with tools for growth, projects, worktrees, Docker objects, and proposed actions. Configure an MCP client with the absolute path to the binary:
+There is no separate server process. `swamp report --json`, `--view <name> --json`, `propose --json`, and `execute --json` print one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
 
-```json
-{
-  "mcpServers": {
-    "swamp": {
-      "command": "/Users/you/.local/bin/swamp-mcp"
-    }
-  }
-}
+```bash
+swamp report ~/src --view grown --json --since 24h
+swamp propose ~/src --filter 'kind:BuildOutput idle > 30d' --json
 ```
 
-An agent can propose a plan and execute an approved one. Grant creation is available through the CLI and TUI confirmation, with no MCP grant-writing tool. This is an interface boundary, not isolation from an agent that also has unrestricted shell access. The [MCP reference](docs/usage.md#agent-interface) lists the tools and authorization flow.
+Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands, the JSON schema, and the authorization rule: an agent may propose a plan, but grant creation and plan approval (`swamp approve`, `swamp grant add`) are reserved for a human's explicit instruction. That rule is followed, not enforced by any wall between "agent" and "human" processes -- a shell-capable agent could type the same command. The real safety boundary is in swamp itself: every execution re-derives its units against the live filesystem, grants are scoped/budgeted/expiring, and every action is ledgered. See [the trust model](skills/swamp/references/trust-model.md).
 
 ## How updates stay small
 
@@ -113,7 +108,7 @@ The [architecture guide](docs/architecture.md) explains observation, history, en
 
 ## Documentation
 
-- [Usage](docs/usage.md): installation, keys, commands, filters, configuration, MCP, and recovery.
+- [Usage](docs/usage.md): installation, keys, commands, filters, configuration, the agent interface, and recovery.
 - [Architecture](docs/architecture.md): data flow, incremental updates, storage, and implementation limits.
 - [Contributing](CONTRIBUTING.md): code map, checks, and documentation maintenance.
 - [Changelog](CHANGELOG.md): behavior introduced in each release.

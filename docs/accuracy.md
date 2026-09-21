@@ -79,3 +79,28 @@ The artifact persistence issue was delegated to a Luna worker at the user's requ
 - All 116 local documentation links and anchors resolved; fenced blocks, 16 shell examples, and JSON examples passed syntax checks.
 - The running MCP binary advertised the nine tools listed in the usage reference.
 - GitHub release metadata confirmed the actual v0.4.0 archive names. Those historical assets remain unchanged; v0.5.0 is the first release built from the renamed source.
+
+## Reconciliation, 2026-09-21
+
+`crates/mcp` was removed (#104): the CLI's `--json` output plus
+`skills/swamp/` is now the sole agent interface. The rows above about
+MCP-specific claims (the nine advertised tools, MCP response metadata
+consistency, MCP's authorization design) describe a surface that no
+longer exists; their `Evidence` links into `crates/mcp/` are dead. They
+are left as-is above as the historical record of that review rather
+than rewritten. Their current-behavior equivalents:
+
+- "Nine tools are advertised by MCP" -> the CLI's noninteractive
+  contract is documented directly in
+  `skills/swamp/references/commands-and-json.md`, verified by
+  `crates/cli/tests/agent_json_contract.rs` and
+  `crates/cli/tests/skill_doc.rs`, rather than by a `tools/list` call.
+- "Every MCP response carries identical history metadata" -> still true
+  of the CLI's JSON envelopes: metadata differs by `--view`; see the
+  same reference.
+- "The MCP authorization design prevents a shell-capable agent from
+  authorizing" -> rewritten as a transport-independent claim in
+  `skills/swamp/references/trust-model.md` and
+  `.oh/guardrails/human-only-authorization.md`: no interface, MCP or
+  CLI, is a security boundary against a shell-capable agent: the sink's
+  own re-derivation, grant scoping, and ledger are what enforce safety.

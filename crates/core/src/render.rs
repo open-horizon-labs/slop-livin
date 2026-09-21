@@ -22,7 +22,7 @@ const DEFAULT_TOP_N: usize = 25;
 /// 1024-vs-1000 unit mismatch masquerading as stale/re-read data.
 /// A project's display name: `owner/repo` when its remote names one, so
 /// two clones of different repos sharing a basename are told apart on
-/// sight. Shared by the TUI, CLI and MCP.
+/// sight. Shared by the TUI and CLI (including its `--json` output).
 pub fn project_display_name(p: &crate::report::ProjectRow) -> String {
     let owner_repo = p.remote.as_deref().and_then(|r| {
         let parts: Vec<&str> = r.trim_end_matches('/').split('/').collect();

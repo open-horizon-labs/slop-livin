@@ -2,7 +2,7 @@
 
 Swamp measures a development tree, attaches project context, and keeps observations for later comparison. Repeated use depends on three choices: retain enough state to reuse unchanged measurements, keep the history smaller than repeated full snapshots, and model the units a developer actually works with.
 
-The CLI, TUI, and MCP server call the same report pipeline in `swamp-core`. This guide describes the implementation, including where work is still proportional to the full stored dataset.
+The CLI (interactive and its `--json` output for agent use) and TUI call the same report pipeline in `swamp-core`. This guide describes the implementation, including where work is still proportional to the full stored dataset.
 
 ## The data model
 
@@ -84,7 +84,7 @@ flowchart TD
     History --> Report
     Report --> Cache[Cache the report]
     Cache --> Checkpoint[Commit replay checkpoint]
-    Checkpoint --> Interfaces[CLI / TUI / MCP]
+    Checkpoint --> Interfaces[CLI / TUI]
 ```
 
 The assembly gate waits for local signals, GitHub results, ecosystem tags, and Docker results. Unavailable enrichment produces unknown facts or notes so the rest of the report can still be built. After growth annotation, tracking and time-series consumers run as sibling subscribers; the final assembler waits for both.
@@ -174,7 +174,7 @@ The history writer closes and syncs each temporary Parquet file before publishin
 
 ### What history can answer
 
-The UI and growth-oriented MCP responses expose the available history window. A newly discovered artifact has no earlier baseline. Unobserved periods are not evidence of zero activity, and a file that grows and shrinks between observations may leave no net change.
+The UI and growth-oriented `--json` responses (`report --view grown`) expose the available history window. A newly discovered artifact has no earlier baseline. Unobserved periods are not evidence of zero activity, and a file that grows and shrinks between observations may leave no net change.
 
 Retained size history helps locate recurring growth and compare periods without traversing the filesystem separately for each baseline. It is not a backup or a forensic log of every write.
 
@@ -196,9 +196,9 @@ Merge status is combined with clean/unpushed terms in `merge-complete`; it is ev
 
 ## Actions and extension points
 
-A report supplies the context for a plan. CLI/MCP plans carry selected units, observations, recovery information, and warnings. Approval supplies a one-shot grant or execution uses a matching standing grant. Execution records outcomes and recovery locations in a ledger. TUI confirmation creates its own short-lived plan and grant and uses core execution primitives.
+A report supplies the context for a plan. CLI `propose` plans (whether run interactively or via `--json` by an agent) carry selected units, observations, recovery information, and warnings. Approval supplies a one-shot grant or execution uses a matching standing grant. Execution records outcomes and recovery locations in a ledger. TUI confirmation creates its own short-lived plan and grant and uses core execution primitives.
 
-These action paths share concepts and lower-level code but do not have identical validation. Do not infer a universal guarantee from a check present in only one path. Docker removal is delegated to the daemon; filesystem moves go to Trash. An MCP grant-writing tool is intentionally absent, but a shell-capable agent still has the operating-system permissions of its account.
+These action paths share concepts and lower-level code but do not have identical validation. Do not infer a universal guarantee from a check present in only one path. Docker removal is delegated to the daemon; filesystem moves go to Trash. Grant-writing (`swamp approve`, `swamp grant add`) is reserved by convention for a human to invoke, but a shell-capable agent still has the operating-system permissions of its account and could invoke those same commands -- see `skills/swamp/references/trust-model.md` and `.oh/guardrails/human-only-authorization.md` for what actually enforces safety at the sink.
 
 To add a fact source, implement a consumer and register it before dispatch. If it introduces a new event payload or report field, also update the event definitions, assembly gate or final assembler, serialization, and relevant interfaces. Registration alone is sufficient only when the existing contracts already express the new fact.
 
@@ -208,7 +208,7 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
 
 - Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.
 - Worktree identity is path-derived. Relative artifact paths do not make history portable across arbitrary moves or renamed remotes.
-- Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI/MCP `since` values for window comparisons.
+- Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI `--since` values for window comparisons.
 - Overlapping scan roots have independent histories. Their totals must not be added together; scanning both also retains measurements for both scopes.
 - Filesystem events may require a full scan. Hardlinks can make an artifact update much more expensive than the changed directory alone suggests.
 - The report covers what swamp measured under the requested root. It is not a complete accounting of volume free space, snapshots, backups, or Docker's physical storage.

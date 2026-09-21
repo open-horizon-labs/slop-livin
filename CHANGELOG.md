@@ -2,6 +2,12 @@
 
 Release notes describe behavior at the named version. See the [README](README.md) and [usage reference](docs/usage.md) for current behavior. Timings below are historical observations from one developer's machine, not a benchmark suite.
 
+## Unreleased
+
+- **Removed `crates/mcp`/`swamp-mcp`.** The CLI's `--json` output is now the sole supported agent interface. `report --json` honors `--view`/`--project`/`--filter` (it previously ignored them and dumped the whole report); gains `--limit`/`--offset` with `total`/`truncated` envelope fields for bounded results; and gains two JSON-only views, `--view projects` and `--view grown`, covering the former `list_projects` and `what_grew` MCP tools. `propose --json` carries the same `state`/`next_step`/`observed_at` fields the MCP `propose` tool added. `plans --json` and the new `grant list --json` wrap their arrays with a `total` field.
+- Added an installable agent skill at `skills/swamp/` (`SKILL.md` plus lazily loaded `references/*.md`): the inspect-first workflow, the full former-MCP-tool-to-CLI-command mapping and JSON schemas, the filter grammar, the propose/approve/execute/grant lifecycle, coverage/history semantics, and the real (transport-independent) authorization trust model.
+- Rewrote the `human_only_authorization` source audit from "the MCP server never calls these functions" to a transport-independent check: authorization-minting functions are called only from the CLI's own approve/grant command handling or the TUI's confirmed-execution path, regardless of which binary a caller invokes.
+
 ## v0.6.3
 
 - Show Cargo build details directly in project trees, grouped by cleanup consequence: compiler caches, compiled tests and examples, and build-script output. Keep the directory view available without counting it as additional storage.

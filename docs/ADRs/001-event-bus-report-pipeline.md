@@ -50,3 +50,13 @@ Consumers must not import other consumers or register stages during a run. Repor
 - Source audits check selected structural constraints; tests check routing and report behavior. Run them through [the contributor checks](../../CONTRIBUTING.md#checks).
 
 The implemented types and dispatch loop are in [bus/mod.rs](../../crates/core/src/bus/mod.rs), with stages under [consumers](../../crates/core/src/consumers/).
+
+## Reconciliation, 2026-09-21
+
+`crates/mcp` (the "MCP server" named above) was removed (#104). The
+decision this ADR records -- one event-bus pipeline shared by every
+interface -- is unchanged and still implemented; only the set of
+interfaces sharing it changed, from CLI/TUI/MCP to CLI/TUI, where the
+CLI's `--json` output is now the agent-facing surface. The original
+Context/Decision/Consequences text above is left as written to preserve
+the record of what was decided and why on 2026-09-18.

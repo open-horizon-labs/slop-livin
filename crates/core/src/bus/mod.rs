@@ -313,7 +313,7 @@ impl EventBus {
     }
 
     /// `run` on a fresh tokio current-thread runtime, for the synchronous
-    /// callers (CLI, MCP, TUI worker thread). Must not be called from
+    /// callers (CLI, TUI worker thread). Must not be called from
     /// inside another tokio runtime.
     pub fn run_blocking(&mut self, seed: Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
         let rt = tokio::runtime::Builder::new_current_thread()

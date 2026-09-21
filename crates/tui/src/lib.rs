@@ -1,6 +1,6 @@
 //! `swamp ui`: the diffstat-ledger terminal UI. See DESIGN.md and
 //! `.impeccable/surfaces/tui.md` (binding). Renders the same
-//! `swamp_core::report_with` `Report` the CLI/MCP use; no second
+//! `swamp_core::report_with` `Report` the CLI uses; no second
 //! data path.
 
 pub mod actions;

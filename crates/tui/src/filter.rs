@@ -1,5 +1,5 @@
 //! The TUI's filter line speaks the same grammar as `--filter` on the CLI
-//! and the MCP tools — it *is* `swamp_core::filter`. This module only
+//! (interactive and `--json`) — it *is* `swamp_core::filter`. This module only
 //! adds the TUI's conveniences: the default line, the `0` = no filter
 //! shorthand, and small accessors the row builders need.
 //!

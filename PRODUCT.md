@@ -10,7 +10,7 @@ web
 
 ## Stack
 
-Rust workspace. `swamp-core` builds the report and provides storage and action primitives. `swamp` provides the CLI and a ratatui/crossterm UI; `swamp-mcp` provides a stdio MCP server.
+Rust workspace. `swamp-core` builds the report and provides storage and action primitives. `swamp` provides the CLI, a ratatui/crossterm UI, and bounded JSON output for agent use; `skills/swamp/` packages that JSON contract as an installable agent skill (no separate server process; see docs/usage.md#agent-interface).
 
 ## Users
 
@@ -22,11 +22,11 @@ Explain disk growth by Git project, checkout or worktree, and artifact. Keep obs
 
 ## Positioning
 
-Swamp combines a development-specific storage model with observation history, incremental filesystem updates, Git and Docker context, and CLI, TUI, and MCP interfaces. Describe these capabilities directly; do not claim exclusive ownership of disk-usage history or use an unverified competitor matrix.
+Swamp combines a development-specific storage model with observation history, incremental filesystem updates, Git and Docker context, and CLI, TUI, and agent-skill interfaces. Describe these capabilities directly; do not claim exclusive ownership of disk-usage history or use an unverified competitor matrix.
 
 ## Operating Context
 
-macOS terminal. Observations come from report commands, MCP report tools, the open TUI, or an optional LaunchAgent. The TUI watches for filesystem events while open. Scheduled observation refreshes data without performing cleanup.
+macOS terminal. Observations come from report commands (interactive or an agent's `--json` calls), the open TUI, or an optional LaunchAgent. The TUI watches for filesystem events while open. Scheduled observation refreshes data without performing cleanup.
 
 ## Capabilities and Constraints
 
@@ -36,7 +36,7 @@ macOS terminal. Observations come from report commands, MCP report tools, the op
 - Artifacts, source directories, whole checkouts, linked worktrees, and some unowned paths can be selected for actions. Confirmation must make the selected scope and recovery behavior visible.
 - Filesystem paths go to Trash. Docker images and volumes are removed by the daemon without a backup. Build-cache records are report-only.
 - Git status and activity are evidence for the user's decision. Dirty, unpushed, and untracked warnings do not universally block removal.
-- Plans require authorization. MCP has no grant-writing tool; this does not prevent a process with shell access from invoking the CLI.
+- Plans require authorization, minted only from reviewed CLI/TUI call sites (`swamp approve`, `swamp grant add`, the TUI's confirmed-execution path); this is a code-review boundary, not an OS-level one, since a shell-capable agent can invoke those same CLI commands. See [the trust model](skills/swamp/references/trust-model.md).
 - Coverage and unowned storage remain visible. Docker has separate reconciliation totals from the filesystem walk.
 
 ## Brand Commitments
