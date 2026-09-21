@@ -119,8 +119,10 @@ enum Command {
     /// Diffstat-ledger terminal UI (ratatui). Default when no
     /// subcommand is given.
     Ui {
-        #[arg(default_value = ".")]
-        root: PathBuf,
+        /// Defaults to the configured effective scope's first present
+        /// root when omitted (see `swamp scope`); an explicit root
+        /// still replaces the configured scope for this invocation.
+        root: Option<PathBuf>,
         /// Skip persisting a new observation; render the last one.
         #[arg(long)]
         no_observe: bool,
@@ -133,8 +135,11 @@ enum Command {
     },
     /// Project x worktree x artifact growth report.
     Report {
-        #[arg(default_value = ".")]
-        root: PathBuf,
+        /// Defaults to the configured effective scope's first present
+        /// root when omitted (see `swamp scope`); an explicit root
+        /// still replaces the configured scope for this invocation,
+        /// though configured exclusions still apply.
+        root: Option<PathBuf>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -235,7 +240,10 @@ enum Command {
     /// the only `swamp` command that calls `gh` on your behalf by
     /// default; `report` reads whatever this last wrote.
     Observe {
-        #[arg(required = true)]
+        /// Defaults to every present root in the configured effective
+        /// scope when omitted (see `swamp scope`); explicit roots still
+        /// replace the configured scope for this invocation, though
+        /// configured exclusions still apply.
         roots: Vec<PathBuf>,
         /// Skip the FSEvents-driven incremental attempt and force a full
         /// walk (also re-anchors the stored event id for next time).
@@ -298,6 +306,23 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Print the effective scan scope (#41): every root swamp would use
+    /// for this invocation, its status (present/missing/unreadable/
+    /// skipped-as-nested/excluded) and every reason it is in scope --
+    /// built-in default, detector (with id/category/provenance),
+    /// configured include, or explicit command root -- plus the full
+    /// detector catalog (including disabled/not-present/unresolved
+    /// entries) and the detector catalog version. With explicit roots,
+    /// shows what those roots resolve to (configured exclusions still
+    /// apply) instead of the configured scope. This is the one shared
+    /// resolution every scope-aware command (`report`, `observe`, `ui`,
+    /// `schedule`) uses when no explicit root is given -- never a
+    /// separate ad hoc computation.
+    Scope {
+        roots: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// List plans (newest first).
     Plans {
@@ -407,6 +432,184 @@ fn swamp_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/swamp")
+}
+
+/// The one shared resolution every scope-aware command (#41) goes
+/// through: built-in defaults, detector results, and configured
+/// include/exclude/disabled-detectors, or -- when `explicit` is
+/// non-empty -- exactly those roots (configured exclusions still
+/// apply). A malformed `config.toml` is a hard error here (nonzero
+/// exit via `main`'s `Result`, message on stderr): scope resolution
+/// never silently falls back to a broader default on invalid config.
+fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveScope> {
+    let store_dir = swamp_dir();
+    let cfg = swamp_core::growth::load_config_checked(&store_dir)?;
+    let env = swamp_core::locations::Environment::from_process();
+    let registry = swamp_core::locations::Registry::with_builtins();
+    Ok(swamp_core::scope::resolve_effective_scope(
+        &env,
+        &cfg.scan,
+        explicit,
+        &registry,
+        swamp_core::entities::now(),
+    ))
+}
+
+/// For the single-root commands (`report`, `ui`) that have not yet
+/// adopted full multi-root observation (#42/#50 -- see
+/// `.oh/sessions/2026-09-21-scope-and-detector-registry.md`): resolves
+/// the configured scope and picks its first present root, noting on
+/// stderr when more than one root is actually in scope. Multi-root
+/// commands (`observe`, `schedule`) use `resolve_scope(...).scan_paths()`
+/// directly instead of this function.
+fn resolve_single_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let explicit_roots: Vec<PathBuf> = explicit.into_iter().collect();
+    let scope = resolve_scope(&explicit_roots)?;
+    if !explicit_roots.is_empty() {
+        return match scope.roots.first() {
+            Some(r)
+                if matches!(
+                    r.status,
+                    swamp_core::scope::RootStatus::Present | swamp_core::scope::RootStatus::Missing
+                ) =>
+            {
+                Ok(r.path.clone())
+            }
+            Some(r) => anyhow::bail!(
+                "root {} is not in scope ({:?}); configured exclusions apply to explicit roots too -- see `swamp scope --json`",
+                r.path.display(),
+                r.status
+            ),
+            None => anyhow::bail!("no root given"),
+        };
+    }
+    let present = scope.scan_paths();
+    if present.is_empty() {
+        if scope.is_empty_scope() {
+            anyhow::bail!(
+                "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+            );
+        }
+        anyhow::bail!(
+            "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+        );
+    }
+    if present.len() > 1 {
+        eprintln!(
+            "note: configured scope has {} present roots; using {} (the first). Full multi-root reporting is #50's job -- see `swamp scope --json`, or `swamp observe`/`swamp schedule` for multi-root observation.",
+            present.len(),
+            present[0].display()
+        );
+    }
+    Ok(present[0].clone())
+}
+
+/// Persists the just-resolved scope and, when a previous one exists,
+/// prints a one-line coverage-change note to stderr (#41's "explain
+/// effective coverage and baseline changes"). This never touches byte
+/// history: it is coverage bookkeeping only, per
+/// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
+fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
+    if let Some(previous) = swamp_core::scope::load_last_effective_scope(store_dir) {
+        let changes = swamp_core::scope::coverage_changes(&previous, scope);
+        if !changes.is_empty() {
+            let summary = changes
+                .iter()
+                .map(|c| {
+                    let sign = match c.kind {
+                        swamp_core::scope::CoverageChangeKind::Added => '+',
+                        swamp_core::scope::CoverageChangeKind::Removed => '-',
+                    };
+                    format!("{sign}root {} ({})", c.path.display(), c.reason)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("coverage changed since last observation: {summary}");
+        }
+    }
+    if let Err(e) = swamp_core::scope::persist_effective_scope(store_dir, scope) {
+        eprintln!("note: could not persist effective scope for next run: {e}");
+    }
+}
+
+fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "catalog {} · defaults={} · disabled=[{}] · {}",
+        scope.catalog_version,
+        scope.defaults_enabled,
+        scope.disabled_detectors.join(", "),
+        if scope.explicit {
+            "explicit roots (configured exclusions still apply)"
+        } else {
+            "configured scope"
+        }
+    );
+    for root in &scope.roots {
+        let status = match &root.status {
+            swamp_core::scope::RootStatus::Present => "present".to_string(),
+            swamp_core::scope::RootStatus::Missing => "missing".to_string(),
+            swamp_core::scope::RootStatus::Unreadable { reason } => {
+                format!("unreadable ({reason})")
+            }
+            swamp_core::scope::RootStatus::SkippedAsNested { parent } => {
+                format!("skipped-as-nested (folded into {})", parent.display())
+            }
+            swamp_core::scope::RootStatus::Excluded { pattern } => format!("excluded ({pattern})"),
+        };
+        let reasons: Vec<String> = root
+            .reasons
+            .iter()
+            .map(|r| match r {
+                swamp_core::scope::RootReason::BuiltinDefault => "built-in default".to_string(),
+                swamp_core::scope::RootReason::Detector {
+                    detector_id,
+                    category,
+                    provenance,
+                } => format!("detector:{detector_id} ({category:?}, {provenance:?})"),
+                swamp_core::scope::RootReason::Included => "include".to_string(),
+                swamp_core::scope::RootReason::ExplicitCommand => "explicit".to_string(),
+                swamp_core::scope::RootReason::NestedFrom { path } => {
+                    format!("covers nested {}", path.display())
+                }
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "  {:<10} {}  [{}]",
+            status,
+            root.path.display(),
+            reasons.join("; ")
+        );
+    }
+    if !scope.pruned_subtrees.is_empty() {
+        let _ = writeln!(out, "pruned subtrees (excluded, inside an in-scope root):");
+        for p in &scope.pruned_subtrees {
+            let _ = writeln!(out, "  {} under {}", p.pattern, p.root.display());
+        }
+    }
+    let _ = writeln!(out, "detectors:");
+    for d in &scope.detectors {
+        for loc in &d.locations {
+            let status = match &loc.status {
+                swamp_core::locations::LocationStatus::Resolved => "resolved".to_string(),
+                swamp_core::locations::LocationStatus::NotPresent => "not-present".to_string(),
+                swamp_core::locations::LocationStatus::Disabled => "disabled".to_string(),
+                swamp_core::locations::LocationStatus::UnresolvedWithReason { reason } => {
+                    format!("unresolved ({reason})")
+                }
+            };
+            let path = loc
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(out, "  {:<12} {:<10} {}", d.detector_id, status, path);
+        }
+    }
+    out
 }
 
 /// Human authorization for one plan: prints every unit with its facts,
@@ -662,10 +865,11 @@ fn report_json_envelope(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Ui {
-        root: PathBuf::from("."),
+        root: None,
         no_observe: false,
     }) {
         Command::Ui { root, no_observe } => {
+            let root = resolve_single_root(root)?;
             swamp_tui::run(&root, no_observe)?;
         }
         Command::Scan { root, store } => {
@@ -703,6 +907,8 @@ fn main() -> Result<()> {
             offset,
             unowned_only,
         } => {
+            let explicit_root = root.clone();
+            let root = resolve_single_root(root)?;
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
             // are given.
@@ -722,6 +928,18 @@ fn main() -> Result<()> {
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = swamp_dir();
+            if !no_observe {
+                // Coverage notes reflect the *configured* scope, not
+                // just the one root this single-root command ended up
+                // reporting on (#41's "explain effective coverage and
+                // baseline changes"); skip entirely for an explicit
+                // root, whose scope is exactly that one root and not
+                // worth diffing against the configured scope's history.
+                if explicit_root.is_none() {
+                    let scope = resolve_scope(&[])?;
+                    note_and_persist_scope(&store_dir, &scope);
+                }
+            }
             let progress =
                 spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
             let r = report_full_mode(
@@ -1090,7 +1308,10 @@ fn main() -> Result<()> {
             match action {
                 ConfigAction::Path => println!("{}", path.display()),
                 ConfigAction::Show => {
-                    print!("{}", swamp_core::growth::load_config(&dir).to_toml());
+                    print!(
+                        "{}",
+                        swamp_core::growth::load_config_checked(&dir)?.to_toml()
+                    );
                     if !path.exists() {
                         eprintln!(
                             "(defaults; no file at {} — `swamp config init` writes one)",
@@ -1106,6 +1327,19 @@ fn main() -> Result<()> {
                     std::fs::create_dir_all(&dir)?;
                     std::fs::write(&path, swamp_core::growth::GrowthConfig::default().to_toml())?;
                     println!("wrote {}", path.display());
+                }
+            }
+        }
+        Command::Scope { roots, json } => {
+            let scope = resolve_scope(&roots)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&scope)?);
+            } else {
+                print!("{}", render_scope_text(&scope));
+                if scope.is_empty_scope() {
+                    eprintln!(
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."
+                    );
                 }
             }
         }
@@ -1235,10 +1469,43 @@ fn main() -> Result<()> {
             }
         }
         Command::Observe { roots, full } => {
-            schedule::cmd_observe(swamp_dir(), roots, full)?;
+            let store_dir = swamp_dir();
+            let scope = resolve_scope(&roots)?;
+            let resolved = scope.scan_paths();
+            if resolved.is_empty() {
+                if scope.is_empty_scope() {
+                    anyhow::bail!(
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                anyhow::bail!(
+                    "no present root to observe (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            note_and_persist_scope(&store_dir, &scope);
+            schedule::cmd_observe(store_dir, resolved, full)?;
         }
         Command::Schedule { every, off, roots } => {
-            schedule::cmd_schedule(swamp_dir(), every, off, roots)?;
+            let store_dir = swamp_dir();
+            // Install-time root resolution only: this bakes concrete
+            // paths into the LaunchAgent's argv, same as an explicit
+            // root list always has. Making a *scheduled run* re-resolve
+            // the configured scope on every fire (rather than replaying
+            // whatever `schedule --every` resolved at install time) is
+            // #50's job -- see `.oh/sessions/2026-09-21-scope-and-detector-registry.md`.
+            let resolved_roots = if roots.is_empty() && !off && every.is_some() {
+                let scope = resolve_scope(&[])?;
+                let resolved = scope.scan_paths();
+                if resolved.is_empty() {
+                    anyhow::bail!(
+                        "effective scan scope is empty; nothing to schedule -- see `swamp scope --json`, or pass roots explicitly."
+                    );
+                }
+                resolved
+            } else {
+                roots
+            };
+            schedule::cmd_schedule(store_dir, every, off, resolved_roots)?;
         }
     }
     Ok(())
