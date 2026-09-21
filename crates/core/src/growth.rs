@@ -2484,12 +2484,8 @@ fn full_walk(
     reason: &'static str,
     excluded: &[PathBuf],
 ) -> Result<TrackedWalk> {
-    let (discovered, mut attribution) = crate::walk::discover_and_attribute_excluding(
-        root,
-        observed_at,
-        large_file_min_bytes,
-        excluded,
-    )?;
+    let (discovered, mut attribution) =
+        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes, excluded)?;
     split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,
@@ -2518,8 +2514,7 @@ fn compute_unconfirmed_worktrees(
     let Some(prev) = prev else {
         return Vec::new();
     };
-    let discovered_paths: HashSet<&Path> =
-        discovered.iter().map(|d| d.path.as_path()).collect();
+    let discovered_paths: HashSet<&Path> = discovered.iter().map(|d| d.path.as_path()).collect();
     prev.iter()
         .filter(|pw| !discovered_paths.contains(pw.path.as_path()))
         .filter(|pw| match fs::symlink_metadata(&pw.path) {
@@ -3446,7 +3441,12 @@ pub(crate) struct StoredExternalRow {
     pub(crate) regrowth_count: u32,
 }
 
-pub(crate) fn external_row_key(detector_id: &str, category: &str, device: u64, path: &str) -> String {
+pub(crate) fn external_row_key(
+    detector_id: &str,
+    category: &str,
+    device: u64,
+    path: &str,
+) -> String {
     format!("{detector_id}\u{1}{category}\u{1}{device}\u{1}{path}")
 }
 
@@ -3557,11 +3557,7 @@ pub struct ObservedExternal {
     pub(crate) hardlinked: bool,
 }
 
-fn external_history_index(
-    dir: &Path,
-    retention_days: u64,
-    now: u64,
-) -> Result<HistoryIndex> {
+fn external_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<HistoryIndex> {
     let retention_secs = retention_days.saturating_mul(86400);
     let horizon = now.saturating_sub(retention_secs);
     let mut index: HashMap<String, Vec<(u64, u64, bool)>> = HashMap::new();
@@ -4220,9 +4216,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1000)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1000, 30, 1000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut projects,
+            1000,
+            30,
+            1000,
+            &HashSet::new(),
+        )
+        .unwrap();
         projects[0].worktrees[0].artifacts[0].dedup_stale = true;
-        observe_and_annotate(tmp.path(), 1, &mut projects, 2000, 30, 1000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut projects,
+            2000,
+            30,
+            1000,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(artifact_row(&projects).growth_bytes, None);
         let dir = volume_dir(tmp.path(), 1);
         assert!(read_rows(&current_path(&dir)).unwrap()[0].dedup_stale);
@@ -4230,7 +4244,16 @@ mod tests {
         assert_eq!(totals, vec![Some(1000), None]);
         projects[0].worktrees[0].artifacts[0].dedup_stale = false;
         projects[0].worktrees[0].artifacts[0].bytes = 2000;
-        observe_and_annotate(tmp.path(), 1, &mut projects, 3000, 30, 1000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut projects,
+            3000,
+            30,
+            1000,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(
             artifact_row(&projects).growth_bytes,
             None,
@@ -4245,7 +4268,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut projects,
+            1_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(artifact_row(&projects).growth_bytes, None);
         assert_eq!(artifact_row(&projects).regrowth_count, 0);
     }
@@ -4295,7 +4327,16 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut present = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut present, 1_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut present,
+            1_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         // target/ deleted: no artifacts observed this pass at all.
         let mut absent: Vec<ProjectRow> = vec![ProjectRow {
@@ -4319,7 +4360,16 @@ mod tests {
 
         // target/ recreated.
         let mut recreated = vec![one_artifact_project(&root, 500_000)];
-        observe_and_annotate(tmp.path(), 1, &mut recreated, 3_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut recreated,
+            3_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(artifact_row(&recreated).regrowth_count, 1);
     }
@@ -4394,7 +4444,16 @@ mod tests {
 
         for i in 0..(COMPACTION_THRESHOLD as u64 + 5) {
             let mut obs = vec![one_artifact_project(&root, 1_000 + i)];
-            observe_and_annotate(tmp.path(), 1, &mut obs, 1_000 + i, 30, 3600, &HashSet::new()).unwrap();
+            observe_and_annotate(
+                tmp.path(),
+                1,
+                &mut obs,
+                1_000 + i,
+                30,
+                3600,
+                &HashSet::new(),
+            )
+            .unwrap();
         }
 
         let files = list_delta_files(&dir);
@@ -4416,7 +4475,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/some/absolute/worktree/root");
         let mut projects = vec![one_artifact_project(&root, 42)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            tmp.path(),
+            1,
+            &mut projects,
+            1_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         let dir = volume_dir(tmp.path(), 1);
         let current = read_rows(&current_path(&dir)).unwrap();

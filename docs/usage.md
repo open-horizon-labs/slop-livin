@@ -105,14 +105,85 @@ cargo-home), -root /Users/you/old-project (excluded)`. This note never
 implies bytes were added or removed -- see
 [coverage and history](../skills/swamp/references/coverage-and-history.md).
 
-Full multi-root support differs by command today: `observe` and
-`schedule` walk every present root in the effective scope (as many
-roots as the scheduler already loops over). `report` and `ui` are
-still single-root: with no explicit root they use the effective
-scope's first present root and print a note if more than one is in
-scope. Making `report`/`ui` themselves coverage-aware across every
-resolved root is tracked separately (#42/#50); `swamp scope` and
-`swamp observe`/`swamp schedule` already show/cover the full picture.
+With no explicit root, `report`, `observe`, and `ui` all now observe
+the **whole** effective scope coherently in one call
+(`swamp_core::report::report_scope`), not just its first present root:
+every present root is walked, every root's growth store is written
+(each root still keeps its own physical current+reverse-delta store,
+keyed by device and canonical path -- this is one coherent
+orchestration, never a merged store, so one root's observation can
+never overwrite or corrupt another's), and the resulting `report --json`
+carries a per-root `scope_coverage` array whenever any root is not
+fully, cleanly observed. Passing an explicit root still replaces the
+scope entirely and stays on the single-root path, same as always. A
+scheduled run installed with no explicit roots (`swamp schedule --every
+30m`, no trailing paths) re-resolves the configured scope on every
+fire, so editing `config.toml` takes effect on the next run rather than
+only after re-running `schedule --every`.
+
+### Observation regions
+
+Every root `report`/`observe`/`ui` considers gets one of five outcomes
+for that pass, visible in `scope_coverage`/`swamp scope`:
+
+- **complete** -- walked in full; its growth store is authoritative.
+- **partial** -- walked, but part of it (a subdirectory, a worktree)
+  could not be read this pass; that part's rows are left untouched
+  rather than tombstoned.
+- **excluded** -- pruned by a config `exclude` entry, either the whole
+  root or a subtree inside an otherwise-included root. Not observed,
+  never treated as deleted.
+- **missing** -- the root does not currently exist. Its previously
+  observed rows (if any) keep their history untouched.
+- **inaccessible** -- the root exists but could not be read at all
+  (e.g. `chmod 000`, or access lost between scope resolution and the
+  walk). No walk is attempted; the store is completely untouched and no
+  FSEvents cursor advances for it.
+
+A root that only *lost read access* (still exists, cannot be listed) is
+distinguished from one that is genuinely gone: losing and regaining
+access to an unchanged tree never fabricates a deletion or a later
+regrowth. Removing a root from scope, or adding an exclusion, is
+likewise a coverage change, never a storage change -- see
+[coverage and history](../skills/swamp/references/coverage-and-history.md).
+
+## External and shared storage
+
+Storage with no containing project -- the Cargo registry, rustup
+toolchains, a Homebrew prefix, and future detector-resolved locations
+(model stores, package caches, ...) -- is measured as a first-class
+**external unit**, independent of any project or worktree:
+
+```bash
+swamp report --view external
+swamp report --view external --json
+```
+
+Each unit's identity is `(detector, category, canonical path)`; size,
+growth and regrowth history live in the same current+reverse-delta
+growth store as everything else (a new key family, not a second
+store), so the same retention/coverage guarantees apply. Categories
+(`installation`, `downloads`, `cache`, `local-state`, `environments`,
+`build-output`, `models`, `unclassified`) come from the detector
+registry that also resolves scope (#44) -- an entire manager home is
+never collapsed into "cache", and a unit is measured whether or not any
+project currently references it (removing the last consumer never
+deletes the unit or its history).
+
+External units are **inspection-only**: a plan can name one for review
+(`swamp propose` support follows the same pattern as any other unit),
+but `swamp execute` refuses every one of them unconditionally with "no
+supported selective action for `<category>`" -- registry/detector
+output identifies storage, it never authorizes removing it. The `--view
+external` total is deliberately kept separate from `reconciliation`
+above it: external units are never folded into `walked_total`/
+`attributed`/`unowned`, so there is nothing to double-count, but the two
+bases (a walked root vs. a detector-resolved location) are different
+enough that summing them would be misleading.
+
+TUI presentation of external units (a dedicated view, not just the CLI
+table) is tracked separately (#51/#60); the CLI/JSON contract and
+growth-store history above are complete today.
 
 ## Cleanup recommendations
 

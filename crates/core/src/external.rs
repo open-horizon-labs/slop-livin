@@ -122,6 +122,29 @@ fn device_of(path: &Path) -> u64 {
 /// otherwise. `swamp_dir: None` returns units with `growth_bytes: None`
 /// and `regrowth_count: 0` (no store to consult), matching the
 /// artifact-row read-only contract elsewhere.
+/// One candidate detector location, before it is known whether it can be
+/// measured this pass.
+struct Candidate {
+    detector_id: String,
+    detector_name: String,
+    category: StorageCategory,
+    provenance: Provenance,
+    path: PathBuf,
+}
+
+/// A candidate that was actually measured this pass, keyed by its
+/// growth-store row key, holding what `discover_and_measure` needs to
+/// build the final `ExternalUnit` after growth annotation.
+struct MeasuredUnit {
+    detector_id: String,
+    detector_name: String,
+    category: StorageCategory,
+    provenance: Provenance,
+    path: PathBuf,
+    bytes: u64,
+    hardlinked: bool,
+}
+
 pub fn discover_and_measure(
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
@@ -130,7 +153,7 @@ pub fn discover_and_measure(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<Vec<ExternalUnit>> {
-    let mut candidates: Vec<(String, String, StorageCategory, Provenance, PathBuf)> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     for summary in &scope.detectors {
         if summary.detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
             continue;
@@ -140,25 +163,29 @@ pub fn discover_and_measure(
                 continue;
             }
             let Some(path) = &loc.path else { continue };
-            candidates.push((
-                summary.detector_id.clone(),
-                summary.name.clone(),
-                loc.category,
-                loc.provenance.clone(),
-                path.clone(),
-            ));
+            candidates.push(Candidate {
+                detector_id: summary.detector_id.clone(),
+                detector_name: summary.name.clone(),
+                category: loc.category,
+                provenance: loc.provenance.clone(),
+                path: path.clone(),
+            });
         }
     }
 
     let mut units: Vec<ExternalUnit> = Vec::new();
     let mut observed: Vec<crate::growth::ObservedExternal> = Vec::new();
     let mut protected_keys: HashSet<String> = HashSet::new();
-    let mut meta_by_key: HashMap<
-        String,
-        (String, String, StorageCategory, Provenance, PathBuf, u64, u64, bool),
-    > = HashMap::new();
+    let mut meta_by_key: HashMap<String, MeasuredUnit> = HashMap::new();
 
-    for (detector_id, detector_name, category, provenance, raw_path) in candidates {
+    for Candidate {
+        detector_id,
+        detector_name,
+        category,
+        provenance,
+        path: raw_path,
+    } in candidates
+    {
         let canonical = fs::canonicalize(&raw_path).unwrap_or_else(|_| raw_path.clone());
         let device = device_of(&canonical);
         let key = unit_key(&detector_id, category, device, &canonical);
@@ -203,16 +230,15 @@ pub fn discover_and_measure(
         });
         meta_by_key.insert(
             key,
-            (
+            MeasuredUnit {
                 detector_id,
                 detector_name,
                 category,
                 provenance,
-                canonical,
-                device,
-                row.bytes,
-                row.hardlinked,
-            ),
+                path: canonical,
+                bytes: row.bytes,
+                hardlinked: row.hardlinked,
+            },
         );
     }
 
@@ -243,8 +269,18 @@ pub fn discover_and_measure(
         .transpose()?
         .unwrap_or_default();
 
-    for (key, (detector_id, detector_name, category, provenance, path, _device, bytes, hardlinked)) in
-        meta_by_key
+    for (
+        key,
+        MeasuredUnit {
+            detector_id,
+            detector_name,
+            category,
+            provenance,
+            path,
+            bytes,
+            hardlinked,
+        },
+    ) in meta_by_key
     {
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
         units.push(ExternalUnit {
@@ -345,7 +381,10 @@ fn load_all_consumers(swamp_dir: &Path) -> Result<HashMap<String, Vec<ExternalCo
     }
 }
 
-fn save_all_consumers(swamp_dir: &Path, map: &HashMap<String, Vec<ExternalConsumer>>) -> Result<()> {
+fn save_all_consumers(
+    swamp_dir: &Path,
+    map: &HashMap<String, Vec<ExternalConsumer>>,
+) -> Result<()> {
     fs::create_dir_all(swamp_dir)?;
     let text = serde_json::to_string_pretty(map)?;
     fs::write(consumers_path(swamp_dir), text)?;

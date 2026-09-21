@@ -105,6 +105,12 @@ Every view returns the envelope:
 }
 ```
 
+With no explicit root, the envelope also gains `scope_coverage` (an
+array) whenever any root in the configured scope is not cleanly
+`complete` this pass -- see `coverage-and-history.md`'s "Multi-root
+observation and per-root coverage". An explicit single root never
+carries this key: nothing about its scope is ambiguous.
+
 `total`/`truncated` are present whenever `result` is an array; they
 describe the array's *unbounded* length and whether `--limit`/
 `--offset` cut anything off this page -- never assume a page is the
@@ -129,6 +135,7 @@ Views:
 | `unowned` | array: `{path_or_object, bytes, reason, shared_bytes, docker_kind, note}` | |
 | `reconciliation` | object: `{attributed, unowned, walked_total, du_total, docker_attributed, docker_unowned}` | |
 | `rust` | array of nested Cargo artifacts | Inspection only; not project-scoped by `--project` yet. |
+| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: `propose`/`execute` can name a unit but execution always refuses it. |
 
 `--view grown` additionally has a top-level `coverage` block:
 

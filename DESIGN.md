@@ -67,6 +67,28 @@ The header shows the root, observation status, available history, and totals as 
 
 Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live FSEvents watch batches changes after 400 ms of quiet. The header can display a history sparkline; body rows use change bars.
 
+### Coverage line and external rows (not yet implemented)
+
+`report_scope`/`external.rs` (#42/#43) give the TUI two facts it does
+not surface yet, recorded here as the intended minimal design for
+whichever worker (#51/#60) wires them in, so the shape is agreed before
+the code:
+
+- **Coverage line.** When more than one root is in scope, or any root
+  is not `Complete` this pass, the header gains one short clause naming
+  the count and the worst status, e.g. `3 roots (1 excluded)` or `2
+  roots (1 inaccessible: permission denied)` -- never silently dropped,
+  never phrased as a deletion. Full text lives in `swamp scope`/`report
+  --json`'s `scope_coverage`; the header clause is a pointer to it, not
+  a duplicate of every reason.
+- **External rows.** A new `ViewKind::External` (`'9'`, the next free
+  digit) lists `ExternalUnit`s the same shape as `ViewKind::Unowned`
+  lists unowned rows: path, category, size, growth, consumer count.
+  Selection/marking must refuse with the same "no supported selective
+  action for `<category>`" reason `actions::execute` already returns
+  for a `PlanUnit::external_category` unit -- the TUI's confirm flow
+  must not invent a delete affordance the action layer does not honor.
+
 ## Actions
 
 Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a single inline row with selected paths, sizes, warnings, and destinations. Enter authorizes the action; Esc cancels it.

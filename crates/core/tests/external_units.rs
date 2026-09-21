@@ -33,7 +33,7 @@ fn write_pattern(path: &std::path::Path, bytes: u64) {
     fs::write(path, vec![7u8; bytes as usize]).unwrap();
 }
 
-fn cargo_home_unit<'a>(units: &'a [ExternalUnit]) -> &'a ExternalUnit {
+fn cargo_home_unit(units: &[ExternalUnit]) -> &ExternalUnit {
     units
         .iter()
         .find(|u| u.detector_id == "cargo-home" && u.category == StorageCategory::Installation)
@@ -50,7 +50,10 @@ fn external_only_root_is_measured_as_one_unit() {
     write_pattern(&cargo_home.join("bin/cargo"), 1_000);
     write_pattern(&cargo_home.join("config.toml"), 200);
 
-    let env = fixture_env(&home.path(), &[("CARGO_HOME", &cargo_home.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("CARGO_HOME", &cargo_home.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
 
@@ -60,7 +63,11 @@ fn external_only_root_is_measured_as_one_unit() {
     // Allocated bytes (disk blocks), not logical file size -- a real
     // measurement, so only a lower/upper sanity bound on the two small
     // files written above, not an exact byte count.
-    assert!(unit.bytes >= 1_200 && unit.bytes < 100_000, "{}", unit.bytes);
+    assert!(
+        unit.bytes >= 1_200 && unit.bytes < 100_000,
+        "{}",
+        unit.bytes
+    );
     assert_eq!(unit.category, StorageCategory::Installation);
     assert!(unit.consumers.is_empty(), "no consumer declared yet");
     // First-ever observation: unknown baseline, never a synthetic zero.
@@ -74,7 +81,10 @@ fn empty_consumer_set_is_empty_not_missing() {
     let home = tempfile::tempdir().unwrap();
     let cargo_home = home.path().join("fixture-cargo");
     write_pattern(&cargo_home.join("bin/cargo"), 500);
-    let env = fixture_env(&home.path(), &[("CARGO_HOME", &cargo_home.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("CARGO_HOME", &cargo_home.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -89,7 +99,10 @@ fn shared_consumers_are_counted_once_in_totals() {
     let home = tempfile::tempdir().unwrap();
     let cargo_home = home.path().join("fixture-cargo");
     write_pattern(&cargo_home.join("bin/cargo"), 3_000);
-    let env = fixture_env(&home.path(), &[("CARGO_HOME", &cargo_home.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("CARGO_HOME", &cargo_home.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -114,7 +127,13 @@ fn shared_consumers_are_counted_once_in_totals() {
     let _ = key; // illustrative only; `real_key` is what associate_consumer needs
 
     associate_consumer(store.path(), &real_key, "project-a", None).unwrap();
-    associate_consumer(store.path(), &real_key, "project-b", Some("declared in config")).unwrap();
+    associate_consumer(
+        store.path(),
+        &real_key,
+        "project-b",
+        Some("declared in config"),
+    )
+    .unwrap();
 
     let units2 = discover_and_measure(&scope, Some(store.path()), true, 2_000, 30, 3600).unwrap();
     let unit2 = cargo_home_unit(&units2);
@@ -123,7 +142,10 @@ fn shared_consumers_are_counted_once_in_totals() {
         unit2.consumers.iter().map(|c| c.label.clone()).collect();
     assert_eq!(
         labels,
-        ["project-a", "project-b"].into_iter().map(String::from).collect()
+        ["project-a", "project-b"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     );
     // The unit itself is still exactly one row: total_bytes counts its
     // bytes once, not once per consumer.
@@ -144,7 +166,10 @@ fn association_changes_never_duplicate_the_unit_or_reset_history() {
     let home = tempfile::tempdir().unwrap();
     let cargo_home = home.path().join("fixture-cargo");
     write_pattern(&cargo_home.join("bin/cargo"), 4_000);
-    let env = fixture_env(&home.path(), &[("CARGO_HOME", &cargo_home.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("CARGO_HOME", &cargo_home.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -152,7 +177,12 @@ fn association_changes_never_duplicate_the_unit_or_reset_history() {
     let before = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
     let before_count = before.len();
     let unit = cargo_home_unit(&before);
-    let key = unit_key(&unit.detector_id, unit.category, real_device(&unit.path), &unit.path);
+    let key = unit_key(
+        &unit.detector_id,
+        unit.category,
+        real_device(&unit.path),
+        &unit.path,
+    );
     let bytes_before = unit.bytes;
     let regrowth_before = unit.regrowth_count;
 
@@ -177,7 +207,11 @@ fn association_changes_never_duplicate_the_unit_or_reset_history() {
         "regrowth_count must be unaffected by consumer association changes"
     );
     assert_eq!(
-        unit_after.consumers.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+        unit_after
+            .consumers
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>(),
         vec!["kept"]
     );
 }
@@ -193,7 +227,10 @@ fn tool_executable_removed_but_storage_remains_still_measures_it() {
     let home = tempfile::tempdir().unwrap();
     let prefix = home.path().join("fixture-homebrew-prefix");
     write_pattern(&prefix.join("Cellar/somepkg/1.0/bin/tool"), 6_000);
-    let env = fixture_env(&home.path(), &[("HOMEBREW_PREFIX", &prefix.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("HOMEBREW_PREFIX", &prefix.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let cfg = ScanConfig {
         defaults: false,
@@ -224,7 +261,10 @@ fn incomplete_coverage_preserves_unknown_not_absent() {
     let home = tempfile::tempdir().unwrap();
     let cargo_home = home.path().join("fixture-cargo");
     write_pattern(&cargo_home.join("bin/cargo"), 2_500);
-    let env = fixture_env(&home.path(), &[("CARGO_HOME", &cargo_home.display().to_string())]);
+    let env = fixture_env(
+        home.path(),
+        &[("CARGO_HOME", &cargo_home.display().to_string())],
+    );
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

@@ -43,7 +43,8 @@ fn external_units_are_inspection_only_and_execution_refuses() {
         .clone();
 
     // A plan CAN name it (identification is not blocked)...
-    let plan = actions::propose_external(&units, &[target.path.clone()], "test").unwrap();
+    let plan =
+        actions::propose_external(&units, std::slice::from_ref(&target.path), "test").unwrap();
     assert_eq!(plan.units.len(), 1);
     assert!(plan.units[0].external_category.is_some());
 
@@ -57,10 +58,7 @@ fn external_units_are_inspection_only_and_execution_refuses() {
     let outcome = &result.outcomes[0];
     assert_eq!(outcome.status, "refused");
     let cause = outcome.cause.as_deref().unwrap_or_default();
-    assert!(
-        cause.contains("no supported selective action"),
-        "{cause}"
-    );
+    assert!(cause.contains("no supported selective action"), "{cause}");
     assert!(cause.contains("Installation"), "{cause}");
 
     // Nothing was moved: the fixture storage is untouched.
@@ -88,7 +86,7 @@ fn propose_external_with_no_matching_path_is_a_visible_error() {
     let store = tempfile::tempdir().unwrap();
     let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
 
-    let err = actions::propose_external(&units, &[home.path().join("not-a-unit")], "test")
-        .unwrap_err();
+    let err =
+        actions::propose_external(&units, &[home.path().join("not-a-unit")], "test").unwrap_err();
     assert!(err.to_string().contains("no external unit matched"));
 }

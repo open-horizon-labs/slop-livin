@@ -59,7 +59,7 @@ impl Consumer for WalkConsumer {
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
-            crate::walk::discover_and_attribute_excluding(
+            crate::walk::discover_and_attribute(
                 &ctx.root,
                 ctx.observed_at,
                 ctx.large_file_min_bytes,

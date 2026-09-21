@@ -135,6 +135,119 @@ real binary on the test machine); `FakeCommandRunner` records every
 call it receives so a test can assert a detector only ever asked for an
 allow-listed, read-only command.
 
+## Multi-root observation and coverage
+
+`crate::report::report_scope` (#42) is the one coherent entry point over
+a resolved `EffectiveScope`: it iterates every candidate root, walks
+each `Present` one through the ordinary single-root pipeline below, and
+returns a merged `Report` plus one `crate::coverage::RootCoverage` row
+per root. `report`/`observe`/`ui` all go through it when no explicit
+root is given; `observe`/`schedule` already looped over every present
+root before this chunk (this is the CLI's callers converging on one
+shared function, not a change to how any single root is walked).
+
+Two design choices are load-bearing here, both direct responses to the
+guardrail
+[coverage changes are not storage changes](../.oh/guardrails/coverage-changes-are-not-storage-changes.md):
+
+- **Physical stores stay per-root**, keyed exactly as before
+  (`growth::root_scoped_volume_id`: device + canonical root path).
+  `report_scope` is a coherent *orchestration* layer, not a merged
+  store -- two roots can never corrupt or overwrite each other's
+  current/delta files, because they are never the same files. The
+  alternative (one store per resolved scope) would need a materially
+  more complex tombstone sweep to avoid exactly the hazard this issue
+  exists to close (a root dropped from scope looking like a mass
+  deletion); keeping per-root stores makes that hazard structurally
+  unreachable instead of merely guarded against.
+- **A root is re-checked for read access immediately before it is
+  walked**, not only at scope-resolution time: `fs::read_dir` on a
+  `Present` root, right before calling into the pipeline. Scope
+  resolution and this call are never atomic, and a permission-denied
+  root's walk used to look exactly like "this root has zero projects",
+  which fed straight into the growth store's "present before, absent
+  now -> tombstone" sweep. A `RootCoverage::Inaccessible` region is
+  recorded instead, and the pipeline is never invoked for that root at
+  all -- its store is completely untouched.
+
+A related, narrower hazard lives one level down: a single root can stay
+readable overall while one *worktree inside it* loses access (a project
+directory chmod'd, not the whole root). Discovery for that worktree
+simply stops finding it -- indistinguishable, at the `discovered: Vec<DiscoveredWorktree>`
+level, from the worktree having been deleted. `growth::compute_unconfirmed_worktrees`
+closes this: after a walk (full or incremental), it diffs the new
+`discovered` list against the previous observation's stored topology,
+and for every worktree that dropped out, stats its stored path directly.
+`ENOENT` is real deletion (tombstoning is correct: it can regrow for
+real when it comes back). Any other outcome -- the path exists but
+cannot be `read_dir`'d -- means access was lost, not the worktree; its
+id goes into `TrackedWalk::unconfirmed_worktree_ids`, threaded through
+the bus (`Event::RootObserved` -> `ProjectsGrouped` -> `Draft::protected_worktree_ids`)
+to `growth::observe_and_annotate`, whose tombstone sweep skips every
+row belonging to a protected worktree id even though it is absent from
+this pass's `seen_keys`. `external.rs` applies the identical distinction
+to external units (see below), and `walk::resize_artifact`/`process_walk`'s
+own permission-denied handling (recording an `UnownedRow`, never
+crashing) is what makes the underlying `fs::read_dir` failure legible in
+the first place.
+
+Exclusion pruning works the same way at the walk level:
+`EffectiveScope::pruned_subtrees` (recorded by scope resolution, #41)
+is consumed by `walk::discover_one`/`process_walk`
+(`discover_parallel_excluding`/`attribute_parallel_carrying`'s
+`excluded` parameter, threaded through `Ctx::pruned_subtrees` ->
+`growth::stage_tracked_with_source`): a directory at or under a pruned
+path is never entered by either the worktree-discovery pass or the
+attribution pass, so it is not measured, not reported as unowned, and
+not present in `discovered` at all -- `Excluded`, never `Partial`. The
+incremental path reaches the same result by filtering FSEvents'
+`changed_dirs` against the same list before any re-walk primitive
+(`apply_incremental`, `discover_shallow`, `attribute_one_worktree`) is
+invoked, rather than teaching each of those smaller entry points their
+own exclusion list.
+
+## External and shared storage units
+
+`crate::external` (#43) turns every non-`builtin-defaults` detector
+location from the registry above into a first-class **external unit**:
+identity `(detector_id, category, device, canonical path)`, independent
+of any project or worktree. Two things distinguish it from an ordinary
+artifact row:
+
+- **Measurement, not a walk.** `walk::resize_artifact` sizes the whole
+  location as one opaque unit (hardlink-deduped within the call, same
+  as an artifact's own folded measurement); nothing inside it is
+  discovered as a project or classified by ecosystem. This is
+  deliberate: `~/.cargo` or a Homebrew prefix has no worktrees to find,
+  and walking it as an ordinary scan root would either find nothing
+  useful or (worse) misclassify its contents.
+- **A new key family in the existing store, not a second store.**
+  `growth::observe_and_annotate_external`/`annotate_readonly_external`
+  reuse the same current+reverse-delta Parquet design as artifact rows,
+  under `${SWAMP_DIR}/external/` (scope-wide, not per-volume: an
+  external unit's device need not match any scan root's). Consumer
+  associations (`external_consumers.json`) are a deliberately separate
+  sidecar, never touched by the growth-store write path, so an
+  association change can only ever affect `ExternalUnit::consumers` --
+  never the unit's identity, its bytes, or its regrowth count.
+
+`report_scope` and `external::discover_and_measure` are independent
+call graphs in this chunk: external units are never folded into
+`Report.reconciliation` (nothing to double-count, since they are never
+summed into `walked_total`/`attributed`/`unowned` in the first place).
+A future worker reconciling the two more tightly (e.g. excluding a
+detector-sourced external-unit root from also being walked as an
+ordinary scan root, which is today's pre-existing #41 behavior,
+unchanged by this chunk) should read `report.rs`'s `report_scope` and
+`external.rs`'s `discover_and_measure` together before changing either.
+
+Action boundary: `actions::unit_from_external`/`propose_external` let a
+plan name an external unit (`PlanUnit::external_category`); `execute`
+refuses every one of them unconditionally, before grant/budget checks
+run, citing the category. No code path upgrades an external unit to a
+deletable one -- the registry that discovers these locations has no way
+to request that, by construction.
+
 ## Observation pipeline
 
 Each consumer subscribes to typed events and returns follow-on events. Registration happens in [EventBus::with_builtins](../crates/core/src/bus/mod.rs) before the run begins. Large shared event payloads use `Arc`.
@@ -284,9 +397,46 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
 - Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.
 - Worktree identity is path-derived. Relative artifact paths do not make history portable across arbitrary moves or renamed remotes.
 - Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI `--since` values for window comparisons.
-- Overlapping scan roots have independent histories. Their totals must not be added together; scanning both also retains measurements for both scopes.
+- Sibling scan roots keep independent physical stores (still true), but
+  `report_scope` (#42) now merges their totals coherently for a
+  multi-root `report`/`observe`/`ui` call: each root's bytes are summed
+  exactly once, and the merge is root-order independent. What is *not*
+  handled: a hardlinked inode shared across two *different, non-nested*
+  top-level roots is not deduplicated against a sibling root's count
+  (only within-root/within-worktree hardlink dedup is implemented);
+  treat a multi-root unique-byte total as an upper bound in that case.
+  Each root's own `series_by_key`/`total_series` sparkline buckets are
+  computed independently (each root's own wall-clock `now`) and merged
+  bucket-for-bucket only when their lengths already match; a length
+  mismatch falls back to the first root's series rather than
+  interleaving mismatched windows.
+- Crash/concurrent-writer limits: an observation's Parquet writes are
+  individually atomic (temp file + rename), but a crash between two
+  related writes (e.g. after the artifact store's current file but
+  before its own delta, or between one root's store and the next root
+  in a `report_scope` call) can leave that one file's state slightly
+  ahead of another's; the next observation's walk re-establishes
+  consistency, it does not require operator intervention. FSEvents
+  cursors are the one thing this design protects transactionally: a
+  cursor only advances after every consumer in that root's pipeline
+  succeeded (`bus::ReportCached`-gated checkpoint commit), so an
+  interrupted observation is retried in full next time rather than
+  silently skipping the gap. Two processes observing the *same* root
+  concurrently is not guarded against beyond the existing `observe`
+  lock file (`schedule::acquire_lock`); running `report`/`ui` by hand
+  while a scheduled `observe` is mid-run for the same root is possible
+  and not separately interlocked.
 - Filesystem events may require a full scan. Hardlinks can make an artifact update much more expensive than the changed directory alone suggests.
-- The report covers what swamp measured under the requested root. It is not a complete accounting of volume free space, snapshots, backups, or Docker's physical storage.
+- The report covers what swamp measured under the requested root(s). It is not a complete accounting of volume free space, snapshots, backups, or Docker's physical storage.
 - GitHub and Docker context can lag local measurements. Check observation times and notes before acting.
+- External units (#43) are measured independently of `report_scope`'s
+  walked roots and never folded into `reconciliation`; a
+  detector-sourced location that also happens to fall inside a walked
+  scan root (today's pre-existing #41 behavior, e.g. `~/.cargo` living
+  under `~/src`) is measured by *both* paths, once as an external unit
+  and once as ordinary walked/unowned bytes under its containing root
+  -- the two are not currently reconciled against each other. The TUI
+  has no dedicated view for external units yet (#51/#60); they are
+  reachable today only through `report --view external`.
 
 The [accuracy report](accuracy.md) records the source checks behind these descriptions. Historical timings in the [changelog](../CHANGELOG.md) are individual observations; representative benchmarks are still needed for latency and storage-size claims.

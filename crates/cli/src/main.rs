@@ -809,7 +809,6 @@ fn cleanup_scope_summary(
 /// silently ignored in JSON mode the way the whole-report dump used to
 /// ignore them.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn report_json_envelope(
     r: &Report,
     root: &Path,
@@ -1170,7 +1169,10 @@ fn main() -> Result<()> {
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
-                        print!("{}", swamp_core::render::render_view_external(&external_units))
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_external(&external_units)
+                        )
                     }
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
@@ -1201,7 +1203,10 @@ fn main() -> Result<()> {
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
-                        print!("{}", swamp_core::render::render_view_external(&external_units))
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_external(&external_units)
+                        )
                     }
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());

@@ -68,6 +68,29 @@ needing to diff two observations yourself -- see
 shared code path for every command; never assume an agent's or
 another command's idea of "the roots" without checking `swamp scope`.
 
+## Multi-root observation and per-root coverage
+
+With no explicit root, `report`/`observe`/`ui` observe the *whole*
+resolved scope in one call, not just one root: `report --json` sums
+every present root's bytes into one report (order-independent, each
+root counted exactly once) and adds a `scope_coverage` array whenever
+any root is not simply, cleanly observed. Each entry:
+
+```json
+{"path": "/Users/you/old-project", "status": "missing", "walked_total": 0, "projects": 0, "mode": ""}
+{"path": "/Users/you/locked", "status": "inaccessible", "reason": "permission denied", "walked_total": 0, "projects": 0, "mode": ""}
+```
+
+Five statuses: `complete`, `partial` (walked, but part of it could not
+be read this pass -- its rows are left untouched, not tombstoned),
+`excluded`, `missing`, `inaccessible` (with a `reason` string on the
+latter two/`partial`). None of these is ever reported as bytes going to
+zero or a tombstone: a `missing`/`inaccessible` root's previous history
+(if any) is untouched, and a root that only lost read access -- the
+path still exists, it just could not be listed -- never counts as
+deletion, and regaining access never counts as regrowth. Treat any
+non-`complete` row as "not fully known this pass", never as "gone".
+
 ## Reconciliation and unknowns
 
 `--view reconciliation --json`: `{attributed, unowned, walked_total,
@@ -84,6 +107,23 @@ denials or an in-progress walk.
 name similarity yourself; that's exactly what `--view docker`'s
 explicit `"unowned, name-alike"` labelling exists to prevent you from
 doing silently.
+
+## External/shared storage units
+
+Storage with no containing project (the Cargo registry, rustup
+toolchains, a Homebrew prefix, ...) is a first-class **external unit**
+(`report --view external`/`--json`), identity `(detector, category,
+canonical path)`, independent of any project or worktree. It carries
+its own size/growth/regrowth history under the same coverage rules
+above, and zero or more declared `consumers` -- adding or removing a
+consumer never duplicates the unit or resets its history. External
+units are **never folded into `reconciliation`** (not summed into
+`walked_total`/`attributed`/`unowned`): the `--view external` total is
+a separate, additive figure, not a double count of anything above it.
+They are inspection-only: `propose`/`execute` can name one, but
+execution always refuses it with "no supported selective action for
+`<category>`" -- never treat an external unit as deletable through any
+path this tool exposes.
 
 ## Filesystem vs. Docker accounting
 

@@ -1468,6 +1468,7 @@ pub fn to_json(report: &Report) -> Result<String> {
 /// all -- see `bus::run_report`'s `ReportCached`-gated checkpoint commit
 /// -- so marking that root `Inaccessible` here never contradicts what was
 /// (not) persisted for it.
+#[allow(clippy::too_many_arguments)]
 pub fn report_scope(
     scope: &crate::scope::EffectiveScope,
     docker_facts: Option<&Path>,
@@ -1613,9 +1614,7 @@ pub fn report_scope_with_source(
                     .count();
                 let status = if unreadable_paths > 0 {
                     RegionStatus::Partial {
-                        reason: format!(
-                            "{unreadable_paths} path(s) unreadable during this walk"
-                        ),
+                        reason: format!("{unreadable_paths} path(s) unreadable during this walk"),
                     }
                 } else {
                     RegionStatus::Complete
@@ -1634,6 +1633,7 @@ pub fn report_scope_with_source(
                     projects: r.projects.len(),
                     mode,
                 });
+                merge_summary_into(&mut merged.summary, &r.summary);
 
                 if merged.root.as_os_str().is_empty() {
                     merged.root = path.clone();
@@ -1698,8 +1698,31 @@ pub fn report_scope_with_source(
         }
     }
     merged.reconciliation.du_total = du_total_sum;
-    merged.summary = summarize(&merged.projects);
     Ok((merged, coverage))
+}
+
+/// Merges one root's already-bus-computed `Summary` into a running total.
+/// Deliberately *not* a call to `summarize` (which stays a bus-pipeline
+/// stage per `all_report_paths_through_bus`/`event_bus_pluggable_consumers`
+/// -- see `docs/ADRs/001-event-bus-report-pipeline.md`): `report_scope`
+/// combines already-fully-formed single-root reports, it does not reach
+/// into the bus's own stages to recompute one from scratch.
+fn merge_summary_into(acc: &mut Summary, add: &Summary) {
+    acc.projects += add.projects;
+    acc.worktrees += add.worktrees;
+    acc.artifacts += add.artifacts;
+    for (tag, t) in &add.by_type {
+        let e = acc.by_type.entry(tag.clone()).or_default();
+        if e.name.is_empty() {
+            e.name = t.name.clone();
+        }
+        e.projects += t.projects;
+        e.artifacts += t.artifacts;
+        e.bytes += t.bytes;
+        if let Some(g) = t.growth_bytes {
+            e.growth_bytes = Some(e.growth_bytes.unwrap_or(0) + g);
+        }
+    }
 }
 
 fn scope_cache_key(scope: &crate::scope::EffectiveScope) -> String {
@@ -1714,7 +1737,10 @@ fn scope_cache_key(scope: &crate::scope::EffectiveScope) -> String {
 }
 
 fn last_scope_report_path(store_dir: &Path, scope: &crate::scope::EffectiveScope) -> PathBuf {
-    store_dir.join(format!("last_report-scope-{}.json.zst", scope_cache_key(scope)))
+    store_dir.join(format!(
+        "last_report-scope-{}.json.zst",
+        scope_cache_key(scope)
+    ))
 }
 
 /// Persists the merged multi-root report from [`report_scope`], the same

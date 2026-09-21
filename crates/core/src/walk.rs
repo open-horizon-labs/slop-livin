@@ -1308,20 +1308,12 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
 /// Runs the parallel discovery pass, then the parallel attribution pass
 /// over the resulting worktree list, matching the two sequential calls
 /// `report_with` used to make to `git::discover` and
-/// `attribution::attribute`.
+/// `attribution::attribute`. `excluded` (#42 --
+/// `scope::EffectiveScope::pruned_subtrees`) prunes every subtree in it
+/// from both passes: nothing under an excluded path is discovered as a
+/// worktree, measured, or reported as unowned. Empty for every caller
+/// with no scope-level exclusions to enforce.
 pub fn discover_and_attribute(
-    root: &Path,
-    observed_at: u64,
-    large_file_min_bytes: u64,
-) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
-    discover_and_attribute_excluding(root, observed_at, large_file_min_bytes, &[])
-}
-
-/// Same as [`discover_and_attribute`], pruning every subtree in `excluded`
-/// (#42) from both the discovery and attribution passes: nothing under an
-/// excluded path is discovered as a worktree, measured, or reported as
-/// unowned.
-pub fn discover_and_attribute_excluding(
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,

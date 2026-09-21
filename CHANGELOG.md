@@ -4,6 +4,37 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+- **Made multi-root observation coverage-aware** (#42). `report`,
+  `observe`, and `ui` with no explicit root now observe the whole
+  configured scope coherently in one call, not just its first present
+  root: every present root is walked, every root's own current+reverse-
+  delta growth store is written (each root still keeps its own
+  physical store; this is a coherent orchestration, not a merged
+  store), and `report --json` gains a `scope_coverage` array naming
+  each root's outcome (`complete`/`partial`/`excluded`/`missing`/
+  `inaccessible`) with a reason whenever it is not simply `complete`. A
+  root that loses read access (`chmod 000`, or a worktree inside an
+  otherwise-readable root) is distinguished from one that is genuinely
+  deleted: losing and regaining access never fabricates a deletion or a
+  later regrowth, and a root dropped from scope (or newly excluded) is
+  a coverage change, never a storage change. `EffectiveScope::pruned_subtrees`
+  (#41, recorded but not previously consumed) is now wired into the
+  walker, so an `exclude` entry inside a kept root is genuinely not
+  measured. `swamp schedule --every` installed with no explicit roots
+  no longer freezes a resolved root list into the LaunchAgent's argv:
+  every scheduled fire re-resolves the configured scope, so a
+  `config.toml` edit takes effect on the next run.
+- **Modeled external/shared storage as first-class measured units**
+  (#43): the Cargo registry, rustup toolchains, Homebrew, and future
+  detector-resolved locations are measured independently of any
+  project/worktree, with size/growth/regrowth history in the same
+  current+reverse-delta growth store (a new key family, not a second
+  store) and declared consumer associations (zero/one/many, counted
+  once, never duplicating the unit or resetting its history). New
+  `report --view external` (text and `--json`). External units are
+  inspection-only: a plan can name one, but `execute` refuses every one
+  of them unconditionally with "no supported selective action for
+  `<category>`" -- registry/detector output never authorizes removal.
 - **Removed `crates/mcp`/`swamp-mcp`.** The CLI's `--json` output is now the sole supported agent interface. `report --json` honors `--view`/`--project`/`--filter` (it previously ignored them and dumped the whole report); gains `--limit`/`--offset` with `total`/`truncated` envelope fields for bounded results; and gains two JSON-only views, `--view projects` and `--view grown`, covering the former `list_projects` and `what_grew` MCP tools. `propose --json` carries the same `state`/`next_step`/`observed_at` fields the MCP `propose` tool added. `plans --json` and the new `grant list --json` wrap their arrays with a `total` field.
 - Added an installable agent skill at `skills/swamp/` (`SKILL.md` plus lazily loaded `references/*.md`): the inspect-first workflow, the full former-MCP-tool-to-CLI-command mapping and JSON schemas, the filter grammar, the propose/approve/execute/grant lifecycle, coverage/history semantics, and the real (transport-independent) authorization trust model.
 - Rewrote the `human_only_authorization` source audit from "the MCP server never calls these functions" to a transport-independent check: authorization-minting functions are called only from the CLI's own approve/grant command handling or the TUI's confirmed-execution path, regardless of which binary a caller invokes.

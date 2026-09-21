@@ -52,7 +52,11 @@ fn make_project(root: &Path, name: &str, bytes: u64) -> PathBuf {
     let target = checkout.join("target");
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("a.bin"), vec![7u8; (bytes / 2) as usize]).unwrap();
-    fs::write(target.join("b.bin"), vec![9u8; (bytes - bytes / 2) as usize]).unwrap();
+    fs::write(
+        target.join("b.bin"),
+        vec![9u8; (bytes - bytes / 2) as usize],
+    )
+    .unwrap();
     checkout
 }
 
@@ -81,7 +85,15 @@ fn observe_scope(
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &cfg, explicit_roots, &registry, 1_000_000);
     report_scope(
-        &scope, None, false, Some(store), None, true, false, false, true,
+        &scope,
+        None,
+        false,
+        Some(store),
+        None,
+        true,
+        false,
+        false,
+        true,
     )
     .expect("report_scope")
 }
@@ -184,13 +196,13 @@ fn inaccessible_root_is_not_reported_as_empty() {
     let store = tempfile::tempdir().unwrap();
 
     // First observation succeeds normally.
-    let (first, _) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (first, _) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert_eq!(first.projects.len(), 1);
     assert!(first.reconciliation.walked_total > 0);
 
     // Lock the root itself.
     fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
-    let (second, coverage) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (second, coverage) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
 
     assert_eq!(coverage.len(), 1);
@@ -208,7 +220,7 @@ fn inaccessible_root_is_not_reported_as_empty() {
     // Restoring access and observing again must see the same project it
     // saw the first time -- no fabricated deletion happened while access
     // was lost, so this is an ordinary re-observation, not a regrowth.
-    let (third, coverage3) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (third, coverage3) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert!(matches!(coverage3[0].status, RegionStatus::Complete));
     assert_eq!(third.projects.len(), 1);
     let artifact = &third.projects[0].worktrees[0].artifacts;
@@ -235,12 +247,12 @@ fn worktree_losing_access_inside_a_readable_root_is_not_tombstoned() {
     make_project(&root, "proj-b", 6_000);
     let store = tempfile::tempdir().unwrap();
 
-    let (first, _) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (first, _) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert_eq!(first.projects.len(), 2);
 
     // Lock just one project's directory; the root itself stays readable.
     fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
-    let (second, coverage) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (second, coverage) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
 
     // The root as a whole was still walked (proj-b is still there), so
@@ -258,7 +270,7 @@ fn worktree_losing_access_inside_a_readable_root_is_not_tombstoned() {
     // ...but restoring access must show proj-a's artifact with zero
     // regrowth: it was never actually deleted, so the protected store
     // row must never have been tombstoned while access was lost.
-    let (third, _) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (third, _) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     let proj_a = third
         .projects
         .iter()
@@ -294,14 +306,18 @@ fn removing_a_root_from_scope_is_a_coverage_change_not_a_deletion() {
     assert_eq!(first.projects.len(), 2);
 
     // Scope edit: root_b is dropped entirely (as if removed from config).
-    let (second, coverage) = observe_scope(store.path(), &[root_a.clone()], &[]);
-    assert_eq!(coverage.len(), 1, "root_b is simply not a candidate anymore");
+    let (second, coverage) = observe_scope(store.path(), std::slice::from_ref(&root_a), &[]);
+    assert_eq!(
+        coverage.len(),
+        1,
+        "root_b is simply not a candidate anymore"
+    );
     assert_eq!(second.projects.len(), 1);
     assert_eq!(second.projects[0].name, "proj-a");
 
     // root_b's own store is untouched: re-observing it alone still finds
     // proj-b with no regrowth (it was never marked absent).
-    let (third, coverage3) = observe_scope(store.path(), &[root_b.clone()], &[]);
+    let (third, coverage3) = observe_scope(store.path(), std::slice::from_ref(&root_b), &[]);
     assert!(matches!(coverage3[0].status, RegionStatus::Complete));
     assert_eq!(third.projects.len(), 1);
     assert_eq!(third.projects[0].name, "proj-b");
@@ -331,7 +347,7 @@ fn excluded_subtree_inside_a_kept_root_is_pruned_not_measured() {
 
     let (report, coverage) = observe_scope(
         store.path(),
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &[excluded_project.display().to_string()],
     );
 
@@ -367,13 +383,13 @@ fn real_delete_then_regrow_still_counts_regrowth() {
     let proj = make_project(&root, "proj", 4_000);
     let store = tempfile::tempdir().unwrap();
 
-    let (first, _) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (first, _) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert_eq!(first.projects.len(), 1);
 
     // Genuine deletion: the whole checkout is gone (ENOENT), not merely
     // unreadable.
     fs::remove_dir_all(&proj).unwrap();
-    let (second, coverage) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (second, coverage) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert!(matches!(coverage[0].status, RegionStatus::Complete));
     assert!(second.projects.is_empty(), "{:?}", second.projects);
 
@@ -382,7 +398,7 @@ fn real_delete_then_regrow_still_counts_regrowth() {
     // rediscovered and that no crash/inconsistency results from the
     // store having tombstoned the old one).
     make_project(&root, "proj", 4_000);
-    let (third, coverage3) = observe_scope(store.path(), &[root.clone()], &[]);
+    let (third, coverage3) = observe_scope(store.path(), std::slice::from_ref(&root), &[]);
     assert!(matches!(coverage3[0].status, RegionStatus::Complete));
     assert_eq!(third.projects.len(), 1, "{:?}", third.projects);
 }
@@ -424,7 +440,7 @@ fn missing_root_is_a_distinct_region_not_zero_bytes() {
     let missing = tmp.path().join("does-not-exist-yet");
     let store = tempfile::tempdir().unwrap();
 
-    let (report, coverage) = observe_scope(store.path(), &[missing.clone()], &[]);
+    let (report, coverage) = observe_scope(store.path(), std::slice::from_ref(&missing), &[]);
     assert_eq!(coverage.len(), 1);
     assert!(matches!(coverage[0].status, RegionStatus::Missing));
     assert!(report.projects.is_empty());
@@ -446,7 +462,7 @@ fn scope_root_status_present_matches_walked_root() {
     let scope = resolve_effective_scope(
         &env,
         &explicit_only_config(),
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &registry,
         1,
     );
