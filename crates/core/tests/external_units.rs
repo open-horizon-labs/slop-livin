@@ -246,11 +246,29 @@ fn tool_executable_removed_but_storage_remains_still_measures_it() {
     // `brew --prefix` query this detector might attempt fails, exactly
     // as it would with `brew` missing from `PATH`.
     let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
-    let unit = units
+    // #49 refined Homebrew into Cellar/Caskroom as their own units,
+    // separate from the bare prefix -- the fixture's file lives under
+    // Cellar, so *that* unit (not the prefix unit, which now correctly
+    // excludes it) is what still measures it with no working `brew`.
+    let cellar = units
+        .iter()
+        .find(|u| {
+            u.detector_id == "homebrew"
+                && u.path == fs::canonicalize(&prefix).unwrap().join("Cellar")
+        })
+        .expect("Cellar is still measured with no working brew binary");
+    assert!(cellar.bytes > 0, "{}", cellar.bytes);
+    // The bare prefix is still measured too, just correctly excluding
+    // Cellar/Caskroom's separately-counted bytes (the external-location
+    // double-measurement fix, same chunk).
+    let prefix_unit = units
         .iter()
         .find(|u| u.detector_id == "homebrew" && u.path == fs::canonicalize(&prefix).unwrap())
         .expect("the conventional prefix is still measured with no working brew binary");
-    assert!(unit.bytes > 0, "{}", unit.bytes);
+    assert_eq!(
+        prefix_unit.bytes, 0,
+        "the prefix's own measurement must exclude Cellar's separately-counted bytes"
+    );
 }
 
 /// A unit whose storage is unreadable this pass (simulated the same way

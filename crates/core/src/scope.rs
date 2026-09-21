@@ -862,16 +862,23 @@ mod tests {
         mk(home, "src/nested");
         let env = env_at(home);
         let registry = Registry::with_builtins();
+        // Isolate this test from every detector's own convention paths
+        // (some, like Homebrew's /opt/homebrew or CoreSimulator's
+        // system-wide runtime volumes, are absolute paths outside the
+        // fixture home and may or may not exist on the machine running
+        // this test) -- this test is about nested folding under ~/src,
+        // not the detector catalog. Disabling every non-builtin-defaults
+        // detector (derived from the registry, not hand-enumerated) is
+        // what keeps this assertion valid as the catalog grows (#45-#49).
+        let non_builtin_detectors: Vec<String> = registry
+            .detectors()
+            .iter()
+            .map(|d| d.id().to_string())
+            .filter(|id| id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID)
+            .collect();
         let cfg = ScanConfig {
             include: vec!["~/src/nested".to_string()],
-            // Isolate this test from whatever real /opt/homebrew or
-            // /usr/local happen to exist on the machine running it --
-            // this test is about nested folding, not Homebrew.
-            disabled_detectors: vec![
-                "cargo-home".to_string(),
-                "rustup".to_string(),
-                "homebrew".to_string(),
-            ],
+            disabled_detectors: non_builtin_detectors,
             ..ScanConfig::default()
         };
         let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);

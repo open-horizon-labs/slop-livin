@@ -1538,7 +1538,6 @@ pub fn report_scope_with_source(
         github_enrichment: None,
         nested_artifacts: Vec::new(),
     };
-    let mut du_total_sum: Option<u64> = None;
 
     for scope_root in &scope.roots {
         match &scope_root.status {
@@ -1655,72 +1654,148 @@ pub fn report_scope_with_source(
                     projects: r.projects.len(),
                     mode,
                 });
-                merge_summary_into(&mut merged.summary, &r.summary);
-
-                if merged.root.as_os_str().is_empty() {
-                    merged.root = path.clone();
-                }
-                merged.projects.extend(r.projects);
-                merged.unowned.extend(r.unowned);
-                merged.reconciliation.attributed += r.reconciliation.attributed;
-                merged.reconciliation.unowned += r.reconciliation.unowned;
-                merged.reconciliation.walked_total += r.reconciliation.walked_total;
-                merged.reconciliation.docker_attributed += r.reconciliation.docker_attributed;
-                merged.reconciliation.docker_unowned += r.reconciliation.docker_unowned;
-                if let Some(d) = r.reconciliation.du_total {
-                    du_total_sum = Some(du_total_sum.unwrap_or(0) + d);
-                }
-                merged.series_by_key.extend(r.series_by_key);
-                if merged.total_series.is_empty() {
-                    merged.total_series = r.total_series;
-                    merged.series_window_secs = r.series_window_secs;
-                } else if merged.total_series.len() == r.total_series.len() {
-                    for (a, b) in merged.total_series.iter_mut().zip(r.total_series.iter()) {
-                        *a = match (*a, *b) {
-                            (None, None) => None,
-                            (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
-                        };
-                    }
-                }
-                // Multi-root series bucket windows can drift apart (each
-                // root's `report_full_mode_with_source` call reads its own
-                // wall-clock `now`); a length mismatch is left as the
-                // first root's series rather than silently interleaved --
-                // documented as a #51 follow-up (TUI is the only current
-                // consumer of `total_series` for a live sparkline).
-                for note in r.notes {
-                    merged.notes.push(format!("[{}] {note}", path.display()));
-                }
-                if let Some(dbw) = r.dirs_by_worktree {
-                    merged
-                        .dirs_by_worktree
-                        .get_or_insert_with(std::collections::HashMap::new)
-                        .extend(dbw);
-                }
-                if let Some(fbw) = r.files_by_worktree {
-                    merged
-                        .files_by_worktree
-                        .get_or_insert_with(std::collections::HashMap::new)
-                        .extend(fbw);
-                }
-                if merged.schedule_line.is_none() {
-                    merged.schedule_line = r.schedule_line;
-                }
-                match (&mut merged.github_enrichment, r.github_enrichment) {
-                    (slot @ None, Some(g)) => *slot = Some(g),
-                    (Some(acc), Some(g)) => {
-                        acc.calls_made += g.calls_made;
-                        acc.worktrees_enriched += g.worktrees_enriched;
-                        acc.elapsed_secs += g.elapsed_secs;
-                    }
-                    _ => {}
-                }
-                merged.nested_artifacts.extend(r.nested_artifacts);
+                merge_root_report_into(&mut merged, r);
             }
         }
     }
-    merged.reconciliation.du_total = du_total_sum;
     Ok((merged, coverage))
+}
+
+/// Folds one already-fully-formed single-root [`Report`] `r` into a
+/// running multi-root accumulator `merged` -- the reusable half of
+/// [`report_scope_with_source`]'s per-root merge, factored out (#51) so
+/// a live TUI refresh can rebuild its aggregate report by re-folding a
+/// per-root cache (`reports_by_root`) without re-deriving this
+/// accumulation logic. `r.root` (already set to the walked path by
+/// `report_full_mode_with_exclusions`) is used to prefix `r`'s notes and
+/// as `merged.root`'s fallback, exactly as `report_scope_with_source`
+/// used its own `path` variable before this extraction -- calling this
+/// twice for the same root is safe only if the caller first removes
+/// that root's *previous* contribution (a fresh `Report::default()`-like
+/// accumulator, or a full re-fold over every root's latest cached
+/// report, never an in-place double-add of the same root).
+pub fn merge_root_report_into(merged: &mut Report, r: Report) {
+    let path = r.root.clone();
+    merge_summary_into(&mut merged.summary, &r.summary);
+
+    if merged.root.as_os_str().is_empty() {
+        merged.root = path.clone();
+    }
+    merged.projects.extend(r.projects);
+    merged.unowned.extend(r.unowned);
+    merged.reconciliation.attributed += r.reconciliation.attributed;
+    merged.reconciliation.unowned += r.reconciliation.unowned;
+    merged.reconciliation.walked_total += r.reconciliation.walked_total;
+    merged.reconciliation.docker_attributed += r.reconciliation.docker_attributed;
+    merged.reconciliation.docker_unowned += r.reconciliation.docker_unowned;
+    merged.reconciliation.du_total = match (merged.reconciliation.du_total, r.reconciliation.du_total) {
+        (None, None) => None,
+        (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+    };
+    merged.series_by_key.extend(r.series_by_key);
+    if merged.total_series.is_empty() {
+        merged.total_series = r.total_series;
+        merged.series_window_secs = r.series_window_secs;
+    } else if merged.total_series.len() == r.total_series.len() {
+        for (a, b) in merged.total_series.iter_mut().zip(r.total_series.iter()) {
+            *a = match (*a, *b) {
+                (None, None) => None,
+                (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+            };
+        }
+    }
+    // Multi-root series bucket windows can drift apart (each root's
+    // `report_full_mode_with_source` call reads its own wall-clock
+    // `now`); a length mismatch is left as the first root's series
+    // rather than silently interleaved -- documented as a #51 follow-up
+    // (TUI is the only current consumer of `total_series` for a live
+    // sparkline).
+    for note in r.notes {
+        merged.notes.push(format!("[{}] {note}", path.display()));
+    }
+    if let Some(dbw) = r.dirs_by_worktree {
+        merged
+            .dirs_by_worktree
+            .get_or_insert_with(std::collections::HashMap::new)
+            .extend(dbw);
+    }
+    if let Some(fbw) = r.files_by_worktree {
+        merged
+            .files_by_worktree
+            .get_or_insert_with(std::collections::HashMap::new)
+            .extend(fbw);
+    }
+    if merged.schedule_line.is_none() {
+        merged.schedule_line = r.schedule_line;
+    }
+    match (&mut merged.github_enrichment, r.github_enrichment) {
+        (slot @ None, Some(g)) => *slot = Some(g),
+        (Some(acc), Some(g)) => {
+            acc.calls_made += g.calls_made;
+            acc.worktrees_enriched += g.worktrees_enriched;
+            acc.elapsed_secs += g.elapsed_secs;
+        }
+        _ => {}
+    }
+    merged.nested_artifacts.extend(r.nested_artifacts);
+}
+
+/// Rebuilds one merged multi-root [`Report`] from scratch given every
+/// root's latest single-root report, in a stable order -- what a TUI
+/// live refresh calls after replacing one root's entry in its own
+/// `reports_by_root` cache, so a change to one root can never leave
+/// another root's rows stale, duplicated, or dropped: every rebuild
+/// starts from an empty accumulator and re-folds every cached report.
+pub fn merge_reports(
+    roots_in_order: &[PathBuf],
+    reports_by_root: &std::collections::HashMap<PathBuf, Report>,
+) -> Report {
+    let observed_at = reports_by_root
+        .values()
+        .map(|r| r.observed_at)
+        .max()
+        .unwrap_or_else(crate::entities::now);
+    let mut merged = Report {
+        observed_at,
+        root: PathBuf::new(),
+        projects: Vec::new(),
+        unowned: Vec::new(),
+        reconciliation: Reconciliation {
+            attributed: 0,
+            unowned: 0,
+            walked_total: 0,
+            du_total: None,
+            docker_attributed: 0,
+            docker_unowned: 0,
+        },
+        series_by_key: std::collections::HashMap::new(),
+        total_series: Vec::new(),
+        series_window_secs: 0,
+        notes: Vec::new(),
+        dirs_by_worktree: None,
+        files_by_worktree: None,
+        schedule_line: None,
+        summary: Summary::default(),
+        github_enrichment: None,
+        nested_artifacts: Vec::new(),
+    };
+    // `dirs_by_worktree`/`files_by_worktree` are `Some` only when the
+    // caller asked for them (`include_dirs`); infer that from whether
+    // *any* per-root report carried them, so the merged report matches
+    // what a single `report_scope` call with the same flag would give.
+    let include_dirs = reports_by_root
+        .values()
+        .any(|r| r.dirs_by_worktree.is_some() || r.files_by_worktree.is_some());
+    if include_dirs {
+        merged.dirs_by_worktree = Some(std::collections::HashMap::new());
+        merged.files_by_worktree = Some(std::collections::HashMap::new());
+    }
+    for root in roots_in_order {
+        if let Some(r) = reports_by_root.get(root) {
+            merge_root_report_into(&mut merged, r.clone());
+        }
+    }
+    merged
 }
 
 /// Merges one root's already-bus-computed `Summary` into a running total.
