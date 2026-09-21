@@ -1,4 +1,10 @@
-//! rustup home: `RUSTUP_HOME` override, else `~/.rustup`.
+//! rustup home: `RUSTUP_HOME` override, else `~/.rustup`. Extended
+//! (#46) to distinguish `toolchains/` (installed, the bulk of real
+//! disk use) from `downloads/` (in-progress/partial download staging)
+//! from `tmp/` (rustup's own scratch space for extracting an update
+//! before it is moved into place) -- three very different lifetimes
+//! under the same root, previously collapsed into one "installation"
+//! entry for the whole home.
 //! https://rust-lang.github.io/rustup/environment-variables.html
 
 use super::{
@@ -38,6 +44,14 @@ impl Detector for RustupDetector {
             ProposedLocation {
                 detector_id: RUSTUP_DETECTOR_ID.to_string(),
                 path: Some(base.clone()),
+                category: StorageCategory::LocalState,
+                provenance: provenance.clone(),
+                status: LocationStatus::Resolved,
+                note: Some("settings.toml, update-hashes, and misc. state".to_string()),
+            },
+            ProposedLocation {
+                detector_id: RUSTUP_DETECTOR_ID.to_string(),
+                path: Some(base.join("toolchains")),
                 category: StorageCategory::Installation,
                 provenance: provenance.clone(),
                 status: LocationStatus::Resolved,
@@ -47,9 +61,17 @@ impl Detector for RustupDetector {
                 detector_id: RUSTUP_DETECTOR_ID.to_string(),
                 path: Some(base.join("downloads")),
                 category: StorageCategory::Downloads,
-                provenance,
+                provenance: provenance.clone(),
                 status: LocationStatus::Resolved,
                 note: Some("in-progress/partial toolchain download staging".to_string()),
+            },
+            ProposedLocation {
+                detector_id: RUSTUP_DETECTOR_ID.to_string(),
+                path: Some(base.join("tmp")),
+                category: StorageCategory::Cache,
+                provenance,
+                status: LocationStatus::Resolved,
+                note: Some("scratch space for extracting an update before install".to_string()),
             },
         ]
     }
@@ -81,5 +103,21 @@ mod tests {
             got[0].provenance,
             Provenance::EnvVar("RUSTUP_HOME".to_string())
         );
+    }
+
+    #[test]
+    fn toolchains_downloads_and_tmp_are_categorized_distinctly() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        let got = RustupDetector.detect(&env);
+        let cat = |rel: &str| {
+            got.iter()
+                .find(|l| l.path == Some(PathBuf::from("/Users/dev/.rustup").join(rel)))
+                .map(|l| l.category)
+        };
+        assert_eq!(cat("toolchains"), Some(StorageCategory::Installation));
+        assert_eq!(cat("downloads"), Some(StorageCategory::Downloads));
+        assert_eq!(cat("tmp"), Some(StorageCategory::Cache));
+        assert_eq!(cat(""), Some(StorageCategory::LocalState));
     }
 }

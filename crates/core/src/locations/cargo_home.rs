@@ -2,9 +2,18 @@
 //! "cargo-home"). https://doc.rust-lang.org/cargo/guide/cargo-home.html
 //!
 //! Reports the home directory itself (installation-adjacent: `bin/`,
-//! `config.toml`, credentials) separately from the two large, safely
-//! re-downloadable subtrees so a consumer can treat them differently --
-//! this registry only proposes locations, it does not judge disposal.
+//! `config.toml`, credentials) separately from four categorized
+//! subtrees (#47's refinement over the original two-way registry/git
+//! split): `registry/cache` (raw downloaded `.crate` files) and
+//! `git/db` (bare git object databases) are raw downloads; `registry/src`
+//! (extracted crate sources) and `git/checkouts` (checked-out worktrees
+//! materialized from `git/db`) are derived/extracted content -- still
+//! disposable, but re-materializing them costs a local extraction, not
+//! a network fetch, which is a materially different "how expensive to
+//! get back" story worth keeping visible. This registry only proposes
+//! locations; it does not judge disposal.
+
+use std::path::PathBuf;
 
 use super::{
     Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
@@ -34,7 +43,7 @@ impl Detector for CargoHomeDetector {
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let (base, provenance) = match env.env_var("CARGO_HOME") {
             Some(v) if !v.is_empty() => (
-                std::path::PathBuf::from(v),
+                PathBuf::from(v),
                 Provenance::EnvVar("CARGO_HOME".to_string()),
             ),
             _ => (env.home.join(".cargo"), Provenance::BuiltinConvention),
@@ -50,19 +59,43 @@ impl Detector for CargoHomeDetector {
             },
             ProposedLocation {
                 detector_id: CARGO_HOME_DETECTOR_ID.to_string(),
-                path: Some(base.join("registry")),
-                category: StorageCategory::Cache,
+                path: Some(base.join("registry/cache")),
+                category: StorageCategory::Downloads,
                 provenance: provenance.clone(),
                 status: LocationStatus::Resolved,
-                note: Some("downloaded crate sources and registry index cache".to_string()),
+                note: Some("downloaded .crate archives (raw registry download cache)".to_string()),
             },
             ProposedLocation {
                 detector_id: CARGO_HOME_DETECTOR_ID.to_string(),
-                path: Some(base.join("git")),
+                path: Some(base.join("registry/src")),
+                category: StorageCategory::Cache,
+                provenance: provenance.clone(),
+                status: LocationStatus::Resolved,
+                note: Some("extracted crate sources, materialized from registry/cache".to_string()),
+            },
+            ProposedLocation {
+                detector_id: CARGO_HOME_DETECTOR_ID.to_string(),
+                path: Some(base.join("registry/index")),
+                category: StorageCategory::Downloads,
+                provenance: provenance.clone(),
+                status: LocationStatus::Resolved,
+                note: Some("registry index cache".to_string()),
+            },
+            ProposedLocation {
+                detector_id: CARGO_HOME_DETECTOR_ID.to_string(),
+                path: Some(base.join("git/db")),
+                category: StorageCategory::Downloads,
+                provenance: provenance.clone(),
+                status: LocationStatus::Resolved,
+                note: Some("bare git object databases for git dependencies".to_string()),
+            },
+            ProposedLocation {
+                detector_id: CARGO_HOME_DETECTOR_ID.to_string(),
+                path: Some(base.join("git/checkouts")),
                 category: StorageCategory::Cache,
                 provenance,
                 status: LocationStatus::Resolved,
-                note: Some("checked-out git dependencies".to_string()),
+                note: Some("checked-out worktrees materialized from git/db".to_string()),
             },
         ]
     }
@@ -80,12 +113,38 @@ mod tests {
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = CargoHomeDetector.detect(&env);
         assert_eq!(got[0].path, Some(PathBuf::from("/Users/dev/.cargo")));
-        assert_eq!(
-            got[1].path,
-            Some(PathBuf::from("/Users/dev/.cargo/registry"))
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Users/dev/.cargo/registry/cache")))
         );
-        assert_eq!(got[2].path, Some(PathBuf::from("/Users/dev/.cargo/git")));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Users/dev/.cargo/git/checkouts")))
+        );
         assert!(matches!(got[0].provenance, Provenance::BuiltinConvention));
+    }
+
+    /// #47's refinement: raw downloads (registry/cache, registry/index,
+    /// git/db) and derived/extracted content (registry/src,
+    /// git/checkouts) must be categorized distinctly, not collapsed
+    /// back into one "cache" bucket -- the tempting shortcut this
+    /// catches is re-merging registry/git into a single category entry
+    /// the way the pre-#47 detector did.
+    #[test]
+    fn downloads_and_extracted_content_are_categorized_distinctly() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        let got = CargoHomeDetector.detect(&env);
+        let cat = |rel: &str| {
+            got.iter()
+                .find(|l| l.path == Some(PathBuf::from("/Users/dev/.cargo").join(rel)))
+                .map(|l| l.category)
+        };
+        assert_eq!(cat("registry/cache"), Some(StorageCategory::Downloads));
+        assert_eq!(cat("registry/src"), Some(StorageCategory::Cache));
+        assert_eq!(cat("registry/index"), Some(StorageCategory::Downloads));
+        assert_eq!(cat("git/db"), Some(StorageCategory::Downloads));
+        assert_eq!(cat("git/checkouts"), Some(StorageCategory::Cache));
     }
 
     #[test]

@@ -23,24 +23,45 @@
 //! rest of detection.
 
 pub mod aider;
+pub mod android;
+pub mod asdf;
 pub mod builtin;
 pub mod cargo_home;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;
 pub mod codex_desktop;
+pub mod conda;
 pub mod continue_dev;
 pub mod copilot_cli;
+pub mod core_simulator;
 pub mod cursor;
+pub mod docker_desktop;
 pub mod gemini_cli;
+pub mod go;
+pub mod gradle;
 pub mod homebrew;
+pub mod huggingface;
+pub mod maven;
+pub mod mise;
+pub mod npm;
+pub mod nvm;
 pub mod oh_my_pi;
+pub mod ollama;
 pub mod opencode;
 pub mod pi;
+pub mod pip;
+pub mod pnpm;
+pub mod pyenv;
+pub mod rbenv;
 pub mod roo_code;
+pub mod ruby_install;
 pub mod rustup;
+pub mod rvm;
+pub mod uv;
 pub mod vscode_hosts;
 pub mod windsurf;
+pub mod xcode;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,7 +74,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the set of detectors or their resolution semantics
 /// changes, so a persisted `EffectiveScope` (`crate::scope`) can show it
 /// was resolved under an older catalog than the one now running.
-pub const CATALOG_VERSION: &str = "2026-09-21.3";
+pub const CATALOG_VERSION: &str = "2026-09-21.4";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -187,7 +208,13 @@ pub trait CommandRunner: Send + Sync {
 /// detector that needs a new query adds one line here, in the open,
 /// reviewable alongside the detector itself -- never a free-form string
 /// built at call time.
-pub const ALLOWED_COMMANDS: &[(&str, &[&str])] = &[("brew", &["--prefix"])];
+pub const ALLOWED_COMMANDS: &[(&str, &[&str])] = &[
+    ("brew", &["--prefix"]),
+    (
+        "defaults",
+        &["read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation"],
+    ),
+];
 
 /// Runs allow-listed commands for real, bounded by `timeout`. Refuses
 /// (without spawning a process) anything not on [`ALLOWED_COMMANDS`].
@@ -451,6 +478,27 @@ impl Registry {
                 Box::new(cline::ClineDetector),
                 Box::new(roo_code::RooCodeDetector),
                 Box::new(continue_dev::ContinueDetector),
+                Box::new(mise::MiseDetector),
+                Box::new(asdf::AsdfDetector),
+                Box::new(pyenv::PyenvDetector),
+                Box::new(uv::UvDetector),
+                Box::new(conda::CondaDetector),
+                Box::new(rbenv::RbenvDetector),
+                Box::new(rvm::RvmDetector),
+                Box::new(ruby_install::RubyInstallDetector),
+                Box::new(nvm::NvmDetector),
+                Box::new(npm::NpmDetector),
+                Box::new(pnpm::PnpmDetector),
+                Box::new(gradle::GradleDetector),
+                Box::new(maven::MavenDetector),
+                Box::new(go::GoDetector),
+                Box::new(pip::PipDetector),
+                Box::new(xcode::XcodeDetector),
+                Box::new(core_simulator::CoreSimulatorDetector),
+                Box::new(android::AndroidDetector),
+                Box::new(huggingface::HuggingFaceDetector),
+                Box::new(ollama::OllamaDetector),
+                Box::new(docker_desktop::DockerDesktopDetector),
             ],
         }
     }

@@ -37,16 +37,22 @@ impl Detector for HomebrewDetector {
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let mut out = Vec::new();
+        // Every prefix this pass resolved, so Cellar/Caskroom (#49) can
+        // be proposed under each one below without duplicating the
+        // env-var-vs-convention branching above.
+        let mut prefixes: Vec<std::path::PathBuf> = Vec::new();
 
         if let Some(prefix) = env.env_var("HOMEBREW_PREFIX").filter(|v| !v.is_empty()) {
+            let path = std::path::PathBuf::from(prefix);
             out.push(ProposedLocation {
                 detector_id: HOMEBREW_DETECTOR_ID.to_string(),
-                path: Some(std::path::PathBuf::from(prefix)),
+                path: Some(path.clone()),
                 category: StorageCategory::Installation,
                 provenance: Provenance::EnvVar("HOMEBREW_PREFIX".to_string()),
                 status: LocationStatus::Resolved,
                 note: Some("Homebrew install prefix (from HOMEBREW_PREFIX)".to_string()),
             });
+            prefixes.push(path);
         } else {
             for prefix in ["/opt/homebrew", "/usr/local"] {
                 out.push(ProposedLocation {
@@ -57,20 +63,25 @@ impl Detector for HomebrewDetector {
                     status: LocationStatus::Resolved,
                     note: Some("conventional Homebrew install prefix".to_string()),
                 });
+                prefixes.push(std::path::PathBuf::from(prefix));
             }
             match env.run_command("brew", &["--prefix"]) {
                 Ok(CommandOutcome {
                     stdout,
                     success: true,
                 }) if !stdout.is_empty() => {
+                    let path = std::path::PathBuf::from(&stdout);
                     out.push(ProposedLocation {
                         detector_id: HOMEBREW_DETECTOR_ID.to_string(),
-                        path: Some(std::path::PathBuf::from(stdout)),
+                        path: Some(path.clone()),
                         category: StorageCategory::Installation,
                         provenance: Provenance::ToolQuery("brew --prefix".to_string()),
                         status: LocationStatus::Resolved,
                         note: Some("corroborated by `brew --prefix`".to_string()),
                     });
+                    if !prefixes.contains(&path) {
+                        prefixes.push(path);
+                    }
                 }
                 Ok(CommandOutcome { success: false, .. }) => {
                     out.push(ProposedLocation {
@@ -100,6 +111,28 @@ impl Detector for HomebrewDetector {
                 Ok(CommandOutcome { stdout, .. }) if stdout.is_empty() => {}
                 Ok(_) => {}
             }
+        }
+
+        // Cellar (installed formula versions) and Caskroom (installed
+        // cask app bundles) under every resolved prefix -- #49's
+        // refinement over the earlier "just the prefix" registration.
+        for prefix in &prefixes {
+            out.push(ProposedLocation {
+                detector_id: HOMEBREW_DETECTOR_ID.to_string(),
+                path: Some(prefix.join("Cellar")),
+                category: StorageCategory::Installation,
+                provenance: Provenance::BuiltinConvention,
+                status: LocationStatus::Resolved,
+                note: Some("installed formula versions".to_string()),
+            });
+            out.push(ProposedLocation {
+                detector_id: HOMEBREW_DETECTOR_ID.to_string(),
+                path: Some(prefix.join("Caskroom")),
+                category: StorageCategory::Installation,
+                provenance: Provenance::BuiltinConvention,
+                status: LocationStatus::Resolved,
+                note: Some("installed cask app bundles".to_string()),
+            });
         }
 
         out.push(ProposedLocation {
@@ -140,6 +173,29 @@ mod tests {
                 .any(|l| matches!(l.status, LocationStatus::UnresolvedWithReason { .. })),
             "the failed tool query must be reported, not silently dropped"
         );
+    }
+
+    /// #49: Cellar/Caskroom are proposed under *every* resolved prefix,
+    /// distinctly from the prefix itself and from the downloads cache --
+    /// the tempting shortcut this catches is treating the bare prefix
+    /// path as "installed formulas" without descending into Cellar.
+    #[test]
+    fn cellar_and_caskroom_are_proposed_under_each_prefix() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        let got = HomebrewDetector.detect(&env);
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            assert!(
+                got.iter()
+                    .any(|l| l.path == Some(PathBuf::from(prefix).join("Cellar"))),
+                "missing Cellar under {prefix}"
+            );
+            assert!(
+                got.iter()
+                    .any(|l| l.path == Some(PathBuf::from(prefix).join("Caskroom"))),
+                "missing Caskroom under {prefix}"
+            );
+        }
     }
 
     #[test]
