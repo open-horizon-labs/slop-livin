@@ -82,7 +82,9 @@ impl Detector for XcodeDetector {
                 category: StorageCategory::Cache,
                 provenance: Provenance::BuiltinConvention,
                 status: LocationStatus::Resolved,
-                note: Some("per-device/OS-version symbol files, shared across projects".to_string()),
+                note: Some(
+                    "per-device/OS-version symbol files, shared across projects".to_string(),
+                ),
             },
             ProposedLocation {
                 detector_id: XCODE_DETECTOR_ID.to_string(),
@@ -90,7 +92,9 @@ impl Detector for XcodeDetector {
                 category: StorageCategory::LocalState,
                 provenance: Provenance::BuiltinConvention,
                 status: LocationStatus::Resolved,
-                note: Some("Xcode's own UI/workspace state (breakpoints, window layout)".to_string()),
+                note: Some(
+                    "Xcode's own UI/workspace state (breakpoints, window layout)".to_string(),
+                ),
             },
         ];
 
@@ -107,11 +111,12 @@ impl Detector for XcodeDetector {
                     path: Some(std::path::PathBuf::from(stdout)),
                     category: StorageCategory::BuildOutput,
                     provenance: Provenance::ToolQuery(
-                        "defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation"
-                            .to_string(),
+                        "defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation".to_string(),
                     ),
                     status: LocationStatus::Resolved,
-                    note: Some("custom DerivedData location (IDECustomDerivedDataLocation)".to_string()),
+                    note: Some(
+                        "custom DerivedData location (IDECustomDerivedDataLocation)".to_string(),
+                    ),
                 });
             }
             Ok(CommandOutcome { success: false, .. }) | Err(_) => {
@@ -165,8 +170,7 @@ mod tests {
         let cat = |rel: &str| {
             got.iter()
                 .find(|l| {
-                    l.path
-                        == Some(PathBuf::from("/Users/dev/Library/Developer/Xcode").join(rel))
+                    l.path == Some(PathBuf::from("/Users/dev/Library/Developer/Xcode").join(rel))
                 })
                 .map(|l| l.category)
         };
@@ -183,8 +187,9 @@ mod tests {
             &["read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation"],
             "/Volumes/fast/DerivedData",
         ));
-        let env = Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS)
-            .with_runner(fake.clone());
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS)
+                .with_runner(fake.clone());
         let got = XcodeDetector.detect(&env);
         assert!(
             got.iter()
@@ -203,11 +208,10 @@ mod tests {
         let env =
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = XcodeDetector.detect(&env);
-        assert!(
-            got.iter()
-                .any(|l| l.path
-                    == Some(PathBuf::from("/Users/dev/Library/Developer/Xcode/DerivedData")))
-        );
+        assert!(got.iter().any(|l| l.path
+            == Some(PathBuf::from(
+                "/Users/dev/Library/Developer/Xcode/DerivedData"
+            ))));
     }
 
     #[test]

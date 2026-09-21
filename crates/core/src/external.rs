@@ -220,7 +220,9 @@ pub fn discover_and_measure(
             .iter()
             .enumerate()
             .filter(|(j, (_, other_canonical))| {
-                *j != idx && other_canonical != &canonical && other_canonical.starts_with(&canonical)
+                *j != idx
+                    && other_canonical != &canonical
+                    && other_canonical.starts_with(&canonical)
             })
             .map(|(_, (_, other_canonical))| other_canonical.clone())
             .collect();

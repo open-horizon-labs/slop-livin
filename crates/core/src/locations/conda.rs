@@ -115,7 +115,9 @@ impl Detector for CondaDetector {
                 category: StorageCategory::Downloads,
                 provenance: Provenance::ConfigField("pkgs_dirs".to_string()),
                 status: LocationStatus::NotPresent,
-                note: Some("no ~/.condarc; default package cache is under the base prefix".to_string()),
+                note: Some(
+                    "no ~/.condarc; default package cache is under the base prefix".to_string(),
+                ),
             });
         }
 
@@ -195,10 +197,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let env = Environment::fixture(tmp.path().to_path_buf(), HashMap::new(), Platform::MacOS);
         let got = CondaDetector.detect(&env);
-        assert!(
-            got.iter()
-                .any(|l| l.status == LocationStatus::NotPresent)
-        );
+        assert!(got.iter().any(|l| l.status == LocationStatus::NotPresent));
     }
 
     #[test]
@@ -227,8 +226,8 @@ mod tests {
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = CondaDetector.detect(&env);
         assert!(
-            got.iter()
-                .any(|l| l.status == LocationStatus::Resolved && l.category == StorageCategory::Installation)
+            got.iter().any(|l| l.status == LocationStatus::Resolved
+                && l.category == StorageCategory::Installation)
         );
     }
 }

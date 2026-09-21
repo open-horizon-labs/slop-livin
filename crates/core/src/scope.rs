@@ -502,14 +502,14 @@ pub fn resolve_effective_scope(
             continue;
         };
         for reason in &child_root.reasons {
-            if let RootReason::Detector { detector_id, .. } = reason {
-                if detector_id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
-                    external_pruned_subtrees.push(ExternalPruneNote {
-                        root: parent.clone(),
-                        path: child.clone(),
-                        detector_id: detector_id.clone(),
-                    });
-                }
+            if let RootReason::Detector { detector_id, .. } = reason
+                && detector_id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID
+            {
+                external_pruned_subtrees.push(ExternalPruneNote {
+                    root: parent.clone(),
+                    path: child.clone(),
+                    detector_id: detector_id.clone(),
+                });
             }
         }
     }

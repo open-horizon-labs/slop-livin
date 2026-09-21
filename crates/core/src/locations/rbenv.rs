@@ -98,7 +98,10 @@ mod tests {
         env_vars.insert("RBENV_ROOT".to_string(), "/opt/rbenv".to_string());
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = RbenvDetector.detect(&env);
-        assert!(got.iter().all(|l| l.path.as_ref().unwrap().starts_with("/opt/rbenv")));
+        assert!(
+            got.iter()
+                .all(|l| l.path.as_ref().unwrap().starts_with("/opt/rbenv"))
+        );
     }
 
     #[test]

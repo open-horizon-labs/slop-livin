@@ -107,9 +107,26 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
 fn observe_with_empty_scope_fails_visibly_never_falls_back_to_cwd() {
     let home = tempfile::tempdir().expect("home");
     let store = tempfile::tempdir().expect("store");
+    // Every detector in the catalog (#45-#49 added many more since this
+    // test was written) except `builtin-defaults`, which `defaults =
+    // false` above already disables -- derived here from the same
+    // registry the binary itself uses (never a hand-maintained literal
+    // list), so this test does not go stale every time a detector is
+    // added.
+    let disabled: Vec<String> = swamp_core::locations::Registry::with_builtins()
+        .detectors()
+        .iter()
+        .map(|d| d.id().to_string())
+        .filter(|id| id != swamp_core::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID)
+        .collect();
+    let disabled_toml = disabled
+        .iter()
+        .map(|id| format!("{id:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\", \"claude-code\", \"codex\", \"codex-desktop\", \"oh-my-pi\", \"opencode\", \"gemini-cli\", \"pi\", \"aider\", \"github-copilot-cli\", \"cursor\", \"windsurf\", \"cline\", \"roo-code\", \"continue\"]\n",
+        format!("[scan]\ndefaults = false\ndisabled_detectors = [{disabled_toml}]\n"),
     )
     .unwrap();
 

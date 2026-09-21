@@ -104,10 +104,12 @@ fn nested_external_location_is_pruned_from_its_parent_roots_walk() {
     // directly) must equal exactly what the ordinary walk attributed to
     // that root -- no more (would mean Homebrew leaked back in), no
     // less (would mean real non-Homebrew cache content vanished).
-    let expected_without_homebrew =
-        resize_artifact_excluding(&caches, swamp_core::report::ArtifactKind::Unknown, 1_000, &[
-            homebrew_cache.clone(),
-        ]);
+    let expected_without_homebrew = resize_artifact_excluding(
+        &caches,
+        swamp_core::report::ArtifactKind::Unknown,
+        1_000,
+        std::slice::from_ref(&homebrew_cache),
+    );
     assert_eq!(
         report.reconciliation.walked_total, expected_without_homebrew.bytes,
         "the ordinary walk of ~/Library/Caches must attribute exactly the \
@@ -226,16 +228,22 @@ fn cargo_homes_own_measurement_excludes_its_separately_measured_subtrees() {
     let home = tempfile::tempdir().unwrap();
     let cargo_home = home.path().join("fixture-cargo");
     write_pattern(&cargo_home.join("bin/cargo"), 5_000);
-    write_pattern(&cargo_home.join("registry/cache/somecrate-1.0.crate"), 30_000);
-    write_pattern(&cargo_home.join("registry/src/somecrate-1.0/lib.rs"), 20_000);
+    write_pattern(
+        &cargo_home.join("registry/cache/somecrate-1.0.crate"),
+        30_000,
+    );
+    write_pattern(
+        &cargo_home.join("registry/src/somecrate-1.0/lib.rs"),
+        20_000,
+    );
     write_pattern(&cargo_home.join("git/db/somerepo/HEAD"), 1_000);
-    write_pattern(&cargo_home.join("git/checkouts/somerepo/abc123/lib.rs"), 8_000);
+    write_pattern(
+        &cargo_home.join("git/checkouts/somerepo/abc123/lib.rs"),
+        8_000,
+    );
 
     let mut env_vars = std::collections::HashMap::new();
-    env_vars.insert(
-        "CARGO_HOME".to_string(),
-        cargo_home.display().to_string(),
-    );
+    env_vars.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
     // Homebrew is disabled by `only_config` below, but its prefix is
     // still pinned into the fixture home defensively, matching every
     // other test in this file -- "never scan the developer's real home
@@ -243,7 +251,10 @@ fn cargo_homes_own_measurement_excludes_its_separately_measured_subtrees() {
     // active detector list.
     env_vars.insert(
         "HOMEBREW_PREFIX".to_string(),
-        home.path().join("fixture-homebrew-prefix").display().to_string(),
+        home.path()
+            .join("fixture-homebrew-prefix")
+            .display()
+            .to_string(),
     );
     let env = Environment::fixture(home.path().to_path_buf(), env_vars, Platform::MacOS);
     let registry = Registry::with_builtins();
@@ -271,7 +282,11 @@ fn cargo_homes_own_measurement_excludes_its_separately_measured_subtrees() {
         ],
     );
     assert_eq!(base_unit.bytes, base_only.bytes);
-    assert!(base_unit.bytes > 0 && base_unit.bytes < 10_000, "{}", base_unit.bytes);
+    assert!(
+        base_unit.bytes > 0 && base_unit.bytes < 10_000,
+        "{}",
+        base_unit.bytes
+    );
 
     // Sum of every unit's bytes must equal one undivided measurement of
     // the whole cargo home -- proving nothing nested was double-counted

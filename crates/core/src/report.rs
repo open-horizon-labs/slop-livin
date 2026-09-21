@@ -1509,8 +1509,49 @@ pub fn report_scope_with_source(
     force_full: bool,
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<(Report, Vec<crate::coverage::RootCoverage>)> {
+    let (r, c, _per_root) = report_scope_with_parts(
+        scope,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+    )?;
+    Ok((r, c))
+}
+
+/// Same as [`report_scope_with_source`], additionally returning every
+/// present root's own single-root [`Report`] (keyed by its walked
+/// path), before they were folded into the merged one -- what a
+/// multi-root TUI (#51) needs so a later live refresh can replace just
+/// one root's entry (`report::merge_root_report_into`/
+/// `report::merge_reports`) instead of re-walking or re-merging every
+/// root whenever any one of them changes.
+#[allow(clippy::too_many_arguments)]
+pub fn report_scope_with_parts(
+    scope: &crate::scope::EffectiveScope,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+) -> Result<(
+    Report,
+    Vec<crate::coverage::RootCoverage>,
+    std::collections::HashMap<PathBuf, Report>,
+)> {
     use crate::coverage::{RegionStatus, RootCoverage};
     use crate::scope::RootStatus;
+
+    let mut per_root: std::collections::HashMap<PathBuf, Report> = std::collections::HashMap::new();
 
     let observed_at = crate::entities::now();
     let mut coverage: Vec<RootCoverage> = Vec::new();
@@ -1654,11 +1695,12 @@ pub fn report_scope_with_source(
                     projects: r.projects.len(),
                     mode,
                 });
+                per_root.insert(path.clone(), r.clone());
                 merge_root_report_into(&mut merged, r);
             }
         }
     }
-    Ok((merged, coverage))
+    Ok((merged, coverage, per_root))
 }
 
 /// Folds one already-fully-formed single-root [`Report`] `r` into a
@@ -1688,10 +1730,11 @@ pub fn merge_root_report_into(merged: &mut Report, r: Report) {
     merged.reconciliation.walked_total += r.reconciliation.walked_total;
     merged.reconciliation.docker_attributed += r.reconciliation.docker_attributed;
     merged.reconciliation.docker_unowned += r.reconciliation.docker_unowned;
-    merged.reconciliation.du_total = match (merged.reconciliation.du_total, r.reconciliation.du_total) {
-        (None, None) => None,
-        (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
-    };
+    merged.reconciliation.du_total =
+        match (merged.reconciliation.du_total, r.reconciliation.du_total) {
+            (None, None) => None,
+            (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+        };
     merged.series_by_key.extend(r.series_by_key);
     if merged.total_series.is_empty() {
         merged.total_series = r.total_series;

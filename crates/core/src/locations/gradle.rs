@@ -90,11 +90,9 @@ mod tests {
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/.gradle/caches")))
         );
-        assert!(
-            got.iter().any(|l| l.path
-                == Some(PathBuf::from("/Users/dev/.gradle/wrapper/dists"))
-                && l.category == StorageCategory::Installation)
-        );
+        assert!(got.iter().any(|l| l.path
+            == Some(PathBuf::from("/Users/dev/.gradle/wrapper/dists"))
+            && l.category == StorageCategory::Installation));
     }
 
     #[test]
@@ -103,7 +101,10 @@ mod tests {
         env_vars.insert("GRADLE_USER_HOME".to_string(), "/opt/gradle".to_string());
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = GradleDetector.detect(&env);
-        assert!(got.iter().all(|l| l.path.as_ref().unwrap().starts_with("/opt/gradle")));
+        assert!(
+            got.iter()
+                .all(|l| l.path.as_ref().unwrap().starts_with("/opt/gradle"))
+        );
     }
 
     #[test]

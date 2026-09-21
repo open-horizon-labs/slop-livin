@@ -38,9 +38,7 @@ fn read_goenv(text: &str) -> HashMap<String, String> {
 
 fn goenv_path(env: &Environment) -> PathBuf {
     match env.platform {
-        Platform::MacOS => env
-            .home
-            .join("Library/Application Support/go/env"),
+        Platform::MacOS => env.home.join("Library/Application Support/go/env"),
         Platform::Linux => env.home.join(".config/go/env"),
     }
 }
@@ -153,11 +151,9 @@ mod tests {
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/go/pkg/mod"))
                     && l.category == StorageCategory::Cache)
         );
-        assert!(
-            got.iter().any(|l| l.path
-                == Some(PathBuf::from("/Users/dev/go/pkg/mod/cache/download"))
-                && l.category == StorageCategory::Downloads)
-        );
+        assert!(got.iter().any(|l| l.path
+            == Some(PathBuf::from("/Users/dev/go/pkg/mod/cache/download"))
+            && l.category == StorageCategory::Downloads));
         assert!(
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/Library/Caches/go-build")))

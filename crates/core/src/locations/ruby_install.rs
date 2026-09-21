@@ -69,8 +69,14 @@ mod tests {
         let env =
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = RubyInstallDetector.detect(&env);
-        assert!(got.iter().any(|l| l.path == Some(PathBuf::from("/Users/dev/.rubies"))));
-        assert!(got.iter().any(|l| l.path == Some(PathBuf::from("/opt/rubies"))));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Users/dev/.rubies")))
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/opt/rubies")))
+        );
     }
 
     #[test]

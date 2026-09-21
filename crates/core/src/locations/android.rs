@@ -84,7 +84,10 @@ impl Detector for AndroidDetector {
         ];
 
         let (avd, avd_prov) = match env.env_var("ANDROID_AVD_HOME").filter(|v| !v.is_empty()) {
-            Some(v) => (PathBuf::from(v), Provenance::EnvVar("ANDROID_AVD_HOME".to_string())),
+            Some(v) => (
+                PathBuf::from(v),
+                Provenance::EnvVar("ANDROID_AVD_HOME".to_string()),
+            ),
             None => (env.home.join(".android/avd"), Provenance::BuiltinConvention),
         };
         out.push(ProposedLocation {
@@ -110,8 +113,10 @@ mod tests {
         let env =
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = AndroidDetector.detect(&env);
-        assert!(got.iter().any(|l| l.path
-            == Some(PathBuf::from("/Users/dev/Library/Android/sdk/platforms"))));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Users/dev/Library/Android/sdk/platforms")))
+        );
         assert!(
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/.android/avd")))
@@ -132,10 +137,11 @@ mod tests {
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/opt/android-home/platforms")))
         );
-        assert!(
-            !got.iter()
-                .any(|l| l.path.as_ref().is_some_and(|p| p.starts_with("/opt/android-sdk-root")))
-        );
+        assert!(!got.iter().any(|l| {
+            l.path
+                .as_ref()
+                .is_some_and(|p| p.starts_with("/opt/android-sdk-root"))
+        }));
     }
 
     #[test]
@@ -159,10 +165,15 @@ mod tests {
         env_vars.insert("ANDROID_AVD_HOME".to_string(), "/data/avd".to_string());
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = AndroidDetector.detect(&env);
-        assert!(got.iter().any(|l| l.path == Some(PathBuf::from("/data/avd"))));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/data/avd")))
+        );
         // SDK root is untouched by ANDROID_AVD_HOME.
-        assert!(got.iter().any(|l| l.path
-            == Some(PathBuf::from("/Users/dev/Library/Android/sdk/platforms"))));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Users/dev/Library/Android/sdk/platforms")))
+        );
     }
 
     #[test]

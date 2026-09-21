@@ -47,7 +47,9 @@ impl Detector for CoreSimulatorDetector {
                 category: StorageCategory::Environments,
                 provenance: Provenance::BuiltinConvention,
                 status: LocationStatus::Resolved,
-                note: Some("mutable per-simulator instance data (installed apps, user data)".to_string()),
+                note: Some(
+                    "mutable per-simulator instance data (installed apps, user data)".to_string(),
+                ),
             },
             ProposedLocation {
                 detector_id: CORE_SIMULATOR_DETECTOR_ID.to_string(),
@@ -102,10 +104,10 @@ mod tests {
             == Some(PathBuf::from(
                 "/Users/dev/Library/Developer/CoreSimulator/Devices"
             ))));
-        assert!(got.iter().any(|l| l.path
-            == Some(PathBuf::from(
-                "/Library/Developer/CoreSimulator/Volumes"
-            ))));
+        assert!(
+            got.iter()
+                .any(|l| l.path == Some(PathBuf::from("/Library/Developer/CoreSimulator/Volumes")))
+        );
     }
 
     #[test]

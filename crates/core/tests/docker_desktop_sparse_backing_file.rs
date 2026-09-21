@@ -46,7 +46,10 @@ fn sparse_backing_file_reports_allocated_bytes_not_apparent_size() {
     // Never let this fixture reach the real Homebrew prefix.
     env.insert(
         "HOMEBREW_PREFIX".to_string(),
-        home.path().join("fixture-homebrew-prefix").display().to_string(),
+        home.path()
+            .join("fixture-homebrew-prefix")
+            .display()
+            .to_string(),
     );
     let environment = Environment::fixture(home.path().to_path_buf(), env, Platform::MacOS);
     let registry = Registry::with_builtins();

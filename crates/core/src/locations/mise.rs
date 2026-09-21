@@ -128,8 +128,10 @@ mod tests {
             "mise's normal Unix data root is ~/.local/share/mise, never ~/.mise"
         );
         assert!(
-            !got.iter()
-                .any(|l| l.path.as_ref().is_some_and(|p| p == Path::new("/Users/dev/.mise"))),
+            !got.iter().any(|l| l
+                .path
+                .as_ref()
+                .is_some_and(|p| p == Path::new("/Users/dev/.mise"))),
             "must never propose the wrong ~/.mise convention"
         );
     }
@@ -142,9 +144,9 @@ mod tests {
         let cat = |rel: &str| {
             got.iter()
                 .find(|l| {
-                    l.path
-                        .as_ref()
-                        .is_some_and(|p| p == &PathBuf::from("/Users/dev/.local/share/mise").join(rel))
+                    l.path.as_ref().is_some_and(|p| {
+                        p == &PathBuf::from("/Users/dev/.local/share/mise").join(rel)
+                    })
                 })
                 .map(|l| l.category)
         };
@@ -163,7 +165,10 @@ mod tests {
         let got = MiseDetector.detect(&env);
         assert_eq!(got[0].path, Some(PathBuf::from("/opt/mise-data")));
         assert_eq!(
-            got.iter().find(|l| l.category == StorageCategory::Cache).unwrap().path,
+            got.iter()
+                .find(|l| l.category == StorageCategory::Cache)
+                .unwrap()
+                .path,
             Some(PathBuf::from("/opt/mise-cache"))
         );
         // MISE_CONFIG_DIR was not overridden: still the convention path.

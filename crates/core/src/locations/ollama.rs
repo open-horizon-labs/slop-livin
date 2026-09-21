@@ -90,7 +90,10 @@ mod tests {
     #[test]
     fn ollama_models_env_var_wins() {
         let mut env_vars = HashMap::new();
-        env_vars.insert("OLLAMA_MODELS".to_string(), "/data/ollama-models".to_string());
+        env_vars.insert(
+            "OLLAMA_MODELS".to_string(),
+            "/data/ollama-models".to_string(),
+        );
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = OllamaDetector.detect(&env);
         assert_eq!(got[1].path, Some(PathBuf::from("/data/ollama-models")));

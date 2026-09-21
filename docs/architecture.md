@@ -145,6 +145,14 @@ per root. `report`/`observe`/`ui` all go through it when no explicit
 root is given; `observe`/`schedule` already looped over every present
 root before this chunk (this is the CLI's callers converging on one
 shared function, not a change to how any single root is walked).
+`report_scope_with_parts` (#51) is the same call with one more return
+value: every present root's own single-root `Report`, keyed by its
+walked path, alongside the merged one -- what `swamp_tui::run_scope`
+needs so a later live refresh can replace one root's contribution
+(`report::merge_root_report_into`/`merge_reports`) without re-walking or
+re-merging every other root. `report_scope`/`report_scope_with_source`
+keep their original two-value return for every existing caller;
+`report_scope_with_parts` is additive, not a breaking change to either.
 
 Two design choices are load-bearing here, both direct responses to the
 guardrail
@@ -232,14 +240,28 @@ artifact row:
   never the unit's identity, its bytes, or its regrowth count.
 
 `report_scope` and `external::discover_and_measure` are independent
-call graphs in this chunk: external units are never folded into
-`Report.reconciliation` (nothing to double-count, since they are never
-summed into `walked_total`/`attributed`/`unowned` in the first place).
-A future worker reconciling the two more tightly (e.g. excluding a
-detector-sourced external-unit root from also being walked as an
-ordinary scan root, which is today's pre-existing #41 behavior,
-unchanged by this chunk) should read `report.rs`'s `report_scope` and
-`external.rs`'s `discover_and_measure` together before changing either.
+call graphs: external units are never folded into `Report.reconciliation`
+(nothing to double-count, since they are never summed into
+`walked_total`/`attributed`/`unowned` in the first place). They *are*,
+however, reconciled against each other at the byte level (the #45-#49
+detector-catalog chunk's fix for a real gap the paragraph above used to
+name as still open): a detector-resolved location that folds into
+another kept root as a nested subdirectory (`scope::resolve_effective_scope`'s
+nested-folding pass, e.g. Homebrew's downloads cache inside the
+built-in `~/Library/Caches` default, or Cargo home's own `registry`/
+`git` subdirectories inside its own base directory) is pruned from that
+root's ordinary walk (`scope::EffectiveScope::external_pruned_subtrees`,
+consumed by `report_scope_with_source` the same way config `exclude`
+subtrees already were) and excluded from any *other* external
+candidate's own `resize_artifact` call
+(`external::discover_and_measure`'s per-candidate nested-exclusion
+computation, `walk::resize_artifact_excluding`) -- so the same bytes
+appear exactly once, attributed to whichever unit actually measures
+them, never to both a walked root's unowned total and an external
+unit, and never to two external units at once. See
+`crates/core/tests/external_double_measurement.rs` for the
+reconstruction-identity tests this fix must pass (sum of the pruned
+pieces equals one undivided naive measurement).
 
 Action boundary: `actions::unit_from_external`/`propose_external` let a
 plan name an external unit (`PlanUnit::external_category`); `execute`

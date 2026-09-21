@@ -21,7 +21,10 @@ impl NpmDetector {
     fn resolve(&self, env: &Environment) -> (std::path::PathBuf, Provenance) {
         for var in ["npm_config_cache", "NPM_CONFIG_CACHE"] {
             if let Some(v) = env.env_var(var).filter(|v| !v.is_empty()) {
-                return (std::path::PathBuf::from(v), Provenance::EnvVar(var.to_string()));
+                return (
+                    std::path::PathBuf::from(v),
+                    Provenance::EnvVar(var.to_string()),
+                );
             }
         }
         (env.home.join(".npm"), Provenance::BuiltinConvention)
@@ -86,7 +89,10 @@ mod tests {
     #[test]
     fn uppercase_fallback_used_when_lowercase_absent() {
         let mut env_vars = HashMap::new();
-        env_vars.insert("NPM_CONFIG_CACHE".to_string(), "/opt/npm-cache2".to_string());
+        env_vars.insert(
+            "NPM_CONFIG_CACHE".to_string(),
+            "/opt/npm-cache2".to_string(),
+        );
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = NpmDetector.detect(&env);
         assert_eq!(got[0].path, Some(PathBuf::from("/opt/npm-cache2")));

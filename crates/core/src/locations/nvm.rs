@@ -89,7 +89,10 @@ mod tests {
         env_vars.insert("NVM_DIR".to_string(), "/opt/nvm".to_string());
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = NvmDetector.detect(&env);
-        assert!(got.iter().all(|l| l.path.as_ref().unwrap().starts_with("/opt/nvm")));
+        assert!(
+            got.iter()
+                .all(|l| l.path.as_ref().unwrap().starts_with("/opt/nvm"))
+        );
     }
 
     #[test]

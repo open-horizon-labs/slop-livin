@@ -95,10 +95,10 @@ mod tests {
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/.asdf/installs")))
         );
-        assert!(got.iter().all(|l| matches!(
-            l.provenance,
-            Provenance::BuiltinConvention
-        )));
+        assert!(
+            got.iter()
+                .all(|l| matches!(l.provenance, Provenance::BuiltinConvention))
+        );
     }
 
     #[test]
@@ -112,8 +112,10 @@ mod tests {
                 .any(|l| l.path == Some(PathBuf::from("/opt/asdf/installs")))
         );
         assert!(
-            !got.iter()
-                .any(|l| l.path.as_ref().is_some_and(|p| p.starts_with("/Users/dev/.asdf"))),
+            !got.iter().any(|l| l
+                .path
+                .as_ref()
+                .is_some_and(|p| p.starts_with("/Users/dev/.asdf"))),
             "an override must redirect every subdirectory, not just add a second location"
         );
     }

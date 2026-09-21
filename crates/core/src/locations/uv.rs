@@ -13,11 +13,7 @@ use super::{
 
 pub const UV_DETECTOR_ID: &str = "uv";
 
-fn resolve(
-    env: &Environment,
-    var: &str,
-    default_rel: &str,
-) -> (std::path::PathBuf, Provenance) {
+fn resolve(env: &Environment, var: &str, default_rel: &str) -> (std::path::PathBuf, Provenance) {
     match env.env_var(var) {
         Some(v) if !v.is_empty() => (
             std::path::PathBuf::from(v),

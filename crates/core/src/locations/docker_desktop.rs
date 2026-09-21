@@ -97,9 +97,10 @@ mod tests {
         let env =
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = DockerDesktopDetector.detect(&env);
-        assert!(got.iter().any(|l| l.path == Some(PathBuf::from(
-            "/Users/dev/Library/Containers/com.docker.docker/Data/vms/0/data"
-        ))));
+        assert!(got.iter().any(|l| l.path
+            == Some(PathBuf::from(
+                "/Users/dev/Library/Containers/com.docker.docker/Data/vms/0/data"
+            ))));
         assert!(
             got.iter()
                 .any(|l| l.path == Some(PathBuf::from("/Users/dev/.orbstack/data")))

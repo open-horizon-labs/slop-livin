@@ -102,7 +102,10 @@ mod tests {
         env_vars.insert("rvm_path".to_string(), "/opt/rvm".to_string());
         let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
         let got = RvmDetector.detect(&env);
-        assert!(got.iter().all(|l| l.path.as_ref().unwrap().starts_with("/opt/rvm")));
+        assert!(
+            got.iter()
+                .all(|l| l.path.as_ref().unwrap().starts_with("/opt/rvm"))
+        );
     }
 
     #[test]

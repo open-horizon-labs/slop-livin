@@ -69,17 +69,17 @@ impl Detector for PnpmDetector {
         }
 
         let npmrc = env.home.join(".npmrc");
-        if let Ok(text) = std::fs::read_to_string(&npmrc) {
-            if let Some(dir) = read_npmrc_field(&text, "store-dir") {
-                return vec![ProposedLocation {
-                    detector_id: PNPM_DETECTOR_ID.to_string(),
-                    path: Some(PathBuf::from(dir)),
-                    category: StorageCategory::Cache,
-                    provenance: Provenance::ConfigField("store-dir".to_string()),
-                    status: LocationStatus::Resolved,
-                    note: Some("content-addressed package store (~/.npmrc store-dir)".to_string()),
-                }];
-            }
+        if let Ok(text) = std::fs::read_to_string(&npmrc)
+            && let Some(dir) = read_npmrc_field(&text, "store-dir")
+        {
+            return vec![ProposedLocation {
+                detector_id: PNPM_DETECTOR_ID.to_string(),
+                path: Some(PathBuf::from(dir)),
+                category: StorageCategory::Cache,
+                provenance: Provenance::ConfigField("store-dir".to_string()),
+                status: LocationStatus::Resolved,
+                note: Some("content-addressed package store (~/.npmrc store-dir)".to_string()),
+            }];
         }
 
         let convention = match env.platform {
