@@ -6,6 +6,45 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
+Column headings identify name, size, change, and cleanup/facts. Name truncation
+and padding use grapheme-aware terminal-cell widths. Badges have separating
+spaces. Build drilldowns reserve a compact candidates/oldest-modified column even
+at 80 columns, hide the change bar, and hide numeric change below 100 columns.
+Their name column caps at 64 cells. Other views hide bars below 140 columns and
+show facts only in selected-row details below 100 columns. Zero and
+unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+
+Collapsed build categories lead with a recommendation and removal consequence:
+start with compiler caches (slower next build), review tests/examples (rebuild
+before rerunning), and lower-priority build-script output (scripts rerun).
+Counts, allocated candidate size, and oldest known modification age follow only
+when space permits; narrow views drop these statistics before clipping advice.
+Unknown age is `?`.
+Candidate directory descendants are not counted again. Final outputs say
+`Inspect only: removes built output`, without suggesting a supported selective action.
+Other unsupported rows say `Selective cleanup unsupported`, not a safety verdict.
+Nested allocated sizes have a `*` suffix and a persistent accounting legend.
+When space remains below the tree, preview the selected category's oldest
+candidates with paths, allocated sizes, ages, and rebuilding effects. This preview
+is read-only: expand the category to select exact groups.
+
+Opening a project shows Cargo profiles with purpose-based cleanup groups:
+Compiler caches, Compiled tests & examples, and Build-script output. Groups
+contain only present, nonempty supported members in that profile. Tests and
+Examples are expandable subgroups. Space marks the exact members for review;
+profile rows also select their supported descendants, never the whole profile
+directory. Profile advice says Review supported groups only.
+Marking a fully marked group clears its members. A failed member review rolls
+back newly added marks, preserving earlier selections. No virtual group is a
+directory deletion target. Age ordering applies within groups; individual members
+can be selected instead of the whole group.
+
+The physical tree remains under a collapsed Inspect directories row; it is a
+second view of the same bytes, not additional storage. Physical category rows
+are navigation, not selective cleanup units. The selected-row detail area shows recommendations
+and rebuilding consequences. Compiler caches are a suggested starting point,
+not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
+
 The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to visible changes. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
 
 Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
@@ -37,5 +76,16 @@ Project rows expand to actionable artifacts. If none exist, a direct project act
 Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.
 
 ## Review
+
+Review and deletion run on background workers. During an operation, replace the
+confirmation row with a three-line progress area: processed/total group gauge,
+success/refusal counts and current path, then phase-specific consequences.
+Elapsed time advances even while one group is being checked. Never imply byte
+reclamation progress. Unknown review totals show checked count rather than a
+fabricated percentage. Esc/Ctrl-C/q request cancellation between groups, with a
+visible Cancelling state; no second action starts while busy. Completed outcomes
+are retained and refused/unattempted marks remain for explicit retry. Idle Ctrl-C
+exits. Observation results are held while busy and pre-deletion results discarded
+so a stale report cannot resurrect removed rows.
 
 Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.

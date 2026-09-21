@@ -30,7 +30,7 @@ Selected local strategy BA0 has parent W0. All owners unassigned; implementation
 
 **Selected:** shared nested identification/history/report contracts with ecosystem adapters, read-only inspection first and scoped selective action downstream. User authorized this as an independent epic under outcome #40. No schema/public API is mandated here; review one-way architecture decisions before execution.
 
-**Rejected:** generic age-based obsolescence, whole-directory/native-clean-only as an identification substitute, Rust-only completion, and making all global-root discovery a delivery prerequisite.
+**Rejected:** claiming generic age-based obsolescence (not age-based cleanup suggestions), whole-directory/native-clean-only as an identification substitute, Rust-only completion, and making all global-root discovery a delivery prerequisite.
 
 **Deferred:** mandatory build wrapping and continuous whole-machine execution telemetry. Optional existing user-initiated build records can strengthen evidence without blocking baseline classification.
 
@@ -74,6 +74,16 @@ BA0, BA1, BA1b, BA2 and BA3 are all selected. Parent W0 remains selected. GBA is
 | BA3 | selected | [#76: Validate and document build-artifact explanation and cleanup as an independent workflow](https://github.com/open-horizon-labs/swamp/issues/76) | BA0 | #72, #73 |
 
 ## Execution Handoff
+
+### Decision-contract clarification — 2026-09-20
+
+User confirmed the reusable approach: **age + size + removal consequences**. Modification age is sufficient to recommend reviewing supported generated/cache units; neither last-access evidence nor proven supersession is required. Recent units remain selectable when supported, unknown/future ages do not rank as ancient, and advice does not authorize removal. Existing unique-data, occupancy and exact-scope protections remain.
+
+Updated existing issue bodies, preserving selected lineage and dependencies: outcome #40; evidence #53/#54/#58; model #64; aggregation/history/storage #65; remaining ecosystem adapters #67–#71; presentation/action #72/#73; epic #74; validation #75/#76. No new epic or implementation was introduced. Cargo's current work is precedent, not cross-ecosystem completion.
+
+Adapters identify units and provide timestamp semantics, size/accounting basis, consequences and action capability. Aggregation summarizes nonempty supported groups without parent/child duplication, retaining oldest-known candidate age and explicit unknown coverage. Storage reuses folded observations and current + reverse-delta Parquet; derive ages from timestamps, do not persist per-file inventories or generate byte deltas for evidence refresh. Deep inspection stays bounded/on demand. Architecture documentation records these as planned cross-ecosystem contracts, distinct from implemented Cargo guidance.
+
+Acceptance includes collapsed-category usefulness, narrow/wide readability, mixed ages, overlapping groups, allocated versus reclaimable accounting, unchanged/changed-group costs and storage size. This clarification requires no new last-use oracle, parallel database or whole-tree refresh pass.
 
 Start #64 independently. #65 and domain adapters follow; #70 reuses JVM/Gradle support from #67. #72 implements read-only views without cleanup; #73 supplies complete supported cleanup behavior and necessary shared protections. #75/#76 validate this epic independently. Outcome-wide #62/#63 remain separate, with #63 consuming #76's evidence later.
 

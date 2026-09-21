@@ -158,7 +158,7 @@ fn header_line(app: &App, width: usize) -> String {
 }
 
 /// Joins clauses with " · " while the result fits in `width`; always keeps
-/// the first clause.
+/// the first clause, truncated to terminal cells if necessary.
 pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     let mut out = String::new();
     for (i, c) in clauses.iter().filter(|c| !c.is_empty()).enumerate() {
@@ -167,12 +167,12 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
         } else {
             format!("{out} · {c}")
         };
-        if i > 0 && width > 0 && candidate.chars().count() > width {
+        if i > 0 && width > 0 && crate::model::display_width(&candidate) > width {
             break;
         }
         out = candidate;
     }
-    out
+    truncate_middle(&out, width)
 }
 
 fn footer_line() -> &'static str {
@@ -187,7 +187,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1), // header
             Constraint::Length(1), // filter line
             Constraint::Min(1),    // body
-            Constraint::Length(if app.confirm_open { 1 } else { 0 }),
+            Constraint::Length(if app.operation.is_some() {
+                3
+            } else if app.confirm_open {
+                1
+            } else {
+                0
+            }),
             Constraint::Length(1), // footer
         ])
         .split(size);
@@ -197,7 +203,60 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_filter_line(frame, app, chunks[1]);
     draw_body(frame, app, chunks[2]);
 
-    if app.confirm_open {
+    if let Some(op) = &app.operation {
+        let cancelling = op.cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let ratio = if op.total == 0 {
+            0.0
+        } else {
+            (op.completed as f64 / op.total as f64).min(1.0)
+        };
+        let label = if cancelling {
+            "Cancelling after current group"
+        } else {
+            op.label
+        };
+        let count = if op.total == 0 {
+            format!("{} checked", op.completed)
+        } else {
+            format!("{}/{} groups", op.completed, op.total)
+        };
+        let area = chunks[3];
+        frame.render_widget(
+            ratatui::widgets::Gauge::default()
+                .ratio(ratio)
+                .label(format!(
+                    "{label} · {count} · {}s",
+                    op.started.elapsed().as_secs()
+                ))
+                .gauge_style(Style::default().fg(Color::Yellow)),
+            Rect { height: 1, ..area },
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} successful · {} refused · {}",
+                op.succeeded,
+                op.failed,
+                op.current.display()
+            )),
+            Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1).min(1),
+                ..area
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(if op.label == "Reviewing" {
+                "Review only; no files are changed. Cancellation preserves previous marks."
+            } else {
+                "Filesystem cleanup moves to Trash; allocated bytes are not freed space."
+            }),
+            Rect {
+                y: area.y + 2,
+                height: area.height.saturating_sub(2).min(1),
+                ..area
+            },
+        );
+    } else if app.confirm_open {
         frame.render_widget(
             Paragraph::new(app.confirm_summary()).style(Style::default().fg(Color::Yellow)),
             chunks[3],
@@ -205,7 +264,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     // The footer is the key legend for the state you are actually in.
-    let footer_text = if let Some(msg) = app.refusal_active() {
+    let footer_text = if let Some(op) = &app.operation {
+        if op.label == "Reviewing" {
+            "Esc / Ctrl-C: cancel review after current check".into()
+        } else {
+            "Esc / Ctrl-C: stop after current group · completed moves remain in Trash".into()
+        }
+    } else if let Some(msg) = app.refusal_active() {
         msg.to_string()
     } else if app.confirm_open {
         "Enter yes · Esc no".to_string()
@@ -390,22 +455,74 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let narrow = width < 120;
     // Half the diverging bar, each side; plus one cell for the axis.
-    let half: usize = ((width.saturating_sub(90)) / 8).clamp(6, 20);
+    let cleanup_view = rows.iter().any(|r| r.cleanup_summary.is_some());
+    let show_growth = !cleanup_view || width >= 100;
+    let half: usize = if width >= 140 && !cleanup_view { 6 } else { 0 };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
-    let fixed = 10 + 1 + 10 + 1 + (half * 2 + 1) + 1;
-    let flexible = width.saturating_sub(fixed).max(40);
-    let signals_width: usize = if narrow {
-        flexible / 4
+    let bar_width = if half > 0 { half * 2 + 2 } else { 0 };
+    let fixed = if show_growth { 24 + bar_width } else { 13 };
+    let flexible = width.saturating_sub(fixed);
+    let signals_width = if cleanup_view {
+        (flexible / 2).min(64)
+    } else if width >= 100 {
+        flexible / 3
     } else {
-        (flexible * 2 / 5).min(70)
+        0
     };
-    let name_width: usize = flexible.saturating_sub(signals_width + 1).max(30);
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    let name_width = if cleanup_view {
+        flexible.saturating_sub(signals_width).min(64)
+    } else {
+        flexible.saturating_sub(signals_width)
+    };
+    let signals_width = if cleanup_view {
+        flexible.saturating_sub(name_width)
+    } else {
+        signals_width
+    };
+    let heading = format!(
+        "{}{:>10} {}{}{}",
+        pad_display("Name", name_width),
+        if cleanup_view { "Size*" } else { "Size" },
+        if show_growth {
+            format!("{:>10} ", "Change")
+        } else {
+            String::new()
+        },
+        pad_display(if half > 0 { "Change bar" } else { "" }, bar_width),
+        pad_display(
+            if cleanup_view {
+                "Cleanup advice / consequence"
+            } else {
+                "Cleanup / facts"
+            },
+            signals_width
+        )
+    );
+    let mut lines: Vec<Line> = vec![Line::styled(
+        heading,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if cleanup_view {
+        lines.push(Line::raw(
+            "* allocated incl. shared links; not additive with report totals. Age = modified",
+        ));
+    }
     for (i, row) in rows.iter().enumerate() {
-        let marked = row
+        let mut marked = row
             .unit
             .as_ref()
             .is_some_and(|u| app.marked.contains_key(&u.0));
+        if let Some(key) = row
+            .expansion_key
+            .as_deref()
+            .filter(|k| crate::model::is_cleanup_selection(&app.report, k))
+        {
+            let members = crate::model::cleanup_members(&app.report, key);
+            marked = !members.is_empty()
+                && members
+                    .iter()
+                    .all(|u| app.marked.contains_key(&u.path.display().to_string()));
+        }
         let mark_prefix = if marked { "✗ " } else { "" };
         let track = match row.track {
             Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
@@ -419,7 +536,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         };
         let raw_name = format!("{}{mark_prefix}{}{badge}{track}", row.rail, row.label);
         let name = truncate_middle(&raw_name, name_width);
-        let bytes = format!("{:>10}", human_bytes(row.bytes));
+        let bytes = format!(
+            "{:>10}",
+            format!(
+                "{}{}",
+                human_bytes(row.bytes),
+                if row.allocated { "*" } else { "" }
+            )
+        );
         let growth = format!(
             "{:>10}",
             row.growth
@@ -446,14 +570,21 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         // uses width up to 200 ... signals spell out."
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
-        let mut signals_text = if row.signals.is_empty() {
+        let mut signals_text = if let Some(summary) = &row.cleanup_summary {
+            // Drop secondary statistics before clipping the decision itself.
+            let mut parts: Vec<_> = summary.split(" · ").collect();
+            while parts.len() > 1 && parts.join(" · ").chars().count() > signals_width {
+                parts.pop();
+            }
+            parts.join(" · ")
+        } else if row.signals.is_empty() {
             String::new()
         } else if narrow {
             pick_signals(&row.signals, 2).join(" · ")
         } else {
             row.signals.join(" · ")
         };
-        if signals_text.chars().count() > signals_width {
+        if row.cleanup_summary.is_none() && signals_text.chars().count() > signals_width {
             // Never overflow the row: prefer the loud signals, then cut.
             signals_text = pick_signals(&row.signals, 3).join(" · ");
             if signals_text.chars().count() > signals_width {
@@ -470,28 +601,37 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        let bar = if half == 0 {
+            String::new()
+        } else if row.growth.is_none_or(|g| g == 0) {
+            " ".repeat(bar_width)
+        } else {
+            format!("{bar_left}{axis}{bar_right} ")
+        };
         let spans = vec![
             Span::styled(pad_display(&name, name_width), name_style),
             Span::raw(bytes),
             Span::raw(" "),
             // The signed number and its bar are one diffstat token: same
             // colour, number flush against the bar it measures.
-            Span::styled(growth, bar_style),
-            Span::raw(" "),
-            Span::styled(bar_left, bar_style),
+            Span::styled(if show_growth { growth } else { String::new() }, bar_style),
+            Span::raw(if show_growth { " " } else { "" }),
+            Span::styled(bar, bar_style),
             Span::styled(
-                axis.to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
+                pad_display(
+                    &if row.cleanup_summary.is_some() {
+                        signals_text
+                    } else {
+                        format!("{signals_text}{hidden}")
+                    },
+                    signals_width,
+                ),
+                Style::default().add_modifier(if row.cleanup_summary.is_some() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::DIM
+                }),
             ),
-            Span::styled(bar_right, bar_style),
-            Span::raw(" "),
-            Span::styled(
-                format!(" {signals_text}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-            Span::styled(hidden, Style::default().add_modifier(Modifier::DIM)),
         ];
 
         let mut line = Line::from(spans);
@@ -504,7 +644,119 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(line);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    // Keep the selection visible even in projects with hundreds of build groups.
+    let detail_height = (if cleanup_view { 3 } else { 2 }).min(area.height.saturating_sub(2));
+    let table_height = area.height.saturating_sub(detail_height);
+    let header_count = if cleanup_view { 2 } else { 1 };
+    let visible = table_height.saturating_sub(header_count) as usize;
+    let offset = app.selected.saturating_sub(visible.saturating_sub(1));
+    let headers: Vec<_> = lines.drain(..header_count as usize).collect();
+    let shown = headers
+        .into_iter()
+        .chain(lines.into_iter().skip(offset).take(visible))
+        .collect::<Vec<_>>();
+    let shown_count = shown.len() as u16;
+    frame.render_widget(
+        Paragraph::new(shown),
+        Rect {
+            height: table_height,
+            ..area
+        },
+    );
+    // Use blank space to preview concrete candidates without expanding the category.
+    let spare = table_height.saturating_sub(shown_count + 1);
+    if spare >= 4
+        && let Some(key) = rows
+            .get(app.selected)
+            .and_then(|r| r.expansion_key.as_deref())
+            .filter(|key| key.starts_with("cargo:") || key.starts_with("cleanup:"))
+    {
+        let path = key.strip_prefix("cargo:").unwrap_or_else(|| {
+            key.strip_prefix("cleanup:")
+                .unwrap()
+                .split_once(':')
+                .unwrap()
+                .1
+        });
+        let parent = std::path::Path::new(path);
+        let mut candidates: Vec<_> = if key.starts_with("cleanup:") {
+            crate::model::cleanup_members(&app.report, key)
+        } else {
+            app.report
+                .nested_artifacts
+                .iter()
+                .filter(|u| {
+                    u.present
+                        && u.bytes > 0
+                        && u.path != parent
+                        && u.path.starts_with(parent)
+                        && swamp_core::cargo_cleanup::candidate(u)
+                })
+                .collect()
+        };
+        candidates
+            .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, app.report.observed_at));
+        if !candidates.is_empty() {
+            let capacity = spare.saturating_sub(2) as usize;
+            let mut preview = vec![Line::styled(
+                format!(
+                    "Oldest candidates · showing {} of {} · → expand to select",
+                    candidates.len().min(capacity),
+                    candidates.len()
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            let path_width = (width / 3).min(64);
+            preview.push(Line::raw(format!(
+                "{}{:>12}  {:8}  Effect of removal",
+                pad_display("Path within category", path_width),
+                "Allocated",
+                "Modified"
+            )));
+            preview.extend(candidates.iter().take(capacity).map(|u| {
+                Line::raw(format!(
+                    "{}{:>12}  {:8}  {}",
+                    pad_display(
+                        &u.path
+                            .strip_prefix(parent)
+                            .unwrap_or(&u.path)
+                            .display()
+                            .to_string(),
+                        path_width
+                    ),
+                    human_bytes(u.bytes),
+                    crate::model::age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                        u,
+                        app.report.observed_at
+                    )),
+                    match u.role {
+                        swamp_core::artifact::ArtifactRole::Incremental => "slower next build",
+                        swamp_core::artifact::ArtifactRole::BuildScriptOutput =>
+                            "rerun build script",
+                        _ => "rebuild before rerunning",
+                    }
+                ))
+            }));
+            frame.render_widget(
+                Paragraph::new(preview),
+                Rect {
+                    y: area.y + shown_count + 1,
+                    height: spare,
+                    ..area
+                },
+            );
+        }
+    }
+    if let Some(row) = rows.get(app.selected) {
+        frame.render_widget(
+            Paragraph::new(row.signals.join(" · ")).wrap(ratatui::widgets::Wrap { trim: true }),
+            Rect {
+                y: area.y + table_height,
+                height: detail_height,
+                ..area
+            },
+        );
+    }
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {

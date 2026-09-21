@@ -5,6 +5,7 @@
 use crate::actions::{self, MarkedUnit};
 use crate::filter::{self, Filter};
 use crate::model::{self, Row, Sort};
+use crate::units::UnitId;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -70,6 +71,12 @@ impl ViewKind {
 }
 
 pub struct App {
+    pub operation: Option<Operation>,
+    operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
+    review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
+    review_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    reviewed: usize,
+    review_total: usize,
     pub report: Report,
     pub root: PathBuf,
     pub view: ViewKind,
@@ -130,6 +137,39 @@ pub struct App {
     pub live_last_batch: Option<Instant>,
 }
 
+pub struct Operation {
+    pub label: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub current: PathBuf,
+    pub started: Instant,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum OperationEvent {
+    Progress {
+        completed: usize,
+        total: usize,
+        path: PathBuf,
+        outcome: Option<bool>,
+    },
+    Reviewed {
+        marked: BTreeMap<String, MarkedUnit>,
+        refusal: Option<String>,
+        confirm: bool,
+        cancelled: bool,
+    },
+    Deleted {
+        results: Vec<actions::UnitResult>,
+        planned: u64,
+        measured: Option<i64>,
+        total: usize,
+    },
+    Failed(String),
+}
+
 fn ui_state_path(store: &std::path::Path) -> PathBuf {
     store.join("ui_state.json")
 }
@@ -182,6 +222,12 @@ impl App {
     pub fn new(report: Report, root: PathBuf) -> Self {
         let filter = filter::default_filter();
         App {
+            operation: None,
+            operation_rx: None,
+            review_progress: None,
+            review_cancel: None,
+            reviewed: 0,
+            review_total: 0,
             report,
             root,
             view: ViewKind::Projects,
@@ -526,49 +572,11 @@ impl App {
         if self.view != ViewKind::Tree {
             return;
         }
-        if let Some(row) = self.selected_row()
-            && row.expandable
-        {
-            // The label carries the path for worktree rows; reconstruct
-            // the key the same way tree_rows does, from the report.
-            let name = self
-                .selected_project
-                .clone()
-                .or_else(|| self.report.projects.first().map(|p| p.name.clone()));
-            if let Some(name) = name
-                && let Some(p) = self.report.projects.iter().find(|p| p.name == name)
-            {
-                // Selected index among tree rows maps to worktree rows at depth 1.
-                let rows = self.rows();
-                if let Some(sel) = rows.get(self.selected) {
-                    let idx = rows
-                        .iter()
-                        .take(self.selected + 1)
-                        .filter(|r| r.depth == 1)
-                        .count()
-                        .saturating_sub(1);
-                    if sel.depth == 1
-                        && let Some(wt) = p.worktrees.get(idx)
-                    {
-                        let key = wt.path.display().to_string();
-                        if self.collapsed.contains(&key) {
-                            self.collapsed.remove(&key);
-                        } else {
-                            self.collapsed.insert(key);
-                        }
-                    } else if sel.depth == 2
-                        && let Some(wt) = p.worktrees.get(idx)
-                    {
-                        // A Source row: expand it into its own directories.
-                        let key = format!("source:{}", wt.path.display());
-                        if self.collapsed.contains(&key) {
-                            self.collapsed.remove(&key);
-                        } else {
-                            self.collapsed.insert(key);
-                        }
-                    }
-                }
+        if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
+            if !self.collapsed.remove(&key) {
+                self.collapsed.insert(key);
             }
+            self.selected = self.selected.min(self.rows().len().saturating_sub(1));
         }
     }
 
@@ -607,6 +615,28 @@ impl App {
                 }
             }
             self.annotate_project(&name);
+            // Show profiles and categories immediately, with individual groups
+            // available inside the same tree rather than a separate view.
+            for unit in &self.report.nested_artifacts {
+                if unit.role == swamp_core::artifact::ArtifactRole::Profile {
+                    self.collapsed
+                        .insert(format!("layout:{}", unit.path.display()));
+                    for kind in ["cache", "runnable", "tests", "examples", "scripts"] {
+                        self.collapsed
+                            .insert(format!("cleanup:{kind}:{}", unit.path.display()));
+                    }
+                }
+                if unit.is_dir
+                    && !matches!(
+                        unit.role,
+                        swamp_core::artifact::ArtifactRole::Container
+                            | swamp_core::artifact::ArtifactRole::Profile
+                    )
+                {
+                    self.collapsed
+                        .insert(format!("cargo:{}", unit.path.display()));
+                }
+            }
             self.selected_project = Some(name);
             self.set_view(ViewKind::Tree);
         }
@@ -740,6 +770,56 @@ impl App {
     /// Enter. Docker objects are the one exception: there is no
     /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
+        if self
+            .review_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return;
+        }
+        if let Some(key) = row
+            .expansion_key
+            .as_deref()
+            .filter(|k| model::is_cleanup_selection(&self.report, k))
+        {
+            let members: Vec<_> = model::cleanup_members(&self.report, key)
+                .into_iter()
+                .cloned()
+                .collect();
+            if members.is_empty() {
+                self.set_refusal("No supported cleanup members remain; refresh the report.");
+                return;
+            }
+            if members
+                .iter()
+                .all(|u| self.marked.contains_key(&u.path.display().to_string()))
+            {
+                for u in members {
+                    self.marked.remove(&u.path.display().to_string());
+                }
+                return;
+            }
+            // A failed member must not leave a silently partial group selected.
+            let original = self.marked.clone();
+            for u in members {
+                let id = UnitId::for_artifact(&u.path);
+                if self.marked.contains_key(&id.0) {
+                    continue;
+                }
+                let mut leaf = row.clone();
+                leaf.expansion_key = None;
+                leaf.unit = Some(id.clone());
+                leaf.label = u.path.display().to_string();
+                leaf.bytes = u.bytes;
+                leaf.kind = Some(swamp_core::report::ArtifactKind::BuildOutput);
+                self.mark_row(&leaf);
+                if !self.marked.contains_key(&id.0) {
+                    self.marked = original;
+                    return;
+                }
+            }
+            return;
+        }
         let Some(unit_id) = row.unit.clone() else {
             if row.signals.iter().any(|s| s == "category") {
                 self.set_refusal(
@@ -765,6 +845,14 @@ impl App {
             self.set_refusal("nothing to delete on this row");
             return;
         };
+        if let Some(tx) = &self.review_progress {
+            let _ = tx.send(OperationEvent::Progress {
+                completed: self.reviewed,
+                total: self.review_total,
+                path: PathBuf::from(&unit_id.0),
+                outcome: None,
+            });
+        }
         // The ignored/untracked rows report bytes scattered across a
         // checkout under the worktree's own path. Marking one would
         // queue the whole checkout, which is not what the row says.
@@ -912,6 +1000,157 @@ impl App {
                 warnings,
             },
         );
+        self.reviewed += 1;
+        if let Some(tx) = &self.review_progress {
+            let _ = tx.send(OperationEvent::Progress {
+                completed: self.reviewed,
+                total: self.review_total,
+                path: PathBuf::from(&unit_id.0),
+                outcome: Some(true),
+            });
+        }
+    }
+
+    pub fn cancel_operation(&mut self) {
+        if let Some(op) = &self.operation {
+            op.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// UI entry point; synchronous marking helpers run only on the worker.
+    pub fn review_in_background(&mut self, all: bool, confirm: bool) {
+        if self.operation.is_some() {
+            return;
+        }
+        if confirm && !self.marked.is_empty() {
+            self.open_confirm();
+            return;
+        }
+        let row = self.selected_row();
+        if !all && row.is_none() {
+            return;
+        }
+        let total = if all {
+            0
+        } else {
+            row.as_ref()
+                .and_then(|r| r.expansion_key.as_deref())
+                .map(|k| model::cleanup_members(&self.report, k).len())
+                .unwrap_or(0)
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker = App::new(self.report.clone(), self.root.clone());
+        worker.marked = self.marked.clone();
+        worker.view = self.view;
+        worker.filter = self.filter.clone();
+        worker.selected_project = self.selected_project.clone();
+        worker.collapsed = self.collapsed.clone();
+        worker.track = self.track.clone();
+        worker.review_total = total;
+        worker.review_cancel = Some(cancel.clone());
+        worker.review_progress = Some(tx.clone());
+        self.operation = Some(Operation {
+            label: "Reviewing",
+            completed: 0,
+            total,
+            succeeded: 0,
+            failed: 0,
+            current: PathBuf::new(),
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.operation_rx = Some(rx);
+        self.refusal = None;
+        self.last_result = None;
+        std::thread::spawn(move || {
+            if all {
+                worker.mark_all_in_view();
+            } else if let Some(row) = row {
+                worker.mark_row(&row);
+            }
+            let _ = tx.send(OperationEvent::Reviewed {
+                marked: worker.marked,
+                refusal: worker.refusal.map(|(msg, _)| msg),
+                confirm: confirm || all,
+                cancelled: cancel.load(std::sync::atomic::Ordering::SeqCst),
+            });
+        });
+    }
+
+    pub fn poll_operation(&mut self) {
+        loop {
+            let event = match self.operation_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(e)) => e,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => OperationEvent::Failed(
+                    "Worker stopped unexpectedly; check the ledger before retrying cleanup".into(),
+                ),
+                _ => break,
+            };
+            match event {
+                OperationEvent::Progress {
+                    completed,
+                    total,
+                    path,
+                    outcome,
+                } => {
+                    if let Some(op) = &mut self.operation {
+                        op.completed = completed;
+                        op.total = total;
+                        op.current = path;
+                        if outcome == Some(true) {
+                            op.succeeded += 1;
+                        }
+                        if outcome == Some(false) {
+                            op.failed += 1;
+                        }
+                    }
+                }
+                OperationEvent::Reviewed {
+                    marked,
+                    refusal,
+                    confirm,
+                    cancelled,
+                } => {
+                    let cancelled = cancelled
+                        || self
+                            .operation
+                            .as_ref()
+                            .is_some_and(|op| op.cancel.load(std::sync::atomic::Ordering::SeqCst));
+                    if !cancelled {
+                        self.marked = marked;
+                        self.refusal = refusal.map(|msg| (msg, Instant::now()));
+                        self.confirm_open = confirm && !self.marked.is_empty();
+                    } else {
+                        self.last_result = Some(
+                            "Review cancelled; previous selection preserved; nothing deleted"
+                                .into(),
+                        );
+                    }
+                    self.operation = None;
+                    self.operation_rx = None;
+                    break;
+                }
+                OperationEvent::Deleted {
+                    results,
+                    planned,
+                    measured,
+                    total,
+                } => {
+                    self.operation = None;
+                    self.operation_rx = None;
+                    self.finish_delete(results, planned, measured, total);
+                    break;
+                }
+                OperationEvent::Failed(msg) => {
+                    self.operation = None;
+                    self.operation_rx = None;
+                    self.confirm_open = false;
+                    self.set_refusal(&msg);
+                    break;
+                }
+            }
+        }
     }
 
     fn set_refusal(&mut self, msg: &str) {
@@ -958,7 +1197,11 @@ impl App {
     /// human authorization for this one plan. Drives plan -> grant ->
     /// execute -> ledger, then re-observes the affected worktrees only.
     pub fn confirm_delete(&mut self) {
-        if !self.confirm_open {
+        self.start_delete(crate::ledger_path(), actions::trash_root());
+    }
+
+    fn start_delete(&mut self, ledger_path: PathBuf, trash: PathBuf) {
+        if !self.confirm_open || self.operation.is_some() {
             return;
         }
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
@@ -967,32 +1210,78 @@ impl App {
             return;
         }
         let planned: u64 = units.iter().map(|u| u.bytes).sum();
+        // A report started before these moves must not resurrect deleted rows.
+        self.pending = None;
+        self.observing = None;
         let (plan, grant) = actions::authorize(&units, &self.actor);
-        let trash = actions::trash_root();
-        let free_before = actions::free_space_bytes(&trash);
-        let ledger_path = crate::ledger_path();
-        let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
-            Ok(l) => l,
-            Err(e) => {
-                self.set_refusal(&format!("could not open ledger: {e}"));
-                self.confirm_open = false;
-                return;
-            }
-        };
-        let results = actions::execute_plan(
-            &units,
-            &plan,
-            &grant,
-            &ledger,
-            &trash,
-            &self.actor,
-            self.keep_executables,
-        );
-        let free_after = actions::free_space_bytes(&trash);
-        let measured = match (free_before, free_after) {
-            (Some(b), Some(a)) => Some(a as i64 - b as i64),
-            _ => None,
-        };
+        let total = units.len();
+        let actor = self.actor.clone();
+        let keep = self.keep_executables;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.operation = Some(Operation {
+            label: "Deleting",
+            completed: 0,
+            total,
+            succeeded: 0,
+            failed: 0,
+            current: PathBuf::new(),
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.operation_rx = Some(rx);
+        self.confirm_open = false;
+        self.last_result = None;
+        self.refusal = None;
+        std::thread::spawn(move || {
+            let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(OperationEvent::Failed(format!(
+                        "could not open ledger: {e}"
+                    )));
+                    return;
+                }
+            };
+            let free_before = actions::free_space_bytes(&trash);
+            let results = actions::execute_plan_progress(
+                &units,
+                &plan,
+                &grant,
+                &ledger,
+                &trash,
+                &actor,
+                keep,
+                |completed, path, outcome| {
+                    let _ = tx.send(OperationEvent::Progress {
+                        completed,
+                        total,
+                        path: path.to_path_buf(),
+                        outcome,
+                    });
+                    !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                },
+            );
+            let measured = match (free_before, actions::free_space_bytes(&trash)) {
+                (Some(b), Some(a)) => Some(a as i64 - b as i64),
+                _ => None,
+            };
+            let _ = tx.send(OperationEvent::Deleted {
+                results,
+                planned,
+                measured,
+                total,
+            });
+        });
+    }
+
+    fn finish_delete(
+        &mut self,
+        results: Vec<actions::UnitResult>,
+        planned: u64,
+        measured: Option<i64>,
+        total: usize,
+    ) {
         let ok = results.iter().filter(|r| r.outcome.is_ok()).count();
         let failed: Vec<String> = results
             .iter()
@@ -1003,12 +1292,23 @@ impl App {
                     .map(|e| format!("{}: {e}", r.path.display()))
             })
             .collect();
-        self.marked.clear();
+        // Retain refused and unprocessed selections for explicit review/retry.
+        for r in &results {
+            if r.outcome.is_ok() {
+                self.marked.remove(&r.path.display().to_string());
+            }
+        }
         self.confirm_open = false;
         let measured_txt = measured
             .map(model::human_signed_bytes)
             .unwrap_or_else(|| "unmeasured".into());
-        self.last_result = Some(if failed.is_empty() {
+        self.last_result = Some(if results.len() < total {
+            format!(
+                "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash",
+                failed.len(),
+                total - results.len()
+            )
+        } else if failed.is_empty() {
             format!(
                 "{ok} deleted · planned {} · measured {measured_txt}",
                 model::human_bytes(planned)
@@ -1220,6 +1520,150 @@ mod tests {
     use swamp_core::report::{
         ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Source, WorktreeKind, WorktreeRow,
     };
+
+    fn wait_operation(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.operation.is_some() {
+            assert!(Instant::now() < deadline, "operation did not complete");
+            app.poll_operation();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn background_review_cancel_preserves_selection_and_never_confirms() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.review_in_background(false, true);
+        assert!(app.operation.is_some());
+        // The worker may already have finished when Ctrl-C arrives, but the UI
+        // has not accepted its result. Cancellation must still win.
+        let result = loop {
+            let event = app
+                .operation_rx
+                .as_ref()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            if matches!(event, OperationEvent::Reviewed { .. }) {
+                break event;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        app.operation_rx = Some(rx);
+        app.cancel_operation();
+        wait_operation(&mut app);
+        assert!(app.marked.is_empty());
+        assert!(!app.confirm_open);
+        assert!(app.last_result.as_ref().unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn cancelled_delete_retains_refused_and_unattempted_marks() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        for name in ["done", "refused", "untouched"] {
+            let path = PathBuf::from(format!("/fixture/{name}"));
+            app.marked.insert(
+                path.display().to_string(),
+                MarkedUnit {
+                    cargo_plan: None,
+                    path,
+                    docker: None,
+                    worktree_path: PathBuf::new(),
+                    bytes: 1,
+                    observed_at: 0,
+                    label: name.into(),
+                    warnings: vec![],
+                    worktree: None,
+                },
+            );
+        }
+        app.finish_delete(
+            vec![
+                actions::UnitResult {
+                    path: "/fixture/done".into(),
+                    outcome: Ok(swamp_core::execution::Outcome {
+                        unit_id: String::new(),
+                        status: "ok".into(),
+                        reason: None,
+                        intended_bytes: 1,
+                        observed_free_space_delta: None,
+                    }),
+                },
+                actions::UnitResult {
+                    path: "/fixture/refused".into(),
+                    outcome: Err("busy".into()),
+                },
+            ],
+            3,
+            None,
+            3,
+        );
+        assert_eq!(app.marked.len(), 2);
+        assert!(!app.marked.contains_key("/fixture/done"));
+        assert!(app.marked.contains_key("/fixture/refused"));
+        assert!(app.marked.contains_key("/fixture/untouched"));
+        assert!(
+            app.last_result
+                .as_ref()
+                .unwrap()
+                .contains("1 not attempted")
+        );
+        assert!(!app.confirm_open);
+    }
+
+    #[test]
+    fn background_delete_finishes_and_worker_failure_is_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data"), b"fixture").unwrap();
+        let mut app = App::new(fixture_report(), tmp.path().into());
+        app.marked.insert(
+            path.display().to_string(),
+            MarkedUnit {
+                cargo_plan: None,
+                path: path.clone(),
+                docker: None,
+                worktree_path: tmp.path().into(),
+                bytes: 7,
+                observed_at: 0,
+                label: "cache".into(),
+                warnings: vec![],
+                worktree: None,
+            },
+        );
+        app.confirm_open = true;
+        app.start_delete(tmp.path().join("ledger.jsonl"), tmp.path().join("Trash"));
+        assert!(app.operation.is_some());
+        assert!(!app.confirm_open);
+        wait_operation(&mut app);
+        assert!(!path.exists());
+        assert!(app.marked.is_empty());
+        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        assert_eq!(
+            swamp_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl"))
+                .unwrap()
+                .all()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        app.review_in_background(true, false);
+        // Replace the receiver with a disconnected worker channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        app.operation_rx = Some(rx);
+        app.poll_operation();
+        assert!(app.operation.is_none());
+        assert!(
+            app.refusal_active()
+                .unwrap()
+                .contains("Worker stopped unexpectedly")
+        );
+    }
 
     fn fixture_report() -> Report {
         Report {

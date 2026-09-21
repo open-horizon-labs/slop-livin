@@ -41,6 +41,25 @@ An image's source label or Compose metadata can associate it with a project even
 
 Filesystem reconciliation separates attributed and unowned bytes. Docker has separate attributed and unowned totals, because daemon storage and shared layers do not map directly to the walked tree. The optional `--verify-du` result is an independent comparison; it does not establish that an entire volume, snapshots, or inaccessible paths have been accounted for.
 
+## Cross-ecosystem decision contract (planned extension)
+
+The reusable decision aid is **age + size + removal consequences**. Cargo currently supplies this guidance; the other ecosystem adapters remain planned under [#74](https://github.com/open-horizon-labs/swamp/issues/74). This is not a claim of implemented cross-ecosystem parity.
+
+Modification age is enough to recommend reviewing a supported generated-output or cache unit. It is not proof of obsolescence, and access time is not a prerequisite. Recent units remain reviewable; unknown or future timestamps must not look ancient. Unique data and active writers still require their specific protections. A recommendation never supplies deletion authority.
+
+The responsibilities are separate:
+
+| Layer | Contract |
+|---|---|
+| Identification and adapters ([#64](https://github.com/open-horizon-labs/swamp/issues/64), #66–#71) | Identify domain units, roles and membership independently of cleanup. Supply size/accounting basis, source-qualified timestamp and coverage, concrete removal consequences and prerequisites, and supported action granularity. Do not infer recoverability from names alone. |
+| Aggregation ([#65](https://github.com/open-horizon-labs/swamp/issues/65)) | Summarize nonempty supported candidates: count, bytes on a common accounting basis, oldest known candidate modification time. Stop at an included removal group rather than counting its descendants again. Preserve unknowns and residuals; never label the oldest child timestamp as the category's last use. |
+| Storage and incremental observation (#65, [#53](https://github.com/open-horizon-labs/swamp/issues/53)) | Reuse folded measurements, event invalidation, existing consumers and current + reverse-delta Parquet history. Retain compact unit-level measurements and source timestamps; derive age when displaying. Evidence refresh and passing time do not create byte-history deltas. No parallel database, exhaustive per-file index or giant artifact JSON cache. |
+| Presentation and action ([#72](https://github.com/open-horizon-labs/swamp/issues/72), [#73](https://github.com/open-horizon-labs/swamp/issues/73)) | Show candidates and consequences in ordinary drill-down, including collapsed summaries. Rank older known candidates first, then size, with unknown age last. Exact selection, live checks and approval remain separate from read-only advice. |
+
+Folded-group timestamp semantics must describe what was observed; a directory's own mtime does not establish every descendant's activity. Optional native last-use evidence remains separately labeled. Deeper attribution or membership inspection is bounded and on demand, not a second recursive walk on every refresh. Exact cleanup checks inspect only the selected groups. Allocated size is not a promise of freed space, and uncertain hardlink reclamation alone is not a reason to reject removal.
+
+The planned validation covers mixed/unknown ages, overlapping groups, non-additive accounting, concrete consequences, evidence-only refresh, and unchanged/one-group-change latency and storage size. The purpose is useful developer cleanup decisions, not a perfect audit of historical use.
+
 ## Observation pipeline
 
 Each consumer subscribes to typed events and returns follow-on events. Registration happens in [EventBus::with_builtins](../crates/core/src/bus/mod.rs) before the run begins. Large shared event payloads use `Arc`.
