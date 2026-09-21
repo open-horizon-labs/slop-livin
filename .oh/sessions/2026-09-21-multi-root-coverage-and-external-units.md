@@ -189,6 +189,23 @@ rather than silently narrowed. `DESIGN.md` records the intended
 minimal shape (coverage-line clause, `ViewKind::External` as `'9'`) so
 the next worker does not have to re-derive it.
 
+**`swamp propose`'s CLI has no `--external` selection mode.** The
+action-layer contract (`actions::unit_from_external`/`propose_external`,
+`execute` refusing every external unit unconditionally) is implemented
+and tested end to end at the Rust-API level
+(`crates/core/tests/external_units_actions.rs`), which is what #43's
+acceptance criterion asks for ("wire the unit type through actions.rs
+so a plan can name one"). `Command::Propose` in `crates/cli/src/main.rs`
+still requires a walked report `root: PathBuf` and has no code path
+that reaches `propose_external` -- adding one means either making
+`root` optional (a larger, riskier change to a well-tested existing
+command under this chunk's time budget) or a separate subcommand. Left
+as an explicit, named gap rather than silently implied by the docs;
+the docs were corrected during this session after an initial pass
+overstated it ("`swamp propose` support follows the same pattern" was
+not true when written -- caught and fixed before commit, not left for
+review to find).
+
 ## Adversarial tests written (not just happy path)
 
 - `crates/core/tests/multi_root_coverage.rs` (11 tests): two disjoint

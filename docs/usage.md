@@ -170,11 +170,16 @@ never collapsed into "cache", and a unit is measured whether or not any
 project currently references it (removing the last consumer never
 deletes the unit or its history).
 
-External units are **inspection-only**: a plan can name one for review
-(`swamp propose` support follows the same pattern as any other unit),
-but `swamp execute` refuses every one of them unconditionally with "no
+External units are **inspection-only**: `actions::propose_external`/
+`unit_from_external` can build a plan naming one for review, and
+`swamp execute` refuses every such unit unconditionally with "no
 supported selective action for `<category>`" -- registry/detector
-output identifies storage, it never authorizes removing it. The `--view
+output identifies storage, it never authorizes removing it. `swamp
+propose`'s CLI does not yet expose a `--external` selection mode (it
+still expects a walked report root); today this plan/refusal contract
+is reachable through the core API and is exercised end to end by
+`crates/core/tests/external_units_actions.rs`, not yet through a
+dedicated CLI flag. The `--view
 external` total is deliberately kept separate from `reconciliation`
 above it: external units are never folded into `walked_total`/
 `attributed`/`unowned`, so there is nothing to double-count, but the two

@@ -135,7 +135,7 @@ Views:
 | `unowned` | array: `{path_or_object, bytes, reason, shared_bytes, docker_kind, note}` | |
 | `reconciliation` | object: `{attributed, unowned, walked_total, du_total, docker_attributed, docker_unowned}` | |
 | `rust` | array of nested Cargo artifacts | Inspection only; not project-scoped by `--project` yet. |
-| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: `propose`/`execute` can name a unit but execution always refuses it. |
+| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: the action layer can name a unit in a plan but execution always refuses it. `propose`'s CLI has no `--external` selection mode yet -- this view is read-only from the CLI today. |
 
 `--view grown` additionally has a top-level `coverage` block:
 

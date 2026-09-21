@@ -120,10 +120,14 @@ consumer never duplicates the unit or resets its history. External
 units are **never folded into `reconciliation`** (not summed into
 `walked_total`/`attributed`/`unowned`): the `--view external` total is
 a separate, additive figure, not a double count of anything above it.
-They are inspection-only: `propose`/`execute` can name one, but
-execution always refuses it with "no supported selective action for
-`<category>`" -- never treat an external unit as deletable through any
-path this tool exposes.
+They are inspection-only by contract: the action layer can name one in
+a plan, but execution always refuses it with "no supported selective
+action for `<category>`" -- never treat an external unit as deletable
+through any path this tool exposes. The CLI's `propose` command does
+not yet expose a selection mode for external units (only `report
+--view external` is CLI-reachable today); do not attempt to `propose`
+an external unit's path through the ordinary root-scoped `propose`
+command -- it will simply not match any row there.
 
 ## Filesystem vs. Docker accounting
 
