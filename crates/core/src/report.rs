@@ -1577,12 +1577,34 @@ pub fn report_scope_with_source(
                     }
                     Ok(_) => {}
                 }
-                let pruned: Vec<PathBuf> = scope
+                let mut pruned: Vec<PathBuf> = scope
                     .pruned_subtrees
                     .iter()
                     .filter(|note| &note.root == path)
                     .map(|note| PathBuf::from(&note.pattern))
                     .collect();
+                // External-unit-eligible locations nested under this
+                // root are pruned from its ordinary walk here (#45-#49's
+                // B2 gap): `crate::external::discover_and_measure`
+                // measures them independently, so counting them again as
+                // this root's walked/unowned bytes would double the
+                // measurement. Noted on the merged report regardless of
+                // this root's walk outcome, so the coverage story is
+                // visible even if the walk itself later fails.
+                let external_prunes: Vec<&crate::scope::ExternalPruneNote> = scope
+                    .external_pruned_subtrees
+                    .iter()
+                    .filter(|n| &n.root == path)
+                    .collect();
+                for n in &external_prunes {
+                    pruned.push(n.path.clone());
+                    merged.notes.push(format!(
+                        "[{}] {} pruned from walk: measured as external unit ({})",
+                        path.display(),
+                        n.path.display(),
+                        n.detector_id
+                    ));
+                }
                 let r = report_full_mode_with_exclusions(
                     path,
                     docker_facts,

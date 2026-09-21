@@ -206,12 +206,39 @@ pub struct EffectiveScope {
     /// exclusion patterns into the walk itself. Exposed now so the
     /// contract exists before that integration lands.
     pub pruned_subtrees: Vec<PruneNote>,
+    /// Detector-resolved (external-unit-eligible) subtrees folded into a
+    /// kept root by nesting, pruned from that root's ordinary walk so
+    /// `crate::external::discover_and_measure`'s independent measurement
+    /// of the same path is the sole count for its bytes. See
+    /// [`ExternalPruneNote`].
+    #[serde(default)]
+    pub external_pruned_subtrees: Vec<ExternalPruneNote>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneNote {
     pub root: PathBuf,
     pub pattern: String,
+}
+
+/// A detector-resolved location that is also a candidate external unit
+/// (`crate::external::discover_and_measure` measures it independently)
+/// and that folded into a kept, ordinarily-walked root as a nested
+/// subdirectory (see the folding pass in [`resolve_effective_scope`]).
+/// Recorded so `report_scope_with_source` can prune `path` out of
+/// `root`'s ordinary walk and note why: without this, the same bytes
+/// would be counted twice -- once as `root`'s walked/unowned total, once
+/// as the external unit's own measurement (see the B2 gap fixed
+/// alongside the developer-storage detector catalog, #45-#49, and
+/// `.oh/sessions/2026-09-21-detector-catalog-and-multi-root-ui.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalPruneNote {
+    /// The kept, ordinarily-walked root this subtree is pruned from.
+    pub root: PathBuf,
+    /// The nested subtree, pruned from `root`'s walk because it is
+    /// separately measured as an external unit.
+    pub path: PathBuf,
+    pub detector_id: String,
 }
 
 impl EffectiveScope {
@@ -461,6 +488,37 @@ pub fn resolve_effective_scope(
             };
         }
     }
+
+    // A folded (nested) candidate that is itself detector-resolved (and
+    // therefore also an external-unit candidate, per `crate::external`)
+    // must be pruned from its parent's ordinary walk -- otherwise its
+    // bytes are counted both there and in the external unit's own
+    // measurement (the B2 gap fixed alongside #45-#49; see
+    // `ExternalPruneNote`'s doc comment). Read before consuming
+    // `nested_of` below.
+    let mut external_pruned_subtrees: Vec<ExternalPruneNote> = Vec::new();
+    for (child, parent) in &nested_of {
+        let Some(child_root) = roots.iter().find(|r| &r.path == child) else {
+            continue;
+        };
+        for reason in &child_root.reasons {
+            if let RootReason::Detector { detector_id, .. } = reason {
+                if detector_id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
+                    external_pruned_subtrees.push(ExternalPruneNote {
+                        root: parent.clone(),
+                        path: child.clone(),
+                        detector_id: detector_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    // De-duplicate: two detector reasons for the same folded path (e.g.
+    // a duplicate registration) must produce one prune note, not one per
+    // reason.
+    external_pruned_subtrees.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
+    external_pruned_subtrees.dedup_by(|a, b| a.root == b.root && a.path == b.path);
+
     // Propagate nested reasons onto their parent roots.
     let nested_reasons: Vec<(PathBuf, PathBuf)> = nested_of.into_iter().collect();
     for (child, parent) in nested_reasons {
@@ -482,6 +540,7 @@ pub fn resolve_effective_scope(
         roots,
         detectors,
         pruned_subtrees,
+        external_pruned_subtrees,
     }
 }
 
@@ -746,27 +805,19 @@ mod tests {
         let home = tmp.path();
         let env = env_at(home);
         let registry = Registry::with_builtins();
+        // Every non-builtin-defaults detector, disabled by id -- derived
+        // from the registry itself (not a hand-maintained list) so this
+        // test does not silently stop covering "every detector disabled"
+        // every time a new detector is added to the catalog (#45-#49).
+        let disabled_detectors: Vec<String> = registry
+            .detectors()
+            .iter()
+            .map(|d| d.id().to_string())
+            .filter(|id| id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID)
+            .collect();
         let cfg = ScanConfig {
             defaults: false,
-            disabled_detectors: vec![
-                "cargo-home".to_string(),
-                "rustup".to_string(),
-                "homebrew".to_string(),
-                "claude-code".to_string(),
-                "codex".to_string(),
-                "codex-desktop".to_string(),
-                "oh-my-pi".to_string(),
-                "opencode".to_string(),
-                "gemini-cli".to_string(),
-                "pi".to_string(),
-                "aider".to_string(),
-                "github-copilot-cli".to_string(),
-                "cursor".to_string(),
-                "windsurf".to_string(),
-                "cline".to_string(),
-                "roo-code".to_string(),
-                "continue".to_string(),
-            ],
+            disabled_detectors,
             ..ScanConfig::default()
         };
         let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);

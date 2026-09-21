@@ -2374,6 +2374,7 @@ mod tests {
             roots,
             detectors: Vec::new(),
             pruned_subtrees: Vec::new(),
+            external_pruned_subtrees: Vec::new(),
         }
     }
 

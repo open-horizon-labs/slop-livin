@@ -949,6 +949,19 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
 /// as the serial `size_as_unit`, since a classified directory is sized as
 /// a best-effort unit rather than reported as a permission gap.
 fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool: &Pool<AttrJob>) {
+    // Pruned (#45-#49's external-location double-measurement fix): a
+    // subtree named in `shared.excluded` is measured independently
+    // elsewhere (typically as its own external unit), so this job
+    // contributes nothing for it -- same "not entered, not measured"
+    // contract as `process_walk`'s identical check.
+    if shared
+        .excluded
+        .iter()
+        .any(|e| path == *e || path.starts_with(e))
+    {
+        finish_size_job(group, shared);
+        return;
+    }
     let Ok(entries) = fs::read_dir(&path) else {
         finish_size_job(group, shared);
         return;
@@ -1162,6 +1175,22 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
     resize_artifact_with_dirs(root_path, kind, observed_at, None).0
 }
 
+/// `resize_artifact`, excluding `excluded` subtrees from the measurement
+/// entirely -- not measured, not folded into the total, exactly like
+/// `process_walk`'s config-exclusion contract (#42). Used by
+/// `crate::external::discover_and_measure` so a location that contains
+/// another, separately-measured detector location (e.g. Cargo home
+/// containing the registry/git subtrees it also proposes as their own
+/// units) is not double-measured (#45-#49).
+pub fn resize_artifact_excluding(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    excluded: &[PathBuf],
+) -> ArtifactRow {
+    resize_artifact_with_dirs_excluding(root_path, kind, observed_at, None, excluded).0
+}
+
 /// `resize_artifact` that also returns the unit's interior directory
 /// rollups (relative to `worktree`), for the store.
 pub fn resize_artifact_with_dirs(
@@ -1169,6 +1198,18 @@ pub fn resize_artifact_with_dirs(
     kind: ArtifactKind,
     observed_at: u64,
     worktree: Option<(&str, &Path)>,
+) -> (ArtifactRow, Vec<DirRollup>) {
+    resize_artifact_with_dirs_excluding(root_path, kind, observed_at, worktree, &[])
+}
+
+/// `resize_artifact_with_dirs`, excluding `excluded` subtrees (see
+/// [`resize_artifact_excluding`]).
+pub fn resize_artifact_with_dirs_excluding(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    worktree: Option<(&str, &Path)>,
+    excluded: &[PathBuf],
 ) -> (ArtifactRow, Vec<DirRollup>) {
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
@@ -1188,7 +1229,7 @@ pub fn resize_artifact_with_dirs(
         files: Mutex::new(Vec::new()),
         large_file_min_bytes: u64::MAX,
         carry: HashMap::new(),
-        excluded: Vec::new(),
+        excluded: excluded.to_vec(),
     });
     let wt_id = worktree
         .map(|(id, _)| id.to_string())

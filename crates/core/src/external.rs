@@ -173,20 +173,57 @@ pub fn discover_and_measure(
         }
     }
 
+    // Canonicalize once up front and de-duplicate exact (category,
+    // canonical path) repeats -- e.g. a symlinked alias, or two
+    // detectors independently conventionalizing the same real directory
+    // -- before deciding what to measure, so a duplicate registration
+    // never becomes two units for the same bytes (#45's "duplicate
+    // registrations without double counting").
+    let mut canon_candidates: Vec<(Candidate, PathBuf)> = Vec::new();
+    {
+        let mut seen: HashSet<(StorageCategory, PathBuf)> = HashSet::new();
+        for c in candidates {
+            let canonical = fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+            if !seen.insert((c.category, canonical.clone())) {
+                continue;
+            }
+            canon_candidates.push((c, canonical));
+        }
+    }
+
     let mut units: Vec<ExternalUnit> = Vec::new();
     let mut observed: Vec<crate::growth::ObservedExternal> = Vec::new();
     let mut protected_keys: HashSet<String> = HashSet::new();
     let mut meta_by_key: HashMap<String, MeasuredUnit> = HashMap::new();
 
-    for Candidate {
-        detector_id,
-        detector_name,
-        category,
-        provenance,
-        path: raw_path,
-    } in candidates
-    {
-        let canonical = fs::canonicalize(&raw_path).unwrap_or_else(|_| raw_path.clone());
+    for (idx, (candidate, canonical)) in canon_candidates.iter().enumerate() {
+        let Candidate {
+            detector_id,
+            detector_name,
+            category,
+            provenance,
+            path: _,
+        } = candidate;
+        let category = *category;
+        let detector_id = detector_id.clone();
+        let detector_name = detector_name.clone();
+        let provenance = provenance.clone();
+        let canonical = canonical.clone();
+        // Other resolved locations strictly nested inside this one are
+        // measured as their own external units; excluding them here is
+        // what makes this location's own measurement stop double as
+        // "this location plus everything separately counted under it"
+        // (the external-location double-measurement fix alongside
+        // #45-#49: e.g. Cargo home's registry/git subtrees, mise's
+        // installs/downloads/plugins/shims, or a model store's blobs).
+        let nested_exclusions: Vec<PathBuf> = canon_candidates
+            .iter()
+            .enumerate()
+            .filter(|(j, (_, other_canonical))| {
+                *j != idx && other_canonical != &canonical && other_canonical.starts_with(&canonical)
+            })
+            .map(|(_, (_, other_canonical))| other_canonical.clone())
+            .collect();
         let device = device_of(&canonical);
         let key = unit_key(&detector_id, category, device, &canonical);
 
@@ -218,7 +255,12 @@ pub fn discover_and_measure(
             Ok(_) => {}
         }
 
-        let row = crate::walk::resize_artifact(&canonical, ArtifactKind::Unknown, observed_at);
+        let row = crate::walk::resize_artifact_excluding(
+            &canonical,
+            ArtifactKind::Unknown,
+            observed_at,
+            &nested_exclusions,
+        );
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),
             detector_id: detector_id.clone(),

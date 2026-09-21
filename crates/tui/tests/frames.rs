@@ -779,6 +779,7 @@ fn header_shows_scope_coverage_clause_for_a_missing_root() {
             ],
             detectors: Vec::new(),
             pruned_subtrees: Vec::new(),
+            external_pruned_subtrees: Vec::new(),
         });
         check(
             &format!("scope_coverage_header_{w}x{h}"),
