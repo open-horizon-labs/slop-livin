@@ -1401,7 +1401,7 @@ pub(crate) fn join_docker_facts(
                 // `external_associations::docker_join_evidence`.
                 let evidence = vec![crate::external_associations::docker_join_evidence(
                     Some(&worktree_id),
-                    &rule,
+                    rule,
                 )];
                 result
                     .rows_by_worktree

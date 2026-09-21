@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// The five decision-evidence domains this contract distinguishes.
 /// Corresponds to #54 (Activity), #56/#57 (Consumer), #55 (CurrentUse),
 /// #58 (Recovery) and #59 (Reclaimability).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FactKind {
     Activity,
@@ -48,7 +48,7 @@ pub enum FactKind {
 
 /// A finer-grained subtype named explicitly so a reader never has to
 /// guess what a bare "activity" fact actually measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FactSubtype {
     // Activity (#54)

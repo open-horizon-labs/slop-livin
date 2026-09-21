@@ -102,6 +102,14 @@ pub struct PlanUnit {
     /// than naming them here as inspection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_meta: Option<AgentPlanMeta>,
+    /// Decision evidence (#61): the exact activity/consumer/reclaimability
+    /// facts this unit's report row already carried
+    /// (`report::attach_decision_evidence`), plus a fresh current-use
+    /// fact taken at proposal time. `execute` re-takes current-use fresh
+    /// rather than trusting this snapshot -- see the occupancy recheck
+    /// immediately before every rename/removal below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 /// See `PlanUnit::agent_meta`.
@@ -539,6 +547,23 @@ pub fn propose_external(
     })
 }
 
+/// A proposal's evidence snapshot (#61): the report row's already-known
+/// facts (Activity/Consumer/Recovery/Reclaimability, from
+/// `report::attach_decision_evidence`) plus one fresh current-use
+/// reading taken right now, at proposal time. `execute` never trusts
+/// this snapshot's current-use entry -- it re-takes its own immediately
+/// before acting (see the occupancy recheck in the rename/removal path
+/// below), so a change between propose and execute is always caught
+/// fresh rather than compared against a possibly-stale copy.
+fn plan_unit_evidence(
+    existing: &[crate::evidence::Evidence],
+    path: &Path,
+) -> Vec<crate::evidence::Evidence> {
+    let mut evidence = existing.to_vec();
+    evidence.push(crate::occupancy::open_file_evidence(path));
+    evidence
+}
+
 fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> PlanUnit {
     let rel = a
         .path
@@ -566,6 +591,7 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         verb: "delete".into(),
         track: a.track,
         warnings: warnings_for(wt, a, None),
+        evidence: plan_unit_evidence(&a.evidence, &a.path),
         external_category: None,
         agent_meta: None,
     }
@@ -605,6 +631,7 @@ pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
         warnings: vec![format!(
             "external unit ({category}): identification only, never authorization"
         )],
+        evidence: unit.evidence.clone(),
         external_category: Some(category),
         agent_meta: None,
     }
@@ -834,6 +861,7 @@ fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
         verb: "delete".into(),
         track: None,
         warnings,
+        evidence: plan_unit_evidence(&u.evidence, &u.path),
         external_category: None,
         agent_meta: Some(AgentPlanMeta {
             tool_id: u.tool_id.clone(),
@@ -1913,6 +1941,19 @@ pub fn execute_with_trash_opts(
                 continue;
             }
             Some(_) => {}
+        }
+        // Current-use recheck (#55, #61): the plan's own evidence
+        // snapshot is never trusted here -- a fresh occupancy reading is
+        // taken immediately before acting, so something that opened this
+        // path *after* proposal (changed occupancy facts between
+        // propose and execute) is still caught, not silently missed.
+        if let crate::evidence::FactStatus::Known(crate::evidence::FactValue::Bool(true)) =
+            crate::occupancy::open_file_evidence(&unit.path).status
+        {
+            outcome.cause =
+                Some("refused: an open file handle was found on this path just now — propose again once it is closed".into());
+            outcomes.push(outcome);
+            continue;
         }
         if keep_executables && unit.verb == "delete" {
             match preserve_executables(&unit.path, &unit.worktree_path) {
