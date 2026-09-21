@@ -628,6 +628,14 @@ pub fn annotate_readonly(
 ///
 /// `swamp_dir` is the top-level store root (e.g.
 /// `${SWAMP_DIR}`); the caller supplies the root-scope key in `volume_id`.
+///
+/// `protected_worktree_ids` (#42) names worktree ids this observation
+/// could not confirm one way or the other -- typically because access to
+/// the worktree's path was lost between observations (see
+/// `compute_unconfirmed_worktrees`). A row belonging to one of these
+/// worktree ids is never tombstoned by this call even though it is
+/// absent from `projects`: absence here means "not observed", not
+/// "deleted". See `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 pub fn observe_and_annotate(
     swamp_dir: &Path,
     volume_id: u64,
@@ -635,6 +643,7 @@ pub fn observe_and_annotate(
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
+    protected_worktree_ids: &HashSet<String>,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
@@ -747,9 +756,14 @@ pub fn observe_and_annotate(
 
     // Rows present before, absent now: tombstone them (kept in the
     // store so a later reappearance counts as regrowth), but never
-    // emitted as report rows in this issue.
+    // emitted as report rows in this issue. A row whose worktree could
+    // not be confirmed this pass (#42) is left untouched instead: its
+    // absence from `seen_keys` reflects lost access, not deletion.
     for (key, row) in current.iter_mut() {
-        if row.present && !seen_keys.contains(key) {
+        if row.present
+            && !seen_keys.contains(key)
+            && !protected_worktree_ids.contains(&row.worktree_id)
+        {
             delta_rows.push(StoredRow {
                 project_id: row.project_id.clone(),
                 worktree_id: row.worktree_id.clone(),
@@ -1970,6 +1984,17 @@ pub struct TrackedWalk {
     /// rows, artifact roots re-sized whole, Source directories re-listed
     /// in place, worktrees handed back to the walker.
     pub in_place: (usize, usize, usize, usize),
+    /// Worktree ids that were present in the last observation's topology
+    /// but are absent from `discovered` this pass *and could not be
+    /// confirmed gone* -- the path still exists on disk but could not be
+    /// read (e.g. `chmod 000`), so its absence from `discovered` reflects
+    /// lost access, not deletion (#42). The growth store must not
+    /// tombstone rows belonging to these worktree ids from this
+    /// observation: an inaccessible worktree is a coverage gap, never a
+    /// storage change. A worktree id whose path is genuinely gone
+    /// (`ENOENT`) is *not* included here -- that is real deletion, and
+    /// tombstoning is exactly correct for it.
+    pub unconfirmed_worktree_ids: Vec<String>,
 }
 
 /// Threshold past which re-walking piecemeal costs more than a full
@@ -2012,6 +2037,7 @@ pub fn observe_tracked(
         force_full,
         observe,
         crate::fs_events::platform_source().as_ref(),
+        &[],
     )
 }
 
@@ -2040,6 +2066,7 @@ pub fn observe_tracked_with_source(
     force_full: bool,
     observe: bool,
     source: &dyn crate::fs_events::FsEventsSource,
+    excluded: &[PathBuf],
 ) -> Result<TrackedWalk> {
     let (walk, checkpoint) = stage_tracked_with_source(
         swamp_dir,
@@ -2049,6 +2076,7 @@ pub fn observe_tracked_with_source(
         force_full,
         observe,
         source,
+        excluded,
     )?;
     if let Some(checkpoint) = checkpoint {
         checkpoint.commit()?;
@@ -2087,6 +2115,7 @@ pub fn stage_tracked_with_source(
     force_full: bool,
     observe: bool,
     source: &dyn crate::fs_events::FsEventsSource,
+    excluded: &[PathBuf],
 ) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
     // This public lower-level entry point must be safe for direct callers;
     // never persist alias-form topology into a canonical root scope.
@@ -2113,13 +2142,19 @@ pub fn stage_tracked_with_source(
     // no longer count (or newly count) as artifacts only get fixed by a
     // walk that visits them, so take the one full walk now.
     let rules_changed = prev_state.rules_version != crate::ecosystem::RULES_VERSION;
+    // Read once, ahead of either branch below: both a forced/rules-change
+    // full walk and the ordinary incremental-or-full path need it to tell
+    // "worktree confirmed gone" from "worktree access lost" (#42).
+    let prev_topology_for_check = read_topology(&dir);
     if force_full || rules_changed {
         let reason = if force_full {
             "full_forced"
         } else {
             "full_rules_changed"
         };
-        let result = full_walk(&root, observed_at, large_file_min_bytes, reason)?;
+        let mut result = full_walk(&root, observed_at, large_file_min_bytes, reason, excluded)?;
+        result.unconfirmed_worktree_ids =
+            compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
         let checkpoint = observe.then(|| ObservationCheckpoint {
             dir,
             topology: to_stored_worktrees(&result.discovered),
@@ -2166,17 +2201,38 @@ pub fn stage_tracked_with_source(
             plan.changed_dirs.len()
         );
     }
-    let prev_topology = read_topology(&dir);
+    let prev_topology = prev_topology_for_check.clone();
+    // Prune any FSEvents-reported change that falls inside an excluded
+    // subtree (#42) before it ever reaches the incremental re-walk
+    // machinery: `apply_incremental`/`attribute_one_worktree`/
+    // `discover_shallow` have no exclusion list of their own precisely
+    // because nothing excluded is ever supposed to reach them.
+    let relevant_changed_dirs: Vec<PathBuf> = if excluded.is_empty() {
+        plan.changed_dirs.clone()
+    } else {
+        plan.changed_dirs
+            .iter()
+            .filter(|p| !excluded.iter().any(|e| *p == e || p.starts_with(e)))
+            .cloned()
+            .collect()
+    };
 
-    let result = if too_soon && !plan.live {
+    let mut result = if too_soon && !plan.live {
         full_walk(
             &root,
             observed_at,
             large_file_min_bytes,
             crate::fs_events::RefreshRefusal::TooSoon.as_str(),
+            excluded,
         )?
     } else if !plan.incremental {
-        full_walk(&root, observed_at, large_file_min_bytes, plan.reason_str())?
+        full_walk(
+            &root,
+            observed_at,
+            large_file_min_bytes,
+            plan.reason_str(),
+            excluded,
+        )?
     } else {
         match prev_topology {
             None => full_walk(
@@ -2184,6 +2240,7 @@ pub fn stage_tracked_with_source(
                 observed_at,
                 large_file_min_bytes,
                 "no_stored_event_id",
+                excluded,
             )?,
             Some(ref topo) => {
                 // Floored at a minimum so a tiny tree (a handful of
@@ -2192,12 +2249,20 @@ pub fn stage_tracked_with_source(
                 // the guard exists to protect large trees, where a
                 // fraction is the meaningful signal.
                 let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
-                if plan.changed_dirs.len() as f64 > TOO_MANY_CHANGES_FRACTION * known_dirs as f64 {
-                    full_walk(&root, observed_at, large_file_min_bytes, "too_many_changes")?
+                if relevant_changed_dirs.len() as f64
+                    > TOO_MANY_CHANGES_FRACTION * known_dirs as f64
+                {
+                    full_walk(
+                        &root,
+                        observed_at,
+                        large_file_min_bytes,
+                        "too_many_changes",
+                        excluded,
+                    )?
                 } else {
                     apply_incremental(
                         topo,
-                        &plan.changed_dirs,
+                        &relevant_changed_dirs,
                         observed_at,
                         large_file_min_bytes,
                         &dir,
@@ -2206,6 +2271,8 @@ pub fn stage_tracked_with_source(
             }
         }
     };
+    result.unconfirmed_worktree_ids =
+        compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
 
     let checkpoint = observe.then(|| ObservationCheckpoint {
         // Re-anchor for the next call regardless of which path was taken.
@@ -2415,9 +2482,14 @@ fn full_walk(
     observed_at: u64,
     large_file_min_bytes: u64,
     reason: &'static str,
+    excluded: &[PathBuf],
 ) -> Result<TrackedWalk> {
-    let (discovered, mut attribution) =
-        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes)?;
+    let (discovered, mut attribution) = crate::walk::discover_and_attribute_excluding(
+        root,
+        observed_at,
+        large_file_min_bytes,
+        excluded,
+    )?;
     split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,
@@ -2428,7 +2500,44 @@ fn full_walk(
         changed_dirs: 0,
         rewalked: None,
         in_place: (0, 0, 0, 0),
+        unconfirmed_worktree_ids: Vec::new(),
     })
+}
+
+/// Worktree ids from `prev` whose path is absent from `discovered` this
+/// pass, split into "confirmed gone" (tombstoning is correct) versus
+/// "could not confirm" (the path still exists but could not be read, so
+/// the growth store must preserve its rows as-is). Only the latter are
+/// returned. A single non-recursive `symlink_metadata`/`read_dir` pair
+/// per candidate; bounded by the number of worktrees that dropped out of
+/// this observation, never by tree size.
+fn compute_unconfirmed_worktrees(
+    prev: Option<&[StoredWorktree]>,
+    discovered: &[DiscoveredWorktree],
+) -> Vec<String> {
+    let Some(prev) = prev else {
+        return Vec::new();
+    };
+    let discovered_paths: HashSet<&Path> =
+        discovered.iter().map(|d| d.path.as_path()).collect();
+    prev.iter()
+        .filter(|pw| !discovered_paths.contains(pw.path.as_path()))
+        .filter(|pw| match fs::symlink_metadata(&pw.path) {
+            // Gone entirely: real deletion, tombstoning is correct.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            // Existed, could not be statted for some other reason (also
+            // commonly permission-denied on a parent directory): treat as
+            // unconfirmed, the conservative choice.
+            Err(_) => true,
+            // The path itself still exists. If it can be listed, a real
+            // walk would have discovered it, so its absence from
+            // `discovered` means it is no longer a git worktree (e.g.
+            // `.git` was removed) -- a real change, not a coverage gap.
+            // If it cannot be listed, access was lost, not the worktree.
+            Ok(_) => fs::read_dir(&pw.path).is_err(),
+        })
+        .map(|pw| pw.worktree_id.clone())
+        .collect()
 }
 
 fn rel_path_string(root: &Path, path: &Path) -> String {
@@ -3309,6 +3418,9 @@ fn apply_incremental(
                 .collect(),
         ),
         in_place: (n_interior, n_whole, relisted, worktrees_to_rewalk.len()),
+        // Set by the caller (`stage_tracked_with_source`), which has both
+        // the previous topology and this result's `discovered` in hand.
+        unconfirmed_worktree_ids: Vec::new(),
     })
 }
 
@@ -3740,9 +3852,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1000)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1000, 30, 1000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut projects, 1000, 30, 1000, &HashSet::new()).unwrap();
         projects[0].worktrees[0].artifacts[0].dedup_stale = true;
-        observe_and_annotate(tmp.path(), 1, &mut projects, 2000, 30, 1000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut projects, 2000, 30, 1000, &HashSet::new()).unwrap();
         assert_eq!(artifact_row(&projects).growth_bytes, None);
         let dir = volume_dir(tmp.path(), 1);
         assert!(read_rows(&current_path(&dir)).unwrap()[0].dedup_stale);
@@ -3750,7 +3862,7 @@ mod tests {
         assert_eq!(totals, vec![Some(1000), None]);
         projects[0].worktrees[0].artifacts[0].dedup_stale = false;
         projects[0].worktrees[0].artifacts[0].bytes = 2000;
-        observe_and_annotate(tmp.path(), 1, &mut projects, 3000, 30, 1000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut projects, 3000, 30, 1000, &HashSet::new()).unwrap();
         assert_eq!(
             artifact_row(&projects).growth_bytes,
             None,
@@ -3765,7 +3877,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600, &HashSet::new()).unwrap();
         assert_eq!(artifact_row(&projects).growth_bytes, None);
         assert_eq!(artifact_row(&projects).regrowth_count, 0);
     }
@@ -3776,10 +3888,10 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut first = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600, &HashSet::new()).unwrap();
 
         let mut second = vec![one_artifact_project(&root, 4_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600, &HashSet::new()).unwrap();
 
         assert_eq!(artifact_row(&second).growth_bytes, Some(3_000_000));
     }
@@ -3790,7 +3902,7 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut first = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600, &HashSet::new()).unwrap();
         let dir = volume_dir(tmp.path(), 1);
         let after_first = list_delta_files(&dir).len();
         assert_eq!(
@@ -3800,7 +3912,7 @@ mod tests {
         );
 
         let mut second = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600, &HashSet::new()).unwrap();
         let after_second = list_delta_files(&dir).len();
         assert_eq!(
             after_second, after_first,
@@ -3815,7 +3927,7 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut present = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut present, 1_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut present, 1_000, 30, 3600, &HashSet::new()).unwrap();
 
         // target/ deleted: no artifacts observed this pass at all.
         let mut absent: Vec<ProjectRow> = vec![ProjectRow {
@@ -3835,11 +3947,11 @@ mod tests {
                 idle_secs: None,
             }],
         }];
-        observe_and_annotate(tmp.path(), 1, &mut absent, 2_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut absent, 2_000, 30, 3600, &HashSet::new()).unwrap();
 
         // target/ recreated.
         let mut recreated = vec![one_artifact_project(&root, 500_000)];
-        observe_and_annotate(tmp.path(), 1, &mut recreated, 3_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut recreated, 3_000, 30, 3600, &HashSet::new()).unwrap();
 
         assert_eq!(artifact_row(&recreated).regrowth_count, 1);
     }
@@ -3861,14 +3973,14 @@ mod tests {
         let original_bytes = 1_000_000;
 
         let mut obs1 = vec![one_artifact_project(&root, original_bytes)];
-        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 5_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 5_000, &HashSet::new()).unwrap();
 
         let mut obs2 = vec![one_artifact_project(&root, original_bytes + 200_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 5_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 5_000, &HashSet::new()).unwrap();
 
         // Shrunk back to exactly the original size.
         let mut obs3 = vec![one_artifact_project(&root, original_bytes)];
-        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 5_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 5_000, &HashSet::new()).unwrap();
 
         assert_eq!(
             artifact_row(&obs3).growth_bytes,
@@ -3888,16 +4000,16 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut obs1 = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 2_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 2_000, &HashSet::new()).unwrap();
 
         let mut obs2 = vec![one_artifact_project(&root, 2_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 2_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 2_000, &HashSet::new()).unwrap();
 
         // since_secs=2_000 at observed_at=3_000 targets time 1_000 --
         // exactly obs1's timestamp -- so the baseline must be obs1's
         // 1_000_000 bytes, not 0.
         let mut obs3 = vec![one_artifact_project(&root, 5_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 2_000).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 2_000, &HashSet::new()).unwrap();
 
         assert_eq!(
             artifact_row(&obs3).growth_bytes,
@@ -3914,7 +4026,7 @@ mod tests {
 
         for i in 0..(COMPACTION_THRESHOLD as u64 + 5) {
             let mut obs = vec![one_artifact_project(&root, 1_000 + i)];
-            observe_and_annotate(tmp.path(), 1, &mut obs, 1_000 + i, 30, 3600).unwrap();
+            observe_and_annotate(tmp.path(), 1, &mut obs, 1_000 + i, 30, 3600, &HashSet::new()).unwrap();
         }
 
         let files = list_delta_files(&dir);
@@ -3936,7 +4048,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/some/absolute/worktree/root");
         let mut projects = vec![one_artifact_project(&root, 42)];
-        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600).unwrap();
+        observe_and_annotate(tmp.path(), 1, &mut projects, 1_000, 30, 3600, &HashSet::new()).unwrap();
 
         let dir = volume_dir(tmp.path(), 1);
         let current = read_rows(&current_path(&dir)).unwrap();

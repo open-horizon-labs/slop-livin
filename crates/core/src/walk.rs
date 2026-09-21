@@ -262,6 +262,18 @@ fn shallow_parallel_measurement_counts_allocations_without_following_links_or_ch
 /// unspecified (workers race), which is fine: callers group by
 /// `project_id`/`worktree_id`, not position.
 pub fn discover_parallel(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
+    discover_parallel_excluding(root, &[])
+}
+
+/// Same as [`discover_parallel`], pruning any subtree at or under a path
+/// in `excluded` (#42 -- `scope::EffectiveScope::pruned_subtrees`): a
+/// pruned directory is never entered, so nothing under it is ever
+/// discovered as a worktree. Excluded, not partially observed -- the
+/// coverage region for it is `Excluded`, never `Missing`/`Partial`.
+pub fn discover_parallel_excluding(
+    root: &Path,
+    excluded: &[PathBuf],
+) -> Result<Vec<DiscoveredWorktree>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -274,7 +286,7 @@ pub fn discover_parallel(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
     pool.push(root.to_path_buf());
 
     pool.drain(worker_count(), |path| {
-        discover_one(&path, device, &pool, &discovered);
+        discover_one(&path, device, &pool, &discovered, excluded);
     });
 
     Ok(discovered.into_inner().unwrap())
@@ -285,7 +297,11 @@ fn discover_one(
     device: u64,
     pool: &Pool<PathBuf>,
     discovered: &Mutex<Vec<DiscoveredWorktree>>,
+    excluded: &[PathBuf],
 ) {
+    if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
+        return;
+    }
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return;
     };
@@ -505,6 +521,11 @@ struct AttrShared {
     /// takes the row instead of sizing the tree again. Empty on a full
     /// walk.
     carry: HashMap<PathBuf, ArtifactRow>,
+    /// Subtrees pruned from measurement (#42 --
+    /// `scope::EffectiveScope::pruned_subtrees`). A directory at or under
+    /// one of these is never entered: not measured, not reported as
+    /// unowned, not walked at all. Excluded, never partially observed.
+    excluded: Vec<PathBuf>,
 }
 
 /// Parallel equivalent of `attribution::attribute`: same classification
@@ -525,21 +546,30 @@ pub fn attribute_parallel(
         observed_at,
         large_file_min_bytes,
         HashMap::new(),
+        &[],
     )
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
-/// `AttrShared::carry`), for the incremental path.
+/// `AttrShared::carry`) and a set of subtrees to prune (#42), for the
+/// full-walk and incremental paths respectively.
 pub fn attribute_parallel_carrying(
     root: &Path,
     worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
+    excluded: &[PathBuf],
 ) -> AttributionResult {
     progress::start();
-    let result =
-        attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes, carry);
+    let result = attribute_parallel_inner(
+        root,
+        worktrees,
+        observed_at,
+        large_file_min_bytes,
+        carry,
+        excluded,
+    );
     progress::finish();
     result
 }
@@ -550,6 +580,7 @@ fn attribute_parallel_inner(
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
+    excluded: &[PathBuf],
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -574,6 +605,7 @@ fn attribute_parallel_inner(
         files: Mutex::new(Vec::new()),
         large_file_min_bytes,
         carry,
+        excluded: excluded.to_vec(),
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -650,6 +682,17 @@ fn attribute_parallel_inner(
 /// (`is_dir`/`is_symlink` come from `DirEntry::file_type` for every other
 /// call site), so it alone still needs its own `symlink_metadata` check.
 fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, pool: &Pool<AttrJob>) {
+    // Pruned by a config exclusion (#42): not entered, not measured, not
+    // reported as unowned. This is what makes a subtree exclusion inside
+    // an otherwise-included root an `Excluded` coverage region rather
+    // than merely a recorded-but-ignored note.
+    if shared
+        .excluded
+        .iter()
+        .any(|e| path == *e || path.starts_with(e))
+    {
+        return;
+    }
     let Ok(meta) = fs::symlink_metadata(&path) else {
         return;
     };
@@ -1094,12 +1137,16 @@ pub fn attribute_one_worktree(
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
 ) -> AttributionResult {
+    // The incremental caller (`growth::stage_tracked_with_source`) filters
+    // `changed_dirs` against `pruned_subtrees` before ever reaching here,
+    // so this re-walk never targets an excluded worktree.
     attribute_parallel_carrying(
         worktree_root,
         all_worktrees,
         observed_at,
         large_file_min_bytes,
         carry,
+        &[],
     )
 }
 
@@ -1141,6 +1188,7 @@ pub fn resize_artifact_with_dirs(
         files: Mutex::new(Vec::new()),
         large_file_min_bytes: u64::MAX,
         carry: HashMap::new(),
+        excluded: Vec::new(),
     });
     let wt_id = worktree
         .map(|(id, _)| id.to_string())
@@ -1222,7 +1270,11 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
     let device = meta.dev();
     let discovered: Mutex<Vec<DiscoveredWorktree>> = Mutex::new(Vec::new());
     let pool: Pool<PathBuf> = Pool::new();
-    discover_one(dir, device, &pool, &discovered);
+    // The incremental path filters `changed_dirs` against
+    // `pruned_subtrees` before this is ever called (see
+    // `growth::stage_tracked_with_source`), so no exclusion list is
+    // needed here.
+    discover_one(dir, device, &pool, &discovered, &[]);
     // discover_one queued the children it would have recursed into; take
     // exactly one level of them, without recursing further.
     while let Some(child) = pool.try_pop() {
@@ -1262,9 +1314,22 @@ pub fn discover_and_attribute(
     observed_at: u64,
     large_file_min_bytes: u64,
 ) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
+    discover_and_attribute_excluding(root, observed_at, large_file_min_bytes, &[])
+}
+
+/// Same as [`discover_and_attribute`], pruning every subtree in `excluded`
+/// (#42) from both the discovery and attribution passes: nothing under an
+/// excluded path is discovered as a worktree, measured, or reported as
+/// unowned.
+pub fn discover_and_attribute_excluding(
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    excluded: &[PathBuf],
+) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
-    let discovered = discover_parallel(root)?;
+    let discovered = discover_parallel_excluding(root, excluded)?;
     if trace {
         eprintln!("[trace] walk::discover_parallel: {:?}", t0.elapsed());
     }
@@ -1277,7 +1342,14 @@ pub fn discover_and_attribute(
         .map(|(p, id)| (p.as_path(), id.as_str()))
         .collect();
     let t1 = std::time::Instant::now();
-    let attribution = attribute_parallel(root, &worktree_refs, observed_at, large_file_min_bytes);
+    let attribution = attribute_parallel_carrying(
+        root,
+        &worktree_refs,
+        observed_at,
+        large_file_min_bytes,
+        HashMap::new(),
+        excluded,
+    );
     if trace {
         eprintln!("[trace] walk::attribute_parallel: {:?}", t1.elapsed());
     }

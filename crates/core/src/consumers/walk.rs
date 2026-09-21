@@ -30,6 +30,7 @@ impl Consumer for WalkConsumer {
         let mut notes: Vec<String> = Vec::new();
         let mut rewalked: Option<Arc<Vec<String>>> = None;
         let mut changed_paths = None;
+        let mut unconfirmed_worktree_ids: Vec<String> = Vec::new();
         let (discovered, attribution) = if let Some(dir) = &ctx.store_dir {
             let (tracked, checkpoint) = crate::growth::stage_tracked_with_source(
                 dir,
@@ -39,21 +40,30 @@ impl Consumer for WalkConsumer {
                 ctx.force_full,
                 ctx.observe,
                 ctx.fs_events,
+                &ctx.pruned_subtrees,
             )?;
             *self.checkpoint.lock().unwrap() = checkpoint;
             notes.push(format!(
                 "fsevents: mode={} reason={} changed_dirs={}",
                 tracked.mode, tracked.reason, tracked.changed_dirs
             ));
+            if !tracked.unconfirmed_worktree_ids.is_empty() {
+                notes.push(format!(
+                    "coverage: {} worktree(s) could not be confirmed this pass (access lost, not deleted); history preserved",
+                    tracked.unconfirmed_worktree_ids.len()
+                ));
+            }
             rewalked = tracked.rewalked.map(Arc::new);
             changed_paths = tracked.changed_paths.map(Arc::new);
+            unconfirmed_worktree_ids = tracked.unconfirmed_worktree_ids;
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
-            crate::walk::discover_and_attribute(
+            crate::walk::discover_and_attribute_excluding(
                 &ctx.root,
                 ctx.observed_at,
                 ctx.large_file_min_bytes,
+                &ctx.pruned_subtrees,
             )?
         };
         Ok(vec![Event::RootObserved {
@@ -62,6 +72,7 @@ impl Consumer for WalkConsumer {
             attribution: Arc::new(attribution),
             notes,
             rewalked,
+            unconfirmed_worktree_ids: Arc::new(unconfirmed_worktree_ids),
         }])
     }
 }

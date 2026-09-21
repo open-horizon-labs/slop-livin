@@ -672,15 +672,56 @@ pub fn report_full_mode_with_source(
     force_full: bool,
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
 ) -> Result<Report> {
+    report_full_mode_with_exclusions(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+        &[],
+    )
+}
+
+/// Same as [`report_full_mode_with_source`], with a set of subtrees to
+/// prune from this walk (#42 -- `scope::EffectiveScope::pruned_subtrees`,
+/// filtered to `root`). [`report_scope`] is the one caller that has scope
+/// exclusions to enforce; every other caller goes through
+/// [`report_full_mode_with_source`] with none.
+#[allow(clippy::too_many_arguments)]
+pub fn report_full_mode_with_exclusions(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+    pruned_subtrees: &[PathBuf],
+) -> Result<Report> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
     // alias and the next uses its canonical spelling: FSEvents is canonical,
     // while a caller-form topology would otherwise make incremental replay
     // compare different path namespaces.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Exclusion patterns were resolved against the pre-canonicalization
+    // root; canonicalize them the same way so a symlinked root's pruned
+    // subtrees still match what the walker actually sees.
+    let pruned_subtrees: Vec<PathBuf> = pruned_subtrees
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
     // The pipeline is consumers on the event bus (ADR 001); this function
     // only translates its arguments into the run context.
-    let ctx = crate::bus::ctx_for(
+    let ctx = crate::bus::ctx_for_excluding(
         &root,
         docker_facts,
         verify_du,
@@ -691,6 +732,7 @@ pub fn report_full_mode_with_source(
         enrich,
         force_full,
         fs_events_source,
+        &pruned_subtrees,
     );
     crate::bus::run_report(&ctx)
 }
@@ -1402,4 +1444,315 @@ pub fn observe_only(
 
 pub fn to_json(report: &Report) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
+}
+
+/// Observes/reports a whole resolved [`crate::scope::EffectiveScope`]
+/// coherently (#42): one call, one merged [`Report`] over every root the
+/// scope actually resolved to walk, plus a [`crate::coverage::RootCoverage`]
+/// row per candidate root explaining what this pass could (and could not)
+/// establish about it.
+///
+/// Each in-scope root keeps its own physical growth store (keyed by
+/// `growth::root_scoped_volume_id`, unchanged from before #42): this
+/// function's contribution is a single coherent orchestration over all of
+/// them, not a merged store. That keeps the hazard this issue exists to
+/// close -- one root's observation silently overwriting or tombstoning
+/// another's, or a scope-wide sweep treating "not walked" as "deleted" --
+/// structurally impossible: two roots can never share a store to corrupt.
+///
+/// A `Present` root is re-checked for read access immediately before
+/// walking (scope resolution and this call are never atomic: access can
+/// be lost in between), and its walk's own outcome is inspected for
+/// permission-denied residue before deciding `Complete` vs `Partial`. A
+/// walk that fails outright (`Err`) never reaches the growth store at
+/// all -- see `bus::run_report`'s `ReportCached`-gated checkpoint commit
+/// -- so marking that root `Inaccessible` here never contradicts what was
+/// (not) persisted for it.
+pub fn report_scope(
+    scope: &crate::scope::EffectiveScope,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+) -> Result<(Report, Vec<crate::coverage::RootCoverage>)> {
+    report_scope_with_source(
+        scope,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        crate::fs_events::platform_source().as_ref(),
+    )
+}
+
+/// Same as [`report_scope`], with the [`crate::fs_events::FsEventsSource`]
+/// supplied explicitly -- the seam adversarial multi-root tests use.
+#[allow(clippy::too_many_arguments)]
+pub fn report_scope_with_source(
+    scope: &crate::scope::EffectiveScope,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+) -> Result<(Report, Vec<crate::coverage::RootCoverage>)> {
+    use crate::coverage::{RegionStatus, RootCoverage};
+    use crate::scope::RootStatus;
+
+    let observed_at = crate::entities::now();
+    let mut coverage: Vec<RootCoverage> = Vec::new();
+    let mut merged = Report {
+        observed_at,
+        root: PathBuf::new(),
+        projects: Vec::new(),
+        unowned: Vec::new(),
+        reconciliation: Reconciliation {
+            attributed: 0,
+            unowned: 0,
+            walked_total: 0,
+            du_total: None,
+            docker_attributed: 0,
+            docker_unowned: 0,
+        },
+        series_by_key: std::collections::HashMap::new(),
+        total_series: Vec::new(),
+        series_window_secs: 0,
+        notes: Vec::new(),
+        dirs_by_worktree: include_dirs.then(std::collections::HashMap::new),
+        files_by_worktree: include_dirs.then(std::collections::HashMap::new),
+        schedule_line: None,
+        summary: Summary::default(),
+        github_enrichment: None,
+        nested_artifacts: Vec::new(),
+    };
+    let mut du_total_sum: Option<u64> = None;
+
+    for scope_root in &scope.roots {
+        match &scope_root.status {
+            RootStatus::Excluded { .. } => {
+                coverage.push(RootCoverage::excluded(scope_root.path.clone()));
+            }
+            // Folded into its parent's own walk (see
+            // `scope::resolve_effective_scope`'s nested-folding pass): the
+            // parent's region already accounts for this path, so it gets
+            // no separate coverage row rather than a misleading "not
+            // observed" one.
+            RootStatus::SkippedAsNested { .. } => {}
+            RootStatus::Missing => {
+                coverage.push(RootCoverage::missing(scope_root.path.clone()));
+            }
+            RootStatus::Unreadable { reason } => {
+                coverage.push(RootCoverage::inaccessible(
+                    scope_root.path.clone(),
+                    reason.clone(),
+                ));
+            }
+            RootStatus::Present => {
+                let path = &scope_root.path;
+                // Scope resolution and this call are never atomic: redo the
+                // presence/readability check right before walking so a
+                // root that lost access in between is never silently
+                // walked as if it were empty.
+                match std::fs::read_dir(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        coverage.push(RootCoverage::missing(path.clone()));
+                        continue;
+                    }
+                    Err(e) => {
+                        coverage.push(RootCoverage::inaccessible(path.clone(), e.to_string()));
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                let pruned: Vec<PathBuf> = scope
+                    .pruned_subtrees
+                    .iter()
+                    .filter(|note| &note.root == path)
+                    .map(|note| PathBuf::from(&note.pattern))
+                    .collect();
+                let r = report_full_mode_with_exclusions(
+                    path,
+                    docker_facts,
+                    verify_du,
+                    store_dir,
+                    since_override,
+                    observe,
+                    include_dirs,
+                    enrich,
+                    force_full,
+                    fs_events_source,
+                    &pruned,
+                );
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // The walk failed outright: `bus::run_report`'s
+                        // checkpoint only commits on `ReportCached`, so no
+                        // consumer -- including the growth store -- wrote
+                        // anything for this root from this attempt.
+                        coverage.push(RootCoverage::inaccessible(path.clone(), e.to_string()));
+                        continue;
+                    }
+                };
+                let unreadable_paths = r
+                    .unowned
+                    .iter()
+                    .filter(|u| u.reason == UnownedReason::PermissionDenied)
+                    .count();
+                let status = if unreadable_paths > 0 {
+                    RegionStatus::Partial {
+                        reason: format!(
+                            "{unreadable_paths} path(s) unreadable during this walk"
+                        ),
+                    }
+                } else {
+                    RegionStatus::Complete
+                };
+                let mode = r
+                    .notes
+                    .iter()
+                    .find_map(|n| n.strip_prefix("fsevents: mode="))
+                    .and_then(|s| s.split(' ').next())
+                    .unwrap_or("full")
+                    .to_string();
+                coverage.push(RootCoverage {
+                    path: path.clone(),
+                    status,
+                    walked_total: r.reconciliation.walked_total,
+                    projects: r.projects.len(),
+                    mode,
+                });
+
+                if merged.root.as_os_str().is_empty() {
+                    merged.root = path.clone();
+                }
+                merged.projects.extend(r.projects);
+                merged.unowned.extend(r.unowned);
+                merged.reconciliation.attributed += r.reconciliation.attributed;
+                merged.reconciliation.unowned += r.reconciliation.unowned;
+                merged.reconciliation.walked_total += r.reconciliation.walked_total;
+                merged.reconciliation.docker_attributed += r.reconciliation.docker_attributed;
+                merged.reconciliation.docker_unowned += r.reconciliation.docker_unowned;
+                if let Some(d) = r.reconciliation.du_total {
+                    du_total_sum = Some(du_total_sum.unwrap_or(0) + d);
+                }
+                merged.series_by_key.extend(r.series_by_key);
+                if merged.total_series.is_empty() {
+                    merged.total_series = r.total_series;
+                    merged.series_window_secs = r.series_window_secs;
+                } else if merged.total_series.len() == r.total_series.len() {
+                    for (a, b) in merged.total_series.iter_mut().zip(r.total_series.iter()) {
+                        *a = match (*a, *b) {
+                            (None, None) => None,
+                            (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+                        };
+                    }
+                }
+                // Multi-root series bucket windows can drift apart (each
+                // root's `report_full_mode_with_source` call reads its own
+                // wall-clock `now`); a length mismatch is left as the
+                // first root's series rather than silently interleaved --
+                // documented as a #51 follow-up (TUI is the only current
+                // consumer of `total_series` for a live sparkline).
+                for note in r.notes {
+                    merged.notes.push(format!("[{}] {note}", path.display()));
+                }
+                if let Some(dbw) = r.dirs_by_worktree {
+                    merged
+                        .dirs_by_worktree
+                        .get_or_insert_with(std::collections::HashMap::new)
+                        .extend(dbw);
+                }
+                if let Some(fbw) = r.files_by_worktree {
+                    merged
+                        .files_by_worktree
+                        .get_or_insert_with(std::collections::HashMap::new)
+                        .extend(fbw);
+                }
+                if merged.schedule_line.is_none() {
+                    merged.schedule_line = r.schedule_line;
+                }
+                match (&mut merged.github_enrichment, r.github_enrichment) {
+                    (slot @ None, Some(g)) => *slot = Some(g),
+                    (Some(acc), Some(g)) => {
+                        acc.calls_made += g.calls_made;
+                        acc.worktrees_enriched += g.worktrees_enriched;
+                        acc.elapsed_secs += g.elapsed_secs;
+                    }
+                    _ => {}
+                }
+                merged.nested_artifacts.extend(r.nested_artifacts);
+            }
+        }
+    }
+    merged.reconciliation.du_total = du_total_sum;
+    merged.summary = summarize(&merged.projects);
+    Ok((merged, coverage))
+}
+
+fn scope_cache_key(scope: &crate::scope::EffectiveScope) -> String {
+    let mut paths: Vec<String> = scope
+        .roots
+        .iter()
+        .filter(|r| matches!(r.status, crate::scope::RootStatus::Present))
+        .map(|r| r.path.display().to_string())
+        .collect();
+    paths.sort();
+    crate::entities::id_for(&paths.join("\u{1}"))[..16].to_string()
+}
+
+fn last_scope_report_path(store_dir: &Path, scope: &crate::scope::EffectiveScope) -> PathBuf {
+    store_dir.join(format!("last_report-scope-{}.json.zst", scope_cache_key(scope)))
+}
+
+/// Persists the merged multi-root report from [`report_scope`], the same
+/// way [`write_last_report`] does for a single root, so a cached
+/// `--no-observe`/TUI-startup read never has to re-walk.
+pub fn write_last_scope_report(
+    store_dir: &Path,
+    scope: &crate::scope::EffectiveScope,
+    report: &Report,
+) -> Result<()> {
+    std::fs::create_dir_all(store_dir)?;
+    let path = last_scope_report_path(store_dir, scope);
+    let tmp = path.with_extension("tmp");
+    let mut slim = report.clone();
+    slim.dirs_by_worktree = None;
+    slim.files_by_worktree = None;
+    let file = std::fs::File::create(&tmp)?;
+    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, encoder);
+    serde_json::to_writer(&mut writer, &slim)?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .finish()?
+        .sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The last merged multi-root report cached by [`write_last_scope_report`]
+/// for exactly this set of present roots. `None` on any mismatch (first
+/// run, or the scope's present-root set changed since the last cache
+/// write) -- never a stale report for a different scope.
+pub fn load_last_scope_report(
+    store_dir: &Path,
+    scope: &crate::scope::EffectiveScope,
+) -> Option<Report> {
+    let file = std::fs::File::open(last_scope_report_path(store_dir, scope)).ok()?;
+    let bytes = zstd::stream::decode_all(file).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }

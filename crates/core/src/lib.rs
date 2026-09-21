@@ -12,6 +12,7 @@ pub mod cargo_artifacts;
 pub mod cargo_cleanup;
 pub mod compose;
 pub mod consumers;
+pub mod coverage;
 pub mod docker;
 pub mod ecosystem;
 pub mod entities;

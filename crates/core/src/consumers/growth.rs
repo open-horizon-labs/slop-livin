@@ -42,6 +42,8 @@ impl Consumer for GrowthConsumer {
             let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
             let t = std::time::Instant::now();
             if ctx.observe {
+                let protected_worktree_ids: std::collections::HashSet<String> =
+                    d.protected_worktree_ids.iter().cloned().collect();
                 crate::growth::observe_and_annotate(
                     dir,
                     volume_id,
@@ -49,6 +51,7 @@ impl Consumer for GrowthConsumer {
                     ctx.observed_at,
                     config.retention_days,
                     since_secs,
+                    &protected_worktree_ids,
                 )?;
                 if trace {
                     eprintln!("[trace] growth: artifacts store: {:?}", t.elapsed());

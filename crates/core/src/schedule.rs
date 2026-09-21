@@ -201,11 +201,15 @@ fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("resolve current executable")
 }
 
-/// `swamp schedule --every <interval> <root>...`.
+/// `swamp schedule --every <interval> <root>...`. `roots` empty (#42/#50)
+/// installs `observe` with no positional roots at all: every scheduled
+/// fire re-resolves the configured scope fresh (see `Command::Observe`'s
+/// `roots.is_empty()` path), rather than replaying whatever roots were
+/// present at install time. Passing explicit roots still freezes exactly
+/// those, same as before -- an explicit root list has always replaced
+/// the configured scope for one invocation, and that includes a
+/// scheduled one.
 pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
-    if roots.is_empty() {
-        bail!("schedule needs at least one root");
-    }
     let seconds = parse_interval(interval_raw)?;
     let exe = current_exe()?;
     let plist = plist_path();
@@ -227,11 +231,15 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
 
     load_plist(&plist)?;
 
-    let roots_str = roots
-        .iter()
-        .map(|r| r.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let roots_str = if roots.is_empty() {
+        "(configured scope, resolved fresh on every run)".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     Ok(format!(
         "Scheduled observation every {}\n  Label: {LABEL}\n  Plist: {}\n  Log:   {}\n  Roots: {}\n  Turn it off with: swamp schedule --off\n",
         format_interval(seconds),
@@ -467,7 +475,17 @@ pub fn status(store_dir: &Path) -> Result<String> {
         Some(s) => out.push_str(&format!("  Interval: {}\n", format_interval(s))),
         None => out.push_str("  Interval: unreadable (the plist was edited by hand)\n"),
     }
-    out.push_str(&format!("  Roots:    {}\n", roots.join(" ")));
+    if roots.is_empty() {
+        // No frozen roots baked into the plist (#42/#50): each fire runs
+        // `observe` with no positional roots, which re-resolves the
+        // configured scope fresh every time -- so a config edit (a new
+        // `include`, a new `exclude`, a detector toggle) takes effect on
+        // the very next scheduled run, not only after `schedule --every`
+        // is run again.
+        out.push_str("  Roots:    (configured scope, resolved fresh on every run)\n");
+    } else {
+        out.push_str(&format!("  Roots:    {}\n", roots.join(" ")));
+    }
 
     match read_last_run(store_dir).or_else(|| last_log_outcome(&log_file())) {
         Some(run) => {
@@ -761,6 +779,87 @@ mod tests {
 
         unsafe {
             std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+        }
+    }
+
+    /// #42/#50: `install` with no explicit roots must not bail (it used
+    /// to require at least one), must write a plist whose
+    /// `ProgramArguments` names no root at all beyond `observe` itself,
+    /// and `status` must say so plainly rather than printing a blank
+    /// "Roots:" line -- the tempting shortcut this guards against is
+    /// resolving the scope once at install time and freezing the result
+    /// into the plist, which would silently stop tracking a later config
+    /// edit until `schedule --every` was run again.
+    #[test]
+    fn install_with_no_roots_freezes_nothing_and_status_says_so() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_LOG_DIR", logs.path());
+            std::env::set_var("SWAMP_TEST_MODE", "1");
+        }
+
+        let message = install("30m", &[]).unwrap();
+        assert!(message.contains("resolved fresh on every run"), "{message}");
+
+        let plist_text = fs::read_to_string(plist_path()).unwrap();
+        assert!(
+            installed_roots(&plist_text).is_empty(),
+            "no root should be frozen into the plist's argv: {plist_text}"
+        );
+        // The launched command is still exactly `<exe> observe` -- no
+        // trailing empty-string argument sneaking in from an empty loop.
+        let array_block = plist_text
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|s| s.split("</array>").next())
+            .unwrap();
+        assert_eq!(
+            array_block.matches("<string>").count(),
+            2,
+            "exactly exe + \"observe\", no root strings: {array_block}"
+        );
+
+        let store = tempfile::tempdir().unwrap();
+        let status_text = status(store.path()).unwrap();
+        assert!(
+            status_text.contains("(configured scope, resolved fresh on every run)"),
+            "{status_text}"
+        );
+
+        unsafe {
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
+        }
+    }
+
+    /// An explicit root list must still be frozen into the plist exactly
+    /// as before -- only the *no-roots* case changed behavior.
+    #[test]
+    fn install_with_explicit_roots_still_freezes_them() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_LOG_DIR", logs.path());
+            std::env::set_var("SWAMP_TEST_MODE", "1");
+        }
+
+        install("30m", &[PathBuf::from("/Users/test/src")]).unwrap();
+        let plist_text = fs::read_to_string(plist_path()).unwrap();
+        assert_eq!(
+            installed_roots(&plist_text),
+            vec!["/Users/test/src".to_string()]
+        );
+
+        unsafe {
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
         }
     }
 

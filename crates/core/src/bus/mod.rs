@@ -59,6 +59,12 @@ pub struct Ctx<'a> {
     pub fs_events: &'a dyn crate::fs_events::FsEventsSource,
     pub observed_at: u64,
     pub large_file_min_bytes: u64,
+    /// Subtrees to prune from this walk (#42 --
+    /// `scope::EffectiveScope::pruned_subtrees`, filtered to this root).
+    /// Empty for every pre-#42 caller (a single-root `report`/`observe`
+    /// call with no scope-level exclusion context); populated only by
+    /// `report::report_scope`.
+    pub pruned_subtrees: Vec<PathBuf>,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.
@@ -87,6 +93,11 @@ pub struct Draft {
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
     pub nested_artifacts: Arc<Vec<crate::artifact::NestedArtifact>>,
+    /// Worktree ids the walk could not confirm gone-vs-inaccessible this
+    /// pass (#42) -- see `growth::compute_unconfirmed_worktrees`. The
+    /// growth store must never tombstone rows for these ids from this
+    /// observation.
+    pub protected_worktree_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,6 +132,11 @@ pub enum Event {
         notes: Vec<String>,
         /// Worktree ids the walk actually visited; `None` = all of them.
         rewalked: Option<Arc<Vec<String>>>,
+        /// Worktree ids this pass could not confirm gone-vs-inaccessible
+        /// (#42): absent from `discovered`, but their path still exists
+        /// and could not be read. Carried to `GrowthAnnotated` so the
+        /// growth store never tombstones their rows from this pass.
+        unconfirmed_worktree_ids: Arc<Vec<String>>,
     },
     ProjectsGrouped {
         projects: Arc<Vec<ProjectRow>>,
@@ -135,6 +151,7 @@ pub enum Event {
         files: Arc<Vec<FileRow>>,
         reconciliation: Reconciliation,
         notes: Vec<String>,
+        unconfirmed_worktree_ids: Arc<Vec<String>>,
     },
     SignalsComputed {
         by_worktree: Arc<HashMap<String, WorktreeSignals>>,
@@ -350,6 +367,39 @@ pub fn ctx_for<'a>(
     force_full: bool,
     fs_events: &'a dyn crate::fs_events::FsEventsSource,
 ) -> Ctx<'a> {
+    ctx_for_excluding(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events,
+        &[],
+    )
+}
+
+/// Same as [`ctx_for`], with `pruned_subtrees` (#42) supplied explicitly.
+/// Used by `report::report_scope`, which has scope-level exclusions to
+/// enforce per root; every other caller goes through [`ctx_for`] with an
+/// empty list.
+#[allow(clippy::too_many_arguments)]
+pub fn ctx_for_excluding<'a>(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events: &'a dyn crate::fs_events::FsEventsSource,
+    pruned_subtrees: &[PathBuf],
+) -> Ctx<'a> {
     let large_file_min_bytes = store_dir
         .map(|dir| crate::growth::load_config(dir).large_file_min_bytes)
         .unwrap_or(crate::growth::DEFAULT_LARGE_FILE_MIN_BYTES);
@@ -366,6 +416,7 @@ pub fn ctx_for<'a>(
         fs_events,
         observed_at: crate::entities::now(),
         large_file_min_bytes,
+        pruned_subtrees: pruned_subtrees.to_vec(),
     }
 }
 

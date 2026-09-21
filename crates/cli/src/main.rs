@@ -532,6 +532,28 @@ fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::Effective
     }
 }
 
+/// One line per non-`Complete` root from a `report_scope` call (#42):
+/// missing/excluded/inaccessible/partial regions, so a coherent
+/// multi-root observation never silently under-reports without saying
+/// why. A `Complete` root prints nothing -- the ordinary case should not
+/// be noisy.
+fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
+    use swamp_core::coverage::RegionStatus;
+    let incomplete: Vec<&swamp_core::coverage::RootCoverage> = coverage
+        .iter()
+        .filter(|c| !matches!(c.status, RegionStatus::Complete))
+        .collect();
+    if incomplete.is_empty() {
+        return;
+    }
+    let summary = incomplete
+        .iter()
+        .map(|c| format!("{} ({})", c.path.display(), c.status.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("scope coverage: {summary}");
+}
+
 fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -781,6 +803,7 @@ fn cleanup_scope_summary(
 /// silently ignored in JSON mode the way the whole-report dump used to
 /// ignore them.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn report_json_envelope(
     r: &Report,
     root: &Path,
@@ -792,6 +815,7 @@ fn report_json_envelope(
     unowned_only: bool,
     limit: Option<usize>,
     offset: usize,
+    scope_coverage: &[swamp_core::coverage::RootCoverage],
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -830,6 +854,9 @@ fn report_json_envelope(
             envelope["total"] = serde_json::json!(p.total);
             envelope["truncated"] = serde_json::json!(p.truncated);
         }
+        if !scope_coverage.is_empty() {
+            envelope["scope_coverage"] = serde_json::json!(scope_coverage);
+        }
         if v == View::Grown {
             envelope["coverage"] = serde_json::json!({
                 "walked_total": rr.reconciliation.walked_total,
@@ -851,6 +878,9 @@ fn report_json_envelope(
     let mut value = serde_json::to_value(&rr)?;
     value["since"] = serde_json::json!(since_str);
     value["index_refreshed"] = serde_json::json!(index_refreshed);
+    if !scope_coverage.is_empty() {
+        value["scope_coverage"] = serde_json::json!(scope_coverage);
+    }
     if let Some(mut projects) = value.get("projects").cloned() {
         let page = swamp_core::agent_json::paginate(&mut projects, limit, offset);
         value["projects"] = projects;
@@ -869,7 +899,46 @@ fn main() -> Result<()> {
         no_observe: false,
     }) {
         Command::Ui { root, no_observe } => {
-            let root = resolve_single_root(root)?;
+            let root = if let Some(explicit) = root {
+                explicit
+            } else {
+                // No explicit root: observe the *whole* configured scope
+                // coherently (#42/#50) before the TUI opens, so every
+                // root's growth store and coverage protection stay
+                // correct even though the TUI itself still renders one
+                // primary root's report (#51 expands multi-root TUI
+                // presentation; #42's job is making the underlying
+                // observation and coverage honest, not the rendering).
+                let scope = resolve_scope(&[])?;
+                let present = scope.scan_paths();
+                if present.is_empty() {
+                    if scope.is_empty_scope() {
+                        anyhow::bail!(
+                            "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                        );
+                    }
+                    anyhow::bail!(
+                        "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                let store_dir = swamp_dir();
+                if !no_observe {
+                    note_and_persist_scope(&store_dir, &scope);
+                }
+                let (_, coverage) = swamp_core::report::report_scope(
+                    &scope,
+                    None,
+                    false,
+                    Some(&store_dir),
+                    None,
+                    !no_observe,
+                    false,
+                    false,
+                    false,
+                )?;
+                print_scope_coverage_note(&coverage);
+                present[0].clone()
+            };
             swamp_tui::run(&root, no_observe)?;
         }
         Command::Scan { root, store } => {
@@ -908,7 +977,6 @@ fn main() -> Result<()> {
             unowned_only,
         } => {
             let explicit_root = root.clone();
-            let root = resolve_single_root(root)?;
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
             // are given.
@@ -928,33 +996,65 @@ fn main() -> Result<()> {
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = swamp_dir();
-            if !no_observe {
-                // Coverage notes reflect the *configured* scope, not
-                // just the one root this single-root command ended up
-                // reporting on (#41's "explain effective coverage and
-                // baseline changes"); skip entirely for an explicit
-                // root, whose scope is exactly that one root and not
-                // worth diffing against the configured scope's history.
-                if explicit_root.is_none() {
-                    let scope = resolve_scope(&[])?;
-                    note_and_persist_scope(&store_dir, &scope);
-                }
-            }
             let progress =
                 spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
-            let r = report_full_mode(
-                &root,
-                docker_facts.as_deref(),
-                verify_du,
-                Some(&store_dir),
-                since.as_deref(),
-                !no_observe,
-                dirs,
-                enrich,
-                full,
-            );
+            // An explicit root replaces the configured scope entirely and
+            // stays on the single-root path (#42's "a single explicit
+            // root is just a scope of one"); with no explicit root, the
+            // whole configured scope is observed coherently in one call
+            // (#42/#50) instead of only its first present root.
+            let (r, coverage) = if let Some(explicit) = &explicit_root {
+                let root = resolve_single_root(Some(explicit.clone()))?;
+                let r = report_full_mode(
+                    &root,
+                    docker_facts.as_deref(),
+                    verify_du,
+                    Some(&store_dir),
+                    since.as_deref(),
+                    !no_observe,
+                    dirs,
+                    enrich,
+                    full,
+                );
+                (r, Vec::new())
+            } else {
+                let scope = resolve_scope(&[])?;
+                if scope.scan_paths().is_empty() {
+                    if scope.is_empty_scope() {
+                        anyhow::bail!(
+                            "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                        );
+                    }
+                    anyhow::bail!(
+                        "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                // Coverage notes reflect the whole configured scope
+                // (#41's "explain effective coverage and baseline
+                // changes").
+                if !no_observe {
+                    note_and_persist_scope(&store_dir, &scope);
+                }
+                swamp_core::report::report_scope(
+                    &scope,
+                    docker_facts.as_deref(),
+                    verify_du,
+                    Some(&store_dir),
+                    since.as_deref(),
+                    !no_observe,
+                    dirs,
+                    enrich,
+                    full,
+                )
+                .map(|(r, c)| (Ok(r), c))
+                .unwrap_or_else(|e| (Err(e), Vec::new()))
+            };
             progress.stop();
             let r = r?;
+            let root = r.root.clone();
+            if !coverage.is_empty() {
+                print_scope_coverage_note(&coverage);
+            }
             if !json
                 && r.projects
                     .iter()
@@ -988,6 +1088,7 @@ fn main() -> Result<()> {
                         unowned_only,
                         limit,
                         offset,
+                        &coverage,
                     )?)?
                 );
             } else if let Some(wt_path) = worktree {
@@ -1487,25 +1588,28 @@ fn main() -> Result<()> {
         }
         Command::Schedule { every, off, roots } => {
             let store_dir = swamp_dir();
-            // Install-time root resolution only: this bakes concrete
-            // paths into the LaunchAgent's argv, same as an explicit
-            // root list always has. Making a *scheduled run* re-resolve
-            // the configured scope on every fire (rather than replaying
-            // whatever `schedule --every` resolved at install time) is
-            // #50's job -- see `.oh/sessions/2026-09-21-scope-and-detector-registry.md`.
-            let resolved_roots = if roots.is_empty() && !off && every.is_some() {
+            // No explicit roots: install `observe` with none baked into
+            // the plist's argv at all (#42/#50), so every scheduled fire
+            // re-resolves the configured scope itself (same code path
+            // `swamp observe` with no roots already takes) instead of
+            // replaying whatever was present at `schedule --every` time.
+            // A config edit therefore takes effect on the next scheduled
+            // run, not only after `schedule --every` is run again. This
+            // is a validate-then-install check only: it fails fast on an
+            // empty scope now rather than installing a schedule that can
+            // never do anything, but it does not freeze the resolved
+            // list into the plist -- explicit roots on the command line
+            // still do, exactly as an explicit root has always replaced
+            // the configured scope for one invocation.
+            if roots.is_empty() && !off && every.is_some() {
                 let scope = resolve_scope(&[])?;
-                let resolved = scope.scan_paths();
-                if resolved.is_empty() {
+                if scope.scan_paths().is_empty() {
                     anyhow::bail!(
                         "effective scan scope is empty; nothing to schedule -- see `swamp scope --json`, or pass roots explicitly."
                     );
                 }
-                resolved
-            } else {
-                roots
-            };
-            schedule::cmd_schedule(store_dir, every, off, resolved_roots)?;
+            }
+            schedule::cmd_schedule(store_dir, every, off, roots)?;
         }
     }
     Ok(())

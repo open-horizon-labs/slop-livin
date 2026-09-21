@@ -26,6 +26,7 @@ impl Consumer for ProjectsConsumer {
             attribution,
             notes,
             rewalked,
+            unconfirmed_worktree_ids,
             ..
         } = event
         else {
@@ -143,6 +144,7 @@ impl Consumer for ProjectsConsumer {
             files: Arc::new(files),
             reconciliation,
             notes: notes.clone(),
+            unconfirmed_worktree_ids: unconfirmed_worktree_ids.clone(),
         }])
     }
 }

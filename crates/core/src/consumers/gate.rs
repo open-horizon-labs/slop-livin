@@ -32,6 +32,7 @@ struct Pending {
     files: Option<Arc<Vec<FileRow>>>,
     reconciliation: Option<Reconciliation>,
     walk_notes: Vec<String>,
+    protected_worktree_ids: Vec<String>,
     signals: Option<Arc<HashMap<String, WorktreeSignals>>>,
     ecosystems: Option<Arc<HashMap<String, Vec<String>>>>,
     github: Option<GithubFactsBundle>,
@@ -68,6 +69,7 @@ impl Consumer for AssemblyGate {
                 files,
                 reconciliation,
                 notes,
+                unconfirmed_worktree_ids,
                 ..
             } => {
                 p.projects = Some(projects.clone());
@@ -76,6 +78,7 @@ impl Consumer for AssemblyGate {
                 p.files = Some(files.clone());
                 p.reconciliation = Some(reconciliation.clone());
                 p.walk_notes = notes.clone();
+                p.protected_worktree_ids = (**unconfirmed_worktree_ids).clone();
             }
             Event::SignalsComputed { by_worktree } => p.signals = Some(by_worktree.clone()),
             Event::EcosystemsDetected { by_project } => p.ecosystems = Some(by_project.clone()),
@@ -186,6 +189,7 @@ impl Consumer for AssemblyGate {
             github_enrichment: gh_summary,
             schedule_line: None,
             nested_artifacts: Arc::new(Vec::new()),
+            protected_worktree_ids: p.protected_worktree_ids.clone(),
         }))])
     }
 }
