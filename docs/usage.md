@@ -186,9 +186,61 @@ above it: external units are never folded into `walked_total`/
 bases (a walked root vs. a detector-resolved location) are different
 enough that summing them would be misleading.
 
-TUI presentation of external units (a dedicated view, not just the CLI
-table) is tracked separately (#51/#60); the CLI/JSON contract and
-growth-store history above are complete today.
+The TUI has a dedicated, read-only External view (`v`/`9`): the same
+one-row-per-unit facts as `--view external`, never markable (the same
+"execute refuses every one unconditionally" contract applies; the TUI
+never offers a delete affordance the action layer would refuse anyway).
+
+## Agent-tool storage
+
+Coding-agent tools (Claude Code, and named others as their adapters
+land) keep session transcripts, caches, logs, checkpoints and
+configuration under their own home directory. `swamp` identifies that
+storage the same way it identifies external storage above -- the home
+directory itself is one external unit -- and additionally classifies
+its *interior* into finer-grained units (sessions, caches, logs,
+checkpoints, protected config, ...), each with its own size/growth
+history and, where evidence supports it, a link to the swamp project a
+session's `cwd` names:
+
+```bash
+swamp report --view agents
+swamp report --view agents --project my-repo
+swamp report --view agents --json
+```
+
+Read `docs/agent-storage.md` for the full category/linkage/privacy
+contract and the required tool matrix (which tools are identified
+today vs. named-and-planned). In short:
+
+- **Privacy is a hard contract.** Identification reads directory names,
+  file sizes/mtimes, and -- for a session's project linkage -- only the
+  first line of its transcript file, looking for a `cwd` field. No
+  prompt, response, attachment or credential content is ever read into
+  a report, a plan, the ledger, or a log.
+- **Categories carry different consequences.** Cache/log categories
+  (`shell-snapshots`, `statsig`, `debug`, plugin/skill `.trash`) are
+  regenerated automatically and are the only categories with a
+  supported action this release. Removing a session means losing its
+  resume/rewind/checkpoint history -- the linked project's own files
+  are never touched. Credentials, settings, skills, commands and
+  similar automation definitions are protected by default and have no
+  supported action at all.
+- **Human keep/protect intent survives refresh:**
+  `swamp protect add <path>` / `swamp protect list [--json]` /
+  `swamp protect remove <path>` -- independent of, and never overridden
+  by, anything observation infers.
+- **Supported actions:** `swamp propose-agents --path <unit-path>
+  [--json]` builds a real plan (or a named refusal) for a selected
+  unit, then the same `swamp approve <plan-id>` / `swamp execute
+  <plan-id>` every other plan uses. Nothing wider than the exact
+  selected unit is ever affected; occupancy, references and identity
+  are all re-checked at execution, not assumed from the plan.
+
+The TUI has a dedicated, read-only Agents view (`v`, no digit -- `0` is
+"clear filter"): the same per-unit facts as `--view agents`. Selective
+action from the TUI (mark/confirm/execute for an agent-storage unit) is
+not wired up this release; use the CLI commands above.
 
 ## Cleanup recommendations
 
@@ -221,7 +273,7 @@ With no subcommand, `swamp` opens the UI at the current directory. It starts fro
 | `/` | Open the filter form |
 | `:` | Edit the filter expression; Tab completes terms |
 | `0` | Clear the filter |
-| `v`, `1`–`8` | Cycle/select projects, tree, builds, deps, Docker, kinds, unowned, types |
+| `v`, `1`–`9` | Cycle/select projects, tree, builds, deps, Docker, kinds, unowned, types, external; `v` also reaches agents (no digit -- `0` is clear filter) |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
 | `r` | Reverse the sort |
 | `?` | Show help |

@@ -970,6 +970,7 @@ mod tests {
         let start = SystemTime::now();
         let units = identify(home, 1);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
+        eprintln!("[measured] identify() over 500 synthetic sessions took {elapsed:?}");
         assert_eq!(
             units
                 .iter()

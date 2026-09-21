@@ -4,6 +4,39 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+- **Modeled agent-tool storage (Claude Code) and shipped a supported
+  cleanup path** (#91, #92, #100, #101). `swamp report --view agents`
+  identifies sessions, caches, logs, checkpoints and protected
+  configuration under an agent-coding tool's home directory (Claude
+  Code's `~/.claude` or `$CLAUDE_CONFIG_DIR` this release), linking
+  each session to a swamp project where its transcript declares a
+  `cwd` -- never a basename guess. History reuses the exact same
+  current+reverse-delta growth-store key family `external.rs`'s
+  detector-resolved units already use (an `"agent:"`-prefixed category
+  string, never a second store). A required 13-tool matrix
+  (`crates/core/src/agents/matrix.rs`) names every major coding-agent
+  tool with a sourced home-path note; only Claude Code has real
+  identification code this release, the rest are explicitly `Planned`.
+  New `swamp protect add/list/remove` for human keep intent (survives
+  refresh, independent of the growth store) and `swamp propose-agents
+  --path <unit-path>` for a real, actionable plan -- cache/log
+  categories move to Trash as a whole directory; an individual session
+  removal moves its exact member set (transcript, subagent dir,
+  file-history, todos) together, with membership re-verified fresh at
+  execution -- through the same `swamp approve`/`swamp execute` every
+  other plan uses. Credentials, settings, skills, commands and
+  automation definitions are protected by default and have no
+  supported action; neither does a database-like (SQLite/WAL/SHM)
+  filename, or an active session (an `lsof`-style occupancy check on
+  the transcript). Identification never reads past a session
+  transcript's first line, and never puts prompt/response/attachment/
+  credential content into a report, plan, or the ledger. The TUI gained
+  two new minimal, read-only views: `ViewKind::External` (`'9'`, the
+  minimal design chunk B2 recorded but did not implement) and
+  `ViewKind::Agents` (no dedicated digit; reached by cycling with `v`).
+  See `docs/agent-storage.md` for the full contract and known gaps
+  (the other 12 named tools, TUI mark/confirm for agent actions,
+  `~/.claude.json` living outside the modeled home directory).
 - **Made multi-root observation coverage-aware** (#42). `report`,
   `observe`, and `ui` with no explicit root now observe the whole
   configured scope coherently in one call, not just its first present

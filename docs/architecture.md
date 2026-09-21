@@ -248,6 +248,87 @@ run, citing the category. No code path upgrades an external unit to a
 deletable one -- the registry that discovers these locations has no way
 to request that, by construction.
 
+## Agent-tool storage
+
+`crate::agents` (#91/#92) identifies the *interior* of an agent-coding
+tool's home directory into finer-grained units, the same relationship
+`crate::cargo_artifacts`'s `NestedArtifact`s have to a Cargo `target/`
+artifact row -- not a fourth accounting model, an application of the
+one two chunks above already established:
+
+- **The home itself is an ordinary external unit.** Each supported
+  tool's home (e.g. `crate::locations::claude_code`'s `~/.claude` or
+  `$CLAUDE_CONFIG_DIR`) is a detector registered in the same
+  `locations::Registry` as Cargo home/Homebrew/rustup: it gets
+  identity, measurement and history for free from `crate::external`,
+  no new mechanism.
+- **The interior reuses the same growth-store key family literally,
+  not just architecturally.** An `AgentUnit`'s key is
+  `(detector_id, "agent:"<category>, device, path)`, built with the
+  exact same `growth::external_row_key`/`observe_and_annotate_external`/
+  `annotate_readonly_external` functions the home-level unit above
+  uses -- the `"agent:"` prefix only keeps an agent category string
+  from ever colliding with `locations::StorageCategory`'s own kebab
+  strings, since both live in the same Parquet store.
+- **Session identity, when a tool has sessions.** Claude Code's
+  category granularity is a folded directory total for everything
+  *except* sessions: a session unit's identity is its transcript file's
+  path, and its `members` (transcript, companion subagent directory,
+  `file-history/<session>/`, matching `todos/`, `image-cache/<session>/`,
+  `uploads/<session>/`) are collected once at identification time and
+  carried into the plan (`actions::AgentPlanMeta::session_members`) so
+  #101's session removal can move the exact same set, re-verified fresh
+  at execution.
+- **Project linkage reuses `crate::git`'s own identity, never a
+  basename guess.** `claude_code::resolve_project_link` reads only a
+  session transcript's first line (bounded: "first N bytes... never
+  whole transcripts"), looks for a `cwd` field, and walks upward from
+  that path calling the same `crate::git::classify_main_checkout`/
+  `classify_git_file` primitives `crate::git::discover` uses --
+  never decodes the `projects/<encoded-cwd>` directory name back into a
+  path (that encoding is lossy: a literal hyphen in a real path cannot
+  be told apart from an encoded path separator).
+
+Scan cost is bounded the same way an artifact's folded measurement is:
+`agents::folded_bytes` is a small hand-rolled stat walker (directory
+names and `stat` calls only, bounded by an entry-count cap), used
+instead of `walk::resize_artifact`'s parallel-pool machinery because
+that machinery is tuned for a handful of potentially huge artifact
+roots, not hundreds of small per-session directories -- spinning up its
+thread pool that many times would itself be the unacceptable cost #91's
+acceptance criteria name. A session's project linkage reads at most one
+transcript's first `HEADER_READ_BYTES` (8 KiB); nothing here ever
+walks, greps, or opens a whole transcript.
+
+Action boundary (#101), built on the same plan/grant/ledger/Trash path
+as everything else, but unlike `crate::external`'s unconditional
+refusal, a *supported* agent category becomes a real action:
+`actions::agent_refusal` refuses at proposal time (protected category
+or path, a category with no supported action yet, a SQLite/WAL/SHM-like
+filename, an active session via `agents::is_active`'s
+`occupancy::occupied` check); everything else becomes a `PlanUnit`
+carrying `agent_meta`. `execute`'s `agent_meta` branch rechecks
+occupancy again (authoritative, not informational) and dispatches to a
+single-path Trash move (a cache/log category directory) or
+`execute_agent_session_removal` (re-runs `claude_code::identify` fresh,
+refuses on any membership drift since the plan was proposed, then
+moves every member into one Trash envelope). Human keep/protect intent
+(`swamp protect add/list/remove`) is a small JSON sidecar
+(`agent_protect.json`) under `$SWAMP_DIR`, deliberately decoupled from
+the growth store exactly like `external_consumers.json` is: touching it
+never affects an `AgentUnit`'s bytes or history.
+
+Only Claude Code (#92) is implemented this chunk. `crate::agents::matrix`
+is the explicit, required 13-tool matrix (#90/#91): every named tool
+has a row with a sourced home-path note, `Supported` or `Planned`,
+never a silent omission and never an empty placeholder adapter that
+claims support it does not have. See `docs/agent-storage.md` for the
+rendered table, category/linkage semantics, and documented gaps
+(`~/.claude.json` living outside the home directory; `todos/` matching
+by filename-prefix heuristic since the naming convention is
+undocumented upstream; no TUI mark/confirm flow yet, only
+`swamp propose-agents`/`approve`/`execute`).
+
 ## Observation pipeline
 
 Each consumer subscribes to typed events and returns follow-on events. Registration happens in [EventBus::with_builtins](../crates/core/src/bus/mod.rs) before the run begins. Large shared event payloads use `Arc`.
@@ -435,8 +516,28 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
   scan root (today's pre-existing #41 behavior, e.g. `~/.cargo` living
   under `~/src`) is measured by *both* paths, once as an external unit
   and once as ordinary walked/unowned bytes under its containing root
-  -- the two are not currently reconciled against each other. The TUI
-  has no dedicated view for external units yet (#51/#60); they are
-  reachable today only through `report --view external`.
+  -- the two are not currently reconciled against each other. The same
+  is true of an agent-tool home registered the same way (e.g.
+  `~/.claude`): registering it as a detector is what gives it
+  external-unit identity/history for free, and the trade-off is the
+  same pre-existing overlap, not a new one this chunk introduced.
+- The TUI's External and Agents views (added this chunk) are read-only:
+  neither row is markable. External because `execute` already refuses
+  every external unit unconditionally; Agents because this chunk's
+  supported actions (`swamp propose-agents`/`approve`/`execute`) have
+  no TUI mark/confirm counterpart yet -- a named gap, not a silent one.
+- Agent-storage coverage: only Claude Code (#92) has real identification
+  code; `crate::agents::matrix` lists the remaining twelve named tools
+  (#93-#99) as `Planned` with sourced home-path notes, not implemented.
+  Within Claude Code, `todos/<session-id>*` matching is a documented,
+  bounded filename-prefix heuristic (the exact naming convention is not
+  in Claude Code's own documentation); `~/.claude.json` (a sibling of
+  the `~/.claude/` home directory, not inside it) is not modeled, since
+  an agent unit's identity is a path *under* the tool home by
+  construction. Claude-created git worktrees are not separately
+  re-measured by this adapter (Claude Code documents no fixed on-disk
+  location for them); they are ordinary Git worktrees the normal scan
+  already discovers, and this adapter cross-references rather than
+  double-counts them.
 
 The [accuracy report](accuracy.md) records the source checks behind these descriptions. Historical timings in the [changelog](../CHANGELOG.md) are individual observations; representative benchmarks are still needed for latency and storage-size claims.

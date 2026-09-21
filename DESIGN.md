@@ -59,7 +59,7 @@ The renderer uses terminal colors and an indexed selection color. Committed fram
 
 `→` opens or expands; `←` collapses or returns to projects. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
 
-The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. Eight views are available through `v` and `1`–`8`. The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
+The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. Ten views are available through `v` and `1`–`9` (External is `9`; Agents has no dedicated digit -- `0` is "clear filter" -- and is reached only by cycling with `v`). The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
 
 ## Header, progress, and history
 
@@ -67,27 +67,35 @@ The header shows the root, observation status, available history, and totals as 
 
 Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live FSEvents watch batches changes after 400 ms of quiet. The header can display a history sparkline; body rows use change bars.
 
-### Coverage line and external rows (not yet implemented)
+### External and Agents rows (implemented); coverage line (still not implemented)
 
-`report_scope`/`external.rs` (#42/#43) give the TUI two facts it does
-not surface yet, recorded here as the intended minimal design for
-whichever worker (#51/#60) wires them in, so the shape is agreed before
-the code:
+`report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) give
+the TUI three facts; two now ship, one is still recorded here as intent
+for whoever picks it up:
 
-- **Coverage line.** When more than one root is in scope, or any root
-  is not `Complete` this pass, the header gains one short clause naming
-  the count and the worst status, e.g. `3 roots (1 excluded)` or `2
-  roots (1 inaccessible: permission denied)` -- never silently dropped,
-  never phrased as a deletion. Full text lives in `swamp scope`/`report
-  --json`'s `scope_coverage`; the header clause is a pointer to it, not
-  a duplicate of every reason.
-- **External rows.** A new `ViewKind::External` (`'9'`, the next free
-  digit) lists `ExternalUnit`s the same shape as `ViewKind::Unowned`
-  lists unowned rows: path, category, size, growth, consumer count.
-  Selection/marking must refuse with the same "no supported selective
-  action for `<category>`" reason `actions::execute` already returns
-  for a `PlanUnit::external_category` unit -- the TUI's confirm flow
-  must not invent a delete affordance the action layer does not honor.
+- **External rows (implemented).** `ViewKind::External` (`'9'`) lists
+  `ExternalUnit`s the same shape as `ViewKind::Unowned` lists unowned
+  rows: path, category, size, growth, consumer count. The row is never
+  markable (`Row.unit: None`) rather than markable-then-refused: the
+  action layer (`actions::execute`) already refuses every
+  `PlanUnit::external_category` unit unconditionally, so there is no
+  delete affordance to offer in the first place.
+- **Agents rows (implemented).** `ViewKind::Agents` (no dedicated digit
+  -- `0` is "clear filter"; reached by cycling with `v`) lists
+  `AgentUnit`s the same way: tool/category/relative-path/project-link
+  facts, never markable. Selective action for agent-storage units is
+  reachable through `swamp propose-agents`/`approve`/`execute`, not
+  (yet) a TUI mark/confirm flow -- a named, deliberate gap, not a
+  silent one.
+- **Coverage line (still not implemented).** When more than one root is
+  in scope, or any root is not `Complete` this pass, the header should
+  gain one short clause naming the count and the worst status, e.g. `3
+  roots (1 excluded)` or `2 roots (1 inaccessible: permission denied)`
+  -- never silently dropped, never phrased as a deletion. Full text
+  lives in `swamp scope`/`report --json`'s `scope_coverage`; the header
+  clause would be a pointer to it, not a duplicate of every reason.
+  Whoever wires this in next should read `report.rs`'s `report_scope`
+  and the TUI's header-building code together first.
 
 ## Actions
 

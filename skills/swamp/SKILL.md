@@ -20,6 +20,7 @@ swamp scope --json                                      # what's in scope, and w
 swamp report <root> --view grown --json --since 24h   # what grew, plus coverage
 swamp report <root> --view projects --json             # ranked project list
 swamp report <root> --view worktrees --json             # branch/idle/PR/merge facts
+swamp report --view agents --json                       # Claude Code (etc.) session/cache/log storage
 ```
 
 `<root>` is the directory tree to scan (a `~/src`-style parent of
@@ -77,18 +78,19 @@ enough for read-only investigation.
 
 | Reference | Load it for | Measured size (`wc -c`) |
 |---|---|---|
-| `references/commands-and-json.md` | Full command/flag/JSON-schema reference including `swamp scope`, the historical MCP-tool-to-CLI-command mapping, exit codes | 10.3 KB |
+| `references/commands-and-json.md` | Full command/flag/JSON-schema reference including `swamp scope`, the historical MCP-tool-to-CLI-command mapping, exit codes | 11.4 KB |
 | `references/cleanup-and-recovery.md` | propose/approve/execute/grant lifecycle, Trash recovery, refusal causes, `cleanup-check` for Cargo builds | 5.1 KB |
 | `references/trust-model.md` | The real authorization boundary: what the sink enforces vs. what is only behavioral convention | 4.6 KB |
-| `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 4.2 KB |
+| `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 6.8 KB |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
+| `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect`, `swamp propose-agents` | 3.4 KB |
 
-This file is 5.3 KB (roughly 1,300 tokens at ~4 bytes/token). Each
+This file is 5.8 KB (roughly 1,400 tokens at ~4 bytes/token). Each
 reference loads independently -- none requires another to make sense,
 and a read-only investigation task typically needs this file alone or
 this file plus `commands-and-json.md`. If every reference were loaded
 in the same turn (rare in practice) the total footprint is about
-27 KB / ~6,700 tokens. These are measured byte counts, not a claim that
+34 KB / ~8,500 tokens. These are measured byte counts, not a claim that
 this beats any particular MCP client's own tool-schema overhead --
 that overhead varies by client and was never measured here; see
 `references/trust-model.md` for what this skill *does* claim about the
