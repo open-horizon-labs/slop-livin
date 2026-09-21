@@ -82,6 +82,15 @@ pub struct PlanUnit {
     /// the same line the TUI shows on its confirm prompt.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Set only for a unit built from `external::ExternalUnit` (#43): the
+    /// unit's storage category, stated so a plan can *name* an external
+    /// unit for inspection/review without ever authorizing its removal.
+    /// `execute` refuses every unit with this set, unconditionally,
+    /// before grant/budget checks even run — registry/detector output
+    /// is identification, never authorization, and this chunk ships no
+    /// supported selective action for any external category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -442,6 +451,64 @@ pub fn propose(
     })
 }
 
+/// Builds an inspection-only plan naming selected external units (#43).
+/// Every resulting unit carries `external_category`, so `execute` refuses
+/// all of them unconditionally: this exists so a human/agent can review
+/// external storage through the same plan/ledger surface as everything
+/// else, never to make it actionable. Mirrors `propose`'s "nothing
+/// matched is an error, never a silent empty plan" contract.
+pub fn propose_external(
+    units: &[crate::external::ExternalUnit],
+    paths: &[PathBuf],
+    proposed_by: &str,
+) -> Result<Plan> {
+    let mut plan_units = Vec::new();
+    let mut refused = Vec::new();
+    for u in units {
+        if !paths.is_empty() && !paths.iter().any(|p| p == &u.path) {
+            continue;
+        }
+        plan_units.push(unit_from_external(u));
+    }
+    for p in paths {
+        if !plan_units.iter().any(|u| &u.path == p) {
+            refused.push(Refused {
+                path: p.clone(),
+                cause: "no external unit at this exact path in the current scope".to_string(),
+            });
+        }
+    }
+    if plan_units.is_empty() {
+        bail!(
+            "nothing to propose: no external unit matched{}",
+            if refused.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} refused: {})",
+                    refused.len(),
+                    refused
+                        .iter()
+                        .map(|r| format!("{} — {}", r.path.display(), r.cause))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        );
+    }
+    let created_at = now();
+    Ok(Plan {
+        id: crate::entities::new_id(),
+        root: PathBuf::new(),
+        created_at,
+        expires_at: created_at + PLAN_TTL_SECS,
+        proposed_by: proposed_by.to_string(),
+        status: PlanStatus::Proposed,
+        units: plan_units,
+        refused,
+    })
+}
+
 fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> PlanUnit {
     let rel = a
         .path
@@ -469,6 +536,45 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         verb: "delete".into(),
         track: a.track,
         warnings: warnings_for(wt, a, None),
+        external_category: None,
+    }
+}
+
+/// A unit built from an `external::ExternalUnit` (#43): inspection-only,
+/// by construction. There is no project/worktree to attribute it to (an
+/// external unit's identity is independent of any project); the
+/// placeholder fields below are stated honestly rather than borrowing a
+/// real project/worktree identity that would misattribute it. `execute`
+/// refuses every such unit unconditionally on `external_category`, so
+/// none of the recovery/verb/grant machinery below is ever reachable for
+/// it -- they are filled with inert, self-explanatory values only so the
+/// plan is legible if a human inspects its JSON.
+pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
+    let category = format!("{:?}", unit.category);
+    PlanUnit {
+        cargo_group: None,
+        path: unit.path.clone(),
+        rel_path: ".".into(),
+        project: format!("(external: {})", unit.detector_name),
+        project_id: format!("external:{}", unit.detector_id),
+        worktree_id: format!("external:{}", unit.detector_id),
+        worktree_path: unit.path.clone(),
+        kind: ArtifactKind::Unknown,
+        bytes: unit.bytes,
+        dedup_stale: false,
+        growth_bytes: unit.growth_bytes,
+        regrowth_count: unit.regrowth_count,
+        observed_at: unit.observed_at,
+        recovery: format!("inspection only: no supported selective action for {category}"),
+        idle_secs: None,
+        merge_complete: false,
+        signals: Vec::new(),
+        verb: "inspect".into(),
+        track: None,
+        warnings: vec![format!(
+            "external unit ({category}): identification only, never authorization"
+        )],
+        external_category: Some(category),
     }
 }
 
@@ -1064,6 +1170,13 @@ pub fn execute_with_trash_opts(
             recovery_location: None,
             preserved: Vec::new(),
         };
+        if let Some(category) = &unit.external_category {
+            outcome.cause = Some(format!(
+                "no supported selective action for {category}: external units are inspection-only"
+            ));
+            outcomes.push(outcome);
+            continue;
+        }
         let Some(gi) = *choice else {
             outcome.cause = Some(format!(
                 "no grant covers this unit; `{}`",

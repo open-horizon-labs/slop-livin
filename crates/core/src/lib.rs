@@ -17,6 +17,7 @@ pub mod docker;
 pub mod ecosystem;
 pub mod entities;
 pub mod execution;
+pub mod external;
 pub mod extractor;
 pub mod filter;
 pub mod fs_events;

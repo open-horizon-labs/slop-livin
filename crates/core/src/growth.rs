@@ -3424,6 +3424,374 @@ fn apply_incremental(
     })
 }
 
+// ---------------------------------------------------------------------
+// #43: external/shared storage units -- a new key family in this same
+// current + reverse-delta store, not a new store. Identity is
+// `(detector_id, category, device, canonical_path)`: independent of any
+// project/worktree, unlike the artifact rows above. Kept scope-wide
+// (directly under `swamp_dir`, not per-volume) because an external
+// unit's device need not match any scan root's device.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredExternalRow {
+    pub(crate) detector_id: String,
+    pub(crate) category: String,
+    pub(crate) device: u64,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) hardlinked: bool,
+    pub(crate) present: bool,
+    pub(crate) observed_at: u64,
+    pub(crate) regrowth_count: u32,
+}
+
+pub(crate) fn external_row_key(detector_id: &str, category: &str, device: u64, path: &str) -> String {
+    format!("{detector_id}\u{1}{category}\u{1}{device}\u{1}{path}")
+}
+
+fn external_dir(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("external")
+}
+fn external_current_path(dir: &Path) -> PathBuf {
+    dir.join("current.parquet")
+}
+fn external_deltas_dir(dir: &Path) -> PathBuf {
+    dir.join("deltas")
+}
+
+fn external_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("detector_id", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("device", DataType::UInt64, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("hardlinked", DataType::Boolean, false),
+        Field::new("present", DataType::Boolean, false),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("regrowth_count", DataType::UInt32, false),
+    ]))
+}
+
+fn write_external_rows(path: &Path, rows: &[StoredExternalRow]) -> Result<()> {
+    let schema = external_schema();
+    let detector_ids: Vec<&str> = rows.iter().map(|r| r.detector_id.as_str()).collect();
+    let categories: Vec<&str> = rows.iter().map(|r| r.category.as_str()).collect();
+    let devices: Vec<u64> = rows.iter().map(|r| r.device).collect();
+    let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
+    let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
+    let present: Vec<bool> = rows.iter().map(|r| r.present).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+    let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(detector_ids)) as ArrayRef,
+            Arc::new(StringArray::from(categories)),
+            Arc::new(UInt64Array::from(devices)),
+            Arc::new(StringArray::from(paths)),
+            Arc::new(UInt64Array::from(bytes)),
+            Arc::new(BooleanArray::from(hardlinked)),
+            Arc::new(BooleanArray::from(present)),
+            Arc::new(UInt64Array::from(observed_at)),
+            Arc::new(UInt32Array::from(regrowth)),
+        ],
+    )?;
+    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
+}
+
+fn read_external_rows(path: &Path) -> Result<Vec<StoredExternalRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .with_context(|| {
+            format!(
+                "read {} (delete it to rebuild this store from a full walk)",
+                path.display()
+            )
+        })?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let detector_id = downcast_str(&batch, "detector_id")?;
+        let category = downcast_str(&batch, "category")?;
+        let device = downcast_u64(&batch, "device")?;
+        let path_col = downcast_str(&batch, "path")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let hardlinked = downcast_bool(&batch, "hardlinked")?;
+        let present = downcast_bool(&batch, "present")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        let regrowth = downcast_u32(&batch, "regrowth_count")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredExternalRow {
+                detector_id: detector_id.value(i).to_string(),
+                category: category.value(i).to_string(),
+                device: device.value(i),
+                path: path_col.value(i).to_string(),
+                bytes: bytes.value(i),
+                hardlinked: hardlinked.value(i),
+                present: present.value(i),
+                observed_at: observed_at.value(i),
+                regrowth_count: regrowth.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// One external unit's observed facts for this pass, before growth
+/// annotation. Mirrors [`Observed`] for artifact rows.
+pub struct ObservedExternal {
+    pub(crate) key: String,
+    pub(crate) detector_id: String,
+    pub(crate) category: String,
+    pub(crate) device: u64,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) hardlinked: bool,
+}
+
+fn external_history_index(
+    dir: &Path,
+    retention_days: u64,
+    now: u64,
+) -> Result<HistoryIndex> {
+    let retention_secs = retention_days.saturating_mul(86400);
+    let horizon = now.saturating_sub(retention_secs);
+    let mut index: HashMap<String, Vec<(u64, u64, bool)>> = HashMap::new();
+    for row in read_external_rows(&external_current_path(dir))? {
+        index
+            .entry(external_row_key(
+                &row.detector_id,
+                &row.category,
+                row.device,
+                &row.path,
+            ))
+            .or_default()
+            .push((row.observed_at, row.bytes, true));
+    }
+    for delta_path in list_files_in(&external_deltas_dir(dir)) {
+        for row in read_external_rows(&delta_path)? {
+            if row.observed_at < horizon {
+                continue;
+            }
+            index
+                .entry(external_row_key(
+                    &row.detector_id,
+                    &row.category,
+                    row.device,
+                    &row.path,
+                ))
+                .or_default()
+                .push((row.observed_at, row.bytes, true));
+        }
+    }
+    for values in index.values_mut() {
+        values.sort_by_key(|(t, _, _)| *t);
+    }
+    Ok(index)
+}
+
+/// Persists this pass's external-unit observations (current + reverse
+/// delta, same layout as the artifact store) and returns
+/// `(key -> (growth_bytes, regrowth_count))` for the caller to annotate
+/// its own `ExternalUnit` rows with. `protected_keys` (mirroring `#42`'s
+/// `protected_worktree_ids`): a key in this set is never tombstoned by
+/// this pass even if absent from `observed` -- used when a unit's path
+/// could not be confirmed gone-vs-inaccessible this pass.
+pub fn observe_and_annotate_external(
+    swamp_dir: &Path,
+    observed: &[ObservedExternal],
+    protected_keys: &HashSet<String>,
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<HashMap<String, (Option<i64>, u32)>> {
+    let dir = external_dir(swamp_dir);
+    fs::create_dir_all(&dir)?;
+    let current_file = external_current_path(&dir);
+
+    let mut current: HashMap<String, StoredExternalRow> = read_external_rows(&current_file)?
+        .into_iter()
+        .map(|r| {
+            (
+                external_row_key(&r.detector_id, &r.category, r.device, &r.path),
+                r,
+            )
+        })
+        .collect();
+
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut current_changed = false;
+    let mut delta_rows: Vec<StoredExternalRow> = Vec::new();
+
+    for obs in observed {
+        seen_keys.insert(obs.key.clone());
+        match current.get_mut(&obs.key) {
+            Some(prev) => {
+                let changed = prev.bytes != obs.bytes || !prev.present;
+                if changed {
+                    current_changed = true;
+                    let regrowth_count = if !prev.present {
+                        prev.regrowth_count + 1
+                    } else {
+                        prev.regrowth_count
+                    };
+                    delta_rows.push(prev.clone());
+                    prev.bytes = obs.bytes;
+                    prev.present = true;
+                    prev.observed_at = observed_at;
+                    prev.regrowth_count = regrowth_count;
+                }
+                if prev.hardlinked != obs.hardlinked {
+                    current_changed = true;
+                }
+                prev.hardlinked = obs.hardlinked;
+            }
+            None => {
+                current_changed = true;
+                current.insert(
+                    obs.key.clone(),
+                    StoredExternalRow {
+                        detector_id: obs.detector_id.clone(),
+                        category: obs.category.clone(),
+                        device: obs.device,
+                        path: obs.path.clone(),
+                        bytes: obs.bytes,
+                        hardlinked: obs.hardlinked,
+                        present: true,
+                        observed_at,
+                        regrowth_count: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    for (key, row) in current.iter_mut() {
+        if row.present && !seen_keys.contains(key) && !protected_keys.contains(key) {
+            delta_rows.push(row.clone());
+            row.present = false;
+            row.bytes = 0;
+            row.observed_at = observed_at;
+            current_changed = true;
+        }
+    }
+
+    let target_time = observed_at.saturating_sub(since_secs);
+    let history_index = external_history_index(&dir, retention_days, observed_at)?;
+    let mut annotations: HashMap<String, (Option<i64>, u32)> = HashMap::new();
+    for obs in observed {
+        let history = history_index.get(&obs.key).cloned().unwrap_or_default();
+        let growth = growth_since(&history, obs.bytes, target_time);
+        let regrowth = current.get(&obs.key).map(|r| r.regrowth_count).unwrap_or(0);
+        annotations.insert(obs.key.clone(), (growth, regrowth));
+    }
+
+    if !delta_rows.is_empty() {
+        let seq_path = next_seq_path(&external_deltas_dir(&dir), "delta-");
+        write_external_rows(&seq_path, &delta_rows)?;
+    }
+
+    let mut current_rows: Vec<StoredExternalRow> = current.into_values().collect();
+    current_rows.sort_by(|a, b| {
+        (&a.detector_id, &a.category, a.device, &a.path).cmp(&(
+            &b.detector_id,
+            &b.category,
+            b.device,
+            &b.path,
+        ))
+    });
+    if current_changed {
+        write_external_rows(&current_file, &current_rows)?;
+    }
+
+    let files = list_files_in(&external_deltas_dir(&dir));
+    if should_compact(&files) {
+        let retention_secs = retention_days.saturating_mul(86400);
+        let horizon = observed_at.saturating_sub(retention_secs);
+        let mut merged: Vec<StoredExternalRow> = Vec::new();
+        for path in &files {
+            for row in read_external_rows(path)? {
+                if row.observed_at >= horizon {
+                    merged.push(row);
+                }
+            }
+        }
+        if !merged.is_empty() {
+            write_external_rows(
+                &next_seq_path(&external_deltas_dir(&dir), "delta-"),
+                &merged,
+            )?;
+        }
+        for path in &files {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+
+    Ok(annotations)
+}
+
+/// The current stored `(bytes, regrowth_count)` for one external-unit
+/// key, straight off `current.parquet`, with no history-window
+/// computation -- what a caller needs to show a unit's last known value
+/// when this pass could not re-measure it (access lost, not deleted).
+pub fn peek_external_current(swamp_dir: &Path, key: &str) -> Result<Option<(u64, u32)>> {
+    let dir = external_dir(swamp_dir);
+    let current_file = external_current_path(&dir);
+    if !current_file.exists() {
+        return Ok(None);
+    }
+    for row in read_external_rows(&current_file)? {
+        if external_row_key(&row.detector_id, &row.category, row.device, &row.path) == key {
+            return Ok(Some((row.bytes, row.regrowth_count)));
+        }
+    }
+    Ok(None)
+}
+
+/// Read-only counterpart to [`observe_and_annotate_external`]: annotates
+/// from existing history without writing a new observation.
+pub fn annotate_readonly_external(
+    swamp_dir: &Path,
+    keys: &[String],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<HashMap<String, (Option<i64>, u32)>> {
+    let dir = external_dir(swamp_dir);
+    let current_file = external_current_path(&dir);
+    if !current_file.exists() {
+        return Ok(HashMap::new());
+    }
+    let current: HashMap<String, StoredExternalRow> = read_external_rows(&current_file)?
+        .into_iter()
+        .map(|r| {
+            (
+                external_row_key(&r.detector_id, &r.category, r.device, &r.path),
+                r,
+            )
+        })
+        .collect();
+    let target_time = observed_at.saturating_sub(since_secs);
+    let history_index = external_history_index(&dir, retention_days, observed_at)?;
+    let mut out = HashMap::new();
+    for key in keys {
+        let history = history_index.get(key).cloned().unwrap_or_default();
+        let bytes_now = current.get(key).map(|r| r.bytes).unwrap_or(0);
+        let growth = growth_since(&history, bytes_now, target_time);
+        let regrowth = current.get(key).map(|r| r.regrowth_count).unwrap_or(0);
+        out.insert(key.clone(), (growth, regrowth));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

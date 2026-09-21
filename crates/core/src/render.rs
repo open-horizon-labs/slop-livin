@@ -1253,3 +1253,62 @@ pub fn render_view_unowned(report: &Report) -> String {
     render_unowned_summary(report, &mut out, true);
     out
 }
+
+/// `--view external` (#43): detector-resolved storage with no containing
+/// project (Cargo registry, rustup toolchains, Homebrew, ...), one line
+/// per unit plus a total that is explicitly *not* folded into any
+/// `reconciliation` total above -- external units are measured
+/// independently of the walked root(s), so summing the two would double
+/// nothing (they never overlap) but would also conflate two different
+/// bases; kept visibly separate instead.
+pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
+    let mut out = String::new();
+    if units.is_empty() {
+        let _ = writeln!(out, "no external storage units detected");
+        return out;
+    }
+    let mut sorted: Vec<&crate::external::ExternalUnit> = units.iter().collect();
+    sorted.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    let mut total = 0u64;
+    for u in &sorted {
+        total += u.bytes;
+        let growth = u
+            .growth_bytes
+            .map(human_bytes_signed)
+            .unwrap_or_else(|| "—".to_string());
+        let consumers = if u.consumers.is_empty() {
+            "no declared consumers".to_string()
+        } else {
+            format!(
+                "consumers: {}",
+                u.consumers
+                    .iter()
+                    .map(|c| c.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let note = u
+            .note
+            .as_deref()
+            .map(|n| format!("  [{n}]"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{:<10} {:>+10}  {:?}  {}  ({})  {}{note}",
+            human_bytes(u.bytes),
+            growth,
+            u.category,
+            u.path.display(),
+            u.detector_id,
+            consumers,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nexternal storage total: {} ({} units, independent of walked_total above)",
+        human_bytes(total),
+        sorted.len()
+    );
+    out
+}

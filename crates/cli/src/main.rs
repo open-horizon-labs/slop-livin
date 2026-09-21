@@ -43,6 +43,12 @@ enum View {
     /// unowned-bytes summary and coverage (walked/du/unowned totals,
     /// permission-denied count, history span). JSON only.
     Grown,
+    /// External/shared storage units (#43): Cargo registry, rustup
+    /// toolchains, Homebrew, and other detector-resolved locations with
+    /// no containing project. Identity, category, size/growth/regrowth
+    /// history and declared consumers. Inspection only -- see `propose
+    /// --external`.
+    External,
 }
 
 impl View {
@@ -816,6 +822,7 @@ fn report_json_envelope(
     limit: Option<usize>,
     offset: usize,
     scope_coverage: &[swamp_core::coverage::RootCoverage],
+    external_units: &[swamp_core::external::ExternalUnit],
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -839,6 +846,10 @@ fn report_json_envelope(
                 swamp_core::agent_json::docker_objects_payload(&rr, unowned_only, project)
             }
             View::Rust => serde_json::json!(rr.nested_artifacts),
+            View::External => serde_json::json!({
+                "units": external_units,
+                "total_bytes": swamp_core::external::total_bytes(external_units),
+            }),
             _ => swamp_core::agent_json::view_payload(&rr, &name, project),
         };
         let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
@@ -1055,6 +1066,26 @@ fn main() -> Result<()> {
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
             }
+            // External units (#43) are detector-resolved, not derived
+            // from the walked root(s): resolved independently so
+            // `--view external` works the same whether `report` is
+            // scoped to the configured catalog or an explicit root.
+            let external_units = if view == Some(View::External) {
+                let detector_scope = resolve_scope(&[])?;
+                swamp_core::external::discover_and_measure(
+                    &detector_scope,
+                    Some(&store_dir),
+                    !no_observe,
+                    r.observed_at,
+                    swamp_core::growth::load_config(&store_dir).retention_days,
+                    since
+                        .as_deref()
+                        .and_then(swamp_core::growth::parse_duration_secs)
+                        .unwrap_or(24 * 3600),
+                )?
+            } else {
+                Vec::new()
+            };
             if !json
                 && r.projects
                     .iter()
@@ -1089,6 +1120,7 @@ fn main() -> Result<()> {
                         limit,
                         offset,
                         &coverage,
+                        &external_units,
                     )?)?
                 );
             } else if let Some(wt_path) = worktree {
@@ -1137,6 +1169,9 @@ fn main() -> Result<()> {
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(View::External) => {
+                        print!("{}", swamp_core::render::render_view_external(&external_units))
+                    }
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
@@ -1165,6 +1200,9 @@ fn main() -> Result<()> {
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(View::External) => {
+                        print!("{}", swamp_core::render::render_view_external(&external_units))
+                    }
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);

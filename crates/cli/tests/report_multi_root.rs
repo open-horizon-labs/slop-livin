@@ -129,6 +129,51 @@ fn report_surfaces_a_missing_configured_root_as_coverage_not_silence() {
     assert!(stderr.contains("scope coverage"), "{stderr}");
 }
 
+/// `--view external` (#43): a detector-resolved, project-independent
+/// location (here, `CARGO_HOME` pointed at a fixture directory) shows up
+/// as its own unit, end to end through the built binary and real
+/// `[scan]` config, distinct from `projects`.
+#[test]
+fn report_view_external_lists_detector_resolved_units() {
+    let home = tempfile::tempdir().unwrap();
+    let cargo_home = home.path().join("fixture-cargo");
+    std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+    std::fs::write(cargo_home.join("bin/cargo"), vec![9u8; 5_000]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    std::fs::write(
+        store.path().join("config.toml"),
+        "[scan]\ndefaults = false\ndisabled_detectors = [\"rustup\", \"homebrew\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .arg("report")
+        .arg("--view")
+        .arg("external")
+        .arg("--json")
+        .env("SWAMP_DIR", store.path())
+        .env("HOME", home.path())
+        .env("CARGO_HOME", &cargo_home)
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run report --view external");
+    assert!(
+        output.status.success(),
+        "report --view external failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["view"], "external");
+    let units = json["result"]["units"].as_array().expect("units array");
+    assert!(
+        units
+            .iter()
+            .any(|u| u["detector_id"] == "cargo-home" && u["category"] == "installation"),
+        "{units:?}"
+    );
+    assert!(json["result"]["total_bytes"].as_u64().unwrap() > 0);
+}
+
 /// An explicit root on the command line still takes the single-root
 /// path unchanged (#42's "a single explicit root is just a scope of
 /// one"): no `scope_coverage` key at all when nothing is ambiguous.
