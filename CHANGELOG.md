@@ -40,6 +40,45 @@ Release notes describe behavior at the named version. See the [README](README.md
   for the full contract and known gaps (the other 12 named tools, TUI
   mark/confirm for agent actions, `~/.claude.json` living outside the
   modeled home directory).
+- **Identified Codex, Codex's desktop app, Oh My Pi and OpenCode
+  storage, and wired agent-storage actions into the TUI** (#93, #94,
+  #95, #101). Four new adapters bring `swamp report --view agents` (CLI
+  and TUI) to five supported tools: Codex (`CODEX_HOME`, default
+  `~/.codex`) identifies live/archived rollout sessions in their
+  year/month/day date trees and six SQLite state stores
+  (`state_5.sqlite`, `logs_2.sqlite`, `goals_1.sqlite`,
+  `memories_1.sqlite`, `queue_1.sqlite`, `thread_history_1.sqlite`),
+  each folded with its `-wal`/`-shm` sidecars into one protected,
+  non-actionable unit; the Codex desktop app is modeled as its own row
+  covering only its confirmed macOS log directory
+  (`~/Library/Logs/com.openai.codex`), never extrapolating the CLI's
+  schema onto it. Oh My Pi (`~/.omp/agent`, confirmed by the user as a
+  fork of `badlogic/pi-mono`) identifies sessions with a fixed 256-byte
+  title-slot header, verifies content markers before treating anything
+  under `~/.omp` as its own format (an explicit "unknown format" unit
+  otherwise, since other tools can plausibly use that path), and tracks
+  its content-addressed `blobs/` store's per-session reference counts
+  with a bounded, per-session body scan -- never offering blob removal
+  in this release, since complete reference coverage is not
+  established. OpenCode identifies both its older file-tree layout
+  (`storage/session/<project>/<session>.json`, linked via
+  `storage/project/<id>.json`'s declared `worktree` field -- no
+  session-body read needed at all) and its newer SQLite-backed one
+  (`opencode.db`), version-gated by which markers are present on disk,
+  plus its git-backed `snapshot/<project>/` checkpoint store
+  (identified, linked, never actionable -- removing it loses `/undo`
+  history). Two new `AgentMemberKind` variants (`Database`,
+  `SessionData`) and a shared `agents::resolve_declared_path` helper
+  (factored out of Claude Code's original implementation) support all
+  four adapters without duplicating the project-linkage git-walk logic.
+  The TUI's Agents view is now markable: `Space`/`Backspace` mark a
+  supported unit and open the confirm banner with its real consequences
+  (loss warnings, linked project), `Enter` executes through the
+  existing background-worker path (never blocking the event/render
+  thread), and a protected/unsupported row's footer names
+  `propose_agents`'s own refusal reason. See `docs/agent-storage.md`
+  for the full per-tool detail and remaining scope boundaries (blob
+  GC, snapshot removal, TUI bulk marking, unconfirmed env var names).
 - **Made multi-root observation coverage-aware** (#42). `report`,
   `observe`, and `ui` with no explicit root now observe the whole
   configured scope coherently in one call, not just its first present

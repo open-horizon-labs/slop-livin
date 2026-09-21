@@ -280,14 +280,19 @@ one two chunks above already established:
   #101's session removal can move the exact same set, re-verified fresh
   at execution.
 - **Project linkage reuses `crate::git`'s own identity, never a
-  basename guess.** `claude_code::resolve_project_link` reads only a
-  session transcript's first line (bounded: "first N bytes... never
-  whole transcripts"), looks for a `cwd` field, and walks upward from
-  that path calling the same `crate::git::classify_main_checkout`/
-  `classify_git_file` primitives `crate::git::discover` uses --
-  never decodes the `projects/<encoded-cwd>` directory name back into a
-  path (that encoding is lossy: a literal hyphen in a real path cannot
-  be told apart from an encoded path separator).
+  basename guess.** `agents::resolve_declared_path` (factored out of
+  `claude_code`'s original implementation once Codex/Oh My Pi/OpenCode
+  needed the identical logic for #93/#94/#95) takes a declared absolute
+  path -- a session transcript's `cwd` field, OpenCode's `project.json`
+  `worktree` field -- and walks upward from it calling the same
+  `crate::git::classify_main_checkout`/`classify_git_file` primitives
+  `crate::git::discover` uses. Every adapter bounds *how* it extracts
+  that path (a transcript's first line; a small declared metadata file)
+  but shares this one resolution function, so a `.git`-walk bug fixed
+  once is fixed for every tool. None of them ever decode a directory
+  name back into a path (Claude Code's `projects/<encoded-cwd>` naming
+  is lossy in reverse: a literal hyphen in a real path cannot be told
+  apart from an encoded path separator).
 
 Scan cost is bounded the same way an artifact's folded measurement is:
 `agents::folded_bytes` is a small hand-rolled stat walker (directory
@@ -310,24 +315,47 @@ filename, an active session via `agents::is_active`'s
 carrying `agent_meta`. `execute`'s `agent_meta` branch rechecks
 occupancy again (authoritative, not informational) and dispatches to a
 single-path Trash move (a cache/log category directory) or
-`execute_agent_session_removal` (re-runs `claude_code::identify` fresh,
-refuses on any membership drift since the plan was proposed, then
-moves every member into one Trash envelope). Human keep/protect intent
+`execute_agent_session_removal`, which re-derives fresh membership by
+dispatching on `meta.tool_id` to the matching adapter's own `identify`
+(`claude_code`/`codex`/`codex_desktop`/`oh_my_pi`/`opencode`), refuses
+on any membership drift since the plan was proposed, then moves every
+member into one Trash envelope. Human keep/protect intent
 (`swamp protect add/list/remove`) is a small JSON sidecar
 (`agent_protect.json`) under `$SWAMP_DIR`, deliberately decoupled from
 the growth store exactly like `external_consumers.json` is: touching it
 never affects an `AgentUnit`'s bytes or history.
 
-Only Claude Code (#92) is implemented this chunk. `crate::agents::matrix`
-is the explicit, required 13-tool matrix (#90/#91): every named tool
-has a row with a sourced home-path note, `Supported` or `Planned`,
-never a silent omission and never an empty placeholder adapter that
-claims support it does not have. See `docs/agent-storage.md` for the
-rendered table, category/linkage semantics, and documented gaps
-(`~/.claude.json` living outside the home directory; `todos/` matching
-by filename-prefix heuristic since the naming convention is
-undocumented upstream; no TUI mark/confirm flow yet, only
-`swamp propose-agents`/`approve`/`execute`).
+The TUI's Agents view reuses the exact same mark/confirm/execute
+machinery every other markable view uses, not a parallel one:
+`model::agent_rows` sets `unit: Some(...)` on every row (protected ones
+included), `app::mark_row` calls `actions::propose_agents` the same way
+its Cargo-artifact branch calls `actions::propose`, and the resulting
+plan rides in `MarkedUnit::agent_plan` -- a field kept separate from
+`cargo_plan` (not folded into it) specifically so `execute_one`'s
+Cargo-only `keep_executables` conflict check can never wrongly refuse
+an unrelated agent-storage removal. A protected/unsupported row still
+reaches `mark_row`'s agent branch and gets `propose_agents`'s own
+refusal text on the footer, rather than a generic "nothing to delete."
+Marking (and the `propose_agents` call it makes) already runs off the
+event/render thread, inside the same background-worker indirection
+`review_in_background` gives every other mark path -- no new
+`tui_nonblocking` guard entry was needed.
+
+Five tools are implemented as of #93/#94/#95: Claude Code (#92), Codex
+and its desktop app, Oh My Pi and OpenCode. `crate::agents::matrix` is
+the explicit, required 14-row matrix (#90/#91): every named tool (Codex
+and its desktop app count as separate rows, since the desktop app is a
+materially different client) has a row with a sourced home-path note,
+`Supported` or `Planned`, never a silent omission and never an empty
+placeholder adapter that claims support it does not have. See
+`docs/agent-storage.md` for the rendered table, category/linkage
+semantics, and documented gaps (`~/.claude.json` living outside the
+home directory; `todos/` matching by filename-prefix heuristic since
+the naming convention is undocumented upstream; Codex's
+`CODEX_SQLITE_HOME` and OpenCode's `OPENCODE_DATA_DIR` env vars;
+Oh My Pi's blob-GC and OpenCode's snapshot/part actions both
+deliberately out of scope this chunk; TUI bulk marking not yet reaching
+agent rows).
 
 ## Observation pipeline
 
@@ -521,23 +549,31 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
   `~/.claude`): registering it as a detector is what gives it
   external-unit identity/history for free, and the trade-off is the
   same pre-existing overlap, not a new one this chunk introduced.
-- The TUI's External and Agents views (added this chunk) are read-only:
-  neither row is markable. External because `execute` already refuses
-  every external unit unconditionally; Agents because this chunk's
-  supported actions (`swamp propose-agents`/`approve`/`execute`) have
-  no TUI mark/confirm counterpart yet -- a named gap, not a silent one.
-- Agent-storage coverage: only Claude Code (#92) has real identification
-  code; `crate::agents::matrix` lists the remaining twelve named tools
-  (#93-#99) as `Planned` with sourced home-path notes, not implemented.
-  Within Claude Code, `todos/<session-id>*` matching is a documented,
-  bounded filename-prefix heuristic (the exact naming convention is not
-  in Claude Code's own documentation); `~/.claude.json` (a sibling of
-  the `~/.claude/` home directory, not inside it) is not modeled, since
-  an agent unit's identity is a path *under* the tool home by
-  construction. Claude-created git worktrees are not separately
+- The TUI's External view is read-only: `execute` already refuses every
+  external unit unconditionally, so it never offers a delete affordance
+  the action layer would refuse anyway. The Agents view is markable
+  (#101's TUI wiring): `Space`/`Backspace`/`Enter` reach
+  `actions::propose_agents`/the ordinary background-worker execute
+  path, the same as every other markable view; a protected/unsupported
+  row cannot be marked and the footer says why. Bulk marking
+  (`Shift+A`) does not yet reach agent rows -- a named gap, not a silent
+  one.
+- Agent-storage coverage: five tools have real identification code
+  (Claude Code #92; Codex, its desktop app, Oh My Pi and OpenCode
+  #93/#94/#95); `crate::agents::matrix` lists the remaining nine named
+  tools (#96-#99) as `Planned` with sourced home-path notes, not
+  implemented. Within Claude Code, `todos/<session-id>*` matching is a
+  documented, bounded filename-prefix heuristic (the exact naming
+  convention is not in Claude Code's own documentation); `~/.claude.json`
+  (a sibling of the `~/.claude/` home directory, not inside it) is not
+  modeled, since an agent unit's identity is a path *under* the tool
+  home by construction. Claude-created git worktrees are not separately
   re-measured by this adapter (Claude Code documents no fixed on-disk
   location for them); they are ordinary Git worktrees the normal scan
   already discovers, and this adapter cross-references rather than
-  double-counts them.
+  double-counts them. Codex's session-header envelope shape around its
+  `cwd` field, Oh My Pi's blob-reference GC, and OpenCode's snapshot/
+  `storage/part` actions are each documented, deliberate scope
+  boundaries in `docs/agent-storage.md`, not silent gaps.
 
 The [accuracy report](accuracy.md) records the source checks behind these descriptions. Historical timings in the [changelog](../CHANGELOG.md) are individual observations; representative benchmarks are still needed for latency and storage-size claims.

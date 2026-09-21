@@ -82,10 +82,22 @@ chunk; all three now ship:
   delete affordance to offer in the first place.
 - **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
   "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
-  same way: tool/category/relative-path/project-link facts, never
-  markable. Selective action for agent-storage units is reachable
-  through `swamp propose-agents`/`approve`/`execute`, not (yet) a TUI
-  mark/confirm flow -- a named, deliberate gap, not a silent one.
+  same way: tool/category/relative-path/project-link facts. Every row
+  carries `Row.unit: Some(...)` (protected/unsupported ones included):
+  `Space`/`Backspace` mark the selected unit through
+  `actions::propose_agents` (the same function `swamp propose-agents`
+  uses) and open the confirm banner with its real consequences
+  (session-removal loss warnings, the linked project); `Enter` executes
+  through the ordinary background-worker path
+  (`actions::execute_plan_progress`) every other markable view already
+  uses -- never a new blocking call on the event/render thread. A
+  protected/unsupported row cannot be marked: `propose_agents`'s own
+  refusal (protected category, no supported action yet, active session)
+  becomes the footer text, never a generic "nothing to delete." Bulk
+  marking (`Shift+A`, `mark_all_in_view`) does not reach agent rows yet
+  -- it recognizes only a `row.kind`/`ArtifactKind` or a projects-view
+  `row.project`, neither of which an agent row sets; a named, deliberate
+  gap for a future worker, not a silent one.
 - **Scope-coverage header clause.** `App::set_scope_note` adds one
   short header clause when the TUI's own root is not simply present
   (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible: permission

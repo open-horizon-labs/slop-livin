@@ -4,8 +4,9 @@ Coding-agent CLIs and editor extensions (Claude Code, Codex, Oh My Pi,
 OpenCode, and others) keep session transcripts, caches, logs,
 checkpoints and configuration under their own home directory. This
 document is the reference for how `swamp` discovers, models, presents
-and selectively cleans up that storage (#90/#91/#92/#100/#101), and
-what is deliberately not done yet.
+and selectively cleans up that storage
+(#90/#91/#92/#93/#94/#95/#100/#101), and what is deliberately not done
+yet.
 
 **The aim:** help a developer understand where agentic coding tools
 consume disk, what grew, which project (if any) it belongs to, and what
@@ -17,9 +18,18 @@ they can give up with an honest, specific consequence -- never a
 This is the hard rule everything else in this document sits on top of:
 
 - Identification reads directory names, file sizes, and modification
-  times. For a session's project linkage, it reads **only the first
-  line** of the session's own transcript file (bounded to 8 KiB),
-  looking for one JSON field (`cwd`). Nothing else is ever read.
+  times. For most adapters, a session's project linkage comes from
+  reading **only the first line** of the session's own transcript file
+  (bounded to 8 KiB), looking for one JSON field (`cwd`); Oh My Pi's
+  sessions have a fixed 256-byte title slot before that header line and
+  this adapter skips it rather than reading it. OpenCode's project
+  linkage instead comes from its own small, declared `project.json`
+  metadata file (a `worktree` field), never from session content at
+  all. Oh My Pi's shared-blob reference accounting is the one adapter
+  that reads further into a session body (bounded to 64 KiB per
+  session), and only to extract opaque `blob:sha256:<hash>` reference
+  tokens -- never any other content, never persisted as text anywhere.
+  Nothing else, in any adapter, is ever read.
 - No prompt, response, attachment, tool-output, or credential *content*
   is put into a report, a plan, the ledger, a log, or a test fixture.
   Every fixture used to build and test this feature is synthetic:
@@ -45,9 +55,10 @@ that every one of the required tools has exactly one row.
 | Tool | Status | Home / override | Sources |
 |---|---|---|---|
 | Claude Code | **Supported** | `~/.claude`, or `$CLAUDE_CONFIG_DIR` if set | [claude-directory](https://code.claude.com/docs/en/claude-directory), [settings](https://code.claude.com/docs/en/settings), [checkpointing](https://code.claude.com/docs/en/checkpointing), [authentication](https://code.claude.com/docs/en/authentication) |
-| Codex | Planned | `CODEX_HOME`, default `~/.codex` (`sessions/`, `auth.json`, `history.jsonl`, `logs/`, `config.toml`) | [openai/codex](https://github.com/openai/codex), [config-advanced](https://developers.openai.com/codex/config-advanced), [cli/reference](https://developers.openai.com/codex/cli/reference) |
-| Oh My Pi | Planned | `~/.omp` (user-confirmed identity: a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md), [docs/settings.md](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) |
-| OpenCode | Planned | data: `OPENCODE_DATA_DIR`, else `${XDG_DATA_HOME:-~/.local/share}/opencode`; config: `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json` | [opencode.ai/docs/troubleshooting](https://opencode.ai/docs/troubleshooting/), [opencode#6669](https://github.com/anomalyco/opencode/issues/6669), [opencode#18633](https://github.com/anomalyco/opencode/issues/18633) |
+| Codex | **Supported** | `CODEX_HOME`, default `~/.codex` (`sessions/`+`archived_sessions/` year/month/day rollout trees, `auth.json`, `history.jsonl`, `config.toml`, `log/`, six `*.sqlite` state stores relocatable via the separate `CODEX_SQLITE_HOME`) | [home-dir/lib.rs](https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs), [rollout/lib.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/lib.rs), [rollout/list.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs), [rollout_file_name.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/rollout_file_name.rs), [rollout/metadata.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/metadata.rs), [state/sqlite.rs](https://github.com/openai/codex/blob/main/codex-rs/state/src/sqlite.rs), [codex_home_metrics.rs](https://github.com/openai/codex/blob/main/codex-rs/app-server/src/codex_home_metrics.rs) |
+| Codex desktop app | **Supported** (log directory only) | macOS `~/Library/Logs/com.openai.codex`; settings/session storage beyond logs is unconfirmed and not modeled | [doctor/desktop.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop.rs), [desktop/platform.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop/platform.rs) |
+| Oh My Pi | **Supported** | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set (user-confirmed identity: a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md), [docs/settings.md](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) |
+| OpenCode | **Supported** | data: `OPENCODE_DATA_DIR` (unconfirmed env var name, honored defensively), else `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode` and cache `${XDG_CACHE_HOME:-~/.cache}/opencode` reported as opaque external units, not decomposed | [opencode.ai/docs/troubleshooting](https://opencode.ai/docs/troubleshooting/), [opencode#6669](https://github.com/anomalyco/opencode/issues/6669), [opencode#18633](https://github.com/anomalyco/opencode/issues/18633), [storage.ts](https://github.com/sst/opencode/blob/dev/packages/opencode/src/storage/storage.ts), [DeepWiki storage-and-database](https://deepwiki.com/sst/opencode/2.9-storage-and-database) |
 | Gemini CLI | Planned | `~/.gemini` (`settings.json`, `GEMINI.md`, `extensions/`, `tmp/`, `chats/`); root overridable via `GEMINI_CONFIG_HOME` | [gemini-cli configuration.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md) |
 | Pi | Planned | `~/.pi/agent/`, overridable via `PI_AGENT_DIR` (`badlogic/pi-mono`, distinct from Oh My Pi, which forks it) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md), [development.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/development.md) |
 | Aider | Planned | `~/.aider` (`~/.aider/caches`); per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v<N>/` are project-local, not under the home directory | [aider config.html](https://aider.chat/docs/config.html), [usage/caching.html](https://aider.chat/docs/usage/caching.html), [Aider-AI/aider](https://github.com/Aider-AI/aider) |
@@ -62,8 +73,10 @@ that every one of the required tools has exactly one row.
 primary sources during this work, but no identification code exists
 for that tool yet -- never a silent omission, and never an empty
 adapter that claims support it does not have. Extending this list for
-a tool *beyond* the thirteen named above is ordinary catalog review,
-not a change to this contract.
+a tool *beyond* the fourteen rows above (Codex and its desktop app
+count separately, per #93's "do not extrapolate one client's schema to
+all clients" acceptance) is ordinary catalog review, not a change to
+this contract.
 
 ## Categories
 
@@ -89,6 +102,24 @@ respected by `swamp protect`, but there is no code path that deletes
 it. This matches the guardrail this feature was built under: identity
 and action capability are independent facts, and the absence of one is
 never disguised as the other.
+
+`AgentMember.kind` (`AgentMemberKind`) gained two variants for #93/#94/
+#95, both explicitly sanctioned by the handoff's "extend the shared
+model only where a tool genuinely needs a new concept" clause:
+
+- **`Database`** -- a SQLite file (or a `-wal`/`-shm` sidecar) backing
+  a newer version's unified session/message/state store (Codex's six
+  `*.sqlite` files, OpenCode's `opencode.db`, Oh My Pi's `agent.db`).
+  Always folded into one unit with its sidecars as members; never split,
+  never opened, never individually actionable (`is_sqlite_like` in
+  `crate::actions` refuses any selective action on a path with this
+  kind unconditionally).
+- **`SessionData`** -- a session-keyed companion directory that is
+  neither a transcript, a subagent dir, todos, file-history, nor an
+  attachment (OpenCode's `storage/message/<session-id>/` and
+  `storage/session_diff/<session-id>/`), matched to a session by the
+  same exact-id-match discipline `claude_code::identify` uses for its
+  own companion directories -- never a guess.
 
 ### Cache/log Trash move
 
@@ -120,8 +151,21 @@ a stale plan.
 - The whole `projects/` directory, or a whole project's session
   directory as one unit -- only individual sessions are units.
 - Any path whose filename looks like a SQLite database or its `-wal`/
-  `-shm` sidecar (defense in depth; no currently-documented Claude Code
-  path is SQLite, but the guardrail is unconditional regardless).
+  `-shm` sidecar. Claude Code has none currently documented, but the
+  guardrail is unconditional regardless, and Codex/OpenCode/Oh My Pi
+  each have real SQLite stores it actually protects (six state
+  databases, `opencode.db`, `agent.db`).
+- A content-addressed blob Oh My Pi's `blobs/` shares across sessions:
+  identified with its reference count (or an explicit "coverage
+  unknown" note when any session's body exceeded this pass's bounded
+  scan), but never offered a selective action at all in this release --
+  reference-based GC from incomplete coverage is out of scope here, not
+  merely gated.
+- OpenCode's `snapshot/<project-id>/` git-backed checkpoint store and
+  its `storage/part/` (message parts, keyed by message id, not session
+  id): identified and linked where possible, never offered a selective
+  action -- removing a snapshot loses `/undo` history, and parts cannot
+  be safely correlated to one session without reading message content.
 - An active session: `swamp propose-agents`/`execute` both check
   occupancy (an `lsof`-style check on the session's transcript file,
   via the same `crate::occupancy` seam existing actions use) and refuse
@@ -140,7 +184,7 @@ Each unit's `project_link` field is one of:
 | `not-a-project` | Metadata names a path that exists but is not (or is no longer) a Git checkout/worktree. |
 | `moved` | The declared path used to resolve to one project identity and now resolves to a different one (or none). *Not currently populated by the Claude Code adapter* -- it has no record of a session's previous linkage to compare against. |
 | `remote` | The declared path is on a different host than this observation runs on. *Not currently populated* -- no reliable remote-host signal exists in a session header. |
-| `shared` | A unit's members collectively name more than one project. *Not currently populated by the Claude Code adapter* (one session always has exactly one declared `cwd`); kept for adapters/aggregates where it can genuinely happen. |
+| `shared` | A unit's members collectively name more than one project. *Not populated by the Claude Code, Codex or OpenCode adapters* (one session always has exactly one declared `cwd`/`worktree`); the Oh My Pi adapter does populate it, when a session's `additionalDirectories` names a workspace root resolving to a different project than its primary `cwd`. |
 | `not-applicable` | This unit is inherently tool-wide (a cache, a log directory, protected config): project linkage does not apply, which is a different, more honest fact than "we tried and could not tell." |
 
 Resolution never decodes the `projects/<encoded-cwd>` directory name
@@ -207,20 +251,161 @@ treats anything else as an unknown, never a parse panic or a guess.
   during ordinary identification, which would mean hundreds of process
   spawns on an otherwise-cheap `report`.
 
+## Codex (#93)
+
+Layout researched from `openai/codex`'s own `codex-rs` source (current
+`main` as of this chunk; see the matrix above for exact file links).
+`CODEX_HOME`'s internal transcript envelope around the `session_meta`
+entry's `cwd` field is not pinned to one nesting shape (genuinely
+version-varying wire format); any shape not matched resolves to
+`unresolved`, never a guess.
+
+- **Sessions:** `sessions/<year>/<month>/<day>/rollout-<timestamp>-
+  <thread-id>[_<rollout-id>].jsonl` -- one file per session, no
+  documented companion directory, so a session's member set is always
+  exactly that one file.
+- **Archived sessions:** `archived_sessions/` in the same date-tree
+  shape, identified the same way with an explicit "archived, not
+  evidence of disuse" note -- archiving is a Codex-side visibility
+  change, not a deletion.
+- **SQLite state stores (a version boundary):** `state_5.sqlite`,
+  `logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`,
+  `queue_1.sqlite`, `thread_history_1.sqlite`, each folded with its
+  `-wal`/`-shm` sidecars into one protected, non-actionable unit.
+  `CODEX_SQLITE_HOME` can relocate all six *outside* `CODEX_HOME`; this
+  adapter does not follow that override (a documented gap, same shape
+  as Claude Code's `~/.claude.json` sibling gap) -- if set, these files
+  are simply not found here rather than guessed at a wrong path.
+- **Protected config:** `config.toml`, `auth.json`, `skills/`
+  (directory name found in source search, not independently confirmed
+  by a primary docs page this chunk).
+- **Individually protected, not by category:** `history.jsonl`
+  (cross-session prompt history, category `sessions`).
+- **Logs (actionable):** `log/` (name carried over from this epic's
+  prior research, not independently re-confirmed by source this
+  chunk).
+- **Not confirmed, not modeled:** no managed-worktree creation by the
+  CLI itself was found in this chunk's source research, so
+  `AgentCategory::ManagedWorktrees` is never populated by this adapter
+  -- an honest absence, not a silent gap.
+
+### Codex desktop app (#93)
+
+The desktop app (`Codex.app`, bundle id `com.openai.codex`) is a
+materially different client with its own storage; this chunk does
+**not** extrapolate the CLI's `CODEX_HOME` schema onto it. Only its log
+directory is confirmed by primary source
+(`codex-rs/cli/src/doctor/desktop.rs`'s `desktop_log_root`): macOS
+`~/Library/Logs/com.openai.codex`, itself a `%Y/%m/%d` date tree. That
+directory is identified as one folded, actionable Logs-category unit.
+Settings/session storage beyond logs is not confirmed and is not
+modeled -- a deliberately partial `Supported` row, stated explicitly
+rather than silently treated as empty. No Linux/Windows desktop build
+is confirmed either; the detector reports `not-present` there instead
+of guessing a path.
+
+## Oh My Pi (#94)
+
+User-confirmed identity: a fork of `badlogic/pi-mono`'s `pi` coding
+agent. Layout researched from `can1357/oh-my-pi`'s own docs (current
+`main` as of this chunk).
+
+- **Unknown-format disambiguation:** `~/.omp` is also a plausible home
+  for unrelated tools (the issue names oh-my-posh as one to check).
+  Resolving `~/.omp/agent` specifically (not the bare `~/.omp` wrapper)
+  already avoids most collision risk, and this adapter adds a second,
+  independent check on top: before identifying anything, it looks for
+  at least one of this format's own content markers (`config.yml`,
+  `config.yaml`, `agent.db`, `sessions/`, `blobs/`). Absent all of
+  them, it reports one non-actionable "unknown format" unit for the
+  whole directory rather than guessing.
+- **Sessions:** `sessions/<encoded-cwd>/<timestamp>_<session-id>.jsonl`
+  -- files begin with a fixed 256-byte `type: "title"` slot, then the
+  session header (`cwd`, `additionalDirectories`); this adapter skips
+  the title slot and reads only the header line, same one-field-at-a-
+  time discipline as every other adapter here.
+- **Shared content-addressed blobs:** `blobs/<sha256>`, referenced from
+  session bodies as `blob:sha256:<hash>`. Establishing *complete*
+  reference coverage would mean reading every session body in full,
+  which this adapter deliberately does not do: each session's body is
+  scanned only up to a bound (64 KiB), extracting reference tokens
+  only -- never persisted or logged as text. A session exceeding the
+  bound marks the whole pass's blob-reference coverage as unknown
+  rather than reporting a possibly-wrong count. No blob is ever offered
+  a selective action in this chunk regardless of its reference count --
+  reference-based GC is out of scope here, not merely gated.
+- **Terminal breadcrumbs (actionable):** `terminal-sessions/`.
+- **Protected config:** `config.yml`/`config.yaml`, `models.yml`,
+  `agent.db` (a SQLite auth store, doubly protected -- by category and
+  by `is_sqlite_like`).
+- **Project-local, not modeled:** `<cwd>/.omp/config.yml` lives outside
+  the agent home entirely (same class of documented gap as Aider's own
+  project-local files in the matrix above).
+
+## OpenCode (#95)
+
+Layout researched from `sst/opencode`'s own source and DeepWiki-indexed
+documentation (current as of this chunk). Unlike the other three tools,
+OpenCode keeps data, config and cache as three *independent* roots
+(`crate::locations::opencode`); only the data root is decomposed into
+`AgentUnit`s -- config and cache are reported as opaque external units
+with their own byte totals, since neither carries session/project
+linkage.
+
+- **Version-aware boundary:** `identify` checks for
+  `opencode.db`/`storage/`/`snapshot/`/`auth.json`/`log/` before doing
+  anything else. A resolved, non-empty data root matching none of them
+  reports one "unsupported layout version" unit rather than guessing
+  at either schema below.
+- **Newer/SQLite layout:** `opencode.db` (+ `-wal`/`-shm`), folded into
+  one protected, non-actionable unit -- never opened, same discipline
+  as Codex's own SQLite stores.
+- **Older/file-tree layout:** `storage/session/<project-id>/
+  <session-id>.json`, with `storage/message/<session-id>/` and
+  `storage/session_diff/<session-id>/` companions matched by the exact
+  session-id-keyed discipline `claude_code::identify` uses for its own
+  companions. `storage/part/<message-id>/*.json` is keyed by *message*,
+  not session, id and is never correlated to individual sessions
+  without reading message content -- folded whole into one protected,
+  non-actionable unit instead, the same honest-gap discipline Claude
+  Code's own `paste-cache` uses.
+- **Project linkage, declared and cheap:** `storage/project/
+  <project-id>.json`'s `worktree` field is a real filesystem path, read
+  once per project directory and reused for every session under it --
+  no session-body scan needed at all for this adapter's project
+  linkage, unlike every other adapter in this document.
+- **Git-backed checkpoint snapshots (both layouts):**
+  `snapshot/<project-id>/<hash>` -- an internal git object store,
+  decoupled from the project's own `.git`, capturing a tree snapshot
+  before/after every agent step so `/undo` can revert. Unique
+  checkpoint/recovery state, identified and linked, never offered a
+  selective action in this chunk.
+- **Protected config:** `auth.json` (directly under the data root, not
+  the separate config root).
+- **Logs (actionable):** `log/` (also directly under the data root).
+
 ## Scan cost
 
 Identification reads directory names and bounded metadata (file
-`stat`, and a session's first transcript line) -- never a full
+`stat`, and a session's first transcript/header line) -- never a full
 directory content walk with `crate::walk::resize_artifact`'s
 parallel-pool machinery, which is tuned for a handful of potentially
 huge artifact roots, not hundreds of small per-session directories.
-`crates/core/src/agents/claude_code.rs`'s
-`identification_cost_is_bounded_for_many_sessions` test measures
-identifying 500 synthetic sessions (each with an oversized body, to
-prove only the first line is ever read) and asserts it completes in
-well under 10 seconds; see
-`.oh/sessions/2026-09-21-agent-storage-claude-code.md` for the measured
-number on the machine that ran it.
+Each adapter has its own `identification_cost_is_bounded_for_many_sessions`
+test, measuring identification of 500 synthetic sessions and asserting
+completion in well under 10 seconds:
+
+| Adapter | Measured (this chunk's dev machine) |
+|---|---|
+| `claude_code` | ~75ms |
+| `codex` | ~68ms |
+| `oh_my_pi` | ~110ms (includes the bounded per-session blob-reference scan) |
+| `opencode` | ~8ms |
+
+See `.oh/sessions/2026-09-21-agent-storage-claude-code.md` for the
+Claude Code number's original recording, and
+`.oh/sessions/2026-09-21-agent-storage-codex-omp-opencode.md` for the
+other three.
 
 ## Interfaces
 
@@ -228,7 +413,8 @@ number on the machine that ran it.
 |---|---|
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
-| TUI | `v` (cycle) reaches the read-only Agents view; no dedicated digit (`0` is "clear filter") |
+| TUI (read) | `v` (cycle) reaches the Agents view; no dedicated digit (`0` is "clear filter") |
+| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Enter` executes through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected/unsupported row cannot be marked; the footer names `propose_agents`'s own refusal reason. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
 | Propose | `swamp propose-agents --path <unit-path> [--json]` |
 | Approve/execute | `swamp approve <plan-id>` / `swamp execute <plan-id> [--json]` (unchanged -- already generic over any plan) |
@@ -236,11 +422,15 @@ number on the machine that ran it.
 
 ## Known gaps, recorded rather than hidden
 
-- Only Claude Code has real identification code; the other twelve named
-  tools are `Planned` (see the matrix above).
-- TUI mark/confirm/execute for an agent-storage unit is not wired up;
-  the CLI `propose-agents`/`approve`/`execute` path is the supported
-  route this release.
+- Five of the fourteen matrix rows have real identification code
+  (Claude Code, Codex, the Codex desktop app, Oh My Pi, OpenCode); the
+  remaining nine named tools are `Planned` (see the matrix above).
+- TUI bulk marking (`Shift+A`, `mark_all_in_view`) does not reach agent
+  rows yet -- it only recognizes a `row.kind`/`ArtifactKind` or a
+  projects-view `row.project`, neither of which an agent row sets.
+  Marking one agent unit at a time (`Space`/`Backspace` on the selected
+  row) works; a future worker can extend `mark_all_in_view` to agent
+  rows the same way it already handles projects-view rows.
 - `swamp propose`'s CLI (the original, walked-report-root command) has
   no `--agent` mode; `propose-agents` is a separate, dedicated
   subcommand instead (mirrors the same reasoning the External chunk
@@ -253,3 +443,12 @@ number on the machine that ran it.
   though Claude Code's own retention policy treats it as ephemeral,
   because it is not scoped to one session and this adapter has no
   per-session reference evidence for it.
+- Oh My Pi's shared blobs and OpenCode's git-backed snapshots/`storage/
+  part` are identified and linked where possible but never offered a
+  selective action in this chunk (see their sections above) -- this is
+  a deliberate scope boundary, not an oversight: reference-based blob
+  GC and per-hash snapshot removal both need reference/coverage
+  guarantees this chunk does not implement.
+- Codex's `CODEX_SQLITE_HOME` and OpenCode's `OPENCODE_DATA_DIR` exact
+  env var name are both documented as unconfirmed/partially-followed in
+  their sections above, not silently treated as settled facts.

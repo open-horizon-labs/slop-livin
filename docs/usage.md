@@ -203,8 +203,9 @@ never offers a delete affordance the action layer would refuse anyway).
 
 ## Agent-tool storage
 
-Coding-agent tools (Claude Code, and named others as their adapters
-land) keep session transcripts, caches, logs, checkpoints and
+Coding-agent tools (Claude Code, Codex, its desktop app, Oh My Pi,
+OpenCode, and named others as their adapters land) keep session
+transcripts, caches, logs, checkpoints and
 configuration under their own home directory. `swamp` identifies that
 storage the same way it identifies external storage above -- the home
 directory itself is one external unit -- and additionally classifies
@@ -247,10 +248,15 @@ today vs. named-and-planned). In short:
   selected unit is ever affected; occupancy, references and identity
   are all re-checked at execution, not assumed from the plan.
 
-The TUI has a dedicated, read-only Agents view (`v`, no digit -- `0` is
-"clear filter"): the same per-unit facts as `--view agents`. Selective
-action from the TUI (mark/confirm/execute for an agent-storage unit) is
-not wired up this release; use the CLI commands above.
+The TUI has a dedicated Agents view (`v`, no digit -- `0` is "clear
+filter"): the same per-unit facts as `--view agents`. `Space`/
+`Backspace` mark the selected unit and open the confirm banner showing
+its real consequences (session-removal loss warnings, the linked
+project); `Enter` executes through the same background-worker path
+every other TUI deletion uses -- never blocking the event/render
+thread. A protected or unsupported row cannot be marked; the footer
+names the exact reason. Bulk marking (`Shift+A`) does not reach agent
+rows yet -- mark one at a time, or use the CLI commands above.
 
 ## Cleanup recommendations
 

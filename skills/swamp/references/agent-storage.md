@@ -1,12 +1,13 @@
 # Agent-tool storage
 
-Coding-agent tools (Claude Code today; Codex/Oh My Pi/OpenCode/others
-are researched and named but not yet identified -- see the matrix in
-`docs/agent-storage.md`) keep session transcripts, caches, logs,
-checkpoints and configuration under their own home directory. Swamp
-identifies this separately from ordinary project storage, links
-sessions to the swamp project they belong to where evidence supports
-it, and offers a narrow, supported cleanup path.
+Coding-agent tools (Claude Code, Codex and its desktop app, Oh My Pi
+and OpenCode today; others are researched and named but not yet
+identified -- see the matrix in `docs/agent-storage.md`) keep session
+transcripts, caches, logs, checkpoints and configuration under their
+own home directory. Swamp identifies this separately from ordinary
+project storage, links sessions to the swamp project they belong to
+where evidence supports it, and offers a narrow, supported cleanup
+path.
 
 **Never read or repeat a session's actual content.** Swamp itself never
 puts prompt/response/attachment/credential text into its output; you
@@ -73,5 +74,8 @@ or "can't be deleted".
 ## Full reference
 
 `docs/agent-storage.md` (in the repo, not this skill) has the complete
-category table, project-linkage state table, the required 13-tool
-matrix with sources, and every documented gap.
+category table, project-linkage state table, the required 14-row tool
+matrix with sources, and every documented gap (Oh My Pi's shared-blob
+GC and OpenCode's snapshot/`storage/part` actions are both deliberately
+out of scope; Codex's `CODEX_SQLITE_HOME` and OpenCode's
+`OPENCODE_DATA_DIR` env var name are both flagged unconfirmed there).
