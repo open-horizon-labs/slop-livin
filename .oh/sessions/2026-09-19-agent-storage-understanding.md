@@ -61,3 +61,13 @@ Updated existing epic #90 and tasks #91–#100/#102 rather than adding duplicate
 Start shared contract #91, prioritize #92/#93/#94, then remaining named adapters. Inspection may progress on completed adapters; full completion of #100/#90 requires the agreed matrix, not just the first three. #101 is planned cleanup implementation, not authorization to execute cleanup now. #102 provides independent validation. Split oversized grouped-tool issues while retaining each adapter and acceptance coverage.
 
 Primary evidence: https://code.claude.com/docs/en/settings ; https://github.com/openai/codex ; https://opencode.ai/docs/troubleshooting/ ; https://github.com/can1357/oh-my-pi/blob/main/docs/session.md and docs/settings.md. Verify supported installed versions and source formats during implementation. No private data is included in issues/fixtures. No application code, dependencies, services or real storage changed during planning.
+
+## Reconciliation, 2026-09-21
+
+#103/#104 landed: `crates/mcp` is removed. Where the #100 table entry and
+elsewhere in this session say "CLI/TUI/MCP", read that as "CLI (interactive
+and `--json`), TUI, and the `skills/swamp/` agent skill" -- no MCP server to
+build or expose this epic's adapters through. Every domain requirement above
+(project linkage, direct/derived relationships, unresolved/moved/deleted
+references, no basename-inferred ownership, no double-counting, no
+history-rewrite on relink) is unchanged; only the transport changed.
