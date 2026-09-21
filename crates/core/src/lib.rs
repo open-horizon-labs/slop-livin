@@ -4,6 +4,7 @@
 //! authority and must re-observe every predicate before changing the filesystem.
 
 pub mod actions;
+pub mod activity;
 pub mod agent_json;
 pub mod agents;
 pub mod artifact;
@@ -17,8 +18,10 @@ pub mod coverage;
 pub mod docker;
 pub mod ecosystem;
 pub mod entities;
+pub mod evidence;
 pub mod execution;
 pub mod external;
+pub mod external_associations;
 pub mod extractor;
 pub mod filter;
 pub mod fs_events;
@@ -31,6 +34,8 @@ pub mod ledger;
 pub mod locations;
 pub mod measurement;
 pub mod occupancy;
+pub mod reclaimability;
+pub mod recovery;
 pub mod render;
 pub mod report;
 pub mod scan;
@@ -38,6 +43,7 @@ pub mod schedule;
 pub mod scope;
 pub mod signals;
 pub mod store;
+pub mod toolchain_declarations;
 pub mod tree;
 pub mod volume;
 pub mod walk;

@@ -2183,6 +2183,7 @@ mod tests {
                             containers: Vec::new(),
                             shared_with: Vec::new(),
                             dangling: false,
+                            evidence: Vec::new(),
                         },
                         ArtifactRow {
                             kind: ArtifactKind::Source,
@@ -2206,6 +2207,7 @@ mod tests {
                             containers: Vec::new(),
                             shared_with: Vec::new(),
                             dangling: false,
+                            evidence: Vec::new(),
                         },
                     ],
                     signals: vec![],

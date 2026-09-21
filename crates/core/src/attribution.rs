@@ -341,6 +341,7 @@ impl<'a> Ctx<'a> {
                         containers: Vec::new(),
                         shared_with: Vec::new(),
                         dangling: false,
+                        evidence: Vec::new(),
                     });
             }
             None => {
@@ -520,6 +521,7 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             });
     }
 

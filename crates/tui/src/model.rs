@@ -1999,6 +1999,7 @@ mod tests {
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            evidence: Vec::new(),
         }
     }
 

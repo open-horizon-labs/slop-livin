@@ -214,6 +214,11 @@ pub const ALLOWED_COMMANDS: &[(&str, &[&str])] = &[
         "defaults",
         &["read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation"],
     ),
+    // Current-use evidence (#55): a read-only device-state listing, never
+    // a boot/shutdown/erase command. Used by `crate::occupancy` to answer
+    // "is this simulator's data directory currently mounted by a booted
+    // instance", not by the detector registry itself.
+    ("xcrun", &["simctl", "list", "devices", "-j"]),
 ];
 
 /// Runs allow-listed commands for real, bounded by `timeout`. Refuses

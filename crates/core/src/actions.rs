@@ -1113,6 +1113,7 @@ fn unit_from_worktree(project: &ProjectRow, wt: &WorktreeRow) -> PlanUnit {
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     };
     let mut u = unit_from_row(project, wt, &pseudo);
     u.rel_path = ".".into();
@@ -1158,6 +1159,7 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     };
     unit_from_row(project, wt, &pseudo)
 }

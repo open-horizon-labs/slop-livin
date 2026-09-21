@@ -196,6 +196,7 @@ fn dummy_artifact() -> ArtifactRow {
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     }
 }
 
@@ -648,6 +649,7 @@ mod tests {
             ],
             shared_with: vec!["hiphi-authorizer:staging".to_string()],
             dangling: false,
+            evidence: Vec::new(),
         }
     }
 

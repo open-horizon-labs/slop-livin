@@ -1911,6 +1911,7 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             });
     }
 
@@ -4197,6 +4198,7 @@ mod tests {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 }],
                 signals: vec![],
                 branch: None,

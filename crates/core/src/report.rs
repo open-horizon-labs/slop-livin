@@ -236,6 +236,13 @@ pub struct ArtifactRow {
     pub shared_with: Vec<String>,
     #[serde(default)]
     pub dangling: bool,
+    /// Decision evidence (#53): activity, consumer, current-use, recovery
+    /// and reclaimability facts for this unit. Populated from the same
+    /// folded-walk stats and existing enrichment already gathered for
+    /// this row -- never a second per-file pass. Empty (and omitted from
+    /// JSON) for a row no evidence source has populated yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 /// One directory measurement within a worktree, including folded artifact
@@ -1342,6 +1349,7 @@ pub(crate) fn join_docker_facts(
                         containers: candidate.containers,
                         shared_with: candidate.shared_with,
                         dangling: candidate.dangling,
+                        evidence: Vec::new(),
                     });
             }
             JoinOutcome::Unowned { note } => {

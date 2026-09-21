@@ -659,6 +659,7 @@ fn attribute_parallel_inner(
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             });
     }
 
@@ -1077,6 +1078,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 });
         }
         None => {
@@ -1286,6 +1288,7 @@ pub fn resize_artifact_with_dirs_excluding(
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     });
     row.kind = kind;
     row.source = Source::new("filesystem.fsevents");

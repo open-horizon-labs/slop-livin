@@ -161,6 +161,7 @@ pub fn type_passes(f: &Filter, project: &swamp_core::report::ProjectRow) -> bool
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             };
             Filter {
                 predicates: vec![Predicate::Type(t.clone())],

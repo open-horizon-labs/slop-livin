@@ -227,6 +227,7 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     }
 }
 

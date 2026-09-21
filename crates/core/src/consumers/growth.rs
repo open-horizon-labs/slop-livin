@@ -215,6 +215,7 @@ fn add_nested_history_rows(
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            evidence: Vec::new(),
         });
         paths.push((unit.id.clone(), unit.path.clone()));
     }
