@@ -204,7 +204,9 @@ never offers a delete affordance the action layer would refuse anyway).
 ## Agent-tool storage
 
 Coding-agent tools (Claude Code, Codex, its desktop app, Oh My Pi,
-OpenCode, and named others as their adapters land) keep session
+OpenCode, Gemini CLI, Pi, Aider, GitHub Copilot CLI, Cursor, Windsurf,
+Cline, Roo Code, Continue -- every tool in the required matrix now has
+real identification code) keep session
 transcripts, caches, logs, checkpoints and
 configuration under their own home directory. `swamp` identifies that
 storage the same way it identifies external storage above -- the home
@@ -255,8 +257,10 @@ its real consequences (session-removal loss warnings, the linked
 project); `Enter` executes through the same background-worker path
 every other TUI deletion uses -- never blocking the event/render
 thread. A protected or unsupported row cannot be marked; the footer
-names the exact reason. Bulk marking (`Shift+A`) does not reach agent
-rows yet -- mark one at a time, or use the CLI commands above.
+names the exact reason. Bulk marking (`Shift+A`) reaches the Agents
+view too: it marks every actionable row on screen the same way,
+skipping protected/unsupported/active ones and naming the skip in the
+footer.
 
 ## Cleanup recommendations
 

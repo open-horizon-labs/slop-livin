@@ -671,6 +671,84 @@ fn agents_view_refusal_state_names_the_protection_reason() {
     }
 }
 
+/// Chunk D follow-up: Shift+A over the Agents view marks the one
+/// actionable row (a session, `SessionRemoval`) and leaves the protected
+/// config row alone, opening one confirm and naming the skip in the
+/// footer -- `App::mark_all_in_view`'s new agent-storage branch, reusing
+/// `mark_row`'s own per-row refusal rather than a generic "nothing here"
+/// or a silent, misleadingly-total selection.
+#[test]
+fn agents_view_mark_all_marks_actionable_and_skips_protected() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.set_agent_units(vec![
+            swamp_core::agents::AgentUnit {
+                tool_id: "claude-code".into(),
+                tool_name: "Claude Code".into(),
+                tool_home: PathBuf::from("/Users/dev/.claude"),
+                category: swamp_core::agents::AgentCategory::Sessions,
+                id: "fixture-session-1".into(),
+                relative_path: "projects/-Users-dev-src-mole/fixture-session.jsonl".into(),
+                path: PathBuf::from(
+                    "/Users/dev/.claude/projects/-Users-dev-src-mole/fixture-session.jsonl",
+                ),
+                members: Vec::new(),
+                bytes: 4_200_000,
+                hardlinked: true,
+                growth_bytes: Some(100_000),
+                regrowth_count: 0,
+                observed_at: 1_700_000_000,
+                mtime_max: 1_699_990_000,
+                protected: false,
+                protect_reason: None,
+                project_link: swamp_core::agents::ProjectLinkState::Linked {
+                    project_id: "fixture-project".into(),
+                    project_name: "mole".into(),
+                    project_path: PathBuf::from("/Users/dev/src/mole"),
+                    source: swamp_core::agents::LinkSource::Declared,
+                    worktree_kind: "main".into(),
+                },
+                action: swamp_core::agents::AgentActionCapability::SessionRemoval,
+                note: None,
+            },
+            swamp_core::agents::AgentUnit {
+                tool_id: "claude-code".into(),
+                tool_name: "Claude Code".into(),
+                tool_home: PathBuf::from("/Users/dev/.claude"),
+                category: swamp_core::agents::AgentCategory::ProtectedConfig,
+                id: "fixture-settings".into(),
+                relative_path: "settings.json".into(),
+                path: PathBuf::from("/Users/dev/.claude/settings.json"),
+                members: Vec::new(),
+                bytes: 4_096,
+                hardlinked: true,
+                growth_bytes: None,
+                regrowth_count: 0,
+                observed_at: 1_700_000_000,
+                mtime_max: 1_699_990_000,
+                protected: true,
+                protect_reason: Some("global settings".into()),
+                project_link: swamp_core::agents::ProjectLinkState::NotApplicable,
+                action: swamp_core::agents::AgentActionCapability::None,
+                note: None,
+            },
+        ]);
+        app.set_view(ViewKind::Agents);
+        app.mark_all_in_view();
+        assert_eq!(
+            app.marked.len(),
+            1,
+            "{:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        assert!(app.confirm_open);
+        check(
+            &format!("agents_mark_all_skips_protected_{w}x{h}"),
+            &capture(&app, w, h),
+        );
+    }
+}
+
 /// The header's coverage clause (`App::set_scope_note`, "Coverage line"
 /// in DESIGN.md): a missing configured root beside the one Present root
 /// this report actually walked shows up as one short clause, never

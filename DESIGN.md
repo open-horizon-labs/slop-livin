@@ -94,10 +94,16 @@ chunk; all three now ship:
   protected/unsupported row cannot be marked: `propose_agents`'s own
   refusal (protected category, no supported action yet, active session)
   becomes the footer text, never a generic "nothing to delete." Bulk
-  marking (`Shift+A`, `mark_all_in_view`) does not reach agent rows yet
-  -- it recognizes only a `row.kind`/`ArtifactKind` or a projects-view
-  `row.project`, neither of which an agent row sets; a named, deliberate
-  gap for a future worker, not a silent one.
+  marking (`Shift+A`, `mark_all_in_view`) reaches agent rows too: since
+  `model::agent_rows` sets `Row.unit` but never `Row.kind` (there is no
+  `ArtifactKind` for an agent-storage unit), `mark_all_in_view` has a
+  third branch alongside its `row.kind`/`ArtifactKind` and projects-view
+  `row.project` ones -- when a row has neither but does carry `unit`, it
+  reuses `mark_row`'s own per-row refusal (`propose_agents`'s protected/
+  unsupported/active reasons) rather than duplicating that logic, and
+  counts a skip instead of a hard stop. The footer names how many agent
+  rows were skipped and why whenever at least one row *was* marked,
+  never silently proceeding as if the skipped rows were not on screen.
 - **Scope-coverage header clause.** `App::set_scope_note` adds one
   short header clause when the TUI's own root is not simply present
   (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible: permission

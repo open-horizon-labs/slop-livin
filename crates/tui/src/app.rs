@@ -750,8 +750,15 @@ impl App {
     /// names how many and why.
     pub fn mark_all_in_view(&mut self) {
         let rows = self.rows();
-        let mut refused: Option<&'static str> = None;
+        let mut refused: Option<String> = None;
         let mut marked = 0usize;
+        // Agents view (#91/#100/#101): `model::agent_rows` sets `unit`
+        // on every row, protected/unsupported ones included, but never
+        // sets `kind` (there is no `ArtifactKind` for an agent-storage
+        // unit). Counted separately so the footer can say how many were
+        // skipped and why, rather than folding it into the single
+        // static per-kind refusal strings below.
+        let mut agent_skipped = 0usize;
         for row in rows {
             let Some(kind) = row.kind.clone() else {
                 // Projects view: each row stands for a whole project.
@@ -761,9 +768,23 @@ impl App {
                     // checkout under the root behind one Enter.
                     let n = self.mark_project(&project, false);
                     if n == 0 {
-                        refused = refused.or(Some("nothing reclaimable in this project"));
+                        refused = refused.or(Some("nothing reclaimable in this project".into()));
                     }
                     marked += n;
+                } else if row.unit.is_some() {
+                    // `mark_row` already knows how to refuse a
+                    // protected/unsupported/active agent-storage row
+                    // (via `actions::propose_agents`'s own refusal
+                    // text) -- reused here instead of duplicating that
+                    // logic, so Shift+A gives the same reason Backspace
+                    // would on the same row, not a generic one.
+                    let before = self.marked.len();
+                    self.mark_row(&row);
+                    if self.marked.len() > before {
+                        marked += 1;
+                    } else {
+                        agent_skipped += 1;
+                    }
                 }
                 continue;
             };
@@ -774,12 +795,29 @@ impl App {
                         marked += 1;
                     }
                 }
-                Err(why) => refused = refused.or(Some(why)),
+                Err(why) => refused = refused.or(Some(why.into())),
             }
         }
+        if agent_skipped > 0 {
+            refused = refused.or(Some(format!(
+                "{agent_skipped} agent-storage row{} protected, unsupported, or active; skipped",
+                if agent_skipped == 1 { " is" } else { "s are" }
+            )));
+        }
         if marked == 0 {
-            self.set_refusal(refused.unwrap_or("nothing in this view can be acted on"));
+            self.set_refusal(
+                refused
+                    .as_deref()
+                    .unwrap_or("nothing in this view can be acted on"),
+            );
             return;
+        }
+        // Some rows were left alone (agent-storage skip, or an empty
+        // project) even though at least one row *was* marked: say so,
+        // rather than silently proceeding to a confirm that looks like
+        // it covers everything the human saw on screen.
+        if let Some(msg) = refused {
+            self.set_refusal(&msg);
         }
         self.confirm_open = true;
     }
@@ -1843,7 +1881,7 @@ mod tests {
             ],
         };
         let scope = swamp_core::scope::resolve_effective_scope(&env, &cfg, &[], &registry, 1);
-        swamp_core::agents::discover_and_measure(&scope, None, false, 1_000, 30, 3600).unwrap()
+        swamp_core::agents::discover_and_measure(&scope, &[], None, false, 1_000, 30, 3600).unwrap()
     }
 
     #[test]
@@ -1906,6 +1944,48 @@ mod tests {
             app.refusal_active()
         );
         assert!(claude_home.path().join("settings.json").exists());
+    }
+
+    /// Shift+A over the Agents view (chunk D follow-up): the actionable
+    /// cache row is marked and the protected config row is left alone,
+    /// with one confirm opened for what *was* marked and a footer that
+    /// names the skip -- never a silent "nothing in this view can be
+    /// acted on" for a screen that plainly has one actionable row, and
+    /// never a false "everything selected" that quietly includes
+    /// `settings.json`.
+    #[test]
+    fn mark_all_in_agents_view_marks_the_cache_and_skips_the_protected_config() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        app.mark_all_in_view();
+
+        let cache_path = claude_home.path().join("shell-snapshots");
+        assert_eq!(
+            app.marked.len(),
+            1,
+            "only the actionable cache row, not the protected config: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        assert!(app.marked.contains_key(&cache_path.display().to_string()));
+        assert!(
+            !app.marked.contains_key(
+                &claude_home
+                    .path()
+                    .join("settings.json")
+                    .display()
+                    .to_string()
+            ),
+            "the protected unit must never be swept up by bulk marking"
+        );
+        assert!(app.confirm_open, "one confirm for what could be marked");
+        assert!(
+            app.refusal_active().is_some_and(|m| m.contains("skipped")),
+            "the footer must explain the skip, not stay silent: {:?}",
+            app.refusal_active()
+        );
     }
 
     fn fixture_report() -> Report {
