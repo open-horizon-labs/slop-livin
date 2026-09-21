@@ -1634,15 +1634,16 @@ pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped
 /// tool → category via the label text (a flat list, same shape as
 /// `unowned_rows`/`external_rows`; a real tool → category → unit tree is
-/// left to `render::render_view_agents`'s CLI drill-down and a future
-/// worker's interactive expansion). Read-only by construction --
-/// `unit: None` -- for the same reason as `external_rows`: this chunk's
-/// supported agent-storage actions
-/// (`actions::propose_agents`/`execute`) are reachable through
-/// `swamp propose-agents`/`swamp approve`/`swamp execute`, not yet
-/// through a TUI mark/confirm flow. Recorded as a named, deliberate gap
-/// (see `.oh/sessions/2026-09-21-agent-storage-claude-code.md`), not a
-/// silent omission.
+/// left to `render::render_view_agents`'s CLI drill-down). `unit` is set
+/// for **every** row, protected/unsupported ones included: `app::mark_row`
+/// hands the exact path to `actions::propose_agents` either way, and that
+/// call's own refusal (protected category, no supported action, active
+/// session, ...) becomes the footer text -- never a silent "nothing to
+/// delete on this row" for a unit the human can plainly see. Backspace's
+/// confirmation and Enter's execution reuse the ordinary
+/// `MarkedUnit`/background-worker path (`crate::actions::execute_plan_progress`),
+/// same as every other markable view; nothing here blocks on the
+/// event/render thread.
 pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
     let mut rows: Vec<Row> = units
         .iter()
@@ -1667,6 +1668,7 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
                 u.growth_bytes,
             );
             row.mtime_max = u.mtime_max;
+            row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
             row
         })
         .collect();

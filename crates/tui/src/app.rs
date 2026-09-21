@@ -1066,6 +1066,37 @@ impl App {
         } else {
             None
         };
+        // Agent-storage unit (#101's TUI wiring): every `agent_rows` row
+        // carries `unit: Some(...)` regardless of whether it is
+        // protected or has a supported action, so this branch is reached
+        // for a protected/unsupported row too -- `propose_agents`'s own
+        // refusal text (protected category, no supported action for this
+        // category yet, active session...) becomes the footer, never a
+        // generic "nothing to delete on this row" for a unit the human
+        // can plainly see in the Agents view.
+        let agent_unit_observed_at = self
+            .agent_units
+            .iter()
+            .find(|u| u.path == unit_path)
+            .map(|u| u.observed_at);
+        let agent_plan = if agent_unit_observed_at.is_some() {
+            match swamp_core::actions::propose_agents(
+                &self.agent_units,
+                std::slice::from_ref(&unit_path),
+                "human:tui",
+            ) {
+                Ok(plan) => {
+                    warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
+                    Some(plan)
+                }
+                Err(e) => {
+                    self.set_refusal(&e.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // The worktree this unit lives in: where `bin/` goes when keeping
         // executables. A worktree row is its own worktree.
         let worktree_path = self
@@ -1084,17 +1115,19 @@ impl App {
             });
         let selected_bytes = cargo_plan
             .as_ref()
+            .or(agent_plan.as_ref())
             .map(|p| p.planned_bytes())
             .unwrap_or(row.bytes);
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
                 cargo_plan,
+                agent_plan,
                 path: unit_path,
                 docker,
                 worktree_path,
                 bytes: selected_bytes,
-                observed_at: self.report.observed_at,
+                observed_at: agent_unit_observed_at.unwrap_or(self.report.observed_at),
                 worktree,
                 label,
                 warnings,
@@ -1668,6 +1701,7 @@ mod tests {
                 path.display().to_string(),
                 MarkedUnit {
                     cargo_plan: None,
+                    agent_plan: None,
                     path,
                     docker: None,
                     worktree_path: PathBuf::new(),
@@ -1724,6 +1758,7 @@ mod tests {
             path.display().to_string(),
             MarkedUnit {
                 cargo_plan: None,
+                agent_plan: None,
                 path: path.clone(),
                 docker: None,
                 worktree_path: tmp.path().into(),
@@ -1763,6 +1798,114 @@ mod tests {
                 .unwrap()
                 .contains("Worker stopped unexpectedly")
         );
+    }
+
+    /// A real (never fixture-literal) Claude Code home under a tempdir:
+    /// one actionable cache category (`shell-snapshots/`) and one
+    /// protected config file (`settings.json`), discovered through the
+    /// same `swamp_core::agents::discover_and_measure` path `swamp
+    /// report --view agents` and the real TUI startup use -- this test
+    /// exercises `App::mark_row`'s new agent-storage branch against real
+    /// identification output, not a hand-built `AgentUnit` literal.
+    fn fixture_agent_units(claude_home: &std::path::Path) -> Vec<swamp_core::agents::AgentUnit> {
+        std::fs::create_dir_all(claude_home.join("shell-snapshots")).unwrap();
+        std::fs::write(
+            claude_home.join("shell-snapshots").join("snap.sh"),
+            b"alias x=y",
+        )
+        .unwrap();
+        std::fs::write(claude_home.join("settings.json"), b"{}").unwrap();
+
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_home.display().to_string(),
+        );
+        let home_dummy = tempfile::tempdir().unwrap();
+        let env = swamp_core::locations::Environment::fixture(
+            home_dummy.path().to_path_buf(),
+            env_vars,
+            swamp_core::locations::Platform::MacOS,
+        );
+        let registry = swamp_core::locations::Registry::with_builtins();
+        let cfg = swamp_core::scope::ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: vec![
+                "cargo-home".into(),
+                "rustup".into(),
+                "homebrew".into(),
+                "codex".into(),
+                "codex-desktop".into(),
+                "oh-my-pi".into(),
+                "opencode".into(),
+            ],
+        };
+        let scope = swamp_core::scope::resolve_effective_scope(&env, &cfg, &[], &registry, 1);
+        swamp_core::agents::discover_and_measure(&scope, None, false, 1_000, 30, 3600).unwrap()
+    }
+
+    #[test]
+    fn agents_view_mark_row_builds_an_agent_plan_and_deletes_it_via_the_ordinary_worker_path() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        let cache_row = model::agent_rows(&app.agent_units)
+            .into_iter()
+            .find(|r| r.label.contains("shell-snapshots"))
+            .expect("cache row present");
+        app.mark_row(&cache_row);
+        let cache_path = claude_home.path().join("shell-snapshots");
+        let marked = app
+            .marked
+            .get(&cache_path.display().to_string())
+            .expect("cache unit marked");
+        assert!(marked.agent_plan.is_some(), "agent_plan must be built");
+        assert!(
+            cache_path.exists(),
+            "marking alone must not delete anything"
+        );
+
+        app.confirm_open = true;
+        app.start_delete(
+            claude_home.path().join("ledger.jsonl"),
+            claude_home.path().join("Trash"),
+        );
+        wait_operation(&mut app);
+        assert!(!cache_path.exists(), "marked cache dir must be trashed");
+        assert!(app.marked.is_empty());
+        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        // Untouched: the protected settings.json survives the same pass.
+        assert!(claude_home.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        let settings_row = model::agent_rows(&app.agent_units)
+            .into_iter()
+            .find(|r| r.label.contains("settings.json"))
+            .expect("settings row present");
+        app.mark_row(&settings_row);
+        assert!(
+            app.marked.is_empty(),
+            "a protected unit must never be marked"
+        );
+        assert!(
+            app.refusal_active()
+                .unwrap_or_default()
+                .contains("protected"),
+            "{:?}",
+            app.refusal_active()
+        );
+        assert!(claude_home.path().join("settings.json").exists());
     }
 
     fn fixture_report() -> Report {

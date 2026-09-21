@@ -18,6 +18,15 @@ use crate::model::human_bytes;
 #[derive(Debug, Clone)]
 pub struct MarkedUnit {
     pub cargo_plan: Option<swamp_core::actions::Plan>,
+    /// The agent-storage counterpart of `cargo_plan` (#101's Agents-view
+    /// TUI wiring): a plan `swamp_core::actions::propose_agents` already
+    /// built and refused-or-cleared at mark time. Kept as a separate
+    /// field, not folded into `cargo_plan`, because `execute_one`'s
+    /// cargo path bails when `keep_executables` is set -- a
+    /// build-artifact-only concern that must never refuse an unrelated
+    /// agent-storage removal just because the human also has "keep
+    /// executables" toggled on.
+    pub agent_plan: Option<swamp_core::actions::Plan>,
     pub path: PathBuf,
     /// Set for a Docker object: what removing it actually runs, and the
     /// fact that it never reaches Trash.
@@ -137,6 +146,56 @@ fn execute_one(
                 anyhow::bail!(
                     "{}",
                     outcome.cause.as_deref().unwrap_or("Cargo action refused")
+                );
+            }
+            Ok(Outcome {
+                unit_id: id_for(&unit.path.display().to_string()),
+                status: "completed".into(),
+                reason: None,
+                intended_bytes: unit.bytes,
+                observed_free_space_delta: result.freed_measured,
+            })
+        })();
+        return UnitResult {
+            path: unit.path.clone(),
+            outcome: result.map_err(|e| e.to_string()),
+        };
+    }
+    if let Some(plan) = &unit.agent_plan {
+        let result = (|| -> Result<Outcome> {
+            if !grant.created_outside_index
+                || grant.expires_at < now()
+                || !grant
+                    .scope
+                    .contains(&id_for(&unit.path.display().to_string()))
+                || _plan_unit.artifact_id != id_for(&unit.path.display().to_string())
+            {
+                anyhow::bail!("agent-storage selection not covered by current confirmation");
+            }
+            let store = ledger
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("ledger has no store directory"))?;
+            if swamp_core::actions::load_plan(store, &plan.id)
+                .is_ok_and(|p| p.status == swamp_core::actions::PlanStatus::Executed)
+            {
+                anyhow::bail!("agent-storage plan already executed");
+            }
+            swamp_core::actions::save_plan(store, plan)?;
+            swamp_core::actions::approve(store, &plan.id, actor)?;
+            let result =
+                swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
+            let outcome = result
+                .outcomes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{}", result.state))?;
+            if outcome.status != "completed" {
+                anyhow::bail!(
+                    "{}",
+                    outcome
+                        .cause
+                        .as_deref()
+                        .unwrap_or("agent-storage action refused")
                 );
             }
             Ok(Outcome {
@@ -395,7 +454,10 @@ pub fn execute_plan_progress(
     keep_executables: bool,
     mut progress: impl FnMut(usize, &Path, Option<bool>) -> bool,
 ) -> Vec<UnitResult> {
-    if units.iter().any(|u| u.cargo_plan.is_some()) {
+    if units
+        .iter()
+        .any(|u| u.cargo_plan.is_some() || u.agent_plan.is_some())
+    {
         for (i, a) in units.iter().enumerate() {
             for b in units.iter().skip(i + 1) {
                 if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
@@ -555,6 +617,7 @@ mod tests {
     fn unit(path: &str, bytes: u64, docker: Option<swamp_core::docker::Removal>) -> MarkedUnit {
         MarkedUnit {
             cargo_plan: None,
+            agent_plan: None,
             path: PathBuf::from(path),
             docker,
             worktree_path: PathBuf::new(),
@@ -689,6 +752,7 @@ mod tests {
 
         let unit = MarkedUnit {
             cargo_plan: None,
+            agent_plan: None,
             path: target.clone(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -719,6 +783,7 @@ mod tests {
     fn confirm_summary_names_units_and_states_their_warnings() {
         let clean = MarkedUnit {
             cargo_plan: None,
+            agent_plan: None,
             path: "/tmp/target".into(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -730,6 +795,7 @@ mod tests {
         };
         let risky = MarkedUnit {
             cargo_plan: None,
+            agent_plan: None,
             path: "/tmp/raw".into(),
             docker: None,
             worktree_path: PathBuf::new(),

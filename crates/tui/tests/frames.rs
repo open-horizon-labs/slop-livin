@@ -581,6 +581,96 @@ fn agents_view() {
     }
 }
 
+/// #101's TUI action wiring: Space/Backspace mark a supported agent unit
+/// (`App::mark_row`'s new agent-storage branch) and the confirm banner
+/// shows this unit's real consequences -- the session-removal loss
+/// warning and the linked project name, both sourced from
+/// `swamp_core::actions::propose_agents`'s own plan, not invented by the
+/// TUI layer. Protected/unsupported rows cannot reach this state at all
+/// (see `agents_view_refusal_state` below).
+#[test]
+fn agents_view_confirm_row_shows_session_removal_consequences() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.set_agent_units(vec![swamp_core::agents::AgentUnit {
+            tool_id: "claude-code".into(),
+            tool_name: "Claude Code".into(),
+            tool_home: PathBuf::from("/Users/dev/.claude"),
+            category: swamp_core::agents::AgentCategory::Sessions,
+            id: "fixture-session-1".into(),
+            relative_path: "projects/-Users-dev-src-mole/fixture-session.jsonl".into(),
+            path: PathBuf::from(
+                "/Users/dev/.claude/projects/-Users-dev-src-mole/fixture-session.jsonl",
+            ),
+            members: Vec::new(),
+            bytes: 4_200_000,
+            hardlinked: true,
+            growth_bytes: Some(100_000),
+            regrowth_count: 0,
+            observed_at: 1_700_000_000,
+            mtime_max: 1_699_990_000,
+            protected: false,
+            protect_reason: None,
+            project_link: swamp_core::agents::ProjectLinkState::Linked {
+                project_id: "fixture-project".into(),
+                project_name: "mole".into(),
+                project_path: PathBuf::from("/Users/dev/src/mole"),
+                source: swamp_core::agents::LinkSource::Declared,
+                worktree_kind: "main".into(),
+            },
+            action: swamp_core::agents::AgentActionCapability::SessionRemoval,
+            note: None,
+        }]);
+        app.set_view(ViewKind::Agents);
+        app.selected = 0;
+        app.mark_selected();
+        app.open_confirm();
+        check(
+            &format!("agents_confirm_session_removal_{w}x{h}"),
+            &capture(&app, w, h),
+        );
+    }
+}
+
+/// The mirror case: a protected/unsupported row's footer names the exact
+/// reason (`propose_agents`'s own refusal text), never a generic
+/// "nothing to delete on this row" -- see `model::agent_rows`'s doc
+/// comment on why `unit` is set even for a row that cannot be acted on.
+#[test]
+fn agents_view_refusal_state_names_the_protection_reason() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.set_agent_units(vec![swamp_core::agents::AgentUnit {
+            tool_id: "claude-code".into(),
+            tool_name: "Claude Code".into(),
+            tool_home: PathBuf::from("/Users/dev/.claude"),
+            category: swamp_core::agents::AgentCategory::ProtectedConfig,
+            id: "fixture-settings".into(),
+            relative_path: "settings.json".into(),
+            path: PathBuf::from("/Users/dev/.claude/settings.json"),
+            members: Vec::new(),
+            bytes: 4_096,
+            hardlinked: true,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1_700_000_000,
+            mtime_max: 1_699_990_000,
+            protected: true,
+            protect_reason: Some("global settings".into()),
+            project_link: swamp_core::agents::ProjectLinkState::NotApplicable,
+            action: swamp_core::agents::AgentActionCapability::None,
+            note: None,
+        }]);
+        app.set_view(ViewKind::Agents);
+        app.selected = 0;
+        app.mark_selected();
+        check(
+            &format!("agents_refusal_protected_{w}x{h}"),
+            &capture(&app, w, h),
+        );
+    }
+}
+
 /// The header's coverage clause (`App::set_scope_note`, "Coverage line"
 /// in DESIGN.md): a missing configured root beside the one Present root
 /// this report actually walked shows up as one short clause, never
@@ -901,6 +991,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
 
     let unit = |path: &std::path::Path| MarkedUnit {
         cargo_plan: None,
+        agent_plan: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),
