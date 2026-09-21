@@ -796,6 +796,7 @@ fn cargo_tree_children(
         }
     }
     cargo_children_from_index(
+        report,
         &by_parent,
         parent,
         depth,
@@ -806,6 +807,7 @@ fn cargo_tree_children(
 }
 
 fn cargo_children_from_index(
+    report: &Report,
     by_parent: &BTreeMap<&std::path::Path, Vec<&swamp_core::artifact::NestedArtifact>>,
     parent: &std::path::Path,
     depth: usize,
@@ -858,11 +860,22 @@ fn cargo_children_from_index(
         row.signals = vec![guidance.recommendation, guidance.consequence.into()];
         row.allocated = true;
         let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
+        let advice = match unit.role {
+            swamp_core::artifact::ArtifactRole::Incremental => "Start here: slower next build",
+            swamp_core::artifact::ArtifactRole::Dependency
+            | swamp_core::artifact::ArtifactRole::TestExecutable
+            | swamp_core::artifact::ArtifactRole::Example => "Review: rebuild before rerunning",
+            swamp_core::artifact::ArtifactRole::BuildScriptOutput => {
+                "Lower priority: reruns scripts"
+            }
+            swamp_core::artifact::ArtifactRole::Profile => "Review supported groups only",
+            _ => "Expand to choose cleanup groups",
+        };
         row.cleanup_summary = Some(if unit.bytes == 0 {
             "Empty".into()
         } else if swamp_core::cargo_cleanup::candidate(unit) {
             format!(
-                "Candidate · modified {}",
+                "{advice} · modified {}",
                 age_label(swamp_core::cargo_cleanup::modified_age_secs(
                     unit,
                     observed_at
@@ -871,7 +884,7 @@ fn cargo_children_from_index(
         } else if candidates > 0 {
             row.signals.push(format!("{candidates} reviewable groups · {} allocated · oldest modification {}. Expand to select groups; not guaranteed freed space.", human_bytes(bytes), age_label(oldest)));
             format!(
-                "{candidates} {} · {} · {}",
+                "{advice} · {candidates} {} · {} · oldest {}",
                 if candidates == 1 {
                     "candidate"
                 } else {
@@ -886,14 +899,14 @@ fn cargo_children_from_index(
                 "Compiled output: review manually; selective removal not supported here".into(),
             );
             format!(
-                "Manual · modified {}",
+                "Inspect only: removes built output · modified {}",
                 age_label(swamp_core::cargo_cleanup::modified_age_secs(
                     unit,
                     observed_at
                 ))
             )
         } else {
-            "No selectable groups".into()
+            "Selective cleanup unsupported".into()
         });
         row.mtime_max = unit.mtime_max;
         if swamp_core::cargo_cleanup::candidate(unit) {
@@ -902,7 +915,46 @@ fn cargo_children_from_index(
         }
         rows.push(row);
         if has_children && !closed {
+            let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+            if unit.role == swamp_core::artifact::ArtifactRole::Profile {
+                rows.extend(cleanup_group_rows(
+                    report,
+                    &unit.path,
+                    depth + 1,
+                    &child_prefix,
+                    collapsed,
+                ));
+                let layout_key = format!("layout:{}", unit.path.display());
+                let mut layout =
+                    Row::leaf(depth + 1, "Inspect directories".into(), unit.bytes, None);
+                layout.rail = format!(
+                    "{child_prefix}└─ {}",
+                    if collapsed.contains(&layout_key) {
+                        "▸ "
+                    } else {
+                        "▾ "
+                    }
+                );
+                layout.expandable = true;
+                layout.expansion_key = Some(layout_key.clone());
+                layout.allocated = true;
+                layout.cleanup_summary = Some("Same bytes by path; not extra storage".into());
+                rows.push(layout);
+                if !collapsed.contains(&layout_key) {
+                    rows.extend(cargo_children_from_index(
+                        report,
+                        by_parent,
+                        &unit.path,
+                        depth + 2,
+                        &format!("{child_prefix}   "),
+                        collapsed,
+                        observed_at,
+                    ));
+                }
+                continue;
+            }
             rows.extend(cargo_children_from_index(
+                report,
                 by_parent,
                 &unit.path,
                 depth + 1,
@@ -913,6 +965,220 @@ fn cargo_children_from_index(
         }
     }
     rows
+}
+
+/// Virtual selections resolve to evidenced, disjoint action units, never a
+/// containing directory. Keys are scoped to a single profile and are not stored.
+pub(crate) fn cleanup_members<'a>(
+    report: &'a Report,
+    key: &str,
+) -> Vec<&'a swamp_core::artifact::NestedArtifact> {
+    use swamp_core::artifact::ArtifactRole as R;
+    let selection = key
+        .strip_prefix("cleanup:")
+        .and_then(|k| k.split_once(':'))
+        .or_else(|| {
+            key.strip_prefix("cargo:")
+                .filter(|path| {
+                    report.nested_artifacts.iter().any(|u| {
+                        u.present && u.role == R::Profile && u.path == std::path::Path::new(path)
+                    })
+                })
+                .map(|path| ("profile", path))
+        });
+    let Some((kind, profile)) = selection else {
+        return Vec::new();
+    };
+    let profile = std::path::Path::new(profile);
+    let mut members: Vec<_> = report
+        .nested_artifacts
+        .iter()
+        .filter(|u| {
+            u.present
+                && u.bytes > 0
+                && u.path.starts_with(profile)
+                && swamp_core::cargo_cleanup::candidate(u)
+                && match kind {
+                    "profile" => true,
+                    "cache" => u.role == R::Incremental,
+                    "runnable" => matches!(u.role, R::TestExecutable | R::Example),
+                    "tests" => u.role == R::TestExecutable,
+                    "examples" => u.role == R::Example,
+                    "scripts" => u.role == R::BuildScriptOutput,
+                    _ => false,
+                }
+        })
+        .collect();
+    members.sort_by(|a, b| a.path.cmp(&b.path));
+    members.dedup_by(|a, b| a.path == b.path);
+    let paths: std::collections::HashSet<_> = members
+        .iter()
+        .filter(|u| u.is_dir)
+        .map(|u| u.path.clone())
+        .collect();
+    members.retain(|u| !u.path.ancestors().skip(1).any(|p| paths.contains(p)));
+    members.sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, report.observed_at));
+    members
+}
+
+pub(crate) fn is_cleanup_selection(report: &Report, key: &str) -> bool {
+    key.starts_with("cleanup:")
+        || key.strip_prefix("cargo:").is_some_and(|path| {
+            report.nested_artifacts.iter().any(|u| {
+                u.present
+                    && u.role == swamp_core::artifact::ArtifactRole::Profile
+                    && u.path == std::path::Path::new(path)
+            })
+        })
+}
+
+fn cleanup_group_rows(
+    report: &Report,
+    profile: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (kind, label, effect) in [
+        ("cache", "Compiler caches", "Start here: slower next build"),
+        (
+            "runnable",
+            "Compiled tests & examples",
+            "Rebuild before rerunning",
+        ),
+        (
+            "scripts",
+            "Build-script output",
+            "Reruns scripts; tools may be needed",
+        ),
+    ] {
+        append_cleanup_group(
+            report, profile, kind, label, effect, depth, prefix, false, collapsed, &mut rows,
+        );
+    }
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cleanup_group(
+    report: &Report,
+    profile: &std::path::Path,
+    kind: &str,
+    label: &str,
+    effect: &str,
+    depth: usize,
+    prefix: &str,
+    last: bool,
+    collapsed: &std::collections::HashSet<String>,
+    rows: &mut Vec<Row>,
+) {
+    let key = format!("cleanup:{kind}:{}", profile.display());
+    let members = cleanup_members(report, &key);
+    if members.is_empty() {
+        return;
+    }
+    let bytes = members.iter().map(|u| u.bytes).sum();
+    let oldest = members
+        .iter()
+        .filter_map(|u| swamp_core::cargo_cleanup::modified_age_secs(u, report.observed_at))
+        .max();
+    let mut row = Row::leaf(depth, label.into(), bytes, None);
+    row.rail = format!(
+        "{prefix}{}{}",
+        if last { "└─ " } else { "├─ " },
+        if collapsed.contains(&key) {
+            "▸ "
+        } else {
+            "▾ "
+        }
+    );
+    row.expandable = true;
+    row.expansion_key = Some(key.clone());
+    row.allocated = true;
+    row.cleanup_summary = Some(format!(
+        "{effect} · {} groups · oldest {}",
+        members.len(),
+        age_label(oldest)
+    ));
+    row.signals = vec![
+        effect.into(),
+        format!(
+            "Space marks {} exact groups for review; → inspects members. Source and unrelated dependencies are not selected. Allocated size is not guaranteed freed space.",
+            members.len()
+        ),
+    ];
+    rows.push(row);
+    if collapsed.contains(&key) {
+        return;
+    }
+    let prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+    if kind == "runnable" {
+        let has_examples =
+            !cleanup_members(report, &format!("cleanup:examples:{}", profile.display())).is_empty();
+        append_cleanup_group(
+            report,
+            profile,
+            "tests",
+            "Tests",
+            effect,
+            depth + 1,
+            &prefix,
+            !has_examples,
+            collapsed,
+            rows,
+        );
+        append_cleanup_group(
+            report,
+            profile,
+            "examples",
+            "Examples",
+            effect,
+            depth + 1,
+            &prefix,
+            true,
+            collapsed,
+            rows,
+        );
+    } else {
+        for (i, u) in members.iter().enumerate() {
+            let mut row = Row::leaf(
+                depth + 1,
+                u.path
+                    .strip_prefix(profile)
+                    .unwrap_or(&u.path)
+                    .display()
+                    .to_string(),
+                u.bytes,
+                u.growth_bytes,
+            );
+            row.rail = format!(
+                "{prefix}{}",
+                if i + 1 == members.len() {
+                    "└─ "
+                } else {
+                    "├─ "
+                }
+            );
+            row.unit = Some(UnitId::for_artifact(&u.path));
+            row.kind = Some(ArtifactKind::BuildOutput);
+            row.allocated = true;
+            row.mtime_max = u.mtime_max;
+            row.cleanup_summary = Some(format!(
+                "{effect} · modified {}",
+                age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                    u,
+                    report.observed_at
+                ))
+            ));
+            row.signals = vec![
+                swamp_core::cargo_cleanup::guidance_at(u, report.observed_at)
+                    .consequence
+                    .into(),
+            ];
+            rows.push(row);
+        }
+    }
 }
 
 pub(crate) fn age_label(age: Option<u64>) -> String {

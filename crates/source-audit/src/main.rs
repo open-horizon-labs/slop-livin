@@ -5,6 +5,7 @@
 
 mod ast;
 mod audits;
+mod tui_nonblocking;
 
 use std::path::Path;
 

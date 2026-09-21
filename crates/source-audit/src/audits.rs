@@ -10,6 +10,10 @@ use std::path::Path;
 pub type Audit = fn(&Path) -> Result<(), String>;
 
 pub const AUDITS: &[(&str, Audit)] = &[
+    (
+        "tui_actions_off_event_thread",
+        crate::tui_nonblocking::audit,
+    ),
     ("one_byte_formatter", one_byte_formatter),
     ("legacy_invariants", legacy_invariants),
     ("fsevents_before_full_walk", fsevents_before_full_walk),

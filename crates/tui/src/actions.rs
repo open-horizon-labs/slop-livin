@@ -371,6 +371,30 @@ pub fn execute_plan(
     actor: &str,
     keep_executables: bool,
 ) -> Vec<UnitResult> {
+    execute_plan_progress(
+        units,
+        plan,
+        grant,
+        ledger,
+        trash_root,
+        actor,
+        keep_executables,
+        |_, _, _| true,
+    )
+}
+
+/// Returning false stops before the next group, never during an in-flight move.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_plan_progress(
+    units: &[MarkedUnit],
+    plan: &swamp_core::grants::Plan,
+    grant: &Grant,
+    ledger: &Ledger,
+    trash_root: &Path,
+    actor: &str,
+    keep_executables: bool,
+    mut progress: impl FnMut(usize, &Path, Option<bool>) -> bool,
+) -> Vec<UnitResult> {
     if units.iter().any(|u| u.cargo_plan.is_some()) {
         for (i, a) in units.iter().enumerate() {
             for b in units.iter().skip(i + 1) {
@@ -388,11 +412,19 @@ pub fn execute_plan(
             }
         }
     }
-    units
-        .iter()
-        .zip(plan.units.iter())
-        .map(|(u, pu)| execute_one(u, pu, grant, ledger, trash_root, actor, keep_executables))
-        .collect()
+    let mut results = Vec::new();
+    for (i, (u, pu)) in units.iter().zip(plan.units.iter()).enumerate() {
+        if !progress(i, &u.path, None) {
+            break;
+        }
+        let result = execute_one(u, pu, grant, ledger, trash_root, actor, keep_executables);
+        let keep_going = progress(i + 1, &u.path, Some(result.outcome.is_ok()));
+        results.push(result);
+        if !keep_going {
+            break;
+        }
+    }
+    results
 }
 
 /// The default Trash root: `~/.Trash` on macOS. Overridable via
@@ -714,5 +746,40 @@ mod tests {
         );
         let s = confirm_summary(&[clean, risky], true);
         assert!(s.ends_with("· keep executables → bin/ (k)"), "{s}");
+    }
+
+    #[test]
+    fn progress_cancellation_stops_between_units_and_keeps_ledger() {
+        let tmp = tempdir().unwrap();
+        let units: Vec<_> = (0..3)
+            .map(|i| {
+                let path = tmp.path().join(format!("cache-{i}"));
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("data"), b"fixture").unwrap();
+                unit(path.to_str().unwrap(), 7, None)
+            })
+            .collect();
+        let (plan, grant) = authorize(&units, "human");
+        let ledger = Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
+        let mut events = Vec::new();
+        let results = execute_plan_progress(
+            &units,
+            &plan,
+            &grant,
+            &ledger,
+            &tmp.path().join("Trash"),
+            "human",
+            false,
+            |done, _, outcome| {
+                events.push((done, outcome));
+                outcome.is_none()
+            },
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
+        assert!(!units[0].path.exists());
+        assert!(units[1].path.exists() && units[2].path.exists());
+        assert_eq!(events, vec![(0, None), (1, Some(true))]);
+        assert_eq!(ledger.all().unwrap().len(), 1);
     }
 }

@@ -39,8 +39,35 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
     handle_key_mod(app, code, false)
 }
 
+pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    if key.code == KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        if app.operation.is_some() {
+            app.cancel_operation();
+        } else {
+            app.quit = true;
+        }
+        return;
+    }
+    handle_key_mod(
+        app,
+        key.code,
+        key.modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT),
+    );
+}
+
 /// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
 pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
+    if app.operation.is_some() {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.cancel_operation();
+        }
+        return;
+    }
     if let Some(p) = app.picker.as_mut() {
         match code {
             KeyCode::Up => p.up(),
@@ -95,11 +122,11 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 app.set_view(app::ViewKind::Projects);
             }
         }
-        KeyCode::Char(' ') => app.mark_selected(),
+        KeyCode::Char(' ') => app.review_in_background(false, false),
         // Shift-A, not `a`: `a` sorts by age, and a key that means two
         // things depending on state is a key nobody trusts.
-        KeyCode::Char('A') => app.mark_all_in_view(),
-        KeyCode::Backspace => app.delete_here(),
+        KeyCode::Char('A') => app.review_in_background(true, true),
+        KeyCode::Backspace => app.review_in_background(false, true),
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
@@ -219,6 +246,15 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let result = event_loop(&mut terminal, &mut app);
 
+    // Terminal failure must not abandon an in-flight filesystem move.
+    if app.operation.is_some() {
+        app.cancel_operation();
+        while app.operation.is_some() {
+            app.poll_operation();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -229,7 +265,9 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
-        if let Some(rx) = &app.pending
+        app.poll_operation();
+        if app.operation.is_none()
+            && let Some(rx) = &app.pending
             && let Ok(res) = rx.try_recv()
         {
             app.pending = None;
@@ -243,7 +281,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             }
         }
         app.drain_watch();
-        if app.live_observe_due() {
+        if app.operation.is_none() && app.live_observe_due() {
             app.observe_live();
         }
         if let Ok(sz) = terminal.size() {
@@ -257,12 +295,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key_mod(
-                app,
-                key.code,
-                key.modifiers
-                    .contains(crossterm::event::KeyModifiers::SHIFT),
-            );
+            handle_terminal_key(app, key);
         }
     }
 }
@@ -325,6 +358,37 @@ mod tests {
         assert!(!app.editing_filter);
         assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
         assert!(app.filter_text.ends_with("idle > 48h"));
+    }
+
+    #[test]
+    fn ctrl_c_cancels_busy_operation_but_exits_when_idle() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let mut app = App::new(empty_report(), "/root".into());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.operation = Some(crate::app::Operation {
+            label: "Deleting",
+            completed: 1,
+            total: 3,
+            succeeded: 1,
+            failed: 0,
+            current: "/tmp/fixture".into(),
+            started: std::time::Instant::now(),
+            cancel: cancel.clone(),
+        });
+        handle_terminal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.operation.is_some());
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!app.quit, "must wait for current group's durable outcome");
+        app.operation = None;
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.quit);
     }
 
     #[test]

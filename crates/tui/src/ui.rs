@@ -187,7 +187,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1), // header
             Constraint::Length(1), // filter line
             Constraint::Min(1),    // body
-            Constraint::Length(if app.confirm_open { 1 } else { 0 }),
+            Constraint::Length(if app.operation.is_some() {
+                3
+            } else if app.confirm_open {
+                1
+            } else {
+                0
+            }),
             Constraint::Length(1), // footer
         ])
         .split(size);
@@ -197,7 +203,60 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_filter_line(frame, app, chunks[1]);
     draw_body(frame, app, chunks[2]);
 
-    if app.confirm_open {
+    if let Some(op) = &app.operation {
+        let cancelling = op.cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let ratio = if op.total == 0 {
+            0.0
+        } else {
+            (op.completed as f64 / op.total as f64).min(1.0)
+        };
+        let label = if cancelling {
+            "Cancelling after current group"
+        } else {
+            op.label
+        };
+        let count = if op.total == 0 {
+            format!("{} checked", op.completed)
+        } else {
+            format!("{}/{} groups", op.completed, op.total)
+        };
+        let area = chunks[3];
+        frame.render_widget(
+            ratatui::widgets::Gauge::default()
+                .ratio(ratio)
+                .label(format!(
+                    "{label} · {count} · {}s",
+                    op.started.elapsed().as_secs()
+                ))
+                .gauge_style(Style::default().fg(Color::Yellow)),
+            Rect { height: 1, ..area },
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} successful · {} refused · {}",
+                op.succeeded,
+                op.failed,
+                op.current.display()
+            )),
+            Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1).min(1),
+                ..area
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(if op.label == "Reviewing" {
+                "Review only; no files are changed. Cancellation preserves previous marks."
+            } else {
+                "Filesystem cleanup moves to Trash; allocated bytes are not freed space."
+            }),
+            Rect {
+                y: area.y + 2,
+                height: area.height.saturating_sub(2).min(1),
+                ..area
+            },
+        );
+    } else if app.confirm_open {
         frame.render_widget(
             Paragraph::new(app.confirm_summary()).style(Style::default().fg(Color::Yellow)),
             chunks[3],
@@ -205,7 +264,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     // The footer is the key legend for the state you are actually in.
-    let footer_text = if let Some(msg) = app.refusal_active() {
+    let footer_text = if let Some(op) = &app.operation {
+        if op.label == "Reviewing" {
+            "Esc / Ctrl-C: cancel review after current check".into()
+        } else {
+            "Esc / Ctrl-C: stop after current group · completed moves remain in Trash".into()
+        }
+    } else if let Some(msg) = app.refusal_active() {
         msg.to_string()
     } else if app.confirm_open {
         "Enter yes · Esc no".to_string()
@@ -426,7 +491,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         pad_display(if half > 0 { "Change bar" } else { "" }, bar_width),
         pad_display(
             if cleanup_view {
-                "Candidates / oldest modified"
+                "Cleanup advice / consequence"
             } else {
                 "Cleanup / facts"
             },
@@ -443,10 +508,21 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     for (i, row) in rows.iter().enumerate() {
-        let marked = row
+        let mut marked = row
             .unit
             .as_ref()
             .is_some_and(|u| app.marked.contains_key(&u.0));
+        if let Some(key) = row
+            .expansion_key
+            .as_deref()
+            .filter(|k| crate::model::is_cleanup_selection(&app.report, k))
+        {
+            let members = crate::model::cleanup_members(&app.report, key);
+            marked = !members.is_empty()
+                && members
+                    .iter()
+                    .all(|u| app.marked.contains_key(&u.path.display().to_string()));
+        }
         let mark_prefix = if marked { "✗ " } else { "" };
         let track = match row.track {
             Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
@@ -495,7 +571,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
         let mut signals_text = if let Some(summary) = &row.cleanup_summary {
-            summary.clone()
+            // Drop secondary statistics before clipping the decision itself.
+            let mut parts: Vec<_> = summary.split(" · ").collect();
+            while parts.len() > 1 && parts.join(" · ").chars().count() > signals_width {
+                parts.pop();
+            }
+            parts.join(" · ")
         } else if row.signals.is_empty() {
             String::new()
         } else if narrow {
@@ -585,24 +666,34 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // Use blank space to preview concrete candidates without expanding the category.
     let spare = table_height.saturating_sub(shown_count + 1);
     if spare >= 4
-        && let Some(path) = rows
+        && let Some(key) = rows
             .get(app.selected)
             .and_then(|r| r.expansion_key.as_deref())
-            .and_then(|key| key.strip_prefix("cargo:"))
+            .filter(|key| key.starts_with("cargo:") || key.starts_with("cleanup:"))
     {
+        let path = key.strip_prefix("cargo:").unwrap_or_else(|| {
+            key.strip_prefix("cleanup:")
+                .unwrap()
+                .split_once(':')
+                .unwrap()
+                .1
+        });
         let parent = std::path::Path::new(path);
-        let mut candidates: Vec<_> = app
-            .report
-            .nested_artifacts
-            .iter()
-            .filter(|u| {
-                u.present
-                    && u.bytes > 0
-                    && u.path != parent
-                    && u.path.starts_with(parent)
-                    && swamp_core::cargo_cleanup::candidate(u)
-            })
-            .collect();
+        let mut candidates: Vec<_> = if key.starts_with("cleanup:") {
+            crate::model::cleanup_members(&app.report, key)
+        } else {
+            app.report
+                .nested_artifacts
+                .iter()
+                .filter(|u| {
+                    u.present
+                        && u.bytes > 0
+                        && u.path != parent
+                        && u.path.starts_with(parent)
+                        && swamp_core::cargo_cleanup::candidate(u)
+                })
+                .collect()
+        };
         candidates
             .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, app.report.observed_at));
         if !candidates.is_empty() {

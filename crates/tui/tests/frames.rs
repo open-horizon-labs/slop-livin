@@ -24,6 +24,7 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     let target = root.join("target");
     std::fs::create_dir_all(target.join("debug/incremental/crate-a")).unwrap();
     std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    std::fs::write(target.join("debug/.cargo-lock"), b"").unwrap();
     std::fs::write(target.join("debug/incremental/crate-a/state"), b"data").unwrap();
     for index in 0..40 {
         std::fs::create_dir_all(target.join(format!("debug/incremental/group-{index:02}")))
@@ -56,6 +57,82 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     app.clear_filter();
     app.drill_into_selected();
     assert_eq!(app.view, ViewKind::Tree);
+    let groups = app.rows();
+    let cache = groups
+        .iter()
+        .find(|r| r.label == "Compiler caches")
+        .unwrap()
+        .clone();
+    assert_eq!(cache.bytes, 4096);
+    assert!(
+        cache.unit.is_none(),
+        "virtual group must never select a directory"
+    );
+    app.mark_row(&cache);
+    assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+    assert!(
+        app.marked.contains_key(
+            &target
+                .join("debug/incremental/crate-a")
+                .display()
+                .to_string()
+        )
+    );
+    app.mark_row(&cache);
+    assert!(
+        app.marked.is_empty(),
+        "group toggle clears its exact members"
+    );
+    // Exercise the real asynchronous keyboard route, not only mark_row.
+    for label in ["Compiler caches", "profile debug"] {
+        app.selected = app.rows().iter().position(|r| r.label == label).unwrap();
+        swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Backspace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.operation.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_operation();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.confirm_open, "{label}: {:?}", app.refusal_active());
+        assert_eq!(app.marked.len(), 1);
+        assert!(
+            app.marked.contains_key(
+                &target
+                    .join("debug/incremental/crate-a")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            !app.marked
+                .contains_key(&target.join("debug").display().to_string())
+        );
+        app.cancel_confirm();
+        app.marked.clear();
+    }
+    let mut missing = app
+        .report
+        .nested_artifacts
+        .iter()
+        .find(|u| u.path.ends_with("crate-a"))
+        .unwrap()
+        .clone();
+    missing.path = target.join("debug/incremental/zzz-missing");
+    missing.mtime_max = 0;
+    app.report.nested_artifacts.push(missing);
+    app.mark_row(&cache);
+    assert!(
+        app.marked.is_empty(),
+        "failed group must roll back earlier successful member checks"
+    );
+    assert!(app.refusal_active().is_some());
+    app.report.nested_artifacts.pop();
+    app.refusal = None;
+    app.selected = groups
+        .iter()
+        .position(|r| r.label == "Inspect directories")
+        .unwrap();
+    app.enter_row();
     let rows = app.rows();
     assert!(rows.iter().any(|r| r.label == "profile debug"));
     let incremental = rows.iter().position(|r| r.label == "incremental").unwrap();
@@ -65,7 +142,7 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             .cleanup_summary
             .as_ref()
             .unwrap()
-            .starts_with("1 candidate ·"),
+            .contains("1 candidate ·"),
         "empty and unsupported groups are not cleanup opportunities"
     );
     assert!(
@@ -73,6 +150,16 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         "category must not become an exact cleanup selection"
     );
     assert!(!rows.iter().any(|r| r.label.contains("crate-a")));
+    // Advice must be visible while a different row is selected, not just in
+    // selected-row details or the spare-space preview.
+    for (width, height) in [(80, 24), (120, 30), (200, 60)] {
+        let rendered = capture(&app, width, height);
+        assert!(
+            rendered.contains("Start here: slower next build"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("No selectable groups"));
+    }
     app.selected = incremental;
     for (width, height) in [(80, 24), (120, 30), (200, 60)] {
         let rendered = capture(&app, width, height);
@@ -279,11 +366,14 @@ fn cargo_cleanup_guidance_frames() {
         ("debug/incremental", "Incremental", true),
         ("debug/incremental/crate-a", "Incremental", true),
         ("debug/deps/test-a", "TestExecutable", false),
+        ("debug/examples", "Example", true),
+        ("debug/examples/demo", "Example", false),
+        ("debug/deps/libkeep.rlib", "Dependency", false),
     ] {
         report.nested_artifacts.push(serde_json::from_value(serde_json::json!({
             "id":rel,"path":format!("{root}/{rel}"),"relative_path":rel,
             "parent_id":null,"container_id":"target","role":role,"membership":"Unknown",
-            "is_dir":is_dir,"logical_bytes":0,"bytes":if role == "Profile" {128000000} else {64000000},"physical_bytes":0,
+            "is_dir":is_dir,"logical_bytes":0,"bytes":if role == "Profile" {256000000} else if role == "Dependency" && is_dir {128000000} else {64000000},"physical_bytes":0,
             "mtime_max":report.observed_at - 21 * 86400,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
             "action_group":null,"present":true
         })).unwrap());
@@ -298,14 +388,64 @@ fn cargo_cleanup_guidance_frames() {
         check(&format!("cargo_cleanup_{w}x{h}"), &frame);
         app.selected_project = Some("mole".into());
         app.set_view(ViewKind::Tree);
+        for kind in ["cache", "runnable", "tests", "examples", "scripts"] {
+            app.collapsed.insert(format!("cleanup:{kind}:{root}/debug"));
+        }
+        app.collapsed.insert(format!("layout:{root}/debug"));
         app.collapsed
             .insert(format!("cargo:{root}/debug/incremental"));
         app.selected = app
             .rows()
             .iter()
-            .position(|r| r.label == "incremental")
+            .position(|r| r.label == "Compiled tests & examples")
             .unwrap();
+        let group = app.rows()[app.selected].clone();
+        assert_eq!(
+            group.bytes, 128000000,
+            "only tests and examples, not dependencies"
+        );
+        assert!(group.unit.is_none());
         check(&format!("cargo_tree_{w}x{h}"), &capture(&app, w, h));
+        app.enter_row();
+        assert!(app.rows().iter().any(|r| r.label == "Tests"));
+        assert!(app.rows().iter().any(|r| r.label == "Examples"));
+        assert!(!app.rows().iter().any(|r| r.label.contains("libkeep")));
+        // This synthetic report has no real files: failed exact-member checks
+        // must not turn the virtual group into a broad-directory fallback.
+        app.mark_row(&group);
+        assert!(app.marked.is_empty());
+        assert!(app.refusal_active().is_some());
+    }
+}
+
+#[test]
+fn deleting_progress_and_cancellation_frames() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.operation = Some(swamp_tui::app::Operation {
+        label: "Deleting",
+        completed: 12,
+        total: 617,
+        succeeded: 11,
+        failed: 1,
+        current: "/Users/dev/src/mole/target/debug/incremental/crate-a".into(),
+        started: std::time::Instant::now(),
+        cancel: cancel.clone(),
+    });
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Deleting · 12/617 groups"), "{frame}");
+        assert!(frame.contains("11 successful · 1 refused"));
+        assert!(frame.contains("Ctrl-C"));
+        check(&format!("deleting_{w}x{h}"), &frame);
+        cancel.store(true, Ordering::SeqCst);
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Cancelling after current group"));
+        cancel.store(false, Ordering::SeqCst);
     }
 }
 
@@ -509,6 +649,12 @@ fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
     // The fixture's project has no remote: Backspace still marks it and
     // asks once, with that fact on the confirm line.
     swamp_tui::handle_key(&mut app, KeyCode::Backspace);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.operation.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let f = capture(&app, 200, 60);
     assert_eq!(app.marked.len(), 1);
     assert!(app.confirm_open);
