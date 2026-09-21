@@ -104,17 +104,24 @@ fn grown_view_reports_partial_coverage_before_any_history_exists() {
     assert_eq!(v["view"], "grown");
     assert_eq!(v["result"]["grown"].as_array().unwrap().len(), 0);
     let history = &v["coverage"]["history"];
-    // The very first observation this store ever wrote has zero span
-    // (nothing to diff against yet): the asked 1h window cannot be
+    // The very first observation this store ever wrote has (near) zero
+    // span (nothing to diff against yet): the asked 1h window cannot be
     // honestly honored, and the note says exactly that instead of
-    // silently reporting growth over a window that never existed.
-    assert_eq!(history["history_secs"], serde_json::json!(0));
-    assert_eq!(history["effective_window_secs"], serde_json::json!(0));
+    // silently reporting growth over a window that never existed. The
+    // exact second count depends on wall-clock timing inside a single
+    // `report_full_mode` call (observe-then-read), so this asserts the
+    // shape (tiny, and asked > held) rather than an exact "0".
+    let history_secs = history["history_secs"].as_u64().expect("history_secs");
+    let effective = history["effective_window_secs"]
+        .as_u64()
+        .expect("effective_window_secs");
+    assert!(history_secs <= 2, "{v:#}");
+    assert_eq!(effective, history_secs);
     assert!(
         history["note"]
             .as_str()
             .unwrap()
-            .contains("the store holds 0s of observations"),
+            .contains(&format!("the store holds {history_secs}s of observations")),
         "{v:#}"
     );
     for key in ["observed_at", "since", "index_refreshed"] {
@@ -149,6 +156,13 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     );
     assert_eq!(first["result"]["grown"].as_array().unwrap().len(), 0);
 
+    // The growth store's observed_at has one-second resolution: two
+    // observations inside the same wall-clock second can share a
+    // baseline. Cross a second boundary between the baseline and the
+    // growth event so the third call below has its own fresh baseline
+    // to compare against, not the pre-growth one.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
     // A real growth event.
     fs::write(
         checkout.join("node_modules/growth-probe"),
@@ -175,7 +189,19 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
         .unwrap_or_else(|| panic!("no node_modules row in {grown:#}"));
     assert!(row["growth_bytes"].as_i64().unwrap() > 0);
 
-    // No-change rerun: growth is an event, not a clock.
+    // Cross another second boundary before the no-change rerun, for the
+    // same reason as above.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // No-change rerun: growth is an event, not a clock. Ask for a
+    // *short* window here (not "1h" again): with only a few seconds of
+    // real history, a 1h ask still resolves its baseline to the oldest
+    // retained observation (the pre-growth one), by design -- see
+    // `history_block`'s asked-vs-held note -- so it would show the same
+    // growth again, correctly, not a bug. A short --since selects the
+    // most recent observation (the post-growth one just taken above) as
+    // the baseline, which is what actually answers "did anything change
+    // just now".
     let again = run_json(
         store.path(),
         &[
@@ -185,7 +211,7 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
             "grown",
             "--json",
             "--since",
-            "1h",
+            "1s",
         ],
     );
     assert_eq!(
