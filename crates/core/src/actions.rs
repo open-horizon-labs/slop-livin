@@ -681,7 +681,6 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
 /// plan either names a real, supported action or refuses).
 pub fn propose_agents(
     units: &[crate::agents::AgentUnit],
-    tool_home: &Path,
     paths: &[PathBuf],
     proposed_by: &str,
 ) -> Result<Plan> {
@@ -696,7 +695,7 @@ pub fn propose_agents(
                 path: u.path.clone(),
                 cause,
             }),
-            None => plan_units.push(unit_from_agent(u, tool_home)),
+            None => plan_units.push(unit_from_agent(u)),
         }
     }
     for p in paths {
@@ -726,9 +725,19 @@ pub fn propose_agents(
         );
     }
     let created_at = now();
+    // `Plan.root` is one path; an agent-storage plan can in principle
+    // span more than one tool home once a second adapter exists. Each
+    // unit's own `agent_meta.tool_home` is the authoritative value
+    // `execute` uses -- this field is informational (free-space
+    // before/after) and set from the first matched unit's home.
+    let root = plan_units
+        .first()
+        .and_then(|u: &PlanUnit| u.agent_meta.as_ref())
+        .map(|m| m.tool_home.clone())
+        .unwrap_or_default();
     Ok(Plan {
         id: crate::entities::new_id(),
-        root: tool_home.to_path_buf(),
+        root,
         created_at,
         expires_at: created_at + PLAN_TTL_SECS,
         proposed_by: proposed_by.to_string(),
@@ -738,7 +747,7 @@ pub fn propose_agents(
     })
 }
 
-fn unit_from_agent(u: &crate::agents::AgentUnit, tool_home: &Path) -> PlanUnit {
+fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
     use crate::agents::{AgentActionCapability, ProjectLinkState};
     let category = u.category.label().to_string();
     let session_members = if u.action == AgentActionCapability::SessionRemoval {
@@ -807,7 +816,7 @@ fn unit_from_agent(u: &crate::agents::AgentUnit, tool_home: &Path) -> PlanUnit {
         external_category: None,
         agent_meta: Some(AgentPlanMeta {
             tool_id: u.tool_id.clone(),
-            tool_home: tool_home.to_path_buf(),
+            tool_home: u.tool_home.clone(),
             category,
             session_members,
         }),

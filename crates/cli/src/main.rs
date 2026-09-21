@@ -49,6 +49,16 @@ enum View {
     /// history and declared consumers. Inspection only -- see `propose
     /// --external`.
     External,
+    /// Agent-tool storage (#91/#92/#100): Claude Code sessions, caches,
+    /// logs, checkpoints and protected config, grouped tool → category →
+    /// unit with size/growth/age and project linkage. `--project`
+    /// filters to units linked to that project. Redaction-aware by
+    /// construction (this view never has session content to print).
+    /// Inspection only from this command; supported cleanup actions
+    /// (`actions::propose_agents`/`execute`) are implemented at the
+    /// Rust-API level for this chunk -- see `swamp protect` for the
+    /// human-keep-intent surface this view respects.
+    Agents,
 }
 
 impl View {
@@ -343,6 +353,43 @@ enum Command {
     Grant {
         #[command(subcommand)]
         cmd: GrantCmd,
+    },
+    /// Propose cleanup for exact agent-storage unit paths (#101): a
+    /// cache/log category directory, or an individual session's own
+    /// transcript path from `report --view agents`. Every match becomes
+    /// a real action or a named refusal (protected, unsupported
+    /// category, database-like file, active session) -- never a
+    /// silent inspection-only row. Approve/execute the resulting plan
+    /// with the same `swamp approve`/`swamp execute` used for every
+    /// other plan. Nothing is deleted by this command.
+    ProposeAgents {
+        /// Exact agent-storage unit paths from `report --view agents`.
+        #[arg(long = "path", required = true)]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Human keep/protect intent for agent-storage paths (#100/#101):
+    /// survives refresh, blocks `propose-agents`/`execute` for any unit
+    /// under a protected path, and is never itself inferred from
+    /// observation -- only this command changes it.
+    Protect {
+        #[command(subcommand)]
+        cmd: ProtectCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProtectCmd {
+    Add {
+        path: PathBuf,
+    },
+    Remove {
+        path: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -793,6 +840,21 @@ fn cleanup_scope_summary(
     summary
 }
 
+/// Whether `u`'s project linkage names `project` (case-insensitive,
+/// matching this codebase's other `--project` matching): only a
+/// `Linked` unit can match; every other linkage state (unresolved,
+/// missing, not-a-project, moved, remote, shared, not-applicable) is
+/// filtered out by a project filter, never silently included. `None`
+/// (no filter given) matches everything.
+fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option<&str>) -> bool {
+    let Some(project) = project else { return true };
+    matches!(
+        &u.project_link,
+        swamp_core::agents::ProjectLinkState::Linked { project_name, .. }
+            if project_name.eq_ignore_ascii_case(project)
+    )
+}
+
 /// The bounded, documented JSON contract behind `report --json` (see
 /// `skills/swamp/references/commands-and-json.md`): with `--view`, an
 /// envelope `{view, project, result, observed_at, since,
@@ -822,6 +884,7 @@ fn report_json_envelope(
     offset: usize,
     scope_coverage: &[swamp_core::coverage::RootCoverage],
     external_units: &[swamp_core::external::ExternalUnit],
+    agent_units: &[swamp_core::agents::AgentUnit],
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -849,6 +912,16 @@ fn report_json_envelope(
                 "units": external_units,
                 "total_bytes": swamp_core::external::total_bytes(external_units),
             }),
+            View::Agents => {
+                let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
+                    .iter()
+                    .filter(|u| agent_unit_matches_project(u, project))
+                    .collect();
+                serde_json::json!({
+                    "units": filtered,
+                    "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
+                })
+            }
             _ => swamp_core::agent_json::view_payload(&rr, &name, project),
         };
         let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
@@ -1085,6 +1158,27 @@ fn main() -> Result<()> {
             } else {
                 Vec::new()
             };
+            // Agent-tool storage (#91/#92/#100): same "detector-resolved,
+            // independent of the walked root(s)" contract as external
+            // units above -- a tool home is found regardless of whether
+            // `report` is scoped to the configured catalog or an
+            // explicit root.
+            let agent_units = if view == Some(View::Agents) {
+                let detector_scope = resolve_scope(&[])?;
+                swamp_core::agents::discover_and_measure(
+                    &detector_scope,
+                    Some(&store_dir),
+                    !no_observe,
+                    r.observed_at,
+                    swamp_core::growth::load_config(&store_dir).retention_days,
+                    since
+                        .as_deref()
+                        .and_then(swamp_core::growth::parse_duration_secs)
+                        .unwrap_or(24 * 3600),
+                )?
+            } else {
+                Vec::new()
+            };
             if !json
                 && r.projects
                     .iter()
@@ -1120,6 +1214,7 @@ fn main() -> Result<()> {
                         offset,
                         &coverage,
                         &external_units,
+                        &agent_units,
                     )?)?
                 );
             } else if let Some(wt_path) = worktree {
@@ -1174,6 +1269,17 @@ fn main() -> Result<()> {
                             swamp_core::render::render_view_external(&external_units)
                         )
                     }
+                    Some(View::Agents) => {
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_agents(
+                                &agent_units,
+                                Some(&name),
+                                all,
+                                r.observed_at
+                            )
+                        )
+                    }
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
@@ -1206,6 +1312,17 @@ fn main() -> Result<()> {
                         print!(
                             "{}",
                             swamp_core::render::render_view_external(&external_units)
+                        )
+                    }
+                    Some(View::Agents) => {
+                        print!(
+                            "{}",
+                            swamp_core::render::render_view_agents(
+                                &agent_units,
+                                None,
+                                all,
+                                r.observed_at
+                            )
                         )
                     }
                     Some(v @ (View::Projects | View::Grown)) => {
@@ -1443,6 +1560,58 @@ fn main() -> Result<()> {
                 );
             } else {
                 print_plan(&plan);
+            }
+        }
+        Command::ProposeAgents { paths, json } => {
+            let store_dir = swamp_dir();
+            anyhow::ensure!(!paths.is_empty(), "--path is required (at least one)");
+            let detector_scope = resolve_scope(&[])?;
+            let observed_at = swamp_core::entities::now();
+            let units = swamp_core::agents::discover_and_measure(
+                &detector_scope,
+                Some(&store_dir),
+                true,
+                observed_at,
+                swamp_core::growth::load_config(&store_dir).retention_days,
+                3600,
+            )?;
+            let plan = swamp_core::actions::propose_agents(&units, &paths, "human:cli")?;
+            swamp_core::actions::save_plan(&store_dir, &plan)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
+                        &plan,
+                        observed_at
+                    )?)?
+                );
+            } else {
+                print_plan(&plan);
+            }
+        }
+        Command::Protect { cmd } => {
+            let store_dir = swamp_dir();
+            match cmd {
+                ProtectCmd::Add { path } => {
+                    swamp_core::agents::protect_add(&store_dir, &path)?;
+                    println!("protected: {}", path.display());
+                }
+                ProtectCmd::Remove { path } => {
+                    swamp_core::agents::protect_remove(&store_dir, &path)?;
+                    println!("no longer protected: {}", path.display());
+                }
+                ProtectCmd::List { json } => {
+                    let paths = swamp_core::agents::protect_list(&store_dir)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&paths)?);
+                    } else if paths.is_empty() {
+                        println!("no protected agent-storage paths");
+                    } else {
+                        for p in paths {
+                            println!("{}", p.display());
+                        }
+                    }
+                }
             }
         }
         Command::Approve { plan_id } => cmd_approve(&plan_id)?,

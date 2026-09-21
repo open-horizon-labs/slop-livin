@@ -1312,3 +1312,161 @@ pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
     );
     out
 }
+
+/// One line's worth of a modification age, correctly labelled: unknown
+/// (`mtime_max == 0`, e.g. a residual row with nothing measured) is
+/// never rendered as ancient, and a future timestamp is never rendered
+/// as old (guardrail: label modification time correctly).
+fn age_label(mtime_max: u64, now: u64) -> String {
+    if mtime_max == 0 {
+        return "age unknown".to_string();
+    }
+    if mtime_max > now {
+        return "modified in the future (clock skew?)".to_string();
+    }
+    let secs = now - mtime_max;
+    if secs < 3600 {
+        format!("{}m ago", (secs / 60).max(1))
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+fn agent_link_label(link: &crate::agents::ProjectLinkState) -> String {
+    use crate::agents::ProjectLinkState as L;
+    match link {
+        L::Linked {
+            project_name,
+            project_path,
+            ..
+        } => format!("project: {project_name} ({})", project_path.display()),
+        L::Unresolved { reason } => format!("project: unresolved ({reason})"),
+        L::Missing { path } => format!("project: missing ({})", path.display()),
+        L::NotAProject { path } => format!("project: not a project ({})", path.display()),
+        L::Moved { from, to } => format!("project: moved ({} -> {})", from.display(), to.display()),
+        L::Remote { host, path } => format!("project: remote ({host}:{})", path.display()),
+        L::Shared { project_ids } => format!("project: shared ({} projects)", project_ids.len()),
+        L::NotApplicable => "project: n/a (tool-wide)".to_string(),
+    }
+}
+
+fn agent_unit_matches_project(u: &crate::agents::AgentUnit, project: Option<&str>) -> bool {
+    let Some(project) = project else { return true };
+    matches!(
+        &u.project_link,
+        crate::agents::ProjectLinkState::Linked { project_name, .. }
+            if project_name.eq_ignore_ascii_case(project)
+    )
+}
+
+/// `--view agents` (#91/#100): tool → category → unit drill-down.
+/// Redaction-aware by construction, not just by convention -- an
+/// `AgentUnit` never carries a session title, first prompt, or any
+/// content field to begin with (see `crate::agents`'s privacy
+/// contract), so there is nothing here to accidentally print. Bounded
+/// to `PER_CATEGORY_LIMIT` per category, oldest-modified first (this
+/// product's existing "old is enough to suggest review" convention),
+/// unless `all` is set. `--project` narrows to units whose linkage
+/// names that project; every other linkage state (unresolved, missing,
+/// not-a-project, shared, not-applicable) is filtered out by a project
+/// filter, never silently included.
+const AGENT_PER_CATEGORY_LIMIT: usize = 20;
+
+pub fn render_view_agents(
+    units: &[crate::agents::AgentUnit],
+    project: Option<&str>,
+    all: bool,
+    now: u64,
+) -> String {
+    let mut out = String::new();
+    let filtered: Vec<&crate::agents::AgentUnit> = units
+        .iter()
+        .filter(|u| agent_unit_matches_project(u, project))
+        .collect();
+    if filtered.is_empty() {
+        let _ = writeln!(
+            out,
+            "no agent-storage units detected{}",
+            project
+                .map(|p| format!(" linked to project {p:?}"))
+                .unwrap_or_default()
+        );
+        return out;
+    }
+    let mut by_tool: BTreeMap<&str, Vec<&crate::agents::AgentUnit>> = BTreeMap::new();
+    for u in &filtered {
+        by_tool.entry(u.tool_name.as_str()).or_default().push(u);
+    }
+    let mut grand_total = 0u64;
+    for (tool, tool_units) in &by_tool {
+        let tool_total: u64 = tool_units.iter().map(|u| u.bytes).sum();
+        grand_total += tool_total;
+        let _ = writeln!(out, "{tool}  ({} total)", human_bytes(tool_total));
+        let mut by_category: BTreeMap<&'static str, Vec<&crate::agents::AgentUnit>> =
+            BTreeMap::new();
+        for u in tool_units {
+            by_category.entry(u.category.label()).or_default().push(u);
+        }
+        for (cat, cat_units) in &by_category {
+            let cat_total: u64 = cat_units.iter().map(|u| u.bytes).sum();
+            let _ = writeln!(
+                out,
+                "  {cat}  ({} total, {} unit{})",
+                human_bytes(cat_total),
+                cat_units.len(),
+                if cat_units.len() == 1 { "" } else { "s" }
+            );
+            let mut sorted = cat_units.clone();
+            // Oldest-modified first; units with an unknown age (0) sort
+            // last, never masquerading as the oldest.
+            sorted.sort_by(|a, b| match (a.mtime_max, b.mtime_max) {
+                (0, 0) => std::cmp::Ordering::Equal,
+                (0, _) => std::cmp::Ordering::Greater,
+                (_, 0) => std::cmp::Ordering::Less,
+                (x, y) => x.cmp(&y),
+            });
+            let limit = if all {
+                sorted.len()
+            } else {
+                AGENT_PER_CATEGORY_LIMIT.min(sorted.len())
+            };
+            for u in sorted.iter().take(limit) {
+                let growth = u
+                    .growth_bytes
+                    .map(human_bytes_signed)
+                    .unwrap_or_else(|| "—".to_string());
+                let protect = if u.protected { "  [protected]" } else { "" };
+                let note = u
+                    .note
+                    .as_deref()
+                    .map(|n| format!("  [{n}]"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "    {:<10} {:>+10}  {}  {}  {}{protect}{note}",
+                    human_bytes(u.bytes),
+                    growth,
+                    age_label(u.mtime_max, now),
+                    u.relative_path,
+                    agent_link_label(&u.project_link),
+                );
+            }
+            if sorted.len() > limit {
+                let _ = writeln!(
+                    out,
+                    "    … and {} more (--all for the rest)",
+                    sorted.len() - limit
+                );
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nagent storage total: {} ({} units, independent of walked_total above)",
+        human_bytes(grand_total),
+        filtered.len()
+    );
+    out
+}

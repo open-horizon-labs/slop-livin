@@ -219,6 +219,13 @@ pub enum AgentActionCapability {
 pub struct AgentUnit {
     pub tool_id: String,
     pub tool_name: String,
+    /// This tool's home directory, as resolved this pass (detector
+    /// override or convention). Carried per-unit, not assumed shared
+    /// across every unit in a list, so a caller acting on a mixed
+    /// selection across multiple tools always knows which home to
+    /// re-derive facts against (e.g. `execute_agent_session_removal`'s
+    /// fresh re-identification).
+    pub tool_home: PathBuf,
     pub category: AgentCategory,
     /// Stable content-addressed id: `blake3(tool_id, category, relative_path)`.
     pub id: String,
@@ -490,7 +497,8 @@ pub fn discover_and_measure(
 ) -> Result<Vec<AgentUnit>> {
     let protected_paths = swamp_dir.map(load_protect).transpose()?.unwrap_or_default();
 
-    let mut candidates_by_key: HashMap<String, (String, CandidateAgentUnit, u64)> = HashMap::new();
+    let mut candidates_by_key: HashMap<String, (String, PathBuf, CandidateAgentUnit, u64)> =
+        HashMap::new();
     let mut observed: Vec<ObservedExternal> = Vec::new();
 
     for summary in &scope.detectors {
@@ -518,7 +526,7 @@ pub fn discover_and_measure(
                 bytes: cand.bytes,
                 hardlinked: true,
             });
-            candidates_by_key.insert(key, (tool_name.clone(), cand, device));
+            candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
         }
     }
 
@@ -539,7 +547,7 @@ pub fn discover_and_measure(
     };
 
     let mut units = Vec::with_capacity(candidates_by_key.len());
-    for (key, (tool_name, cand, _device)) in candidates_by_key {
+    for (key, (tool_name, tool_home, cand, _device)) in candidates_by_key {
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
         let default_protected = cand.category.default_protected();
         let human_protected = is_human_protected(&protected_paths, &cand.path)
@@ -569,6 +577,7 @@ pub fn discover_and_measure(
             id: unit_id(&tool_id, cand.category, &cand.relative_path),
             tool_id,
             tool_name,
+            tool_home,
             category: cand.category,
             relative_path: cand.relative_path,
             path: cand.path,

@@ -124,13 +124,8 @@ fn cache_removal_preserves_auth_and_history() {
     let (units, _home_dummy) = units_for(&claude_home, store.path());
 
     let shell_snapshots = claude_home.join("shell-snapshots");
-    let plan = actions::propose_agents(
-        &units,
-        &claude_home,
-        std::slice::from_ref(&shell_snapshots),
-        "test",
-    )
-    .unwrap();
+    let plan =
+        actions::propose_agents(&units, std::slice::from_ref(&shell_snapshots), "test").unwrap();
     assert_eq!(plan.units.len(), 1);
     assert_eq!(
         plan.units[0].agent_meta.as_ref().unwrap().session_members,
@@ -139,7 +134,10 @@ fn cache_removal_preserves_auth_and_history() {
 
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
-    let result = actions::execute(store.path(), &plan.id, "human:test").unwrap();
+    let trash_dir = tempfile::tempdir().unwrap();
+    let result =
+        actions::execute_with_trash(store.path(), &plan.id, "human:test", trash_dir.path())
+            .unwrap();
 
     assert_eq!(
         result.outcomes[0].status, "completed",
@@ -173,8 +171,7 @@ fn selected_session_removal_preserves_other_sessions_and_shared_material() {
     let store = tempfile::tempdir().unwrap();
     let (units, _home_dummy) = units_for(&claude_home, store.path());
 
-    let plan = actions::propose_agents(&units, &claude_home, std::slice::from_ref(&jsonl), "test")
-        .unwrap();
+    let plan = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap();
     assert_eq!(plan.units.len(), 1);
     let meta = plan.units[0].agent_meta.as_ref().unwrap();
     assert!(meta.session_members.is_some());
@@ -182,7 +179,10 @@ fn selected_session_removal_preserves_other_sessions_and_shared_material() {
 
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
-    let result = actions::execute(store.path(), &plan.id, "human:test").unwrap();
+    let trash_dir = tempfile::tempdir().unwrap();
+    let result =
+        actions::execute_with_trash(store.path(), &plan.id, "human:test", trash_dir.path())
+            .unwrap();
     assert_eq!(
         result.outcomes[0].status, "completed",
         "{:?}",
@@ -235,13 +235,7 @@ fn protected_categories_refuse_at_proposal_time() {
     let (units, _home_dummy) = units_for(&claude_home, store.path());
 
     let settings = claude_home.join("settings.json");
-    let err = actions::propose_agents(
-        &units,
-        &claude_home,
-        std::slice::from_ref(&settings),
-        "test",
-    )
-    .unwrap_err();
+    let err = actions::propose_agents(&units, std::slice::from_ref(&settings), "test").unwrap_err();
     assert!(err.to_string().contains("protected"), "{err}");
     assert!(settings.exists());
     let _ = root;
@@ -254,8 +248,7 @@ fn widened_scope_path_not_matching_any_unit_refuses() {
     let (units, _home_dummy) = units_for(&claude_home, store.path());
 
     let bogus = claude_home.join("not-a-real-unit");
-    let err = actions::propose_agents(&units, &claude_home, std::slice::from_ref(&bogus), "test")
-        .unwrap_err();
+    let err = actions::propose_agents(&units, std::slice::from_ref(&bogus), "test").unwrap_err();
     assert!(err.to_string().contains("no agent-storage unit"), "{err}");
     let _ = root;
 }
@@ -273,8 +266,7 @@ fn active_session_transcript_refuses_at_proposal_and_execution() {
     // checks for -- no mocking needed, this is the real seam.
     let _held_open = fs::File::open(&jsonl).expect("open transcript to simulate an active session");
 
-    let err = actions::propose_agents(&units, &claude_home, std::slice::from_ref(&jsonl), "test")
-        .unwrap_err();
+    let err = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap_err();
     assert!(
         err.to_string().contains("active") || err.to_string().contains("no agent-storage unit"),
         "{err}"
@@ -292,14 +284,16 @@ fn plan_and_ledger_never_contain_the_canary_prompt_content() {
     let serialized_units = serde_json::to_string(&units).unwrap();
     assert!(!serialized_units.contains(CANARY));
 
-    let plan = actions::propose_agents(&units, &claude_home, std::slice::from_ref(&jsonl), "test")
-        .unwrap();
+    let plan = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap();
     let serialized_plan = serde_json::to_string(&plan).unwrap();
     assert!(!serialized_plan.contains(CANARY));
 
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
-    let result = actions::execute(store.path(), &plan.id, "human:test").unwrap();
+    let trash_dir = tempfile::tempdir().unwrap();
+    let result =
+        actions::execute_with_trash(store.path(), &plan.id, "human:test", trash_dir.path())
+            .unwrap();
     let serialized_result = serde_json::to_string(&result).unwrap();
     assert!(!serialized_result.contains(CANARY));
 
