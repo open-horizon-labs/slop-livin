@@ -317,7 +317,7 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     // Hinnant's algorithm), avoiding a chrono dependency for one parse.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let mp = (month + 9) % 12;
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
