@@ -39,7 +39,11 @@
 //! `Debug`, or JSON-serialized output.
 
 pub mod claude_code;
+pub mod codex;
+pub mod codex_desktop;
 pub mod matrix;
+pub mod oh_my_pi;
+pub mod opencode;
 
 use crate::growth::{ObservedExternal, annotate_readonly_external, observe_and_annotate_external};
 use crate::scope::EffectiveScope;
@@ -181,6 +185,21 @@ pub enum AgentMemberKind {
     Attachments,
     CategoryDir,
     ConfigFile,
+    /// A SQLite database file (or one of its `-wal`/`-shm` sidecars)
+    /// backing session/message/state storage for a tool whose newer
+    /// layout moved off flat JSON/JSONL files (#93 Codex, #95 OpenCode's
+    /// `opencode.db`, #94 Oh My Pi's `agent.db`). Always folded into one
+    /// unit with its sidecars as members, never split -- `is_sqlite_like`
+    /// in `crate::actions` refuses any selective action on a path with
+    /// this kind unconditionally, independent of category/protection.
+    Database,
+    /// A session-keyed companion directory/file that is neither a raw
+    /// transcript, a subagent dir, todos, file-history, nor an
+    /// attachment -- e.g. OpenCode's `storage/message/<session-id>/` and
+    /// `storage/session_diff/<session-id>/`, matched to a session by the
+    /// same exact-id-match discipline `crate::agents::claude_code` uses
+    /// for `file-history/`/`image-cache/`/`uploads/`, never guessed.
+    SessionData,
 }
 
 /// One physical path this unit's byte total is made of. A session unit
@@ -353,12 +372,77 @@ pub fn folded_bytes(path: &Path, max_entries: usize) -> (u64, u64, bool) {
     (total, mtime_max, truncated)
 }
 
-fn mtime_secs(meta: &fs::Metadata) -> u64 {
+pub(crate) fn mtime_secs(meta: &fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------
+// Shared declared-path -> project-identity resolution (#91's original
+// contract, factored out during #93/#94/#95 so every adapter that reads
+// a declared absolute path out of its own tool's metadata --
+// `claude_code`'s transcript `cwd`, `codex`'s session-header `cwd`,
+// `oh_my_pi`'s session-header `cwd`, `opencode`'s `project.json`
+// `worktree` -- resolves it against swamp's project/worktree identity
+// the same way, once. Never a basename guess: this walks upward from
+// `path` looking for a `.git` directory/file and resolves through
+// `crate::git`'s own object-store-based project identity primitives.
+// ---------------------------------------------------------------------
+
+/// Resolves an absolute path declared by some tool's own metadata (never
+/// a filename/directory-name guess) to this swamp instance's project
+/// identity. `field_missing_reason` is the adapter-specific explanation
+/// for why no path could be extracted at all (e.g. "no cwd field found
+/// in the session's first line"), used only for the `Unresolved` case.
+pub(crate) fn resolve_declared_path(
+    declared: Option<String>,
+    field_missing_reason: &str,
+) -> ProjectLinkState {
+    let Some(declared) = declared else {
+        return ProjectLinkState::Unresolved {
+            reason: field_missing_reason.to_string(),
+        };
+    };
+    let path = PathBuf::from(&declared);
+    if !path.exists() {
+        return ProjectLinkState::Missing { path };
+    }
+    for ancestor in path.ancestors() {
+        let git_path = ancestor.join(".git");
+        let Ok(git_meta) = fs::symlink_metadata(&git_path) else {
+            continue;
+        };
+        if git_meta.is_dir() {
+            if let Some(dw) = crate::git::classify_main_checkout(ancestor, &git_path) {
+                return ProjectLinkState::Linked {
+                    project_id: dw.project_id,
+                    project_name: dw.project_name,
+                    project_path: dw.path,
+                    source: LinkSource::Declared,
+                    worktree_kind: "main".to_string(),
+                };
+            }
+        } else if git_meta.is_file()
+            && let Some(dw) = crate::git::classify_git_file(ancestor, &git_path)
+        {
+            let kind = if dw.kind == crate::report::WorktreeKind::Linked {
+                "linked"
+            } else {
+                "main"
+            };
+            return ProjectLinkState::Linked {
+                project_id: dw.project_id,
+                project_name: dw.project_name,
+                project_path: dw.path,
+                source: LinkSource::Declared,
+                worktree_kind: kind.to_string(),
+            };
+        }
+    }
+    ProjectLinkState::NotAProject { path }
 }
 
 // ---------------------------------------------------------------------
@@ -467,6 +551,10 @@ fn identify_for_tool(
 ) -> Option<Vec<CandidateAgentUnit>> {
     match tool_id {
         claude_code::CLAUDE_CODE_TOOL_ID => Some(claude_code::identify(home, observed_at)),
+        codex::CODEX_TOOL_ID => Some(codex::identify(home, observed_at)),
+        codex_desktop::CODEX_DESKTOP_TOOL_ID => Some(codex_desktop::identify(home, observed_at)),
+        oh_my_pi::OH_MY_PI_TOOL_ID => Some(oh_my_pi::identify(home, observed_at)),
+        opencode::OPENCODE_TOOL_ID => Some(opencode::identify(home, observed_at)),
         _ => None,
     }
 }

@@ -858,6 +858,16 @@ fn execute_agent_session_removal(
         crate::agents::claude_code::CLAUDE_CODE_TOOL_ID => {
             crate::agents::claude_code::identify(&meta.tool_home, at)
         }
+        crate::agents::codex::CODEX_TOOL_ID => crate::agents::codex::identify(&meta.tool_home, at),
+        crate::agents::codex_desktop::CODEX_DESKTOP_TOOL_ID => {
+            crate::agents::codex_desktop::identify(&meta.tool_home, at)
+        }
+        crate::agents::oh_my_pi::OH_MY_PI_TOOL_ID => {
+            crate::agents::oh_my_pi::identify(&meta.tool_home, at)
+        }
+        crate::agents::opencode::OPENCODE_TOOL_ID => {
+            crate::agents::opencode::identify(&meta.tool_home, at)
+        }
         other => bail!("no session-removal re-identification implemented for tool {other}"),
     };
     let current = fresh

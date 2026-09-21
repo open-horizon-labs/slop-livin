@@ -753,6 +753,10 @@ mod tests {
                 "rustup".to_string(),
                 "homebrew".to_string(),
                 "claude-code".to_string(),
+                "codex".to_string(),
+                "codex-desktop".to_string(),
+                "oh-my-pi".to_string(),
+                "opencode".to_string(),
             ],
             ..ScanConfig::default()
         };

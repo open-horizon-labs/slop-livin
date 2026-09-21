@@ -5,14 +5,17 @@
 //! during implementation (never guessed, never learned from a real
 //! `~/.claude`-style directory on this machine).
 //!
-//! Only [`AgentToolId::ClaudeCode`] is [`SupportLevel::Supported`] in this
-//! chunk (#92): [`crate::agents::claude_code`] implements real
-//! identification for it. Every other row is
-//! [`SupportLevel::Planned`] -- its home-path note is real, sourced
-//! research (not a guess), but no identification code exists yet, and no
-//! adapter here claims otherwise. `docs/agent-storage.md` renders this
-//! same table as a doc; keep the two in sync by hand (this module is the
-//! single source of truth, generated into the doc, not the reverse).
+//! [`AgentToolId::ClaudeCode`] (#92), [`AgentToolId::Codex`] and
+//! [`AgentToolId::CodexDesktop`] (#93), [`AgentToolId::OhMyPi`] (#94) and
+//! [`AgentToolId::OpenCode`] (#95) are [`SupportLevel::Supported`] as of
+//! this chunk: `crate::agents::{claude_code, codex, codex_desktop,
+//! oh_my_pi, opencode}` each implement real identification. Every other
+//! row is [`SupportLevel::Planned`] -- its home-path note is real,
+//! sourced research (not a guess), but no identification code exists
+//! yet, and no adapter here claims otherwise. `docs/agent-storage.md`
+//! renders this same table as a doc; keep the two in sync by hand (this
+//! module is the single source of truth, generated into the doc, not the
+//! reverse).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +24,12 @@ use serde::{Deserialize, Serialize};
 pub enum AgentToolId {
     ClaudeCode,
     Codex,
+    /// The Codex **desktop app** (`Codex.app`), a materially different
+    /// client from the Codex CLI with its own storage -- modeled as its
+    /// own row rather than folded into `Codex`'s, per #93's explicit
+    /// "do not extrapolate one client's schema to all clients"
+    /// acceptance.
+    CodexDesktop,
     OhMyPi,
     OpenCode,
     GeminiCli,
@@ -39,6 +48,7 @@ impl AgentToolId {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
+            Self::CodexDesktop => "codex-desktop",
             Self::OhMyPi => "oh-my-pi",
             Self::OpenCode => "opencode",
             Self::GeminiCli => "gemini-cli",
@@ -110,43 +120,78 @@ pub const MATRIX: &[MatrixEntry] = &[
     MatrixEntry {
         id: AgentToolId::Codex,
         display_name: "Codex",
-        support: SupportLevel::Planned,
-        home_note: "CODEX_HOME, default ~/.codex; contains sessions/, auth.json, \
-                     history.jsonl, logs/, config.toml",
+        support: SupportLevel::Supported,
+        home_note: "CODEX_HOME, default ~/.codex; sessions/ and archived_sessions/ (year/month/ \
+                     day rollout-*.jsonl trees), auth.json, history.jsonl, config.toml, log/, \
+                     six SQLite state stores (state_5/logs_2/goals_1/memories_1/queue_1/ \
+                     thread_history_1.sqlite) relocatable via the separate CODEX_SQLITE_HOME",
         sources: &[
-            "https://github.com/openai/codex",
-            "https://developers.openai.com/codex/config-advanced",
-            "https://developers.openai.com/codex/cli/reference",
+            "https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/lib.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/rollout_file_name.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/metadata.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/state/src/sqlite.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/app-server/src/codex_home_metrics.rs",
         ],
-        note: "#93's job; not implemented in this chunk",
+        note: "#93; crate::agents::codex implements identification. The session-header envelope \
+               nesting around `cwd` is not pinned to one shape (internal, version-varying wire \
+               format); no managed-worktree creation by the CLI itself is confirmed",
+    },
+    MatrixEntry {
+        id: AgentToolId::CodexDesktop,
+        display_name: "Codex desktop app",
+        support: SupportLevel::Supported,
+        home_note: "macOS only, confirmed: ~/Library/Logs/com.openai.codex (date-tree session \
+                     logs). Settings/session storage beyond logs is not confirmed by primary \
+                     source and is not modeled -- logs-only support, stated explicitly rather \
+                     than silently treated as empty",
+        sources: &[
+            "https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop.rs",
+            "https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop/platform.rs",
+        ],
+        note: "#93; crate::agents::codex_desktop implements identification for the confirmed \
+               log directory only, a deliberately partial Supported row",
     },
     MatrixEntry {
         id: AgentToolId::OhMyPi,
         display_name: "Oh My Pi",
-        support: SupportLevel::Planned,
-        home_note: "~/.omp (user-confirmed identity: Oh My Pi, a fork of badlogic/pi-mono)",
+        support: SupportLevel::Supported,
+        home_note: "~/.omp/agent (user-confirmed identity: Oh My Pi, a fork of badlogic/ \
+                     pi-mono), or the whole of PI_CODING_AGENT_DIR when set; sessions/ \
+                     <encoded-cwd>/<ts>_<session-id>.jsonl, content-addressed blobs/<sha256>, \
+                     terminal-sessions/, config.yml/config.yaml, models.yml, agent.db (SQLite \
+                     auth store)",
         sources: &[
             "https://github.com/can1357/oh-my-pi/blob/main/docs/session.md",
             "https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md",
         ],
-        note: "sources recorded per #90's own required-sources list; not independently fetched \
-               or implemented in this chunk (#94's job)",
+        note: "#94; crate::agents::oh_my_pi implements identification, including a content-marker \
+               check that reports an explicit unknown-format unit rather than guessing when \
+               ~/.omp is not actually Oh My Pi's own layout, and bounded per-session blob-\
+               reference accounting that never offers blob removal in this chunk",
     },
     MatrixEntry {
         id: AgentToolId::OpenCode,
         display_name: "OpenCode",
-        support: SupportLevel::Planned,
-        home_note: "data: OPENCODE_DATA_DIR, else ${XDG_DATA_HOME:-~/.local/share}/opencode \
-                     (message/<session>/, session/<projectHash>/<session>.json); config: \
-                     ${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json",
+        support: SupportLevel::Supported,
+        home_note: "data: OPENCODE_DATA_DIR (unconfirmed env var name, honored defensively), \
+                     else ${XDG_DATA_HOME:-~/.local/share}/opencode (auth.json, log/, \
+                     storage/{session,message,part,session_diff,project}/ or opencode.db \
+                     depending on version, snapshot/<project-id>/<hash> git-backed checkpoints); \
+                     config ${XDG_CONFIG_HOME:-~/.config}/opencode (opaque external unit); cache \
+                     ${XDG_CACHE_HOME:-~/.cache}/opencode (opaque external unit)",
         sources: &[
             "https://opencode.ai/docs/troubleshooting/",
             "https://github.com/anomalyco/opencode/issues/6669",
             "https://github.com/anomalyco/opencode/issues/18633",
+            "https://github.com/sst/opencode/blob/dev/packages/opencode/src/storage/storage.ts",
+            "https://deepwiki.com/sst/opencode/2.9-storage-and-database",
         ],
-        note: "#95's job; not implemented in this chunk. Upstream's own issue tracker notes \
-               XDG_STATE_HOME vs XDG_DATA_HOME inconsistency -- verify against the installed \
-               version, not this note, at implementation time",
+        note: "#95; crate::agents::opencode implements identification for both the older file- \
+               tree layout and the newer SQLite-backed one, version-gated by which markers are \
+               present on disk; an unrecognized layout is reported as one explicit \
+               unsupported-version unit rather than guessed at either schema",
     },
     MatrixEntry {
         id: AgentToolId::GeminiCli,
@@ -292,6 +337,7 @@ mod tests {
         let ids = [
             AgentToolId::ClaudeCode,
             AgentToolId::Codex,
+            AgentToolId::CodexDesktop,
             AgentToolId::OhMyPi,
             AgentToolId::OpenCode,
             AgentToolId::GeminiCli,
@@ -316,9 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_code_is_supported_this_chunk() {
+    fn the_five_implemented_adapters_are_supported_the_rest_are_planned() {
+        let supported = [
+            AgentToolId::ClaudeCode,
+            AgentToolId::Codex,
+            AgentToolId::CodexDesktop,
+            AgentToolId::OhMyPi,
+            AgentToolId::OpenCode,
+        ];
         for e in MATRIX {
-            let expected = if e.id == AgentToolId::ClaudeCode {
+            let expected = if supported.contains(&e.id) {
                 SupportLevel::Supported
             } else {
                 SupportLevel::Planned

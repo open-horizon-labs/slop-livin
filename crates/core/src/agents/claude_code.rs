@@ -42,7 +42,7 @@
 
 use super::{
     AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    LinkSource, ProjectLinkState, folded_bytes,
+    ProjectLinkState, folded_bytes,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -289,48 +289,10 @@ fn identify_sessions(
 /// to a real path in general: a literal hyphen in a real path is
 /// indistinguishable from an encoded path separator).
 fn resolve_project_link(jsonl: &Path) -> ProjectLinkState {
-    let Some(cwd) = read_header_cwd(jsonl) else {
-        return ProjectLinkState::Unresolved {
-            reason: "no cwd field found in the session's first line".to_string(),
-        };
-    };
-    let path = PathBuf::from(&cwd);
-    if !path.exists() {
-        return ProjectLinkState::Missing { path };
-    }
-    for ancestor in path.ancestors() {
-        let git_path = ancestor.join(".git");
-        let Ok(git_meta) = fs::symlink_metadata(&git_path) else {
-            continue;
-        };
-        if git_meta.is_dir() {
-            if let Some(dw) = crate::git::classify_main_checkout(ancestor, &git_path) {
-                return ProjectLinkState::Linked {
-                    project_id: dw.project_id,
-                    project_name: dw.project_name,
-                    project_path: dw.path,
-                    source: LinkSource::Declared,
-                    worktree_kind: "main".to_string(),
-                };
-            }
-        } else if git_meta.is_file()
-            && let Some(dw) = crate::git::classify_git_file(ancestor, &git_path)
-        {
-            let kind = if dw.kind == crate::report::WorktreeKind::Linked {
-                "linked"
-            } else {
-                "main"
-            };
-            return ProjectLinkState::Linked {
-                project_id: dw.project_id,
-                project_name: dw.project_name,
-                project_path: dw.path,
-                source: LinkSource::Declared,
-                worktree_kind: kind.to_string(),
-            };
-        }
-    }
-    ProjectLinkState::NotAProject { path }
+    super::resolve_declared_path(
+        read_header_cwd(jsonl),
+        "no cwd field found in the session's first line",
+    )
 }
 
 fn read_header_cwd(jsonl: &Path) -> Option<String> {

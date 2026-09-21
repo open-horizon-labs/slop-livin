@@ -25,7 +25,11 @@
 pub mod builtin;
 pub mod cargo_home;
 pub mod claude_code;
+pub mod codex;
+pub mod codex_desktop;
 pub mod homebrew;
+pub mod oh_my_pi;
+pub mod opencode;
 pub mod rustup;
 
 use std::collections::HashMap;
@@ -424,6 +428,10 @@ impl Registry {
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
                 Box::new(claude_code::ClaudeCodeDetector),
+                Box::new(codex::CodexDetector),
+                Box::new(codex_desktop::CodexDesktopDetector),
+                Box::new(oh_my_pi::OhMyPiDetector),
+                Box::new(opencode::OpenCodeDetector),
             ],
         }
     }
