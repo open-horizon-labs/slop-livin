@@ -752,6 +752,7 @@ mod tests {
                 "cargo-home".to_string(),
                 "rustup".to_string(),
                 "homebrew".to_string(),
+                "claude-code".to_string(),
             ],
             ..ScanConfig::default()
         };

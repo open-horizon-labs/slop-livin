@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod agent_json;
+pub mod agents;
 pub mod artifact;
 pub mod attribution;
 pub mod bus;

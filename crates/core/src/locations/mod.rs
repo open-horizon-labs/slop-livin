@@ -24,6 +24,7 @@
 
 pub mod builtin;
 pub mod cargo_home;
+pub mod claude_code;
 pub mod homebrew;
 pub mod rustup;
 
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the set of detectors or their resolution semantics
 /// changes, so a persisted `EffectiveScope` (`crate::scope`) can show it
 /// was resolved under an older catalog than the one now running.
-pub const CATALOG_VERSION: &str = "2026-09-21.1";
+pub const CATALOG_VERSION: &str = "2026-09-21.2";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -422,6 +423,7 @@ impl Registry {
                 Box::new(cargo_home::CargoHomeDetector),
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
+                Box::new(claude_code::ClaudeCodeDetector),
             ],
         }
     }
