@@ -21,7 +21,7 @@ cargo run -q -p swamp-source-audit
 # comment is skipped.
 violations=$(
   grep -rnE 'rm[[:space:]]+-rf|std::fs::remove_dir_all|"safe"|"unused"|"stale"' \
-    crates/core/src crates/cli/src crates/mcp/src |
+    crates/core/src crates/cli/src |
     awk '{ code = $0; sub(/^[^:]*:[0-9]+:/, "", code); if (code !~ /^[[:space:]]*\/\//) print }'
 ) || true
 if [ -n "$violations" ]; then

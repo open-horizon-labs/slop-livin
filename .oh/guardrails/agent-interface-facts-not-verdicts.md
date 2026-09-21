@@ -10,4 +10,4 @@ audit: agent_interface_facts_not_verdicts
 Worktree staleness is not decidable. A verdict word is a claim the tool cannot back; a fact with terms is one the agent can reason from.
 
 ## Detection
-No string literal in `render.rs`, `mcp/main.rs` or the TUI contains a verdict phrase. AST audit `agent_interface_facts_not_verdicts` (a `syn` literal visitor, not a grep, so identifiers and comments do not trip it).
+No string literal in `render.rs`, `agent_json.rs`, the CLI, or the TUI contains a verdict phrase. AST audit `agent_interface_facts_not_verdicts` (a `syn` literal visitor, not a grep, so identifiers and comments do not trip it). Covers every noninteractive JSON surface (`report --json`, `propose --json`, ...) since the CLI is the sole supported machine interface (#104); previously scanned `crates/mcp/src/main.rs` in place of the CLI.

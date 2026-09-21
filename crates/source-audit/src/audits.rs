@@ -375,11 +375,17 @@ const VERDICTS: &[&str] = &[
     "unused",
 ];
 
+/// Every file whose strings might reach a human or an agent verbatim:
+/// the text renderer, the bounded agent-facing JSON shaper, the CLI, and
+/// the TUI. Transport-independent by construction -- it does not matter
+/// which of these binaries a given string ships through, only that none
+/// of them ever asserts a verdict.
 fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
     let mut files = vec![
         "crates/core/src/render.rs".to_string(),
-        "crates/mcp/src/main.rs".to_string(),
+        "crates/core/src/agent_json.rs".to_string(),
     ];
+    files.extend(ast::rust_files_under(root, "crates/cli/src"));
     files.extend(ast::rust_files_under(root, "crates/tui/src"));
     for rel in files {
         let f = ast::parse(root, &rel)?;
@@ -395,16 +401,64 @@ fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The three functions that mint or change authorization
+/// (`swamp_core::actions::approve`, `add_standing_grant`,
+/// `revoke_grant`). This audit is transport-independent: it does not
+/// check which *binary* calls them (a shell-capable agent can invoke
+/// any binary in this workspace), only which *named function* in the
+/// source calls them directly. That is a real, checkable boundary --
+/// "authorization is minted from exactly these reviewed call sites and
+/// nowhere else" -- unlike "an agent cannot reach this", which no
+/// static check can honestly claim. See
+/// `.oh/guardrails/human-only-authorization.md` and
+/// `skills/swamp/references/trust-model.md`.
+const AUTH_MINTING_SINKS: &[&str] = &["approve", "add_standing_grant", "revoke_grant"];
+
+/// `(file, allowed function/method names)`: the only call sites in the
+/// workspace allowed to reach an `AUTH_MINTING_SINKS` function. The
+/// CLI's own subcommand handling for `approve`/`grant add`/`grant
+/// revoke` is factored into these three named functions precisely so
+/// this list can name them; the TUI's confirmed-execution path is
+/// `execute_one`, reached only after its own confirm-prompt flow.
+const AUTH_MINTING_ALLOWED_CALLERS: &[(&str, &[&str])] = &[
+    (
+        "crates/cli/src/main.rs",
+        &["cmd_approve", "cmd_grant_add", "cmd_grant_revoke"],
+    ),
+    ("crates/tui/src/actions.rs", &["execute_one"]),
+];
+
 fn human_only_authorization(root: &Path) -> Result<(), String> {
-    let f = ast::parse(root, "crates/mcp/src/main.rs")?;
-    for ident in ast::referenced_idents(&f.ast) {
-        if matches!(
-            ident.as_str(),
-            "approve" | "write_grants" | "revoke_grant" | "add_grant" | "grant_add"
-        ) {
-            return Err(format!(
-                "mcp/main.rs reaches `{ident}`: the MCP server must not mint or change authorization"
-            ));
+    let mut files = Vec::new();
+    for krate in ["core", "cli", "tui"] {
+        files.extend(ast::rust_files_under(root, &format!("crates/{krate}/src")));
+    }
+    for rel in files {
+        // `actions.rs` is the sinks' own definition file: `approve`
+        // calling its own internal `write_grants` helper, or `execute`
+        // spending an already-minted grant's budget, is the sinks'
+        // ordinary internal wiring, not a new minting call site.
+        if rel == "crates/core/src/actions.rs" {
+            continue;
+        }
+        let allowed: &[&str] = AUTH_MINTING_ALLOWED_CALLERS
+            .iter()
+            .find(|(f, _)| *f == rel)
+            .map(|(_, fns)| *fns)
+            .unwrap_or(&[]);
+        let f = ast::parse(root, &rel)?;
+        for func in ast::functions(&f.ast) {
+            let hits: Vec<&str> = AUTH_MINTING_SINKS
+                .iter()
+                .copied()
+                .filter(|sink| func.body.contains(&format!("actions :: {sink} (")))
+                .collect();
+            if !hits.is_empty() && !allowed.contains(&func.name.as_str()) {
+                return Err(format!(
+                    "{rel}: `{}` calls authorization-minting function(s) {hits:?} outside the reviewed CLI approve/grant command handling or TUI confirmation path -- see .oh/guardrails/human-only-authorization.md",
+                    func.name
+                ));
+            }
         }
     }
     Ok(())
@@ -605,7 +659,7 @@ fn adr_validation(root: &Path) -> Result<(), String> {
     }
     // ADRs: every audit resolves; every cargo test exists as a fn somewhere.
     let mut all_rust = String::new();
-    for krate in ["core", "cli", "mcp", "tui"] {
+    for krate in ["core", "cli", "tui"] {
         for rel in ast::rust_files_under(root, &format!("crates/{krate}/src")) {
             all_rust.push_str(&std::fs::read_to_string(root.join(&rel)).unwrap_or_default());
         }
@@ -647,4 +701,94 @@ fn adr_validation(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod human_only_authorization_tests {
+    use super::human_only_authorization;
+    use std::fs;
+    use std::path::Path;
+
+    /// A minimal fake workspace: `crates/core/src/actions.rs` (the
+    /// sinks' own definitions, always skipped), plus whatever extra
+    /// `(rel_path, contents)` files the case supplies.
+    fn fake_workspace(extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let write = |rel: &str, text: &str| {
+            let p = tmp.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        };
+        write(
+            "crates/core/src/actions.rs",
+            "pub fn approve() { write_grants(); }\n\
+             fn write_grants() {}\n\
+             pub fn add_standing_grant() { write_grants(); }\n\
+             pub fn revoke_grant() { write_grants(); }\n",
+        );
+        for (rel, text) in extra {
+            write(rel, text);
+        }
+        tmp
+    }
+
+    #[test]
+    fn allowed_cli_and_tui_call_sites_pass() {
+        let tmp = fake_workspace(&[
+            (
+                "crates/cli/src/main.rs",
+                "fn cmd_approve() { actions::approve(); }\n\
+                 fn cmd_grant_add() { actions::add_standing_grant(); }\n\
+                 fn cmd_grant_revoke() { actions::revoke_grant(); }\n",
+            ),
+            (
+                "crates/tui/src/actions.rs",
+                "fn execute_one() { swamp_core::actions::approve(); }\n",
+            ),
+        ]);
+        assert_eq!(human_only_authorization(tmp.path()), Ok(()));
+    }
+
+    #[test]
+    fn a_call_site_outside_the_allowlist_is_rejected() {
+        let tmp = fake_workspace(&[(
+            "crates/cli/src/main.rs",
+            // Same call, wrong function name: not one of the reviewed
+            // command handlers the allowlist names.
+            "fn main() { actions::approve(); }\n",
+        )]);
+        let err = human_only_authorization(tmp.path()).unwrap_err();
+        assert!(err.contains("main"), "{err}");
+        assert!(err.contains("approve"), "{err}");
+    }
+
+    #[test]
+    fn a_new_call_site_in_core_outside_actions_rs_is_rejected() {
+        let tmp = fake_workspace(&[(
+            "crates/core/src/growth.rs",
+            "fn refresh() { crate::actions::add_standing_grant(); }\n",
+        )]);
+        let err = human_only_authorization(tmp.path()).unwrap_err();
+        assert!(err.contains("growth.rs"), "{err}");
+    }
+
+    #[test]
+    fn internal_wiring_inside_actions_rs_itself_is_not_flagged() {
+        // approve/add_standing_grant/revoke_grant calling their own
+        // private write_grants helper is ordinary internal wiring, not
+        // a new external minting call site -- actions.rs is skipped
+        // entirely.
+        let tmp = fake_workspace(&[]);
+        assert_eq!(human_only_authorization(tmp.path()), Ok(()));
+    }
+
+    #[test]
+    fn repository_call_sites_match_the_allowlist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        human_only_authorization(root).unwrap();
+    }
 }

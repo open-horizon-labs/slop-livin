@@ -4,7 +4,6 @@ members = [
     "crates/core",
     "crates/cli",
     "crates/harvest",
-    "crates/mcp",
     "crates/source-audit",
     "crates/tui",
 ]
