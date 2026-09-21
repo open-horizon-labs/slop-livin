@@ -90,7 +90,7 @@ pub fn allocation_note(row: &crate::report::ArtifactRow) -> String {
     format!(" [unique stale; allocated {allocated}{growth}]")
 }
 
-fn kind_label(kind: &ArtifactKind) -> &'static str {
+pub fn kind_label(kind: &ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::BuildOutput => "build",
         ArtifactKind::DependencyTree => "deps",
@@ -107,7 +107,7 @@ fn kind_label(kind: &ArtifactKind) -> &'static str {
     }
 }
 
-fn reason_label(reason: &UnownedReason) -> &'static str {
+pub fn reason_label(reason: &UnownedReason) -> &'static str {
     match reason {
         UnownedReason::OutsideAnyCheckout => "outside-any-checkout",
         UnownedReason::OwnedByNothing => "owned-by-nothing",

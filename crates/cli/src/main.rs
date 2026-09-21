@@ -11,7 +11,7 @@ use swamp_core::{
         render_view_builds, render_view_deps, render_view_docker, render_view_reconciliation,
         render_view_unowned, render_worktree_signals, render_worktrees,
     },
-    report::{Report, report_full_mode, to_json},
+    report::{Report, report_full_mode},
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -36,6 +36,26 @@ enum View {
     /// Nested Cargo target/build units with physical-accounting and
     /// evidence/unknown details. Inspection only.
     Rust,
+    /// Ranked list of every discovered project: name, id, total bytes,
+    /// growth, checkout+worktree count, remote. JSON only.
+    Projects,
+    /// Rows with growth > 0 since the window, sorted desc, plus an
+    /// unowned-bytes summary and coverage (walked/du/unowned totals,
+    /// permission-denied count, history span). JSON only.
+    Grown,
+}
+
+impl View {
+    /// The name this view is addressed by in `--view` and echoed back in
+    /// `report --json`'s `"view"` field -- derived from clap's own
+    /// kebab-case rendering of the variant so the flag value and the
+    /// JSON contract never drift apart.
+    fn name(self) -> String {
+        use clap::ValueEnum;
+        self.to_possible_value()
+            .map(|v| v.get_name().to_string())
+            .unwrap_or_else(|| "worktrees".to_string())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -192,6 +212,21 @@ enum Command {
         /// Reverse the sort order (smallest first, newest first, …).
         #[arg(long)]
         reverse: bool,
+        /// Bound a JSON array-shaped result (the `result` array with
+        /// `--view`, or the `projects` array without one) to this many
+        /// rows. Only consulted with `--json`; the envelope's `total`
+        /// and `truncated` fields say whether this is a partial page.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip this many rows of a JSON array-shaped result before
+        /// applying `--limit`. Only consulted with `--json`.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// With `--view docker --json`, restrict to Docker objects with
+        /// no join evidence to a project (never attributed by name
+        /// similarity in this mode).
+        #[arg(long)]
+        unowned_only: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment live for every GitHub-remote worktree found
@@ -293,7 +328,10 @@ enum GrantCmd {
         #[arg(long)]
         max_units: Option<u32>,
     },
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     Revoke {
         grant_id: String,
     },
@@ -370,6 +408,86 @@ fn swamp_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/swamp")
 }
 
+/// Human authorization for one plan: prints every unit with its facts,
+/// then writes a one-shot grant scoped to that plan id.
+///
+/// This is one of exactly two call sites in the whole workspace allowed
+/// to reach `swamp_core::actions::approve`/`add_standing_grant`/
+/// `revoke_grant` (the other is the TUI's confirmed-execution path,
+/// `crates/tui/src/actions.rs`'s `execute_one`) -- enforced by the
+/// `human_only_authorization` source audit, which is transport-
+/// independent by construction: it does not matter that this function
+/// happens to live in the CLI binary, only that authorization is minted
+/// from exactly this reviewed call site and no other. Any shell-capable
+/// process can invoke `swamp approve`/`swamp grant add`; the boundary
+/// this enforces is "authorization is minted from one reviewed code
+/// path", not "only a human process can reach this binary". See
+/// `.oh/guardrails/human-only-authorization.md`.
+fn cmd_approve(plan_id: &str) -> Result<()> {
+    let plan = swamp_core::actions::load_plan(&swamp_dir(), plan_id)?;
+    for u in &plan.units {
+        println!(
+            "  {:<16} {:>10}  {}{}",
+            u.verb,
+            swamp_core::render::human_bytes_pub(u.bytes),
+            u.path.display(),
+            if u.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("  ⚠ {}", u.warnings.join(" · "))
+            }
+        );
+    }
+    let g = swamp_core::actions::approve(&swamp_dir(), plan_id, "human:cli")?;
+    println!(
+        "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
+        plan_id,
+        g.id,
+        swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+        g.max_units.unwrap_or(0),
+        g.expires_at
+    );
+    println!("execute with: swamp execute {plan_id}");
+    Ok(())
+}
+
+/// Human authorization for a standing grant. See `cmd_approve`'s doc for
+/// why this call site's identity matters to the `human_only_authorization`
+/// audit.
+fn cmd_grant_add(
+    dir: &Path,
+    predicate: &str,
+    budget: &str,
+    expires: &str,
+    max_units: Option<u32>,
+) -> Result<()> {
+    let budget_bytes = parse_size_arg(budget)?;
+    let expires_secs = swamp_core::growth::parse_duration_secs(expires)
+        .ok_or_else(|| anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)"))?;
+    let g = swamp_core::actions::add_standing_grant(
+        dir,
+        predicate,
+        budget_bytes,
+        max_units,
+        expires_secs,
+        "human:cli",
+    )?;
+    println!(
+        "grant {} added: delete where {} · budget {} · expires {}",
+        g.id, g.predicate, budget, expires
+    );
+    Ok(())
+}
+
+/// Human revocation of a standing or one-shot grant. See `cmd_approve`'s
+/// doc for why this call site's identity matters to the
+/// `human_only_authorization` audit.
+fn cmd_grant_revoke(dir: &Path, grant_id: &str) -> Result<()> {
+    swamp_core::actions::revoke_grant(dir, grant_id)?;
+    println!("grant {grant_id} revoked");
+    Ok(())
+}
+
 const CLEANUP_COVERAGE_DETAIL_ROWS: usize = 20;
 const CLEANUP_COVERAGE_DETAIL_LIMITS: usize = 8;
 
@@ -443,6 +561,103 @@ fn cleanup_scope_summary(
     summary
 }
 
+/// The bounded, documented JSON contract behind `report --json` (see
+/// `skills/swamp/references/commands-and-json.md`): with `--view`, an
+/// envelope `{view, project, result, observed_at, since,
+/// index_refreshed, total, truncated}` (plus `coverage` for `--view
+/// grown`); without one, the full (optionally project-scoped) report
+/// with the same `since`/`index_refreshed`/`total`/`truncated` fields
+/// added and its top-level `projects` array bounded by
+/// `--limit`/`--offset`. `--filter`, when given, narrows the whole
+/// report before any view is computed -- the same order the retired MCP
+/// `report` tool applied it in, so a filtered view and a filtered full
+/// report agree on what rows exist. This function is the only place
+/// that builds `report --json` output; every branch below funnels
+/// through it so `--view`/`--project`/`--filter` can never again be
+/// silently ignored in JSON mode the way the whole-report dump used to
+/// ignore them.
+#[allow(clippy::too_many_arguments)]
+fn report_json_envelope(
+    r: &Report,
+    root: &Path,
+    view: Option<View>,
+    project: Option<&str>,
+    parsed_filter: Option<&filter::Filter>,
+    since: Option<&str>,
+    index_refreshed: bool,
+    unowned_only: bool,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<serde_json::Value> {
+    let store_dir = swamp_dir();
+    let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
+    let mut rr = r.clone();
+    if let Some(f) = parsed_filter {
+        swamp_core::agent_json::apply_filter_to_report(&mut rr, f);
+    }
+    let observed_at = rr.observed_at;
+
+    if let Some(v) = view {
+        let name = v.name();
+        let mut result = match v {
+            View::Grown => swamp_core::agent_json::what_grew_payload(&rr, project),
+            View::Projects => swamp_core::agent_json::list_projects_payload(&rr, project),
+            View::Worktrees => swamp_core::agent_json::list_worktrees_payload(
+                &rr,
+                &filter::Filter::default(),
+                project,
+            ),
+            View::Docker => {
+                swamp_core::agent_json::docker_objects_payload(&rr, unowned_only, project)
+            }
+            View::Rust => serde_json::json!(rr.nested_artifacts),
+            _ => swamp_core::agent_json::view_payload(&rr, &name, project),
+        };
+        let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
+        let mut envelope = serde_json::json!({
+            "view": name,
+            "project": project,
+            "result": result,
+            "observed_at": observed_at,
+            "since": since_str,
+            "index_refreshed": index_refreshed,
+        });
+        if let Some(p) = page {
+            envelope["total"] = serde_json::json!(p.total);
+            envelope["truncated"] = serde_json::json!(p.truncated);
+        }
+        if v == View::Grown {
+            envelope["coverage"] = serde_json::json!({
+                "walked_total": rr.reconciliation.walked_total,
+                "du_total": rr.reconciliation.du_total,
+                "unowned_total": rr.reconciliation.unowned,
+                "attributed_total": rr.reconciliation.attributed,
+                "observed_at": observed_at,
+                "since": since_str,
+                "index_refreshed": index_refreshed,
+                "history": swamp_core::agent_json::history_block(&store_dir, root, since),
+            });
+        }
+        return Ok(envelope);
+    }
+
+    if let Some(name) = project {
+        swamp_core::agent_json::scope_to_project(&mut rr, name);
+    }
+    let mut value = serde_json::to_value(&rr)?;
+    value["since"] = serde_json::json!(since_str);
+    value["index_refreshed"] = serde_json::json!(index_refreshed);
+    if let Some(mut projects) = value.get("projects").cloned() {
+        let page = swamp_core::agent_json::paginate(&mut projects, limit, offset);
+        value["projects"] = projects;
+        if let Some(p) = page {
+            value["total"] = serde_json::json!(p.total);
+            value["truncated"] = serde_json::json!(p.truncated);
+        }
+    }
+    Ok(value)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Ui {
@@ -483,6 +698,9 @@ fn main() -> Result<()> {
             full,
             sort,
             reverse,
+            limit,
+            offset,
+            unowned_only,
         } => {
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
@@ -538,7 +756,21 @@ fn main() -> Result<()> {
                 None => None,
             };
             if json {
-                println!("{}", to_json(&r)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report_json_envelope(
+                        &r,
+                        &root,
+                        view,
+                        project.as_deref(),
+                        parsed_filter.as_ref(),
+                        since.as_deref(),
+                        !no_observe,
+                        unowned_only,
+                        limit,
+                        offset,
+                    )?)?
+                );
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {
                     Some(text) => print!("{text}"),
@@ -585,6 +817,10 @@ fn main() -> Result<()> {
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(v @ (View::Projects | View::Grown)) => {
+                        eprintln!("--view {} is JSON only; add --json", v.name());
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 match view {
@@ -609,6 +845,10 @@ fn main() -> Result<()> {
                     }
                     Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
                     Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(v @ (View::Projects | View::Grown)) => {
+                        eprintln!("--view {} is JSON only; add --json", v.name());
+                        std::process::exit(1);
+                    }
                     None => print!(
                         "{}",
                         render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
@@ -831,39 +1071,18 @@ fn main() -> Result<()> {
             let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
             swamp_core::actions::save_plan(&store_dir, &plan)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
+                        &plan,
+                        r.observed_at
+                    )?)?
+                );
             } else {
                 print_plan(&plan);
             }
         }
-        Command::Approve { plan_id } => {
-            // The human's confirm line: every unit with the facts on it,
-            // before the grant is written.
-            let plan = swamp_core::actions::load_plan(&swamp_dir(), &plan_id)?;
-            for u in &plan.units {
-                println!(
-                    "  {:<16} {:>10}  {}{}",
-                    u.verb,
-                    swamp_core::render::human_bytes_pub(u.bytes),
-                    u.path.display(),
-                    if u.warnings.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ⚠ {}", u.warnings.join(" · "))
-                    }
-                );
-            }
-            let g = swamp_core::actions::approve(&swamp_dir(), &plan_id, "human:cli")?;
-            println!(
-                "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
-                plan_id,
-                g.id,
-                swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                g.max_units.unwrap_or(0),
-                g.expires_at
-            );
-            println!("execute with: swamp execute {plan_id}");
-        }
+        Command::Approve { plan_id } => cmd_approve(&plan_id)?,
         Command::Config { action } => {
             let dir = swamp_dir();
             let path = dir.join("config.toml");
@@ -943,7 +1162,13 @@ fn main() -> Result<()> {
         Command::Plans { json } => {
             let plans = swamp_core::actions::list_plans(&swamp_dir())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&plans)?);
+                let total = plans.len();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"plans": plans, "total": total})
+                    )?
+                );
             } else if plans.is_empty() {
                 println!("no plans");
             } else {
@@ -968,54 +1193,44 @@ fn main() -> Result<()> {
                     budget,
                     expires,
                     max_units,
-                } => {
-                    let budget_bytes = parse_size_arg(&budget)?;
-                    let expires_secs = swamp_core::growth::parse_duration_secs(&expires)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)")
-                        })?;
-                    let g = swamp_core::actions::add_standing_grant(
-                        &dir,
-                        &predicate,
-                        budget_bytes,
-                        max_units,
-                        expires_secs,
-                        "human:cli",
-                    )?;
-                    println!(
-                        "grant {} added: delete where {} · budget {} · expires {}",
-                        g.id, g.predicate, budget, expires
-                    );
-                }
-                GrantCmd::List => {
+                } => cmd_grant_add(&dir, &predicate, &budget, &expires, max_units)?,
+                GrantCmd::List { json } => {
                     let gs = swamp_core::actions::list_grants(&dir)?;
-                    if gs.is_empty() {
-                        println!("no grants");
-                    }
-                    for g in gs {
+                    if json {
+                        let total = gs.len();
                         println!(
-                            "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
-                            g.id,
-                            if g.revoked { "revoked" } else { "live" },
-                            g.plan_id
-                                .as_ref()
-                                .map(|p| format!("plan {p}"))
-                                .unwrap_or_else(|| format!("where {}", g.predicate)),
-                            swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                            swamp_core::render::human_bytes_pub(g.spent_bytes),
-                            g.used_units,
-                            g.max_units
-                                .map(|m| m.to_string())
-                                .unwrap_or_else(|| "∞".into()),
-                            g.expires_at,
-                            g.actor
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "grants": gs,
+                                "total": total,
+                                "note": "grants are minted only by a human running `swamp approve <plan_id>` or `swamp grant add ...`; no command reads standing authorization into existence on its own",
+                            }))?
                         );
+                    } else if gs.is_empty() {
+                        println!("no grants");
+                    } else {
+                        for g in gs {
+                            println!(
+                                "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
+                                g.id,
+                                if g.revoked { "revoked" } else { "live" },
+                                g.plan_id
+                                    .as_ref()
+                                    .map(|p| format!("plan {p}"))
+                                    .unwrap_or_else(|| format!("where {}", g.predicate)),
+                                swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
+                                swamp_core::render::human_bytes_pub(g.spent_bytes),
+                                g.used_units,
+                                g.max_units
+                                    .map(|m| m.to_string())
+                                    .unwrap_or_else(|| "∞".into()),
+                                g.expires_at,
+                                g.actor
+                            );
+                        }
                     }
                 }
-                GrantCmd::Revoke { grant_id } => {
-                    swamp_core::actions::revoke_grant(&dir, &grant_id)?;
-                    println!("grant {grant_id} revoked");
-                }
+                GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&dir, &grant_id)?,
             }
         }
         Command::Observe { roots, full } => {

@@ -4,6 +4,7 @@
 //! authority and must re-observe every predicate before changing the filesystem.
 
 pub mod actions;
+pub mod agent_json;
 pub mod artifact;
 pub mod attribution;
 pub mod bus;
