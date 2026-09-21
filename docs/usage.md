@@ -42,6 +42,78 @@ Use `--full` to force a full filesystem walk. A normal observation can also fall
 
 Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
 
+## Scope and coverage
+
+`report`, `observe`, `ui`, and `schedule` all take an explicit root. Omit
+it and they resolve the same **effective scope**, computed by one shared
+function so no command can silently disagree with another:
+
+```bash
+swamp scope
+swamp scope --json
+```
+
+The effective scope is built from four sources, in this order:
+
+1. **Built-in default roots** on macOS: `~/src`, `~/Library/Developer`,
+   `~/Library/Caches`. (Linux has no built-in defaults yet.)
+2. **Detector results.** A small built-in catalog of read-only
+   detectors proposes locations for developer tools: Cargo home
+   (`CARGO_HOME` or `~/.cargo`, split into the home directory, the
+   registry cache, and the git-dependency cache), rustup
+   (`RUSTUP_HOME` or `~/.rustup`), and Homebrew (`HOMEBREW_PREFIX`, or
+   the conventional `/opt/homebrew` and `/usr/local` prefixes,
+   optionally corroborated by a bounded, read-only `brew --prefix`
+   call). A conventional path is still proposed even when the tool's
+   executable is absent, so a leftover cache can still be found. This
+   catalog will grow; `swamp scope --json` always lists the exact
+   detector IDs and versions in use.
+3. **`[scan] include`** in `config.toml`: extra roots always in scope.
+4. **`exclude`** and **`disabled_detectors`**: pruned last, and always
+   win over every other source -- including an explicit root you pass
+   on the command line. Disabling a detector does not hide a path
+   reachable through another still-enabled root (e.g. disabling the
+   Cargo detector does not hide `~/.cargo` if it happens to live inside
+   `~/src`, which is still in scope via the built-in defaults).
+
+`[scan] defaults = false` turns off just the three built-in default
+roots (source 1); every detector not separately named in
+`disabled_detectors` still runs. This is "explicit-only scope": only
+what you named in `include`, plus whatever detectors remain enabled.
+
+Passing an explicit root (`swamp report ~/other-tree`) replaces sources
+1-3 entirely for that invocation -- `exclude` still applies. A root that
+sits inside another in-scope root is folded into its parent for
+measurement (not walked twice); `swamp scope --json` still lists it,
+marked `skipped-as-nested`, so you can see exactly why it did not get
+its own line.
+
+An effective scope that resolves to nothing at all -- `defaults =
+false`, no `include`, and every detector disabled -- is a visible error,
+never a silent fallback to the current directory or your home
+directory. Malformed `[scan]` config (e.g. `defaults = "yes"` instead
+of a bool) is also a visible, nonzero-exit error rather than a silently
+broadened scope.
+
+Coverage is not storage: adding a root, excluding one, or a detector
+newly resolving a path is a change in what swamp *looks at*, not a
+change in what exists on disk. `report`/`observe` persist the resolved
+scope (`scope.json` under `SWAMP_DIR`) and print a one-line note on
+stderr when it changes since the last observation, e.g. `coverage
+changed since last observation: +root /Users/you/.cargo (detector
+cargo-home), -root /Users/you/old-project (excluded)`. This note never
+implies bytes were added or removed -- see
+[coverage and history](../skills/swamp/references/coverage-and-history.md).
+
+Full multi-root support differs by command today: `observe` and
+`schedule` walk every present root in the effective scope (as many
+roots as the scheduler already loops over). `report` and `ui` are
+still single-root: with no explicit root they use the effective
+scope's first present root and print a note if more than one is in
+scope. Making `report`/`ui` themselves coverage-aware across every
+resolved root is tracked separately (#42/#50); `swamp scope` and
+`swamp observe`/`swamp schedule` already show/cover the full picture.
+
 ## Cleanup recommendations
 
 Age is a cleanup signal, not a proof requirement. Supported Cargo cleanup groups
@@ -348,7 +420,23 @@ since = "24h"
 retention_days = 30
 large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
+
+[scan]
+defaults = true
+include = []
+exclude = []
+disabled_detectors = []
 ```
+
+`config init`'s `[scan]` table is not a frozen copy of the built-in
+default roots or the detector catalog -- it documents the four keys
+with their meaning; the actual defaults and detector catalog live in
+the binary and can grow across releases without editing every user's
+config. See [Scope and coverage](#scope-and-coverage) for what each key
+does and `swamp scope --json` for the resolved result. `config show`
+and `config init` both refuse (nonzero exit, message on stderr) on a
+`config.toml` with a malformed `[scan]` table, rather than silently
+falling back to the all-defaults scope.
 
 The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. The schedule log defaults to `~/Library/Logs/swamp/observe.log`. The observation timeout applies to `observe`, not every interactive operation.
 

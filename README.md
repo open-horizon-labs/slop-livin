@@ -77,6 +77,8 @@ swamp schedule --every 15m ~/src
 
 This installs a per-user LaunchAgent that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
 
+Every root above is explicit. Omit it and `report`/`observe`/`ui`/`schedule` resolve swamp's **effective scope** instead: built-in roots (`~/src`, `~/Library/Developer`, `~/Library/Caches`), plus detected developer-tool locations (Cargo, rustup, Homebrew, and more), plus anything you add or exclude in `config.toml`. Run `swamp scope` to see exactly what's in scope, why, and what's missing or excluded -- see [Scope and coverage](docs/usage.md#scope-and-coverage).
+
 ## Decide with context
 
 Swamp shows artifact types, Git tracking status, dirty files, unpushed commits, worktree activity, and cached GitHub PR and merge information. An ignored file may hold private data. A tracked file may have uncommitted edits. Neither label establishes that a copy exists elsewhere.

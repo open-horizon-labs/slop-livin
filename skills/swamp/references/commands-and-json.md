@@ -30,6 +30,54 @@ There is no CLI equivalent for an MCP tool that *writes* a grant,
 because none ever existed: grant creation was always
 `swamp grant add`/human-at-CLI only. See `trust-model.md`.
 
+`<root>` is now optional on `report`/`observe`/`ui`/`schedule`: omit it
+and the command resolves swamp's configured effective scope (built-in
+defaults, detected tool locations, and `config.toml`'s `[scan]` table)
+instead of one explicit path. `swamp scope --json` (below) is the one
+place every one of those commands' root resolution is inspectable.
+
+## `swamp scope [<root>...] --json`
+
+No MCP predecessor -- new in the scope/detector-registry work (#41/#44).
+Prints the effective scan scope: every root swamp would use for this
+invocation (or, given explicit roots, what those resolve to -- config
+`exclude` still applies), each with its filesystem status
+(`present`/`missing`/`unreadable`/`skipped-as-nested`/`excluded`) and
+every reason it is in scope, plus the full detector catalog (including
+`disabled`/`not-present`/`unresolved-with-reason` entries never
+promoted to a root) and the catalog version:
+
+```json
+{
+  "catalog_version": "2026-09-21.1",
+  "generated_at": 1758470400,
+  "defaults_enabled": true,
+  "disabled_detectors": [],
+  "configured_include": [],
+  "configured_exclude": [],
+  "explicit": false,
+  "roots": [
+    {
+      "path": "/Users/you/src",
+      "reasons": [{"source": "detector", "detector_id": "builtin-defaults", "category": "unclassified", "provenance": {"BuiltinConvention": null}}],
+      "status": {"state": "present"}
+    }
+  ],
+  "detectors": [
+    {"detector_id": "cargo-home", "name": "Cargo home", "locations": [{"detector_id": "cargo-home", "path": "/Users/you/.cargo", "category": "installation", "provenance": "builtin-convention", "status": {"state": "resolved"}, "note": "cargo home: bin/, config.toml, credentials"}]}
+  ],
+  "pruned_subtrees": []
+}
+```
+
+An effective scope with no roots at all (`defaults = false`, no
+`include`, every detector disabled) is not an empty `roots: []` --
+`report`/`observe`/`scope` all refuse to run with a nonzero exit and an
+explicit stderr message, never a silent fallback to the current
+directory. See [coverage-and-history.md](coverage-and-history.md) for
+the coverage-change notes `report`/`observe` print when the resolved
+scope differs from the last observation.
+
 ## `swamp report <root> --json`
 
 Always applies `--filter` (if given) to the whole report before

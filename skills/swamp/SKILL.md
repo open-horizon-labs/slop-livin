@@ -16,20 +16,28 @@ evidence of disuse.
 Every session starts read-only. Get oriented before proposing anything:
 
 ```sh
+swamp scope --json                                      # what's in scope, and why -- check this first
 swamp report <root> --view grown --json --since 24h   # what grew, plus coverage
 swamp report <root> --view projects --json             # ranked project list
 swamp report <root> --view worktrees --json             # branch/idle/PR/merge facts
 ```
 
 `<root>` is the directory tree to scan (a `~/src`-style parent of
-several checkouts, or one checkout). Every command below is
-noninteractive and prints exactly one JSON document to stdout with
-diagnostics on stderr -- safe to pipe to `jq`, safe to run unattended.
-Full schemas, every view, pagination and error/exit-code contract: see
+several checkouts, or one checkout) and is optional: omit it and
+`report`/`observe`/`ui`/`schedule` resolve swamp's configured effective
+scope instead (built-in roots, detected tool locations like Cargo/
+rustup/Homebrew, and `config.toml`'s `[scan]` additions/exclusions).
+`swamp scope --json` shows exactly what that resolves to, with
+provenance for every root -- run it before trusting an implicit root.
+Every command below is noninteractive and prints exactly one JSON
+document to stdout with diagnostics on stderr -- safe to pipe to `jq`,
+safe to run unattended. Full schemas, every view, pagination and
+error/exit-code contract, and `swamp scope`'s own schema: see
 `references/commands-and-json.md`. Narrowing what you see with
 `--project`/`--filter`: see `references/filters.md`. What "since"/
-"history"/partial coverage actually mean before you trust a growth
-number: see `references/coverage-and-history.md`.
+"history"/partial coverage/scope actually mean before you trust a
+growth number or an implicit root: see
+`references/coverage-and-history.md`.
 
 ## Proposing cleanup
 
@@ -69,18 +77,18 @@ enough for read-only investigation.
 
 | Reference | Load it for | Measured size (`wc -c`) |
 |---|---|---|
-| `references/commands-and-json.md` | Full command/flag/JSON-schema reference, the historical MCP-tool-to-CLI-command mapping, exit codes | 8.4 KB |
+| `references/commands-and-json.md` | Full command/flag/JSON-schema reference including `swamp scope`, the historical MCP-tool-to-CLI-command mapping, exit codes | 10.3 KB |
 | `references/cleanup-and-recovery.md` | propose/approve/execute/grant lifecycle, Trash recovery, refusal causes, `cleanup-check` for Cargo builds | 5.1 KB |
 | `references/trust-model.md` | The real authorization boundary: what the sink enforces vs. what is only behavioral convention | 4.6 KB |
-| `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, what a growth number does and doesn't prove | 3.3 KB |
+| `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 4.2 KB |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
 
-This file is 4.6 KB (roughly 1,100 tokens at ~4 bytes/token). Each
+This file is 5.3 KB (roughly 1,300 tokens at ~4 bytes/token). Each
 reference loads independently -- none requires another to make sense,
 and a read-only investigation task typically needs this file alone or
 this file plus `commands-and-json.md`. If every reference were loaded
 in the same turn (rare in practice) the total footprint is about
-24 KB / ~6,000 tokens. These are measured byte counts, not a claim that
+27 KB / ~6,700 tokens. These are measured byte counts, not a claim that
 this beats any particular MCP client's own tool-schema overhead --
 that overhead varies by client and was never measured here; see
 `references/trust-model.md` for what this skill *does* claim about the

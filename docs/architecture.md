@@ -60,6 +60,81 @@ Folded-group timestamp semantics must describe what was observed; a directory's 
 
 The planned validation covers mixed/unknown ages, overlapping groups, non-additive accounting, concrete consequences, evidence-only refresh, and unchanged/one-group-change latency and storage size. The purpose is useful developer cleanup decisions, not a perfect audit of historical use.
 
+## Effective scope and location detectors
+
+Before any observation, swamp resolves *which roots to look at* -- a
+separate concern from the observation pipeline below, which decides how
+to walk a chosen root. [`crate::scope::resolve_effective_scope`](../crates/core/src/scope.rs)
+is a pure function: given an [`Environment`](../crates/core/src/locations/mod.rs)
+(home directory, env vars, platform, and an optional command runner),
+a `ScanConfig` (the `[scan]` table), any explicit command-line roots,
+and a detector [`Registry`](../crates/core/src/locations/mod.rs), it
+returns an `EffectiveScope` -- never touching the filesystem except a
+single, non-recursive presence/readability check per candidate root.
+Every scope-resolving CLI command (`scope`, `report`, `observe`, `ui`,
+`schedule`) calls this one function; none of them recomputes scope on
+its own. See [Scope and coverage](usage.md#scope-and-coverage) for the
+user-facing behavior this produces.
+
+### Location detector registry
+
+A detector proposes candidate storage locations for one developer tool
+(Cargo, rustup, Homebrew, ...). It is deliberately **not** an
+`EventBus` consumer: the bus's consumers react to walk events for an
+already-chosen root, and a detector's whole job is deciding which roots
+to walk in the first place -- there is no walk in progress yet for it
+to subscribe to. What a detector *does* borrow from the bus's
+discipline (see "Observation pipeline" below and
+[extractors-are-pluggable](../.oh/guardrails/extractors-are-pluggable.md)):
+static registration (`Registry::with_builtins`, mirroring
+`EventBus::with_builtins`), no detector knows about another, and
+`crate::scope` never special-cases the walk or report assembly for a
+new detector.
+
+Adding a detector is one small file plus one line of registration.
+Copy an existing one under [`crates/core/src/locations/`](../crates/core/src/locations/)
+-- `cargo_home.rs` for a single env-var-or-convention root split into
+several categorized sub-locations, or `homebrew.rs` for a detector that
+also runs one bounded, read-only, allow-listed tool query -- then add it
+to `Registry::with_builtins`. Every detector:
+
+- Declares a stable `id()` (used in `disabled_detectors` config and in
+  `EffectiveScope` provenance -- never reused for a different meaning
+  once released), the `platforms()` it applies to, and a
+  `version_note()` for `swamp scope` output and this doc.
+- Returns `ProposedLocation`s carrying a `StorageCategory`
+  (installation/downloads/cache/local-state/environments/build-output/
+  models/unclassified), a `Provenance` (built-in convention, env var,
+  config field, or tool query), and a `LocationStatus` (resolved,
+  not-present, disabled, or unresolved-with-reason) -- never a bare
+  path with no explanation of how it was found.
+- Never executes shell startup files, project scripts, plugins, or
+  package-install commands. A tool query is optional, must appear on
+  the detector-wide `ALLOWED_COMMANDS` allow-list, is bounded by a
+  timeout, and its failure is reported on its own `ProposedLocation`
+  entry (`UnresolvedWithReason`), never fatal to the rest of detection.
+  A convention-path proposal does not depend on the tool query
+  succeeding or even running, so a leftover cache is still found after
+  the tool itself is uninstalled.
+- Never authorizes measurement, attribution, or removal. Discovery
+  (this registry) is strictly upstream of measurement (the observation
+  pipeline), attribution (project/worktree linkage), and deletion
+  eligibility (grants/actions).
+
+`crate::scope` folds detector output into scope: it deduplicates two
+detectors resolving the same normalized path (retaining every
+reason/provenance), applies `disabled_detectors` (and, for the
+built-in-defaults detector specifically, `defaults = false`) before
+calling `detect()` at all, applies `exclude` after resolution, and
+folds a root that is a subdirectory of another in-scope root into its
+parent for measurement while retaining the fold as an inclusion reason
+on the parent. Tests never scan the real home directory: `Environment::fixture`
+takes an explicit home/env/platform and a `NullCommandRunner` by
+default (any tool query fails loudly rather than silently reaching a
+real binary on the test machine); `FakeCommandRunner` records every
+call it receives so a test can assert a detector only ever asked for an
+allow-listed, read-only command.
+
 ## Observation pipeline
 
 Each consumer subscribes to typed events and returns follow-on events. Registration happens in [EventBus::with_builtins](../crates/core/src/bus/mod.rs) before the run begins. Large shared event payloads use `Arc`.

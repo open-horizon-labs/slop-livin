@@ -49,6 +49,25 @@ generates a byte-history delta or a tombstone on its own. If a number
 changes between two calls with nothing on disk actually different,
 that is a defect to investigate, not an expected refresh artifact.
 
+This also covers *scope* changes: adding a root to `config.toml`'s
+`[scan]` table, a detector newly resolving a location, or excluding a
+path are changes in what swamp *looks at*, never a change in what
+exists on disk. `report`/`observe` persist the resolved scope
+(`scope.json` under `$SWAMP_DIR`) and print a one-line note on stderr
+when it differs from the last one:
+
+```
+coverage changed since last observation: +root /Users/you/.cargo (detector cargo-home), -root /Users/you/old-project (excluded)
+```
+
+`swamp scope --json` shows the full resolved scope on demand (roots,
+statuses, reasons, the detector catalog, and its version) without
+needing to diff two observations yourself -- see
+`commands-and-json.md`'s `swamp scope` section. A root omitted from a
+`report`/`observe`/`ui`/`schedule` call resolves this same scope, one
+shared code path for every command; never assume an agent's or
+another command's idea of "the roots" without checking `swamp scope`.
+
 ## Reconciliation and unknowns
 
 `--view reconciliation --json`: `{attributed, unowned, walked_total,
