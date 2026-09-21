@@ -199,8 +199,17 @@ fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
             .iter()
             .any(|init| init.contains("classify_at"));
         // `process_size` recurses inside an already-folded unit;
-        // `resize_artifact` re-sizes a path the store already classified.
-        if !guarded && s.func != "process_size" && s.func != "resize_artifact_with_dirs" {
+        // `resize_artifact`/`resize_artifact_with_dirs` (and their
+        // `_excluding` variants, #45-#49: an external unit's own
+        // measurement can exclude a nested, separately-measured
+        // sub-location) re-size a path the caller already classified --
+        // the exclusion list only prunes what is folded, it never
+        // widens what may be folded without a classify_at guard.
+        if !guarded
+            && s.func != "process_size"
+            && s.func != "resize_artifact_with_dirs"
+            && s.func != "resize_artifact_with_dirs_excluding"
+        {
             return Err(format!(
                 "walk::{}: builds AttrJob::Size outside an `if let Some(kind) = classify_at(..)`: a directory would be folded without being an artifact",
                 s.func

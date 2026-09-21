@@ -4,6 +4,36 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+- **Added the full developer-storage detector catalog** (#45-#49):
+  language version managers (mise, asdf, pyenv, uv, Conda, rbenv, RVM,
+  ruby-install, nvm, and rustup extended to distinguish toolchains/
+  downloads/tmp), shared dependency/build caches (Cargo home refined
+  into five categorized locations, npm, pnpm, Gradle, Maven, Go, pip),
+  Apple/Android developer tooling (Xcode, CoreSimulator, Android SDK),
+  and package/model/VM stores (Homebrew extended with Cellar/Caskroom,
+  Hugging Face, Ollama, and Docker Desktop's sparse VM backing file
+  measured allocated-not-apparent, plus OrbStack). See
+  [docs/locations.md](docs/locations.md) for the full table, sources,
+  and documented limits (pnpm's per-volume stores, Maven's undecidable
+  downloaded-vs-local split, Docker Desktop's relocatable disk image).
+  Fixed alongside it: a detector-resolved location nested inside
+  another kept root, or inside another detector's own base directory,
+  used to be measured twice (once in that root's/location's own
+  whole-directory total, again as its own separate external unit) --
+  it is now pruned from the outer measurement and counted exactly once
+  (`scope::EffectiveScope::external_pruned_subtrees`,
+  `walk::resize_artifact_excluding`).
+- **Supported multi-root reports, coverage inspection, and live
+  refresh in the TUI** (#51). `swamp ui` with no explicit root now
+  opens over the *whole* configured scope, not just its first present
+  root: project/shared/external/agent-tool storage from every present
+  root is visible together, including a root with no Git checkout in
+  it at all. The header's coverage clause now reflects this pass's
+  actual per-root walk outcome (`Partial`/`Missing`/`Excluded`/
+  `Inaccessible`), not just pre-walk presence; the live FSEvents watch
+  and cached-startup/background refresh both cover every included
+  root independently, so a change under one root never erases or
+  stale-marks another's rows.
 - **Modeled agent-tool storage (Claude Code) and shipped a supported
   cleanup path** (#91, #92, #100, #101). `swamp report --view agents`
   identifies sessions, caches, logs, checkpoints and protected

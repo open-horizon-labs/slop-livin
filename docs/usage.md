@@ -57,17 +57,28 @@ The effective scope is built from four sources, in this order:
 
 1. **Built-in default roots** on macOS: `~/src`, `~/Library/Developer`,
    `~/Library/Caches`. (Linux has no built-in defaults yet.)
-2. **Detector results.** A small built-in catalog of read-only
-   detectors proposes locations for developer tools: Cargo home
-   (`CARGO_HOME` or `~/.cargo`, split into the home directory, the
-   registry cache, and the git-dependency cache), rustup
-   (`RUSTUP_HOME` or `~/.rustup`), and Homebrew (`HOMEBREW_PREFIX`, or
-   the conventional `/opt/homebrew` and `/usr/local` prefixes,
-   optionally corroborated by a bounded, read-only `brew --prefix`
-   call). A conventional path is still proposed even when the tool's
-   executable is absent, so a leftover cache can still be found. This
-   catalog will grow; `swamp scope --json` always lists the exact
-   detector IDs and versions in use.
+2. **Detector results.** A built-in catalog of read-only detectors
+   proposes locations for developer tools: language version managers
+   (mise, asdf, pyenv, uv, Conda, rbenv, RVM, ruby-install, nvm,
+   rustup), shared dependency/build caches (Cargo home, npm, pnpm,
+   Gradle, Maven, Go, pip), Apple/Android developer tooling (Xcode,
+   CoreSimulator, Android SDK), and package/model/VM stores (Homebrew,
+   Hugging Face, Ollama, Docker Desktop's host backing file, OrbStack).
+   A conventional path is still proposed even when the tool's
+   executable is absent, so a leftover cache can still be found. See
+   [docs/locations.md](locations.md) for the full table -- every
+   detector, its locations, overrides, categories, and documented
+   limits (e.g. pnpm's per-volume stores are not enumerated, Maven's
+   downloaded-vs-locally-installed split needs per-artifact evidence
+   this catalog does not inspect). `swamp scope --json` always lists
+   the exact detector IDs and catalog version in use.
+
+   A detector-resolved location that falls *inside* another kept root
+   (a config `include`, a built-in default, or another detector's own
+   base directory) is pruned from that root's walk and measured
+   exactly once, as its own external unit -- see
+   [coverage-and-history.md](../skills/swamp/references/coverage-and-history.md)'s
+   "External/shared storage units".
 3. **`[scan] include`** in `config.toml`: extra roots always in scope.
 4. **`exclude`** and **`disabled_detectors`**: pruned last, and always
    win over every other source -- including an explicit root you pass
@@ -120,6 +131,18 @@ scheduled run installed with no explicit roots (`swamp schedule --every
 30m`, no trailing paths) re-resolves the configured scope on every
 fire, so editing `config.toml` takes effect on the next run rather than
 only after re-running `schedule --every`.
+
+`swamp ui` with no explicit root opens over this same whole scope, not
+just its first present root: project, shared/external, and agent-tool
+storage from every present root are all visible together, including a
+root that has no Git checkout in it at all. The header shows a short
+coverage clause whenever any root's own walk this pass was not cleanly
+`complete` (e.g. `2 roots (1 missing)`, `2 roots (1 partial: 2 path(s)
+unreadable during this walk)`); the live FSEvents watch and the
+cached-startup/background refresh both cover every included root
+independently, so a change under one root is reflected without ever
+touching another root's rows. Passing an explicit root
+(`swamp ui ~/other-tree`) keeps the single-root path unchanged.
 
 ### Observation regions
 
