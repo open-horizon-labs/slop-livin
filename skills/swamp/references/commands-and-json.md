@@ -49,7 +49,7 @@ promoted to a root) and the catalog version:
 
 ```json
 {
-  "catalog_version": "2026-09-21.1",
+  "catalog_version": "2026-09-21.4",
   "generated_at": 1758470400,
   "defaults_enabled": true,
   "disabled_detectors": [],
@@ -66,9 +66,26 @@ promoted to a root) and the catalog version:
   "detectors": [
     {"detector_id": "cargo-home", "name": "Cargo home", "locations": [{"detector_id": "cargo-home", "path": "/Users/you/.cargo", "category": "installation", "provenance": "builtin-convention", "status": {"state": "resolved"}, "note": "cargo home: bin/, config.toml, credentials"}]}
   ],
-  "pruned_subtrees": []
+  "pruned_subtrees": [],
+  "external_pruned_subtrees": []
 }
 ```
+
+`detectors` covers the full catalog (#45-#49): language version
+managers (mise, asdf, pyenv, uv, Conda, rbenv, RVM, ruby-install, nvm,
+rustup), shared dependency/build caches (Cargo home, npm, pnpm,
+Gradle, Maven, Go, pip), Apple/Android tooling (Xcode, CoreSimulator,
+Android SDK), and model/VM stores (Homebrew, Hugging Face, Ollama,
+Docker Desktop's sparse backing file, OrbStack) -- see
+`docs/locations.md` for the full table of every detector, its
+locations, overrides, categories, and documented limits (e.g. pnpm's
+per-volume stores, Maven's undecidable downloaded-vs-local split).
+`external_pruned_subtrees` names a detector-resolved location that
+folded into one of `roots` as a nested subtree and was pruned from
+that root's walk because it is separately measured as its own external
+unit (`--view external`) -- the mechanism that keeps a location's
+bytes counted exactly once instead of twice (see
+`coverage-and-history.md`'s "External/shared storage units").
 
 An effective scope with no roots at all (`defaults = false`, no
 `include`, every detector disabled) is not an empty `roots: []` --

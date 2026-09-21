@@ -111,23 +111,40 @@ doing silently.
 ## External/shared storage units
 
 Storage with no containing project (the Cargo registry, rustup
-toolchains, a Homebrew prefix, ...) is a first-class **external unit**
-(`report --view external`/`--json`), identity `(detector, category,
-canonical path)`, independent of any project or worktree. It carries
-its own size/growth/regrowth history under the same coverage rules
-above, and zero or more declared `consumers` -- adding or removing a
-consumer never duplicates the unit or resets its history. External
-units are **never folded into `reconciliation`** (not summed into
+toolchains, a Homebrew prefix, a language-version-manager data dir, a
+model cache, ...) is a first-class **external unit** (`report --view
+external`/`--json`), identity `(detector, category, canonical path)`,
+independent of any project or worktree. It carries its own
+size/growth/regrowth history under the same coverage rules above, and
+zero or more declared `consumers` -- adding or removing a consumer
+never duplicates the unit or resets its history. External units are
+**never folded into `reconciliation`** (not summed into
 `walked_total`/`attributed`/`unowned`): the `--view external` total is
 a separate, additive figure, not a double count of anything above it.
-They are inspection-only by contract: the action layer can name one in
-a plan, but execution always refuses it with "no supported selective
-action for `<category>`" -- never treat an external unit as deletable
-through any path this tool exposes. The CLI's `propose` command does
-not yet expose a selection mode for external units (only `report
---view external` is CLI-reachable today); do not attempt to `propose`
-an external unit's path through the ordinary root-scoped `propose`
-command -- it will simply not match any row there.
+
+A detector-resolved location that falls *inside* an ordinary scan root
+(e.g. Homebrew's `~/Library/Caches/Homebrew` inside the built-in
+`~/Library/Caches` default, or Cargo home's own `registry`/`git`
+subdirectories inside its own base directory) is pruned from that
+root's walk rather than counted twice: `swamp scope --json`'s
+`external_pruned_subtrees` names exactly which subtree was pruned from
+which root and which detector separately measures it, and
+`report --json`'s top-level `notes` array carries a matching one-line
+entry for the same reason. The same "count it once" rule applies
+*among* external units themselves: a location nested inside another
+detector-resolved location (mise's `installs`/`downloads` inside its
+own data dir, Hugging Face's `hub` cache inside `HF_HOME`) is excluded
+from that outer location's own measurement, so summing every unit in
+`--view external` never double-counts a nested one.
+They are inspection-only by contract: `swamp propose --external
+[--path P]` (or a bare `swamp propose --path P` when `P` matches an
+external unit and not an agent-storage one) builds a plan naming it --
+useful to see exactly what a plan would say about it -- but `execute`
+always refuses every external unit unconditionally with "no supported
+selective action for `<category>`", before any grant/budget check
+runs. Never treat an external unit as deletable through any path this
+tool exposes; `propose --external` is inspection, not a second
+authorization route.
 
 ## Filesystem vs. Docker accounting
 
