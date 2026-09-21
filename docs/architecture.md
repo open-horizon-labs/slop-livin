@@ -60,6 +60,85 @@ Folded-group timestamp semantics must describe what was observed; a directory's 
 
 The planned validation covers mixed/unknown ages, overlapping groups, non-additive accounting, concrete consequences, evidence-only refresh, and unchanged/one-group-change latency and storage size. The purpose is useful developer cleanup decisions, not a perfect audit of historical use.
 
+## Decision evidence contract (#53-#61)
+
+Distinct from the section above (that one is the independent
+build-artifact-identification epic, #64-#74): this is the catalog-wide
+current-state evidence contract for artifact rows, external units,
+agent-storage units and nested build-artifact units, implemented in
+`crates/core/src/evidence.rs`.
+
+`evidence::Evidence` is the shared shape: `kind` (`Activity`,
+`Consumer`, `CurrentUse`, `Recovery`, `Reclaimability`), `subtype` (a
+named finer-grained fact, e.g. `Modified` vs. `ToolReportedUse` within
+`Activity`), `status` (`Known(value)` / `Unknown{reason}` /
+`Unavailable{reason}` / `Conflicting{candidates,reason}`), `source`
+(`EvidenceSource`, naming exactly what produced it, down to a file
+path or tool name), `observed_at`, an optional `event_at` distinct from
+`observed_at`, and a `Freshness` (an optional expiry for short-lived
+facts, and/or a stated coverage limit). `Unknown` and `Unavailable` are
+deliberately distinct: the former means the source was consulted and
+had no answer, the latter means the source itself could not be reached
+this pass (permission, daemon down, query timeout) -- collapsing them
+would make "the query failed" indistinguishable from "checked, found
+nothing".
+
+Each domain has its own populating module, all pure/read-only and
+reusing facts a pass already has in hand:
+
+| Module | Domain | What it reuses |
+|---|---|---|
+| `activity.rs` (#54) | Activity | `ArtifactRow`/`ExternalUnit`/`AgentUnit`'s already-recorded `mtime_max`; `statfs` flags (macOS) / `/proc/mounts` (Linux) to detect `noatime`/`relatime` before ever trusting an access-time read; Docker's own `last_used`, kept as a separate fact from filesystem mtime |
+| `occupancy.rs` (#55) | CurrentUse | `lsof` (existing `occupied()`'s underlying command, now also exposed as structured evidence distinguishing "no match" from "query failed"), already-collected Docker `ContainerRef`s, a non-blocking `flock` probe for manager lock files, and the bounded, allow-listed `xcrun simctl list devices -j` query (new `locations::ALLOWED_COMMANDS` entry) for simulator booted state |
+| `toolchain_declarations.rs` (#56) | Consumer | Read-only parsers for `.tool-versions`/`mise.toml`, `.python-version`, `.ruby-version`, `.nvmrc`/`.node-version`, `rust-toolchain(.toml)`, rustup's global `default_toolchain`; matched against measured installations with manager semantics (an alias/range like `lts/*` or a bare `3.12` stays an explicit unresolved range unless exactly one installation uniquely matches) |
+| `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`) joined by exact name+version; `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
+| `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven `_remote.repositories` marker (network fetch vs. unknown -- directory category alone never decides this), a known toolchain version string (local reinstall); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
+| `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice |
+
+Attachment point: `report::attach_decision_evidence`, called exactly
+once from `bus::run_report` -- the single choke point every report
+caller (CLI text/JSON, TUI, single- and multi-root) goes through --
+populates every `ArtifactRow.evidence` with Activity, Reclaimability
+and (for `BuildOutput`/`DependencyTree`/`Cache` kinds) Recovery facts.
+The Docker-join site in `report.rs` and `external::discover_and_measure`
+attach Consumer facts from data they already collected. `CurrentUse` is
+deliberately *not* attached during a passive report (a live
+process/lock/container check is short-lived and only meaningful right
+before an action): `actions::plan_unit_evidence` takes it fresh at
+proposal time, and `execute_with_trash_opts` takes it fresh *again*
+immediately before acting, so a fact that changes between propose and
+execute is always caught rather than compared against a possibly-stale
+snapshot.
+
+Cost discipline: every population step above is O(rows) arithmetic
+over numbers the walk/measurement pass already produced, or one
+bounded query per *proposed* unit (never per file, never per report
+row for `CurrentUse`) -- see `crates/core/tests/evidence_contract.rs`'s
+`refreshing_evidence_never_writes_byte_history_delta`, which asserts
+two observations with nothing changed on disk produce byte-identical
+`bytes`/`growth_bytes`/`regrowth_count`, and that calling
+`attach_decision_evidence` again on an already-annotated report changes
+nothing.
+
+Human keep/protect intent (`swamp protect`, previously effective only
+for agent-storage units) is extended to ordinary artifact rows via
+`actions::propose_checking_protection`: a protected path is refused at
+proposal time with a named cause in `plan.refused`, never silently
+dropped or silently left plannable. Only `agents::protect_add`/
+`protect_remove` (reachable only from the CLI's own `protect`
+subcommand) can change the underlying list -- a scanned project file or
+an agent's own observation cannot.
+
+Known gaps, named rather than silently absent: the bespoke-shaped JSON
+views (`kinds`/`builds`/`deps`/`unowned`/`worktrees`) do not yet carry
+`evidence` (only the default report view and `--view external`/
+`--view agents` do, since those pass whole structs through serde); the
+TUI's detail rendering of evidence is not yet wired; Maven's
+declared-dependency join (#57) still relies on the `_remote.repositories`
+marker rather than a parsed dependency list (no XML parser dependency
+in this workspace); `pom.xml` dependency parsing is not implemented for
+the same reason.
+
 ## Effective scope and location detectors
 
 Before any observation, swamp resolves *which roots to look at* -- a

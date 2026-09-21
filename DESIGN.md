@@ -193,6 +193,17 @@ Project rows expand to actionable artifacts. If none exist, a direct project act
 
 Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.
 
+Known, named gap (#60/#61): the confirmation row's warnings line comes
+from `PlanUnit::warnings` (dirty/unpushed/untracked/no-remote facts),
+which predates the decision-evidence contract (#53) and is not yet
+extended to render `PlanUnit::evidence`'s activity/consumer/recovery/
+reclaimability facts inline. The CLI (`report --view external` text,
+and the default/`--view external`/`--view agents` JSON) is the
+currently-wired presentation surface for that contract -- see
+`docs/usage.md`'s "Decision evidence" section. Revisit alongside the
+`history_secs` simplification noted above the next time this file's
+Actions/confirmation area is touched.
+
 ## Review
 
 Review and deletion run on background workers. During an operation, replace the

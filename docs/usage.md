@@ -526,6 +526,71 @@ swamp plans
 
 The ledger lives at `~/.local/share/swamp/ledger.jsonl`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
 
+## Decision evidence
+
+Beyond size and growth, an artifact row, external unit, agent-storage
+unit and nested build-artifact unit can carry `evidence`: a list of
+sourced facts in five domains (#40's W2a/W2b), never a safety verdict.
+Each fact states its own provenance and limits rather than a bare
+value:
+
+- **kind**: `activity`, `consumer`, `current-use`, `recovery`, or
+  `reclaimability`.
+- **status**: `known` (with a typed value), `unknown` (consulted, no
+  answer), `unavailable` (the source itself could not be reached this
+  pass -- distinct from "checked and found nothing"), or `conflicting`
+  (two sources disagree; both are kept).
+- **source**: what produced it (`filesystem-metadata`, `tool-reported`,
+  `process-query`, `manager-lock`, `config-declaration`, `lockfile`,
+  `build-metadata`, `docker-api`, `statvfs`, or `inferred`), with
+  enough detail to judge how much to trust it.
+- **observed_at** / **event_at**: when swamp looked, versus when the
+  underlying thing happened -- a file's modification time observed
+  today is not "modified today".
+- **freshness**: an optional expiry (short-lived facts like an open-
+  file check are rechecked at the next action boundary, never trusted
+  indefinitely) and/or a stated coverage limit (e.g. "only measured
+  children the folded walk recorded this pass").
+
+`report --json` (default view, `--view external`, `--view agents`)
+includes each row's `evidence` array; the interactive CLI text output
+(`--view external`) prints one line per fact. `swamp propose` snapshots
+a unit's report-row evidence plus a fresh current-use reading at
+proposal time; `swamp execute` re-takes current-use fresh immediately
+before acting rather than trusting that snapshot, so something that
+started using a unit between proposal and execution is still caught.
+
+What each domain actually establishes:
+
+| Domain | What it can show | What it cannot |
+|---|---|---|
+| Activity | Newest recorded modification among a unit's measured children (never "last used"); a tool's own reported use timestamp (Docker's `last_used`, a Cargo fingerprint), kept distinct from filesystem age | Whether a human intentionally used the content; access time when the mount suppresses `atime` (`noatime`/`relatime`, detected and reported `unavailable`) |
+| Consumer | A declared reference: a version-manager pin, a dependency lockfile entry, an Xcode `WorkspacePath`, a Docker join -- who *asks for* something | Whether that reference was ever actually exercised at runtime |
+| Current-use | A live, bounded, read-only check: an open file handle (`lsof`), a running Docker container, a simulator's booted state, a manager lock file's holder | Whether something not currently open/running/locked has no consumer at all -- absence here is not proof of no use |
+| Recovery | A sourced restoration path (rebuild from present source, network-fetch from a named lockfile, local reinstall from a known version, or "potentially unique local state" for mutable environments) with named prerequisites and a concrete smallest useful follow-up check | Whether the network/registry/credentials needed at restore time are actually available -- always stated as a material unknown, never assumed |
+| Reclaimability | Allocated bytes (always known), an estimated-reclaimable figure that is bounded rather than exact when hardlinks/APFS clones/snapshots are in play, and an observed post-action free-space change (`statvfs` before/after) | An exact reclaimed-byte guarantee from a scan alone; Trash, snapshots, open files and concurrent writers can all suppress the expected change |
+
+Inventory of which artifact/detector domains have real activity
+evidence today versus report unknown: filesystem artifact rows get
+modification age (and access time only where the mount supports it);
+Docker build-cache entries get the daemon's own `last_used`; Docker
+images/volumes report unknown (the daemon has no last-used field for
+them); Cargo nested build artifacts get their fingerprint file's mtime;
+agent-tool and external-location units get modification age only, with
+no per-tool invocation history read.
+
+`swamp protect add/remove/list` (previously effective only for
+agent-storage units) now also refuses a plan proposal that names a
+protected path for an ordinary filesystem artifact row: the path is
+named in the plan's `refused` list, never silently dropped or silently
+included. Only this explicit, human-issued command can add or remove a
+protection; a scanned project file or an agent's own observation
+cannot.
+
+See `docs/architecture.md`'s "Decision evidence contract" section for
+the implementation, and `skills/swamp/references/evidence.md` for the
+same summary aimed at an agent reading the skill.
+
 ## Agent interface
 
 Through v0.6.x, agent access went through a separate `swamp-mcp` stdio

@@ -4,6 +4,44 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+- **Added the current-state decision-evidence contract** (#53-#61):
+  activity, consumer, current-use, recovery and reclaimability facts,
+  each carrying a source, observation/event time and freshness/
+  coverage limit -- never a bare value or a safety verdict. Populated
+  from data every pass already collects (folded `mtime_max`, Docker's
+  own `last_used`/container references, existing consumer
+  associations, Docker joins, a unit's `bytes`/`hardlinked` flag) and
+  attached to artifact rows, external units, agent-storage units and
+  nested build-artifact units. New domain modules:
+  `crates/core/src/evidence.rs` (the shared contract),
+  `activity.rs` (#54, folded modification age and access-time
+  reliability detection via `statfs`/`/proc/mounts`),
+  `occupancy.rs` extensions (#55, structured lsof/Docker-container/
+  manager-lock/simulator-booted current-use evidence, all bounded and
+  read-only), `toolchain_declarations.rs` (#56, `.tool-versions`/
+  `mise.toml`/`.python-version`/`.nvmrc`/`rust-toolchain` parsing
+  matched to measured installations with manager-specific
+  alias/range semantics), `external_associations.rs` (#57, Xcode
+  DerivedData `WorkspacePath` and dependency-lockfile joins),
+  `recovery.rs` (#58, per-unit sourced recovery paths with named
+  prerequisites and a concrete follow-up check, replacing the blanket
+  per-kind label), and `reclaimability.rs` (#59, logical/allocated/
+  estimated-reclaimable/observed-freed accounting with selection-set
+  inode deduplication). `report::attach_decision_evidence` wires
+  Activity/Reclaimability/Recovery into every report through
+  `bus::run_report`'s single choke point; current-use is taken fresh
+  at proposal time and rechecked fresh again immediately before
+  `execute` acts, so a fact that changes between propose and execute
+  (something opens a unit after proposal) is always caught. `swamp
+  protect` is extended from agent-storage-only to ordinary filesystem
+  artifact rows. See [docs/usage.md](docs/usage.md)'s "Decision
+  evidence" section and
+  [docs/architecture.md](docs/architecture.md)'s "Decision evidence
+  contract" section for the full picture, including named gaps (the
+  bespoke-shaped JSON views and the TUI's detail rendering do not yet
+  carry evidence; Maven/`pom.xml` dependency parsing is not
+  implemented).
+
 - **Added the full developer-storage detector catalog** (#45-#49):
   language version managers (mise, asdf, pyenv, uv, Conda, rbenv, RVM,
   ruby-install, nvm, and rustup extended to distinguish toolchains/

@@ -59,7 +59,11 @@ Show the human the plan's units, bytes, and warnings (dirty checkout,
 unpushed commits, no remote) verbatim -- they are facts to weigh, not
 noise to summarize away. Full lifecycle (propose -> approve -> execute,
 grants, `--keep-executables`, Trash recovery, refusal causes): see
-`references/cleanup-and-recovery.md`.
+`references/cleanup-and-recovery.md`. Each row/unit and each plan unit
+also carries an `evidence` array (activity, consumer, current-use,
+recovery, reclaimability facts with source and freshness) -- read
+`references/evidence.md` before summarizing what keeping or removing
+something would actually mean.
 
 ## Why this isn't a security boundary
 
@@ -84,13 +88,14 @@ enough for read-only investigation.
 | `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 6.8 KB |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
 | `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect`, `swamp propose --path` | 3.4 KB |
+| `references/evidence.md` | The activity/consumer/current-use/recovery/reclaimability evidence contract: what each fact's `status`/`source`/`freshness` actually establishes, and what it does not | 5.2 KB |
 
 This file is 5.8 KB (roughly 1,400 tokens at ~4 bytes/token). Each
 reference loads independently -- none requires another to make sense,
 and a read-only investigation task typically needs this file alone or
 this file plus `commands-and-json.md`. If every reference were loaded
 in the same turn (rare in practice) the total footprint is about
-34 KB / ~8,500 tokens. These are measured byte counts, not a claim that
+39 KB / ~9,700 tokens. These are measured byte counts, not a claim that
 this beats any particular MCP client's own tool-schema overhead --
 that overhead varies by client and was never measured here; see
 `references/trust-model.md` for what this skill *does* claim about the
