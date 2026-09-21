@@ -17,7 +17,7 @@ pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 /// is `Projects` here: one row per project, same aggregation), plus
 /// `Tree`, the per-project drill-down `--project` renders (#33). `v`
 /// cycles this exact order on both surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
     Projects,
     Tree,
@@ -28,9 +28,20 @@ pub enum ViewKind {
     Unowned,
     /// Per-ecosystem rollup (`Report.summary`).
     Types,
+    /// External/shared storage units (#43), the minimal shape DESIGN.md
+    /// recorded: read-only, one row per detector-resolved unit.
+    External,
+    /// Agent-tool storage (#91/#92/#100): read-only, one row per
+    /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
+    /// marking is not wired up in this chunk.
+    Agents,
 }
 
 impl ViewKind {
+    /// `'0'` is not a view digit here: it is already the global "clear
+    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Agents`
+    /// has no dedicated digit and is reached only by cycling with `v`
+    /// (`ViewKind::next`) -- documented, not a silent omission.
     pub fn from_digit(d: char) -> Option<Self> {
         Some(match d {
             '1' => ViewKind::Projects,
@@ -41,6 +52,7 @@ impl ViewKind {
             '6' => ViewKind::Kinds,
             '7' => ViewKind::Unowned,
             '8' => ViewKind::Types,
+            '9' => ViewKind::External,
             _ => return None,
         })
     }
@@ -53,7 +65,9 @@ impl ViewKind {
             ViewKind::Docker => ViewKind::Kinds,
             ViewKind::Kinds => ViewKind::Unowned,
             ViewKind::Unowned => ViewKind::Types,
-            ViewKind::Types => ViewKind::Projects,
+            ViewKind::Types => ViewKind::External,
+            ViewKind::External => ViewKind::Agents,
+            ViewKind::Agents => ViewKind::Projects,
         }
     }
     pub fn label(self) -> &'static str {
@@ -66,6 +80,8 @@ impl ViewKind {
             ViewKind::Docker => "docker",
             ViewKind::Unowned => "unowned",
             ViewKind::Types => "types",
+            ViewKind::External => "external",
+            ViewKind::Agents => "agents",
         }
     }
 }
@@ -135,6 +151,14 @@ pub struct App {
     /// When the last batch arrived; observation starts once the stream has
     /// been quiet for `LIVE_QUIET`.
     pub live_last_batch: Option<Instant>,
+    /// External/shared storage units (#43), for `ViewKind::External`.
+    /// Empty until `set_external_units` is called (once, at startup --
+    /// detector resolution is disk I/O and never runs on this struct's
+    /// own event/render path).
+    pub external_units: Vec<swamp_core::external::ExternalUnit>,
+    /// Agent-tool storage units (#91/#100), for `ViewKind::Agents`. Same
+    /// startup-only population contract as `external_units`.
+    pub agent_units: Vec<swamp_core::agents::AgentUnit>,
 }
 
 pub struct Operation {
@@ -264,7 +288,22 @@ impl App {
             live_last_batch: None,
             track: std::collections::HashMap::new(),
             history_secs: None,
+            external_units: Vec::new(),
+            agent_units: Vec::new(),
         }
+    }
+
+    /// Sets `external_units` for `ViewKind::External` (#43). Called once
+    /// at startup, never from the event/render loop -- detector
+    /// resolution and measurement are disk I/O.
+    pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
+        self.external_units = units;
+    }
+
+    /// Sets `agent_units` for `ViewKind::Agents` (#91/#100). Same
+    /// startup-only contract as `set_external_units`.
+    pub fn set_agent_units(&mut self, units: Vec<swamp_core::agents::AgentUnit>) {
+        self.agent_units = units;
     }
 
     /// Annotates every row of one project with its git tracking status:
@@ -366,6 +405,8 @@ impl App {
             ViewKind::Docker => model::docker_rows(&self.report),
             ViewKind::Unowned => model::unowned_rows(&self.report),
             ViewKind::Types => model::types_rows(&self.report, &self.filter),
+            ViewKind::External => model::external_rows(&self.external_units),
+            ViewKind::Agents => model::agent_rows(&self.agent_units),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
@@ -2043,14 +2084,26 @@ mod tests {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
         assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Builds));
         assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
-        assert_eq!(ViewKind::from_digit('9'), None);
-        // Full cycle returns to Projects, matching the CLI's view order:
-        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/types.
         assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
+        assert_eq!(ViewKind::from_digit('9'), Some(ViewKind::External));
+        // '0' is reserved for "clear filter" (crate::handle_key_mod);
+        // Agents has no dedicated digit and must not silently claim '0'.
+        assert_eq!(ViewKind::from_digit('0'), None);
+        // Full cycle returns to Projects, matching the CLI's view order:
+        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
+        // types/external/agents.
         let mut v = ViewKind::Projects;
-        for _ in 0..8 {
+        for _ in 0..10 {
             v = v.next();
         }
         assert_eq!(v, ViewKind::Projects);
+        // Agents is reachable by cycling even without its own digit.
+        let mut seen = std::collections::HashSet::new();
+        let mut v = ViewKind::Projects;
+        for _ in 0..10 {
+            seen.insert(v);
+            v = v.next();
+        }
+        assert!(seen.contains(&ViewKind::Agents));
     }
 }

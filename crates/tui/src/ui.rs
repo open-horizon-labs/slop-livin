@@ -788,7 +788,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from(
-            "  v, 1-8    switch view (projects · tree · builds · deps · docker · kinds · unowned · types)",
+            "  v, 1-9    switch view (projects · tree · builds · deps · docker · kinds · unowned ·",
+        ),
+        Line::from(
+            "            types · external); v also reaches agents (read-only, no digit: 0 is clear filter)",
         ),
         Line::from(
             "  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered)",
@@ -836,6 +839,9 @@ pub fn view_index(v: ViewKind) -> usize {
         ViewKind::Kinds => 6,
         ViewKind::Unowned => 7,
         ViewKind::Types => 8,
+        ViewKind::External => 9,
+        // No dedicated digit ('0' is "clear filter"); reached via `v`.
+        ViewKind::Agents => 10,
     }
 }
 

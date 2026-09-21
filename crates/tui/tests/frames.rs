@@ -518,6 +518,69 @@ fn unowned_view() {
     }
 }
 
+/// #43/#51/#60: the minimal read-only External view.
+#[test]
+fn external_view() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.set_external_units(vec![swamp_core::external::ExternalUnit {
+            detector_id: "cargo-home".into(),
+            detector_name: "Cargo home".into(),
+            category: swamp_core::locations::StorageCategory::Cache,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: PathBuf::from("/Users/dev/.cargo/registry"),
+            bytes: 2_500_000_000,
+            hardlinked: true,
+            growth_bytes: Some(50_000_000),
+            regrowth_count: 0,
+            observed_at: 1_700_000_000,
+            consumers: Vec::new(),
+            note: None,
+        }]);
+        app.set_view(ViewKind::External);
+        check(&format!("external_{w}x{h}"), &capture(&app, w, h));
+    }
+}
+
+/// #91/#92/#100: the minimal read-only Agents view.
+#[test]
+fn agents_view() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.set_agent_units(vec![swamp_core::agents::AgentUnit {
+            tool_id: "claude-code".into(),
+            tool_name: "Claude Code".into(),
+            tool_home: PathBuf::from("/Users/dev/.claude"),
+            category: swamp_core::agents::AgentCategory::Sessions,
+            id: "fixture-session-1".into(),
+            relative_path: "projects/-Users-dev-src-mole/fixture-session.jsonl".into(),
+            path: PathBuf::from(
+                "/Users/dev/.claude/projects/-Users-dev-src-mole/fixture-session.jsonl",
+            ),
+            members: Vec::new(),
+            bytes: 4_200_000,
+            hardlinked: true,
+            growth_bytes: Some(100_000),
+            regrowth_count: 0,
+            observed_at: 1_700_000_000,
+            mtime_max: 1_699_990_000,
+            protected: false,
+            protect_reason: None,
+            project_link: swamp_core::agents::ProjectLinkState::Linked {
+                project_id: "fixture-project".into(),
+                project_name: "mole".into(),
+                project_path: PathBuf::from("/Users/dev/src/mole"),
+                source: swamp_core::agents::LinkSource::Declared,
+                worktree_kind: "main".into(),
+            },
+            action: swamp_core::agents::AgentActionCapability::SessionRemoval,
+            note: None,
+        }]);
+        app.set_view(ViewKind::Agents);
+        check(&format!("agents_{w}x{h}"), &capture(&app, w, h));
+    }
+}
+
 #[test]
 fn marked_rows_state() {
     for (w, h) in [(80, 24), (200, 60)] {

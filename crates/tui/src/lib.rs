@@ -131,7 +131,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(d @ '1'..='8') => {
+        KeyCode::Char(d @ '1'..='9') => {
             if let Some(v) = ViewKind::from_digit(d) {
                 app.set_view(v);
             }
@@ -224,6 +224,43 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     };
     app.pending = Some(rx);
     app.store_dir = Some(store.clone());
+    // External/agent-tool storage (#43/#91/#100): resolved once here, at
+    // startup, alongside the initial report load above -- never on the
+    // event/render loop this function is about to enter. Detector
+    // resolution and measurement are disk I/O with the same cost shape
+    // as the report observation just above it.
+    if let Ok(cfg) = swamp_core::growth::load_config_checked(&store) {
+        let env = swamp_core::locations::Environment::from_process();
+        let registry = swamp_core::locations::Registry::with_builtins();
+        let detector_scope = swamp_core::scope::resolve_effective_scope(
+            &env,
+            &cfg.scan,
+            &[],
+            &registry,
+            swamp_core::entities::now(),
+        );
+        let retention_days = cfg.retention_days;
+        if let Ok(units) = swamp_core::external::discover_and_measure(
+            &detector_scope,
+            Some(&store),
+            !no_observe,
+            swamp_core::entities::now(),
+            retention_days,
+            24 * 3600,
+        ) {
+            app.set_external_units(units);
+        }
+        if let Ok(units) = swamp_core::agents::discover_and_measure(
+            &detector_scope,
+            Some(&store),
+            !no_observe,
+            swamp_core::entities::now(),
+            retention_days,
+            24 * 3600,
+        ) {
+            app.set_agent_units(units);
+        }
+    }
     if !no_observe {
         app.start_watch();
     }

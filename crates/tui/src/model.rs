@@ -1597,6 +1597,83 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .collect()
 }
 
+/// External/shared storage view (#43/#51/#60): the same flat shape
+/// `unowned_rows` renders, one row per detector-resolved unit. Read-only
+/// by construction (`unit: None`, never markable) -- selection refusal
+/// for these units already lives at the action layer
+/// (`actions::execute` refuses every `PlanUnit::external_category`
+/// unconditionally); the TUI simply never offers a delete affordance
+/// the action layer would refuse anyway, rather than inventing a
+/// confirm flow only to refuse it.
+pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
+    let mut rows: Vec<Row> = units
+        .iter()
+        .map(|u| {
+            let consumers = if u.consumers.is_empty() {
+                "no declared consumers".to_string()
+            } else {
+                format!("{} consumer(s)", u.consumers.len())
+            };
+            Row::leaf(
+                0,
+                format!(
+                    "{:?} · {} ({}) · {consumers}",
+                    u.category,
+                    u.path.display(),
+                    u.detector_id
+                ),
+                u.bytes,
+                u.growth_bytes,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows
+}
+
+/// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped
+/// tool → category via the label text (a flat list, same shape as
+/// `unowned_rows`/`external_rows`; a real tool → category → unit tree is
+/// left to `render::render_view_agents`'s CLI drill-down and a future
+/// worker's interactive expansion). Read-only by construction --
+/// `unit: None` -- for the same reason as `external_rows`: this chunk's
+/// supported agent-storage actions
+/// (`actions::propose_agents`/`execute`) are reachable through
+/// `swamp propose-agents`/`swamp approve`/`swamp execute`, not yet
+/// through a TUI mark/confirm flow. Recorded as a named, deliberate gap
+/// (see `.oh/sessions/2026-09-21-agent-storage-claude-code.md`), not a
+/// silent omission.
+pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
+    let mut rows: Vec<Row> = units
+        .iter()
+        .map(|u| {
+            let link = match &u.project_link {
+                swamp_core::agents::ProjectLinkState::Linked { project_name, .. } => {
+                    format!("project: {project_name}")
+                }
+                swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
+                other => format!("{other:?}"),
+            };
+            let protect = if u.protected { " [protected]" } else { "" };
+            let mut row = Row::leaf(
+                0,
+                format!(
+                    "{} · {} · {} · {link}{protect}",
+                    u.tool_name,
+                    u.category.label(),
+                    u.relative_path
+                ),
+                u.bytes,
+                u.growth_bytes,
+            );
+            row.mtime_max = u.mtime_max;
+            row
+        })
+        .collect();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows
+}
+
 /// Element-wise sum of several equal-length series; `None` if none.
 /// Elementwise sum of child series. A bucket is `None` only when no child
 /// had been observed yet at that time.
