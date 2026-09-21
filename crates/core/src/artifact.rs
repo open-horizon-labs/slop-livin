@@ -128,6 +128,14 @@ pub struct NestedArtifact {
     pub growth_bytes: Option<i64>,
     #[serde(default)]
     pub regrowth_count: u32,
+    /// Decision evidence (#53), distinct from `producer_evidence`/
+    /// `consumer_evidence` above (the #64-#71 build-artifact-
+    /// identification epic's own narrower evidence shape): activity/
+    /// recovery/reclaimability facts using the shared `crate::evidence`
+    /// contract, so a nested unit's decision evidence renders the same
+    /// way as an artifact row's or external unit's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_evidence: Vec<crate::evidence::Evidence>,
 }
 
 impl NestedArtifact {

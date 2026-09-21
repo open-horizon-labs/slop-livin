@@ -125,7 +125,7 @@ pub enum EvidenceSource {
 
 /// The value carried by a fact, once its status is [`FactStatus::Known`]
 /// (or as one candidate inside [`FactStatus::Conflicting`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
 pub enum FactValue {
     Timestamp(u64),
@@ -139,7 +139,7 @@ pub enum FactValue {
 
 /// A fact's resolution. Every non-known outcome is explicit and carries a
 /// reason -- there is no variant that means "just leave this out".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum FactStatus {
     Known(FactValue),
@@ -164,7 +164,7 @@ pub enum FactStatus {
 }
 
 /// Freshness/expiry and coverage limits every fact must state.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Freshness {
     /// Seconds after `observed_at` after which this fact should be
     /// rechecked rather than trusted as current (short-lived facts like a
@@ -205,7 +205,7 @@ impl Freshness {
 
 /// One decision-relevant fact, attached to an artifact row, external
 /// unit, agent unit or nested build-artifact unit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub kind: FactKind,
     pub subtype: FactSubtype,

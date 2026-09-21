@@ -347,7 +347,12 @@ pub fn run_report(ctx: &Ctx<'_>) -> Result<Report> {
     let events = bus.run_blocking(Event::RootRequested, ctx)?;
     for e in events.into_iter().rev() {
         if let Event::ReportAssembled(report) = e {
-            return Ok(Arc::try_unwrap(report).unwrap_or_else(|arc| (*arc).clone()));
+            let mut report = Arc::try_unwrap(report).unwrap_or_else(|arc| (*arc).clone());
+            // Decision evidence (#53-#54, #58-#59): a pure post-pass over
+            // facts this report already collected, never a new walk or
+            // byte-history write -- see `report::attach_decision_evidence`.
+            crate::report::attach_decision_evidence(&mut report);
+            return Ok(report);
         }
     }
     bail!("the bus finished without assembling a report")

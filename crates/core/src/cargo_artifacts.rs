@@ -733,6 +733,7 @@ fn node(
         present,
         growth_bytes: None,
         regrowth_count: 0,
+        decision_evidence: Vec::new(),
     }
 }
 

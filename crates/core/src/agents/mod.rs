@@ -284,6 +284,12 @@ pub struct AgentUnit {
     /// could not be read"), never content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Decision evidence (#53): activity/current-use facts for this
+    /// unit -- see `crate::evidence`. Populated in
+    /// [`discover_and_measure`] from `mtime_max` (already recorded by
+    /// the adapter); never a new per-unit scan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 /// What an adapter (`claude_code::identify`) produces before growth
@@ -754,6 +760,13 @@ pub fn discover_and_measure(
         // Extract the detector_id back out of the key rather than
         // threading it separately; the key's first field always is it.
         let tool_id = key.split('\u{1}').next().unwrap_or_default().to_string();
+        // Activity evidence (#54): the adapter already recorded
+        // `mtime_max` while folding this unit's members; turn it into
+        // the shared contract's fact rather than a second stat pass.
+        let evidence = vec![crate::activity::modification_evidence(
+            cand.mtime_max,
+            observed_at,
+        )];
         units.push(AgentUnit {
             id: unit_id(&tool_id, cand.category, &cand.relative_path),
             tool_id,
@@ -774,6 +787,7 @@ pub fn discover_and_measure(
             project_link: cand.project_link,
             action: cand.action,
             note: cand.note,
+            evidence,
         });
     }
     units.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));

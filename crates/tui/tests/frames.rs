@@ -537,6 +537,7 @@ fn external_view() {
             observed_at: 1_700_000_000,
             consumers: Vec::new(),
             note: None,
+            evidence: Vec::new(),
         }]);
         app.set_view(ViewKind::External);
         check(&format!("external_{w}x{h}"), &capture(&app, w, h));
@@ -576,6 +577,7 @@ fn agents_view() {
             },
             action: swamp_core::agents::AgentActionCapability::SessionRemoval,
             note: None,
+            evidence: Vec::new(),
         }]);
         app.set_view(ViewKind::Agents);
         check(&format!("agents_{w}x{h}"), &capture(&app, w, h));
@@ -621,6 +623,7 @@ fn agents_view_confirm_row_shows_session_removal_consequences() {
             },
             action: swamp_core::agents::AgentActionCapability::SessionRemoval,
             note: None,
+            evidence: Vec::new(),
         }]);
         app.set_view(ViewKind::Agents);
         app.selected = 0;
@@ -661,6 +664,7 @@ fn agents_view_refusal_state_names_the_protection_reason() {
             project_link: swamp_core::agents::ProjectLinkState::NotApplicable,
             action: swamp_core::agents::AgentActionCapability::None,
             note: None,
+            evidence: Vec::new(),
         }]);
         app.set_view(ViewKind::Agents);
         app.selected = 0;
@@ -711,6 +715,7 @@ fn agents_view_mark_all_marks_actionable_and_skips_protected() {
                 },
                 action: swamp_core::agents::AgentActionCapability::SessionRemoval,
                 note: None,
+                evidence: Vec::new(),
             },
             swamp_core::agents::AgentUnit {
                 tool_id: "claude-code".into(),
@@ -732,6 +737,7 @@ fn agents_view_mark_all_marks_actionable_and_skips_protected() {
                 project_link: swamp_core::agents::ProjectLinkState::NotApplicable,
                 action: swamp_core::agents::AgentActionCapability::None,
                 note: None,
+                evidence: Vec::new(),
             },
         ]);
         app.set_view(ViewKind::Agents);

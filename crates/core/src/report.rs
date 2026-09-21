@@ -476,6 +476,78 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
     report_with(root, docker_facts, false, None, None)
 }
 
+/// Populates every `ArtifactRow.evidence` (#53) from facts this report
+/// pass already has in hand -- `mtime_max`, `hardlinked`/`dedup_stale`,
+/// the row's own kind and its worktree's path -- never a new per-file
+/// walk. Called exactly once, from `bus::run_report`, so every report
+/// (single- or multi-root, CLI/TUI/JSON) carries the same evidence.
+/// Existing evidence a row already carries (e.g. the Docker-join
+/// consumer fact attached at construction in `join_docker`) is
+/// preserved; this only appends.
+pub fn attach_decision_evidence(report: &mut Report) {
+    let observed_at = report.observed_at;
+    for project in &mut report.projects {
+        for wt in &mut project.worktrees {
+            let wt_path = wt.path.clone();
+            for a in &mut wt.artifacts {
+                // Activity (#54): the folded walk's own newest-child-mtime
+                // stat, already recorded on every row.
+                a.evidence.push(crate::activity::modification_evidence(
+                    a.mtime_max,
+                    observed_at,
+                ));
+
+                // Reclaimability (#59): allocated bytes are already
+                // known; whether they are uniquely this row's is bounded,
+                // not asserted, when the row is flagged hardlinked or its
+                // dedup is stale.
+                let acc = if a.hardlinked || a.dedup_stale {
+                    crate::reclaimability::hardlink_unresolved_bound(a.bytes)
+                } else {
+                    crate::reclaimability::exclusive_allocation(a.bytes)
+                };
+                a.evidence
+                    .extend(crate::reclaimability::accounting_evidence(
+                        &acc,
+                        crate::evidence::EvidenceSource::FilesystemMetadata {
+                            detail: "folded directory allocation".into(),
+                        },
+                    ));
+
+                // Recovery (#58): only for kinds this pass can source
+                // without guessing. A worktree appearing in this report at
+                // all means its own source is present this pass.
+                let recovery = match a.kind {
+                    ArtifactKind::BuildOutput => {
+                        Some(crate::recovery::build_output_recovery(true, &wt_path))
+                    }
+                    ArtifactKind::DependencyTree => {
+                        let lockfile = [
+                            "Cargo.lock",
+                            "package-lock.json",
+                            "pnpm-lock.yaml",
+                            "go.sum",
+                        ]
+                        .iter()
+                        .map(|name| wt_path.join(name))
+                        .find(|p| p.exists());
+                        Some(crate::recovery::dependency_tree_recovery(
+                            lockfile.as_deref(),
+                        ))
+                    }
+                    ArtifactKind::Cache => Some(crate::recovery::cache_without_signal_recovery(
+                        "no lockfile/source signal collected for this cache in this pass",
+                    )),
+                    _ => None,
+                };
+                if let Some(r) = recovery {
+                    a.evidence.push(r.evidence);
+                }
+            }
+        }
+    }
+}
+
 /// Same as [`report`], optionally running `du -skPx` on the root as an
 /// independent oracle for `reconciliation.du_total`, and optionally
 /// observing into the reverse-delta growth store (`growth.rs`).
@@ -1323,6 +1395,14 @@ pub(crate) fn join_docker_facts(
                     (None, Some(cache_note)) => Some(cache_note.clone()),
                     (None, None) => None,
                 };
+                // Consumer evidence (#57): normalizes this already-decided
+                // Docker join into the shared contract rather than
+                // re-deriving it -- see
+                // `external_associations::docker_join_evidence`.
+                let evidence = vec![crate::external_associations::docker_join_evidence(
+                    Some(&worktree_id),
+                    &rule,
+                )];
                 result
                     .rows_by_worktree
                     .entry(worktree_id)
@@ -1349,7 +1429,7 @@ pub(crate) fn join_docker_facts(
                         containers: candidate.containers,
                         shared_with: candidate.shared_with,
                         dangling: candidate.dangling,
-                        evidence: Vec::new(),
+                        evidence,
                     });
             }
             JoinOutcome::Unowned { note } => {

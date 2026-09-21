@@ -117,6 +117,26 @@ pub fn apfs_clone_or_snapshot_bound(allocated_bytes: u64) -> ByteAccounting {
     }
 }
 
+/// A unit flagged `hardlinked` (`ArtifactRow::hardlinked`/
+/// `ExternalUnit::hardlinked`'s conservative default) whose exact shared
+/// inode set has not been reconciled this pass (`dedup_stale`): bounded
+/// the same way as an APFS clone/snapshot, but naming the real reason
+/// (unresolved hardlink membership, not copy-on-write extents).
+pub fn hardlink_unresolved_bound(allocated_bytes: u64) -> ByteAccounting {
+    ByteAccounting {
+        logical_bytes: None,
+        allocated_bytes,
+        estimated_reclaimable: EstimatedReclaimable::Bounded {
+            min: 0,
+            max: allocated_bytes,
+            reason: "this unit may contain hardlinked files whose other links are not yet \
+                     reconciled; freeing it could reclaim up to its full allocated bytes, or \
+                     less if another retained path shares the same inodes"
+                .into(),
+        },
+    }
+}
+
 /// A sparse file: `logical_bytes` (apparent/declared length) can be far
 /// larger than `allocated_bytes` (blocks actually on disk). Removing it
 /// only ever frees the allocated bytes -- the gap was never occupying
@@ -347,6 +367,23 @@ mod tests {
             acc.estimated_reclaimable,
             EstimatedReclaimable::Known { bytes: 1_000 }
         );
+    }
+
+    #[test]
+    fn hardlink_unresolved_bound_is_never_asserted_exact() {
+        let acc = hardlink_unresolved_bound(4_000);
+        match acc.estimated_reclaimable {
+            EstimatedReclaimable::Bounded {
+                min,
+                max,
+                ref reason,
+            } => {
+                assert_eq!(min, 0);
+                assert_eq!(max, 4_000);
+                assert!(reason.contains("hardlink"));
+            }
+            other => panic!("expected Bounded, got {other:?}"),
+        }
     }
 
     #[test]

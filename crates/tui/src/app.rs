@@ -2788,6 +2788,7 @@ mod tests {
             observed_at: 1000,
             consumers: Vec::new(),
             note: None,
+            evidence: Vec::new(),
         }]);
         assert!(app.rows().is_empty(), "no projects, no project rows");
         app.set_view(ViewKind::External);

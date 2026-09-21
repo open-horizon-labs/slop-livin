@@ -71,6 +71,39 @@ pub struct ExternalUnit {
     /// not appearing in the list at all (a genuinely gone unit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Decision evidence (#53): activity/consumer/current-use facts for
+    /// this unit -- see `crate::evidence`. Populated from already-
+    /// collected facts (this unit's own `consumers`, its `growth_bytes`
+    /// history); never a new per-unit scan on every report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
+}
+
+/// Turns this unit's existing declared-consumer sidecar
+/// (`associate_consumer`/`dissociate_consumer`) into the shared
+/// decision-evidence contract (#53/#57), so a manually-declared
+/// consumer and a lockfile/manifest-sourced one (#57's real ecosystem
+/// evidence, once wired) render identically. Reuses data already
+/// loaded for `ExternalUnit::consumers`; never a new scan.
+fn consumers_evidence(consumers: &[ExternalConsumer]) -> Vec<crate::evidence::Evidence> {
+    consumers
+        .iter()
+        .map(|c| {
+            let ev = crate::evidence::Evidence::known(
+                crate::evidence::FactKind::Consumer,
+                crate::evidence::FactSubtype::DeclaredConsumer,
+                crate::evidence::FactValue::Text(c.label.clone()),
+                crate::evidence::EvidenceSource::ConfigDeclaration {
+                    path: "swamp consumer association".to_string(),
+                },
+                crate::entities::now(),
+            );
+            match &c.note {
+                Some(n) => ev.with_note(n.clone()),
+                None => ev,
+            }
+        })
+        .collect()
 }
 
 /// The stable identity string used both for the growth-store row key and
@@ -327,6 +360,8 @@ pub fn discover_and_measure(
     ) in meta_by_key
     {
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
+        let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
+        let evidence = consumers_evidence(&consumers);
         units.push(ExternalUnit {
             detector_id,
             detector_name,
@@ -338,8 +373,9 @@ pub fn discover_and_measure(
             growth_bytes,
             regrowth_count,
             observed_at,
-            consumers: consumers_by_key.get(&key).cloned().unwrap_or_default(),
+            consumers,
             note: None,
+            evidence,
         });
     }
     for key in &protected_keys {
@@ -350,6 +386,11 @@ pub fn discover_and_measure(
         if let Some((detector_id, category_s, _device, path)) = parse_external_key(key) {
             let path_buf = PathBuf::from(path);
             let last = swamp_dir.and_then(|dir| last_known_external(dir, key).ok().flatten());
+            let consumers = swamp_dir
+                .map(|dir| load_consumers(dir, key))
+                .transpose()?
+                .unwrap_or_default();
+            let evidence = consumers_evidence(&consumers);
             units.push(ExternalUnit {
                 detector_id: detector_id.clone(),
                 detector_name: scope
@@ -366,11 +407,9 @@ pub fn discover_and_measure(
                 growth_bytes: None,
                 regrowth_count: last.as_ref().map(|r| r.1).unwrap_or(0),
                 observed_at,
-                consumers: swamp_dir
-                    .map(|dir| load_consumers(dir, key))
-                    .transpose()?
-                    .unwrap_or_default(),
+                consumers,
                 note: Some("coverage incomplete this pass: could not be read".to_string()),
+                evidence,
             });
         }
     }

@@ -80,6 +80,7 @@ fn synthetic_unit(
         project_link: ProjectLinkState::NotApplicable,
         action,
         note: None,
+        evidence: Vec::new(),
     }
 }
 

@@ -2208,6 +2208,7 @@ mod cleanup_check_tests {
             present: true,
             growth_bytes: None,
             regrowth_count: 0,
+            decision_evidence: Vec::new(),
         }
     }
 
