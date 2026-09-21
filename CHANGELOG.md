@@ -33,10 +33,13 @@ Release notes describe behavior at the named version. See the [README](README.md
   credential content into a report, plan, or the ledger. The TUI gained
   two new minimal, read-only views: `ViewKind::External` (`'9'`, the
   minimal design chunk B2 recorded but did not implement) and
-  `ViewKind::Agents` (no dedicated digit; reached by cycling with `v`).
-  See `docs/agent-storage.md` for the full contract and known gaps
-  (the other 12 named tools, TUI mark/confirm for agent actions,
-  `~/.claude.json` living outside the modeled home directory).
+  `ViewKind::Agents` (no dedicated digit; reached by cycling with `v`),
+  plus a header scope-coverage clause (`2 roots (1 missing)`) for its
+  own root, scoped down from the full multi-root vision (#50) to what
+  is available without walking anything. See `docs/agent-storage.md`
+  for the full contract and known gaps (the other 12 named tools, TUI
+  mark/confirm for agent actions, `~/.claude.json` living outside the
+  modeled home directory).
 - **Made multi-root observation coverage-aware** (#42). `report`,
   `observe`, and `ui` with no explicit root now observe the whole
   configured scope coherently in one call, not just its first present

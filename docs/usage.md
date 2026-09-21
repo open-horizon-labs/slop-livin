@@ -147,6 +147,16 @@ regrowth. Removing a root from scope, or adding an exclusion, is
 likewise a coverage change, never a storage change -- see
 [coverage and history](../skills/swamp/references/coverage-and-history.md).
 
+The TUI header shows a short coverage clause when its own root is not
+simply present (e.g. `2 roots (1 missing)`), dropped first among
+trailing clauses on a narrow terminal like every other low-priority
+header fact -- never silently hidden. This reflects the *resolved*
+scope for the one root `swamp ui` was given (`scope::RootStatus`, no
+walk required), not the richer per-root walk outcome above
+(`coverage::RegionStatus`) that `report --json`'s `scope_coverage`
+shows; making the TUI's own report itself multi-root is tracked
+separately (#50).
+
 ## External and shared storage
 
 Storage with no containing project -- the Cargo registry, rustup

@@ -159,6 +159,17 @@ pub struct App {
     /// Agent-tool storage units (#91/#100), for `ViewKind::Agents`. Same
     /// startup-only population contract as `external_units`.
     pub agent_units: Vec<swamp_core::agents::AgentUnit>,
+    /// A short header clause naming how many roots the *configured*
+    /// scope resolves to and the worst non-`Present` status among them
+    /// (e.g. `"3 roots (1 missing)"`), or `None` when the scope is a
+    /// single present root -- the ordinary case, worth no clause at
+    /// all. Derived from `scope::EffectiveScope::roots`
+    /// (`scope::RootStatus`, resolved without walking anything), not
+    /// from `report_scope`'s own per-root `coverage::RegionStatus`
+    /// (that would require making the TUI's own rendered report
+    /// multi-root, #50's still-open job -- see DESIGN.md). Populated
+    /// once at startup, same contract as `external_units`/`agent_units`.
+    pub scope_note: Option<String>,
 }
 
 pub struct Operation {
@@ -290,6 +301,7 @@ impl App {
             history_secs: None,
             external_units: Vec::new(),
             agent_units: Vec::new(),
+            scope_note: None,
         }
     }
 
@@ -304,6 +316,53 @@ impl App {
     /// startup-only contract as `set_external_units`.
     pub fn set_agent_units(&mut self, units: Vec<swamp_core::agents::AgentUnit>) {
         self.agent_units = units;
+    }
+
+    /// Sets `scope_note` from a resolved `EffectiveScope`, called once
+    /// at startup. `None` when the scope is a single `Present` root (the
+    /// ordinary case): every other case -- more than one root in scope,
+    /// or the one root not simply `Present` -- gets one short clause,
+    /// worst status first, e.g. `"3 roots (1 missing)"` or `"2 roots (1
+    /// inaccessible: permission denied)"`. Roots folded into a parent
+    /// (`RootStatus::SkippedAsNested`) are not counted as separate roots.
+    pub fn set_scope_note(&mut self, scope: &swamp_core::scope::EffectiveScope) {
+        use swamp_core::scope::RootStatus;
+        let roots: Vec<&swamp_core::scope::ScopeRoot> = scope
+            .roots
+            .iter()
+            .filter(|r| !matches!(r.status, RootStatus::SkippedAsNested { .. }))
+            .collect();
+        if roots.len() <= 1 && roots.iter().all(|r| r.status == RootStatus::Present) {
+            self.scope_note = None;
+            return;
+        }
+        let total = roots.len();
+        let not_present = roots
+            .iter()
+            .filter(|r| r.status != RootStatus::Present)
+            .count();
+        let worst = roots
+            .iter()
+            .find_map(|r| match &r.status {
+                RootStatus::Unreadable { reason } => Some(format!("inaccessible: {reason}")),
+                _ => None,
+            })
+            .or_else(|| {
+                roots
+                    .iter()
+                    .any(|r| matches!(r.status, RootStatus::Excluded { .. }))
+                    .then(|| "excluded".to_string())
+            })
+            .or_else(|| {
+                roots
+                    .iter()
+                    .any(|r| r.status == RootStatus::Missing)
+                    .then(|| "missing".to_string())
+            });
+        self.scope_note = Some(match worst {
+            Some(w) if not_present > 0 => format!("{total} roots ({not_present} {w})"),
+            _ => format!("{total} roots"),
+        });
     }
 
     /// Annotates every row of one project with its git tracking status:
@@ -2077,6 +2136,90 @@ mod tests {
         app.commit_filter();
         assert_eq!(app.filter, before);
         assert!(app.filter_error.is_some());
+    }
+
+    fn scope_of(roots: Vec<swamp_core::scope::ScopeRoot>) -> swamp_core::scope::EffectiveScope {
+        swamp_core::scope::EffectiveScope {
+            catalog_version: "test".into(),
+            generated_at: 0,
+            defaults_enabled: true,
+            disabled_detectors: Vec::new(),
+            configured_include: Vec::new(),
+            configured_exclude: Vec::new(),
+            explicit: true,
+            roots,
+            detectors: Vec::new(),
+            pruned_subtrees: Vec::new(),
+        }
+    }
+
+    fn scope_root(
+        path: &str,
+        status: swamp_core::scope::RootStatus,
+    ) -> swamp_core::scope::ScopeRoot {
+        swamp_core::scope::ScopeRoot {
+            path: path.into(),
+            reasons: Vec::new(),
+            status,
+        }
+    }
+
+    #[test]
+    fn scope_note_is_none_for_one_present_root() {
+        use swamp_core::scope::RootStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&scope_of(vec![scope_root("/root", RootStatus::Present)]));
+        assert_eq!(app.scope_note, None);
+    }
+
+    #[test]
+    fn scope_note_names_count_and_worst_status_for_a_missing_root() {
+        use swamp_core::scope::RootStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&scope_of(vec![
+            scope_root("/root", RootStatus::Present),
+            scope_root("/gone", RootStatus::Missing),
+        ]));
+        assert_eq!(app.scope_note.as_deref(), Some("2 roots (1 missing)"));
+    }
+
+    #[test]
+    fn scope_note_prioritizes_unreadable_over_missing_and_names_the_reason() {
+        use swamp_core::scope::RootStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&scope_of(vec![
+            scope_root("/root", RootStatus::Present),
+            scope_root("/gone", RootStatus::Missing),
+            scope_root(
+                "/denied",
+                RootStatus::Unreadable {
+                    reason: "permission denied".into(),
+                },
+            ),
+        ]));
+        assert_eq!(
+            app.scope_note.as_deref(),
+            Some("3 roots (2 inaccessible: permission denied)")
+        );
+    }
+
+    #[test]
+    fn scope_note_ignores_roots_folded_into_a_parent() {
+        use swamp_core::scope::RootStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&scope_of(vec![
+            scope_root("/root", RootStatus::Present),
+            scope_root(
+                "/root/nested",
+                RootStatus::SkippedAsNested {
+                    parent: "/root".into(),
+                },
+            ),
+        ]));
+        assert_eq!(
+            app.scope_note, None,
+            "a folded-nested root is not a separate root"
+        );
     }
 
     #[test]

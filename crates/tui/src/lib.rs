@@ -260,6 +260,25 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
         ) {
             app.set_agent_units(units);
         }
+        // The header's coverage clause is about *this report's own*
+        // root(s), not the wider configured-scope catalog `detector_scope`
+        // above resolves for external/agent-unit discovery (same split
+        // the CLI's `report --view external/agents` already has: "works
+        // the same whether report is scoped to the configured catalog or
+        // an explicit root"). `run` always has exactly one explicit root
+        // (no multi-root TUI report yet -- #50), so resolve *that* root
+        // specifically ("explicit roots replace defaults/detectors
+        // entirely", #41) rather than reusing `detector_scope`, which
+        // would show the wrong roots' status for a report that only
+        // ever walks one of them.
+        let report_scope = swamp_core::scope::resolve_effective_scope(
+            &env,
+            &cfg.scan,
+            std::slice::from_ref(&root),
+            &registry,
+            swamp_core::entities::now(),
+        );
+        app.set_scope_note(&report_scope);
     }
     if !no_observe {
         app.start_watch();

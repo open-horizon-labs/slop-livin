@@ -129,7 +129,10 @@ anyway, since both are the same shape of minimal read-only addition.
   dedicated digit; `v`-cycle only), both read-only (`Row.unit: None`).
   `App::set_external_units`/`set_agent_units`, populated once at
   startup in `crates/tui/src/lib.rs::run()` alongside the existing
-  initial report load -- never on the event/render loop.
+  initial report load -- never on the event/render loop. Also added the
+  header's scope-coverage clause (`App::set_scope_note`) the chunk
+  brief asked for alongside the External view -- see the scoped-down
+  decision below.
 
 ## Decisions that needed to be made explicitly
 
@@ -301,11 +304,20 @@ data, not just the loose CI bound.
   session-removal warnings, Trash envelope) is a real feature, not a
   rendering tweak -- same judgment chunk B2 recorded for why it left
   the External view unimplemented, applied consistently here.
-- **Coverage line** (`DESIGN.md`'s remaining unimplemented item): the
-  header clause naming multi-root coverage status is still not wired
-  into the TUI; this chunk implemented the *other* two recorded gaps
-  (External rows, and Agents rows as their natural extension) but did
-  not touch the coverage line, which is #42/#50's scope, not #91's.
+- **Coverage line, scoped down and implemented.** The chunk brief
+  explicitly asked for "the coverage clause in the header" alongside
+  the External view, so I added `App::set_scope_note`/`ui.rs`'s new
+  header clause -- but scoped to what is honestly available without
+  taking on #50's full "make the TUI's own report multi-root" job: it
+  reflects `scope::RootStatus` for the TUI's one explicit root
+  (resolved fresh, no walk needed), not `coverage::RegionStatus` (the
+  actual per-root walk outcome `report_scope`'s `scope_coverage` field
+  carries, which does not exist for the TUI's single-root
+  `report_full_mode`/`report_with_dirs` path). The common case (one
+  present root) shows no clause, matching today's real usage; a future
+  #50 worker making the TUI multi-root should read
+  `App::set_scope_note` and switch its input to a real
+  `coverage::RegionStatus` list rather than re-deriving the mechanism.
 - **`todos/` naming convention**: if a future worker learns Claude
   Code's actual `todos/` filename convention (from an upstream source,
   never from a real `~/.claude`), replace the filename-prefix heuristic

@@ -67,35 +67,41 @@ The header shows the root, observation status, available history, and totals as 
 
 Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live FSEvents watch batches changes after 400 ms of quiet. The header can display a history sparkline; body rows use change bars.
 
-### External and Agents rows (implemented); coverage line (still not implemented)
+### External and Agents rows, and a scope-coverage header clause
 
-`report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) give
-the TUI three facts; two now ship, one is still recorded here as intent
-for whoever picks it up:
+`report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) gave
+the TUI three facts recorded here as unimplemented intent by an earlier
+chunk; all three now ship:
 
-- **External rows (implemented).** `ViewKind::External` (`'9'`) lists
-  `ExternalUnit`s the same shape as `ViewKind::Unowned` lists unowned
-  rows: path, category, size, growth, consumer count. The row is never
-  markable (`Row.unit: None`) rather than markable-then-refused: the
-  action layer (`actions::execute`) already refuses every
+- **External rows.** `ViewKind::External` (`'9'`) lists `ExternalUnit`s
+  the same shape as `ViewKind::Unowned` lists unowned rows: path,
+  category, size, growth, consumer count. The row is never markable
+  (`Row.unit: None`) rather than markable-then-refused: the action
+  layer (`actions::execute`) already refuses every
   `PlanUnit::external_category` unit unconditionally, so there is no
   delete affordance to offer in the first place.
-- **Agents rows (implemented).** `ViewKind::Agents` (no dedicated digit
-  -- `0` is "clear filter"; reached by cycling with `v`) lists
-  `AgentUnit`s the same way: tool/category/relative-path/project-link
-  facts, never markable. Selective action for agent-storage units is
-  reachable through `swamp propose-agents`/`approve`/`execute`, not
-  (yet) a TUI mark/confirm flow -- a named, deliberate gap, not a
-  silent one.
-- **Coverage line (still not implemented).** When more than one root is
-  in scope, or any root is not `Complete` this pass, the header should
-  gain one short clause naming the count and the worst status, e.g. `3
-  roots (1 excluded)` or `2 roots (1 inaccessible: permission denied)`
-  -- never silently dropped, never phrased as a deletion. Full text
-  lives in `swamp scope`/`report --json`'s `scope_coverage`; the header
-  clause would be a pointer to it, not a duplicate of every reason.
-  Whoever wires this in next should read `report.rs`'s `report_scope`
-  and the TUI's header-building code together first.
+- **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
+  "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
+  same way: tool/category/relative-path/project-link facts, never
+  markable. Selective action for agent-storage units is reachable
+  through `swamp propose-agents`/`approve`/`execute`, not (yet) a TUI
+  mark/confirm flow -- a named, deliberate gap, not a silent one.
+- **Scope-coverage header clause.** `App::set_scope_note` adds one
+  short header clause when the TUI's own root is not simply present
+  (e.g. `2 roots (1 missing)`, `3 roots (1 inaccessible: permission
+  denied)`), dropped last by the existing "fit clauses to width" rule
+  like every other trailing clause -- never silently hidden, just
+  lower priority than size/growth facts on a narrow terminal. This is
+  scoped down from the full vision below: it reflects
+  `scope::RootStatus` (resolved without walking anything, for exactly
+  the one explicit root `swamp ui <root>` was given), not
+  `coverage::RegionStatus` (the actual per-root *walk* outcome
+  `report_scope`/`report --json`'s `scope_coverage` field shows) --
+  producing that would mean making the TUI's own rendered report
+  multi-root, which is #50's still-open job, not this chunk's. The
+  common case (one present root) shows no clause at all, matching
+  today's real usage; the mechanism and header slot exist for #50 to
+  extend, not re-derive.
 
 ## Actions
 

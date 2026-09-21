@@ -153,6 +153,7 @@ fn header_line(app: &App, width: usize) -> String {
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),
         format!("docker {} unowned", human_bytes(docker_unowned)),
+        app.scope_note.clone().unwrap_or_default(),
     ];
     fit_clauses(&clauses, width)
 }
