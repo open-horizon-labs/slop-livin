@@ -26,6 +26,16 @@ fn only_detector(id: &str) -> ScanConfig {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
+        // Every other named agent-tool detector must be disabled here,
+        // not only the four this file's fixtures originally covered
+        // (#93/#94/#95): Pi and Oh My Pi share `PI_CODING_AGENT_DIR` as
+        // a disclosed collision-risk override (see
+        // `crate::locations::pi`'s own doc comment), so an
+        // `only_detector("oh-my-pi")` fixture that also left "pi"
+        // enabled had both adapters independently identify the exact
+        // same fixture session -- caught by `propose_agents`'s own
+        // overlap refusal (#101's refusal-matrix hardening), not a bug
+        // in that refusal.
         disabled_detectors: ["cargo-home", "rustup", "homebrew"]
             .into_iter()
             .chain(
@@ -35,6 +45,15 @@ fn only_detector(id: &str) -> ScanConfig {
                     "codex-desktop",
                     "oh-my-pi",
                     "opencode",
+                    "gemini-cli",
+                    "pi",
+                    "aider",
+                    "github-copilot-cli",
+                    "cursor",
+                    "windsurf",
+                    "cline",
+                    "roo-code",
+                    "continue",
                 ]
                 .into_iter()
                 .filter(|d| *d != id),

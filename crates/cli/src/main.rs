@@ -7,9 +7,9 @@ use swamp_core::{
     artifact::{ArtifactRole, NestedArtifact},
     filter,
     render::{
-        OverviewSort, render_kinds, render_overview_sorted, render_project_tree, render_types,
-        render_view_builds, render_view_deps, render_view_docker, render_view_reconciliation,
-        render_view_unowned, render_worktree_signals, render_worktrees,
+        OverviewSort, render_kinds, render_overview_sorted, render_project_tree_with_agents,
+        render_types, render_view_builds, render_view_deps, render_view_docker,
+        render_view_reconciliation, render_view_unowned, render_worktree_signals, render_worktrees,
     },
     report::{Report, report_full_mode},
     scan::{ScanOptions, observation},
@@ -280,26 +280,48 @@ enum Command {
         off: bool,
         roots: Vec<PathBuf>,
     },
-    /// Propose cleanup for exact artifact, Cargo group, or worktree paths, or
-    /// a filter. Review paths, sizes, warnings and recovery before
-    /// authorizing. Use report --view worktrees for worktree signals; for
-    /// individual Cargo builds, start with cleanup-check. Nothing is deleted
-    /// by this command.
+    /// Propose cleanup: the one entry point for artifact/Cargo-group/
+    /// worktree paths (with `root`), agent-storage units, or external
+    /// units (with `--path` and no `root`) -- see `--path`'s own help
+    /// for exactly how a bare path is routed. Review paths, sizes,
+    /// warnings and recovery before authorizing. Use report --view
+    /// worktrees for worktree signals; for individual Cargo builds,
+    /// start with cleanup-check. Nothing is deleted by this command.
     #[command(
-        after_help = "Whole-worktree example:\n  swamp report ~/src --view worktrees\n  swamp propose ~/src --path /absolute/path/to/a-worktree\nReview the plan; proposing never authorizes removal."
+        after_help = "Whole-worktree example:\n  swamp report ~/src --view worktrees\n  swamp propose ~/src --path /absolute/path/to/a-worktree\n\nAgent-storage or external-unit example (no root needed):\n  swamp report --view agents\n  swamp propose --path /absolute/path/to/a/session/or/unit\n\nExternal-unit inspection (never actionable; refused at execution):\n  swamp propose --external --path /absolute/path/to/an/external/unit\n\nReview the plan; proposing never authorizes removal."
     )]
     Propose {
-        root: PathBuf,
+        /// A walked report's root. Omit it entirely when every `--path`
+        /// names an agent-storage unit (`report --view agents`) or an
+        /// external unit (`report --view external`) instead of a
+        /// filesystem artifact/worktree -- those are detector-resolved,
+        /// not root-relative, and this command finds them the same way
+        /// `report --view agents|external` does, without a root.
+        root: Option<PathBuf>,
         /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
+        /// Only meaningful with a `root` (filesystem artifacts).
         #[arg(long)]
         filter: Option<String>,
-        /// Exact artifact, Cargo group, or worktree paths from a report.
+        /// Exact artifact/Cargo-group/worktree path (with `root`), or an
+        /// exact agent-storage/external unit path (without `root`) --
+        /// routed automatically: an agent-storage unit match takes
+        /// priority, then an external unit, then (only with `root`) a
+        /// filesystem artifact/Cargo-group/worktree. Use `--external` to
+        /// force the external-unit route explicitly.
         #[arg(long = "path")]
         paths: Vec<PathBuf>,
         #[arg(long)]
         since: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Force the external-unit route (never agent-storage or
+        /// filesystem): every resulting unit is inspection-only and
+        /// `execute` refuses it unconditionally -- this exists to
+        /// review external storage through the plan/ledger surface,
+        /// never to make it actionable (#43/#101). With no `--path`,
+        /// proposes every discovered external unit.
+        #[arg(long, conflicts_with = "root")]
+        external: bool,
     },
     /// Human authorization for ONE plan: writes a one-shot grant scoped to
     /// that plan id. Only a human at this keyboard should run this.
@@ -356,8 +378,10 @@ enum Command {
         #[command(subcommand)]
         cmd: GrantCmd,
     },
-    /// Propose cleanup for exact agent-storage unit paths (#101): a
-    /// cache/log category directory, or an individual session's own
+    /// Deprecated alias for `swamp propose --path <unit>` (no `root`)
+    /// (#101 unification): kept only so existing scripts/muscle memory
+    /// keep working. Propose cleanup for exact agent-storage unit paths:
+    /// a cache/log category directory, or an individual session's own
     /// transcript path from `report --view agents`. Every match becomes
     /// a real action or a named refusal (protected, unsupported
     /// category, database-like file, active session) -- never a
@@ -857,6 +881,174 @@ fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option
     )
 }
 
+// ---------------------------------------------------------------------
+// Unified `propose` entry point (#101): a single CLI command that
+// routes `--path` to the right proposer -- agent-storage unit,
+// external unit, or (only with an explicit `root`) a filesystem
+// artifact/Cargo-group/worktree -- so a human never has to know in
+// advance which of three subsystems a path belongs to. `propose-agents`
+// is kept only as a thin, deprecated alias into the same code (see
+// `Command::ProposeAgents`'s handler below).
+// ---------------------------------------------------------------------
+
+/// Agent-storage units for the unified `propose --path` route (no
+/// `root`): a real report walk, exactly like `report --view agents`
+/// computes, so every known project worktree is available to supply
+/// Aider's per-repo units (#96) -- never the narrower "walk upward from
+/// each requested path" fast path `propose-agents` used before this
+/// chunk, which could not discover an Aider unit whose worktree root
+/// was not itself derivable from the requested path (chunk E's
+/// follow-up). This costs a full scope walk instead of a handful of
+/// `stat`s, which is the deliberate trade #101's correctness
+/// requirement makes: `propose` without a `root` is not a hot path.
+fn discover_agent_units_for_propose(
+    store_dir: &Path,
+) -> Result<Vec<swamp_core::agents::AgentUnit>> {
+    let detector_scope = resolve_scope(&[])?;
+    let (r, _coverage) = swamp_core::report::report_scope(
+        &detector_scope,
+        None,
+        false,
+        Some(store_dir),
+        None,
+        true,
+        false,
+        false,
+        false,
+    )?;
+    let project_worktrees: Vec<PathBuf> = r
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .map(|wt| wt.path.clone())
+        .collect();
+    swamp_core::agents::discover_and_measure(
+        &detector_scope,
+        &project_worktrees,
+        Some(store_dir),
+        true,
+        r.observed_at,
+        swamp_core::growth::load_config(store_dir).retention_days,
+        3600,
+    )
+}
+
+/// External units for the unified `propose` route: the same
+/// detector-resolved discovery `report --view external` uses.
+fn discover_external_units_for_propose(
+    store_dir: &Path,
+) -> Result<Vec<swamp_core::external::ExternalUnit>> {
+    let detector_scope = resolve_scope(&[])?;
+    let observed_at = swamp_core::entities::now();
+    swamp_core::external::discover_and_measure(
+        &detector_scope,
+        Some(store_dir),
+        true,
+        observed_at,
+        swamp_core::growth::load_config(store_dir).retention_days,
+        24 * 3600,
+    )
+}
+
+/// Saves `plan` and prints it (JSON envelope or the plain-text form),
+/// the identical tail every `propose`/`propose-agents` branch used to
+/// duplicate.
+fn save_and_print_plan(
+    store_dir: &Path,
+    plan: &swamp_core::actions::Plan,
+    observed_at: u64,
+    json: bool,
+) -> Result<()> {
+    swamp_core::actions::save_plan(store_dir, plan)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
+                plan,
+                observed_at
+            )?)?
+        );
+    } else {
+        print_plan(plan);
+    }
+    Ok(())
+}
+
+/// The unified `propose` entry point's full routing logic, shared
+/// verbatim between `Command::Propose` and the deprecated
+/// `Command::ProposeAgents` alias.
+#[allow(clippy::too_many_arguments)]
+fn propose_unified(
+    root: Option<PathBuf>,
+    filter: Option<String>,
+    paths: Vec<PathBuf>,
+    since: Option<String>,
+    json: bool,
+    external: bool,
+) -> Result<()> {
+    let store_dir = swamp_dir();
+    if external {
+        anyhow::ensure!(
+            root.is_none(),
+            "--external is only valid without a root: external units are detector-resolved, independent of any walked root"
+        );
+        let units = discover_external_units_for_propose(&store_dir)?;
+        let observed_at = swamp_core::entities::now();
+        let plan = swamp_core::actions::propose_external(&units, &paths, "human:cli")?;
+        return save_and_print_plan(&store_dir, &plan, observed_at, json);
+    }
+    if let Some(root) = root {
+        let r = report_full_mode(
+            &root,
+            None,
+            false,
+            Some(&store_dir),
+            since.as_deref(),
+            true,
+            false,
+            false,
+            false,
+        )?;
+        let parsed = match filter.as_deref().map(filter::parse) {
+            Some(Ok(f)) => Some(f),
+            Some(Err(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            None => None,
+        };
+        let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
+        return save_and_print_plan(&store_dir, &plan, r.observed_at, json);
+    }
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "either a root (for a filesystem artifact/Cargo-group/worktree) or at least one --path (for an agent-storage or external unit) is required"
+    );
+    let agent_units = discover_agent_units_for_propose(&store_dir)?;
+    let agent_hit = paths
+        .iter()
+        .any(|p| agent_units.iter().any(|u| &u.path == p));
+    if agent_hit {
+        let observed_at = swamp_core::entities::now();
+        let plan = swamp_core::actions::propose_agents(&agent_units, &paths, "human:cli")?;
+        return save_and_print_plan(&store_dir, &plan, observed_at, json);
+    }
+    let external_units = discover_external_units_for_propose(&store_dir)?;
+    let external_hit = paths
+        .iter()
+        .any(|p| external_units.iter().any(|u| &u.path == p));
+    if external_hit {
+        let observed_at = swamp_core::entities::now();
+        let plan = swamp_core::actions::propose_external(&external_units, &paths, "human:cli")?;
+        return save_and_print_plan(&store_dir, &plan, observed_at, json);
+    }
+    anyhow::bail!(
+        "no agent-storage or external unit matched any given --path (checked {} agent-storage unit(s), {} external unit(s)); pass a root to propose a filesystem artifact/Cargo group/worktree instead, or run `swamp report --view agents|external --json` to find the exact unit path",
+        agent_units.len(),
+        external_units.len()
+    );
+}
+
 /// The bounded, documented JSON contract behind `report --json` (see
 /// `skills/swamp/references/commands-and-json.md`): with `--view`, an
 /// envelope `{view, project, result, observed_at, since,
@@ -965,6 +1157,22 @@ fn report_json_envelope(
     value["index_refreshed"] = serde_json::json!(index_refreshed);
     if !scope_coverage.is_empty() {
         value["scope_coverage"] = serde_json::json!(scope_coverage);
+    }
+    // `--project NAME --json` (no `--view`): include this project's own
+    // linked agent-storage units inline, same linkage-state contract as
+    // `--view agents --project NAME` (#100's "the CLI `report --project
+    // X --json` includes linked agent units with linkage states" --
+    // this used to be silently absent whenever `--view agents` was not
+    // also passed).
+    if project.is_some() && !agent_units.is_empty() {
+        let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
+            .iter()
+            .filter(|u| agent_unit_matches_project(u, project))
+            .collect();
+        value["agent_storage"] = serde_json::json!({
+            "units": filtered,
+            "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
+        });
     }
     if let Some(mut projects) = value.get("projects").cloned() {
         let page = swamp_core::agent_json::paginate(&mut projects, limit, offset);
@@ -1164,8 +1372,13 @@ fn main() -> Result<()> {
             // independent of the walked root(s)" contract as external
             // units above -- a tool home is found regardless of whether
             // `report` is scoped to the configured catalog or an
-            // explicit root.
-            let agent_units = if view == Some(View::Agents) {
+            // explicit root. Also computed for a project-scoped query
+            // (`--project NAME`, with or without `--view agents`) so the
+            // project tree's collapsed "Agent storage (linked)" row and
+            // `--project NAME --json`'s linked units are never silently
+            // missing just because `--view agents` was not also passed
+            // (#100's project-linkage acceptance).
+            let agent_units = if view == Some(View::Agents) || project.is_some() {
                 let detector_scope = resolve_scope(&[])?;
                 // Aider's per-repo units (#96) need every known worktree
                 // root; `r` (this report) is already computed above, so
@@ -1251,13 +1464,18 @@ fn main() -> Result<()> {
                 }
             } else if let Some(name) = project {
                 match view {
-                    None | Some(View::Worktrees) => match render_project_tree(&r, &name) {
-                        Some(text) => print!("{text}"),
-                        None => {
-                            eprintln!("no project named {name:?} found under {}", root.display());
-                            std::process::exit(1);
+                    None | Some(View::Worktrees) => {
+                        match render_project_tree_with_agents(&r, &name, &agent_units) {
+                            Some(text) => print!("{text}"),
+                            None => {
+                                eprintln!(
+                                    "no project named {name:?} found under {}",
+                                    root.display()
+                                );
+                                std::process::exit(1);
+                            }
                         }
-                    },
+                    }
                     Some(View::Builds) => print!("{}", render_view_builds(&r, Some(&name))),
                     Some(View::Deps) => print!("{}", render_view_deps(&r, Some(&name))),
                     Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
@@ -1539,80 +1757,16 @@ fn main() -> Result<()> {
             paths,
             since,
             json,
+            external,
         } => {
-            let store_dir = swamp_dir();
-            let r = report_full_mode(
-                &root,
-                None,
-                false,
-                Some(&store_dir),
-                since.as_deref(),
-                true,
-                false,
-                false,
-                false,
-            )?;
-            let parsed = match filter.as_deref().map(filter::parse) {
-                Some(Ok(f)) => Some(f),
-                Some(Err(e)) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-                None => None,
-            };
-            let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
-            swamp_core::actions::save_plan(&store_dir, &plan)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
-                        &plan,
-                        r.observed_at
-                    )?)?
-                );
-            } else {
-                print_plan(&plan);
-            }
+            propose_unified(root, filter, paths, since, json, external)?;
         }
         Command::ProposeAgents { paths, json } => {
-            let store_dir = swamp_dir();
             anyhow::ensure!(!paths.is_empty(), "--path is required (at least one)");
-            let detector_scope = resolve_scope(&[])?;
-            let observed_at = swamp_core::entities::now();
-            // This command deliberately never computes a full `Report`
-            // (it targets exact paths already known to the caller), so
-            // Aider's per-repo units (#96) are supplied by walking
-            // upward from each requested path for its own worktree root
-            // instead -- cheap, and exact for the paths actually asked
-            // about, rather than a whole-scope walk just to find them.
-            let mut project_worktrees: Vec<std::path::PathBuf> = paths
-                .iter()
-                .filter_map(|p| swamp_core::agents::worktree_root_containing(p))
-                .collect();
-            project_worktrees.sort();
-            project_worktrees.dedup();
-            let units = swamp_core::agents::discover_and_measure(
-                &detector_scope,
-                &project_worktrees,
-                Some(&store_dir),
-                true,
-                observed_at,
-                swamp_core::growth::load_config(&store_dir).retention_days,
-                3600,
-            )?;
-            let plan = swamp_core::actions::propose_agents(&units, &paths, "human:cli")?;
-            swamp_core::actions::save_plan(&store_dir, &plan)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
-                        &plan,
-                        observed_at
-                    )?)?
-                );
-            } else {
-                print_plan(&plan);
-            }
+            eprintln!(
+                "note: `propose-agents` is a deprecated alias; use `swamp propose --path <unit>` (no root needed) instead."
+            );
+            propose_unified(None, None, paths, None, json, false)?;
         }
         Command::Protect { cmd } => {
             let store_dir = swamp_dir();

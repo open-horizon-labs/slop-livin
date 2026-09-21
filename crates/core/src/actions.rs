@@ -724,6 +724,27 @@ pub fn propose_agents(
             }
         );
     }
+    // Defense in depth (#101's refusal matrix): today's adapters never
+    // produce two agent-storage units whose own anchor paths nest
+    // (each unit's identity is one category's own folded
+    // directory/file), but nothing *enforces* that invariant across
+    // fourteen independent adapters plus whatever a future one adds.
+    // Refuse before a plan is minted, the same discipline `propose`'s
+    // own Cargo-group overlap check already applies to filesystem
+    // units, rather than silently accepting a plan whose execution
+    // order could move a parent out from under a child (or vice
+    // versa).
+    for (i, a) in plan_units.iter().enumerate() {
+        for b in plan_units.iter().skip(i + 1) {
+            if a.path == b.path || a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                bail!(
+                    "overlapping agent-storage selections: {} and {} are nested (or identical); select either the parent or the child, not both",
+                    a.path.display(),
+                    b.path.display()
+                );
+            }
+        }
+    }
     let created_at = now();
     // `Plan.root` is one path; an agent-storage plan can in principle
     // span more than one tool home once a second adapter exists. Each
@@ -841,6 +862,68 @@ fn execute_agent_cache_trash(path: &Path, trash: &Path, at: u64) -> Result<(Path
     Ok((dest, bytes))
 }
 
+/// One member's fate inside a session-removal Trash envelope's own
+/// recovery manifest (`restore.json`, mirroring `cargo_cleanup`'s own
+/// precedent of writing a manifest into the envelope it creates).
+/// Written *before* any member is moved (every entry `"pending"`) and
+/// rewritten after each successful move, so a partial failure (some
+/// members moved, then a rename fails) still leaves an accurate,
+/// on-disk account of exactly what happened -- never just an error
+/// message with no durable record next to the moved content itself.
+#[derive(Debug, Clone, Serialize)]
+struct RestoreManifestMember {
+    /// Absolute original path, so a human/script can restore it.
+    original: PathBuf,
+    /// Name inside the envelope once moved; `None` while `"pending"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
+    bytes: u64,
+    /// `"pending"` | `"moved"`.
+    status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreManifest {
+    tool_id: String,
+    category: String,
+    session_path: PathBuf,
+    members: Vec<RestoreManifestMember>,
+}
+
+fn write_restore_manifest(envelope: &Path, manifest: &RestoreManifest) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    fs::write(envelope.join("restore.json"), bytes).context("writing restore.json")?;
+    Ok(())
+}
+
+/// Returned when a session removal fails *after* the Trash envelope was
+/// created and at least the pre-flight pass completed -- i.e. some
+/// members may already be physically inside `envelope`. Carries enough
+/// for the caller to still record an honest `recovery_location` and
+/// partial `trashed_bytes` rather than silently losing track of content
+/// that really did move. See `restore.json` inside `envelope` for the
+/// exact per-member outcome.
+#[derive(Debug)]
+pub struct PartialAgentRemoval {
+    pub envelope: PathBuf,
+    pub moved_bytes: u64,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for PartialAgentRemoval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} already moved into {}; see restore.json there for the exact per-member outcome)",
+            self.source,
+            crate::render::human_bytes_pub(self.moved_bytes),
+            self.envelope.display()
+        )
+    }
+}
+
+impl std::error::Error for PartialAgentRemoval {}
+
 /// Moves a session's exact member set into one Trash envelope, after
 /// re-deriving the session's current membership from scratch (never
 /// trusting `planned_members`) and refusing on any drift: a member now
@@ -937,14 +1020,35 @@ fn execute_agent_session_removal(
         .unwrap_or("session");
     let envelope = trash.join(format!("agent-session-{slug}-{at}"));
     fs::create_dir_all(&envelope).context("could not create Trash envelope")?;
+
+    let mut manifest = RestoreManifest {
+        tool_id: meta.tool_id.clone(),
+        category: meta.category.clone(),
+        session_path: session_path.to_path_buf(),
+        members: sized_members
+            .iter()
+            .map(|(path, bytes, _)| RestoreManifestMember {
+                original: path.clone(),
+                moved_to: None,
+                bytes: *bytes,
+                status: "pending",
+            })
+            .collect(),
+    };
+    // Written before any move, so even a failure on the very first
+    // member leaves an accurate (all-pending) manifest next to whatever
+    // Trash envelope directory was created.
+    write_restore_manifest(&envelope, &manifest)?;
+
     let mut moved_bytes = 0u64;
     for (i, (member, bytes, _is_dir)) in sized_members.iter().enumerate() {
         let name = member
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("member");
-        let dest = envelope.join(format!("{i}-{name}"));
-        fs::rename(member, &dest).with_context(|| {
+        let dest_name = format!("{i}-{name}");
+        let dest = envelope.join(&dest_name);
+        if let Err(e) = fs::rename(member, &dest).with_context(|| {
             format!(
                 "rename to Trash failed for {} ({} of {} members already moved into {})",
                 member.display(),
@@ -952,8 +1056,24 @@ fn execute_agent_session_removal(
                 sized_members.len(),
                 envelope.display()
             )
-        })?;
+        }) {
+            // Best-effort: leave the manifest reflecting exactly what
+            // moved before this failure, never silently stale.
+            let _ = write_restore_manifest(&envelope, &manifest);
+            return Err(PartialAgentRemoval {
+                envelope,
+                moved_bytes,
+                source: e,
+            }
+            .into());
+        }
         moved_bytes += bytes;
+        manifest.members[i].status = "moved";
+        manifest.members[i].moved_to = Some(dest_name);
+        // Rewritten after every successful move (not only at the end),
+        // so a failure on member i+1 still leaves an accurate record of
+        // members 0..=i having actually moved.
+        write_restore_manifest(&envelope, &manifest)?;
     }
     Ok((envelope, moved_bytes))
 }
@@ -1615,6 +1735,16 @@ pub fn execute_with_trash_opts(
                 }
                 Err(e) => {
                     outcome.status = "failed".into();
+                    // A partial session removal (some members already
+                    // physically moved before a later rename failed)
+                    // still names its Trash envelope and the bytes that
+                    // really did move -- `restore.json` inside that
+                    // envelope has the exact per-member account. Never
+                    // silently drop where partially-moved content went.
+                    if let Some(partial) = e.downcast_ref::<PartialAgentRemoval>() {
+                        outcome.recovery_location = Some(partial.envelope.clone());
+                        trashed += partial.moved_bytes;
+                    }
                     outcome.cause = Some(e.to_string());
                 }
             }
@@ -1899,4 +2029,171 @@ pub fn execute_with_trash_opts(
         },
         actor: actor.to_string(),
     })
+}
+
+#[cfg(test)]
+mod agent_partial_removal_tests {
+    //! #101's "account for partial failure (some members moved, then
+    //! failure) with explicit outcome and recovery manifest": these
+    //! tests call the private `execute_agent_session_removal` directly
+    //! (same crate, same file) because forcing a *specific* member's
+    //! `rename` to fail deterministically needs to reach in past the
+    //! public `execute` surface. No real user data anywhere -- every
+    //! path here is a synthetic fixture under a `tempfile::tempdir`.
+    use super::*;
+    use crate::agents::claude_code::{CLAUDE_CODE_TOOL_ID, identify};
+    use std::fs;
+
+    fn touch(path: &Path, content: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    /// A Claude Code session with several members (transcript,
+    /// subagents-companion dir, file-history dir, todos file) -- the
+    /// same fixture shape `claude_code`'s own tests use, reused here so
+    /// a real, multi-member session removal is exercised, not a
+    /// hand-built `AgentUnit`.
+    fn fixture_session(home: &Path) -> (PathBuf, String) {
+        let repo = home.join("fixture-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let session_id = "22222222-2222-4222-8222-222222222222".to_string();
+        let proj_dir = home.join("projects").join("-fixture-repo-encoded");
+        let jsonl = proj_dir.join(format!("{session_id}.jsonl"));
+        let line = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{}\",\"gitBranch\":\"main\"}}\n",
+            repo.display()
+        );
+        touch(&jsonl, line.as_bytes());
+        touch(
+            &proj_dir.join(&session_id).join("subagents").join("a.jsonl"),
+            line.as_bytes(),
+        );
+        touch(
+            &home.join("file-history").join(&session_id).join("snap.txt"),
+            b"recoverable-fixture-content",
+        );
+        touch(
+            &home
+                .join("todos")
+                .join(format!("{session_id}-agent-1.json")),
+            b"[]",
+        );
+        (jsonl, session_id)
+    }
+
+    /// Forces the *last* member (in the same sorted order
+    /// `execute_agent_session_removal` itself uses) to fail its rename
+    /// by pre-occupying its exact destination inside the envelope with
+    /// an incompatible entry (a plain file where a directory needs to
+    /// land, or vice versa -- both are reliable, portable `rename`
+    /// failures). Returns the envelope path and the members in the
+    /// order the function will process them, so the test can assert
+    /// precisely which ones must have moved and which must not have.
+    fn force_last_member_rename_to_fail(
+        home: &Path,
+        trash: &Path,
+        session_path: &Path,
+        session_id: &str,
+        at: u64,
+    ) -> (PathBuf, Vec<PathBuf>) {
+        let candidates = identify(home, at);
+        let current = candidates
+            .iter()
+            .find(|c| c.path == session_path)
+            .expect("session identified");
+        let mut members: Vec<PathBuf> = current.members.iter().map(|m| m.path.clone()).collect();
+        members.sort();
+        assert!(
+            members.len() >= 2,
+            "need at least two members to prove a *partial* failure, got {members:?}"
+        );
+
+        let slug = session_path.file_stem().and_then(|s| s.to_str()).unwrap();
+        assert_eq!(slug, session_id);
+        let envelope = trash.join(format!("agent-session-{slug}-{at}"));
+        fs::create_dir_all(&envelope).unwrap();
+
+        let last_idx = members.len() - 1;
+        let last = &members[last_idx];
+        let name = last.file_name().and_then(|n| n.to_str()).unwrap();
+        let dest = envelope.join(format!("{last_idx}-{name}"));
+        let last_is_dir = fs::symlink_metadata(last).unwrap().is_dir();
+        if last_is_dir {
+            // Renaming a directory onto an existing non-directory path
+            // fails (ENOTDIR) on every platform this project targets.
+            fs::write(&dest, b"blocking").unwrap();
+        } else {
+            // Renaming a file onto an existing non-empty directory
+            // fails (EISDIR/ENOTEMPTY) on every platform this project
+            // targets.
+            fs::create_dir_all(dest.join("blocking-child")).unwrap();
+        }
+        (envelope, members)
+    }
+
+    #[test]
+    fn partial_session_removal_reports_the_envelope_and_writes_a_restore_manifest() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let trash = tempfile::tempdir().unwrap();
+        let (session_path, session_id) = fixture_session(home);
+        let at = 5_000_000u64;
+        let (envelope, members) =
+            force_last_member_rename_to_fail(home, trash.path(), &session_path, &session_id, at);
+
+        let meta = AgentPlanMeta {
+            tool_id: CLAUDE_CODE_TOOL_ID.to_string(),
+            tool_home: home.to_path_buf(),
+            category: "sessions".to_string(),
+            session_members: Some(members.clone()),
+        };
+        let err = execute_agent_session_removal(&meta, &session_path, &members, trash.path(), at)
+            .expect_err("the last member's rename was deliberately blocked");
+        let partial = err
+            .downcast_ref::<PartialAgentRemoval>()
+            .unwrap_or_else(|| panic!("expected PartialAgentRemoval, got: {err:#}"));
+        assert_eq!(partial.envelope, envelope);
+        assert!(
+            partial.moved_bytes > 0 || members.len() == 1,
+            "at least the members before the blocked one must have moved"
+        );
+
+        // The recovery manifest exists and reflects exactly what
+        // happened: every member but the last is "moved" (and no
+        // longer at its original path); the last is "pending" (and
+        // untouched at its original path).
+        let manifest_bytes = fs::read(envelope.join("restore.json")).expect("restore.json exists");
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["tool_id"], CLAUDE_CODE_TOOL_ID);
+        let manifest_members = manifest["members"].as_array().unwrap();
+        assert_eq!(manifest_members.len(), members.len());
+        let last_idx = members.len() - 1;
+        for (i, m) in manifest_members.iter().enumerate() {
+            let original = std::path::PathBuf::from(m["original"].as_str().unwrap());
+            assert_eq!(&original, &members[i]);
+            if i == last_idx {
+                assert_eq!(m["status"], "pending", "{manifest}");
+                assert!(
+                    original.exists(),
+                    "the blocked member must remain at its original location"
+                );
+            } else {
+                assert_eq!(m["status"], "moved", "{manifest}");
+                assert!(
+                    !original.exists(),
+                    "a member reported \"moved\" must no longer be at its original location"
+                );
+                assert!(m["moved_to"].as_str().is_some());
+            }
+        }
+
+        // Nothing here ever wrote the fixture's own content into the
+        // manifest (metadata only: original path, byte count, status).
+        assert!(
+            !manifest_bytes
+                .windows(b"recoverable-fixture-content".len())
+                .any(|w| w == b"recoverable-fixture-content")
+        );
+    }
 }
