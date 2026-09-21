@@ -554,11 +554,28 @@ pub fn tree_rows(
     collapsed: &std::collections::HashSet<String>,
     track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
 ) -> Vec<Row> {
+    tree_rows_with_agents(report, project_name, filter, collapsed, track, &[])
+}
+
+/// Same as [`tree_rows`], additionally appending the collapsed "Agent
+/// storage (linked)" summary row(s) #100 requires when `agent_units`
+/// names any unit linked to this project. The row is informational
+/// only (`unit: None`): acting on agent storage stays the dedicated
+/// Agents view's job (full per-unit protections/occupancy checks), not
+/// something the project tree can mark.
+pub fn tree_rows_with_agents(
+    report: &Report,
+    project_name: &str,
+    filter: &Filter,
+    collapsed: &std::collections::HashSet<String>,
+    track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
+    agent_units: &[swamp_core::agents::AgentUnit],
+) -> Vec<Row> {
     let mut out = Vec::new();
     let Some(p) = report.projects.iter().find(|p| p.name == project_name) else {
         return out;
     };
-    let tree = swamp_core::tree::build_project_tree(p, &report.root);
+    let tree = swamp_core::tree::build_project_tree(p, &report.root, agent_units);
     let wt_count = tree.worktrees.len();
     for (wi, wt) in tree.worktrees.iter().enumerate() {
         // Look up the underlying `WorktreeRow` for its absolute path (the
@@ -775,6 +792,32 @@ pub fn tree_rows(
                 }
             }
         }
+    }
+    if !tree.agent_rows.is_empty() {
+        let total_bytes: u64 = tree.agent_rows.iter().map(|r| r.bytes).sum();
+        let total_growth = tree
+            .agent_rows
+            .iter()
+            .filter_map(|r| r.growth_bytes)
+            .reduce(|a, b| a + b);
+        let tools = tree
+            .agent_rows
+            .iter()
+            .map(|r| r.tool_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut row = Row::leaf(
+            1,
+            format!("agent storage (linked)   {tools}"),
+            total_bytes,
+            total_growth,
+        );
+        row.rail = "└─ ".into();
+        // Deliberately no `unit`/`kind`: this collapsed summary row is
+        // never a mark target from the project tree (see doc comment
+        // above) -- the Agents view is where a specific unit's own
+        // protections/occupancy are checked before it can be marked.
+        out.push(row);
     }
     out
 }

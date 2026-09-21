@@ -448,12 +448,13 @@ impl App {
                     .clone()
                     .or_else(|| self.report.projects.first().map(|p| p.name.clone()));
                 return match name {
-                    Some(n) => model::tree_rows(
+                    Some(n) => model::tree_rows_with_agents(
                         &self.report,
                         &n,
                         &self.filter,
                         &self.collapsed,
                         &self.track,
+                        &self.agent_units,
                     ),
                     None => Vec::new(),
                 };

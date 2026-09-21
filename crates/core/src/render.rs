@@ -765,8 +765,21 @@ pub fn render_text(report: &Report) -> String {
 /// absolute, which the flat drill used to leak), and a signal is
 /// printed as its value only, never `name: name: value`.
 pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
+    render_project_tree_with_agents(report, name, &[])
+}
+
+/// Same as [`render_project_tree`], additionally rendering the
+/// collapsed "Agent storage (linked)" row(s) #100 requires when
+/// `agent_units` names any unit linked to this project. Callers that
+/// have not computed agent-storage units get identical output to
+/// `render_project_tree`'s (an empty slice never adds a row).
+pub fn render_project_tree_with_agents(
+    report: &Report,
+    name: &str,
+    agent_units: &[crate::agents::AgentUnit],
+) -> Option<String> {
     let project = report.projects.iter().find(|p| p.name == name)?;
-    let tree = crate::tree::build_project_tree(project, &report.root);
+    let tree = crate::tree::build_project_tree(project, &report.root, agent_units);
     let mut out = String::new();
     let growth_str = tree
         .growth_bytes
@@ -788,6 +801,7 @@ pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
     );
     if tree.worktrees.is_empty() {
         let _ = writeln!(out, "  (no worktrees)");
+        write_agent_rows(&mut out, &tree.agent_rows);
         return Some(out);
     }
     let last_idx = tree.worktrees.len() - 1;
@@ -843,7 +857,39 @@ pub fn render_project_tree(report: &Report, name: &str) -> Option<String> {
             );
         }
     }
+    write_agent_rows(&mut out, &tree.agent_rows);
     Some(out)
+}
+
+/// Appends one collapsed line per tool contributing linked agent
+/// storage to this project (#100), or nothing when `rows` is empty --
+/// absence of agent-storage linkage is never rendered as a zero row.
+/// This is a summary only: per-session/transcript detail stays in
+/// `render_view_agents`/the TUI Agents view, never duplicated here.
+fn write_agent_rows(out: &mut String, rows: &[crate::tree::ProjectAgentToolRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "Agent storage (linked):");
+    let last = rows.len() - 1;
+    for (i, row) in rows.iter().enumerate() {
+        let branch = if i == last { "└─" } else { "├─" };
+        let growth = row
+            .growth_bytes
+            .map(human_signed_bytes)
+            .unwrap_or_else(|| "—".to_string());
+        let count = if row.unit_count == 1 {
+            "1 unit".to_string()
+        } else {
+            format!("{} units", row.unit_count)
+        };
+        let _ = writeln!(
+            out,
+            "{branch} {:<20} {:>10}  ({growth})   {count}",
+            row.tool_name,
+            human_bytes(row.bytes),
+        );
+    }
 }
 
 /// `--view builds`: every `BuildOutput`/`Cache` row across the project
