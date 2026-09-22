@@ -23,7 +23,8 @@ cargo test -p swamp-core \
   --test agent_matrix_matches_docs \
   --test agent_storage_validation \
   --test agent_container_seams \
-  --test unit_root_event_cursors
+  --test unit_root_event_cursors \
+  --test reviewer_counterexamples_stack3
 
 # `--test-threads=1` here and nowhere else. This test measures through
 # the *process-global* work counters (`work_counters::reset` +
@@ -36,7 +37,7 @@ cargo test -p swamp-core \
 # in this list because its spawn count came from a process-wide PATH
 # shim and a shared log file.
 cargo test -p swamp-core \
-  --test reviewer_cost_measurement_stack2 \
+  --test reviewer_cost_measurement_stack3 \
   -- --test-threads=1
 cargo test -p swamp-tui --test scope_preserving_refresh \
   --test reviewer_counterexamples_stack2_tui
@@ -46,7 +47,8 @@ cargo test -p swamp-tui --test scope_preserving_refresh \
 # the audit that let it through required to reject it
 # (GUARDRAILS_SPEC.md section 17). Named explicitly because an audit
 # nobody has shown rejects anything is the state all 42 were in.
-cargo test -p swamp-source-audit --test mutation_corpus
+cargo test -p swamp-source-audit --test mutation_corpus \
+  --test mutation_operators --test reviewer_mutation_sweep_stack3
 
 # These checks intentionally fail obvious safety regressions in source
 # review: a raw recursive delete, and verdict vocabulary the tool never

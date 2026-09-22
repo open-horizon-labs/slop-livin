@@ -2398,7 +2398,19 @@ pub fn stage_tracked_with_source(
     // Classification rules changed since the store was walked: rows that
     // no longer count (or newly count) as artifacts only get fixed by a
     // walk that visits them, so take the one full walk now.
-    let rules_changed = prev_state.rules_version != crate::ecosystem::RULES_VERSION;
+    //
+    // Only a *stored* state can carry an older rules version. A root's
+    // first observation has none, and used to read as "rules changed":
+    // it took this branch, which keeps the stored event id -- absent --
+    // so the second observation had no anchor either, walked fully a
+    // second time, and the steady state began on the third (re-review 3:
+    // pass 2 still listed 40 directories and stat'ed 5,561 files). The
+    // first observation now takes the ordinary path below, whose replay
+    // refuses with `no_stored_event_id` and whose checkpoint records the
+    // current event id, so the second observation can replay.
+    let has_stored_state = prev_state.event_id.is_some() || prev_state.last_observed_at.is_some();
+    let rules_changed =
+        has_stored_state && prev_state.rules_version != crate::ecosystem::RULES_VERSION;
     // Read once, ahead of either branch below: both a forced/rules-change
     // full walk and the ordinary incremental-or-full path need it to tell
     // "worktree confirmed gone" from "worktree access lost" (#42).
@@ -2456,9 +2468,11 @@ pub fn stage_tracked_with_source(
     });
     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
         eprintln!(
-            "[trace] fsevents replay: {:?} (incremental={}, changed_dirs={})",
+            "[trace] fsevents replay: {:?} (incremental={}, reason={}, too_soon={}, changed_dirs={})",
             t_replay.elapsed(),
             plan.incremental,
+            plan.reason_str(),
+            too_soon,
             plan.changed_dirs.len()
         );
     }
