@@ -135,3 +135,18 @@ android     dirs_listed=0 files_statted=0 manifest_bytes=0 containers_reused=1 i
 - Listing caps (`SHALLOW_LIST_CAP`, the 2,000-module Go download budget,
   the 400 dist-info budget, the 200 archive budget) are stated on the
   units they bound; a store over a cap is sized, not fully identified.
+
+## Verification (final tip)
+
+- `cargo fmt --all --check`: clean.
+- `cargo test --workspace --locked --no-fail-fast`: 1290 passed, 1 failed,
+  2 ignored. The failure is the inherited
+  `reviewer_cost_measurement_stack2::two_unchanged_full_observations_cost_report`
+  (71 listings, its stack/13 number; not touched).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo run --locked -p swamp-source-audit`: every audit `ok`, including
+  `build_stores_join_by_capability`.
+- `scripts/check.sh` steps after the workspace test (named suites incl.
+  `build_store_join`, the TUI suites, the mutation corpus -- 3 passed in
+  206 s -- and the grep audits): all pass except the same inherited
+  reviewer cost test.
