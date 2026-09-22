@@ -28,9 +28,7 @@
 //! rather than borrowing the mtime for the claim.
 
 use super::{BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, NestedUnitBuilder};
-use crate::artifact::{
-    ArtifactRole, ArtifactVariant, Membership, NestedArtifact, TimeSource, relative_path,
-};
+use crate::artifact::{ArtifactRole, ArtifactVariant, Membership, NestedArtifact, relative_path};
 use crate::entities::Confidence;
 use std::path::{Path, PathBuf};
 
@@ -333,29 +331,23 @@ fn identify_project_cache(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nes
 /// A Gradle user home (`~/.gradle` or `GRADLE_USER_HOME`), resolved by
 /// the caller and handed in as a shared container.
 fn identify_user_home(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
-    let mut units = vec![
-        NestedUnitBuilder::new(
-            container,
-            ArtifactRole::SharedStoreEntry,
-            container.path.clone(),
-        )
-        .is_dir(true)
-        .supported_with_reason("a Gradle user home shared by every Gradle build on this machine")
-        .evidence("gradle-layout", "gradle user home", Confidence::Medium)
-        .consequence(
-            "the next build re-downloads modules and distributions it needs -- needs network \
-             access",
-        )
-        .no_action_because("this home is shared by every Gradle project on this machine")
-        .build(),
-    ];
-    if let (Some(d), Some(first)) = (ctx.folded().get(&container.path), units.first_mut()) {
-        first.bytes = d.allocated_total;
-        first.basis = crate::artifact::AccountingBasis::Allocated;
-        first.mtime_max = d.mtime_max;
-        first.time_source = TimeSource::FoldedDirectoryModification;
-        first.coverage.complete = d.complete;
-    }
+    let mut root = NestedUnitBuilder::new(
+        container,
+        ArtifactRole::SharedStoreEntry,
+        container.path.clone(),
+    )
+    .is_dir(true)
+    .supported_with_reason("a Gradle user home shared by every Gradle build on this machine")
+    .evidence("gradle-layout", "gradle user home", Confidence::Medium)
+    .consequence(
+        "the next build re-downloads modules and distributions it needs -- needs network access",
+    )
+    .no_action_because("this home is shared by every Gradle project on this machine");
+    root = match ctx.folded().get(&container.path) {
+        Some(d) => root.folded(d),
+        None => root.limit("this Gradle user home was not measured by the walk this pass"),
+    };
+    let mut units = vec![root.build()];
     for child in ctx.folded().children(&container.path) {
         let name = child
             .path
@@ -393,6 +385,9 @@ fn identify_user_home(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedA
         }
         if name == "wrapper" {
             units.extend(identify_wrapper(container, ctx, &child.path));
+        }
+        if name == "daemon" {
+            units.extend(identify_daemons(container, ctx, &child.path));
         }
     }
     units
@@ -472,7 +467,43 @@ fn identify_modules(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
+        if files_name.starts_with("metadata-") {
+            // `modules-2/metadata-2.106/`: Gradle's resolution metadata
+            // for the cached modules (descriptors, resolved versions),
+            // keyed by the metadata format version in its name.
+            let mut variant = ArtifactVariant::default();
+            variant.configuration = Some(format!("module metadata {files_name}"));
+            units.push(
+                NestedUnitBuilder::new(container, ArtifactRole::Metadata, files.path.clone())
+                    .folded(files)
+                    .variant(variant)
+                    .supported_with_reason(format!(
+                        "`modules-2/{files_name}` is the dependency cache's own resolution \
+                         metadata"
+                    ))
+                    .evidence(
+                        "gradle-modules",
+                        format!("module metadata {files_name}"),
+                        Confidence::Medium,
+                    )
+                    .consequence(
+                        "the next build re-resolves module metadata -- needs network access",
+                    )
+                    .no_action_because("this metadata is shared by every Gradle build")
+                    .build(),
+            );
+            continue;
+        }
         if !files_name.starts_with("files-") {
+            units.push(
+                NestedUnitBuilder::new(container, ArtifactRole::Residual, files.path.clone())
+                    .folded(files)
+                    .unsupported_layout(format!(
+                        "`modules-2/{files_name}` is not a module-cache directory this adapter \
+                         identifies"
+                    ))
+                    .build(),
+            );
             continue;
         }
         for group in ctx.folded().children(&files.path) {
@@ -581,6 +612,50 @@ fn identify_wrapper(
                 .build(),
             );
         }
+    }
+    units
+}
+
+/// `daemon/<gradle-version>/`: one Gradle version's daemon registry and
+/// logs. The version keeps two daemons' logs distinct; nothing here says
+/// which version any project still uses.
+fn identify_daemons(
+    container: &BuildContainer,
+    ctx: &BuildCtx,
+    daemon: &Path,
+) -> Vec<NestedArtifact> {
+    let mut units = Vec::new();
+    for dir in ctx.folded().children(daemon) {
+        let name = dir
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut variant = ArtifactVariant::default();
+        let b =
+            NestedUnitBuilder::new(container, ArtifactRole::Metadata, dir.path.clone()).folded(dir);
+        let b = if crate::build_adapters::jvm_common::looks_like_version(&name) {
+            variant.toolchain = Some(format!("gradle {name}"));
+            b.variant(variant)
+                .supported_with_reason(format!(
+                    "`daemon/{name}` holds the Gradle {name} daemon's registry and logs"
+                ))
+                .evidence(
+                    "gradle-layout",
+                    format!("daemon logs for gradle {name}"),
+                    Confidence::Medium,
+                )
+                .consequence(format!(
+                    "the next Gradle {name} build starts a new daemon and a new log"
+                ))
+        } else {
+            variant.unknowns.push("toolchain".into());
+            b.variant(variant).unsupported_layout(format!(
+                "`daemon/{name}` is not a per-version daemon directory"
+            ))
+        };
+        units.push(b.build());
     }
     units
 }
@@ -761,6 +836,128 @@ mod tests {
             Adapter.containers(tmp.path(), &[]).is_empty(),
             "a `build/` with no Gradle marker beside it is not Gradle's"
         );
+    }
+
+    #[test]
+    fn two_gradle_versions_project_caches_stay_distinct() {
+        // `.gradle/8.5` and `.gradle/8.9` are two tool versions' caches
+        // side by side. Neither supersedes the other, and the version is
+        // what keeps them apart.
+        let tmp = tempfile::tempdir().unwrap();
+        let dot = tmp.path().join(".gradle");
+        let a = dot.join("8.5");
+        let b = dot.join("8.9");
+        for p in [&a, &b] {
+            fs::create_dir_all(p).unwrap();
+        }
+        let c = BuildContainer::project("gradle", dot.clone(), tmp.path().to_path_buf());
+        let units = run(
+            &c,
+            &index(&[(&dot, 600, 500), (&a, 300, 400), (&b, 300, 900)]),
+        );
+        let ua = units.iter().find(|u| u.path == a).expect("8.5");
+        let ub = units.iter().find(|u| u.path == b).expect("8.9");
+        assert_ne!(ua.id, ub.id);
+        assert_eq!(ua.variant.toolchain.as_deref(), Some("gradle 8.5"));
+        assert_eq!(ub.variant.toolchain.as_deref(), Some("gradle 8.9"));
+        assert_eq!(
+            ua.action,
+            crate::artifact::NestedActionCapability::InspectionOnly,
+            "the older version's cache gets no different treatment for being older"
+        );
+    }
+
+    #[test]
+    fn an_incompletely_measured_build_directory_says_so_and_stays_identified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        fs::create_dir_all(&build).unwrap();
+        let partial = FoldedIndex::from_dirs([FoldedDir {
+            path: build.clone(),
+            allocated_total: 4_000,
+            mtime_max: 500,
+            complete: false,
+        }]);
+        let units = run(
+            &BuildContainer::project("gradle", build.clone(), tmp.path().to_path_buf()),
+            &partial,
+        );
+        let u = &units[0];
+        assert!(!u.coverage.complete);
+        assert!(u.coverage.supported, "incomplete is not unsupported");
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("could not read all of this directory")),
+            "{:?}",
+            u.coverage.limits
+        );
+    }
+
+    #[test]
+    fn a_custom_gradle_user_home_is_identified_by_its_layout_not_its_name() {
+        // `GRADLE_USER_HOME=/opt/ci/gradle-cache`: the adapter never
+        // reads the variable (the detector resolves the home and hands
+        // it in), and nothing in identification depends on the home
+        // being called `.gradle`.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("ci/gradle-cache");
+        let caches = home.join("caches");
+        let modules = caches.join("modules-2");
+        let meta = modules.join("metadata-2.106");
+        let files = modules.join("files-2.1");
+        let group = files.join("org.slf4j");
+        let art = group.join("slf4j-api");
+        let ver = art.join("2.0.9");
+        let daemon = home.join("daemon");
+        let d85 = daemon.join("8.5");
+        let d89 = daemon.join("8.9");
+        let odd = modules.join("journal-1");
+        for p in [&meta, &ver, &d85, &d89, &odd] {
+            fs::create_dir_all(p).unwrap();
+        }
+        let c = BuildContainer::shared_store("gradle", home.clone());
+        let units = run(
+            &c,
+            &index(&[
+                (&home, 1_000, 500),
+                (&caches, 800, 500),
+                (&modules, 800, 500),
+                (&meta, 100, 500),
+                (&files, 600, 500),
+                (&group, 600, 500),
+                (&art, 600, 500),
+                (&ver, 600, 500),
+                (&odd, 100, 500),
+                (&daemon, 200, 500),
+                (&d85, 100, 400),
+                (&d89, 100, 900),
+            ]),
+        );
+        let module = units.iter().find(|u| u.path == art).expect("module unit");
+        assert_eq!(
+            module.variant.package.as_deref(),
+            Some("org.slf4j:slf4j-api")
+        );
+        let m = units
+            .iter()
+            .find(|u| u.path == meta)
+            .expect("metadata unit");
+        assert_eq!(m.role, ArtifactRole::Metadata);
+        let j = units
+            .iter()
+            .find(|u| u.path == odd)
+            .expect("an unknown modules-2 entry");
+        assert!(
+            !j.coverage.supported,
+            "an unknown entry is a named residual"
+        );
+        let a = units.iter().find(|u| u.path == d85).unwrap();
+        let b = units.iter().find(|u| u.path == d89).unwrap();
+        assert_eq!(a.variant.toolchain.as_deref(), Some("gradle 8.5"));
+        assert_eq!(b.variant.toolchain.as_deref(), Some("gradle 8.9"));
+        assert_ne!(a.id, b.id, "two daemon versions' logs never collapse");
     }
 
     #[test]
