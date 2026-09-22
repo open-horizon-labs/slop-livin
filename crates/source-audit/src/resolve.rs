@@ -602,7 +602,11 @@ pub fn calls(file: &syn::File) -> Vec<CallSite> {
 /// Production calls only: nothing inside `#[cfg(test)]`/`#[test]`, and
 /// nothing in a function marked `#[allow(dead_code)]` (which is what the
 /// sweep added to manufacture a caller for a dead public API).
-pub fn production_calls(file: &syn::File) -> Vec<CallSite> {
+pub fn production_calls(file: &crate::ast::CachedAst) -> Vec<CallSite> {
+    crate::ast::memoised("production_calls", file, || production_calls_uncached(file))
+}
+
+fn production_calls_uncached(file: &syn::File) -> Vec<CallSite> {
     calls(file)
         .into_iter()
         .filter(|c| !c.in_test && !c.dead_code_allowed)
@@ -885,13 +889,16 @@ pub fn unknown_macros(file: &syn::File) -> Vec<(String, String)> {
 pub struct Parsed {
     pub rel: String,
     pub text: String,
-    pub ast: syn::File,
+    pub ast: std::rc::Rc<crate::ast::CachedAst>,
 }
 
 pub fn parse(root: &Path, rel: &str) -> Result<Parsed, String> {
     let path: PathBuf = root.join(rel);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {rel}: {e}"))?;
-    let ast = syn::parse_file(&text).map_err(|e| format!("{rel} is not valid Rust: {e}"))?;
+    // Shares one contents-keyed cache with `ast::parse`: the resolver
+    // and the rules read the same files, and parsing them twice per
+    // audit run was most of what an audit run cost.
+    let ast = crate::ast::parse_cached(rel, &text)?;
     Ok(Parsed {
         rel: rel.to_string(),
         text,
@@ -1024,14 +1031,14 @@ mod tests {
     #[test]
     fn a_dead_code_allowed_caller_is_not_a_production_caller() {
         let f = file("#[allow(dead_code)] fn fake() { real_api(); }");
-        assert!(production_calls(&f).is_empty());
+        assert!(production_calls_uncached(&f).is_empty());
         assert!(calls(&f).iter().any(|c| c.path == "real_api"));
     }
 
     #[test]
     fn test_code_is_excluded_from_production_calls() {
         let f = file("#[cfg(test)] mod t { fn g() { real_api(); } }");
-        assert!(production_calls(&f).is_empty());
+        assert!(production_calls_uncached(&f).is_empty());
     }
 
     #[test]

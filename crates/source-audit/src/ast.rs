@@ -10,18 +10,117 @@ use syn::visit::Visit;
 pub struct SourceFile {
     pub rel: String,
     pub text: String,
-    pub ast: syn::File,
+    pub ast: std::rc::Rc<CachedAst>,
+}
+
+/// A parsed file plus the identity the derived caches key on.
+///
+/// The id is assigned once per distinct `(path, contents)` and never
+/// reused, which is what makes it safe to memoise an expensive
+/// derivation (`functions`) against it: two `CachedAst`s with the same
+/// id are the same bytes parsed once, and a different parse of the same
+/// path gets a different id. Derefs to the `syn::File`, so every rule
+/// that only wants the AST keeps reading it exactly as before.
+pub struct CachedAst {
+    id: u64,
+    file: syn::File,
+}
+
+impl std::ops::Deref for CachedAst {
+    type Target = syn::File;
+    fn deref(&self) -> &syn::File {
+        &self.file
+    }
 }
 
 pub fn parse(root: &Path, rel: &str) -> Result<SourceFile, String> {
     let path = root.join(rel);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {rel}: {e}"))?;
-    let ast = syn::parse_file(&text).map_err(|e| format!("{rel} is not valid Rust: {e}"))?;
+    let ast = parse_cached(rel, &text)?;
     Ok(SourceFile {
         rel: rel.to_string(),
         text,
         ast,
     })
+}
+
+/// `syn::parse_file`, memoised on the file's **exact contents**.
+///
+/// Parsing and the derivations over it are what an audit run costs:
+/// every rule reads the whole workspace, and the mutation corpus runs
+/// one audit per fixture over a copy of that workspace, so the same
+/// unchanged files were re-parsed and re-analysed 136 times over. The
+/// cache is keyed on `(rel, text)` and compares the text exactly, never
+/// a stamp or a digest, so a cached parse can only ever be returned for
+/// input that is byte-for-byte the file being parsed. Reading the file
+/// still happens every time; only the parse is skipped.
+///
+/// Thread-local, so no audit run can observe another thread's entries
+/// and no lock is taken on the hot path.
+pub fn parse_cached(rel: &str, text: &str) -> Result<std::rc::Rc<CachedAst>, String> {
+    let key = (rel.to_string(), text.to_string());
+    if let Some(hit) = PARSE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let file = syn::parse_file(text).map_err(|e| format!("{rel} is not valid Rust: {e}"))?;
+    let id = NEXT_AST_ID.with(|n| {
+        let v = n.get();
+        n.set(v + 1);
+        v
+    });
+    let ast = std::rc::Rc::new(CachedAst { id, file });
+    PARSE_CACHE.with(|c| c.borrow_mut().insert(key, ast.clone()));
+    Ok(ast)
+}
+
+/// Empties this thread's parse and derivation caches. Exists so a test
+/// can prove they change nothing: run an audit cold, clear, run it
+/// again, and compare the two results. Both caches are cleared together
+/// -- a derived entry outliving the parse it was derived from is the one
+/// way this could answer for the wrong file.
+pub fn clear_parse_cache() {
+    PARSE_CACHE.with(|c| c.borrow_mut().clear());
+    DERIVED_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// `(path, contents)` → the one parse of those bytes.
+type ParseCache = std::collections::HashMap<(String, String), std::rc::Rc<CachedAst>>;
+/// `(derivation name, file id)` → that derivation's cached result.
+type DerivedCache = std::collections::HashMap<(&'static str, u64), std::rc::Rc<dyn std::any::Any>>;
+
+thread_local! {
+    static PARSE_CACHE: std::cell::RefCell<ParseCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static DERIVED_CACHE: std::cell::RefCell<DerivedCache> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_AST_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Memoises one derivation over one parsed file.
+///
+/// `what` names the derivation and `file.id` the exact bytes it was
+/// derived from, so two entries can only collide if they are the same
+/// derivation over the same contents. Cleared with the parse cache, so
+/// a derived entry can never outlive the parse it came from.
+pub fn memoised<T: Clone + 'static>(
+    what: &'static str,
+    file: &CachedAst,
+    compute: impl FnOnce() -> T,
+) -> T {
+    let key = (what, file.id);
+    if let Some(hit) = DERIVED_CACHE.with(|c| c.borrow().get(&key).cloned())
+        && let Ok(typed) = hit.downcast::<T>()
+    {
+        return (*typed).clone();
+    }
+    let value = compute();
+    DERIVED_CACHE.with(|c| {
+        c.borrow_mut().insert(
+            key,
+            std::rc::Rc::new(value.clone()) as std::rc::Rc<dyn std::any::Any>,
+        )
+    });
+    value
 }
 
 /// Every `.rs` file at or below `rel_dir`, relative to `root`.
@@ -36,6 +135,7 @@ pub fn rust_files_under(root: &Path, rel_dir: &str) -> Vec<String> {
 
 /// Every free function and impl method in the file, with its name and
 /// body token string (test modules excluded).
+#[derive(Clone)]
 pub struct Func {
     pub name: String,
     pub body: String,
@@ -133,7 +233,20 @@ fn macro_literal_text(file: &syn::File, func: &str, body: &str) -> String {
     out
 }
 
-pub fn functions(file: &syn::File) -> Vec<Func> {
+/// Every function in the file with its **resolved** body, memoised on
+/// the file's identity.
+///
+/// This is the single most expensive thing the audits do -- fifty-one
+/// call sites, each rewriting every path in every body through the
+/// resolver -- and thirty rules do it to the same unchanged files. The
+/// cache is keyed on [`CachedAst`]'s id, which is assigned once per
+/// distinct `(path, contents)` and never reused, and it is cleared
+/// together with the parse cache.
+pub fn functions(file: &CachedAst) -> Vec<Func> {
+    memoised("functions", file, || functions_uncached(file))
+}
+
+fn functions_uncached(file: &syn::File) -> Vec<Func> {
     let res = crate::resolve::resolver(file);
     let raw = functions_raw(file);
     raw.into_iter()
@@ -314,7 +427,11 @@ fn referenced_idents_raw(file: &syn::File) -> Vec<String> {
 /// as stat_path_inner` then `stat_path_inner(p)` is reported as
 /// `std::fs::metadata`. That alias is how the mutation sweep walked past
 /// `symlinks_never_followed`.
-pub fn call_paths(file: &syn::File) -> Vec<String> {
+pub fn call_paths(file: &CachedAst) -> Vec<String> {
+    memoised("call_paths", file, || call_paths_uncached(file))
+}
+
+fn call_paths_uncached(file: &syn::File) -> Vec<String> {
     let res = crate::resolve::resolver(file);
     call_paths_raw(file)
         .into_iter()
@@ -372,7 +489,11 @@ pub fn call_paths_raw(file: &syn::File) -> Vec<String> {
 /// `concat!("can", " be deleted")` was how the sweep hid a verdict from
 /// `agent_interface_facts_not_verdicts`, and `format!("project-{}.json")`
 /// was how it hid a JSON sidecar from `store_data_is_parquet_not_json_sidecars`.
-pub fn string_literals(file: &syn::File) -> Vec<String> {
+pub fn string_literals(file: &CachedAst) -> Vec<String> {
+    memoised("string_literals", file, || string_literals_uncached(file))
+}
+
+fn string_literals_uncached(file: &syn::File) -> Vec<String> {
     let mut out = string_literals_raw(file);
     for (_, l) in crate::resolve::literals(file) {
         out.push(l);

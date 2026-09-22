@@ -131,10 +131,80 @@ fn fixtures() -> Vec<Fixture> {
     out
 }
 
+/// One worker's private copy of the workspace, so fixtures can be
+/// applied in parallel without two of them editing the same file.
+fn fresh_copy(tmp: &Path) -> PathBuf {
+    let work = tmp.join("workspace");
+    for entry in COPIED {
+        let from = repo_root().join(entry);
+        if from.exists() {
+            copy_tree(&from, &work.join(entry));
+        }
+    }
+    work
+}
+
+/// Applies one fixture to `work`, runs its audit, restores the file, and
+/// returns the problem it found, if any.
+///
+/// Restoring rather than re-copying is what makes a shared copy usable,
+/// and it is also why a worker owns its copy outright: two fixtures
+/// whose targets overlap would otherwise see each other's mutation.
+fn check_fixture(work: &Path, f: &Fixture) -> Option<String> {
+    let Some((_, audit)) = AUDITS.iter().find(|(n, _)| *n == f.audit) else {
+        return Some(format!(
+            "{}/{}: no audit named `{}` is registered",
+            f.audit, f.name, f.audit
+        ));
+    };
+    let target = work.join(&f.target);
+    let original = std::fs::read_to_string(&target).unwrap_or_default();
+    let mutated = match f.mode.as_str() {
+        "replace" => f.body.clone(),
+        _ => format!("{original}\n{}", f.body),
+    };
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, &mutated).unwrap();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(work)));
+
+    if original.is_empty() {
+        let _ = std::fs::remove_file(&target);
+    } else {
+        std::fs::write(&target, &original).unwrap();
+    }
+
+    match outcome {
+        Err(_) => Some(format!(
+            "{}/{}: the audit panicked on the mutated tree",
+            f.audit, f.name
+        )),
+        Ok(Ok(())) if f.expect == "reject" => Some(format!(
+            "{}/{}: ACCEPTED a mutation it must reject -- {}\n    (applied to {})",
+            f.audit, f.name, f.why, f.target
+        )),
+        Ok(Err(e)) if f.expect == "accept" => Some(format!(
+            "{}/{}: REJECTED a legitimate shape -- {}\n    audit said: {e}",
+            f.audit, f.name, f.why
+        )),
+        Ok(_) => None,
+    }
+}
+
 /// Every fixture is applied to a copy of the real workspace and the
 /// named audit is run against it. A `reject` fixture that passes is
 /// reported with the sweep slip it reproduces, so the failure names the
 /// hole rather than a fixture number.
+///
+/// Sharded across workers, each with its own workspace copy and its own
+/// thread-local parse cache (`ast::parse_cached`). Both halves matter:
+/// the audits are pure functions of a directory, so an audit run costs
+/// one full workspace analysis, and there are 136 of them. Together with
+/// the parse cache this took the corpus from 191 s to the figure in
+/// `.oh/sessions/2026-09-22-detector-root-cursors.md`. Neither changes
+/// what any fixture asserts -- the sharding only decides which worker
+/// runs which fixture, and the cache is keyed on the file's exact
+/// contents (`the_parse_cache_never_changes_an_audit_verdict`).
 #[test]
 fn every_mutation_fixture_is_rejected_by_its_audit() {
     let fixtures = fixtures();
@@ -143,57 +213,49 @@ fn every_mutation_fixture_is_rejected_by_its_audit() {
         "the mutation corpus is empty; every audit needs at least three rejection fixtures \
          including one alias/rename and one discarded-result variant"
     );
+    // Each worker holds one workspace's parsed ASTs, so the worker count
+    // is bounded by memory as much as by cores.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 12)
+        .min(fixtures.len());
     let tmp = tempfile::tempdir().expect("tempdir");
-    let work = tmp.path().join("workspace");
-    for entry in COPIED {
-        let from = repo_root().join(entry);
-        if from.exists() {
-            copy_tree(&from, &work.join(entry));
-        }
-    }
+    let shards: Vec<Vec<&Fixture>> = (0..workers)
+        .map(|w| {
+            fixtures
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % workers == w)
+                .map(|(_, f)| f)
+                .collect()
+        })
+        .collect();
 
-    let mut problems: Vec<String> = Vec::new();
-    for f in &fixtures {
-        let Some((_, audit)) = AUDITS.iter().find(|(n, _)| *n == f.audit) else {
-            problems.push(format!(
-                "{}/{}: no audit named `{}` is registered",
-                f.audit, f.name, f.audit
-            ));
-            continue;
-        };
-        let target = work.join(&f.target);
-        let original = std::fs::read_to_string(&target).unwrap_or_default();
-        let mutated = match f.mode.as_str() {
-            "replace" => f.body.clone(),
-            _ => format!("{original}\n{}", f.body),
-        };
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, &mutated).unwrap();
+    let problems: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = shards
+            .into_iter()
+            .enumerate()
+            .map(|(w, shard)| {
+                let dir = tmp.path().join(format!("w{w}"));
+                scope.spawn(move || {
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let work = fresh_copy(&dir);
+                    shard
+                        .into_iter()
+                        .filter_map(|f| check_fixture(&work, f))
+                        .collect::<Vec<String>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker"))
+            .collect()
+    });
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(&work)));
-
-        if original.is_empty() {
-            let _ = std::fs::remove_file(&target);
-        } else {
-            std::fs::write(&target, &original).unwrap();
-        }
-
-        match outcome {
-            Err(_) => problems.push(format!(
-                "{}/{}: the audit panicked on the mutated tree",
-                f.audit, f.name
-            )),
-            Ok(Ok(())) if f.expect == "reject" => problems.push(format!(
-                "{}/{}: ACCEPTED a mutation it must reject -- {}\n    (applied to {})",
-                f.audit, f.name, f.why, f.target
-            )),
-            Ok(Err(e)) if f.expect == "accept" => problems.push(format!(
-                "{}/{}: REJECTED a legitimate shape -- {}\n    audit said: {e}",
-                f.audit, f.name, f.why
-            )),
-            Ok(_) => {}
-        }
-    }
+    let mut problems = problems;
+    problems.sort();
     assert!(
         problems.is_empty(),
         "{} of {} mutation fixtures behaved wrongly:\n{}",
@@ -201,6 +263,78 @@ fn every_mutation_fixture_is_rejected_by_its_audit() {
         fixtures.len(),
         problems.join("\n")
     );
+}
+
+/// The parse cache is an optimisation, so it has to be invisible: the
+/// same fixture must get the same verdict from a cold cache and a warm
+/// one.
+///
+/// Three fixtures, cold-then-warm and warm-then-cold, because a cache
+/// that only ever answers one way round is not being exercised. The
+/// warm run is warmed by a *different* fixture's mutation of the same
+/// file, which is the state the sharded run above actually creates.
+#[test]
+fn the_parse_cache_never_changes_an_audit_verdict() {
+    let fixtures = fixtures();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sample: Vec<&Fixture> = fixtures
+        .iter()
+        .step_by(fixtures.len().max(1) / 3)
+        .take(3)
+        .collect();
+    assert_eq!(sample.len(), 3, "three fixtures, from across the corpus");
+
+    std::thread::scope(|scope| {
+        for (i, f) in sample.into_iter().enumerate() {
+            let dir = tmp.path().join(format!("v{i}"));
+            scope.spawn(move || check_cache_is_invisible(&dir, f));
+        }
+    });
+}
+
+/// One fixture's cold/warm comparison, on a workspace copy of its own.
+fn check_cache_is_invisible(dir: &Path, f: &Fixture) {
+    {
+        let Some((_, audit)) = AUDITS.iter().find(|(n, _)| *n == f.audit) else {
+            return;
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        let work = fresh_copy(dir);
+        let target = work.join(&f.target);
+        let original = std::fs::read_to_string(&target).unwrap_or_default();
+        let mutated = match f.mode.as_str() {
+            "replace" => f.body.clone(),
+            _ => format!("{original}\n{}", f.body),
+        };
+
+        swamp_source_audit::ast::clear_parse_cache();
+        std::fs::write(&target, &mutated).unwrap();
+        let cold = audit(&work).is_ok();
+
+        // Warm the cache with the *unmutated* file, then re-run the
+        // mutated one: if the cache were keyed on anything weaker than
+        // the contents -- a path, a length, a stamp -- this is where it
+        // would answer for the wrong text.
+        std::fs::write(&target, &original).unwrap();
+        let _ = audit(&work);
+        std::fs::write(&target, &mutated).unwrap();
+        let warm = audit(&work).is_ok();
+
+        std::fs::write(&target, &original).unwrap();
+        let restored = audit(&work).is_ok();
+
+        assert_eq!(
+            cold, warm,
+            "{}/{}: the parse cache changed the verdict (cold={cold}, warm={warm})",
+            f.audit, f.name
+        );
+        assert!(
+            restored,
+            "{}/{}: the restored file must pass its own audit again, or the cache is holding \
+             a mutated parse for unmutated text",
+            f.audit, f.name
+        );
+    }
 }
 
 /// The unmutated copy must pass every audit, or a "rejected" result
@@ -215,16 +349,34 @@ fn the_unmutated_workspace_copy_reproduces_the_real_audit_result() {
             copy_tree(&from, &work.join(entry));
         }
     }
-    for (name, audit) in AUDITS {
-        let on_copy = audit(&work);
-        let on_real = audit(&repo_root());
-        assert_eq!(
-            on_copy.is_ok(),
-            on_real.is_ok(),
-            "audit `{name}` disagrees between the real tree and its copy: copy={on_copy:?} \
-             real={on_real:?}"
-        );
-    }
+    // One audit per worker, since each audit reads the whole workspace
+    // twice here and there are thirty of them. Read-only on both trees,
+    // so no worker needs a copy of its own.
+    let real = repo_root();
+    let problems: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = AUDITS
+            .iter()
+            .map(|(name, audit)| {
+                let work = work.clone();
+                let real = real.clone();
+                scope.spawn(move || {
+                    let on_copy = audit(&work);
+                    let on_real = audit(&real);
+                    (on_copy.is_ok() != on_real.is_ok()).then(|| {
+                        format!(
+                            "audit `{name}` disagrees between the real tree and its copy: \
+                             copy={on_copy:?} real={on_real:?}"
+                        )
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("worker"))
+            .collect()
+    });
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// Section 17, item 6: an audit with no rejection fixture is an audit

@@ -240,19 +240,58 @@ shared and killed the stream on the line that took ownership of it.
 
 ---
 
-# 6. Not done
+# 6. Mutation corpus: 191 s → 18 s
 
-**Mutation corpus speed (brief item 4).** The brief scoped it as "do
-this LAST and only if 1–3 are complete and green". 1–3 are complete and
-green; this is not attempted, and the reason is the one the previous
-chunk gave: it changes the machinery the audits' own evidence rests on
-(parse the workspace once, overlay each fixture in memory, run only the
-owning audit), and it needs the "overlay equals the on-disk copy"
-equivalence test the brief specifies before anyone should trust a
-byte-identical claim about 136 fixtures. It deserves the review attention
-of its own chunk rather than the tail of one that already changed the
-replay lifecycle and an adapter's stored shape. `mutation_corpus` still
-costs about 191 s.
+`every_mutation_fixture_is_rejected_by_its_audit` was **191 s**. It is
+now **18.4 s** measured alone; the whole `mutation_corpus` test file,
+which also runs the unmutated-copy check and the new cache-equivalence
+check, is 32 s wall (18.4 + 11.4 + 5.3 s measured individually, sharing
+twelve cores).
+
+Two changes, and the first one is not what the brief's phrasing
+predicted:
+
+1. **Parsing is memoised on file contents, and so is the expensive
+   derivation over it.** `ast::parse_cached` keys `syn::parse_file` on
+   `(rel, text)` and compares the text exactly — never a stamp, never a
+   digest — so a cached parse can only be returned for input that is
+   byte-for-byte the file being parsed. `ast::CachedAst` carries an id
+   assigned once per distinct `(path, contents)` and never reused, and
+   `ast::memoised` keys derivations on it. Both caches are thread-local
+   and cleared together, so a derived entry can never outlive the parse
+   it came from.
+
+   Caching the *parse* alone took 191 s to 136 s, which was the surprise:
+   parsing was not the dominant cost. Measuring each audit showed no hot
+   spot — thirty rules at 1–7 s each, all of them re-deriving the same
+   function bodies. `ast::functions` (fifty-one call sites, and it
+   rewrites every path in every body through the resolver) is what
+   actually mattered; memoising it took 54 s to 31 s. Memoising
+   `production_calls`, `string_literals` and `call_paths` as well
+   changed nothing measurable, and they are kept only because they cost
+   nothing to keep.
+
+2. **The corpus is sharded.** The audits are pure functions of a
+   directory, so each worker gets its own workspace copy and its own
+   thread-local caches; the unmutated-copy check gets one worker per
+   audit (it is read-only on both trees). 513 s of CPU on 12 cores.
+
+   Peak RSS for the whole test file is 1.6 GB — twelve parsed copies of
+   the workspace — which is why the worker count is clamped rather than
+   simply `available_parallelism`.
+
+Neither change touches what a fixture asserts.
+`the_parse_cache_never_changes_an_audit_verdict` is the guard the brief
+asked for, in the form this implementation needs: three fixtures from
+across the corpus, each run cold and then warm, where the *warm* run is
+warmed by the unmutated file's own parse of the same path. A cache keyed
+on anything weaker than the contents — a path, a length, a stamp — fails
+there. It also asserts the restored file passes its audit again, which
+catches a cache holding a mutated parse for unmutated text.
+
+---
+
+# 7. Not done
 
 **The `TooSoon` residual on the reviewer's back-to-back fixture**
 (section 2). Needs the integration owner's call: either the fixture

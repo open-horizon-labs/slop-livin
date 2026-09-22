@@ -45,6 +45,12 @@ Making the reuse fire, and keeping a count honest while it does.
   partial count, and the home level sums stored partials and fresh ones;
   a replayed container whose partial is missing makes every blob count
   unknown rather than short. No blob is offered for removal either way.
+- **The audit mutation corpus runs in 18 s instead of 191 s.** Parsing
+  and the function-body analysis over it are memoised on each file's
+  exact contents, and the corpus is sharded across workers with a
+  workspace copy each. A test asserts the caches change no audit's
+  verdict, cold or warm. Developer-facing only; no audit's behaviour
+  changed.
 - **The live file watcher opens one stream per root reliably.** Starting
   an FSEvents stream is a request to `fseventsd` that takes seconds and
   is serialized per process; the watcher waited for each root's stream
