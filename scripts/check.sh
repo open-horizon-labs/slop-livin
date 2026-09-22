@@ -74,6 +74,7 @@ for t in \
   core/tests/fsevents_incremental \
   core/tests/build_adapter_contract \
   core/tests/build_adapter_cost \
+  core/tests/build_adapter_history \
   tui/tests/scope_preserving_refresh \
   tui/tests/reviewer_counterexamples_stack2_tui \
   source-audit/tests/compile_fail \
