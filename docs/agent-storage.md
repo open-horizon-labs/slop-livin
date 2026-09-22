@@ -99,20 +99,20 @@ is recorded per row below and in
 
 | Tool | Id | Support | Actions | Home / override | Verified against |
 |---|---|---|---|---|---|
-| Claude Code | `claude-code` | supported | yes | `~/.claude`, or `$CLAUDE_CONFIG_DIR` if set | [claude-directory](https://code.claude.com/docs/en/claude-directory) (retrieved 2026-09-21): the directory table and the override |
-| Codex | `codex` | supported | yes | `CODEX_HOME`, default `~/.codex` (`sessions/`+`archived_sessions/` year/month/day rollout trees, `auth.json`, `history.jsonl`, `config.toml`, `log/`, a deprecated `skills/`, six `*.sqlite` state stores relocatable via `CODEX_SQLITE_HOME`) | openai/codex `main` @ `30daed37ad8035f041f65a4c4615fbc590dc8552`: `codex-rs/state/src/lib.rs` (`CODEX_SQLITE_HOME`), `codex-rs/core/src/config/mod.rs` (`log/`, overridable by `log_dir`), `codex-rs/ext/skills/src/host_roots.rs` (`skills/`, upstream-deprecated in favour of `~/.agents/skills`) |
-| Codex desktop app | `codex-desktop` | supported | yes | macOS `~/Library/Logs/com.openai.codex`; settings/session storage beyond logs is unconfirmed and not modeled | openai/codex `codex-rs/cli/src/doctor/desktop/platform.rs` (read during #93): the log directory only -- a deliberately partial row |
-| Oh My Pi | `oh-my-pi` | supported | yes | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set (a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md) `main`, read during #94; **not re-fetched 2026-09-21** |
-| OpenCode | `opencode` | supported | yes | data `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode`, also settable by `OPENCODE_CONFIG_DIR`; cache `${XDG_CACHE_HOME:-~/.cache}/opencode` -- config and cache reported as opaque external units | sst/opencode `dev` @ `fe3f3a41f79ad292cc3c7c629567385a20ec5130`: `packages/core/src/global.ts` (data dir is `$XDG_DATA_HOME/opencode` via `xdg-basedir`), `packages/core/src/flag/flag.ts` (the complete env-var registry). **`OPENCODE_DATA_DIR` does not exist** -- this row claimed it was "honored defensively"; the claim is withdrawn |
-| Gemini CLI | `gemini-cli` | supported | yes | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `bin/`, `oauth_creds.json`); `tmp/<project-id>/` and `history/<project-id>/`, where the id is a legacy `sha256` or a current registry slug | google-gemini/gemini-cli `main` @ `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`: `packages/core/src/config/storage.ts` (`OAUTH_FILE = oauth_creds.json`; the `projects.json` registry and the hash-to-slug migration), `packages/core/src/utils/paths.ts` (`GEMINI_CLI_HOME`; `GEMINI_DIR` is a constant, not an env var) |
-| Pi | `pi` | supported | yes | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (shared with Oh My Pi's own override; `badlogic/pi-mono`, which Oh My Pi forks) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md) `main`, read during #96; **not re-fetched 2026-09-21** |
-| Aider | `aider` | supported | yes | `~/.aider/caches` and an optional home-level `.aider.conf.yml`; per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v*/` at the git root -- project-local, attached to the worktree model | Aider-AI/aider `main` `aider/args.py`, `aider/repomap.py`, `aider/models.py`, read during #96; **not re-fetched 2026-09-21** |
-| GitHub Copilot CLI | `github-copilot-cli` | supported | yes | `~/.copilot`, overridable via `COPILOT_HOME`; separate platform-conventional cache via `COPILOT_CACHE_HOME` | [cli-config-dir-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), retrieved during #97: the full config-directory listing and both overrides |
-| Cursor | `cursor` | unverified | no | editor-profile storage, macOS only: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | [cursor.com troubleshooting guide](https://cursor.com/docs/troubleshooting/troubleshooting-guide), retrieved 2026-09-21: **NOT CONFIRMED** -- it says data is cached locally and names no path; the page contains none of `Application Support/Cursor`, `globalStorage`, `workspaceStorage` or `state.vscdb`. Only `forum.cursor.com` community threads corroborate it |
-| Windsurf | `windsurf` | unverified | no | `~/.codeium/windsurf` (not decomposed) plus the VS-Code-fork profile at `~/Library/Application Support/Windsurf`, macOS only. Upstream renamed the product **Devin Desktop** on 2026-06-02 and moved the read-write profile to `~/Library/Application Support/Devin` | [docs.devin.ai desktop FAQ](https://docs.devin.ai/desktop/devin-desktop-faq), retrieved 2026-09-21 (`docs.windsurf.com` 307-redirects here): **PARTIALLY CONFIRMED** -- the profile root and `globalStorage/` are named, along with `User/settings.json`, `User/keybindings.json`, `User/snippets/`, `Workspaces/` and `argv.json`. `workspaceStorage` is **not** on the page, and neither are the `Cache`/`CachedData`/`CachedExtensionVSIXs`/`logs` siblings this adapter also models |
-| Cline | `cline` | supported | yes | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/`. Cline 4.x adds a second root -- `CLINE_DATA_DIR`, else `CLINE_DIR/data`, else `~/.cline/data` -- **not modeled yet** | cline/cline `main` @ `d4d3d9f31f309f89d0327e2b48ab6f775030595e`: `apps/vscode/src/core/storage/disk.ts` (the task filenames and directory), `apps/vscode/package.json` (the extension id). **`task_metadata.json` has no `workspace` field** (`apps/vscode/src/core/context/context-tracking/ContextTrackerTypes.ts`: `{ files_in_context, model_usage, environment_history }`), refuting this row's previous linkage claim; the working directory is `HistoryItem.cwdOnTaskInitialization` (optional) in the `taskHistory` extension state, inside `state.vscdb` or `~/.cline/data/state/taskHistory.json` |
-| Roo Code | `roo-code` | supported | yes | Same per-host modeling as Cline: `globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` (`api_conversation_history.json`, `ui_messages.json`, `task_metadata.json`, `history_item.json`, plus `tasks/_index.json`). The `roo-cline.customStoragePath` setting can relocate `tasks/` entirely, in which case this catalog simply does not find it | RooCodeInc/Roo-Code `main` @ `b867ec9145750d0ae1ff7f02d35406e9bf2a0b16`: `src/shared/globalFileNames.ts`, `src/utils/storage.ts` (`getTaskDirectoryPath` and the override), `src/core/task-persistence/TaskHistoryStore.ts` (the `workspace` field is in `history_item.json`, **not** `task_metadata.json`, which `src/core/context-tracking/FileContextTrackerTypes.ts` defines as `{ files_in_context }`) |
-| Continue | `continue` | supported | yes | `~/.continue`, or `CONTINUE_GLOBAL_DIR` when set (`config.yaml`/`config.json`, `sessions/<id>.json` + a `sessions/sessions.json` index, `index/` embeddings/tag caches, `dev_data/` with `devdata.sqlite`) | continuedev/continue `main` @ `5522c6f44ca0ac3528b37244818fbfa39b5af470`: `core/util/paths.ts` (the whole layout and the override), `core/index.d.ts` + `core/util/history.ts` (`Session.workspaceDirectory` is a required field, written per session and mirrored into the index) -- so this row's previous "no confirmed per-session workspace-linkage field was found" is superseded, and the adapter reads it |
+| Claude Code | `claude-code` | supported | yes | `~/.claude`, or `$CLAUDE_CONFIG_DIR` if set | [claude-directory](https://code.claude.com/docs/en/claude-directory) (retrieved 2026-09-22): the directory table and the `CLAUDE_CONFIG_DIR` override, which the page states re-roots every path on it. The page also documents `todos/`, `statsig/` and `logs/` in one row as **legacy directories from older versions, "No longer written"** -- so they are not auto-regenerating caches, and this catalog's previous "community-documented, regenerates automatically" note for `statsig` was wrong in both halves |
+| Codex | `codex` | supported | yes | `CODEX_HOME`, default `~/.codex` (`sessions/`+`archived_sessions/` year/month/day rollout trees, `auth.json`, `history.jsonl`, `config.toml`, `log/`, a deprecated `skills/`, **seven** `*.sqlite` state stores relocatable via `CODEX_SQLITE_HOME`) | openai/codex `main` @ `ac7634b9f73ec1bf96466be7a5869f0949d20b30`: `codex-rs/state/src/sqlite.rs` (`const RUNTIME_DBS: [RuntimeDbSpec; 7]` -- `state_5`, `logs_2`, `goals_1`, `memories_1`, **`memories_v2_1`**, `queue_1`, `thread_history_1`; this row previously said six), `codex-rs/state/src/lib.rs` (`SQLITE_HOME_ENV` only -- **not** the filenames, which this row previously cited it for), `codex-rs/config/src/config_toml.rs` + `codex-rs/core/src/config/mod.rs` (`log/`, overridable by `log_dir`), `codex-rs/ext/skills/src/host_roots.rs` (`skills/`, upstream-deprecated in favour of `~/.agents/skills`), `codex-rs/utils/home-dir/src/lib.rs`, `codex-rs/rollout/src/{lib,list,rollout_file_name,metadata}.rs`, `codex-rs/protocol/src/protocol.rs` (`SessionMeta.cwd`) |
+| Codex desktop app | `codex-desktop` | supported | yes | logs only: macOS `~/Library/Logs/<identity>` and Windows `%LOCALAPPDATA%/Codex/Logs`, both day-partitioned `YYYY/MM/DD`; Linux unconfirmed. Settings/session storage beyond logs is unconfirmed and not modeled | openai/codex `main` @ `ac7634b9f73ec1bf96466be7a5869f0949d20b30`: **`codex-rs/cli/src/doctor/desktop.rs`** (`desktop_log_root`). This row previously cited `doctor/desktop/platform.rs`, which contains no `log_root` at all, and claimed no Windows desktop build was confirmed -- the source confirms it; only Linux returns `None` |
+| Oh My Pi | `oh-my-pi` | supported | yes | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set. **Unmodelled and stated rather than left silent**: a named profile (`--profile`/`OMP_PROFILE`) re-roots everything under `~/.omp/profiles/<name>/`, and an existing XDG data/state/cache directory relocates the corresponding subtrees | can1357/oh-my-pi `main` @ `fd3f8e3c569b511611081e16b181b740a4c98599`: `packages/utils/src/dirs.ts` (`CONFIG_DIR_NAME = .omp`, `getAgentDir`, `getSessionsDir`, `getBlobsDir`, `getLogsDir`, the `agent.db`/`history.db`/`models.db` stores), `docs/config-usage.md` (the profile and XDG relocations) |
+| OpenCode | `opencode` | supported | yes | data `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode`, also settable by `OPENCODE_CONFIG_DIR`; cache `${XDG_CACHE_HOME:-~/.cache}/opencode` -- config and cache reported as opaque external units. **Unmodelled**: the `state` root (`$XDG_STATE_HOME/opencode`) and `tmp` | sst/opencode `dev` @ `fe3f3a41f79ad292cc3c7c629567385a20ec5130`: `packages/core/src/global.ts` (the roots -- data, config, cache, **state**, tmp, plus derived bin/log/repos; **`OPENCODE_DATA_DIR` does not exist**), `packages/opencode/src/storage/storage.ts` (every key becomes `path.join(dir, ...key) + ".json"`, so `storage/session_diff/<session-id>` is a **file**, not a directory), `packages/opencode/src/session/revert.ts`, `packages/core/src/database/database.ts` (`opencode.db`) |
+| Gemini CLI | `gemini-cli` | supported | yes | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `oauth_creds.json`, and **`tmp/bin`** -- not `bin/`); `tmp/<project-id>/` and `history/<project-id>/`, where the id is a legacy `sha256` or a current registry slug. Under `SANDBOX=sandbox-exec` the runtime dir moves to `~/.cache/.gemini` | google-gemini/gemini-cli `main` @ `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`: `packages/core/src/config/storage.ts` (`getGlobalBinDir() = join(getGlobalTempDir(), 'bin')` -- so the cache is at `tmp/bin` and this row's `~/.gemini/bin` was a path no version writes; and the `sandbox-exec` -> `~/.cache/.gemini` runtime move), `packages/core/src/utils/paths.ts` (`GEMINI_DIR` is a constant, not an env var), `packages/core/src/config/projectRegistry.ts` (the `projects.json` slug registry and the hash-to-slug migration) |
+| Pi | `pi` | supported | yes | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (shared with Oh My Pi's own override) | earendil-works/pi `main` @ `d201760ffee16564aa8d9a759e0c85b70db33674`: **`packages/coding-agent/docs/environment-variables.md`** (`PI_CODING_AGENT_DIR`) -- this row previously cited `settings.md`, which does not contain that string at all; the claim was true, the citation did not establish it. Also `packages/coding-agent/src/config.ts` (`CONFIG_DIR_NAME = .pi`, `getAgentDir`, `getSessionsDir`) and `docs/sessions.md` |
+| Aider | `aider` | supported | yes | `~/.aider/caches` and an optional home-level `.aider.conf.yml`; per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v{3,4}/` at the git root -- project-local, attached to the worktree model. `.aider.llm.history` is **opt-in** upstream, so it is identified where present and never assumed | Aider-AI/aider `main` @ `5dc9490bb35f9729ef2c95d00a19ccd30c26339c`: `aider/args.py` (the history filenames and `--llm-history-file` defaulting to `None`), `aider/repomap.py` (`TAGS_CACHE_DIR`), `aider/models.py` (the 24-hour-TTL price cache), `aider/main.py` (`.aider.conf.yml`) |
+| GitHub Copilot CLI | `github-copilot-cli` | supported | yes | `~/.copilot`, overridable via `COPILOT_HOME`; separate platform-conventional cache via `COPILOT_CACHE_HOME`. The directory names are documented; **what is inside `session-state/` is not**, so linkage is `unresolved` and no selective action is offered on it | github/docs `main` @ `72e940d15a9aff06b6e84216f3c97dac25c47d9b`: `content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md` -- the full config-directory listing and both overrides. Re-checked 2026-09-22 across four pinned pages: `workspaceFolder` and `workingDirectory` appear **zero** times and every `cwd` hit is the `/cwd` command, prose, an MCP launch key or an ACP wire parameter. The CLI is closed source. The `cwd`/`workspace`/`workspaceFolder` fields this adapter parsed were the guess this page promised it would not make |
+| Cursor | `cursor` | unverified | no | editor-profile storage, macOS only: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | Re-searched 2026-09-22 -- `cursor.com/docs/llms.txt` (the official 457-line index), `/docs/agent/overview`, `/docs/agent/projects`, `/docs/configuration/worktrees`; the former `docs.cursor.com/en/agent/chat/history` now redirects to the docs root. **NOT CONFIRMED**: zero hits for `state.vscdb`, `workspaceStorage`, `globalStorage` or `Application Support` in any of them, and Cursor is closed source so there is no repository to pin. The only official on-disk path found is unrelated to session state (`cli/reference/configuration`: `~/.cursor/cli-config.json`). Only `forum.cursor.com` community threads corroborate the profile layout |
+| Windsurf | `windsurf` | unverified | no | macOS only: the **current** profile at `~/Library/Application Support/Devin` and the **legacy** one at `.../Windsurf` (both modeled -- an installation mid-migration has bytes in each), plus `~/.codeium/windsurf`, which upstream states is *not* changing in the rename and stays read-write | [docs.devin.ai desktop FAQ](https://docs.devin.ai/desktop/devin-desktop-faq), retrieved 2026-09-22 (`docs.windsurf.com` 307-redirects here): **PARTIALLY CONFIRMED** -- both profile roots on macOS/Windows/Linux are named, with `User/settings.json`, `User/keybindings.json`, `User/snippets/`, `globalStorage/`, `Workspaces/` and `argv.json` inside them. `workspaceStorage` is **not** on the page, and neither are the `Cache`/`CachedData`/`CachedExtensionVSIXs`/`logs` siblings this adapter also models, so the row stays unverified |
+| Cline | `cline` | supported | yes | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/` plus `state/taskHistory.json`. The second root -- `CLINE_DATA_DIR`, else `CLINE_DIR/data`, else `~/.cline/data` -- **is now modeled** as its own location | cline/cline `main` @ `254f40c4b592d1e662b84f2ba06fe45dca77cab3`: `apps/vscode/src/sdk/legacy-state-reader.ts` (the per-task filenames, and `path.join(resolveDataDir(dataDir), "state", "taskHistory.json")`), `apps/vscode/src/hosts/vscode/vscode-to-file-migration.ts` (taskHistory "is **NOT** migrated here" -- it lives at `{globalStorageFsPath}/state/taskHistory.json`, and for VS Code that path is *not* `~/.cline/data`), `apps/vscode/src/shared/HistoryItem.ts` (`cwdOnTaskInitialization`, optional), `apps/vscode/src/shared/storage/storage-context.ts` + `sdk/packages/shared/src/storage/paths.ts` (the second root), `.clinerules/storage.md`. **Upstream's own spelling is ambiguous** -- `state/taskHistory.json` (migration comment), `tasks/taskHistory.json` (same file's skip list), `~/.cline/data/tasks/taskHistory.json` (`.clinerules/storage.md`) -- so this catalog follows the executable code (`state/`) and says so in the unresolved reason rather than asserting one path |
+| Roo Code | `roo-code` | supported | yes | Same per-host modeling as Cline: `globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` (`api_conversation_history.json`, `ui_messages.json`, `task_metadata.json`, `history_item.json`, plus `tasks/_index.json`). The `roo-cline.customStoragePath` setting can relocate `tasks/` entirely, in which case this catalog simply does not find it | RooCodeInc/Roo-Code `main` @ `b867ec9145750d0ae1ff7f02d35406e9bf2a0b16`: `src/shared/globalFileNames.ts`, `src/utils/storage.ts` (`getTaskDirectoryPath` and `getStorageBasePath`'s override), `packages/types/src/history.ts` (the optional `workspace` field), `src/core/task-persistence/TaskHistoryStore.ts` (upstream keys its own linkage off the same field via `getByWorkspace`, written into `history_item.json`, **not** `task_metadata.json`) |
+| Continue | `continue` | supported | yes | `~/.continue`, or `CONTINUE_GLOBAL_DIR` when set (`config.yaml`/`config.json`, `sessions/<id>.json` + a `sessions/sessions.json` index, `index/` embeddings/tag caches, `dev_data/` with `devdata.sqlite`) | continuedev/continue `main` @ `5522c6f44ca0ac3528b37244818fbfa39b5af470`: `core/util/paths.ts` (the whole layout and the override), `core/index.d.ts` (`Session.workspaceDirectory` is a **required** field), `core/util/history.ts` (upstream itself writes `workspaceDirectory: ""` from the `catch` of `load(sessionId)`, so an empty string is an expected on-disk value and resolves to `unresolved`, never `missing`) |
 
 ### What the 2026-09-21 re-verification changed
 
@@ -143,10 +143,16 @@ officially documented, but `workspaceStorage` and the cache/log siblings
 are not). Identification still runs for both; no action is offered and
 linkage is `unresolved`.
 
-Three rows are **supported** on research from an earlier chunk that was
-not re-fetched on 2026-09-21 -- Oh My Pi, Pi and Aider. Their
-`Verified against` column says so. That is a smaller claim than "checked
-today" and a bigger one than "assumed".
+Every row's citation was re-fetched at a pinned commit (or, for a
+documentation page, a retrieval date) on **2026-09-22**, vendored as a
+minimal excerpt under `crates/core/tests/fixtures/upstream/` with its
+blake3 digest, and listed in that directory's `citations.toml`.
+`crates/core/tests/upstream_citations_are_checked.rs` greps every
+excerpt for the symbols its claim depends on and fails naming the
+citation that does not support it. Before that, CI checked that the
+`Verified against` cell was longer than thirty characters -- and six of
+twelve `Supported` rows cited something that did not establish the
+claim, with the suite green.
 
 Cursor, Windsurf, Cline and Roo Code are macOS-only in this chunk, with
 Linux paths deferred to the independent Linux track (#77-#89). Extending
@@ -185,7 +191,7 @@ never disguised as the other.
 model only where a tool genuinely needs a new concept" clause:
 
 - **`Database`** -- a SQLite file (or a `-wal`/`-shm` sidecar) backing
-  a newer version's unified session/message/state store (Codex's six
+  a newer version's unified session/message/state store (Codex's seven
   `*.sqlite` files, OpenCode's `opencode.db`, Oh My Pi's `agent.db`).
   Always folded into one unit with its sidecars as members; never split,
   never opened, never individually actionable (`is_sqlite_like` in
@@ -194,9 +200,10 @@ model only where a tool genuinely needs a new concept" clause:
 - **`SessionData`** -- a session-keyed companion directory that is
   neither a transcript, a subagent dir, todos, file-history, nor an
   attachment (OpenCode's `storage/message/<session-id>/` and
-  `storage/session_diff/<session-id>/`), matched to a session by the
-  same exact-id-match discipline `claude_code::identify` uses for its
-  own companion directories -- never a guess.
+  `storage/session_diff/<session-id>.json` -- a **file**, not a
+  directory), matched to a session by the same exact-id-match
+  discipline `claude_code::identify` uses for its own companions --
+  never a guess.
 
 #96/#97/#98/#99's nine adapters needed **no new `AgentMemberKind`
 variant**: Cursor/Windsurf's `state.vscdb` and GitHub Copilot CLI's
@@ -240,7 +247,7 @@ a stale plan.
 - Any path whose filename looks like a SQLite database or its `-wal`/
   `-shm` sidecar. Claude Code has none currently documented, but the
   guardrail is unconditional regardless, and Codex/OpenCode/Oh My Pi
-  each have real SQLite stores it actually protects (six state
+  each have real SQLite stores it actually protects (seven state
   databases, `opencode.db`, `agent.db`).
 - A content-addressed blob Oh My Pi's `blobs/` shares across sessions:
   identified with its reference count (or an explicit "coverage
@@ -310,10 +317,20 @@ treats anything else as an unknown, never a parse panic or a guess.
   prefix match on the session id): the exact naming convention is not
   in Claude Code's official documentation. Session ids are UUIDv4, so
   collision risk is negligible; an ambiguous match is excluded rather
-  than guessed.
-- **Caches (actionable):** `shell-snapshots/`, `statsig` (community-
-  documented, not found in the official settings fetch used here),
-  `plugins/.trash/`, `skills/.trash/`.
+  than guessed. A `todos/` entry no session claims is folded into one
+  `todos (unlinked)` unit -- previously those bytes were in no unit at
+  all, and a test asserted the gap instead of closing it.
+- **Caches (actionable):** `shell-snapshots/`, `plugins/.trash/`,
+  `skills/.trash/`.
+- **Legacy, no longer written (actionable):** `statsig/`, `logs/`, and
+  any `todos/` entry no live session claims. The cited page documents
+  all three in one row as "Legacy directories from older versions. No
+  longer written", and answers "Nothing" in its own what-you-lose
+  table. So removing them costs no regeneration -- they are residue,
+  not a cache that will come back. This catalog previously called
+  `statsig` "community-documented, not found in the official settings
+  fetch used here" and modelled it as regenerating automatically; both
+  halves were wrong, and the page it already cited said so.
 - **Logs (actionable):** `debug/`.
 - **Protected config:** `settings.json`, `.credentials.json`,
   `keybindings.json`, `themes/`, `rules/`, `skills/`, `commands/`,
@@ -357,15 +374,23 @@ version-varying wire format); any shape not matched resolves to
   change, not a deletion.
 - **SQLite state stores (a version boundary):** `state_5.sqlite`,
   `logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`,
-  `queue_1.sqlite`, `thread_history_1.sqlite`, each folded with its
-  `-wal`/`-shm` sidecars into one protected, non-actionable unit.
-  `CODEX_SQLITE_HOME` can relocate all six *outside* `CODEX_HOME`; this
+  `memories_v2_1.sqlite`, `queue_1.sqlite`, `thread_history_1.sqlite`,
+  each folded with its `-wal`/`-shm` sidecars into one protected,
+  non-actionable unit. That is **seven**, which is what upstream's
+  `const RUNTIME_DBS: [RuntimeDbSpec; 7]` declares; this catalog
+  modelled six, because `memories_v2_1.sqlite`'s filename is an inline
+  literal rather than one of the six `*_DB_FILENAME` constants, so it
+  was neither folded with its sidecars nor protected. The sidecars are
+  also excluded from the unclassified residual now -- previously their
+  bytes were counted twice, once in the store's unit and once there.
+  `CODEX_SQLITE_HOME` can relocate all seven *outside* `CODEX_HOME`; this
   adapter does not follow that override (a documented gap, same shape
   as Claude Code's `~/.claude.json` sibling gap) -- if set, these files
   are simply not found here rather than guessed at a wrong path.
-- **Protected config:** `config.toml`, `auth.json`, `skills/`
-  (directory name found in source search, not independently confirmed
-  by a primary docs page this chunk).
+- **Protected config:** `config.toml`, `auth.json`, `skills/` --
+  upstream comments this last one "Deprecated user skills location" and
+  puts the current root at `~/.agents/skills`, which is outside
+  `CODEX_HOME` and is not modeled here.
 - **Individually protected, not by category:** `history.jsonl`
   (cross-session prompt history, category `sessions`).
 - **Logs (actionable):** `log/` (name carried over from this epic's
@@ -382,14 +407,24 @@ The desktop app (`Codex.app`, bundle id `com.openai.codex`) is a
 materially different client with its own storage; this chunk does
 **not** extrapolate the CLI's `CODEX_HOME` schema onto it. Only its log
 directory is confirmed by primary source
-(`codex-rs/cli/src/doctor/desktop.rs`'s `desktop_log_root`): macOS
-`~/Library/Logs/com.openai.codex`, itself a `%Y/%m/%d` date tree. That
+(`codex-rs/cli/src/doctor/desktop.rs`'s `desktop_log_root` -- the matrix row
+used to cite `doctor/desktop/platform.rs`, which contains no `log_root`
+at all): macOS `~/Library/Logs/com.openai.codex`, itself a `%Y/%m/%d`
+date tree. That
 directory is identified as one folded, actionable Logs-category unit.
 Settings/session storage beyond logs is not confirmed and is not
 modeled -- a deliberately partial `Supported` row, stated explicitly
-rather than silently treated as empty. No Linux/Windows desktop build
-is confirmed either; the detector reports `not-present` there instead
-of guessing a path.
+rather than silently treated as empty.
+
+`desktop_log_root` matches exactly two platforms and returns `None` for
+everything else, so **Windows is confirmed too**:
+`%LOCALAPPDATA%/Codex/Logs`, falling back to
+`%USERPROFILE%/AppData/Local/Codex/Logs`, day-partitioned the same way.
+This document used to say no Windows desktop build was confirmed; the
+source it cited confirms it, and **Linux** is the only genuinely
+unconfirmed platform. The Windows root belongs to the Windows track, so
+this detector still reports `not-present` there -- an unimplemented
+platform, which is a different statement from an unknown path.
 
 ## Oh My Pi (#94)
 
@@ -448,8 +483,9 @@ linkage.
   one protected, non-actionable unit -- never opened, same discipline
   as Codex's own SQLite stores.
 - **Older/file-tree layout:** `storage/session/<project-id>/
-  <session-id>.json`, with `storage/message/<session-id>/` and
-  `storage/session_diff/<session-id>/` companions matched by the exact
+  <session-id>.json`, with `storage/message/<session-id>/` (a
+  directory) and `storage/session_diff/<session-id>.json` (a **file**)
+  companions matched by the exact
   session-id-keyed discipline `claude_code::identify` uses for its own
   companions. `storage/part/<message-id>/*.json` is keyed by *message*,
   not session, id and is never correlated to individual sessions
@@ -488,8 +524,10 @@ than a fabricated match or a silently dropped fact.
   `docs/get-started/authentication.md` both 404 against current `main`),
   so any top-level file whose name contains `oauth`/`cred` is protected
   defensively by filename pattern instead of an exact confirmed name.
-- **Caches (actionable):** `bin/` (downloaded runtime tools, e.g.
-  LiteRT-LM).
+- **Caches (actionable):** `tmp/bin` (downloaded runtime tools, e.g.
+  LiteRT-LM). Not `~/.gemini/bin`: upstream builds it as
+  `getGlobalBinDir() = join(getGlobalTempDir(), 'bin')`, so the path
+  this adapter used to look at does not exist in any version.
 - **Per-project-hash `tmp/<hash>/`:** `shell_history` (Logs, actionable),
   `checkpoints/` (Checkpoints, not actionable -- tool-call recovery
   state for `/restore`), `chats/*` (Sessions, one unit per saved chat
@@ -568,21 +606,35 @@ own `.git` root).
 
 ## GitHub Copilot CLI (#97)
 
-Layout sourced directly from GitHub's own reference page (current as of
-this chunk), correcting this issue's own guessed directory name
-(`history-session-state/`) to the real `session-state/` and
-`command-history-state/`.
+Directory layout sourced directly from GitHub's own reference page,
+re-pinned 2026-09-22 to `github/docs` @
+`72e940d15a9aff06b6e84216f3c97dac25c47d9b`, correcting this issue's own
+guessed directory name (`history-session-state/`, which upstream's
+changelog shows is the *pre-0.0.342* name, migrated on `--resume`) to
+the real `session-state/` and `command-history-state/`.
+
+What that page documents is **directory names**. It documents nothing
+about the contents of a session's own files, which is why linkage and
+selective action are withheld -- see the sessions bullet below.
 
 - **Protected config:** `config.json`, `settings.json`, `mcp-config.json`,
   `lsp-config.json`, `permissions-config.json`, `providers.json`,
   `copilot-instructions.md`, `instructions/`, `agents/`, `hooks/`,
   `skills/`, `extensions/`, `installed-plugins/`, `plugin-data/`,
   `mcp-oauth-config/`, `mcp-secrets/`.
-- **Sessions:** `session-state/` -- one unit per immediate child (file or
-  folded directory), linked via a bounded, small-JSON scan for a
-  `cwd`/`workspace`/`workspaceFolder` field in the child's own metadata
-  files; `unresolved` when none is found, never a guess at an
-  undocumented schema.
+- **Sessions (identified, not actionable):** `session-state/` -- one
+  unit per immediate child (file or folded directory). Project linkage
+  is always `unresolved` and **no selective action is offered**. This
+  adapter used to scan a child's small JSON files for a
+  `cwd`/`workspace`/`workspaceFolder` field and this document used to
+  promise that was "never a guess at an undocumented schema". It was
+  exactly that: no upstream source documents any field inside Copilot
+  CLI session state (four pinned `github/docs` pages contain zero
+  occurrences of `workspaceFolder` or `workingDirectory`), and the CLI
+  is closed source. The directory names stay confirmed, so the bytes
+  are still identified and measured; the claim about what is inside
+  them is withdrawn, and with it the removal capability that rested on
+  it.
 - **`session-store.db`** (+ `-wal`/`-shm`): protected, non-actionable,
   same discipline as every other tool's cross-session SQLite store.
 - **Caches (actionable):** `command-history-state/` (reverse-search
@@ -602,11 +654,21 @@ Both use the shared `crate::agents::vscode_family` module (Cursor and
 Windsurf are VS Code forks with the same underlying storage
 conventions -- one real implementation, per the handoff's "extend the
 shared model only where a tool genuinely needs a new concept").
-Community-reverse-engineered (Cursor: corroborated by two independent
-sources; Windsurf: assumed, since `docs.windsurf.com` redirected to
-`docs.devin.ai` during this chunk's research and no primary
-documentation of its layout was reachable). Both are macOS-only this
-chunk; Linux is the independent Linux track's job (#77-#89).
+Cursor's layout is community-reverse-engineered only: re-searched
+2026-09-22 across `cursor.com/docs/llms.txt` and the agent/configuration
+pages with zero hits for `state.vscdb`, `workspaceStorage`,
+`globalStorage` or `Application Support`, and Cursor is closed source,
+so there is no repository to pin. Windsurf's **profile roots** are
+primary-source confirmed -- `docs.windsurf.com` 307-redirects to
+`docs.devin.ai`, whose desktop FAQ names the rename and both locations
+(`~/Library/Application Support/Windsurf` legacy -> `.../Devin` current)
+along with `User/settings.json`, `User/keybindings.json`,
+`User/snippets/`, `globalStorage/`, `Workspaces/` and `argv.json`. What
+that page does **not** name is `workspaceStorage/` or the
+`Cache`/`CachedData`/`CachedExtensionVSIXs`/`logs` siblings, which is
+why the row stays `unverified`. Both roots are modeled, because an
+installation mid-migration has bytes in each. Both tools are macOS-only
+this chunk; Linux is the independent Linux track's job (#77-#89).
 
 - **`User/globalStorage/state.vscdb`** (+ `-wal`/`-shm`): protected,
   metadata-only, never opened while writable -- holds every project's
@@ -626,8 +688,10 @@ chunk; Linux is the independent Linux track's job (#77-#89).
   does not actually match the assumed VS-Code-fork shape shows up,
   rather than a silent miscount.
 - Cursor's separate `~/.cursor/` and Windsurf's `~/.codeium/windsurf`
-  are reported as opaque external units, not decomposed (no confirmed
-  interior shape).
+  are reported as opaque external units, not decomposed (their interior
+  shape is not documented). `~/.codeium/` is *current*, not legacy: the
+  FAQ states that tree is not changing in the rename and stays
+  read-write.
 
 ## Cline, Roo Code and Continue (#99)
 
@@ -653,13 +717,28 @@ never collide in identity or display.
   assuming one field name for everybody:
   - **Roo Code** declares `tasks/<id>/history_item.json`'s `workspace`
     field, confirmed in `src/core/task-persistence/TaskHistoryStore.ts`.
-  - **Cline** declares "not in any file we read". Its working directory
-    lives in the `taskHistory` extension state
-    (`HistoryItem.cwdOnTaskInitialization`, itself optional), inside
-    `state.vscdb` -- the SQLite store this catalog refuses to open -- or
-    under `~/.cline/data/state/taskHistory.json`, a root not modeled
-    yet. Cline tasks carry an `unresolved` link whose reason names that
-    store.
+  - **Cline** declares a *shared history file*:
+    `{globalStorage}/state/taskHistory.json`, an array of `HistoryItem`
+    keyed by task id whose `cwdOnTaskInitialization` field is the
+    working directory. It is read **once per host**, not once per task,
+    through the same capped reader as everything else; a history longer
+    than the bound reports the tasks past it as truncated rather than
+    as declaring nothing. This catalog previously said the answer lived
+    "inside `state.vscdb` -- the SQLite store this catalog refuses to
+    open", which was wrong: the file sits inside the directory the
+    adapter already walks. `cwdOnTaskInitialization` is optional
+    upstream, so an absent entry is still `unresolved`, never a guess
+    from the task id.
+
+    **Upstream spells the store three ways at the same commit** --
+    `{globalStorageFsPath}/state/taskHistory.json` (the migration
+    file's comment), `tasks/taskHistory.json` (the same file's skip
+    list) and `~/.cline/data/tasks/taskHistory.json`
+    (`.clinerules/storage.md`). This catalog follows the executable
+    code (`state/`) and records the ambiguity in the `unresolved`
+    reason rather than asserting one path. The `~/.cline/data` root is
+    modeled separately, and upstream states it does *not* hold the VS
+    Code host's task history.
 
   Both adapters previously read `task_metadata.json`'s `workspace`
   field. That field exists in neither extension's schema, so it resolved
@@ -676,10 +755,15 @@ its own `~/.continue` home, config confirmed by primary docs:
 - **Sessions (actionable):** `sessions/<id>` -- one unit per entry,
   excluding index-like filenames (`sessions.json`/`index.json`), which
   are protected separately instead (removing the index alongside a kept
-  session would otherwise corrupt it for every session that remains). No
-  confirmed per-session workspace-linkage field was found, so every
-  session carries an honest `unresolved` link rather than a guess from
-  the session id.
+  session would otherwise corrupt it for every session that remains).
+  Linkage comes from `Session.workspaceDirectory`, a **required** field
+  in `core/index.d.ts` which the adapter reads from the bounded header.
+  Upstream itself writes `workspaceDirectory: ""` from the `catch` of
+  `load(sessionId)`, so an empty string is an expected on-disk value:
+  it resolves to `unresolved`, never `missing`, because `missing` would
+  claim a path was named and has since disappeared. A field past the
+  bounded read's cap is also `unresolved`, never a guess from the
+  session id.
 - **Caches (actionable):** `index/` (embeddings/tag caches).
 - **Logs (actionable):** `dev_data/` (anonymized usage events).
 - `sessions/index/dev_data`'s presence is treated as a version marker

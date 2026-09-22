@@ -4,6 +4,80 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Repairs after review 2, part 3
+
+The container-level half of the incrementality work, and a support
+matrix whose every `Supported` row is now backed by a citation CI
+actually reads.
+
+- **An unchanged tool home costs stamp checks per container, not stats
+  per session file.** The identification cache removed the header
+  *reads* from an unchanged pass; its validity key is each session
+  file's own `(size, mtime, ctime, inode)`, so knowing a session was
+  unchanged still cost one `stat` per session. `swamp` now records the
+  directories each container's identification listed and replays the
+  container from the store when none of their stamps have moved.
+  Measured over a 5,000-session home in 5 project directories: 11
+  listings and 5,031 stats on the first pass, **5 listings and 31 stats**
+  on an unchanged second. One appended session re-identifies exactly one
+  container and replays the other four.
+  - Stated limit, the same one the external reuse has and it bites
+    harder here: a file rewritten **in place** -- including an append to
+    an open session transcript -- does not move its container's stamp,
+    so the stored byte total stands until something is created, removed
+    or renamed in that container. It is a reporting lag, never an
+    authorization hole: every action re-derives from the live filesystem
+    with both caches disabled.
+- **Gemini CLI's downloaded-tools cache was at a path that does not
+  exist.** It is `~/.gemini/tmp/bin`, not `~/.gemini/bin`, so that unit
+  never appeared. Also new: under `SANDBOX=sandbox-exec` the runtime
+  directory moves to `~/.cache/.gemini`, which is now detected when this
+  process is itself under that sandbox.
+- **Codex has seven SQLite state stores, not six.**
+  `memories_v2_1.sqlite` was neither folded with its `-wal`/`-shm`
+  sidecars nor protected. The sidecars of all seven are also no longer
+  counted a second time in the unclassified residual.
+- **OpenCode's session diffs were counted nowhere.**
+  `storage/session_diff/<session-id>` is a `.json` **file**, not a
+  companion directory; `swamp` gated on "is a directory" and swept only
+  directories, so every diff's bytes were in no unit at all.
+- **Cline sessions now report their project.** The working directory is
+  in `state/taskHistory.json` -- a plain file inside the extension
+  storage directory `swamp` already reads -- not, as this changelog
+  previously implied, locked inside `state.vscdb`. Read once per editor
+  host. Upstream spells that path three different ways at the same
+  commit, and the unresolved reason says so rather than asserting one.
+  Cline's second root (`CLINE_DATA_DIR`, else `CLINE_DIR/data`, else
+  `~/.cline/data`) is now detected.
+- **GitHub Copilot CLI sessions no longer claim a project.** `swamp`
+  parsed `cwd`/`workspace`/`workspaceFolder` out of session files while
+  the documentation promised it never guessed at an undocumented schema.
+  No upstream source documents any such field and the CLI is closed
+  source, so linkage is now unresolved and no selective action is
+  offered on session state. The directories are still identified and
+  measured.
+- **Claude Code's `statsig/`, `logs/` and unmatched `todos/` entries are
+  legacy, not caches.** Anthropic's own documentation lists them as "no
+  longer written"; `swamp` described `statsig` as community-documented
+  and auto-regenerating. Unmatched `todos/` entries are also now
+  reported instead of appearing in no unit at all.
+- **Continue's empty workspace directory is `unresolved`, not
+  `missing`.** Upstream writes `""` itself when it cannot load a
+  session, so it is an expected value and not a path that disappeared.
+- **Windsurf's current profile root is modeled.** The product was
+  renamed, and the read-write profile moved to
+  `~/Library/Application Support/Devin`; both it and the legacy
+  `.../Windsurf` are now detected, because an installation mid-migration
+  has bytes in each. The row stays `unverified`: the documentation
+  confirms the roots, not the per-workspace layout.
+- **Every matrix citation is pinned and checked.** Each cited upstream
+  file is vendored as a minimal excerpt with its blake3 digest under
+  `crates/core/tests/fixtures/upstream/`, and CI greps it for the
+  symbols the claim depends on. The previous check was that the
+  provenance string was longer than thirty characters. A new check also
+  fails when a prose paragraph asserts doubt about a tool its own table
+  row lists as supported.
+
 ### Repairs after review 2
 
 A second independent review, plus a background mutation sweep that

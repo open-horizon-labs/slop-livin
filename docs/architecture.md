@@ -550,6 +550,40 @@ artifact row:
   place does not move its directory's stamp, so a rewrite that also
   changes the file's allocation leaves the reused total stale until
   something else in that directory changes.
+- **The agent family has the same reuse, keyed per container.** The
+  identification cache (`${SWAMP_DIR}/associations/agent_identifications.parquet`)
+  removed the header *reads* from an unchanged pass, but its validity
+  key is each session file's own `(len, mtime_ns, ctime_ns, inode)`, so
+  knowing a session is unchanged costs a `stat` per session -- work that
+  scales with files, which the handoff forbids. Since 2026-09-22 an
+  adapter wraps the identification of one **container directory**
+  (`projects/<encoded-cwd>/`, a tool's session parent) in
+  `agents::IdentifyCtx::container`. Every directory that identification
+  lists or folds is recorded; the container's fingerprint is those
+  directories' own `mtime`/`ctime`; and an unchanged container is
+  replayed from `${SWAMP_DIR}/associations/agent_containers.parquet` --
+  one row per directory and one per unit, never one per file. A
+  5,000-session home in 5 project directories costs 11 listings and
+  5,031 stats on the first pass and **5 listings / 31 stats** on an
+  unchanged second; one appended session re-identifies exactly one
+  container.
+  - Project linkage is *not* replayed. It is resolved against a declared
+    path somewhere else on the disk entirely, so a unit records the
+    declared path (`agents::LinkBasis::Declared`) and a replayed
+    container re-resolves it live, memoised per distinct declared path --
+    one resolution per project rather than one per session. A unit whose
+    link can neither be recomputed nor go stale makes its whole container
+    unpersistable rather than replaying a stale answer.
+  - Same blind spot as the external reuse, and it matters more here: a
+    session transcript **appended to in place** does not move its
+    container's stamp, so its stored byte total stands until the
+    container's shape changes. Reporting lag, bounded by that next shape
+    change, never an authorization hole -- every execution sink
+    re-derives from the live filesystem with both caches disabled
+    (`agents::reidentify_for_tool`). Recorded on
+    `agents::ContainerCache` and in
+    `.oh/guardrails/no-second-traversal-on-report-path.md`, and measured
+    by `a_session_rewritten_in_place_is_not_seen_until_its_container_moves`.
 - **A new key family in the existing store, not a second store.**
   `growth::observe_and_annotate_external`/`annotate_readonly_external`
   reuse the same current+reverse-delta Parquet design as artifact rows,

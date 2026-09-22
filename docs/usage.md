@@ -310,13 +310,26 @@ today vs. named-and-planned). In short:
   prompt, response, attachment or credential content is ever read into
   a report, a plan, the ledger, or a log.
 - **Categories carry different consequences.** Cache/log categories
-  (`shell-snapshots`, `statsig`, `debug`, plugin/skill `.trash`) are
-  regenerated automatically and are the only categories with a
-  supported action this release. Removing a session means losing its
-  resume/rewind/checkpoint history -- the linked project's own files
-  are never touched. Credentials, settings, skills, commands and
+  (`shell-snapshots`, `debug`, plugin/skill `.trash`) are regenerated
+  automatically and are, with the legacy directories below, the only
+  categories with a supported action this release. A few directories are
+  neither: Claude Code's `statsig/`, `logs/` and unmatched `todos/`
+  entries are documented upstream as legacy and **no longer written**, so
+  removing them costs nothing and nothing comes back. Removing a session
+  means losing its resume/rewind/checkpoint history -- the linked
+  project's own files are never touched. Credentials, settings, skills, commands and
   similar automation definitions are protected by default and have no
   supported action at all.
+- **A tool whose layout is not confirmed against its own source gets
+  identification and nothing else.** `swamp report --view agents` still
+  measures Cursor's and Windsurf's storage, but offers no action and
+  reports linkage as unresolved, because acting on a layout nobody has
+  verified is not a size question. The same now applies, narrowly, to
+  GitHub Copilot CLI's `session-state/`: the *directory names* are
+  documented by GitHub, what is inside them is not, so those units are
+  measured and never proposed. `docs/agent-storage.md`'s matrix says
+  which is which, and every "supported" row's citation is pinned to an
+  upstream commit and checked by CI.
 - **Human keep/protect intent survives refresh:**
   `swamp protect add <path>` / `swamp protect list [--json]` /
   `swamp protect remove <path>` -- independent of, and never overridden
