@@ -315,7 +315,7 @@ pub fn check(
                         .collect();
                     result.check_status = "ready_for_review";
                     result.reason_code = "checks_passed";
-                    result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Not confirmed unused. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
+                    result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
                     result.next_action = "review_plan";
                     result.next_command = vec!["swamp".into(), "plans".into(), "--json".into()];
                     result.plan_id = Some(plan.id);
@@ -711,7 +711,7 @@ pub(crate) fn move_reviewed(
     }
     for m in &group.members {
         if !same_safety(&snapshot(&m.path)?, m) {
-            bail!("stale Cargo member {}; propose again", m.path.display());
+            bail!("Cargo member {} changed since review; propose again", m.path.display());
         }
     }
     // The shared live-state recheck, after the Cargo-specific checks so

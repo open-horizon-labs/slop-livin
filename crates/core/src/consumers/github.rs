@@ -102,7 +102,7 @@ impl Consumer for GithubConsumer {
                         crate::github::DEFAULT_GITHUB_TTL_SECS,
                     );
                     read_notes
-                        .retain(|n| !n.contains("not enriched") && !n.contains("stale cached"));
+                        .retain(|n| !n.contains("not enriched") && !n.contains("older than the refresh window"));
                     read_notes.extend(summary.notes);
                     (
                         facts,

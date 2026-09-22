@@ -820,7 +820,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.min(90);
-    let h = area.height.min(30);
+    let h = area.height.min(42);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -830,7 +830,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         height: h,
     };
     frame.render_widget(Clear, popup);
-    let text = vec![
+    let mut text = vec![
         Line::from("Keys"),
         Line::from("  ↑↓        move selection"),
         Line::from("  →/←       in / out: open or expand · collapse or go back"),
@@ -881,6 +881,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("        🔨 has build output   ⎇ N  N linked worktrees"),
     ];
+    // The activity-evidence inventory (#54): which domains this pass can
+    // establish a real activity fact for, and which it reports as
+    // unknown. `docs/usage.md` carries the same table, checked against
+    // the constant by `evidence_contract.rs`.
+    text.push(Line::from(""));
+    text.push(Line::from("Activity evidence this pass can establish"));
+    for (domain, evidence) in swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY {
+        text.push(Line::from(format!("  {domain}: {evidence}")));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title("help (? to close)");

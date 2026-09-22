@@ -910,7 +910,7 @@ pub fn read_cached(
     let mut notes = Vec::new();
     if stale > 0 {
         notes.push(format!(
-            "github: {stale} worktree(s) have stale cached enrichment (run `swamp observe` to refresh)"
+            "github: {stale} worktree(s) have cached enrichment older than the refresh window (run `swamp observe` to refresh)"
         ));
     }
     if missing > 0 {

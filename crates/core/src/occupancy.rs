@@ -50,6 +50,7 @@ pub enum OccupancyState {
 impl OccupancyState {
     /// True only for [`OccupancyState::Free`]: the one state in which a
     /// destructive action may proceed.
+    #[cfg(test)]
     pub fn is_free(&self) -> bool {
         matches!(self, Self::Free)
     }
@@ -171,16 +172,6 @@ fn classify_lsof_exit(
             OccupancyState::Unknown(format!("lsof exited with {other:?} for {}", path.display()))
         }
     }
-}
-
-/// Boolean convenience over [`probe_path`], fail-closed: anything but
-/// [`OccupancyState::Free`] is `true`. **Never call this from a
-/// destructive sink** -- it collapses `Unknown` into `Occupied` and so
-/// cannot record *why* an action was refused; sinks use
-/// `crate::recheck::member_occupancy` (audited by
-/// `occupancy_is_tristate_at_sinks`).
-pub fn occupied(path: &Path) -> bool {
-    !probe_path(path).is_free()
 }
 
 /// Structured current-use evidence for whether some process holds this

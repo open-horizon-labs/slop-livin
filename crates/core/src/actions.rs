@@ -282,7 +282,7 @@ fn recovery_for(kind: &ArtifactKind) -> &'static str {
 fn warnings_for(wt: &WorktreeRow, a: &ArtifactRow, whole: Option<&ProjectRow>) -> Vec<String> {
     let mut w = Vec::new();
     if a.dedup_stale {
-        w.push("unique-byte estimate is stale; full scan required before budgeted standing-grant cleanup".into());
+        w.push("unique-byte estimate is out of date; full scan required before budgeted standing-grant cleanup".into());
     }
     match a.track {
         Some(crate::ignore::TrackState::Untracked) => {

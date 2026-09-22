@@ -67,7 +67,7 @@ fn should_compact(files: &[PathBuf]) -> bool {
         && files
             .iter()
             .try_fold(0u64, |n, p| {
-                fs::metadata(p).map(|m| n.saturating_add(m.len()))
+                fs::symlink_metadata(p).map(|m| n.saturating_add(m.len()))
             })
             .is_ok_and(|bytes| bytes <= 128 * 1024)
 }

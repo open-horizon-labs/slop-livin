@@ -59,7 +59,7 @@ impl Grant {
         if now().saturating_sub(artifact.meta.observed_at)
             > self.predicate.require_fresh_within_secs
         {
-            anyhow::bail!("fact is stale")
+            anyhow::bail!("fact is older than the grant's freshness window")
         }
         if self.verb == Verb::Delete && artifact.recovery == RecoveryContract::Irrecoverable {
             anyhow::bail!("irrecoverable artifact requires leave")

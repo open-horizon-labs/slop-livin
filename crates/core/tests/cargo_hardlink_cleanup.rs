@@ -174,7 +174,7 @@ fn alias_removal_and_replacement_after_proposal_is_stale() {
             .cause
             .as_deref()
             .unwrap()
-            .contains("stale Cargo member")
+            .contains("changed since review")
     );
     assert!(group.exists());
     assert!(group.join("replacement-alias.o").exists());
@@ -198,7 +198,7 @@ fn external_alias_content_mutation_makes_plan_stale() {
             .cause
             .as_deref()
             .unwrap()
-            .contains("stale Cargo member")
+            .contains("changed since review")
     );
     assert!(group.exists());
     assert_eq!(
