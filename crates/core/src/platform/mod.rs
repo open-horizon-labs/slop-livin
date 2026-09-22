@@ -29,8 +29,9 @@
 //!    "nothing changed" -- the exact falsehood the growth store must
 //!    never record.
 //! 3. **Shared Unix stays shared.** Allocated bytes (`st_blocks * 512`),
-//!    device/inode identity, and free space (`statvfs`) are POSIX and
-//!    live in [`fs_space`] and `crate::walk` for both targets. Target
+//!    device/inode identity, and the free-space contract are POSIX and
+//!    live in [`fs_space`] and `crate::walk` for both targets (only the
+//!    free-space syscall differs: `statfs` on macOS, `statvfs` on Linux). Target
 //!    gating is for genuinely different kernels, not for filing code by
 //!    operating system.
 //!
@@ -397,8 +398,9 @@ pub const CAPABILITIES: &[Capability] = &[
         id: "free-space",
         macos: Support::Supported,
         linux: Support::Supported,
-        note: "statvfs(3) through libc on both, replacing df output parsing whose columns \
-               differ between the two.",
+        note: "A syscall through libc, replacing df output parsing whose columns differ \
+               between the two: statfs(2) on macOS, whose statvfs has 32-bit block counts, and \
+               statvfs(3) on Linux.",
     },
     Capability {
         id: "history-replay",
@@ -528,6 +530,122 @@ mod tests {
             assert!(!c.note.is_empty(), "{} has no note", c.id);
             assert!(capability(c.id).is_some());
         }
+    }
+
+    /// Env vars are process-global, so the resolution tests take the
+    /// crate-wide lock -- the same one `schedule`'s tests take, because
+    /// one of the tests below unsets `HOME` and `schedule::home()` reads
+    /// it. Every test restores what it changed.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[&'static str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|v| (*v, std::env::var_os(v)))
+                .collect::<Vec<_>>();
+            for v in vars {
+                // SAFETY: serialized by ENV_LOCK; restored on drop.
+                unsafe { std::env::remove_var(v) };
+            }
+            Self { saved }
+        }
+        fn set(&self, key: &str, value: &str) {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(key, value) };
+        }
+        fn unset(&self, key: &str) {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                // SAFETY: as above.
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swamp_dir_overrides_every_convention() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
+        env.set("SWAMP_DIR", "/explicit/store");
+        env.set("HOME", "/home/dev");
+        env.set("XDG_DATA_HOME", "/data/dev");
+        assert_eq!(data_dir().unwrap(), PathBuf::from("/explicit/store"));
+    }
+
+    /// macOS keeps `~/.local/share/swamp` unchanged -- an existing
+    /// install's history lives there and this work moves no user data --
+    /// and does not start honouring `$XDG_DATA_HOME`, which is not a
+    /// macOS convention. Linux does honour it, because there it is the
+    /// documented way to say where per-user data goes.
+    #[test]
+    fn the_store_directory_follows_this_platforms_convention() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
+        env.set("HOME", "/home/dev");
+
+        assert_eq!(
+            data_dir().unwrap(),
+            PathBuf::from("/home/dev/.local/share/swamp"),
+            "both platforms default to the same path"
+        );
+
+        env.set("XDG_DATA_HOME", "/data/dev");
+        match Os::current() {
+            Os::Linux => assert_eq!(data_dir().unwrap(), PathBuf::from("/data/dev/swamp")),
+            Os::MacOs => assert_eq!(
+                data_dir().unwrap(),
+                PathBuf::from("/home/dev/.local/share/swamp"),
+                "XDG_DATA_HOME is not a macOS convention and must not move an existing store"
+            ),
+        }
+    }
+
+    /// The XDG base directory spec: a relative value is invalid and must
+    /// be ignored. Honouring one would put the growth store somewhere
+    /// relative to the process's working directory.
+    #[test]
+    fn a_relative_xdg_data_home_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
+        env.set("HOME", "/home/dev");
+        env.set("XDG_DATA_HOME", "relative/share");
+        let dir = data_dir().unwrap();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert_eq!(dir, PathBuf::from("/home/dev/.local/share/swamp"));
+    }
+
+    /// The old resolution fell back to `.`, which scattered a growth
+    /// store into whatever directory swamp was run from -- and made the
+    /// next run, from somewhere else, look like every project had
+    /// vanished. A missing home is a question for the user.
+    #[test]
+    fn no_home_and_no_override_is_an_error_not_the_current_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
+        env.unset("HOME");
+        let err = data_dir().expect_err("a missing HOME must not resolve to the cwd");
+        let message = format!("{err}");
+        assert!(message.contains("SWAMP_DIR"), "{message}");
+        assert!(
+            message.contains("current") && message.contains("directory"),
+            "the error must say what it refused to do: {message}"
+        );
     }
 
     #[test]

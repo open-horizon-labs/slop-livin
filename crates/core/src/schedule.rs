@@ -755,7 +755,9 @@ mod tests {
     // test mode) to point launchd/plist/log paths at a temp dir instead
     // of the real machine. Serialized so parallel `cargo test` threads
     // never observe each other's env var.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The crate-wide lock, not a module-local one: `platform`'s tests
+    // unset `HOME`, which `home()` reads (see `crate::TEST_ENV_LOCK`).
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[cfg(target_os = "macos")]
     #[test]

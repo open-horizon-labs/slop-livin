@@ -22,7 +22,7 @@ This table is generated from `crates/core/src/platform/CAPABILITIES`, and `crate
 | Capability | macOS | Linux | Notes |
 |---|---|---|---|
 | `walk-and-accounting` | supported | supported | Allocated bytes from st_blocks*512, hardlink dedup by (dev, ino), same-filesystem boundary by st_dev, symlinks never followed. Shared POSIX code. |
-| `free-space` | supported | supported | statvfs(3) through libc on both, replacing df output parsing whose columns differ between the two. |
+| `free-space` | supported | supported | A syscall through libc, replacing df output parsing whose columns differ between the two: statfs(2) on macOS, whose statvfs has 32-bit block counts, and statvfs(3) on Linux. |
 | `history-replay` | supported | unavailable | macOS replays the fseventsd log from a stored event id. Linux has no persisted kernel change history; an observation there walks fully and says so. |
 | `live-watch` | supported | planned | macOS opens an FSEvents stream for the TUI. A Linux inotify watcher is #81; until then the TUI refreshes on demand. |
 | `scheduled-observation` | supported | planned | macOS installs an opt-in per-user LaunchAgent. Linux refuses and names #86 (systemd --user); nothing is written. |
@@ -193,6 +193,25 @@ And one rule swamp adds: **no current-directory fallback.** If `HOME` is unset a
 Neither platform's conventions may appear in the other's build, which is asserted by `neither_platforms_conventions_leak_into_the_other` rather than left to review.
 
 Homebrew is detected on both, with the prefixes each platform actually uses: `/opt/homebrew` and `/usr/local` on macOS, `/home/linuxbrew/.linuxbrew` on Linux. `/usr/local` is not proposed on Linux — there it is a distribution-owned directory Homebrew does not claim.
+
+### Detectors that do not apply here
+
+A detector that does not apply to the running platform (Xcode's, CoreSimulator's and the other macOS-only ones on Linux) is **reported, not omitted**. Silence would be indistinguishable from a detector that ran and found nothing, or one that failed. `swamp scope` lists them under their own heading, *not applicable on this platform*, with the platforms each one does apply to, and `swamp scope --json` carries the same list as `not_applicable_detectors`. Every registered detector is in exactly one of the applicable and not-applicable lists, and a macOS scope must list no macOS detector as inapplicable (`scope::tests`, both directions).
+
+## How the platform invariants are enforced
+
+Two kinds of check, because each misses what the other catches.
+
+**Runtime tests on both runners** hold the behaviour: `install_refuses_and_writes_nothing_where_there_is_no_scheduler` asserts the plist, agents and log directories are *empty* after a Linux refusal; `a_kernel_without_persisted_history_says_so_rather_than_unsupported` pins the Linux refusal; `neither_platforms_conventions_leak_into_the_other` pins the defaults; `platform_matrix_matches_docs` pins the table above.
+
+**A source audit**, `platform_capabilities_gate_their_backends`, holds the shape future code must keep, and is written in the derived-set form the audit re-review asked for rather than as file or function-name lists:
+
+- capability queries are *derived*: any definition in the workspace whose return type is a capability enum;
+- every answer to one must reach control flow (`let _ = scheduling();` fails);
+- the scheduling feature is derived from the CLI's own `Schedule` dispatch arm, and every path from it to a filesystem write or process spawn — through helpers, renamed entry points and aliased imports — passes an honoured capability check first. Writes are an inverted set: every `std::fs` call except a short list of reads;
+- which refusal a platform without replay gives is decided in exactly one function, the one that reads `ContinuitySource`.
+
+Call edges resolve to *definitions*, not names. The first version keyed them by name and so let `work_counters::install` (called by every subcommand) hide `schedule::install` from the rule entirely; ten fixtures in `crates/source-audit/tests/mutations/platform_capabilities_gate_their_backends/` now pin that and the other bypasses. What the audit cannot see — trait-object dispatch, function pointers, a writing helper genuinely shared with another subcommand — is listed in `.oh/guardrails/platform-capabilities-are-refused-not-approximated.md`, and is what the runtime tests are for.
 
 ## Volume identity, and its limit
 

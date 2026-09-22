@@ -54,6 +54,20 @@ pub mod volume;
 pub mod walk;
 pub mod work_counters;
 
+/// The one lock every unit test that mutates the process environment
+/// takes.
+///
+/// Environment variables are process-global and `cargo test` runs a
+/// binary's tests in parallel. Two modules each having *their own*
+/// mutex serializes each against itself and neither against the other,
+/// which is how `schedule`'s tests (which read `HOME` through
+/// `home()`) and `platform`'s (one of which unsets `HOME` to prove the
+/// store does not fall back to the current directory) would have
+/// interfered -- rarely, and looking like a real failure when they did.
+/// The same class of bug as the PATH shims removed in stack/13.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use entities::*;
 pub use grants::*;
 pub use ledger::*;
