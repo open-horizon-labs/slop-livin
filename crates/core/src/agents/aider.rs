@@ -10,18 +10,21 @@
 //!
 //! [`identify`] covers the home: `caches/` (regenerable) and, if
 //! present, a home-level `.aider.conf.yml`. [`identify_repo_units`]
-//! covers the per-repo files and is called once per **known project
-//! worktree root** by `crate::agents::discover_and_measure`'s
-//! `project_worktrees` parameter -- #96's explicit acceptance ("attach
-//! to the existing worktree artifact model as an agent category, not a
-//! tool-home unit"). A worktree root is itself the "declared path" here
-//! (the caller already knows it is a real checkout), so project linkage
-//! reuses `resolve_declared_path` against that same root rather than
-//! inventing a second mechanism.
+//! covers the per-repo files and is reached through
+//! [`AgentAdapter::project_local_units`] -- this adapter is the one that
+//! declares [`AdapterCapabilities::project_local_units`], so the shared
+//! layer calls it once per **known project worktree root** instead of
+//! keeping a bespoke call path for one tool. That is #96's explicit
+//! acceptance ("attach to the existing worktree artifact model as an
+//! agent category, not a tool-home unit"). A worktree root is itself the
+//! "declared path" here (the caller already knows it is a real
+//! checkout), so project linkage reuses `resolve_declared_path` against
+//! that same root rather than inventing a second mechanism.
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes, mtime_secs, resolve_declared_path,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs,
+    resolve_declared_path,
 };
 use std::fs;
 use std::path::Path;
@@ -30,11 +33,38 @@ pub const AIDER_TOOL_ID: &str = crate::locations::aider::AIDER_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        AIDER_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "Aider"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            project_local_units: true,
+            ..Default::default()
+        }
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+    fn project_local_units(
+        &self,
+        worktree_root: &Path,
+        ctx: &IdentifyCtx,
+    ) -> Vec<CandidateAgentUnit> {
+        identify_repo_units(worktree_root, ctx)
+    }
+}
+
 // ---------------------------------------------------------------------
 // Home-level: ~/.aider/caches (+ an optional home-level .aider.conf.yml).
 // ---------------------------------------------------------------------
 
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     if !home.is_dir() {
         return Vec::new();
     }
@@ -43,46 +73,36 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
     let caches = home.join("caches");
     let caches_existed = caches.exists();
     if caches.is_dir() {
-        let (bytes, mtime, truncated) = folded_bytes(&caches, MAX_FOLD_ENTRIES);
-        units.push(CandidateAgentUnit {
-            category: AgentCategory::Caches,
-            relative_path: "caches".to_string(),
-            path: caches,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::CacheOrLogTrash,
-            note: Some(if truncated {
-                "model-price/context-window and version-check caches, wholly re-downloadable; \
-                 directory entry count bound reached"
-                    .to_string()
-            } else {
-                "model-price/context-window and version-check caches, wholly re-downloadable"
-                    .to_string()
-            }),
-        });
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&caches, MAX_FOLD_ENTRIES);
+        units.push(
+            AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, caches)
+                .relative_path("caches")
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .action(AgentActionCapability::CacheOrLogTrash)
+                .note(if truncated {
+                    "model-price/context-window and version-check caches, wholly re-downloadable; \
+                     directory entry count bound reached"
+                } else {
+                    "model-price/context-window and version-check caches, wholly re-downloadable"
+                })
+                .build(),
+        );
     }
 
     let conf = home.join(".aider.conf.yml");
     if let Ok(meta) = fs::symlink_metadata(&conf)
         && meta.is_file()
     {
-        units.push(CandidateAgentUnit {
-            category: AgentCategory::ProtectedConfig,
-            relative_path: ".aider.conf.yml".to_string(),
-            path: conf,
-            members: Vec::new(),
-            bytes: meta.len(),
-            mtime_max: mtime_secs(&meta),
-            protected: true,
-            protect_reason: Some("home-level Aider configuration".to_string()),
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: None,
-        });
+        units.push(
+            AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::ProtectedConfig, conf)
+                .relative_path(".aider.conf.yml")
+                .bytes(meta.len())
+                .mtime_max(mtime_secs(&meta))
+                .protect("home-level Aider configuration")
+                .action(AgentActionCapability::None)
+                .build(),
+        );
     }
 
     if !caches_existed && !home.join(".aider.conf.yml").exists() {
@@ -91,27 +111,21 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
         // directory would be -- Aider has no other documented top-level
         // marker this chunk found, so there is nothing to classify, not
         // an unknown format to flag.
-        let has_entries = fs::read_dir(home)
-            .map(|mut rd| rd.next().is_some())
-            .unwrap_or(false);
-        if has_entries {
-            let (bytes, mtime, _t) = folded_bytes(home, MAX_FOLD_ENTRIES);
-            units.push(CandidateAgentUnit {
-                category: AgentCategory::Unclassified,
-                relative_path: "(unclassified residual)".to_string(),
-                path: home.to_path_buf(),
-                members: Vec::new(),
-                bytes,
-                mtime_max: mtime,
-                protected: false,
-                protect_reason: None,
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: Some(
-                    "no recognized Aider home markers (caches/, .aider.conf.yml) found here"
-                        .to_string(),
-                ),
-            });
+        if ctx.has_entries(home) {
+            let (bytes, mtime, _t) = ctx.folded_bytes(home, MAX_FOLD_ENTRIES);
+            units.push(
+                AgentUnitBuilder::new(
+                    AIDER_TOOL_ID,
+                    AgentCategory::Unclassified,
+                    home.to_path_buf(),
+                )
+                .relative_path("(unclassified residual)")
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .action(AgentActionCapability::None)
+                .note("no recognized Aider home markers (caches/, .aider.conf.yml) found here")
+                .build(),
+            );
         }
     }
     units
@@ -125,7 +139,7 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
 /// research confirmed, checked directly at `worktree_root` (never a
 /// recursive search -- these files live exactly at the git root per
 /// `aider/args.py`/`repomap.py`).
-pub fn identify_repo_units(worktree_root: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     if !worktree_root.is_dir() {
         return Vec::new();
     }
@@ -149,62 +163,48 @@ pub fn identify_repo_units(worktree_root: &Path, _observed_at: u64) -> Vec<Candi
         if let Ok(meta) = fs::symlink_metadata(&path)
             && meta.is_file()
         {
-            units.push(CandidateAgentUnit {
-                category: AgentCategory::Sessions,
-                relative_path: rel.to_string(),
-                path: path.clone(),
-                members: vec![AgentMember {
-                    path,
-                    bytes: meta.len(),
-                    kind: AgentMemberKind::Transcript,
-                }],
-                bytes: meta.len(),
-                mtime_max: mtime_secs(&meta),
-                protected: false,
-                protect_reason: None,
-                project_link: project_link.clone(),
-                action: AgentActionCapability::SessionRemoval,
-                note: Some(note.to_string()),
-            });
+            units.push(
+                AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Sessions, path.clone())
+                    .relative_path(rel)
+                    .members(vec![AgentMember {
+                        path,
+                        bytes: meta.len(),
+                        kind: AgentMemberKind::Transcript,
+                    }])
+                    .mtime_max(mtime_secs(&meta))
+                    .project_link(project_link.clone())
+                    .action(AgentActionCapability::SessionRemoval)
+                    .note(note)
+                    .build(),
+            );
         }
     }
 
     // `.aider.tags.cache.v{3,4}` -- the version number is a repomap
     // implementation detail (whether the optional TSL pack is in use),
-    // checked directly rather than guessed at one fixed number.
-    let Ok(rd) = fs::read_dir(worktree_root) else {
-        return units;
-    };
-    for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    // checked directly rather than guessed at one fixed number, so the
+    // prefix match is deliberately not pinned to a version suffix.
+    for name in ctx.dir_names(worktree_root) {
         if !name.starts_with(".aider.tags.cache.v") {
             continue;
         }
-        let path = entry.path();
-        let (bytes, mtime, truncated) = folded_bytes(&path, MAX_FOLD_ENTRIES);
-        units.push(CandidateAgentUnit {
-            category: AgentCategory::Caches,
-            relative_path: name,
-            path,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: project_link.clone(),
-            action: AgentActionCapability::CacheOrLogTrash,
-            note: Some(if truncated {
-                "repo-map tags cache, regenerated on next Aider run; directory entry count bound \
-                 reached"
-                    .to_string()
-            } else {
-                "repo-map tags cache, regenerated on next Aider run".to_string()
-            }),
-        });
+        let path = worktree_root.join(&name);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+        units.push(
+            AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, path)
+                .relative_path(name)
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .project_link(project_link.clone())
+                .action(AgentActionCapability::CacheOrLogTrash)
+                .note(if truncated {
+                    "repo-map tags cache, regenerated on next Aider run; directory entry count \
+                     bound reached"
+                } else {
+                    "repo-map tags cache, regenerated on next Aider run"
+                })
+                .build(),
+        );
     }
     units
 }
@@ -212,7 +212,18 @@ pub fn identify_repo_units(worktree_root: &Path, _observed_at: u64) -> Vec<Candi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, LinkSource, ProjectLinkState, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
+
+    fn run_repo(worktree_root: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify_repo_units(worktree_root, &IdentifyCtx::new(1, &cache))
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -222,7 +233,7 @@ mod tests {
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(identify(dir.path(), 1).is_empty());
+        assert!(run(dir.path()).is_empty());
     }
 
     #[test]
@@ -234,7 +245,7 @@ mod tests {
             b"{}",
         );
         touch(&home.join("caches/versioncheck"), b"");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units.iter().find(|u| u.relative_path == "caches").unwrap();
         assert!(!u.protected);
         assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
@@ -245,7 +256,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join(".aider.conf.yml"), b"dark-mode: true");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units
             .iter()
             .find(|u| u.relative_path == ".aider.conf.yml")
@@ -264,7 +275,7 @@ mod tests {
             &home.join(".aider.chat.history.md"),
             b"# aider chat history",
         );
-        let units = identify(home, 1);
+        let units = run(home);
         assert!(
             units
                 .iter()
@@ -284,7 +295,7 @@ mod tests {
             format!("# aider chat started\n\nUser: {canary}\n").as_bytes(),
         );
         touch(&repo.join(".aider.input.history"), b"+++ /help\n");
-        let units = identify_repo_units(repo, 1);
+        let units = run_repo(repo);
         assert_eq!(units.len(), 2);
         for u in &units {
             assert_eq!(u.category, AgentCategory::Sessions);
@@ -301,7 +312,7 @@ mod tests {
         let repo = repo.path();
         fs::create_dir_all(repo.join(".git")).unwrap();
         touch(&repo.join(".aider.tags.cache.v3/tags.db"), b"cache-bytes");
-        let units = identify_repo_units(repo, 1);
+        let units = run_repo(repo);
         let u = units
             .iter()
             .find(|u| u.relative_path == ".aider.tags.cache.v3")
@@ -311,11 +322,29 @@ mod tests {
     }
 
     #[test]
+    fn a_tags_cache_of_any_version_suffix_is_identified() {
+        // The version suffix is a repomap implementation detail, so the
+        // prefix match must not be pinned to the versions that happened
+        // to exist when this adapter was written.
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(&repo.join(".aider.tags.cache.v9/tags.db"), b"cache-bytes");
+        let units = run_repo(repo);
+        assert!(
+            units
+                .iter()
+                .any(|u| u.relative_path == ".aider.tags.cache.v9"),
+            "a future tags-cache version must still be identified: {units:?}"
+        );
+    }
+
+    #[test]
     fn a_worktree_with_no_aider_files_yields_nothing() {
         let repo = tempfile::tempdir().unwrap();
         let repo = repo.path();
         fs::create_dir_all(repo.join(".git")).unwrap();
-        assert!(identify_repo_units(repo, 1).is_empty());
+        assert!(run_repo(repo).is_empty());
     }
 
     #[test]
@@ -330,12 +359,151 @@ mod tests {
             );
         }
         let start = SystemTime::now();
-        let units = identify_repo_units(repo, 1);
+        let units = run_repo(repo);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!(
             "[measured] aider identify_repo_units() over a 2000-file tags cache took {elapsed:?}"
         );
         assert_eq!(units.len(), 1);
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        // A ~/.aider with none of the documented markers is still
+        // reported, as one explicit `(unclassified residual)` row that
+        // names which markers were looked for -- never an empty vec,
+        // and never re-read as some other tool's layout.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("something-unrecognized.bin"), b"\x00\x01");
+        let units = run(home);
+        assert_eq!(units.len(), 1, "unrecognized content must still surface");
+        assert_eq!(units[0].relative_path, "(unclassified residual)");
+        assert_eq!(units[0].category, AgentCategory::Unclassified);
+        assert_eq!(units[0].action, AgentActionCapability::None);
+        let note = units[0].note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("no recognized Aider home markers"),
+            "the unit must say what was looked for: {note}"
+        );
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-AIDER-CONTRACT-DO-NOT-LEAK-91ab";
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // First line *and* body, since a future header read would see
+        // the first line.
+        touch(
+            &repo.join(".aider.chat.history.md"),
+            format!("# aider chat started {canary}\n\nUser: {canary}\n").as_bytes(),
+        );
+        touch(
+            &repo.join(".aider.input.history"),
+            format!("{canary}\n+++ /help\n").as_bytes(),
+        );
+        contract::no_content_leak(&run_repo(repo), canary);
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(
+            &home.join(".aider.conf.yml"),
+            format!("openai-api-key: {canary}\n").as_bytes(),
+        );
+        contract::no_content_leak(&run(home), canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut fixture_bytes = 0u64;
+        for i in 0..20 {
+            let body = b"x".repeat(50_000);
+            touch(&repo.join(format!(".aider.tags.cache.v3/f{i}")), &body);
+            fixture_bytes += body.len() as u64;
+        }
+        let transcript = b"y".repeat(200_000);
+        touch(&repo.join(".aider.chat.history.md"), &transcript);
+        fixture_bytes += transcript.len() as u64;
+
+        let (units, counters) = contract::measured(|| run_repo(repo));
+        assert_eq!(units.len(), 2, "transcript + tags cache");
+        // Aider's per-repo files are identified by name and measured by
+        // `stat`; this adapter reads no file contents at all, so the
+        // bound is not "small", it is zero.
+        assert_eq!(
+            counters.header_bytes_read, 0,
+            "aider identification reads no content"
+        );
+        assert!(
+            counters.header_bytes_read < fixture_bytes,
+            "{} vs {fixture_bytes} fixture bytes",
+            counters.header_bytes_read
+        );
+        contract::within_header_cap(counters, 0);
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join(".aider.conf.yml"), b"model: gpt-4o\n");
+        touch(&home.join("caches/versioncheck"), b"");
+        let units = run(home);
+        let conf = units
+            .iter()
+            .find(|u| u.relative_path == ".aider.conf.yml")
+            .expect("home config identified");
+        assert_eq!(conf.category, AgentCategory::ProtectedConfig);
+        assert!(conf.protected);
+        assert_eq!(
+            conf.protect_reason.as_deref(),
+            Some("home-level Aider configuration")
+        );
+        contract::protection_defaults_hold(&units);
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        // (a) A worktree root the caller already resolved is the
+        // declared path: linkage comes back `Declared`, from that root's
+        // own git identity.
+        let declared = tempfile::tempdir().unwrap();
+        let declared = declared.path().join("declared-checkout");
+        fs::create_dir_all(declared.join(".git")).unwrap();
+        touch(&declared.join(".aider.input.history"), b"+++ /help\n");
+        let linked = run_repo(&declared);
+        assert_eq!(linked.len(), 1);
+        match &linked[0].project_link {
+            ProjectLinkState::Linked { source, .. } => assert_eq!(*source, LinkSource::Declared),
+            other => panic!("a resolved worktree root must link: {other:?}"),
+        }
+
+        // (b) A home-level directory merely *named* like a project is
+        // never turned into a link: the home-level units are tool-wide,
+        // so `NotApplicable` is the honest answer and the basename never
+        // reaches the linkage field.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let decoy = home.join("looks-like-my-project");
+        fs::create_dir_all(decoy.join(".git")).unwrap();
+        touch(&decoy.join(".aider.chat.history.md"), b"# not ours\n");
+        let home_units = run(home);
+        assert!(!home_units.is_empty(), "the residual must still surface");
+        assert!(
+            home_units
+                .iter()
+                .all(|u| matches!(u.project_link, ProjectLinkState::NotApplicable)),
+            "home-level units are tool-wide: {home_units:?}"
+        );
+        contract::linkage_is_declared_or_explicit(&home_units, "looks-like-my-project");
+        contract::linkage_is_declared_or_explicit(&linked, "looks-like-my-project");
     }
 }

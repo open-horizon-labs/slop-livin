@@ -69,28 +69,13 @@ fn real_units_with_canary_content() -> (Report, PathBuf, Vec<swamp_core::agents:
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: [
-            "cargo-home",
-            "rustup",
-            "homebrew",
-            "codex",
-            "codex-desktop",
-            "oh-my-pi",
-            "opencode",
-            "gemini-cli",
-            "pi",
-            "aider",
-            "github-copilot-cli",
-            "cursor",
-            "windsurf",
-            "cline",
-            "roo-code",
-            "continue",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
-        enabled_detectors: Vec::new(),
+        // An allow-list: see the note in
+        // `crates/core/tests/external_units.rs`'s escaping-detector
+        // test. A deny-list of the other agent detectors left
+        // `core-simulator`, `homebrew` and `ruby-install` reaching real
+        // machine-wide paths from a fixture.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["claude-code".to_string()],
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1_000);
     let store = tempfile::tempdir().unwrap();

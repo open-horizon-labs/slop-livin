@@ -85,6 +85,74 @@ pub fn measure(path: &Path, exclusions: &[PathBuf], observed_at: u64) -> FoldedU
     }
 }
 
+/// Bounded, stat-only folded byte total for `path` (file or directory),
+/// returning `(bytes, mtime_max, truncated)`.
+///
+/// This is deliberately *not* [`measure`]'s parallel-pool machinery:
+/// that is tuned for a handful of potentially huge artifact roots, not
+/// hundreds of small per-session directories, and spinning up its thread
+/// pool that many times would itself be the "unacceptable scanning cost"
+/// the agent epic guards against. Reads directory names and `stat` calls
+/// only -- never file contents. Bounded by `max_entries`; a directory
+/// that hits the bound is reported truncated rather than silently
+/// under-measured.
+///
+/// It lives here rather than in `agents/mod.rs` because this module is
+/// the one place allowed to traverse on the ordinary report path
+/// (`.oh/guardrails/no-second-traversal-on-report-path.md`); adapters
+/// reach it through `agents::IdentifyCtx::folded_bytes`, never directly.
+pub fn folded_bytes_bounded(path: &Path, max_entries: usize) -> (u64, u64, bool) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, 0, false);
+    };
+    if meta.is_file() {
+        return (meta.len(), mtime_secs(&meta), false);
+    }
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return (0, 0, false);
+    }
+    let mut total = 0u64;
+    let mut mtime_max = mtime_secs(&meta);
+    let mut stack = vec![path.to_path_buf()];
+    let mut seen = 0usize;
+    let mut truncated = false;
+    while let Some(dir) = stack.pop() {
+        crate::work_counters::record_dir_listed();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut here = 0u64;
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > max_entries {
+                truncated = true;
+                break;
+            }
+            let Ok(m) = entry.metadata() else { continue };
+            here += 1;
+            mtime_max = mtime_max.max(mtime_secs(&m));
+            if m.is_dir() && !m.file_type().is_symlink() {
+                stack.push(entry.path());
+            } else if m.is_file() {
+                total += m.len();
+            }
+        }
+        crate::work_counters::record_files_statted(here);
+        if truncated {
+            break;
+        }
+    }
+    (total, mtime_max, truncated)
+}
+
+pub fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

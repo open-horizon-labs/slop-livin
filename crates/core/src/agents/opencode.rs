@@ -39,6 +39,19 @@
 //!   the separate config root), per
 //!   <https://opencode.ai/docs/troubleshooting/>.
 //!
+//! There is **no `OPENCODE_DATA_DIR` environment variable**: sst/opencode
+//! `dev` @ `fe3f3a41f79ad292cc3c7c629567385a20ec5130` computes the data
+//! directory in `packages/core/src/global.ts` as `$XDG_DATA_HOME/opencode`
+//! through the `xdg-basedir` package, and the complete env-var registry
+//! in `packages/core/src/flag/flag.ts` holds only `OPENCODE_CONFIG_DIR`,
+//! `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_DB` and
+//! `OPENCODE_TEST_HOME` (<https://opencode.ai/docs/config> agrees,
+//! retrieved 2026-09-21). This adapter never reads the environment
+//! anyway -- the data root arrives from the detector -- but the earlier
+//! "`OPENCODE_DATA_DIR`, unconfirmed, honored defensively" note that
+//! `crate::locations::opencode` and `crate::agents::matrix` still carry
+//! is now disproved rather than merely unconfirmed.
+//!
 //! Version-aware boundary (#95's explicit acceptance): `identify` checks
 //! for `opencode.db`/`storage/`/`snapshot/`/`auth.json`/`log/` before
 //! doing anything else. If a resolved data root exists but is non-empty
@@ -47,8 +60,9 @@
 //! guessing at either schema.
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes, mtime_secs, resolve_declared_path,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
+    mtime_secs, resolve_declared_path,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -58,7 +72,29 @@ pub const OPENCODE_TOOL_ID: &str = crate::locations::opencode::OPENCODE_DETECTOR
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+/// The cap on the one content read this adapter performs:
+/// `storage/project/<id>.json`, a four-field metadata file. Everything
+/// else is identified by name and measured by `stat`.
+const HEADER_READ_BYTES: usize = 8192;
+
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        OPENCODE_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "OpenCode"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+}
+
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     if !home.is_dir() {
         return Vec::new();
     }
@@ -68,58 +104,54 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
     let has_auth = home.join("auth.json").is_file();
     let has_log = home.join("log").is_dir();
     if !(has_db || has_storage || has_snapshot || has_auth || has_log) {
-        return unknown_version_residual(home);
+        return unknown_version_residual(home, ctx);
     }
 
     let mut units = Vec::new();
     if has_db {
         identify_sqlite_store(home, &mut units);
     }
-    let projects = load_project_worktrees(home);
+    let projects = load_project_worktrees(home, ctx);
     let mut claimed_session_ids: HashSet<String> = HashSet::new();
     if has_storage {
         if !has_db {
-            identify_file_tree_sessions(home, &projects, &mut claimed_session_ids, &mut units);
+            identify_file_tree_sessions(home, ctx, &projects, &mut claimed_session_ids, &mut units);
         }
-        identify_storage_auxiliary(home, &claimed_session_ids, &mut units);
+        identify_storage_auxiliary(home, ctx, &claimed_session_ids, &mut units);
     }
     if has_snapshot {
-        identify_snapshots(home, &projects, &mut units);
+        identify_snapshots(home, ctx, &projects, &mut units);
     }
-    identify_static_categories(home, has_db, has_storage, has_snapshot, &mut units);
+    identify_static_categories(home, ctx, has_db, has_storage, has_snapshot, &mut units);
     units
 }
 
-fn unknown_version_residual(home: &Path) -> Vec<CandidateAgentUnit> {
+fn unknown_version_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     // See `oh_my_pi::unknown_format_residual`'s identical note: a
     // genuinely empty, existing directory is not "unsupported version",
-    // and `folded_bytes`'s mtime is non-zero for an empty directory
-    // itself, so entries are checked directly instead.
-    let has_entries = fs::read_dir(home)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
-    if !has_entries {
+    // and the folded mtime is non-zero for an empty directory itself, so
+    // entries are checked directly instead.
+    if !ctx.has_entries(home) {
         return Vec::new();
     }
-    let (bytes, mtime, _truncated) = folded_bytes(home, MAX_FOLD_ENTRIES);
-    vec![CandidateAgentUnit {
-        category: AgentCategory::Unclassified,
-        relative_path: "(unsupported layout version)".to_string(),
-        path: home.to_path_buf(),
-        members: Vec::new(),
-        bytes,
-        mtime_max: mtime,
-        protected: false,
-        protect_reason: None,
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: Some(
+    let (bytes, mtime, _truncated) = ctx.folded_bytes(home, MAX_FOLD_ENTRIES);
+    vec![
+        AgentUnitBuilder::new(
+            OPENCODE_TOOL_ID,
+            AgentCategory::Unclassified,
+            home.to_path_buf(),
+        )
+        .relative_path("(unsupported layout version)")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .action(AgentActionCapability::None)
+        .note(
             "no recognized OpenCode data-directory markers found (opencode.db/storage/snapshot/ \
              auth.json/log) at this resolved path; unsupported or future layout version -- \
-             treated as unknown, not scanned further"
-                .to_string(),
-        ),
-    }]
+             treated as unknown, not scanned further",
+        )
+        .build(),
+    ]
 }
 
 // ---------------------------------------------------------------------
@@ -128,33 +160,40 @@ fn unknown_version_residual(home: &Path) -> Vec<CandidateAgentUnit> {
 // under it -- declared metadata, no session-body scan needed at all.
 // ---------------------------------------------------------------------
 
-fn load_project_worktrees(home: &Path) -> HashMap<String, ProjectLinkState> {
+fn load_project_worktrees(home: &Path, ctx: &IdentifyCtx) -> HashMap<String, ProjectLinkState> {
     let mut map = HashMap::new();
     let dir = home.join("storage").join("project");
-    let Ok(rd) = fs::read_dir(&dir) else {
-        return map;
-    };
-    for e in rd.flatten() {
-        let path = e.path();
+    for name in ctx.file_names(&dir) {
+        let path = dir.join(&name);
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
         let Some(project_id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Small, bounded metadata file -- not conversation content.
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let worktree = value
-            .get("worktree")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let link = resolve_declared_path(worktree, "no worktree field in project.json");
+        // Small, bounded metadata file -- not conversation content --
+        // and memoised against its own (size, mtime), so a home whose
+        // projects have not changed costs zero header bytes on a second
+        // pass even with thousands of sessions under them.
+        let worktree = ctx.derived(
+            OPENCODE_TOOL_ID,
+            "project-worktree",
+            &path,
+            HEADER_READ_BYTES,
+            &|text| {
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                value
+                    .get("worktree")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            },
+        );
+        let link = resolve_declared_path(
+            worktree,
+            "no worktree field in project.json (absent, or the file did not parse as JSON within \
+             the bounded read)",
+        );
         map.insert(project_id.to_string(), link);
     }
     map
@@ -205,24 +244,20 @@ fn identify_sqlite_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
             });
         }
     }
-    out.push(CandidateAgentUnit {
-        category: AgentCategory::Sessions,
-        relative_path: "opencode.db".to_string(),
-        path: db,
-        members,
-        bytes,
-        mtime_max,
-        protected: true,
-        protect_reason: Some(
-            "SQLite-backed session/message/history store (current OpenCode layout); \
-             metadata-only, never opened while writable; no per-session drill-down in this \
-             version boundary"
-                .to_string(),
-        ),
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: None,
-    });
+    out.push(
+        AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Sessions, db)
+            .relative_path("opencode.db")
+            .bytes(bytes)
+            .members_keep_bytes(members)
+            .mtime_max(mtime_max)
+            .protect(
+                "SQLite-backed session/message/history store (current OpenCode layout); \
+                 metadata-only, never opened while writable; no per-session drill-down in this \
+                 version boundary",
+            )
+            .action(AgentActionCapability::None)
+            .build(),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -231,26 +266,17 @@ fn identify_sqlite_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
 
 fn identify_file_tree_sessions(
     home: &Path,
+    ctx: &IdentifyCtx,
     projects: &HashMap<String, ProjectLinkState>,
     claimed: &mut HashSet<String>,
     out: &mut Vec<CandidateAgentUnit>,
 ) {
     let base = home.join("storage").join("session");
-    let Ok(rd) = fs::read_dir(&base) else { return };
-    for project_entry in rd.flatten() {
-        let Ok(ft) = project_entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let project_id = project_entry.file_name().to_string_lossy().into_owned();
+    for project_id in ctx.dir_names(&base) {
+        let project_dir = base.join(&project_id);
         let project_link = project_link_for(projects, &project_id);
-        let Ok(session_files) = fs::read_dir(project_entry.path()) else {
-            continue;
-        };
-        for sf in session_files.flatten() {
-            let path = sf.path();
+        for file_name in ctx.file_names(&project_dir) {
+            let path = project_dir.join(&file_name);
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
             }
@@ -277,7 +303,7 @@ fn identify_file_tree_sessions(
             ] {
                 let companion = home.join("storage").join(dir_name).join(&session_id);
                 if companion.is_dir() {
-                    let (b, m, _t) = folded_bytes(&companion, MAX_FOLD_ENTRIES);
+                    let (b, m, _t) = ctx.folded_bytes(&companion, MAX_FOLD_ENTRIES);
                     bytes += b;
                     mtime_max = mtime_max.max(m);
                     members.push(AgentMember {
@@ -289,19 +315,16 @@ fn identify_file_tree_sessions(
             }
             claimed.insert(session_id);
             let relative_path = relative_to(home, &path);
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Sessions,
-                relative_path,
-                path,
-                members,
-                bytes,
-                mtime_max,
-                protected: false,
-                protect_reason: None,
-                project_link: project_link.clone(),
-                action: AgentActionCapability::SessionRemoval,
-                note: None,
-            });
+            out.push(
+                AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Sessions, path)
+                    .relative_path(relative_path)
+                    .bytes(bytes)
+                    .members_keep_bytes(members)
+                    .mtime_max(mtime_max)
+                    .project_link(project_link.clone())
+                    .action(AgentActionCapability::SessionRemoval)
+                    .build(),
+            );
         }
     }
 }
@@ -313,72 +336,61 @@ fn identify_file_tree_sessions(
 /// message id -- see module doc comment) and is always folded whole.
 fn identify_storage_auxiliary(
     home: &Path,
+    ctx: &IdentifyCtx,
     claimed: &HashSet<String>,
     out: &mut Vec<CandidateAgentUnit>,
 ) {
     for dir_name in ["message", "session_diff"] {
         let base = home.join("storage").join(dir_name);
-        let Ok(rd) = fs::read_dir(&base) else {
-            continue;
-        };
         let mut bytes = 0u64;
         let mut mtime_max = 0u64;
         let mut any = false;
-        for e in rd.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if !ft.is_dir() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().into_owned();
+        for name in ctx.dir_names(&base) {
             if claimed.contains(&name) {
                 continue;
             }
-            let (b, m, _t) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+            let (b, m, _t) = ctx.folded_bytes(&base.join(&name), MAX_FOLD_ENTRIES);
             bytes += b;
             mtime_max = mtime_max.max(m);
             any = true;
         }
         if any {
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Unclassified,
-                relative_path: format!("storage/{dir_name} (unlinked)"),
-                path: base,
-                members: Vec::new(),
-                bytes,
-                mtime_max,
-                protected: false,
-                protect_reason: None,
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: Some(format!(
-                    "{dir_name} entries keyed by session id with no matching current session \
-                     file in storage/session/ (already removed, or the current data root uses \
-                     the SQLite-backed layout with no file-tree session to correlate against)"
-                )),
-            });
+            out.push(
+                AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Unclassified, base)
+                    .relative_path(format!("storage/{dir_name} (unlinked)"))
+                    .bytes(bytes)
+                    .mtime_max(mtime_max)
+                    .action(AgentActionCapability::None)
+                    .note(format!(
+                        "{dir_name} entries keyed by session id with no matching current session \
+                         file in storage/session/ (already removed, or the current data root uses \
+                         the SQLite-backed layout with no file-tree session to correlate against)"
+                    ))
+                    .build(),
+            );
         }
     }
     let part = home.join("storage").join("part");
     if part.is_dir() {
-        let (bytes, mtime, truncated) = folded_bytes(&part, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Attachments,
-            relative_path: "storage/part".to_string(),
-            path: part,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: true,
-            protect_reason: Some(
-                "message parts, keyed by message id; no per-session reference evidence is \
-                 available without reading message file content, so this adapter does not \
-                 offer it as a supported action"
-                    .to_string(),
-            ),
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: truncated.then(|| "directory entry count bound reached".to_string()),
-        });
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&part, MAX_FOLD_ENTRIES);
+        let mut builder = AgentUnitBuilder::new(
+            OPENCODE_TOOL_ID,
+            AgentCategory::Attachments,
+            part,
+        )
+        .relative_path("storage/part")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .protect(
+            "message parts, keyed by message id; no per-session reference evidence is available \
+             without reading message file content, so this adapter does not offer it as a \
+             supported action",
+        )
+        .action(AgentActionCapability::None);
+        if truncated {
+            builder = builder.note("directory entry count bound reached");
+        }
+        out.push(builder.build());
     }
 }
 
@@ -388,18 +400,14 @@ fn identify_storage_auxiliary(
 
 fn identify_snapshots(
     home: &Path,
+    ctx: &IdentifyCtx,
     projects: &HashMap<String, ProjectLinkState>,
     out: &mut Vec<CandidateAgentUnit>,
 ) {
     let base = home.join("snapshot");
-    let Ok(rd) = fs::read_dir(&base) else { return };
-    for e in rd.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let project_id = e.file_name().to_string_lossy().into_owned();
-        let (bytes, mtime, truncated) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+    for project_id in ctx.dir_names(&base) {
+        let path = base.join(&project_id);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
         let note = if truncated {
             "git-backed checkpoint history for this project's /undo; removing it loses the \
              ability to revert past this point (directory entry count bound reached) -- not a \
@@ -409,19 +417,17 @@ fn identify_snapshots(
              ability to revert past this point -- not a supported selective action in this \
              chunk"
         };
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Checkpoints,
-            relative_path: relative_to(home, &e.path()),
-            path: e.path(),
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: project_link_for(projects, &project_id),
-            action: AgentActionCapability::None,
-            note: Some(note.to_string()),
-        });
+        let relative_path = relative_to(home, &path);
+        out.push(
+            AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Checkpoints, path)
+                .relative_path(relative_path)
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .project_link(project_link_for(projects, &project_id))
+                .action(AgentActionCapability::None)
+                .note(note)
+                .build(),
+        );
     }
 }
 
@@ -431,6 +437,7 @@ fn identify_snapshots(
 
 fn identify_static_categories(
     home: &Path,
+    ctx: &IdentifyCtx,
     has_db: bool,
     has_storage: bool,
     has_snapshot: bool,
@@ -440,41 +447,32 @@ fn identify_static_categories(
     if let Ok(meta) = fs::symlink_metadata(&auth)
         && meta.is_file()
     {
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::ProtectedConfig,
-            relative_path: "auth.json".to_string(),
-            path: auth,
-            members: Vec::new(),
-            bytes: meta.len(),
-            mtime_max: mtime_secs(&meta),
-            protected: true,
-            protect_reason: Some(
-                "authentication data (API keys, OAuth tokens); contents are never read by this \
-                 adapter"
-                    .to_string(),
-            ),
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: None,
-        });
+        out.push(
+            AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::ProtectedConfig, auth)
+                .relative_path("auth.json")
+                .bytes(meta.len())
+                .mtime_max(mtime_secs(&meta))
+                .protect(
+                    "authentication data (API keys, OAuth tokens); contents are never read by \
+                     this adapter",
+                )
+                .action(AgentActionCapability::None)
+                .build(),
+        );
     }
 
     let log = home.join("log");
     if log.is_dir() {
-        let (bytes, mtime, truncated) = folded_bytes(&log, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Logs,
-            relative_path: "log".to_string(),
-            path: log,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::CacheOrLogTrash,
-            note: truncated.then(|| "directory entry count bound reached".to_string()),
-        });
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&log, MAX_FOLD_ENTRIES);
+        let mut builder = AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Logs, log)
+            .relative_path("log")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::CacheOrLogTrash);
+        if truncated {
+            builder = builder.note("directory entry count bound reached");
+        }
+        out.push(builder.build());
     }
 
     let mut seen_top_level: HashSet<&str> = HashSet::from(["auth.json", "log"]);
@@ -487,45 +485,36 @@ fn identify_static_categories(
     if has_snapshot {
         seen_top_level.insert("snapshot");
     }
-    let Ok(rd) = fs::read_dir(home) else { return };
     let mut residual_bytes = 0u64;
     let mut residual_mtime = 0u64;
     let mut residual_names: Vec<String> = Vec::new();
-    for e in rd.flatten() {
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if seen_top_level.contains(name.as_str()) {
+    for entry in ctx.list(home) {
+        if seen_top_level.contains(entry.name.as_str()) {
             continue;
         }
-        let (bytes, mtime, _t) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let (bytes, mtime, _t) = ctx.folded_bytes(&home.join(&entry.name), MAX_FOLD_ENTRIES);
         residual_bytes += bytes;
         residual_mtime = residual_mtime.max(mtime);
-        residual_names.push(name);
+        residual_names.push(entry.name);
     }
     if !residual_names.is_empty() {
         residual_names.sort();
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Unclassified,
-            relative_path: "(unclassified residual)".to_string(),
-            path: home.to_path_buf(),
-            members: Vec::new(),
-            bytes: residual_bytes,
-            mtime_max: residual_mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: Some(format!(
+        out.push(
+            AgentUnitBuilder::new(
+                OPENCODE_TOOL_ID,
+                AgentCategory::Unclassified,
+                home.to_path_buf(),
+            )
+            .relative_path("(unclassified residual)")
+            .bytes(residual_bytes)
+            .mtime_max(residual_mtime)
+            .action(AgentActionCapability::None)
+            .note(format!(
                 "entries with no specific rule in this adapter: {}",
                 residual_names.join(", ")
-            )),
-        });
+            ))
+            .build(),
+        );
     }
 }
 
@@ -539,7 +528,13 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, LinkSource, bounded_io, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -553,16 +548,7 @@ mod tests {
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(identify(dir.path(), 1).is_empty());
-    }
-
-    #[test]
-    fn no_markers_yields_unsupported_version_not_a_guess() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(&dir.path().join("unrelated.txt"), b"hello");
-        let units = identify(dir.path(), 1);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert!(run(dir.path()).is_empty());
     }
 
     #[test]
@@ -584,7 +570,7 @@ mod tests {
             &home.join("storage/message/s1/m1.json"),
             format!("{{\"content\":\"{canary}\"}}").as_bytes(),
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let session = units
             .iter()
             .find(|u| u.category == AgentCategory::Sessions)
@@ -608,7 +594,7 @@ mod tests {
         // Legacy file-tree debris that must NOT be double-counted as a
         // live session once the DB-backed layout is in play.
         touch(&home.join("storage/session/p1/s1.json"), b"{}");
-        let units = identify(home, 1);
+        let units = run(home);
         let db = units
             .iter()
             .find(|u| u.relative_path == "opencode.db")
@@ -629,7 +615,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("storage/part/msg1/p1.json"), b"{}");
-        let units = identify(home, 1);
+        let units = run(home);
         let part = units
             .iter()
             .find(|u| u.relative_path == "storage/part")
@@ -649,7 +635,7 @@ mod tests {
             project_json(&repo.display().to_string()).as_bytes(),
         );
         touch(&home.join("snapshot/p1/abcd1234"), b"git-object-bytes");
-        let units = identify(home, 1);
+        let units = run(home);
         let snap = units
             .iter()
             .find(|u| u.category == AgentCategory::Checkpoints)
@@ -663,7 +649,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("auth.json"), b"[redacted]");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units
             .iter()
             .find(|u| u.relative_path == "auth.json")
@@ -677,7 +663,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("log").join("app.log"), b"debug line");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units.iter().find(|u| u.relative_path == "log").unwrap();
         assert!(!u.protected);
         assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
@@ -703,7 +689,7 @@ mod tests {
             );
         }
         let start = SystemTime::now();
-        let units = identify(home, 1);
+        let units = run(home);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!("[measured] opencode identify() over 500 synthetic sessions took {elapsed:?}");
         assert_eq!(
@@ -714,5 +700,214 @@ mod tests {
             500
         );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn an_unchanged_project_file_costs_no_header_bytes_on_a_second_pass() {
+        // What `ctx.derived` buys: the project.json read is memoised
+        // against its own (size, mtime), so re-identifying an unchanged
+        // home reads nothing at all.
+        let store = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("declared-checkout");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(
+            &home.join("storage/project/p1.json"),
+            project_json(&repo.display().to_string()).as_bytes(),
+        );
+        touch(&home.join("storage/session/p1/s1.json"), b"{\"id\":\"s1\"}");
+
+        let cache = IdentificationCache::load(store.path());
+        let (first, first_counters) =
+            contract::measured(|| identify(home, &IdentifyCtx::new(1, &cache)));
+        assert!(
+            first_counters.header_bytes_read > 0,
+            "the first pass must actually read the project file"
+        );
+        let (second, second_counters) =
+            contract::measured(|| identify(home, &IdentifyCtx::new(2, &cache)));
+        assert_eq!(
+            second_counters.header_bytes_read, 0,
+            "an unchanged project file must be a cache hit, not a re-read"
+        );
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        // A data root that exists, holds something, and matches none of
+        // the documented markers is reported as exactly one explicit
+        // "unsupported layout version" row -- never an empty vec, and
+        // never re-read as the other layout's shape.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("unrelated.txt"), b"hello");
+        touch(&dir.path().join("future-layout/db.sqlite3"), b"nope");
+        let units = run(dir.path());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert_eq!(units[0].category, AgentCategory::Unclassified);
+        assert_eq!(units[0].action, AgentActionCapability::None);
+        let note = units[0].note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("unsupported or future layout version"),
+            "the unit must say why it is unclassified: {note}"
+        );
+        assert!(units[0].bytes > 0, "an unknown layout is still measured");
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-OC-CONTRACT-DO-NOT-LEAK-6b12";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("declared-checkout");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // The one file this adapter *does* read a header from: the
+        // canary sits beside the field it parses, on the first line.
+        touch(
+            &home.join("storage/project/p1.json"),
+            format!(
+                "{{\"id\":\"p1\",\"worktree\":\"{}\",\"note\":\"{canary}\"}}",
+                repo.display()
+            )
+            .as_bytes(),
+        );
+        // And in a session body, first line and onwards.
+        touch(
+            &home.join("storage/session/p1/s1.json"),
+            format!("{{\"id\":\"s1\",\"title\":\"{canary}\"}}\n{canary}\n").as_bytes(),
+        );
+        touch(
+            &home.join("storage/message/s1/m1.json"),
+            format!("{{\"content\":\"{canary}\"}}").as_bytes(),
+        );
+        touch(
+            &home.join("log/app.log"),
+            format!("prompt: {canary}\n").as_bytes(),
+        );
+        let units = run(home);
+        assert!(!units.is_empty());
+        contract::no_content_leak(&units, canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("declared-checkout");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut fixture_bytes = 0u64;
+        let project = project_json(&repo.display().to_string());
+        touch(&home.join("storage/project/p1.json"), project.as_bytes());
+        fixture_bytes += project.len() as u64;
+        // Sessions are identified by name and measured by `stat`; none
+        // of these bytes may be read.
+        for i in 0..25 {
+            let mut content = format!("{{\"id\":\"s{i}\"}}").into_bytes();
+            content.extend_from_slice(&b"x".repeat(100_000));
+            touch(
+                &home.join(format!("storage/session/p1/s{i}.json")),
+                &content,
+            );
+            fixture_bytes += content.len() as u64;
+        }
+        let (units, counters) = contract::measured(|| run(home));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            25
+        );
+        // One project.json is the *only* read: 25 sessions cost zero
+        // content bytes between them.
+        contract::within_header_cap(counters, 1);
+        assert!(
+            counters.header_bytes_read <= HEADER_READ_BYTES as u64,
+            "identification read {} bytes, above this adapter's own {HEADER_READ_BYTES} byte cap",
+            counters.header_bytes_read
+        );
+        assert!(
+            counters.header_bytes_read < fixture_bytes,
+            "{} vs {fixture_bytes} fixture bytes",
+            counters.header_bytes_read
+        );
+        const { assert!(bounded_io::MAX_HEADER_BYTES >= HEADER_READ_BYTES) };
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("auth.json"), b"[redacted]");
+        touch(&home.join("log/app.log"), b"debug line");
+        touch(&home.join("storage/part/msg1/p1.json"), b"{}");
+        let units = run(home);
+        let auth = units
+            .iter()
+            .find(|u| u.relative_path == "auth.json")
+            .expect("auth.json identified");
+        assert_eq!(auth.category, AgentCategory::ProtectedConfig);
+        assert!(auth.protected);
+        assert!(
+            auth.protect_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("authentication data"),
+            "the protection reason must name what it protects: {:?}",
+            auth.protect_reason
+        );
+        contract::protection_defaults_hold(&units);
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        // (a) A project.json that declares a real checkout resolves
+        // `Linked` from `LinkSource::Declared`.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("declared-checkout");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(
+            &home.join("storage/project/p1.json"),
+            project_json(&repo.display().to_string()).as_bytes(),
+        );
+        touch(&home.join("storage/session/p1/s1.json"), b"{\"id\":\"s1\"}");
+        let units = run(home);
+        let session = units
+            .iter()
+            .find(|u| u.category == AgentCategory::Sessions)
+            .expect("session identified");
+        match &session.project_link {
+            ProjectLinkState::Linked { source, .. } => assert_eq!(*source, LinkSource::Declared),
+            other => panic!("a declared worktree must link: {other:?}"),
+        }
+
+        // (b) A session file *named* like a real checkout that sits right
+        // next to it, with no project.json declaring anything, must come
+        // back `Unresolved` with a reason -- never linked to the
+        // same-named repo.
+        let bare = tempfile::tempdir().unwrap();
+        let bare = bare.path();
+        fs::create_dir_all(bare.join("my-repo-name/.git")).unwrap();
+        let oc = bare.join("oc-data");
+        touch(&oc.join("storage/session/p1/my-repo-name.json"), b"{}");
+        let bare_units = run(&oc);
+        let session = bare_units
+            .iter()
+            .find(|u| u.category == AgentCategory::Sessions)
+            .expect("session identified");
+        match &session.project_link {
+            ProjectLinkState::Unresolved { reason } => assert!(
+                reason.contains("no storage/project/p1.json found"),
+                "{reason}"
+            ),
+            other => panic!("an undeclared session must not link: {other:?}"),
+        }
+        contract::linkage_is_declared_or_explicit(&bare_units, "my-repo-name");
+        contract::linkage_is_declared_or_explicit(&units, "my-repo-name");
     }
 }

@@ -212,6 +212,19 @@ pub struct IdentityTable(KeyedTable);
 /// by the `info.plist`'s own `(size, mtime)`.
 pub struct XcodeJoinTable(KeyedTable);
 
+/// `adapter\u{1}kind\u{1}unit path -> one derived string`: the agent
+/// adapters' identification cache.
+///
+/// An adapter derives a small fact from a session's *header* -- the
+/// declared working directory, a workspace path, a format marker. Before
+/// this table each of those facts was re-derived on every observation,
+/// so an unchanged home with 5,000 sessions re-read 5,000 headers
+/// (`.oh/sessions/2026-09-21-foundation-repairs.md` recorded the
+/// measured 740 KB). The fingerprint is the source file's own
+/// `(size, mtime)` plus the adapter version, so an unchanged session is
+/// a table lookup and a changed or appended one is read exactly once.
+pub struct IdentificationTable(KeyedTable);
+
 /// `external unit key -> (consumer label, note)`: the declared-consumer
 /// sidecar. Human intent rather than derived data, so it is *not*
 /// fingerprint-invalidated -- the fingerprint column is a constant --
@@ -257,6 +270,21 @@ impl XcodeJoinTable {
         Self(KeyedTable {
             path: dir(swamp_dir).join("xcode_derived_data.parquet"),
             value_columns: &["outcome", "detail"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl IdentificationTable {
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("agent_identifications.parquet"),
+            value_columns: &["value"],
         })
     }
     pub fn load(&self) -> HashMap<String, CachedRows> {

@@ -68,21 +68,32 @@ const ALL_AGENT_DETECTOR_IDS: &[&str] = &[
 /// bug once already -- see `agent_units_actions_new_adapters.rs`'s own
 /// fixed `only_detector`).
 fn only(keep: &[&str]) -> ScanConfig {
+    // An allow-list makes a typo silent -- an unknown id simply
+    // authorizes nothing, and the fixture then "passes" by finding no
+    // units. So the ids are checked against the catalog here.
+    for id in keep {
+        assert!(
+            ALL_AGENT_DETECTOR_IDS.contains(id),
+            "{id:?} is not an agent detector id; an allow-list typo would leave this fixture \
+             with an empty scope and a vacuously passing assertion"
+        );
+    }
     ScanConfig {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: ["cargo-home", "rustup", "homebrew"]
-            .into_iter()
-            .chain(
-                ALL_AGENT_DETECTOR_IDS
-                    .iter()
-                    .copied()
-                    .filter(|d| !keep.contains(d)),
-            )
-            .map(str::to_string)
-            .collect(),
-        enabled_detectors: Vec::new(),
+        // An **allow-list**. A deny-list naming only the noisy build-tool
+        // detectors left the rest of the catalog in scope, including
+        // three detectors whose paths are machine-wide conventions no
+        // injected `HOME` can relocate -- `homebrew`'s prefixes,
+        // `ruby-install`'s /opt/rubies, and `core_simulator`'s
+        // /Library/Developer/CoreSimulator/Volumes. A fixture that
+        // reaches those reads the developer's real storage, which is
+        // both wrong and slow (42 GB and ninety seconds on the machine
+        // where it was found). See
+        // `external_units.rs::a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_byte_total`.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: keep.iter().copied().map(str::to_string).collect(),
     }
 }
 
@@ -147,6 +158,21 @@ fn custom_root_overrides_redirect_discovery_away_from_the_convention_path() {
 // Malformed / partial metadata never panics, always explicit
 // ---------------------------------------------------------------------
 
+/// An adapter context with the identification cache disabled: every
+/// derivation reads live, which is what a validation fixture wants (a
+/// cached answer would mean a second call proved nothing).
+fn ctx_for(at: u64) -> (swamp_core::agents::IdentificationCache, u64) {
+    (swamp_core::agents::IdentificationCache::disabled(), at)
+}
+
+macro_rules! identify_with {
+    ($adapter:path, $home:expr) => {{
+        let (cache, at) = ctx_for(1_000);
+        let ctx = swamp_core::agents::IdentifyCtx::new(at, &cache);
+        $adapter($home, &ctx)
+    }};
+}
+
 #[test]
 fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
     // Claude Code: a completely empty transcript file.
@@ -159,7 +185,7 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
             .join("55555555-5555-4555-8555-555555555555.jsonl");
         write(&jsonl, b"");
         let result = std::panic::catch_unwind(|| {
-            swamp_core::agents::claude_code::identify(home.path(), 1_000)
+            identify_with!(swamp_core::agents::claude_code::identify, home.path())
         });
         let units = result.expect("an empty transcript must never panic identification");
         let unit = units
@@ -182,8 +208,9 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
             .path()
             .join("sessions/2026/09/21/rollout-not-json.jsonl");
         write(&jsonl, b"{not valid json at all\n");
-        let result =
-            std::panic::catch_unwind(|| swamp_core::agents::codex::identify(home.path(), 1_000));
+        let result = std::panic::catch_unwind(|| {
+            identify_with!(swamp_core::agents::codex::identify, home.path())
+        });
         let units = result.expect("invalid JSON header must never panic identification");
         let unit = units.iter().find(|u| u.path == jsonl);
         if let Some(unit) = unit {
@@ -203,8 +230,9 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
         write(&home.path().join("storage/project/p1.json"), b"{not json");
         write(&home.path().join("storage/session/p1/s1.json"), b"{}");
         write(&home.path().join("auth.json"), b"[redacted]");
-        let result =
-            std::panic::catch_unwind(|| swamp_core::agents::opencode::identify(home.path(), 1_000));
+        let result = std::panic::catch_unwind(|| {
+            identify_with!(swamp_core::agents::opencode::identify, home.path())
+        });
         result.expect("a malformed project.json must never panic identification");
     }
 }
@@ -220,19 +248,19 @@ fn unrecognized_or_unknown_schema_units_are_never_actionable() {
             let home = tempfile::tempdir().unwrap();
             fs::create_dir_all(home.path()).unwrap();
             write(&home.path().join("unrelated.txt"), b"hello");
-            swamp_core::agents::windsurf::identify(home.path(), 1_000)
+            identify_with!(swamp_core::agents::windsurf::identify, home.path())
         },
         {
             let home = tempfile::tempdir().unwrap();
             fs::create_dir_all(home.path()).unwrap();
             write(&home.path().join("unrelated.txt"), b"hello");
-            swamp_core::agents::opencode::identify(home.path(), 1_000)
+            identify_with!(swamp_core::agents::opencode::identify, home.path())
         },
         {
             let home = tempfile::tempdir().unwrap();
             fs::create_dir_all(home.path()).unwrap();
             write(&home.path().join("unrelated.txt"), b"hello");
-            swamp_core::agents::oh_my_pi::identify(home.path(), 1_000)
+            identify_with!(swamp_core::agents::oh_my_pi::identify, home.path())
         },
     ];
     for units in cases {
@@ -278,7 +306,7 @@ fn oh_my_pi_shared_blob_reference_states_are_explicit_and_never_actionable() {
     bytes.extend_from_slice(format!("blob:sha256:{referenced_hash}\n").as_bytes());
     write(&session, &bytes);
 
-    let units = swamp_core::agents::oh_my_pi::identify(home, 1_000);
+    let units = identify_with!(swamp_core::agents::oh_my_pi::identify, home);
     let referenced = units
         .iter()
         .find(|u| u.path.ends_with(&referenced_hash))

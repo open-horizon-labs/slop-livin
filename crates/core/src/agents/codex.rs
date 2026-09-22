@@ -21,8 +21,9 @@
 //!   background size metric walks exactly `sessions/` and
 //!   `archived_sessions/` recursively, stat-only, without following
 //!   symlinks and without reading file contents -- the same discipline
-//!   `super::folded_bytes` already gives every adapter in this module,
-//!   confirming (not just assuming) it matches upstream's own practice.
+//!   `IdentifyCtx::folded_bytes` already gives every adapter in this
+//!   module, confirming (not just assuming) it matches upstream's own
+//!   practice.
 //! - `codex-rs/rollout/src/metadata.rs`: the rollout's first logical
 //!   item is a `session_meta` entry carrying `meta.cwd` (and, when
 //!   present, `git.commit_hash`/`git.branch`/`git.repository_url`,
@@ -47,12 +48,12 @@
 //! gap (`docs/agent-storage.md` records the same note in prose).
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes, mtime_secs, resolve_declared_path,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
+    mtime_secs, resolve_declared_path,
 };
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const CODEX_TOOL_ID: &str = crate::locations::codex::CODEX_DETECTOR_ID;
@@ -68,12 +69,29 @@ const HEADER_READ_BYTES: usize = 8192;
 /// headroom for a future layout change without becoming unbounded.
 const MAX_WALK_DEPTH: usize = 8;
 
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        CODEX_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "Codex"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+}
+
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let mut units = Vec::new();
-    identify_sessions(home, "sessions", false, &mut units);
-    identify_sessions(home, "archived_sessions", true, &mut units);
+    identify_sessions(home, "sessions", false, ctx, &mut units);
+    identify_sessions(home, "archived_sessions", true, ctx, &mut units);
     identify_sqlite_stores(home, &mut units);
-    identify_static_categories(home, &mut units);
+    identify_static_categories(home, ctx, &mut units);
     units
 }
 
@@ -83,10 +101,16 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
 // research, so a session's `members` is always exactly the one file.
 // ---------------------------------------------------------------------
 
-fn identify_sessions(home: &Path, subdir: &str, archived: bool, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_sessions(
+    home: &Path,
+    subdir: &str,
+    archived: bool,
+    ctx: &IdentifyCtx,
+    out: &mut Vec<CandidateAgentUnit>,
+) {
     let base = home.join(subdir);
     let mut files = Vec::new();
-    collect_jsonl_files(&base, 0, out.len(), &mut files);
+    collect_jsonl_files(&base, 0, out.len(), ctx, &mut files);
     for jsonl in files {
         let Ok(meta) = fs::symlink_metadata(&jsonl) else {
             continue;
@@ -94,91 +118,85 @@ fn identify_sessions(home: &Path, subdir: &str, archived: bool, out: &mut Vec<Ca
         let bytes = meta.len();
         let mtime = mtime_secs(&meta);
         let project_link = resolve_declared_path(
-            read_header_cwd(&jsonl),
+            read_header_cwd(&jsonl, ctx),
             "no cwd field found in the session's first line",
         );
-        let relative_path = relative_to(home, &jsonl);
-        let note = archived.then(|| {
-            "archived: hidden from the default thread list, but still unique conversation \
-             history -- archiving is not evidence this session is unused"
-                .to_string()
-        });
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Sessions,
-            relative_path,
-            path: jsonl.clone(),
-            members: vec![AgentMember {
+        let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
+            .relative_to(home)
+            .members(vec![AgentMember {
                 path: jsonl,
                 bytes,
                 kind: AgentMemberKind::Transcript,
-            }],
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link,
-            action: AgentActionCapability::SessionRemoval,
-            note,
-        });
+            }])
+            .mtime_max(mtime)
+            .project_link(project_link)
+            .action(AgentActionCapability::SessionRemoval);
+        if archived {
+            unit = unit.note(
+                "archived: hidden from the default thread list, but still unique conversation \
+                 history -- archiving is not evidence this session is unused",
+            );
+        }
+        out.push(unit.build());
     }
 }
 
-/// Bounded recursive `*.jsonl` collection under `dir`, depth- and
-/// entry-count-bounded like `super::folded_bytes`. `already_seen` is the
-/// running count from earlier calls in the same `identify()` pass so
-/// `sessions/` and `archived_sessions/` share one overall bound rather
+/// Bounded recursive `*.jsonl` collection under `dir`, one explicit
+/// level at a time through the shared capped listing (`IdentifyCtx::list`
+/// never follows a symlink and never recurses on its own), depth- and
+/// entry-count-bounded like `IdentifyCtx::folded_bytes`. `already_seen`
+/// is the running count from earlier calls in the same `identify()` pass
+/// so `sessions/` and `archived_sessions/` share one overall bound rather
 /// than each independently allowing the full `MAX_FOLD_ENTRIES`.
-fn collect_jsonl_files(dir: &Path, depth: usize, already_seen: usize, out: &mut Vec<PathBuf>) {
+fn collect_jsonl_files(
+    dir: &Path,
+    depth: usize,
+    already_seen: usize,
+    ctx: &IdentifyCtx,
+    out: &mut Vec<PathBuf>,
+) {
     if depth > MAX_WALK_DEPTH || already_seen + out.len() > MAX_FOLD_ENTRIES {
         return;
     }
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
+    for entry in ctx.list(dir) {
         if already_seen + out.len() > MAX_FOLD_ENTRIES {
             return;
         }
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() && !ft.is_symlink() {
-            collect_jsonl_files(&path, depth + 1, already_seen, out);
-        } else if ft.is_file()
-            && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-"))
-        {
+        let path = dir.join(&entry.name);
+        if entry.is_dir {
+            collect_jsonl_files(&path, depth + 1, already_seen, ctx, out);
+        } else if entry.name.ends_with(".jsonl") && entry.name.starts_with("rollout-") {
             out.push(path);
         }
     }
 }
 
-fn read_header_cwd(path: &Path) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; HEADER_READ_BYTES];
-    let n = f.read(&mut buf).ok()?;
-    buf.truncate(n);
-    let text = String::from_utf8_lossy(&buf);
-    let first_line = text.lines().next()?;
-    let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
-    // Undocumented, version-varying envelope shape (see module doc
-    // comment): try the plausible nestings in order, first match wins.
-    for candidate in [
-        value.get("cwd"),
-        value.get("meta").and_then(|m| m.get("cwd")),
-        value.get("payload").and_then(|p| {
-            p.get("cwd")
-                .or_else(|| p.get("meta").and_then(|m| m.get("cwd")))
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(s) = candidate.as_str().filter(|s| !s.is_empty()) {
-            return Some(s.to_string());
+/// The session's declared `cwd`, derived once per `(size, mtime,
+/// adapter version)` through the identification cache: an unchanged
+/// home costs zero header bytes on a second pass.
+fn read_header_cwd(path: &Path, ctx: &IdentifyCtx) -> Option<String> {
+    ctx.derived(CODEX_TOOL_ID, "cwd", path, HEADER_READ_BYTES, &|text| {
+        let first_line = text.lines().next()?;
+        let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
+        // Undocumented, version-varying envelope shape (see module doc
+        // comment): try the plausible nestings in order, first match wins.
+        for candidate in [
+            value.get("cwd"),
+            value.get("meta").and_then(|m| m.get("cwd")),
+            value.get("payload").and_then(|p| {
+                p.get("cwd")
+                    .or_else(|| p.get("meta").and_then(|m| m.get("cwd")))
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(s) = candidate.as_str().filter(|s| !s.is_empty()) {
+                return Some(s.to_string());
+            }
         }
-    }
-    None
+        None
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -252,23 +270,21 @@ fn identify_sqlite_stores(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
                 });
             }
         }
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Sessions,
-            relative_path: store.filename.to_string(),
-            path,
-            members,
-            bytes,
-            mtime_max,
-            protected: true,
-            protect_reason: Some(format!(
-                "SQLite {} (never opened while Codex may be writing; metadata-only, no \
-                 per-row drill-down in this chunk)",
-                store.purpose
-            )),
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: None,
-        });
+        out.push(
+            AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, path)
+                .relative_path(store.filename)
+                .bytes(bytes)
+                .members_keep_bytes(members)
+                .mtime_max(mtime_max)
+                .project_link(ProjectLinkState::NotApplicable)
+                .action(AgentActionCapability::None)
+                .protect(format!(
+                    "SQLite {} (never opened while Codex may be writing; metadata-only, no \
+                     per-row drill-down in this chunk)",
+                    store.purpose
+                ))
+                .build(),
+        );
     }
 }
 
@@ -327,7 +343,7 @@ const STATIC_ENTRIES: &[StaticEntry] = &[
     },
 ];
 
-fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let mut seen_top_level: HashSet<String> = HashSet::new();
     for entry in STATIC_ENTRIES {
         seen_top_level.insert(entry.rel.to_string());
@@ -335,7 +351,7 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         if !path.exists() {
             continue;
         }
-        let (bytes, mtime, truncated) = folded_bytes(&path, MAX_FOLD_ENTRIES);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
         let note = if truncated {
             format!(
                 "{} (directory entry count bound reached; total may be an undercount)",
@@ -344,77 +360,67 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         } else {
             entry.note.to_string()
         };
-        out.push(CandidateAgentUnit {
-            category: entry.category,
-            relative_path: entry.rel.to_string(),
-            path,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: entry.protected,
-            protect_reason: entry.protected.then(|| entry.note.to_string()),
-            project_link: ProjectLinkState::NotApplicable,
-            action: entry.action,
-            note: Some(note),
-        });
+        let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, entry.category, path)
+            .relative_path(entry.rel)
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(ProjectLinkState::NotApplicable)
+            .action(entry.action)
+            .note(note);
+        if entry.protected {
+            unit = unit.protect(entry.note);
+        }
+        out.push(unit.build());
     }
     for store in SQLITE_STORES {
         seen_top_level.insert(store.filename.to_string());
     }
 
-    let Ok(rd) = fs::read_dir(home) else { return };
     let mut residual_bytes = 0u64;
     let mut residual_mtime = 0u64;
     let mut residual_names: Vec<String> = Vec::new();
-    for e in rd.flatten() {
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
+    for e in ctx.list(home) {
+        let name = e.name;
         if name == "sessions" || name == "archived_sessions" || seen_top_level.contains(&name) {
             continue;
         }
-        let (bytes, mtime, _truncated) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let (bytes, mtime, _truncated) = ctx.folded_bytes(&home.join(&name), MAX_FOLD_ENTRIES);
         residual_bytes += bytes;
         residual_mtime = residual_mtime.max(mtime);
         residual_names.push(name);
     }
     if !residual_names.is_empty() {
         residual_names.sort();
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Unclassified,
-            relative_path: "(unclassified residual)".to_string(),
-            path: home.to_path_buf(),
-            members: Vec::new(),
-            bytes: residual_bytes,
-            mtime_max: residual_mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: Some(format!(
+        out.push(
+            AgentUnitBuilder::new(
+                CODEX_TOOL_ID,
+                AgentCategory::Unclassified,
+                home.to_path_buf(),
+            )
+            .relative_path("(unclassified residual)")
+            .bytes(residual_bytes)
+            .mtime_max(residual_mtime)
+            .project_link(ProjectLinkState::NotApplicable)
+            .action(AgentActionCapability::None)
+            .note(format!(
                 "entries with no specific rule in this adapter: {}",
                 residual_names.join(", ")
-            )),
-        });
+            ))
+            .build(),
+        );
     }
-}
-
-fn relative_to(home: &Path, path: &Path) -> String {
-    path.strip_prefix(home)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -430,7 +436,7 @@ mod tests {
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(identify(dir.path(), 1).is_empty());
+        assert!(run(dir.path()).is_empty());
     }
 
     #[test]
@@ -446,7 +452,7 @@ mod tests {
             &jsonl,
             header_line(&repo.display().to_string(), canary).as_bytes(),
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let session = units
             .iter()
             .find(|u| u.category == AgentCategory::Sessions && u.path == jsonl)
@@ -462,6 +468,39 @@ mod tests {
     }
 
     #[test]
+    fn the_envelope_nesting_around_cwd_is_not_pinned_to_one_shape() {
+        // The tolerance the module doc records: `cwd`, `meta.cwd`,
+        // `payload.cwd` and `payload.meta.cwd` all resolve, and anything
+        // else is `Unresolved` rather than a guess.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().join("declared-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.display().to_string();
+        for (i, header) in [
+            format!("{{\"cwd\":\"{cwd}\"}}"),
+            format!("{{\"meta\":{{\"cwd\":\"{cwd}\"}}}}"),
+            format!("{{\"payload\":{{\"cwd\":\"{cwd}\"}}}}"),
+            format!("{{\"payload\":{{\"meta\":{{\"cwd\":\"{cwd}\"}}}}}}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let home = tempfile::tempdir().unwrap();
+            let jsonl = home
+                .path()
+                .join(format!("sessions/2026/09/21/rollout-shape-{i}.jsonl"));
+            touch(&jsonl, format!("{header}\nbody\n").as_bytes());
+            let units = run(home.path());
+            let session = units.iter().find(|u| u.path == jsonl).unwrap();
+            assert!(
+                matches!(session.project_link, ProjectLinkState::Linked { .. }),
+                "shape {i} ({header}) must still resolve: {:?}",
+                session.project_link
+            );
+        }
+    }
+
+    #[test]
     fn archived_sessions_are_identified_with_an_explicit_note() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
@@ -469,7 +508,7 @@ mod tests {
             "archived_sessions/2026/01/02/rollout-2026-01-02T00-00-00-22222222-2222-4222-8222-222222222222.jsonl",
         );
         touch(&jsonl, header_line("/nonexistent", "x").as_bytes());
-        let units = identify(home, 1);
+        let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(session.note.as_deref().unwrap().contains("archived"));
     }
@@ -480,7 +519,7 @@ mod tests {
         let home = home.path();
         let jsonl = home.join("sessions/2026/01/01/rollout-2026-01-01T00-00-00-x.jsonl");
         touch(&jsonl, b"not valid json");
-        let units = identify(home, 1);
+        let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
             session.project_link,
@@ -495,7 +534,7 @@ mod tests {
         touch(&home.join("state_5.sqlite"), b"sqlite-bytes");
         touch(&home.join("state_5.sqlite-wal"), b"wal-bytes");
         touch(&home.join("state_5.sqlite-shm"), b"shm-bytes");
-        let units = identify(home, 1);
+        let units = run(home);
         let db = units
             .iter()
             .find(|u| u.relative_path == "state_5.sqlite")
@@ -507,6 +546,12 @@ mod tests {
             db.bytes,
             "sqlite-bytes".len() as u64 + "wal-bytes".len() as u64 + "shm-bytes".len() as u64
         );
+        assert!(
+            db.members
+                .iter()
+                .all(|m| m.kind == AgentMemberKind::Database),
+            "every member of a SQLite store stays a Database member"
+        );
     }
 
     #[test]
@@ -515,7 +560,7 @@ mod tests {
         let home = home.path();
         touch(&home.join("auth.json"), b"[redacted]");
         touch(&home.join("config.toml"), b"[redacted]");
-        let units = identify(home, 1);
+        let units = run(home);
         for rel in ["auth.json", "config.toml"] {
             let u = units.iter().find(|u| u.relative_path == rel).unwrap();
             assert!(u.protected, "{rel} must be protected");
@@ -528,7 +573,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("log").join("codex.log"), b"debug line");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units.iter().find(|u| u.relative_path == "log").unwrap();
         assert!(!u.protected);
         assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
@@ -539,7 +584,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("some-future-file.json"), b"{}");
-        let units = identify(home, 1);
+        let units = run(home);
         let residual = units
             .iter()
             .find(|u| u.relative_path == "(unclassified residual)")
@@ -568,7 +613,7 @@ mod tests {
             touch(&jsonl, content.as_bytes());
         }
         let start = SystemTime::now();
-        let units = identify(home, 1);
+        let units = run(home);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!("[measured] codex identify() over 500 synthetic sessions took {elapsed:?}");
         assert_eq!(
@@ -579,5 +624,157 @@ mod tests {
             500
         );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        // A home holding nothing this adapter has a rule for is reported
+        // as an explicit `(unclassified residual)` row naming what was
+        // found -- never an empty vec, and never re-read as some other
+        // Codex-family layout.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("unrecognised-v9-store.bin"), b"\x00\x01\x02");
+        fs::create_dir_all(home.join("future-layout")).unwrap();
+        touch(&home.join("future-layout/thing.dat"), b"opaque");
+        let units = run(home);
+        assert!(!units.is_empty(), "an unrecognized layout must still speak");
+        let residual = units
+            .iter()
+            .find(|u| u.relative_path == "(unclassified residual)")
+            .expect("an explicit residual row, not silence");
+        assert_eq!(residual.category, AgentCategory::Unclassified);
+        assert_eq!(residual.action, AgentActionCapability::None);
+        let note = residual.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("no specific rule")
+                && note.contains("unrecognised-v9-store.bin")
+                && note.contains("future-layout"),
+            "the residual must name what it could not classify: {note}"
+        );
+        assert!(
+            matches!(residual.project_link, ProjectLinkState::NotApplicable),
+            "an unclassified residual is tool-wide, never linked to a project"
+        );
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-CODEX-DO-NOT-LEAK-7c02";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let jsonl = home.join("sessions/2026/09/21/rollout-2026-09-21T10-00-00-canary.jsonl");
+        // The canary sits on the header line this adapter *does* read
+        // and again in the body it must never reach.
+        let mut content = header_line("/nonexistent", canary);
+        content.push_str(&format!("{{\"role\":\"user\",\"text\":\"{canary}\"}}\n"));
+        content.push_str(&format!("plain body line: {canary}\n"));
+        touch(&jsonl, content.as_bytes());
+        touch(&home.join("history.jsonl"), canary.as_bytes());
+        let units = run(home);
+        assert!(units.iter().any(|u| u.path == jsonl), "session identified");
+        contract::no_content_leak(&units, canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let sessions = 40usize;
+        let per_file = 100_000usize;
+        for i in 0..sessions {
+            let jsonl = home.join(format!("sessions/2026/09/21/rollout-cap-{i}.jsonl"));
+            let mut content = header_line("/nonexistent", "unread");
+            content.push_str(&"x".repeat(per_file));
+            touch(&jsonl, content.as_bytes());
+        }
+        let (units, counters) = contract::measured(|| run(home));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            sessions
+        );
+        // One capped header read per session, and this adapter's own cap
+        // is tighter than the shared ceiling.
+        assert!(
+            counters.header_bytes_read <= (sessions * HEADER_READ_BYTES) as u64,
+            "read {} bytes, above {sessions} x this adapter's {HEADER_READ_BYTES} byte cap",
+            counters.header_bytes_read
+        );
+        assert!(
+            counters.header_bytes_read < (sessions * per_file) as u64,
+            "identification read a transcript's worth of bytes"
+        );
+        const {
+            assert!(
+                HEADER_READ_BYTES <= bounded_io::MAX_HEADER_BYTES,
+                "this adapter's cap must sit under the shared ceiling"
+            )
+        };
+        contract::within_header_cap(counters, sessions as u64);
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("auth.json"), b"[redacted]");
+        touch(&home.join("config.toml"), b"model = \"redacted\"\n");
+        touch(&home.join("skills/mine/SKILL.md"), b"# redacted");
+        touch(&home.join("history.jsonl"), b"{}\n");
+        let units = run(home);
+        contract::protection_defaults_hold(&units);
+        // The two non-default-protected-category units this adapter
+        // still protects on its own judgment keep saying why.
+        let history = units
+            .iter()
+            .find(|u| u.relative_path == "history.jsonl")
+            .expect("history.jsonl identified");
+        assert!(history.protected);
+        assert!(
+            history
+                .protect_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("prompt history")),
+            "the adapter's own protection reason must survive the builder"
+        );
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        // (a) declared metadata naming a real worktree resolves.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().join("declared-worktree");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let declared = home.join("sessions/2026/09/21/rollout-declared.jsonl");
+        touch(
+            &declared,
+            header_line(&repo.display().to_string(), "x").as_bytes(),
+        );
+        // (b) a session sitting in a directory *named* like a project,
+        // declaring nothing, must never become a link.
+        let guessed = home.join("sessions/guessable-project-name/rollout-guessed.jsonl");
+        touch(&guessed, b"not a json header at all\n");
+        let units = run(home);
+        let a = units.iter().find(|u| u.path == declared).unwrap();
+        match &a.project_link {
+            ProjectLinkState::Linked { source, .. } => {
+                assert_eq!(*source, crate::agents::LinkSource::Declared)
+            }
+            other => panic!("declared cwd must link: {other:?}"),
+        }
+        let b = units.iter().find(|u| u.path == guessed).unwrap();
+        assert!(
+            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            "a basename is not evidence: {:?}",
+            b.project_link
+        );
+        contract::linkage_is_declared_or_explicit(&units, "guessable-project-name");
     }
 }

@@ -1,29 +1,36 @@
 //! Pi identification (#96): sessions, protected configuration, and a
 //! locally-installed npm package cache under the home
 //! `crate::locations::pi::PiDetector` resolves. **Distinct tool from Oh
-//! My Pi** (`crate::agents::oh_my_pi`) -- see that detector's sibling
-//! doc comment for the disclosed override-variable collision risk.
+//! My Pi** -- see that detector's sibling doc comment for the disclosed
+//! override-variable collision risk.
 //!
 //! Layout sourced from primary docs during implementation (never a real
 //! `~/.pi` on this machine -- PRIVACY IS A HARD RULE); see
 //! `crate::locations::pi`'s doc comment for citations.
 //!
-//! ## Explicit format/version detection (#96's own instruction: "reuse
-//! the OMP adapter's parsing where formats match, but detect version/
-//! format explicitly")
+//! ## Explicit format detection, and why there is no cross-tool fallback
 //!
-//! Pi's own README documents its session files only as "JSONL files with
-//! a tree structure. Each entry has an `id` and `parentId`" -- it does
-//! **not** document Oh My Pi's 256-byte fixed-width title slot ahead of
-//! the header line (`crate::agents::oh_my_pi`'s own citation). This
-//! adapter therefore tries, per session file, in order:
-//! 1. Parse line 1 (byte offset 0) directly as JSON, looking for a `cwd`
-//!    field -- Pi's own documented shape.
-//! 2. Only if that fails, retry Oh My Pi's title-slot-skip shape (in
-//!    case a particular Pi release shares it, since Oh My Pi is a fork
-//!    of this very package) -- reused, not assumed.
-//! 3. If neither yields a `cwd`, this session's linkage is `Unresolved`,
-//!    naming both shapes checked, never a guess.
+//! Pi's own README documents its session files as "JSONL files with a
+//! tree structure. Each entry has an `id` and `parentId`" -- the header
+//! object is the file's first line, at byte offset 0. This adapter parses
+//! **only** that documented shape, through the neutral mechanics in
+//! `crate::agents::pi_family` (`HeaderLayout::OffsetZero`).
+//!
+//! A session header this adapter cannot parse is reported as an explicit
+//! unknown-format outcome -- `ProjectLinkState::Unresolved` with a reason
+//! naming the shape that was expected, plus a note on the unit -- and a
+//! whole home with none of this tool's content markers is reported as one
+//! explicit unknown-format residual unit. It is **never** retried against
+//! some other tool's header shape.
+//!
+//! That is not caution, it is the guardrail
+//! (`.oh/guardrails/agent-adapters-are-pluggable.md`): an adapter names
+//! no other adapter, because if this adapter understood a sibling tool's
+//! layout, a change to *that* tool's format would silently change *this*
+//! tool's identification -- and a wrong project link is worse than an
+//! honest "unknown format". Genuinely shared mechanics (finding a header
+//! line at a byte offset, pulling a declared `cwd` out of it) live in the
+//! neutral `pi_family` module, which names no tool at all.
 //!
 //! `sessions/` is documented as "organized by working directory" -- this
 //! adapter deliberately does not decode a directory name into a project
@@ -31,21 +38,25 @@
 //! only on each session file's own declared `cwd`.
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes, mtime_secs, resolve_declared_path,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs, pi_family,
+    resolve_declared_path,
 };
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const PI_TOOL_ID: &str = crate::locations::pi::PI_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 const MAX_WALK_DEPTH: usize = 4;
-const HEADER_READ_BYTES: usize = 8192;
-/// Oh My Pi's own fixed-width title slot, tried only as a fallback --
-/// see the module doc comment.
-const TITLE_SLOT_BYTES: usize = 256;
+/// Per-session header read cap. Pi's header is one JSON line at byte
+/// offset 0, so the read never needs a title-slot allowance.
+const HEADER_READ_BYTES: usize = pi_family::HEADER_READ_BYTES;
+
+/// The only layout this tool documents. A single-element list on
+/// purpose: the list is what an adapter is *willing* to accept, and this
+/// one accepts nothing it has no primary source for.
+const ACCEPTED_LAYOUTS: &[pi_family::HeaderLayout] = &[pi_family::HeaderLayout::OffsetZero];
 
 const FORMAT_MARKERS: &[&str] = &[
     "settings.json",
@@ -55,142 +66,126 @@ const FORMAT_MARKERS: &[&str] = &[
     "npm",
 ];
 
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        PI_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "Pi"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+}
+
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     if !home.is_dir() {
         return Vec::new();
     }
     if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
-        return unknown_format_residual(home);
+        return unknown_format_residual(home, ctx);
     }
     let mut units = Vec::new();
-    identify_sessions(home, &mut units);
-    identify_static_categories(home, &mut units);
+    identify_sessions(home, ctx, &mut units);
+    identify_static_categories(home, ctx, &mut units);
     units
 }
 
-fn unknown_format_residual(home: &Path) -> Vec<CandidateAgentUnit> {
-    let has_entries = fs::read_dir(home)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
-    if !has_entries {
+fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+    // A genuinely empty, existing directory (nothing here yet) is not
+    // "unknown format" -- there is simply nothing to classify. Checked by
+    // directory entries, not by the folded byte/mtime pair: an empty
+    // directory's own mtime is non-zero, which would otherwise read as
+    // "something present" and produce a bogus residual unit.
+    if !ctx.has_entries(home) {
         return Vec::new();
     }
-    let (bytes, mtime, _t) = folded_bytes(home, MAX_FOLD_ENTRIES);
-    vec![CandidateAgentUnit {
-        category: AgentCategory::Unclassified,
-        relative_path: "(unknown format)".to_string(),
-        path: home.to_path_buf(),
-        members: Vec::new(),
-        bytes,
-        mtime_max: mtime,
-        protected: false,
-        protect_reason: None,
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: Some(
-            "no Pi content markers found (settings.json/trust.json/models.json/sessions/npm) at \
-             this resolved path; this directory may belong to a different tool, be empty, or use \
-             an unsupported version -- treated as unknown format, not scanned further"
-                .to_string(),
-        ),
-    }]
+    let (bytes, mtime, _t) = ctx.folded_bytes(home, MAX_FOLD_ENTRIES);
+    vec![
+        AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Unclassified, home.to_path_buf())
+            .relative_path("(unknown format)")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::None)
+            .note(
+                "no Pi content markers found (settings.json/trust.json/models.json/sessions/npm) \
+                 at this resolved path; this directory may belong to a different tool, be empty, \
+                 or use an unsupported version -- treated as unknown format, not scanned further",
+            )
+            .build(),
+    ]
 }
 
-fn identify_sessions(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("sessions");
     let mut files = Vec::new();
-    collect_files(&base, 0, &mut files);
+    collect_files(&base, 0, ctx, &mut files);
     for jsonl in files {
         let Ok(meta) = fs::symlink_metadata(&jsonl) else {
             continue;
         };
         let bytes = meta.len();
         let mtime = mtime_secs(&meta);
-        let project_link = resolve_session_link(&jsonl);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Sessions,
-            relative_path: relative_to(home, &jsonl),
-            path: jsonl.clone(),
-            members: vec![AgentMember {
+        let header = pi_family::derived_header(
+            ctx,
+            PI_TOOL_ID,
+            "session-cwd",
+            &jsonl,
+            HEADER_READ_BYTES,
+            ACCEPTED_LAYOUTS,
+        );
+        let unknown_format = header.is_empty();
+        let project_link = resolve_declared_path(
+            header.cwd,
+            &pi_family::no_layout_matched_reason(ACCEPTED_LAYOUTS),
+        );
+        let mut unit = AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
+            .relative_to(home)
+            .members(vec![AgentMember {
                 path: jsonl,
                 bytes,
                 kind: AgentMemberKind::Transcript,
-            }],
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link,
-            action: AgentActionCapability::SessionRemoval,
-            note: None,
-        });
+            }])
+            .mtime_max(mtime)
+            .project_link(project_link)
+            .action(AgentActionCapability::SessionRemoval);
+        if unknown_format {
+            // Explicit, not silent: this session's header is not in the
+            // shape Pi documents, and this adapter says so rather than
+            // retrying another tool's shape.
+            unit = unit.note(
+                "unknown-format session header: not parseable as a JSON header at byte offset 0 \
+                 (Pi's own documented shape); another tool's header shape is deliberately never \
+                 tried here, so this session's project linkage stays unresolved",
+            );
+        }
+        out.push(unit.build());
     }
 }
 
-fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
     if depth > MAX_WALK_DEPTH || out.len() > MAX_FOLD_ENTRIES {
         return;
     }
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
+    for entry in ctx.list(dir) {
         if out.len() > MAX_FOLD_ENTRIES {
             return;
         }
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() && !ft.is_symlink() {
-            collect_files(&path, depth + 1, out);
-        } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        let path = dir.join(&entry.name);
+        if entry.is_dir {
+            collect_files(&path, depth + 1, ctx, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
     }
 }
 
-fn cwd_from_json_line(line: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    value
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// Tries Pi's own documented shape (line 1 at offset 0) first, then Oh
-/// My Pi's title-slot-skip shape as a fallback -- see the module doc
-/// comment. Returns which shape (if either) matched, for the honest
-/// `Unresolved` reason when neither does.
-fn resolve_session_link(path: &Path) -> ProjectLinkState {
-    let Ok(mut f) = fs::File::open(path) else {
-        return resolve_declared_path(None, "could not open session file to read its header");
-    };
-    let mut buf = vec![0u8; TITLE_SLOT_BYTES + HEADER_READ_BYTES];
-    let Ok(n) = f.read(&mut buf) else {
-        return resolve_declared_path(None, "could not read session file header");
-    };
-    buf.truncate(n);
-    let text = String::from_utf8_lossy(&buf);
-
-    if let Some(first_line) = text.lines().next()
-        && let Some(cwd) = cwd_from_json_line(first_line)
-    {
-        return resolve_declared_path(Some(cwd), "");
-    }
-    if n > TITLE_SLOT_BYTES {
-        let after_title = String::from_utf8_lossy(&buf[TITLE_SLOT_BYTES..]);
-        if let Some(header_line) = after_title.lines().next()
-            && let Some(cwd) = cwd_from_json_line(header_line)
-        {
-            return resolve_declared_path(Some(cwd), "");
-        }
-    }
-    resolve_declared_path(
-        None,
-        "no cwd field found at byte offset 0 (Pi's own documented shape) or after Oh My Pi's \
-         256-byte title slot (checked as a fallback)",
-    )
-}
-
-fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for (rel, note) in [
         ("settings.json", "main configuration"),
         ("trust.json", "per-project trust decisions"),
@@ -200,44 +195,35 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         if let Ok(meta) = fs::symlink_metadata(&path)
             && meta.is_file()
         {
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::ProtectedConfig,
-                relative_path: rel.to_string(),
-                path,
-                members: Vec::new(),
-                bytes: meta.len(),
-                mtime_max: mtime_secs(&meta),
-                protected: true,
-                protect_reason: Some(note.to_string()),
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: None,
-            });
+            out.push(
+                AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::ProtectedConfig, path)
+                    .relative_path(rel)
+                    .bytes(meta.len())
+                    .mtime_max(mtime_secs(&meta))
+                    .protect(note)
+                    .action(AgentActionCapability::None)
+                    .build(),
+            );
         }
     }
 
     let npm = home.join("npm");
     if npm.is_dir() {
-        let (bytes, mtime, truncated) = folded_bytes(&npm, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Caches,
-            relative_path: "npm".to_string(),
-            path: npm,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::CacheOrLogTrash,
-            note: Some(if truncated {
-                "user-scoped npm package installs, reinstallable; directory entry count bound \
-                 reached"
-                    .to_string()
-            } else {
-                "user-scoped npm package installs, reinstallable".to_string()
-            }),
-        });
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&npm, MAX_FOLD_ENTRIES);
+        out.push(
+            AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Caches, npm)
+                .relative_path("npm")
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .action(AgentActionCapability::CacheOrLogTrash)
+                .note(if truncated {
+                    "user-scoped npm package installs, reinstallable; directory entry count bound \
+                     reached"
+                } else {
+                    "user-scoped npm package installs, reinstallable"
+                })
+                .build(),
+        );
     }
 
     let seen: std::collections::HashSet<&str> = [
@@ -249,76 +235,85 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
     ]
     .into_iter()
     .collect();
-    let Ok(rd) = fs::read_dir(home) else { return };
     let mut residual_bytes = 0u64;
     let mut residual_mtime = 0u64;
     let mut residual_names: Vec<String> = Vec::new();
-    for e in rd.flatten() {
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if seen.contains(name.as_str()) {
+    for entry in ctx.list(home) {
+        if seen.contains(entry.name.as_str()) {
             continue;
         }
-        let (bytes, mtime, _t) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let (bytes, mtime, _t) = ctx.folded_bytes(&home.join(&entry.name), MAX_FOLD_ENTRIES);
         residual_bytes += bytes;
         residual_mtime = residual_mtime.max(mtime);
-        residual_names.push(name);
+        residual_names.push(entry.name);
     }
     if !residual_names.is_empty() {
         residual_names.sort();
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Unclassified,
-            relative_path: "(unclassified residual)".to_string(),
-            path: home.to_path_buf(),
-            members: Vec::new(),
-            bytes: residual_bytes,
-            mtime_max: residual_mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: Some(format!(
-                "entries with no specific rule in this adapter: {}",
-                residual_names.join(", ")
-            )),
-        });
+        out.push(
+            AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Unclassified, home.to_path_buf())
+                .relative_path("(unclassified residual)")
+                .bytes(residual_bytes)
+                .mtime_max(residual_mtime)
+                .action(AgentActionCapability::None)
+                .note(format!(
+                    "entries with no specific rule in this adapter: {}",
+                    residual_names.join(", ")
+                ))
+                .build(),
+        );
     }
-}
-
-fn relative_to(home: &Path, path: &Path) -> String {
-    path.strip_prefix(home)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, ProjectLinkState, bounded_io, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
     }
 
+    /// A session file in Pi's own documented shape: the JSON header is
+    /// line 1, at byte offset 0.
+    fn pi_session_bytes(cwd: &str, canary: &str) -> Vec<u8> {
+        format!(
+            "{{\"id\":\"1\",\"parentId\":null,\"cwd\":\"{cwd}\"}}\n\
+             {{\"id\":\"2\",\"parentId\":\"1\",\"content\":\"{canary}\"}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// A session file in the *sibling* fork's shape: a 256-byte title
+    /// slot ahead of the header line. Pi does not document this, so this
+    /// adapter must treat it as unknown format -- never parse it.
+    fn title_slot_session_bytes(cwd: &str) -> Vec<u8> {
+        let mut title = vec![b' '; 256];
+        let title_json = b"{\"type\":\"title\"}";
+        title[..title_json.len()].copy_from_slice(title_json);
+        title[255] = b'\n';
+        let mut out = title;
+        out.extend_from_slice(format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n").as_bytes());
+        out
+    }
+
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(identify(dir.path(), 1).is_empty());
+        assert!(run(dir.path()).is_empty());
     }
 
     #[test]
     fn no_markers_yields_unknown_format_not_a_guess() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("unrelated.txt"), b"hello");
-        let units = identify(dir.path(), 1);
+        let units = run(dir.path());
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].relative_path, "(unknown format)");
     }
@@ -334,13 +329,9 @@ mod tests {
         let jsonl = home.join("sessions/-fixture-repo/1700000000.jsonl");
         touch(
             &jsonl,
-            format!(
-                "{{\"id\":\"1\",\"parentId\":null,\"cwd\":\"{}\"}}\n{{\"id\":\"2\",\"parentId\":\"1\",\"content\":\"{canary}\"}}\n",
-                repo.display()
-            )
-            .as_bytes(),
+            &pi_session_bytes(&repo.display().to_string(), canary),
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let session = units
             .iter()
             .find(|u| u.category == AgentCategory::Sessions)
@@ -354,46 +345,34 @@ mod tests {
         assert!(!serialized.contains(canary), "content leaked");
     }
 
+    /// Replaces the former `session_falls_back_to_the_omp_title_slot_shape`
+    /// test, which asserted exactly the cross-adapter knowledge the
+    /// pluggability guardrail forbids: a file in the sibling fork's shape
+    /// must come back as an explicit unknown format, not as a link.
     #[test]
-    fn session_falls_back_to_the_omp_title_slot_shape() {
+    fn a_sibling_forks_header_shape_is_unknown_format_here_not_a_link() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("settings.json"), b"{}");
         let repo = home.join("fixture-repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
-        let mut title = vec![b' '; 256];
-        let title_json = b"{\"type\":\"title\"}";
-        title[..title_json.len()].copy_from_slice(title_json);
-        title[255] = b'\n';
-        let header = format!("{{\"type\":\"session\",\"cwd\":\"{}\"}}\n", repo.display());
-        let mut body = title;
-        body.extend_from_slice(header.as_bytes());
         let jsonl = home.join("sessions/x/1.jsonl");
-        touch(&jsonl, &body);
-        let units = identify(home, 1);
-        let session = units
-            .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
-            .expect("session identified via fallback shape");
-        assert!(matches!(
-            session.project_link,
-            ProjectLinkState::Linked { .. }
-        ));
-    }
-
-    #[test]
-    fn session_with_neither_shape_is_unresolved_not_guessed() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path();
-        touch(&home.join("settings.json"), b"{}");
-        let jsonl = home.join("sessions/x/1.jsonl");
-        touch(&jsonl, b"not a session header at all\n");
-        let units = identify(home, 1);
+        touch(
+            &jsonl,
+            &title_slot_session_bytes(&repo.display().to_string()),
+        );
+        let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
-        assert!(matches!(
-            session.project_link,
-            ProjectLinkState::Unresolved { .. }
-        ));
+        assert!(
+            matches!(session.project_link, ProjectLinkState::Unresolved { .. }),
+            "a shape this tool does not document must not resolve a project: {:?}",
+            session.project_link
+        );
+        let note = session.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("unknown-format session header"),
+            "the unknown format must be stated on the unit: {note}"
+        );
     }
 
     #[test]
@@ -401,7 +380,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("npm/pkg/index.js"), b"module.exports = {}");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units.iter().find(|u| u.relative_path == "npm").unwrap();
         assert!(!u.protected);
         assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
@@ -414,15 +393,11 @@ mod tests {
         touch(&home.join("settings.json"), b"{}");
         touch(&home.join("trust.json"), b"{}");
         touch(&home.join("models.json"), b"{}");
-        let units = identify(home, 1);
+        let units = run(home);
         for rel in ["settings.json", "trust.json", "models.json"] {
-            assert!(
-                units
-                    .iter()
-                    .find(|u| u.relative_path == rel)
-                    .unwrap()
-                    .protected
-            );
+            let u = units.iter().find(|u| u.relative_path == rel).unwrap();
+            assert!(u.protected);
+            assert!(u.protect_reason.is_some());
         }
     }
 
@@ -441,7 +416,7 @@ mod tests {
             touch(&jsonl, &body);
         }
         let start = SystemTime::now();
-        let units = identify(home, 1);
+        let units = run(home);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!("[measured] pi identify() over 500 synthetic sessions took {elapsed:?}");
         assert_eq!(
@@ -452,5 +427,164 @@ mod tests {
             500
         );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        // (a) a whole home with none of this tool's markers: one
+        // explicit unknown-format unit, never an empty vec.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("unrelated.txt"), b"hello");
+        let units = run(dir.path());
+        assert_eq!(units.len(), 1, "an unrecognized home must still surface");
+        assert_eq!(units[0].relative_path, "(unknown format)");
+        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert!(
+            units[0]
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown format")
+        );
+
+        // (b) a session header in no shape this tool documents: an
+        // explicit unresolved linkage with a stated reason, never a
+        // retry against another tool's shape.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        let jsonl = home.join("sessions/x/1.jsonl");
+        touch(&jsonl, b"not a session header at all\n");
+        let units = run(home);
+        let session = units.iter().find(|u| u.path == jsonl).unwrap();
+        match &session.project_link {
+            ProjectLinkState::Unresolved { reason } => {
+                assert!(
+                    reason.contains("byte offset 0"),
+                    "the reason must name the shape that was expected: {reason}"
+                );
+                assert!(
+                    !reason.contains("title slot"),
+                    "this adapter must not claim to have checked another tool's shape: {reason}"
+                );
+            }
+            other => panic!("expected an explicit unresolved outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-PI-BODY-DO-NOT-LEAK-9d4e";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        // On the first line (which this adapter *does* read) and in the
+        // body (which it never reads).
+        let jsonl = home.join("sessions/x/1.jsonl");
+        touch(
+            &jsonl,
+            format!(
+                "{{\"id\":\"1\",\"cwd\":\"/no/such/dir\",\"title\":\"{canary}\"}}\n\
+                 {{\"id\":\"2\",\"content\":\"{canary}\"}}\n"
+            )
+            .as_bytes(),
+        );
+        contract::no_content_leak(&run(home), canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        let mut fixture_bytes = 0u64;
+        for i in 0..20 {
+            let jsonl = home.join(format!("sessions/x/{i}.jsonl"));
+            let mut body = b"{\"id\":\"1\",\"cwd\":\"/no/such/dir\"}\n".to_vec();
+            body.extend_from_slice(&b"x".repeat(100_000));
+            fixture_bytes += body.len() as u64;
+            touch(&jsonl, &body);
+        }
+        let (units, counters) = contract::measured(|| run(home));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            20
+        );
+        // One capped header read per session, and nothing else.
+        contract::within_header_cap(counters, 20);
+        assert!(
+            counters.header_bytes_read <= 20 * HEADER_READ_BYTES as u64,
+            "read {} bytes, above this adapter's own per-session cap",
+            counters.header_bytes_read
+        );
+        assert!(
+            counters.header_bytes_read < fixture_bytes,
+            "identification read {} of {fixture_bytes} fixture bytes",
+            counters.header_bytes_read
+        );
+        const { assert!(HEADER_READ_BYTES <= bounded_io::MAX_HEADER_BYTES) };
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        touch(&home.join("trust.json"), b"{}");
+        touch(&home.join("npm/pkg/index.js"), b"{}");
+        let units = run(home);
+        contract::protection_defaults_hold(&units);
+        let settings = units
+            .iter()
+            .find(|u| u.relative_path == "settings.json")
+            .unwrap();
+        assert_eq!(settings.category, AgentCategory::ProtectedConfig);
+        assert_eq!(
+            settings.protect_reason.as_deref(),
+            Some("main configuration"),
+            "the adapter's own, more specific reason survives the builder default"
+        );
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        // (a) declared metadata naming a real worktree resolves Linked.
+        let repo = home.join("declared-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let declared = home.join("sessions/-declared-repo/1.jsonl");
+        touch(
+            &declared,
+            &pi_session_bytes(&repo.display().to_string(), "body"),
+        );
+        // (b) a session sitting in a directory *named* after a real
+        // worktree, declaring nothing: unresolved, never linked.
+        let guessable = home.join("guessable-repo");
+        fs::create_dir_all(guessable.join(".git")).unwrap();
+        let undeclared = home.join("sessions/guessable-repo/2.jsonl");
+        touch(&undeclared, b"{\"id\":\"1\",\"parentId\":null}\n");
+
+        let units = run(home);
+        let a = units.iter().find(|u| u.path == declared).unwrap();
+        match &a.project_link {
+            ProjectLinkState::Linked { source, .. } => {
+                assert_eq!(*source, crate::agents::LinkSource::Declared)
+            }
+            other => panic!("declared cwd must link: {other:?}"),
+        }
+        let b = units.iter().find(|u| u.path == undeclared).unwrap();
+        assert!(
+            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            "a directory name is not evidence: {:?}",
+            b.project_link
+        );
+        contract::linkage_is_declared_or_explicit(&units, "guessable-repo");
     }
 }

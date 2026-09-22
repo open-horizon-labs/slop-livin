@@ -41,16 +41,23 @@ const ALL_TOOL_DETECTORS: &[&str] = &[
 ];
 
 fn only_detector(id: &str) -> ScanConfig {
+    // An unknown id would authorize nothing and leave the fixture
+    // passing vacuously, so the allow-list entry is checked against the
+    // catalog this file enumerates.
+    assert!(
+        ALL_TOOL_DETECTORS.contains(&id),
+        "{id:?} is not one of this file's tool detector ids"
+    );
     ScanConfig {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: ["cargo-home", "rustup", "homebrew"]
-            .into_iter()
-            .chain(ALL_TOOL_DETECTORS.iter().copied().filter(|d| *d != id))
-            .map(str::to_string)
-            .collect(),
-        enabled_detectors: Vec::new(),
+        // Allow-list of exactly the tool under test. The previous
+        // deny-list named every *other* tool detector and left the rest
+        // of the catalog running, including core_simulator, whose
+        // absolute system path ignores the fixture home.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec![id.to_string()],
     }
 }
 
@@ -256,8 +263,13 @@ fn aider_disabled_detector_turns_off_both_home_and_repo_units() {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
+        // Deliberately both: `aider` is the only detector this scope
+        // would consider, and it is explicitly disabled -- which is the
+        // whole point of this test. Bounding the allow-list as well
+        // keeps a fixture from reaching any other detector's absolute
+        // system paths.
         disabled_detectors: vec!["aider".to_string()],
-        enabled_detectors: Vec::new(),
+        enabled_detectors: vec!["aider".to_string()],
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

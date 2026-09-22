@@ -362,30 +362,12 @@ fn plan_scope_drift_refuses_at_execute_for_claude_code() {
             defaults: false,
             include: Vec::new(),
             exclude: Vec::new(),
-            disabled_detectors: [
-                "cargo-home",
-                "rustup",
-                "homebrew",
-                "claude-code",
-                "codex",
-                "codex-desktop",
-                "oh-my-pi",
-                "opencode",
-                "gemini-cli",
-                "pi",
-                "aider",
-                "github-copilot-cli",
-                "cursor",
-                "windsurf",
-                "cline",
-                "roo-code",
-                "continue",
-            ]
-            .into_iter()
-            .filter(|d| *d != id)
-            .map(str::to_string)
-            .collect(),
-            enabled_detectors: Vec::new(),
+            // An allow-list: see the note in
+            // `agent_storage_validation.rs::only`. A deny-list of the
+            // agent detectors left `core-simulator`, `homebrew` and
+            // `ruby-install` reaching real machine-wide paths.
+            disabled_detectors: Vec::new(),
+            enabled_detectors: vec![id.to_string()],
         }
     }
 

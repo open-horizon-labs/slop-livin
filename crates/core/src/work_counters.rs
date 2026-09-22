@@ -8,18 +8,33 @@
 //! `crates/core/tests/incremental_external_and_agent_measurement.rs`
 //! does exactly that.
 //!
-//! Relaxed atomics behind the existing trace seam: incrementing three
-//! `AtomicU64`s per directory listing is far below the cost of the
-//! listing itself, and nothing reads them except tests and
-//! `swamp report --json`'s optional work block.
+//! The counters are **per thread**. They were process-global
+//! `AtomicU64`s, which made every assertion in this crate's own tests a
+//! race: `cargo test` runs the lib tests in parallel threads, so one
+//! adapter's `header_bytes_read == 0` could be falsified by a different
+//! adapter's fixture reading a header at the same moment. An
+//! intermittently wrong measurement is worse than no measurement.
+//!
+//! Per-thread is also the *right* scope for what these measure:
+//! identification, folded measurement and the bounded listings all run
+//! on the caller's own thread, and a caller asking "what did my pass
+//! cost" means its own pass. Incrementing a `Cell<u64>` is cheaper than
+//! an atomic, and nothing reads these except tests and `swamp report
+//! --json`'s optional work block.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
-static DIRS_LISTED: AtomicU64 = AtomicU64::new(0);
-static FILES_STATTED: AtomicU64 = AtomicU64::new(0);
-static HEADER_BYTES: AtomicU64 = AtomicU64::new(0);
-static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static DIRS_LISTED: Cell<u64> = const { Cell::new(0) };
+    static FILES_STATTED: Cell<u64> = const { Cell::new(0) };
+    static HEADER_BYTES: Cell<u64> = const { Cell::new(0) };
+    static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
+    static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn add(counter: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
+    counter.with(|c| c.set(c.get().saturating_add(n)));
+}
 
 /// A snapshot of the work counters, for a test or a `--json` work block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -32,43 +47,47 @@ pub struct WorkCounters {
 }
 
 pub fn record_dir_listed() {
-    DIRS_LISTED.fetch_add(1, Ordering::Relaxed);
+    add(&DIRS_LISTED, 1);
 }
 
 pub fn record_files_statted(n: u64) {
-    FILES_STATTED.fetch_add(n, Ordering::Relaxed);
+    add(&FILES_STATTED, n);
 }
 
 pub fn record_header_bytes(n: u64) {
-    HEADER_BYTES.fetch_add(n, Ordering::Relaxed);
+    add(&HEADER_BYTES, n);
 }
 
 pub fn record_cache_hit() {
-    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    add(&CACHE_HITS, 1);
 }
 
 pub fn record_cache_miss() {
-    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    add(&CACHE_MISSES, 1);
 }
 
 pub fn snapshot() -> WorkCounters {
     WorkCounters {
-        dirs_listed: DIRS_LISTED.load(Ordering::Relaxed),
-        files_statted: FILES_STATTED.load(Ordering::Relaxed),
-        header_bytes_read: HEADER_BYTES.load(Ordering::Relaxed),
-        identification_cache_hits: CACHE_HITS.load(Ordering::Relaxed),
-        identification_cache_misses: CACHE_MISSES.load(Ordering::Relaxed),
+        dirs_listed: DIRS_LISTED.with(Cell::get),
+        files_statted: FILES_STATTED.with(Cell::get),
+        header_bytes_read: HEADER_BYTES.with(Cell::get),
+        identification_cache_hits: CACHE_HITS.with(Cell::get),
+        identification_cache_misses: CACHE_MISSES.with(Cell::get),
     }
 }
 
-/// Zeroes every counter. Tests call this immediately before the pass
-/// they are measuring; nothing in production resets them.
+/// Zeroes this thread's counters. Tests call this immediately before the
+/// pass they are measuring; nothing in production resets them.
 pub fn reset() {
-    DIRS_LISTED.store(0, Ordering::Relaxed);
-    FILES_STATTED.store(0, Ordering::Relaxed);
-    HEADER_BYTES.store(0, Ordering::Relaxed);
-    CACHE_HITS.store(0, Ordering::Relaxed);
-    CACHE_MISSES.store(0, Ordering::Relaxed);
+    for c in [
+        &DIRS_LISTED,
+        &FILES_STATTED,
+        &HEADER_BYTES,
+        &CACHE_HITS,
+        &CACHE_MISSES,
+    ] {
+        c.with(|c| c.set(0));
+    }
 }
 
 /// The work done between `before` and now.

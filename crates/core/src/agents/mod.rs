@@ -53,6 +53,7 @@ pub mod oh_my_pi;
 pub mod opencode;
 pub mod pi;
 pub mod pi_family;
+pub mod registry;
 pub mod roo_code;
 pub mod vscode_family;
 pub mod windsurf;
@@ -313,6 +314,453 @@ pub struct CandidateAgentUnit {
     pub note: Option<String>,
 }
 
+// ---------------------------------------------------------------------
+// The adapter interface (guardrail spec sections 13/14).
+//
+// Before this, `identify_for_tool` was a fourteen-arm `match tool_id`
+// here and a second, independently maintained fourteen-arm match in
+// `crate::actions`; `multi_location_tool` hardcoded two tool ids; Aider
+// had a bespoke call path; and `pi.rs` fell back to Oh My Pi's header
+// shape. Adding a tool meant editing four places and hoping. The
+// location detectors already had the right shape (`locations::Detector`
+// + a static registry), so this mirrors it exactly.
+// ---------------------------------------------------------------------
+
+/// One entry of a bounded, single-level directory listing, as an adapter
+/// sees it. Deliberately a type of this module rather than
+/// `locations::ShallowEntry`: an adapter knows the home it is handed and
+/// nothing about detectors
+/// (`.oh/guardrails/agent-adapters-do-not-reach-detectors.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Bumped whenever an adapter's header parsing changes what a derived
+/// value *means*, so a value cached by an older binary is never trusted.
+/// Part of every identification-cache fingerprint.
+pub const ADAPTER_VERSION: &str = "2026-09-21.1";
+
+/// The memo that makes an unchanged observation cost zero header reads.
+///
+/// An adapter derives a small fact from a session header (the declared
+/// `cwd`, a workspace path, a format marker). Re-deriving it means
+/// re-reading the header, which on a 5,000-session home is 5,000 capped
+/// reads on *every* pass -- the gap the previous repair measured and
+/// left open. The value is cached against the source file's own
+/// `(size, mtime)` plus [`ADAPTER_VERSION`], so an unchanged file is a
+/// lookup, a changed one is read exactly once, and a rewritten file can
+/// never serve a stale answer.
+///
+/// [`IdentificationCache::disabled`] is the execution-time form: it
+/// never reads or writes the table, so a recheck always re-derives from
+/// the live filesystem. A plan is never spent against a cached
+/// derivation.
+pub struct IdentificationCache {
+    entries: std::cell::RefCell<HashMap<String, crate::assoc_store::CachedRows>>,
+    enabled: bool,
+}
+
+impl IdentificationCache {
+    /// No cache at all: every derivation reads live. Used by
+    /// `reidentify` at every execution sink, and by callers with no
+    /// store.
+    pub fn disabled() -> Self {
+        Self {
+            entries: std::cell::RefCell::new(HashMap::new()),
+            enabled: false,
+        }
+    }
+
+    pub fn load(swamp_dir: &Path) -> Self {
+        Self {
+            entries: std::cell::RefCell::new(
+                crate::assoc_store::IdentificationTable::open(swamp_dir).load(),
+            ),
+            enabled: true,
+        }
+    }
+
+    pub fn save(&self, swamp_dir: &Path, observed_at: u64) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        crate::assoc_store::IdentificationTable::open(swamp_dir)
+            .save(&self.entries.borrow(), observed_at)
+    }
+}
+
+/// The identity a cached derivation is valid for.
+///
+/// **Not just `(size, mtime_secs)`.** Two independent adversarial passes
+/// over this cache found the same hole with the same shape: rewriting a
+/// session's declared `cwd` to a path of the *same length* within the
+/// same wall-clock second left size and whole-second mtime unchanged, so
+/// the stale answer was served and a re-linked session never moved. A
+/// cache that cannot see a same-second, same-size rewrite is a cache that
+/// silently lies, and the only reason the unit tests missed it is that
+/// they slept a second first.
+///
+/// So the fingerprint carries, where the platform has them:
+///
+/// * `len` -- the obvious one;
+/// * the modification time in **nanoseconds**, not seconds;
+/// * `ctime` in nanoseconds -- the inode change time, which moves on a
+///   rename-over even when the content's mtime is preserved; and
+/// * the inode number -- a replaced file is a different file, whatever
+///   its timestamps say.
+///
+/// Plus [`ADAPTER_VERSION`], so a derivation whose *meaning* changed is
+/// never answered from a value computed by an older binary.
+///
+/// None of this costs a read: it is all in the `stat` the caller already
+/// needed.
+fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
+    let mut parts = vec![
+        (format!("{ADAPTER_VERSION}\u{2}len"), meta.len()),
+        (
+            "mtime_ns".to_string(),
+            meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        parts.push((
+            "ctime_ns".to_string(),
+            (meta.ctime() as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec() as u64),
+        ));
+        parts.push(("ino".to_string(), meta.ino()));
+    }
+    parts
+}
+
+/// Everything an adapter is allowed to see and do during identification.
+///
+/// It carries the folded/listing primitives (so no adapter calls
+/// `read_dir`), the one capped content reader (so no adapter calls
+/// `read_to_string`), and the identification cache (so an unchanged
+/// session is never re-read). An adapter that wants a fact it cannot get
+/// from here is asking for a capability the guardrails deny.
+pub struct IdentifyCtx<'a> {
+    observed_at: u64,
+    cache: &'a IdentificationCache,
+}
+
+impl<'a> IdentifyCtx<'a> {
+    pub fn new(observed_at: u64, cache: &'a IdentificationCache) -> Self {
+        Self { observed_at, cache }
+    }
+
+    pub fn observed_at(&self) -> u64 {
+        self.observed_at
+    }
+
+    /// One bounded, single-level, symlink-refusing listing. Sorted, so
+    /// identification output does not depend on directory order.
+    pub fn list(&self, dir: &Path) -> Vec<Entry> {
+        crate::locations::shallow_list(dir)
+            .into_iter()
+            .map(|e| Entry {
+                name: e.name,
+                is_dir: e.is_dir,
+            })
+            .collect()
+    }
+
+    pub fn dir_names(&self, dir: &Path) -> Vec<String> {
+        self.list(dir)
+            .into_iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name)
+            .collect()
+    }
+
+    pub fn file_names(&self, dir: &Path) -> Vec<String> {
+        self.list(dir)
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.name)
+            .collect()
+    }
+
+    /// Whether `dir` holds anything at all -- the "is this home empty or
+    /// merely unrecognized" question several adapters ask before
+    /// reporting an unknown-format residual.
+    pub fn has_entries(&self, dir: &Path) -> bool {
+        !self.list(dir).is_empty()
+    }
+
+    pub fn folded_bytes(&self, path: &Path, max_entries: usize) -> (u64, u64, bool) {
+        crate::folded_measurement::folded_bytes_bounded(path, max_entries)
+    }
+
+    /// An uncached capped header read. Prefer [`IdentifyCtx::derived`]:
+    /// this one costs its bytes on every pass.
+    pub fn read_header(&self, path: &Path, max_bytes: usize) -> Option<String> {
+        bounded_io::read_header(path, max_bytes)
+    }
+
+    /// A value derived from `path`'s capped header, read at most once
+    /// per `(size, mtime, adapter version)`.
+    ///
+    /// `kind` names the derivation, so two facts taken from the same file
+    /// do not collide. `derive` receives the header text and returns the
+    /// value, or `None` for "this file genuinely declares nothing" --
+    /// which is itself cached, or an absent field would be re-read
+    /// forever.
+    pub fn derived(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        path: &Path,
+        max_bytes: usize,
+        derive: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return None;
+        };
+        let fingerprint = crate::assoc_store::fingerprint_string(&file_fingerprint(&meta));
+        let key = format!("{adapter_id}\u{1}{kind}\u{1}{}", path.display());
+        if self.cache.enabled {
+            let entries = self.cache.entries.borrow();
+            if let Some(hit) = entries.get(&key)
+                && hit.fingerprint == fingerprint
+            {
+                crate::work_counters::record_cache_hit();
+                return hit.rows.first().and_then(|r| r.first()).cloned();
+            }
+        }
+        crate::work_counters::record_cache_miss();
+        let value = bounded_io::read_header(path, max_bytes).and_then(|text| derive(&text));
+        if self.cache.enabled {
+            self.cache.entries.borrow_mut().insert(
+                key,
+                crate::assoc_store::CachedRows {
+                    fingerprint,
+                    // An absent value is stored as a fingerprint-only
+                    // row, which `assoc_store` already round-trips as
+                    // "this key genuinely has nothing".
+                    rows: value.iter().map(|v| vec![v.clone()]).collect(),
+                },
+            );
+        }
+        value
+    }
+
+    /// The first line of a derived header value's source, the shape most
+    /// adapters actually parse.
+    pub fn derived_line(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        path: &Path,
+        max_bytes: usize,
+        derive: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        self.derived(adapter_id, kind, path, max_bytes, &|text| {
+            derive(text.lines().next().unwrap_or(""))
+        })
+    }
+}
+
+/// What an adapter's storage *shape* requires of the shared layer.
+/// Declared by the adapter rather than matched on its id, so the shared
+/// layer never grows a second table of tool ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdapterCapabilities {
+    /// This tool's storage can be installed into more than one editor
+    /// host at once (#99's "model each host as a separate detector
+    /// location, dedupe nothing that is genuinely separate storage"), so
+    /// *every* authorized location is decomposed rather than only the
+    /// first. Was `multi_location_tool`'s hardcoded Cline/Roo match.
+    pub decomposes_every_location: bool,
+    /// This tool keeps units inside each project checkout rather than
+    /// under a tool home (Aider's `.aider.chat.history.md` and friends),
+    /// so the shared layer also calls
+    /// [`AgentAdapter::project_local_units`] once per known worktree.
+    pub project_local_units: bool,
+}
+
+/// One tool's identification code. Copy the smallest adapter
+/// (`cursor.rs`) for the pattern; `docs/architecture.md` has the worked
+/// description.
+///
+/// An adapter names no other adapter, reads no file outside
+/// [`IdentifyCtx`], never acts, and never emits -- each of those is a
+/// separate audit, not a convention.
+pub trait AgentAdapter: Send + Sync {
+    /// Stable id, equal to this tool's detector id and to its
+    /// `matrix::AgentToolId::slug()`.
+    fn id(&self) -> &'static str;
+    fn name(&self) -> &'static str;
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    /// Identify this tool's units inside `home`.
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit>;
+    /// Re-identify for an execution-time recheck. The default is
+    /// [`AgentAdapter::identify`] with whatever context it is given --
+    /// and the sink always hands it an
+    /// [`IdentificationCache::disabled`] one, so a recheck reads live
+    /// state and an approval is never spent against a cached
+    /// derivation.
+    fn reidentify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        self.identify(home, ctx)
+    }
+    /// Units that live inside one project checkout rather than under a
+    /// tool home. Called only when
+    /// [`AdapterCapabilities::project_local_units`] is set.
+    fn project_local_units(
+        &self,
+        _worktree_root: &Path,
+        _ctx: &IdentifyCtx,
+    ) -> Vec<CandidateAgentUnit> {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------
+// AgentUnitBuilder: protected-by-default is a constructor, not a habit
+// ---------------------------------------------------------------------
+
+/// The only way an adapter builds a unit
+/// (`.oh/guardrails/agent-units-built-through-builder.md`).
+///
+/// A `CandidateAgentUnit { .. }` literal has to spell out `protected`
+/// and `protect_reason`, which means a new adapter can silently ship a
+/// credentials file with `protected: false` and nothing notices. The
+/// constructor applies [`AgentCategory::default_protected`] instead, and
+/// lifting it requires [`AgentUnitBuilder::unprotect_with_reason`] --
+/// visible in review, and in the diff.
+pub struct AgentUnitBuilder {
+    unit: CandidateAgentUnit,
+}
+
+impl AgentUnitBuilder {
+    pub fn new(_tool_id: &str, category: AgentCategory, path: PathBuf) -> Self {
+        let (protected, protect_reason) = if category.default_protected() {
+            (
+                true,
+                Some(format!(
+                    "{} is protected by default (credentials/config/skills/automation)",
+                    category.label()
+                )),
+            )
+        } else {
+            (false, None)
+        };
+        let relative_path = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Self {
+            unit: CandidateAgentUnit {
+                category,
+                relative_path,
+                path,
+                members: Vec::new(),
+                bytes: 0,
+                mtime_max: 0,
+                protected,
+                protect_reason,
+                project_link: ProjectLinkState::NotApplicable,
+                action: AgentActionCapability::None,
+                note: None,
+            },
+        }
+    }
+
+    /// Sets `relative_path` from this unit's path relative to `home`,
+    /// forward-slashed.
+    pub fn relative_to(mut self, home: &Path) -> Self {
+        self.unit.relative_path = relative_to(home, &self.unit.path);
+        self
+    }
+
+    pub fn relative_path(mut self, rel: impl Into<String>) -> Self {
+        self.unit.relative_path = rel.into();
+        self
+    }
+
+    pub fn bytes(mut self, bytes: u64) -> Self {
+        self.unit.bytes = bytes;
+        self
+    }
+
+    pub fn mtime_max(mut self, mtime: u64) -> Self {
+        self.unit.mtime_max = mtime;
+        self
+    }
+
+    /// Sets the member list and derives `bytes` from it.
+    pub fn members(mut self, members: Vec<AgentMember>) -> Self {
+        self.unit.bytes = members.iter().map(|m| m.bytes).sum();
+        self.unit.members = members;
+        self
+    }
+
+    /// Sets the member list without touching an explicitly set byte
+    /// total (a folded category unit whose members are a subset).
+    pub fn members_keep_bytes(mut self, members: Vec<AgentMember>) -> Self {
+        self.unit.members = members;
+        self
+    }
+
+    pub fn project_link(mut self, link: ProjectLinkState) -> Self {
+        self.unit.project_link = link;
+        self
+    }
+
+    pub fn action(mut self, action: AgentActionCapability) -> Self {
+        self.unit.action = action;
+        self
+    }
+
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.unit.note = Some(note.into());
+        self
+    }
+
+    /// Protects this unit for a stated reason, on top of whatever its
+    /// category already implies.
+    pub fn protect(mut self, reason: impl Into<String>) -> Self {
+        self.unit.protected = true;
+        self.unit.protect_reason = Some(reason.into());
+        self
+    }
+
+    /// Lifts a category's default protection. Deliberately noisy: a
+    /// reason is required and the audit records every use.
+    pub fn unprotect_with_reason(mut self, reason: &str) -> Self {
+        self.unit.protected = false;
+        self.unit.protect_reason = Some(format!("default protection lifted: {reason}"));
+        self
+    }
+
+    pub fn build(self) -> CandidateAgentUnit {
+        self.unit
+    }
+}
+
+/// `path` relative to `home`, forward-slashed; the whole path if it is
+/// not beneath `home`.
+pub fn relative_to(home: &Path, path: &Path) -> String {
+    path.strip_prefix(home)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn unit_id(tool_id: &str, category: AgentCategory, relative_path: &str) -> String {
     crate::entities::id_for(&format!(
         "agent-unit:v1:{tool_id}:{}:{relative_path}",
@@ -342,60 +790,17 @@ pub(crate) fn device_of(path: &Path) -> u64 {
     }
 }
 
-/// Bounded, stat-only folded byte total for `path` (file or directory),
-/// deliberately *not* `crate::walk::resize_artifact`'s parallel-pool
-/// machinery: that machinery is tuned for a handful of potentially huge
-/// artifact roots, not hundreds of small per-session directories, and
-/// spinning up its thread pool that many times would itself be the
-/// "unacceptable scanning cost" #91 guards against. Reads directory
-/// names and `stat` calls only -- never file contents. Bounded by
-/// `max_entries`; a directory that hits the bound is reported truncated
-/// rather than silently under-measured.
+/// Bounded, stat-only folded byte total for `path`, delegating to
+/// `crate::folded_measurement` -- the one module on the ordinary report
+/// path allowed to traverse. Adapters reach it through
+/// [`IdentifyCtx::folded_bytes`]; this alias exists for the shared layer
+/// and for `crate::actions`' own member sizing.
 pub fn folded_bytes(path: &Path, max_entries: usize) -> (u64, u64, bool) {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return (0, 0, false);
-    };
-    if meta.is_file() {
-        let mtime = mtime_secs(&meta);
-        return (meta.len(), mtime, false);
-    }
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return (0, 0, false);
-    }
-    let mut total = 0u64;
-    let mut mtime_max = mtime_secs(&meta);
-    let mut stack = vec![path.to_path_buf()];
-    let mut seen = 0usize;
-    let mut truncated = false;
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else { continue };
-        for entry in rd.flatten() {
-            seen += 1;
-            if seen > max_entries {
-                truncated = true;
-                break;
-            }
-            let Ok(m) = entry.metadata() else { continue };
-            mtime_max = mtime_max.max(mtime_secs(&m));
-            if m.is_dir() && !m.file_type().is_symlink() {
-                stack.push(entry.path());
-            } else if m.is_file() {
-                total += m.len();
-            }
-        }
-        if truncated {
-            break;
-        }
-    }
-    (total, mtime_max, truncated)
+    crate::folded_measurement::folded_bytes_bounded(path, max_entries)
 }
 
 pub(crate) fn mtime_secs(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::folded_measurement::mtime_secs(meta)
 }
 
 // ---------------------------------------------------------------------
@@ -604,8 +1009,19 @@ pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
     load_protect(swamp_dir)
 }
 
-/// Whether human keep/protect intent covers `candidate` in **either**
-/// direction (`.oh/guardrails/protection-fails-closed.md`):
+/// The reason human keep/protect intent blocks `candidate`, or `None`.
+///
+/// **The only** protection predicate in the crate. There used to be a
+/// second, `is_human_protected`, which returned a bare `bool` by
+/// delegating here -- and that was how a one-directional mutation
+/// survived: the audit inspected this function, while
+/// `actions::propose_checking_protection` called the boolean wrapper,
+/// and no test proposed an ordinary directory *containing* a protected
+/// descendant. One predicate, everywhere, so there is nothing to
+/// inspect the wrong one of
+/// (`.oh/guardrails/protection-fails-closed.md`).
+///
+/// It covers `candidate` in **both** directions:
 ///
 /// * `candidate` is the protected path or lies beneath it -- the
 ///   original, obvious direction; and
@@ -615,14 +1031,9 @@ pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
 ///   removing `debug/` destroys exactly what the human asked to keep, so
 ///   a unit *containing* a protected path is protected too.
 ///
-/// A one-directional check is a guardrail violation the
+/// The returned string carries which direction matched, so a refusal can
+/// say *why*. A one-directional check is a guardrail violation the
 /// `protection_fails_closed` audit rejects.
-pub fn is_human_protected(protected: &[PathBuf], candidate: &Path) -> bool {
-    protection_conflict(protected, candidate).is_some()
-}
-
-/// The reason human keep/protect intent blocks `candidate`, or `None`.
-/// Carries which direction matched so a refusal can say *why*.
 pub fn protection_conflict(protected: &[PathBuf], candidate: &Path) -> Option<String> {
     for p in protected {
         if candidate == p {
@@ -660,49 +1071,6 @@ pub fn is_active(path: &Path) -> bool {
 // Discovery orchestration
 // ---------------------------------------------------------------------
 
-/// Every tool this chunk implements identification for. Extending this
-/// list is how a future adapter (#93-#99) plugs in; see
-/// `crate::agents::matrix` for the full required-tool matrix, including
-/// the tools with no entry here yet.
-fn identify_for_tool(
-    tool_id: &str,
-    home: &Path,
-    observed_at: u64,
-) -> Option<Vec<CandidateAgentUnit>> {
-    match tool_id {
-        claude_code::CLAUDE_CODE_TOOL_ID => Some(claude_code::identify(home, observed_at)),
-        codex::CODEX_TOOL_ID => Some(codex::identify(home, observed_at)),
-        codex_desktop::CODEX_DESKTOP_TOOL_ID => Some(codex_desktop::identify(home, observed_at)),
-        oh_my_pi::OH_MY_PI_TOOL_ID => Some(oh_my_pi::identify(home, observed_at)),
-        opencode::OPENCODE_TOOL_ID => Some(opencode::identify(home, observed_at)),
-        gemini_cli::GEMINI_CLI_TOOL_ID => Some(gemini_cli::identify(home, observed_at)),
-        pi::PI_TOOL_ID => Some(pi::identify(home, observed_at)),
-        // aider::AIDER_TOOL_ID is dispatched here too (home-level caches/
-        // only); its per-repo units come from a separate code path -- see
-        // `discover_and_measure`'s `project_worktrees` handling below.
-        aider::AIDER_TOOL_ID => Some(aider::identify(home, observed_at)),
-        copilot_cli::COPILOT_CLI_TOOL_ID => Some(copilot_cli::identify(home, observed_at)),
-        cursor::CURSOR_TOOL_ID => Some(cursor::identify(home, observed_at)),
-        windsurf::WINDSURF_TOOL_ID => Some(windsurf::identify(home, observed_at)),
-        cline::CLINE_TOOL_ID => Some(cline::identify(home, observed_at)),
-        roo_code::ROO_CODE_TOOL_ID => Some(roo_code::identify(home, observed_at)),
-        continue_dev::CONTINUE_TOOL_ID => Some(continue_dev::identify(home, observed_at)),
-        _ => None,
-    }
-}
-
-/// Tool ids whose storage can be installed into more than one editor
-/// host at once (#99's explicit "model each host as a separate detector
-/// location, dedupe nothing that is genuinely separate storage"):
-/// `discover_and_measure` decomposes *every* `Resolved` location this
-/// detector proposes, not just the first, unlike every other tool in
-/// this catalog (including the multi-location `opencode`/`copilot-cli`/
-/// `cursor`/`windsurf` detectors, whose secondary locations are
-/// deliberately *not* decomposed -- see each one's own doc comment).
-fn multi_location_tool(tool_id: &str) -> bool {
-    matches!(tool_id, cline::CLINE_TOOL_ID | roo_code::ROO_CODE_TOOL_ID)
-}
-
 /// Every tool home the *authorized* scope lets this pass identify, as
 /// `(tool_id, home)`.
 ///
@@ -713,14 +1081,21 @@ fn multi_location_tool(tool_id: &str) -> bool {
 /// `crate::scope` interprets detector output now
 /// (`.oh/guardrails/discovery-consumes-effective-scope.md`).
 ///
-/// A tool whose storage can live in several editor hosts at once
-/// (`multi_location_tool`) contributes every authorized location; every
-/// other tool contributes its first, matching the pre-existing contract.
-fn authorized_tool_homes(scope: &EffectiveScope) -> Vec<(String, PathBuf)> {
+/// A tool whose adapter declares
+/// [`AdapterCapabilities::decomposes_every_location`] contributes every
+/// authorized location; every other tool contributes its first, matching
+/// the pre-existing contract. That used to be a hardcoded id match here.
+fn authorized_tool_homes(
+    scope: &EffectiveScope,
+    registry: &registry::Registry,
+) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     let mut seen_single: HashSet<String> = HashSet::new();
     let mut push = |tool_id: String, path: PathBuf, out: &mut Vec<(String, PathBuf)>| {
-        if multi_location_tool(&tool_id) {
+        let every = registry
+            .get(&tool_id)
+            .is_some_and(|a| a.capabilities().decomposes_every_location);
+        if every {
             if !out.iter().any(|(t, p)| t == &tool_id && p == &path) {
                 out.push((tool_id, path));
             }
@@ -792,15 +1167,27 @@ pub fn discover_and_measure(
     let mut observed: Vec<ObservedExternal> = Vec::new();
     let mut covered_roots: Vec<PathBuf> = Vec::new();
 
+    let adapters = registry::Registry::with_builtins();
+    // The identification cache is the reason an unchanged pass costs
+    // zero header reads. Without a store there is nowhere to keep it, so
+    // it is disabled and every derivation reads live -- correct, just not
+    // free.
+    let cache = match swamp_dir {
+        Some(dir) => IdentificationCache::load(dir),
+        None => IdentificationCache::disabled(),
+    };
+    let ctx = IdentifyCtx::new(observed_at, &cache);
+
     // Authorized scope only: a tool home the user excluded, or whose
     // detector is disabled, or that lies outside an explicit command
     // root, is not discovered at all
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
-    for (tool_id, home) in authorized_tool_homes(scope) {
+    for (tool_id, home) in authorized_tool_homes(scope, &adapters) {
         let tool_name = tool_name_for(&tool_id, scope);
-        let Some(units) = identify_for_tool(&tool_id, &home, observed_at) else {
+        let Some(adapter) = adapters.get(&tool_id) else {
             continue;
         };
+        let units = adapter.identify(&home, &ctx);
         covered_roots.push(home.clone());
         let device = device_of(&home);
         for cand in units {
@@ -818,29 +1205,36 @@ pub fn discover_and_measure(
         }
     }
 
-    // Aider's per-repo units (#96): materially different shape from
+    // Project-local units (#96, Aider): materially different shape from
     // every other tool in this catalog -- attached to each *known
     // project worktree root* the caller supplies, never derived from a
-    // `crate::locations` detector home. Skipped entirely when the
-    // `aider` detector itself is disabled, so disabling a detector
-    // always turns off everything it would otherwise identify, home-
-    // level or project-local alike.
+    // `crate::locations` detector home. Which adapters have them is the
+    // adapter's own declared capability, not a tool-id match here.
     //
-    // "Enabled" is now decided by the authorized scope, not by reading
-    // the detector's own status: an excluded Aider home, a disabled
-    // detector, or an explicit-root invocation that does not reach it
-    // all mean the same thing here -- no Aider units.
-    let aider_enabled = scope.detector_enabled(aider::AIDER_TOOL_ID);
-    if aider_enabled {
-        let tool_name = tool_name_for(aider::AIDER_TOOL_ID, scope);
+    // Skipped entirely when the tool's detector is disabled, so
+    // disabling a detector always turns off everything it would
+    // otherwise identify, home-level or project-local alike. "Enabled"
+    // is decided by the authorized scope, not by reading the detector's
+    // own status: an excluded home, a disabled detector, or an
+    // explicit-root invocation that does not reach it all mean the same
+    // thing here -- no units.
+    for adapter in adapters.adapters() {
+        if !adapter.capabilities().project_local_units {
+            continue;
+        }
+        let tool_id = adapter.id();
+        if !scope.detector_enabled(tool_id) {
+            continue;
+        }
+        let tool_name = tool_name_for(tool_id, scope);
         for wt_path in project_worktrees {
             covered_roots.push(wt_path.clone());
             let device = device_of(wt_path);
-            for cand in aider::identify_repo_units(wt_path, observed_at) {
-                let key = unit_key(aider::AIDER_TOOL_ID, cand.category, device, &cand.path);
+            for cand in adapter.project_local_units(wt_path, &ctx) {
+                let key = unit_key(tool_id, cand.category, device, &cand.path);
                 observed.push(ObservedExternal {
                     key: key.clone(),
-                    detector_id: aider::AIDER_TOOL_ID.to_string(),
+                    detector_id: tool_id.to_string(),
                     category: cand.category.key_str(),
                     device,
                     path: cand.path.display().to_string(),
@@ -850,6 +1244,15 @@ pub fn discover_and_measure(
                 candidates_by_key.insert(key, (tool_name.clone(), wt_path.clone(), cand, device));
             }
         }
+    }
+
+    // The cache is persisted on the same terms as the growth history:
+    // `observe: false` is a read-only annotation pass and leaves the
+    // store untouched.
+    if let Some(dir) = swamp_dir
+        && observe
+    {
+        cache.save(dir, observed_at)?;
     }
 
     // This observation owns only agent-family rows, and only under the
@@ -877,7 +1280,36 @@ pub fn discover_and_measure(
     };
 
     let mut units = Vec::with_capacity(candidates_by_key.len());
-    for (key, (tool_name, tool_home, cand, _device)) in candidates_by_key {
+    for (key, (tool_name, tool_home, mut cand, _device)) in candidates_by_key {
+        // Extract the detector_id back out of the key rather than
+        // threading it separately; the key's first field always is it.
+        let tool_id = key.split('\u{1}').next().unwrap_or_default().to_string();
+        // An `Unverified` tool is one whose modeled layout this catalog
+        // could not confirm against that tool's own source or
+        // documentation (`crate::agents::matrix`). Identification still
+        // runs -- knowing roughly where the bytes are is useful -- but
+        // nothing is offered: no action, and no project linkage, because
+        // both would be claims resting on the layout we just said we
+        // could not verify. One place, so it cannot be forgotten in an
+        // adapter (`docs/agent-storage.md`'s support matrix).
+        if matrix::support_for(&tool_id) == Some(matrix::SupportLevel::Unverified) {
+            cand.action = AgentActionCapability::None;
+            if !matches!(cand.project_link, ProjectLinkState::NotApplicable) {
+                cand.project_link = ProjectLinkState::Unresolved {
+                    reason: format!(
+                        "{tool_name}'s storage layout is not confirmed against its own source or \
+                         documentation (support level: unverified), so a project link would rest \
+                         on an unverified layout"
+                    ),
+                };
+            }
+            let why = "support level: unverified -- this tool's layout could not be confirmed \
+                       against its own source or documentation, so no action is offered";
+            cand.note = Some(match cand.note.take() {
+                Some(n) => format!("{n}; {why}"),
+                None => why.to_string(),
+            });
+        }
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
         let default_protected = cand.category.default_protected();
         // Both directions (`protection_conflict`): a unit beneath a
@@ -907,9 +1339,6 @@ pub fn discover_and_measure(
         } else {
             (false, None)
         };
-        // Extract the detector_id back out of the key rather than
-        // threading it separately; the key's first field always is it.
-        let tool_id = key.split('\u{1}').next().unwrap_or_default().to_string();
         // Activity evidence (#54): the adapter already recorded
         // `mtime_max` while folding this unit's members; turn it into
         // the shared contract's fact rather than a second stat pass.
@@ -944,15 +1373,440 @@ pub fn discover_and_measure(
     Ok(units)
 }
 
+/// Re-identifies `tool_id`'s units under `home` from the **live**
+/// filesystem, for an execution-time recheck.
+///
+/// The cache is [`IdentificationCache::disabled`], so nothing here can
+/// be answered from a previous pass: an approval is spent against what
+/// is on disk now, which is the whole point of a recheck
+/// (`.oh/guardrails/execution-sinks-recheck-live-state.md`). An adapter
+/// whose storage is project-local is re-identified against the worktree
+/// root the plan recorded as its `tool_home`, exactly as it was
+/// identified.
+///
+/// Replaces the second fourteen-arm `match tool_id` that used to live in
+/// `crate::actions`, which could (and did) drift from the first.
+pub fn reidentify_for_tool(
+    tool_id: &str,
+    home: &Path,
+    observed_at: u64,
+) -> Option<Vec<CandidateAgentUnit>> {
+    let registry = registry::Registry::with_builtins();
+    let adapter = registry.get(tool_id)?;
+    let cache = IdentificationCache::disabled();
+    let ctx = IdentifyCtx::new(observed_at, &cache);
+    let caps = adapter.capabilities();
+    let mut units = adapter.reidentify(home, &ctx);
+    if caps.project_local_units {
+        // The plan recorded the worktree root as `tool_home` for a
+        // project-local unit, so the same path serves both halves.
+        units.extend(adapter.project_local_units(home, &ctx));
+    }
+    Some(units)
+}
+
 /// Sum of every unit's bytes, for a tool/category total. Counted once
 /// per unit regardless of member count (mirrors `external::total_bytes`).
 pub fn total_bytes(units: &[AgentUnit]) -> u64 {
     units.iter().map(|u| u.bytes).sum()
 }
 
+/// The shared assertions behind every adapter's five required tests
+/// (`.oh/guardrails/agent-adapter-test-contract.md`). They live here so
+/// the *contract* is one reviewed implementation rather than fifteen
+/// near-copies that can each drift, and so a new adapter's five tests
+/// cannot be satisfied by five empty function bodies.
+#[cfg(test)]
+pub(crate) mod contract {
+    use super::*;
+
+    /// Runs `identify` and returns what it produced plus the work it
+    /// did, so a test can assert on bytes read rather than trusting a
+    /// comment.
+    pub fn measured<T>(f: impl FnOnce() -> T) -> (T, crate::work_counters::WorkCounters) {
+        let before = crate::work_counters::snapshot();
+        let out = f();
+        (out, crate::work_counters::since(before))
+    }
+
+    /// Every unit in a default-protected category arrives protected, and
+    /// carries a stated reason. This is what `AgentUnitBuilder::new`
+    /// guarantees and what a `CandidateAgentUnit { .. }` literal could
+    /// silently omit.
+    pub fn protection_defaults_hold(units: &[CandidateAgentUnit]) {
+        let mut checked = 0usize;
+        for u in units {
+            if u.category.default_protected() {
+                checked += 1;
+                assert!(
+                    u.protected,
+                    "{} is in the default-protected category {} and arrived unprotected",
+                    u.relative_path,
+                    u.category.label()
+                );
+                assert!(
+                    u.protect_reason.is_some(),
+                    "{} is protected with no stated reason",
+                    u.relative_path
+                );
+            }
+            if u.protected {
+                assert_ne!(
+                    u.action,
+                    AgentActionCapability::SessionRemoval,
+                    "{} is protected yet offers session removal",
+                    u.relative_path
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "this fixture produced no default-protected unit, so the assertion proved nothing; \
+             give the fixture a config/credentials file, or state in the test why this adapter \
+             has none"
+        );
+    }
+
+    /// The form of [`protection_defaults_hold`] for an adapter that
+    /// genuinely models no default-protected category (a log directory,
+    /// an editor profile whose config lives elsewhere). It asserts that
+    /// claim rather than assuming it, checks every *individually*
+    /// protected unit still carries a reason and offers no session
+    /// removal, and then exercises the builder's own guarantee through
+    /// `tool_id`'s construction path so the test is never vacuous.
+    pub fn protection_defaults_hold_with_no_protected_category(
+        units: &[CandidateAgentUnit],
+        tool_id: &str,
+    ) {
+        for u in units {
+            assert!(
+                !u.category.default_protected(),
+                "{} is in the default-protected category {}, so this adapter does have one and \
+                 should use `protection_defaults_hold`",
+                u.relative_path,
+                u.category.label()
+            );
+            if u.protected {
+                assert!(
+                    u.protect_reason.is_some(),
+                    "{} is protected with no stated reason",
+                    u.relative_path
+                );
+                assert_ne!(
+                    u.action,
+                    AgentActionCapability::SessionRemoval,
+                    "{} is protected yet offers session removal",
+                    u.relative_path
+                );
+            }
+        }
+        let built = AgentUnitBuilder::new(
+            tool_id,
+            AgentCategory::ProtectedConfig,
+            PathBuf::from("/nonexistent/fixture/credentials.json"),
+        )
+        .build();
+        protection_defaults_hold(&[built]);
+    }
+
+    /// No field of any unit carries file *content*. The fixture seeds a
+    /// canary into a session body; identification may read a header and
+    /// must never carry it out.
+    pub fn no_content_leak(units: &[CandidateAgentUnit], canary: &str) {
+        let debug = format!("{units:?}");
+        assert!(
+            !debug.contains(canary),
+            "content leaked into an AgentUnit field: {debug}"
+        );
+        for u in units {
+            let json = serde_json::to_string(&super::AgentUnit {
+                tool_id: "t".into(),
+                tool_name: "t".into(),
+                tool_home: PathBuf::from("/"),
+                category: u.category,
+                id: "id".into(),
+                relative_path: u.relative_path.clone(),
+                path: u.path.clone(),
+                members: u.members.clone(),
+                bytes: u.bytes,
+                hardlinked: true,
+                growth_bytes: None,
+                regrowth_count: 0,
+                observed_at: 0,
+                mtime_max: u.mtime_max,
+                protected: u.protected,
+                protect_reason: u.protect_reason.clone(),
+                project_link: u.project_link.clone(),
+                action: u.action,
+                note: u.note.clone(),
+                evidence: Vec::new(),
+            })
+            .expect("serialize");
+            assert!(!json.contains(canary), "content leaked into JSON: {json}");
+        }
+    }
+
+    /// Project linkage is either read from metadata the tool itself
+    /// wrote, or explicitly unresolved. `forbidden` is a string that
+    /// appears only in a *directory or file name* of the fixture, never
+    /// in declared metadata: a `Linked`/`NotAProject` state naming it
+    /// means the adapter guessed from a basename.
+    pub fn linkage_is_declared_or_explicit(units: &[CandidateAgentUnit], forbidden: &str) {
+        for u in units {
+            match &u.project_link {
+                ProjectLinkState::Linked { source, .. } => {
+                    assert_eq!(
+                        *source,
+                        LinkSource::Declared,
+                        "{} claims a link from something other than declared metadata",
+                        u.relative_path
+                    );
+                }
+                ProjectLinkState::Unresolved { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{} is Unresolved with no stated reason",
+                        u.relative_path
+                    );
+                }
+                _ => {}
+            }
+            let rendered = format!("{:?}", u.project_link);
+            assert!(
+                !rendered.contains(forbidden),
+                "{} resolved a project from the basename {forbidden:?}: {rendered}",
+                u.relative_path
+            );
+        }
+    }
+
+    /// Identification read no more than `reads` capped headers' worth of
+    /// content. The bound is the shared cap, which is what makes "we
+    /// never read a transcript" a number instead of a promise.
+    pub fn within_header_cap(counters: crate::work_counters::WorkCounters, reads: u64) {
+        let cap = reads * bounded_io::MAX_HEADER_BYTES as u64;
+        assert!(
+            counters.header_bytes_read <= cap,
+            "identification read {} bytes, above {reads} x the {} byte cap",
+            counters.header_bytes_read,
+            bounded_io::MAX_HEADER_BYTES
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_builder_protects_a_config_category_without_being_asked() {
+        // The whole point of the builder: a literal can omit
+        // `protected`, a constructor cannot.
+        let u = AgentUnitBuilder::new(
+            "t",
+            AgentCategory::ProtectedConfig,
+            PathBuf::from("/home/.credentials.json"),
+        )
+        .build();
+        assert!(u.protected);
+        assert!(u.protect_reason.is_some());
+        let c =
+            AgentUnitBuilder::new("t", AgentCategory::Caches, PathBuf::from("/home/cache")).build();
+        assert!(!c.protected);
+    }
+
+    #[test]
+    fn lifting_a_default_protection_records_a_reason() {
+        let u = AgentUnitBuilder::new(
+            "t",
+            AgentCategory::ProtectedConfig,
+            PathBuf::from("/home/x"),
+        )
+        .unprotect_with_reason("fixture")
+        .build();
+        assert!(!u.protected);
+        assert!(
+            u.protect_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("fixture")),
+            "an unprotect must leave its reason behind"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_is_derived_once_and_then_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        std::fs::write(&f, b"{\"cwd\":\"/x\"}\nBODY\n").unwrap();
+        let cache = IdentificationCache::disabled();
+        // Disabled: every call reads.
+        let ctx = IdentifyCtx::new(1, &cache);
+        let before = crate::work_counters::snapshot();
+        for _ in 0..3 {
+            assert_eq!(
+                ctx.derived("t", "cwd", &f, 4096, &|s| Some(
+                    s.lines().next()?.to_string()
+                )),
+                Some("{\"cwd\":\"/x\"}".to_string())
+            );
+        }
+        assert!(crate::work_counters::since(before).header_bytes_read > 0);
+
+        // Enabled: the first call reads, the rest do not.
+        let store = tempfile::tempdir().unwrap();
+        let cache = IdentificationCache::load(store.path());
+        let ctx = IdentifyCtx::new(1, &cache);
+        let _ = ctx.derived("t", "cwd", &f, 4096, &|s| {
+            Some(s.lines().next()?.to_string())
+        });
+        let before = crate::work_counters::snapshot();
+        for _ in 0..3 {
+            let _ = ctx.derived("t", "cwd", &f, 4096, &|s| {
+                Some(s.lines().next()?.to_string())
+            });
+        }
+        assert_eq!(
+            crate::work_counters::since(before).header_bytes_read,
+            0,
+            "a cached derivation must not re-read the file"
+        );
+
+        // A rewritten file invalidates it: a stale answer is worse than
+        // a slow one.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&f, b"{\"cwd\":\"/y\"}\nBODY\n").unwrap();
+        let before = crate::work_counters::snapshot();
+        assert_eq!(
+            ctx.derived("t", "cwd", &f, 4096, &|s| Some(
+                s.lines().next()?.to_string()
+            )),
+            Some("{\"cwd\":\"/y\"}".to_string())
+        );
+        assert!(
+            crate::work_counters::since(before).header_bytes_read > 0,
+            "a changed file must be re-read"
+        );
+    }
+
+    #[test]
+    fn a_same_second_same_size_rewrite_invalidates_the_cached_derivation() {
+        // The hole two independent adversarial passes found, with no
+        // sleep: a session re-linked to a different project of the same
+        // path length, rewritten within the same wall-clock second. A
+        // `(size, mtime_secs)` fingerprint cannot see it and serves the
+        // old project; the whole cache is then a silent source of wrong
+        // attribution. This test has no `sleep` on purpose -- adding one
+        // is what hid it.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        let store = tempfile::tempdir().unwrap();
+        let cache = IdentificationCache::load(store.path());
+        let ctx = IdentifyCtx::new(1, &cache);
+        let cwd = |s: &str| {
+            Some(
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()?
+                    .get("cwd")?
+                    .as_str()?
+                    .to_string(),
+            )
+        };
+        std::fs::write(&f, b"{\"cwd\":\"/aaa/one\"}\n").unwrap();
+        assert_eq!(
+            ctx.derived("t", "cwd", &f, 4096, &cwd),
+            Some("/aaa/one".to_string())
+        );
+        // Same byte length, same second.
+        std::fs::write(&f, b"{\"cwd\":\"/bbb/two\"}\n").unwrap();
+        assert_eq!(
+            ctx.derived("t", "cwd", &f, 4096, &cwd),
+            Some("/bbb/two".to_string()),
+            "a same-size rewrite in the same second must not be answered from the cache"
+        );
+    }
+
+    #[test]
+    fn a_replaced_file_is_a_different_file_however_its_timestamps_look() {
+        // A rename-over preserves mtime. The inode does not.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        let store = tempfile::tempdir().unwrap();
+        let cache = IdentificationCache::load(store.path());
+        let ctx = IdentifyCtx::new(1, &cache);
+        let first = |s: &str| Some(s.trim().to_string());
+        std::fs::write(&f, b"AAAA\n").unwrap();
+        assert_eq!(ctx.derived("t", "k", &f, 64, &first), Some("AAAA".into()));
+        let replacement = dir.path().join("tmp");
+        std::fs::write(&replacement, b"BBBB\n").unwrap();
+        // Copy the original's mtime onto the replacement, then swap it
+        // in: size and mtime now match the cached fingerprint exactly.
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&replacement, &f).unwrap();
+        assert_eq!(
+            ctx.derived("t", "k", &f, 64, &first),
+            Some("BBBB".into()),
+            "a replaced inode must invalidate the cached derivation"
+        );
+    }
+
+    #[test]
+    fn an_absent_derivation_is_cached_too() {
+        // Otherwise "this session declares no cwd" costs a read forever.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        std::fs::write(&f, b"not json\n").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let cache = IdentificationCache::load(store.path());
+        let ctx = IdentifyCtx::new(1, &cache);
+        assert_eq!(ctx.derived("t", "cwd", &f, 4096, &|_| None), None);
+        let before = crate::work_counters::snapshot();
+        assert_eq!(ctx.derived("t", "cwd", &f, 4096, &|_| None), None);
+        assert_eq!(crate::work_counters::since(before).header_bytes_read, 0);
+    }
+
+    #[test]
+    fn the_cache_round_trips_through_the_parquet_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        std::fs::write(&f, b"{\"cwd\":\"/x\"}\n").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        {
+            let cache = IdentificationCache::load(store.path());
+            let ctx = IdentifyCtx::new(1, &cache);
+            let _ = ctx.derived("t", "cwd", &f, 4096, &|s| Some(s.trim().to_string()));
+            cache.save(store.path(), 1).unwrap();
+        }
+        let cache = IdentificationCache::load(store.path());
+        let ctx = IdentifyCtx::new(2, &cache);
+        let before = crate::work_counters::snapshot();
+        assert_eq!(
+            ctx.derived("t", "cwd", &f, 4096, &|s| Some(s.trim().to_string())),
+            Some("{\"cwd\":\"/x\"}".to_string())
+        );
+        assert_eq!(
+            crate::work_counters::since(before).header_bytes_read,
+            0,
+            "a cache that does not survive a restart closes nothing"
+        );
+    }
+
+    #[test]
+    fn a_disabled_cache_never_writes_the_store() {
+        let store = tempfile::tempdir().unwrap();
+        IdentificationCache::disabled()
+            .save(store.path(), 1)
+            .unwrap();
+        assert!(
+            !store.path().join("associations").exists(),
+            "an execution-time recheck must not write an identification cache"
+        );
+    }
 
     #[test]
     fn category_default_protection_is_config_only() {
@@ -1014,7 +1868,7 @@ mod tests {
         protect_add(dir.path(), &target).unwrap();
         let listed = protect_list(dir.path()).unwrap();
         assert_eq!(listed.len(), 1);
-        assert!(is_human_protected(&listed, &target));
+        assert!(protection_conflict(&listed, &target).is_some());
         // Idempotent add.
         protect_add(dir.path(), &target).unwrap();
         assert_eq!(protect_list(dir.path()).unwrap().len(), 1);
@@ -1030,7 +1884,7 @@ mod tests {
         protect_add(dir.path(), &home).unwrap();
         let reloaded = protect_list(dir.path()).unwrap();
         let nested = home.join("projects/x/session.jsonl");
-        assert!(is_human_protected(&reloaded, &nested));
+        assert!(protection_conflict(&reloaded, &nested).is_some());
     }
 
     #[test]

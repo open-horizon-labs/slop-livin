@@ -34,8 +34,11 @@ fn only_claude_code_config() -> ScanConfig {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: vec!["cargo-home".into(), "rustup".into(), "homebrew".into()],
-        enabled_detectors: Vec::new(),
+        // Allow-list: a fixture must not reach a detector that proposes
+        // an absolute system path (core_simulator's runtime volumes),
+        // which a deny-list of three ids left wide open.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["claude-code".into()],
     }
 }
 

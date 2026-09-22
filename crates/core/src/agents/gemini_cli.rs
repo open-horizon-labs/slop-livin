@@ -1,40 +1,51 @@
-//! Gemini CLI identification (#96): per-project-hash temp state (shell
+//! Gemini CLI identification (#96): per-project temp state (shell
 //! history, checkpoints, saved chats), shadow-Git checkpoint history and
 //! protected configuration under the home
 //! `crate::locations::gemini_cli::GeminiCliDetector` resolves.
 //!
-//! Layout and the `getProjectHash` algorithm are sourced from primary
-//! docs/source during implementation (never a real `~/.gemini` on this
-//! machine -- PRIVACY IS A HARD RULE); see
-//! `crate::locations::gemini_cli`'s doc comment for the full citations.
+//! Layout is sourced from primary docs/source during implementation
+//! (never a real `~/.gemini` on this machine -- PRIVACY IS A HARD RULE);
+//! see `crate::locations::gemini_cli`'s doc comment for the full
+//! citations.
 //!
-//! ## Project-hash linkage (#96's explicit bar)
+//! ## Project-id linkage (#96's explicit bar)
 //!
-//! `getProjectHash(projectRoot) = sha256(projectRoot).hex()` is
-//! confirmed, not guessed -- but it is a **one-way** function. Given a
-//! `tmp/<hash>` or `history/<hash>` directory name, this adapter cannot
-//! recover the project root that produced it without hashing every
-//! candidate path in a project catalog this identification layer does
-//! not have (`identify` only receives this tool's own home path). Rather
-//! than fabricate a match or silently drop the fact that a real,
-//! documented algorithm exists, every unit under a hash directory
-//! carries `ProjectLinkState::Unresolved` with a reason naming the
-//! algorithm explicitly. A future caller with a project catalog in hand
-//! (e.g. the CLI's own worktree list) could resolve this by hashing each
-//! candidate and comparing -- not implemented this chunk.
+//! `tmp/<project-id>` and `history/<project-id>` are keyed by an id this
+//! adapter treats as **opaque**, because upstream has used two different
+//! shapes for it:
+//!
+//! * historically, `getProjectHash(projectRoot) = sha256(projectRoot).hex()`
+//!   (`packages/core/src/utils/paths.ts`) -- a 64-hex-character name and
+//!   a one-way function; and
+//! * in current versions, a **short slug id**: projects are registered in
+//!   `<runtimeDir>/projects.json` and the older hash directories are
+//!   migrated across to the slug (`packages/core/src/config/storage.ts`,
+//!   google-gemini/gemini-cli main @
+//!   `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`).
+//!
+//! So a directory name here is never assumed to be 64 hex characters,
+//! never decoded, and never matched against a basename. Reading
+//! `projects.json` -- the one upstream mapping from id back to project
+//! root -- is deliberately **out of scope for this adapter**, so every
+//! unit under a project-id directory carries
+//! `ProjectLinkState::Unresolved` with a reason that says exactly that.
+//! A future caller with that mapping (or with a project catalog to hash
+//! against, for the legacy shape) could resolve it -- not implemented
+//! here, and not guessed here.
 //!
 //! ## Version-aware boundary
 //!
 //! Checked content markers: `settings.json`, `GEMINI.md` (or another
 //! configured context filename -- only the default is checked),
-//! `extensions/`, `tmp/`, `history/`, `trustedFolders.json`, `bin/`. None
-//! present but the directory non-empty -> one `Unclassified`,
-//! non-actionable "unsupported layout version" residual, same discipline
-//! `crate::agents::opencode`/`oh_my_pi` use.
+//! `extensions/`, `tmp/`, `history/`, `trustedFolders.json`, `bin/`,
+//! `oauth_creds.json`. None present but the directory non-empty -> one
+//! `Unclassified`, non-actionable "unsupported layout version" residual,
+//! same discipline `crate::agents::opencode`/`oh_my_pi` use.
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes, mtime_secs,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
+    mtime_secs,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -43,9 +54,23 @@ use std::path::Path;
 pub const GEMINI_CLI_TOOL_ID: &str = crate::locations::gemini_cli::GEMINI_CLI_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
-const HASH_UNRESOLVED_REASON: &str = "Gemini CLI's project hash is sha256(project root path) per \
-     packages/core/src/utils/paths.ts's getProjectHash, a one-way function; this adapter cannot \
-     recover the project root from the hash alone without a candidate project-path catalog";
+
+/// The one credential filename confirmed by primary source:
+/// `packages/core/src/config/storage.ts`'s `OAUTH_FILE`
+/// (google-gemini/gemini-cli main @
+/// `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`). The defensive filename
+/// pattern below stays in place for any *other* credential file this
+/// adapter has not confirmed; this constant is what lets the confirmed
+/// one carry a confirmed reason instead of a defensive one.
+const OAUTH_CREDS_FILE: &str = "oauth_creds.json";
+
+const PROJECT_ID_UNRESOLVED_REASON: &str = "Gemini CLI keys this directory by an opaque project id: historically \
+     sha256(project root path) per packages/core/src/utils/paths.ts's getProjectHash, and in \
+     current versions a short slug id registered in <runtimeDir>/projects.json (packages/core/\
+     src/config/storage.ts), with the older hash directories migrated across. Both shapes are \
+     one-way from the directory name alone, projects.json is the upstream mapping back to a \
+     project root, and this adapter does not read it -- so the project behind this id is \
+     reported unresolved rather than guessed";
 
 const FORMAT_MARKERS: &[&str] = &[
     "settings.json",
@@ -55,52 +80,78 @@ const FORMAT_MARKERS: &[&str] = &[
     "history",
     "trustedFolders.json",
     "bin",
+    OAUTH_CREDS_FILE,
 ];
 
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        GEMINI_CLI_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "Gemini CLI"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+}
+
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     if !home.is_dir() {
         return Vec::new();
     }
     if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
-        return unknown_version_residual(home);
+        return unknown_version_residual(home, ctx);
     }
     let mut units = Vec::new();
-    identify_protected(home, &mut units);
-    identify_tmp(home, &mut units);
-    identify_history(home, &mut units);
-    identify_residual(home, &mut units);
+    identify_protected(home, ctx, &mut units);
+    identify_tmp(home, ctx, &mut units);
+    identify_history(home, ctx, &mut units);
+    identify_residual(home, ctx, &mut units);
     units
 }
 
-fn unknown_version_residual(home: &Path) -> Vec<CandidateAgentUnit> {
-    let has_entries = fs::read_dir(home)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
-    if !has_entries {
+fn unknown_version_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+    if !ctx.has_entries(home) {
         return Vec::new();
     }
-    let (bytes, mtime, _t) = folded_bytes(home, MAX_FOLD_ENTRIES);
-    vec![CandidateAgentUnit {
-        category: AgentCategory::Unclassified,
-        relative_path: "(unsupported layout version)".to_string(),
-        path: home.to_path_buf(),
-        members: Vec::new(),
-        bytes,
-        mtime_max: mtime,
-        protected: false,
-        protect_reason: None,
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: Some(
+    let (bytes, mtime, _t) = ctx.folded_bytes(home, MAX_FOLD_ENTRIES);
+    vec![
+        AgentUnitBuilder::new(
+            GEMINI_CLI_TOOL_ID,
+            AgentCategory::Unclassified,
+            home.to_path_buf(),
+        )
+        .relative_path("(unsupported layout version)")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::None)
+        .note(
             "no recognized Gemini CLI markers found (settings.json/GEMINI.md/extensions/tmp/\
-             history/trustedFolders.json/bin) at this resolved path -- unsupported or future \
-             layout version, treated as unknown, not scanned further"
-                .to_string(),
-        ),
-    }]
+             history/trustedFolders.json/bin/oauth_creds.json) at this resolved path -- \
+             unsupported or future layout version, treated as unknown, not scanned further",
+        )
+        .build(),
+    ]
 }
 
-fn identify_protected(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+/// A top-level filename that *looks* credential-shaped. Guardrail
+/// precedent: `crate::actions::is_sqlite_like`. Kept alongside the
+/// confirmed `oauth_creds.json` because upstream may write other
+/// credential/account files this adapter has not confirmed, and an
+/// unconfirmed credential file must be protected rather than left
+/// actionable pending a citation.
+fn is_credential_shaped(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.contains("oauth") || lower.contains("cred")) && !lower.starts_with('.')
+}
+
+fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for (rel, note) in [
         ("settings.json", "user settings"),
         ("GEMINI.md", "context/memory file"),
@@ -110,295 +161,247 @@ fn identify_protected(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         if let Ok(meta) = fs::symlink_metadata(&path)
             && meta.is_file()
         {
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::ProtectedConfig,
-                relative_path: rel.to_string(),
-                path,
-                members: Vec::new(),
-                bytes: meta.len(),
-                mtime_max: mtime_secs(&meta),
-                protected: true,
-                protect_reason: Some(note.to_string()),
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: None,
-            });
+            out.push(
+                AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::ProtectedConfig, path)
+                    .relative_path(rel)
+                    .bytes(meta.len())
+                    .mtime_max(mtime_secs(&meta))
+                    .protect(note)
+                    .project_link(ProjectLinkState::NotApplicable)
+                    .action(AgentActionCapability::None)
+                    .build(),
+            );
         }
     }
-    // Defensive filename-pattern check (guardrail precedent:
-    // `crate::actions::is_sqlite_like`): no primary source this chunk
-    // named the exact OAuth/account credential file(s) --
-    // docs/cli/authentication.md and docs/get-started/authentication.md
-    // both 404 against current main -- so any top-level file whose name
-    // looks credential-shaped is protected rather than left unprotected
-    // pending an unconfirmed filename.
-    if let Ok(rd) = fs::read_dir(home) {
-        for e in rd.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if !ft.is_file() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-            if (name.contains("oauth") || name.contains("cred")) && !name.starts_with('.') {
-                let path = e.path();
-                if let Ok(meta) = e.metadata() {
-                    out.push(CandidateAgentUnit {
-                        category: AgentCategory::ProtectedConfig,
-                        relative_path: e.file_name().to_string_lossy().into_owned(),
-                        path,
-                        members: Vec::new(),
-                        bytes: meta.len(),
-                        mtime_max: mtime_secs(&meta),
-                        protected: true,
-                        protect_reason: Some(
-                            "credential-shaped filename (defensive pattern match; exact upstream \
-                             name not confirmed this chunk)"
-                                .to_string(),
-                        ),
-                        project_link: ProjectLinkState::NotApplicable,
-                        action: AgentActionCapability::None,
-                        note: None,
-                    });
-                }
-            }
+    for entry in ctx.list(home) {
+        if entry.is_dir {
+            continue;
         }
+        let confirmed = entry.name == OAUTH_CREDS_FILE;
+        if !confirmed && !is_credential_shaped(&entry.name) {
+            continue;
+        }
+        let path = home.join(&entry.name);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let reason = if confirmed {
+            "OAuth credentials -- confirmed upstream as packages/core/src/config/storage.ts's \
+             OAUTH_FILE = \"oauth_creds.json\" (google-gemini/gemini-cli main @ \
+             d5b3e3accb26000d273abf16e0f1dd83aa5428a9)"
+        } else {
+            "credential-shaped filename (defensive pattern match; oauth_creds.json is the one \
+             confirmed credential file upstream, and the pattern stays for any other this \
+             adapter has not confirmed)"
+        };
+        out.push(
+            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::ProtectedConfig, path)
+                .relative_path(entry.name.clone())
+                .bytes(meta.len())
+                .mtime_max(mtime_secs(&meta))
+                .protect(reason)
+                .project_link(ProjectLinkState::NotApplicable)
+                .action(AgentActionCapability::None)
+                .build(),
+        );
     }
     let extensions = home.join("extensions");
     if extensions.is_dir() {
-        let (bytes, mtime, _t) = folded_bytes(&extensions, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Plugins,
-            relative_path: "extensions".to_string(),
-            path: extensions,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: true,
-            protect_reason: Some(
-                "installed extensions; removing breaks the CLI's configured integrations"
-                    .to_string(),
-            ),
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: None,
-        });
+        let (bytes, mtime, _t) = ctx.folded_bytes(&extensions, MAX_FOLD_ENTRIES);
+        out.push(
+            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Plugins, extensions)
+                .relative_path("extensions")
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .protect("installed extensions; removing breaks the CLI's configured integrations")
+                .project_link(ProjectLinkState::NotApplicable)
+                .action(AgentActionCapability::None)
+                .build(),
+        );
     }
     let bin = home.join("bin");
     if bin.is_dir() {
-        let (bytes, mtime, truncated) = folded_bytes(&bin, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Caches,
-            relative_path: "bin".to_string(),
-            path: bin,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::CacheOrLogTrash,
-            note: Some(if truncated {
-                "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable; directory entry \
-                 count bound reached"
-                    .to_string()
-            } else {
-                "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable".to_string()
-            }),
-        });
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&bin, MAX_FOLD_ENTRIES);
+        out.push(
+            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Caches, bin)
+                .relative_path("bin")
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .project_link(ProjectLinkState::NotApplicable)
+                .action(AgentActionCapability::CacheOrLogTrash)
+                .note(if truncated {
+                    "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable; directory entry \
+                     count bound reached"
+                } else {
+                    "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable"
+                })
+                .build(),
+        );
     }
 }
 
-fn identify_tmp(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("tmp");
-    let Ok(rd) = fs::read_dir(&base) else { return };
-    for hash_entry in rd.flatten() {
-        let Ok(ft) = hash_entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let hash_dir = hash_entry.path();
+    // Every subdirectory name is opaque: a legacy 64-hex project hash and
+    // a current short slug id are handled identically, because neither is
+    // invertible here (see the module docs).
+    for project_id in ctx.dir_names(&base) {
+        let project_dir = base.join(&project_id);
         let mut seen: HashSet<&str> = HashSet::new();
 
-        let shell_history = hash_dir.join("shell_history");
+        let shell_history = project_dir.join("shell_history");
         if let Ok(meta) = fs::symlink_metadata(&shell_history)
             && meta.is_file()
         {
             seen.insert("shell_history");
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Logs,
-                relative_path: relative_to(home, &shell_history),
-                path: shell_history,
-                members: Vec::new(),
-                bytes: meta.len(),
-                mtime_max: mtime_secs(&meta),
-                protected: false,
-                protect_reason: None,
-                project_link: ProjectLinkState::Unresolved {
-                    reason: HASH_UNRESOLVED_REASON.to_string(),
-                },
-                action: AgentActionCapability::CacheOrLogTrash,
-                note: Some("per-project shell command history for this CLI session".to_string()),
-            });
+            out.push(
+                AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Logs, shell_history)
+                    .relative_to(home)
+                    .bytes(meta.len())
+                    .mtime_max(mtime_secs(&meta))
+                    .project_link(ProjectLinkState::Unresolved {
+                        reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+                    })
+                    .action(AgentActionCapability::CacheOrLogTrash)
+                    .note("per-project shell command history for this CLI session")
+                    .build(),
+            );
         }
 
-        let checkpoints = hash_dir.join("checkpoints");
+        let checkpoints = project_dir.join("checkpoints");
         if checkpoints.is_dir() {
             seen.insert("checkpoints");
-            let (bytes, mtime, truncated) = folded_bytes(&checkpoints, MAX_FOLD_ENTRIES);
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Checkpoints,
-                relative_path: relative_to(home, &checkpoints),
-                path: checkpoints,
-                members: Vec::new(),
-                bytes,
-                mtime_max: mtime,
-                protected: false,
-                protect_reason: None,
-                project_link: ProjectLinkState::Unresolved {
-                    reason: HASH_UNRESOLVED_REASON.to_string(),
-                },
-                action: AgentActionCapability::None,
-                note: Some(if truncated {
-                    "tool-call checkpoint state for /restore; not a supported selective action \
+            let (bytes, mtime, truncated) = ctx.folded_bytes(&checkpoints, MAX_FOLD_ENTRIES);
+            out.push(
+                AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Checkpoints, checkpoints)
+                    .relative_to(home)
+                    .bytes(bytes)
+                    .mtime_max(mtime)
+                    .project_link(ProjectLinkState::Unresolved {
+                        reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+                    })
+                    .action(AgentActionCapability::None)
+                    .note(if truncated {
+                        "tool-call checkpoint state for /restore; not a supported selective action \
                      this chunk (directory entry count bound reached)"
-                        .to_string()
-                } else {
-                    "tool-call checkpoint state for /restore; not a supported selective action \
+                    } else {
+                        "tool-call checkpoint state for /restore; not a supported selective action \
                      this chunk"
-                        .to_string()
-                }),
-            });
+                    })
+                    .build(),
+            );
         }
 
-        let chats = hash_dir.join("chats");
-        if let Ok(chat_rd) = fs::read_dir(&chats) {
+        let chats = project_dir.join("chats");
+        if chats.is_dir() {
             seen.insert("chats");
-            for chat_entry in chat_rd.flatten() {
-                let Ok(cft) = chat_entry.file_type() else {
+            for name in ctx.file_names(&chats) {
+                let path = chats.join(&name);
+                let Ok(meta) = fs::symlink_metadata(&path) else {
                     continue;
                 };
-                if !cft.is_file() {
-                    continue;
-                }
-                let path = chat_entry.path();
-                let Ok(meta) = chat_entry.metadata() else {
-                    continue;
-                };
-                out.push(CandidateAgentUnit {
-                    category: AgentCategory::Sessions,
-                    relative_path: relative_to(home, &path),
-                    path: path.clone(),
-                    members: vec![AgentMember {
+                out.push(
+                    AgentUnitBuilder::new(
+                        GEMINI_CLI_TOOL_ID,
+                        AgentCategory::Sessions,
+                        path.clone(),
+                    )
+                    .relative_to(home)
+                    .mtime_max(mtime_secs(&meta))
+                    .members(vec![AgentMember {
                         path,
                         bytes: meta.len(),
                         kind: AgentMemberKind::Transcript,
-                    }],
-                    bytes: meta.len(),
-                    mtime_max: mtime_secs(&meta),
-                    protected: false,
-                    protect_reason: None,
-                    project_link: ProjectLinkState::Unresolved {
-                        reason: HASH_UNRESOLVED_REASON.to_string(),
-                    },
-                    action: AgentActionCapability::SessionRemoval,
-                    note: Some("saved chat (/chat save, /resume)".to_string()),
-                });
+                    }])
+                    .project_link(ProjectLinkState::Unresolved {
+                        reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+                    })
+                    .action(AgentActionCapability::SessionRemoval)
+                    .note("saved chat (/chat save, /resume)")
+                    .build(),
+                );
             }
         }
 
         let (residual_bytes, residual_mtime, residual_names) =
-            fold_residual_children(&hash_dir, &seen);
+            fold_residual_children(&project_dir, &seen, ctx);
         if !residual_names.is_empty() {
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Unclassified,
-                relative_path: format!("{} (unclassified residual)", relative_to(home, &hash_dir)),
-                path: hash_dir.clone(),
-                members: Vec::new(),
-                bytes: residual_bytes,
-                mtime_max: residual_mtime,
-                protected: false,
-                protect_reason: None,
-                project_link: ProjectLinkState::Unresolved {
-                    reason: HASH_UNRESOLVED_REASON.to_string(),
-                },
-                action: AgentActionCapability::None,
-                note: Some(format!(
+            out.push(
+                AgentUnitBuilder::new(
+                    GEMINI_CLI_TOOL_ID,
+                    AgentCategory::Unclassified,
+                    project_dir.clone(),
+                )
+                .relative_path(format!(
+                    "{} (unclassified residual)",
+                    super::relative_to(home, &project_dir)
+                ))
+                .bytes(residual_bytes)
+                .mtime_max(residual_mtime)
+                .project_link(ProjectLinkState::Unresolved {
+                    reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+                })
+                .action(AgentActionCapability::None)
+                .note(format!(
                     "entries with no specific rule in this adapter: {}",
                     residual_names.join(", ")
-                )),
-            });
+                ))
+                .build(),
+            );
         }
     }
 }
 
-fn identify_history(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("history");
-    let Ok(rd) = fs::read_dir(&base) else { return };
-    for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let (bytes, mtime, truncated) = folded_bytes(&path, MAX_FOLD_ENTRIES);
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Checkpoints,
-            relative_path: relative_to(home, &path),
-            path,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::Unresolved {
-                reason: HASH_UNRESOLVED_REASON.to_string(),
-            },
-            action: AgentActionCapability::None,
-            note: Some(if truncated {
-                "shadow Git repository backing this project's /restore checkpoints, independent \
-                 of the project's own .git; not a supported selective action this chunk \
-                 (directory entry count bound reached)"
-                    .to_string()
-            } else {
-                "shadow Git repository backing this project's /restore checkpoints, independent \
-                 of the project's own .git; not a supported selective action this chunk"
-                    .to_string()
-            }),
-        });
+    for project_id in ctx.dir_names(&base) {
+        let path = base.join(&project_id);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+        out.push(
+            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Checkpoints, path)
+                .relative_to(home)
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .project_link(ProjectLinkState::Unresolved {
+                    reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+                })
+                .action(AgentActionCapability::None)
+                .note(if truncated {
+                    "shadow Git repository backing this project's /restore checkpoints, \
+                     independent of the project's own .git; not a supported selective action \
+                     this chunk (directory entry count bound reached)"
+                } else {
+                    "shadow Git repository backing this project's /restore checkpoints, \
+                     independent of the project's own .git; not a supported selective action \
+                     this chunk"
+                })
+                .build(),
+        );
     }
 }
 
-fn fold_residual_children(dir: &Path, seen: &HashSet<&str>) -> (u64, u64, Vec<String>) {
+fn fold_residual_children(
+    dir: &Path,
+    seen: &HashSet<&str>,
+    ctx: &IdentifyCtx,
+) -> (u64, u64, Vec<String>) {
     let mut bytes = 0u64;
     let mut mtime = 0u64;
     let mut names = Vec::new();
-    let Ok(rd) = fs::read_dir(dir) else {
-        return (bytes, mtime, names);
-    };
-    for e in rd.flatten() {
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if seen.contains(name.as_str()) {
+    for entry in ctx.list(dir) {
+        if seen.contains(entry.name.as_str()) {
             continue;
         }
-        let (b, m, _t) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let (b, m, _t) = ctx.folded_bytes(&dir.join(&entry.name), MAX_FOLD_ENTRIES);
         bytes += b;
         mtime = mtime.max(m);
-        names.push(name);
+        names.push(entry.name);
     }
     names.sort();
     (bytes, mtime, names)
 }
 
-fn identify_residual(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let seen: HashSet<&str> = [
         "settings.json",
         "GEMINI.md",
@@ -410,48 +413,47 @@ fn identify_residual(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
     ]
     .into_iter()
     .collect();
-    let (bytes, mtime, names) = fold_residual_children(home, &seen);
-    // Credential-shaped filenames were already claimed above; exclude
-    // them from the generic residual so they are not double-counted.
+    let (bytes, mtime, names) = fold_residual_children(home, &seen, ctx);
+    // Credential files (the confirmed `oauth_creds.json` and anything the
+    // defensive pattern claimed) already have their own protected units;
+    // exclude them from the generic residual so they are not
+    // double-counted.
     let names: Vec<String> = names
         .into_iter()
-        .filter(|n| {
-            let lower = n.to_ascii_lowercase();
-            !((lower.contains("oauth") || lower.contains("cred")) && !lower.starts_with('.'))
-        })
+        .filter(|n| n != OAUTH_CREDS_FILE && !is_credential_shaped(n))
         .collect();
     if names.is_empty() {
         return;
     }
-    out.push(CandidateAgentUnit {
-        category: AgentCategory::Unclassified,
-        relative_path: "(unclassified residual)".to_string(),
-        path: home.to_path_buf(),
-        members: Vec::new(),
-        bytes,
-        mtime_max: mtime,
-        protected: false,
-        protect_reason: None,
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: Some(format!(
+    out.push(
+        AgentUnitBuilder::new(
+            GEMINI_CLI_TOOL_ID,
+            AgentCategory::Unclassified,
+            home.to_path_buf(),
+        )
+        .relative_path("(unclassified residual)")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::None)
+        .note(format!(
             "entries with no specific rule in this adapter: {}",
             names.join(", ")
-        )),
-    });
-}
-
-fn relative_to(home: &Path, path: &Path) -> String {
-    path.strip_prefix(home)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+        ))
+        .build(),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -461,16 +463,7 @@ mod tests {
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(identify(dir.path(), 1).is_empty());
-    }
-
-    #[test]
-    fn no_markers_yields_unsupported_version_not_a_guess() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(&dir.path().join("unrelated.txt"), b"hello");
-        let units = identify(dir.path(), 1);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert!(run(dir.path()).is_empty());
     }
 
     #[test]
@@ -479,7 +472,7 @@ mod tests {
         let home = home.path();
         touch(&home.join("settings.json"), b"{}");
         touch(&home.join("GEMINI.md"), b"# context");
-        let units = identify(home, 1);
+        let units = run(home);
         assert!(
             units
                 .iter()
@@ -497,18 +490,55 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_oauth_creds_file_is_protected_with_its_citation() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join(OAUTH_CREDS_FILE), b"[redacted]");
+        let units = run(home);
+        let u = units
+            .iter()
+            .find(|u| u.relative_path == OAUTH_CREDS_FILE)
+            .expect("the confirmed credential file is identified on its own");
+        assert!(u.protected);
+        assert_eq!(u.action, AgentActionCapability::None);
+        let reason = u.protect_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("storage.ts") && reason.contains("OAUTH_FILE"),
+            "the confirmed file must carry its primary-source citation: {reason}"
+        );
+    }
+
+    #[test]
     fn credential_shaped_filename_is_protected_defensively() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("settings.json"), b"{}");
-        touch(&home.join("oauth_creds.json"), b"[redacted]");
-        let units = identify(home, 1);
+        touch(
+            &home.join("google_accounts_credentials.json"),
+            b"[redacted]",
+        );
+        let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "oauth_creds.json")
+            .find(|u| u.relative_path == "google_accounts_credentials.json")
             .expect("credential-shaped file identified");
         assert!(u.protected);
         assert_eq!(u.action, AgentActionCapability::None);
+        assert!(
+            u.protect_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("defensive pattern match"),
+            "an unconfirmed credential file says so"
+        );
+        assert!(
+            !units.iter().any(|u| u
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("google_accounts_credentials.json")),
+            "a claimed credential file must not also land in the residual"
+        );
     }
 
     #[test]
@@ -516,7 +546,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("extensions/foo/package.json"), b"{}");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units
             .iter()
             .find(|u| u.relative_path == "extensions")
@@ -525,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_hash_dir_children_are_categorized_and_hash_is_unresolved() {
+    fn tmp_project_dir_children_are_categorized_and_project_id_is_unresolved() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let hash = "e".repeat(64);
@@ -536,7 +566,7 @@ mod tests {
             &home.join(format!("tmp/{hash}/chats/decision-point.json")),
             format!("{{\"note\":\"{canary}\"}}").as_bytes(),
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let shell = units
             .iter()
             .find(|u| u.category == AgentCategory::Logs)
@@ -560,6 +590,32 @@ mod tests {
     }
 
     #[test]
+    fn a_short_slug_project_id_is_identified_like_a_legacy_hash() {
+        // Current upstream registers projects in projects.json and keys
+        // these directories by a short slug id; a 64-hex name is the
+        // legacy shape, not a requirement (see the module docs).
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("tmp/a1b2c3/chats/s.json"), b"{}");
+        touch(&home.join("history/a1b2c3/HEAD"), b"ref: refs/heads/main");
+        let units = run(home);
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            1,
+            "a slug-named project directory is identified, not skipped"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|u| u.category == AgentCategory::Checkpoints),
+            "a slug-named history directory is identified too"
+        );
+    }
+
+    #[test]
     fn history_shadow_repo_is_checkpoint_category_and_not_actionable() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
@@ -568,7 +624,7 @@ mod tests {
             &home.join(format!("history/{hash}/HEAD")),
             b"ref: refs/heads/main",
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units
             .iter()
             .find(|u| u.category == AgentCategory::Checkpoints)
@@ -581,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn identification_cost_is_bounded_for_many_project_hashes() {
+    fn identification_cost_is_bounded_for_many_project_ids() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         for i in 0..300 {
@@ -592,10 +648,10 @@ mod tests {
             );
         }
         let start = SystemTime::now();
-        let units = identify(home, 1);
+        let units = run(home);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!(
-            "[measured] gemini_cli identify() over 300 synthetic project hashes took {elapsed:?}"
+            "[measured] gemini_cli identify() over 300 synthetic project ids took {elapsed:?}"
         );
         assert_eq!(
             units
@@ -605,5 +661,129 @@ mod tests {
             300
         );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("unrelated.txt"), b"hello");
+        let units = run(dir.path());
+        assert_eq!(units.len(), 1, "an unrecognized home still surfaces a row");
+        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert_eq!(units[0].category, AgentCategory::Unclassified);
+        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert!(
+            units[0]
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported or future layout version"),
+            "the row must say why it is unclassified, not guess another tool's shape"
+        );
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-GEMINI-DO-NOT-LEAK-91ab";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let id = "a".repeat(64);
+        // First line and body alike: this adapter reads neither.
+        touch(
+            &home.join(format!("tmp/{id}/chats/s.json")),
+            format!("{{\"title\":\"{canary}\"}}\nbody: {canary}\n").as_bytes(),
+        );
+        touch(
+            &home.join(format!("tmp/{id}/shell_history")),
+            format!("echo {canary}\n").as_bytes(),
+        );
+        touch(&home.join("settings.json"), canary.as_bytes());
+        contract::no_content_leak(&run(home), canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let mut total = 0u64;
+        for i in 0..40 {
+            let id = format!("{i:064}");
+            let body = b"x".repeat(30_000);
+            total += body.len() as u64;
+            touch(&home.join(format!("tmp/{id}/chats/s.json")), &body);
+        }
+        let (units, counters) = contract::measured(|| run(home));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            40
+        );
+        // This adapter resolves nothing from a chat body: its whole
+        // identification is `stat` plus bounded listings.
+        assert_eq!(
+            counters.header_bytes_read, 0,
+            "a Gemini CLI home is measured and listed, never read"
+        );
+        assert!(total > 0);
+        contract::within_header_cap(counters, 0);
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        touch(&home.join("trustedFolders.json"), b"{}");
+        touch(&home.join(OAUTH_CREDS_FILE), b"[redacted]");
+        let id = "b".repeat(64);
+        touch(&home.join(format!("tmp/{id}/chats/s.json")), b"{}");
+        let units = run(home);
+        contract::protection_defaults_hold(&units);
+        assert!(
+            units
+                .iter()
+                .any(|u| u.relative_path == OAUTH_CREDS_FILE && u.protected),
+            "the confirmed credential file is protected"
+        );
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        // Gemini CLI declares no project path anywhere this adapter
+        // reads: the project id is one-way, so `Linked` is never
+        // produced and a directory *named* like a repo must not become
+        // one.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("tmp/my-repo-name/chats/s.json"), b"{}");
+        touch(&home.join("history/my-repo-name/HEAD"), b"ref: x");
+        let units = run(home);
+        assert!(
+            !units.is_empty(),
+            "a project-id directory is identified even when its id is unresolvable"
+        );
+        for u in &units {
+            assert!(
+                !matches!(u.project_link, ProjectLinkState::Linked { .. }),
+                "{} claimed a link with no declared metadata",
+                u.relative_path
+            );
+        }
+        let reason = units
+            .iter()
+            .find_map(|u| match &u.project_link {
+                ProjectLinkState::Unresolved { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("a project-id unit is explicitly unresolved");
+        assert!(
+            reason.contains("projects.json") && reason.contains("one-way"),
+            "the reason must name the upstream mapping this adapter does not read: {reason}"
+        );
+        contract::linkage_is_declared_or_explicit(&units, "my-repo-name");
     }
 }

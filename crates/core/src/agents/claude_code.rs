@@ -39,10 +39,21 @@
 //! Any `file-history/`, `todos/`, `image-cache/` or `uploads/` entry
 //! that matches no known session id becomes its own small residual unit
 //! (never silently dropped, never attached to the wrong session).
+//!
+//! ## Cost
+//!
+//! Every directory listing goes through [`IdentifyCtx::list`] (bounded,
+//! single-level, symlink-refusing) and every byte total through
+//! [`IdentifyCtx::folded_bytes`]. The one content read -- a session's
+//! declared `cwd` -- goes through [`IdentifyCtx::derived`] under the
+//! derivation kind `"cwd"`, so an unchanged session home costs *zero*
+//! header bytes on a second pass rather than one capped read per
+//! session. `crates/core/tests/incremental_external_and_agent_measurement.rs`
+//! measures exactly that over a 5,000-session synthetic home.
 
 use super::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, CandidateAgentUnit,
-    ProjectLinkState, folded_bytes,
+    AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -50,24 +61,42 @@ use std::path::{Path, PathBuf};
 
 pub const CLAUDE_CODE_TOOL_ID: &str = crate::locations::claude_code::CLAUDE_CODE_DETECTOR_ID;
 
-/// Bound on any one folded directory's entry count (`super::folded_bytes`).
+/// Bound on any one folded directory's entry count
+/// ([`IdentifyCtx::folded_bytes`]).
 const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Bound on how many bytes of a transcript's first line this adapter
 /// will ever read looking for a `cwd` field -- "first N bytes... never
 /// whole transcripts" (#91's scan-cost acceptance).
 const HEADER_READ_BYTES: usize = 8192;
 
-/// `observed_at` is accepted for interface consistency with future
-/// adapters (`crate::agents::identify_for_tool`'s shared signature) but
-/// unused by this one: every `AgentUnit`'s `observed_at` is stamped by
-/// `crate::agents::discover_and_measure`, not by the adapter itself.
-pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
+pub struct Adapter;
+
+impl AgentAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        CLAUDE_CODE_TOOL_ID
+    }
+    fn name(&self) -> &'static str {
+        "Claude Code"
+    }
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::default()
+    }
+    fn identify(&self, home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+        identify(home, ctx)
+    }
+}
+
+/// Identifies this tool's units inside `home`. Every `observed_at` is
+/// stamped by `crate::agents::discover_and_measure`, not by the adapter
+/// itself; `ctx.observed_at()` has it for an adapter that needs one.
+pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let mut units = Vec::new();
     let mut claimed_session_ids: HashSet<String> = HashSet::new();
 
-    identify_sessions(home, &mut units, &mut claimed_session_ids);
+    identify_sessions(home, ctx, &mut units, &mut claimed_session_ids);
     identify_session_keyed_top_level(
         home,
+        ctx,
         "file-history",
         AgentMemberKind::FileHistory,
         &claimed_session_ids,
@@ -79,6 +108,7 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
     );
     identify_session_keyed_top_level(
         home,
+        ctx,
         "image-cache",
         AgentMemberKind::Attachments,
         &claimed_session_ids,
@@ -88,6 +118,7 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
     );
     identify_session_keyed_top_level(
         home,
+        ctx,
         "uploads",
         AgentMemberKind::Attachments,
         &claimed_session_ids,
@@ -96,7 +127,7 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
         "web/mobile attachments with no matching current session transcript",
     );
 
-    identify_static_categories(home, &mut units);
+    identify_static_categories(home, ctx, &mut units);
     units
 }
 
@@ -106,38 +137,36 @@ pub fn identify(home: &Path, _observed_at: u64) -> Vec<CandidateAgentUnit> {
 
 fn identify_sessions(
     home: &Path,
+    ctx: &IdentifyCtx,
     out: &mut Vec<CandidateAgentUnit>,
     claimed: &mut HashSet<String>,
 ) {
     let projects_dir = home.join("projects");
-    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+    let project_names = ctx.dir_names(&projects_dir);
+    if project_names.is_empty() {
         return;
-    };
-    // `todos/` is read once, up front, and matched in-memory per
-    // session -- never one `read_dir` per session.
-    let todos: Vec<PathBuf> = fs::read_dir(home.join("todos"))
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
+    }
+    // `todos/` is listed once, up front, and matched in-memory per
+    // session -- never one listing per session.
+    let todos_dir = home.join("todos");
+    let todos: Vec<PathBuf> = ctx
+        .list(&todos_dir)
+        .into_iter()
+        .map(|e| todos_dir.join(e.name))
+        .collect();
 
-    for project_entry in project_entries.flatten() {
-        let project_path = project_entry.path();
-        if !project_entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&project_path) else {
-            continue;
-        };
+    for project_name in project_names {
+        let project_path = projects_dir.join(&project_name);
         let mut jsonl_files: Vec<PathBuf> = Vec::new();
         let mut companion_dirs: HashMap<String, PathBuf> = HashMap::new();
-        for e in entries.flatten() {
-            let p = e.path();
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_file() && p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                jsonl_files.push(p);
-            } else if ft.is_dir()
-                && let Some(name) = p.file_name().and_then(|n| n.to_str())
-            {
-                companion_dirs.insert(name.to_string(), p);
+        for e in ctx.list(&project_path) {
+            let p = project_path.join(&e.name);
+            if !e.is_dir {
+                if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    jsonl_files.push(p);
+                }
+            } else {
+                companion_dirs.insert(e.name.clone(), p);
             }
         }
 
@@ -163,7 +192,7 @@ fn identify_sessions(
             let mut mtime_max = file_mtime;
 
             if let Some(dir) = companion_dirs.remove(&session_id) {
-                let (bytes, mtime, _truncated) = folded_bytes(&dir, MAX_FOLD_ENTRIES);
+                let (bytes, mtime, _truncated) = ctx.folded_bytes(&dir, MAX_FOLD_ENTRIES);
                 mtime_max = mtime_max.max(mtime);
                 members.push(AgentMember {
                     path: dir,
@@ -174,7 +203,7 @@ fn identify_sessions(
 
             let fh_dir = home.join("file-history").join(&session_id);
             if fh_dir.is_dir() {
-                let (bytes, mtime, _truncated) = folded_bytes(&fh_dir, MAX_FOLD_ENTRIES);
+                let (bytes, mtime, _truncated) = ctx.folded_bytes(&fh_dir, MAX_FOLD_ENTRIES);
                 mtime_max = mtime_max.max(mtime);
                 members.push(AgentMember {
                     path: fh_dir,
@@ -186,7 +215,7 @@ fn identify_sessions(
             for dir_name in ["image-cache", "uploads"] {
                 let d = home.join(dir_name).join(&session_id);
                 if d.is_dir() {
-                    let (bytes, mtime, _truncated) = folded_bytes(&d, MAX_FOLD_ENTRIES);
+                    let (bytes, mtime, _truncated) = ctx.folded_bytes(&d, MAX_FOLD_ENTRIES);
                     mtime_max = mtime_max.max(mtime);
                     members.push(AgentMember {
                         path: d,
@@ -220,60 +249,52 @@ fn identify_sessions(
             }
 
             claimed.insert(session_id.clone());
-            let project_link = resolve_project_link(&jsonl);
-            let bytes: u64 = members.iter().map(|m| m.bytes).sum();
+            let project_link = resolve_project_link(&jsonl, ctx);
             let relative_path = relative_to(home, &jsonl);
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Sessions,
-                relative_path,
-                path: jsonl,
-                members,
-                bytes,
-                mtime_max,
-                protected: false,
-                protect_reason: None,
-                project_link,
-                action: AgentActionCapability::SessionRemoval,
-                note: None,
-            });
+            out.push(
+                AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Sessions, jsonl)
+                    .relative_path(relative_path)
+                    .members(members)
+                    .mtime_max(mtime_max)
+                    .project_link(project_link)
+                    .action(AgentActionCapability::SessionRemoval)
+                    .build(),
+            );
         }
 
         // Anything left in `companion_dirs` matched no session id in
         // this project directory: e.g. `memory/` (auto memory, always
         // present and always unmatched by construction), or a companion
         // directory whose transcript was removed by hand outside this
-        // adapter.
-        for (name, dir) in companion_dirs {
-            let (bytes, mtime, _truncated) = folded_bytes(&dir, MAX_FOLD_ENTRIES);
+        // adapter. Sorted, so identification output does not depend on
+        // hash order.
+        let mut leftovers: Vec<(String, PathBuf)> = companion_dirs.into_iter().collect();
+        leftovers.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, dir) in leftovers {
+            let (bytes, mtime, _truncated) = ctx.folded_bytes(&dir, MAX_FOLD_ENTRIES);
             let relative_path = relative_to(home, &dir);
-            let (protected, note) = if name == "memory" {
-                (
-                    true,
-                    "per-project persistent notes Claude maintains across sessions (auto memory); \
-                     treated as retained work, not a cache"
-                        .to_string(),
-                )
+            let is_memory = name == "memory";
+            let note = if is_memory {
+                "per-project persistent notes Claude maintains across sessions (auto memory); \
+                 treated as retained work, not a cache"
             } else {
-                (
-                    false,
-                    "companion directory with no matching session transcript in this project \
-                     directory"
-                        .to_string(),
-                )
+                "companion directory with no matching session transcript in this project \
+                 directory"
             };
-            out.push(CandidateAgentUnit {
-                category: AgentCategory::Unclassified,
-                relative_path,
-                path: dir,
-                members: Vec::new(),
-                bytes,
-                mtime_max: mtime,
-                protected,
-                protect_reason: Some(note.clone()),
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: Some(note),
-            });
+            let unit = AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Unclassified, dir)
+                .relative_path(relative_path)
+                .bytes(bytes)
+                .mtime_max(mtime)
+                .note(note);
+            // `memory/` is retained work, so it is individually
+            // protected with that reason. An ordinary orphan companion
+            // directory is not protected; it carries the same
+            // explanation as its note (the pre-builder literal also set
+            // a `protect_reason` on it, which nothing ever read -- the
+            // shared layer consults `protect_reason` only for a unit
+            // that is actually protected).
+            let unit = if is_memory { unit.protect(note) } else { unit };
+            out.push(unit.build());
         }
     }
 }
@@ -287,24 +308,36 @@ fn identify_sessions(
 /// heuristic (the `projects/<encoded>` directory name is not reversible
 /// to a real path in general: a literal hyphen in a real path is
 /// indistinguishable from an encoded path separator).
-fn resolve_project_link(jsonl: &Path) -> ProjectLinkState {
+fn resolve_project_link(jsonl: &Path, ctx: &IdentifyCtx) -> ProjectLinkState {
     super::resolve_declared_path(
-        read_header_cwd(jsonl),
+        read_header_cwd(jsonl, ctx),
         "no cwd field found in the session's first line",
     )
 }
 
-fn read_header_cwd(jsonl: &Path) -> Option<String> {
-    // Through the shared capped reader, so the privacy bound is one
-    // reviewed function rather than fifteen open-coded reads, and the
-    // cost is counted (`.oh/guardrails/agent-adapters-read-bounded-headers-only.md`).
-    let first_line = super::bounded_io::read_header_line(jsonl, HEADER_READ_BYTES)?;
-    let value: serde_json::Value = serde_json::from_str(&first_line).ok()?;
-    value
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+fn read_header_cwd(jsonl: &Path, ctx: &IdentifyCtx) -> Option<String> {
+    // Through the shared *memoised* capped reader, so the privacy bound
+    // is one reviewed function rather than fifteen open-coded reads, the
+    // cost is counted
+    // (`.oh/guardrails/agent-adapters-read-bounded-headers-only.md`), and
+    // an unchanged transcript is never re-read: the derived `cwd` is
+    // cached against the transcript's own `(size, mtime)`, which is what
+    // makes an unchanged 5,000-session home cost zero header bytes.
+    ctx.derived(
+        CLAUDE_CODE_TOOL_ID,
+        "cwd",
+        jsonl,
+        HEADER_READ_BYTES,
+        &|text| {
+            let first_line = text.lines().next()?;
+            let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
+            value
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -312,8 +345,10 @@ fn read_header_cwd(jsonl: &Path) -> Option<String> {
 // (residual, folded into one unit rather than one row per orphan).
 // ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn identify_session_keyed_top_level(
     home: &Path,
+    ctx: &IdentifyCtx,
     dir_name: &str,
     kind: AgentMemberKind,
     claimed: &HashSet<String>,
@@ -322,50 +357,29 @@ fn identify_session_keyed_top_level(
     note: &str,
 ) {
     let base = home.join(dir_name);
-    let Ok(rd) = fs::read_dir(&base) else { return };
     let mut members = Vec::new();
     let mut mtime_max = 0u64;
-    for e in rd.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
+    for name in ctx.dir_names(&base) {
         if claimed.contains(&name) {
             continue;
         }
-        let (bytes, mtime, _truncated) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let path = base.join(&name);
+        let (bytes, mtime, _truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
         mtime_max = mtime_max.max(mtime);
-        members.push(AgentMember {
-            path: e.path(),
-            bytes,
-            kind,
-        });
+        members.push(AgentMember { path, bytes, kind });
     }
     if members.is_empty() {
         return;
     }
-    let bytes: u64 = members.iter().map(|m| m.bytes).sum();
-    out.push(CandidateAgentUnit {
-        category: AgentCategory::Attachments,
-        relative_path: format!("{dir_name}/({relative_slug})"),
-        path: base,
-        members,
-        bytes,
-        mtime_max,
-        protected: true,
-        protect_reason: Some(note.to_string()),
-        project_link: ProjectLinkState::NotApplicable,
-        action: AgentActionCapability::None,
-        note: Some(note.to_string()),
-    });
+    out.push(
+        AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Attachments, base)
+            .relative_path(format!("{dir_name}/({relative_slug})"))
+            .members(members)
+            .mtime_max(mtime_max)
+            .protect(note)
+            .note(note)
+            .build(),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -556,7 +570,7 @@ const STATIC_ENTRIES: &[StaticEntry] = &[
     },
 ];
 
-fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let mut seen_top_level: HashSet<String> = HashSet::new();
     for entry in STATIC_ENTRIES {
         let path = home.join(entry.rel);
@@ -566,7 +580,7 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         if !path.exists() {
             continue;
         }
-        let (bytes, mtime, truncated) = folded_bytes(&path, MAX_FOLD_ENTRIES);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
         let note = if truncated {
             format!(
                 "{} (directory entry count bound reached; total may be an undercount)",
@@ -575,40 +589,32 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         } else {
             entry.note.to_string()
         };
-        out.push(CandidateAgentUnit {
-            category: entry.category,
-            relative_path: entry.rel.to_string(),
-            path,
-            members: Vec::new(),
-            bytes,
-            mtime_max: mtime,
-            protected: entry.protected,
-            protect_reason: entry.protected.then(|| entry.note.to_string()),
-            project_link: ProjectLinkState::NotApplicable,
-            action: entry.action,
-            note: Some(note),
-        });
+        let unit = AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, entry.category, path)
+            .relative_path(entry.rel)
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(entry.action)
+            .note(note);
+        // `protect` carries the entry's own reason, which is more
+        // specific than the category default the builder already
+        // applied to a `ProtectedConfig` unit.
+        let unit = if entry.protected {
+            unit.protect(entry.note)
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 
     // Genuine unclassified residual: any other top-level entry this
     // adapter has no specific rule for (a new file/dir a future Claude
     // Code version adds), folded into one unit rather than silently
     // dropped -- #91's "retain unclassified residuals" acceptance.
-    let Ok(rd) = fs::read_dir(home) else {
-        return;
-    };
     let mut residual_bytes = 0u64;
     let mut residual_mtime = 0u64;
     let mut residual_names: Vec<String> = Vec::new();
-    for e in rd.flatten() {
-        let Some(name) = e
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
+    for e in ctx.list(home) {
+        let name = e.name;
         if name == "projects"
             || name == "file-history"
             || name == "image-cache"
@@ -618,29 +624,28 @@ fn identify_static_categories(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         {
             continue;
         }
-        let (bytes, mtime, _truncated) = folded_bytes(&e.path(), MAX_FOLD_ENTRIES);
+        let (bytes, mtime, _truncated) = ctx.folded_bytes(&home.join(&name), MAX_FOLD_ENTRIES);
         residual_bytes += bytes;
         residual_mtime = residual_mtime.max(mtime);
         residual_names.push(name);
     }
     if !residual_names.is_empty() {
         residual_names.sort();
-        out.push(CandidateAgentUnit {
-            category: AgentCategory::Unclassified,
-            relative_path: "(unclassified residual)".to_string(),
-            path: home.to_path_buf(),
-            members: Vec::new(),
-            bytes: residual_bytes,
-            mtime_max: residual_mtime,
-            protected: false,
-            protect_reason: None,
-            project_link: ProjectLinkState::NotApplicable,
-            action: AgentActionCapability::None,
-            note: Some(format!(
+        out.push(
+            AgentUnitBuilder::new(
+                CLAUDE_CODE_TOOL_ID,
+                AgentCategory::Unclassified,
+                home.to_path_buf(),
+            )
+            .relative_path("(unclassified residual)")
+            .bytes(residual_bytes)
+            .mtime_max(residual_mtime)
+            .note(format!(
                 "entries with no specific rule in this adapter: {}",
                 residual_names.join(", ")
-            )),
-        });
+            ))
+            .build(),
+        );
     }
 }
 
@@ -654,7 +659,24 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};
+
+    fn run(home: &Path) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        identify(home, &IdentifyCtx::new(1, &cache))
+    }
+
+    /// `crate::work_counters` is process-global, so this module's two
+    /// large session fixtures are serialized against each other: the
+    /// 500-session cost fixture's own header reads would otherwise land
+    /// inside the header-cap measurement's window and make that number
+    /// mean something other than what it claims.
+    static MEASURED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn measured_serial() -> std::sync::MutexGuard<'static, ()> {
+        MEASURED.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -671,7 +693,7 @@ mod tests {
     #[test]
     fn empty_home_yields_no_units() {
         let dir = tempfile::tempdir().unwrap();
-        let units = identify(dir.path(), 1_000);
+        let units = run(dir.path());
         assert!(units.is_empty());
     }
 
@@ -704,7 +726,7 @@ mod tests {
             b"[]",
         );
 
-        let units = identify(home, 2_000);
+        let units = run(home);
         let session_unit = units
             .iter()
             .find(|u| u.category == AgentCategory::Sessions && u.path == jsonl)
@@ -739,7 +761,7 @@ mod tests {
             .join("-nonexistent")
             .join(format!("{session_id}.jsonl"));
         touch(&jsonl, session_line("/nonexistent/gone", "x").as_bytes());
-        let units = identify(home, 1);
+        let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
             unit.project_link,
@@ -762,7 +784,7 @@ mod tests {
             &jsonl,
             session_line(&plain_dir.display().to_string(), "x").as_bytes(),
         );
-        let units = identify(home, 1);
+        let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
             unit.project_link,
@@ -780,7 +802,7 @@ mod tests {
             .join("-x")
             .join(format!("{session_id}.jsonl"));
         touch(&jsonl, b"{not valid json at all");
-        let units = identify(home, 1);
+        let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
             unit.project_link,
@@ -798,7 +820,7 @@ mod tests {
             .join("-x")
             .join(format!("{session_id}.jsonl"));
         touch(&jsonl, b"");
-        let units = identify(home, 1);
+        let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
             unit.project_link,
@@ -820,7 +842,7 @@ mod tests {
         let mut line = session_line(&repo.display().to_string(), "x");
         line.pop(); // drop trailing newline: still-being-appended file
         touch(&jsonl, line.as_bytes());
-        let units = identify(home, 1);
+        let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(unit.project_link, ProjectLinkState::Linked { .. }));
     }
@@ -831,7 +853,7 @@ mod tests {
         let home = home.path();
         touch(&home.join("settings.json"), b"{}");
         touch(&home.join(".credentials.json"), b"[redacted]");
-        let units = identify(home, 1);
+        let units = run(home);
         for rel in ["settings.json", ".credentials.json"] {
             let u = units.iter().find(|u| u.relative_path == rel).unwrap();
             assert!(u.protected, "{rel} must be protected");
@@ -845,7 +867,7 @@ mod tests {
         let home = home.path();
         touch(&home.join("shell-snapshots").join("snap.sh"), b"alias x=y");
         touch(&home.join("debug").join("log.txt"), b"debug line");
-        let units = identify(home, 1);
+        let units = run(home);
         for rel in ["shell-snapshots", "debug"] {
             let u = units.iter().find(|u| u.relative_path == rel).unwrap();
             assert!(!u.protected, "{rel} must not be protected");
@@ -858,7 +880,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("history.jsonl"), b"{}\n");
-        let units = identify(home, 1);
+        let units = run(home);
         let u = units
             .iter()
             .find(|u| u.relative_path == "history.jsonl")
@@ -869,11 +891,41 @@ mod tests {
     }
 
     #[test]
+    fn per_project_memory_is_retained_work_not_an_orphan_cache() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(
+            &home
+                .join("projects")
+                .join("-x")
+                .join("memory")
+                .join("notes.md"),
+            b"[redacted]",
+        );
+        let units = run(home);
+        let u = units
+            .iter()
+            .find(|u| u.relative_path == "projects/-x/memory")
+            .expect("memory directory is its own unit");
+        assert_eq!(u.category, AgentCategory::Unclassified);
+        assert!(u.protected, "auto memory is retained work");
+        assert!(
+            u.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("auto memory"),
+            "{:?}",
+            u.note
+        );
+        assert_eq!(u.action, AgentActionCapability::None);
+    }
+
+    #[test]
     fn unmatched_todos_are_folded_into_one_orphan_note_not_dropped() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("todos").join("no-such-session.json"), b"[]");
-        let units = identify(home, 1);
+        let units = run(home);
         // No session claimed this todos file; it must not silently
         // vanish -- but this adapter also must not fabricate a session
         // unit for it. `todos/` on its own (with no session directory)
@@ -886,22 +938,24 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_residual_captures_unknown_top_level_entries() {
+    fn unlinked_file_history_is_its_own_explicit_unit() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        touch(&home.join("some-future-file.json"), b"{}");
-        let units = identify(home, 1);
-        let residual = units
-            .iter()
-            .find(|u| u.relative_path == "(unclassified residual)")
-            .expect("residual unit present");
-        assert!(
-            residual
-                .note
-                .as_deref()
-                .unwrap()
-                .contains("some-future-file.json")
+        touch(
+            &home
+                .join("file-history")
+                .join("99999999-9999-4999-8999-999999999999")
+                .join("snap.txt"),
+            b"[redacted]",
         );
+        let units = run(home);
+        let u = units
+            .iter()
+            .find(|u| u.relative_path == "file-history/(unlinked-file-history)")
+            .expect("orphan file-history is reported, never dropped");
+        assert!(u.protected);
+        assert_eq!(u.action, AgentActionCapability::None);
+        assert_eq!(u.members.len(), 1);
     }
 
     #[test]
@@ -912,6 +966,7 @@ mod tests {
         // transcripts). This is a cost *bound* assertion, not a formal
         // benchmark; see .oh/sessions/2026-09-21-agent-storage-claude-code.md
         // for the measured number this test's threshold is derived from.
+        let _serial = measured_serial();
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let repo = home.join("big-repo");
@@ -927,7 +982,7 @@ mod tests {
             touch(&jsonl, content.as_bytes());
         }
         let start = SystemTime::now();
-        let units = identify(home, 1);
+        let units = run(home);
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!("[measured] identify() over 500 synthetic sessions took {elapsed:?}");
         assert_eq!(
@@ -941,5 +996,243 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "identifying 500 sessions took {elapsed:?}, expected well under 10s from bounded reads"
         );
+    }
+
+    // --- the five contract tests ---------------------------------------
+
+    #[test]
+    fn unknown_format_is_explicit_not_empty() {
+        // A home this adapter has no rule for is never an empty vec and
+        // never re-interpreted as some other tool's layout: an unknown
+        // top-level entry becomes the `(unclassified residual)` row
+        // naming it, and a project-directory entry that is not a session
+        // becomes its own unit saying exactly that.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("some-future-file.json"), b"{}");
+        touch(
+            &home
+                .join("projects")
+                .join("-x")
+                .join("some-future-companion")
+                .join("data.bin"),
+            b"\x00\x01",
+        );
+        let units = run(home);
+        assert!(
+            !units.is_empty(),
+            "an unrecognized layout must still surface units"
+        );
+
+        let residual = units
+            .iter()
+            .find(|u| u.relative_path == "(unclassified residual)")
+            .expect("residual unit present");
+        assert_eq!(residual.category, AgentCategory::Unclassified);
+        assert!(
+            residual
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("some-future-file.json"),
+            "the residual must name what it could not classify: {:?}",
+            residual.note
+        );
+
+        let orphan = units
+            .iter()
+            .find(|u| u.relative_path == "projects/-x/some-future-companion")
+            .expect("an unrecognized project-directory entry is still a unit");
+        assert!(
+            orphan
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no matching session transcript"),
+            "{:?}",
+            orphan.note
+        );
+        assert!(
+            units.iter().all(|u| u.category != AgentCategory::Sessions),
+            "an unrecognized entry must never be guessed into a session"
+        );
+    }
+
+    #[test]
+    fn canary_content_never_appears_in_output() {
+        let canary = "CANARY-CLAUDE-CODE-DO-NOT-LEAK-91ab";
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("canary-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let session_id = "88888888-8888-4888-8888-888888888888";
+        let proj_dir = home.join("projects").join("-canary-repo-encoded");
+        // The canary is seeded on the header line this adapter *does*
+        // read, and again in the body it must never reach.
+        let mut content = session_line(&repo.display().to_string(), canary);
+        content.push_str(&format!(
+            "{{\"role\":\"assistant\",\"text\":\"{canary}\"}}\n"
+        ));
+        content.push_str(&format!("more body: {canary}\n"));
+        touch(
+            &proj_dir.join(format!("{session_id}.jsonl")),
+            content.as_bytes(),
+        );
+        touch(
+            &home.join("file-history").join(session_id).join("snap.txt"),
+            format!("{canary}\n").as_bytes(),
+        );
+        touch(
+            &home.join("history.jsonl"),
+            format!("{canary}\n").as_bytes(),
+        );
+
+        let units = run(home);
+        assert!(!units.is_empty());
+        contract::no_content_leak(&units, canary);
+    }
+
+    #[test]
+    fn identification_reads_no_more_than_header_cap() {
+        // Several large transcripts: the per-session cost is one capped
+        // header read, so the measured byte total is far below the
+        // fixture's own size and within the shared cap.
+        const SESSIONS: usize = 20;
+        const BODY_BYTES: usize = 300_000;
+        let _serial = measured_serial();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("cap-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let proj_dir = home.join("projects").join("-cap-repo-encoded");
+        let mut fixture_bytes = 0u64;
+        for i in 0..SESSIONS {
+            let session_id = format!("aaaaaaaa-aaaa-4aaa-8{i:03}-aaaaaaaaaaaa");
+            let mut content = session_line(&repo.display().to_string(), "unread-canary");
+            content.push_str(&"x".repeat(BODY_BYTES));
+            fixture_bytes += content.len() as u64;
+            touch(
+                &proj_dir.join(format!("{session_id}.jsonl")),
+                content.as_bytes(),
+            );
+        }
+
+        let (units, counters) = contract::measured(|| run(home));
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::Sessions)
+                .count(),
+            SESSIONS
+        );
+        assert!(
+            counters.header_bytes_read > 0,
+            "the declared cwd has to be read from somewhere on a first pass"
+        );
+        assert!(
+            counters.header_bytes_read < fixture_bytes,
+            "identification read {} of the fixture's {fixture_bytes} bytes; transcripts are \
+             never read whole",
+            counters.header_bytes_read
+        );
+        // One capped read per session is 20 x 8 KiB = 160 KiB against a
+        // ~6 MiB fixture. The factor of two is slack for the
+        // process-global counter, which a concurrently running test in
+        // another module can also add to; the point being proven is the
+        // order of magnitude, not an exact syscall total.
+        assert!(
+            counters.header_bytes_read <= 2 * (SESSIONS as u64) * HEADER_READ_BYTES as u64,
+            "this adapter's own per-session cap is {HEADER_READ_BYTES} bytes, and it read {}",
+            counters.header_bytes_read
+        );
+        // And within the shared ceiling every adapter is held to.
+        const { assert!(HEADER_READ_BYTES <= bounded_io::MAX_HEADER_BYTES) };
+        contract::within_header_cap(counters, SESSIONS as u64);
+    }
+
+    #[test]
+    fn protected_categories_default_protected() {
+        // Claude Code has real default-protected units: credentials,
+        // settings, keybindings, themes and rules all land in
+        // `ProtectedConfig`, so the shared assertion has material to
+        // work with rather than a hand-built stand-in.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(&home.join("settings.json"), b"{}");
+        touch(&home.join(".credentials.json"), b"[redacted]");
+        touch(&home.join("keybindings.json"), b"{}");
+        touch(&home.join("themes").join("dark.json"), b"{}");
+        touch(&home.join("rules").join("house-style.md"), b"# rules");
+        // A cache alongside them, so the helper also proves the default
+        // does not spill onto categories that are meant to be actionable.
+        touch(&home.join("shell-snapshots").join("snap.sh"), b"alias x=y");
+
+        let units = run(home);
+        contract::protection_defaults_hold(&units);
+        assert_eq!(
+            units
+                .iter()
+                .filter(|u| u.category == AgentCategory::ProtectedConfig)
+                .count(),
+            5,
+            "settings, credentials, keybindings, themes, rules"
+        );
+        let cache = units
+            .iter()
+            .find(|u| u.relative_path == "shell-snapshots")
+            .expect("cache unit present");
+        assert!(!cache.protected);
+        assert_eq!(cache.action, AgentActionCapability::CacheOrLogTrash);
+    }
+
+    #[test]
+    fn project_link_is_declared_or_unresolved_never_basename_guess() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+
+        // (a) A session whose own metadata declares a real worktree.
+        let declared_repo = home.join("declared-repo");
+        fs::create_dir_all(declared_repo.join(".git")).unwrap();
+        let linked_id = "12121212-1212-4121-8121-121212121212";
+        let linked_jsonl = home
+            .join("projects")
+            .join("-declared-repo")
+            .join(format!("{linked_id}.jsonl"));
+        touch(
+            &linked_jsonl,
+            session_line(&declared_repo.display().to_string(), "x").as_bytes(),
+        );
+
+        // (b) A session sitting in a directory *named* after a real git
+        // checkout, declaring nothing. The encoded directory name is not
+        // reversible to a path, so the only honest answer is Unresolved.
+        let tempting = home.join("basename-only-repo");
+        fs::create_dir_all(tempting.join(".git")).unwrap();
+        let unresolved_id = "13131313-1313-4131-8131-131313131313";
+        let unresolved_jsonl = home
+            .join("projects")
+            .join("-basename-only-repo")
+            .join(format!("{unresolved_id}.jsonl"));
+        touch(&unresolved_jsonl, b"{\"type\":\"user\"}\n");
+
+        let units = run(home);
+
+        let linked = units.iter().find(|u| u.path == linked_jsonl).unwrap();
+        match &linked.project_link {
+            ProjectLinkState::Linked { source, .. } => {
+                assert_eq!(*source, crate::agents::LinkSource::Declared)
+            }
+            other => panic!("a declared cwd must resolve to a link, got {other:?}"),
+        }
+
+        let unresolved = units.iter().find(|u| u.path == unresolved_jsonl).unwrap();
+        match &unresolved.project_link {
+            ProjectLinkState::Unresolved { reason } => {
+                assert!(reason.contains("cwd"), "{reason}")
+            }
+            other => panic!("a session declaring nothing must be Unresolved, got {other:?}"),
+        }
+
+        contract::linkage_is_declared_or_explicit(&units, "basename-only-repo");
     }
 }

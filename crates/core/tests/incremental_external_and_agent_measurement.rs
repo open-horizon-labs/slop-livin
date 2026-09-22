@@ -138,20 +138,30 @@ fn a_large_agent_home_reads_headers_once_and_not_again() {
         first.header_bytes_read, first.dirs_listed, second.header_bytes_read, second.dirs_listed
     );
 
-    // MEASURED GAP, recorded rather than claimed fixed. Header reads now
-    // go through one counted, capped reader, which is what makes this
-    // number exist at all -- but the per-session identification cache
-    // that would make an unchanged pass cost *zero* headers is not built
-    // yet, because it has to arrive with the `AgentAdapter` trait rather
-    // than be threaded through fifteen adapters by hand. The assertion
-    // below is therefore the honest one; the strict `== 0` form, and the
-    // number it must replace, are in the "still open" section of
-    // `.oh/sessions/2026-09-21-foundation-repairs.md`.
+    // THE CLOSED GAP. The previous repair measured, and recorded,
+    // 740 KB of header reads on an *unchanged* second pass over this
+    // fixture -- every one of the 5,000 sessions re-read to re-derive a
+    // `cwd` that had not moved. The identification cache arrived with
+    // the `AgentAdapter` trait, keyed on each session file's own
+    // `(len, mtime_ns, ctime_ns, inode)` plus the adapter version, so an
+    // unchanged session is a table lookup.
+    //
+    // This assertion is strict on purpose. "Fewer" would pass with a
+    // cache that worked for four sessions in five, and the number this
+    // replaces was exactly the kind of "bounded reads are enough" claim
+    // the review rejected.
     assert_eq!(
-        second.header_bytes_read, first.header_bytes_read,
-        "until the identification cache lands, an unchanged pass costs the same header reads as \
-         the first; a *different* number here means something changed and this test must be \
-         re-read rather than adjusted"
+        second.header_bytes_read, 0,
+        "an unchanged agent home must cost zero header bytes: {} sessions, {} bytes on the \
+         first pass, {} on the second",
+        SESSIONS, first.header_bytes_read, second.header_bytes_read
+    );
+    assert!(
+        second.identification_cache_hits >= SESSIONS as u64,
+        "every session must be answered from the cache, not merely skipped: {} hits over {} \
+         sessions",
+        second.identification_cache_hits,
+        SESSIONS
     );
 }
 
@@ -185,13 +195,19 @@ fn appending_one_session_reads_exactly_one_header() {
         third.header_bytes_read > 0,
         "the new session's header must be read"
     );
-    // Whatever the caching story, every header read is capped: that is
-    // the privacy bound, and it holds today.
-    let reads = (SESSIONS + 1) as u64;
+    // Exactly one header read: the appended session, and nothing else.
+    // The bound is one capped read, not `SESSIONS + 1` of them -- the
+    // weaker form would have passed while every unchanged session was
+    // still being re-read.
     assert!(
-        third.header_bytes_read <= reads * swamp_core::agents::bounded_io::MAX_HEADER_BYTES as u64,
-        "every header read is bounded by the shared cap: {} bytes over at most {reads} reads",
+        third.header_bytes_read <= swamp_core::agents::bounded_io::MAX_HEADER_BYTES as u64,
+        "one appended session costs one capped header read; {} bytes means the unchanged \
+         sessions were re-read too",
         third.header_bytes_read
+    );
+    assert_eq!(
+        third.identification_cache_misses, 1,
+        "exactly one derivation may miss the cache: the session that is actually new"
     );
 }
 
