@@ -4,6 +4,7 @@ severity: hard
 statement: "A Supported row in the agent support matrix cites an upstream file at a pinned commit (or a documentation page at a retrieval date), that file is vendored as a minimal excerpt with its blake3 digest, CI greps the excerpt for every symbol the claim depends on, and no prose paragraph asserts doubt about a tool its own row lists as supported."
 outcome: decision-relevant-storage-evidence
 audit: none
+audit_none_reason: "2026-09-22: the claim is about upstream files and vendored excerpts, not about this workspace's source, so no source audit can check it; the runtime tests below do, offline, on every run"
 runtime_tests:
   - crates/core/tests/upstream_citations_are_checked.rs
   - crates/core/tests/agent_matrix_matches_docs.rs::no_prose_paragraph_asserts_doubt_a_supported_row_has_resolved

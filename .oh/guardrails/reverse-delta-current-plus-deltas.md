@@ -10,4 +10,10 @@ audit: reverse_delta_current_plus_deltas
 Reverse deltas make the latest state a single read and history a replay backwards, which is what a sparkline or a growth window needs. The DuckDB→Go port once discarded this design; it does not get discarded again.
 
 ## Detection
-`observe_and_annotate`, `observe_and_annotate_dirs` and `observe_and_annotate_files` each write both the current path and a delta path. AST audit `reverse_delta_current_plus_deltas`.
+
+A history writer is derived: a function that computes a current-table path and is in the destructive set. It must honour a call to a delta-path helper. Every `observe_and_annotate*` reaches both a current-table and a delta-path helper.
+
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `reverse_delta_current_plus_deltas/01-no-delta-append`, `reverse_delta_current_plus_deltas/02-delta-only-no-current`, `reverse_delta_current_plus_deltas/03-files-history-loses-both`, `reverse_delta_current_plus_deltas/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+

@@ -14,18 +14,11 @@ expensive checks too; both review and execution belong on background workers.
 
 ## Detection
 
-The `syn` AST audit starts at `event_loop`, key dispatchers and `draw`, follows
-local free functions and methods across TUI source files, and rejects synchronous
-marking, proposal, execution, free-space probes, sleep and blocking channel waits.
-Ordinary closures remain in scope. Only a literal `std::thread::spawn` closure
-is excluded; expressions constructing its argument are still checked. Renamed
-imports and function-path references are followed. Missing entry points fail.
+From every TUI entry point (the required ones, and every function named for key handling, the event loop or drawing), follow exactly resolved calls and value references, never into a `thread::spawn` closure. A TUI function blocks if it builds a subprocess, sleeps, waits on a channel or child, or joins a worker; a core callee blocks if it is in the closure of those plus traversal (stopped at the capped `shallow_list`). Calls inside macro arguments are calls.
 
-Run `cargo run -p swamp-source-audit -- tui_actions_off_event_thread`.
-The same repository check runs under `cargo test -p swamp-source-audit`, so the
-existing workspace test/release workflow executes it. Negative fixtures cover
-direct calls, helper indirection, ordinary closures, renamed imports, function
-references, blocking receives, eager spawn arguments and immediate handle joins.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `tui_actions_off_event_thread/01-probe-path-per-keystroke`, `tui_actions_off_event_thread/02-command-output-on-event-path`, `tui_actions_off_event_thread/03-aliased-blocking-report`, `tui_actions_off_event_thread/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Limits and runtime checks
 

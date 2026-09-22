@@ -21,16 +21,11 @@ user sees a number move on a disk where nothing moved.
 
 ## Detection
 
-- `growth.rs` must define `ObservationOwnership` (family +
-  covered_roots), and `observe_and_annotate_external` must take it.
-- The statement that sets `present = false` must be preceded in the
-  token stream by an `ownership.owns(..)` (or `ownership.covers(..)`)
-  guard.
-- No function anywhere in `crates/{core,cli,tui}/src` may construct a
-  wildcard ownership (`ObservationOwnership::all()`/`::wildcard()`).
+Every tombstone anywhere (see `coverage_changes_are_not_storage_changes` for the recognition) must be inside an ownership condition; a function that sweeps under an `ObservationOwnership` verdict must be handed the window as a parameter; no wildcard window is constructed.
 
-**Limits.** The audit proves a guard exists before the tombstone, not
-that `owns` is implemented correctly; the runtime tests carry that.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `history_sweeps_are_owned/01-discarded-ownership`, `history_sweeps_are_owned/02-guard-not-the-condition`, `history_sweeps_are_owned/03-wildcard-ownership`, `history_sweeps_are_owned/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

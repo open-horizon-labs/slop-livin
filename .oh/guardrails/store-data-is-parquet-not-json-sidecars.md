@@ -20,17 +20,11 @@ syntax.
 
 ## Detection
 
-Every string literal ending in `.json`, `.jsonl` or `.json.zst` in
-`crates/core/src` and `crates/tui/src` must name one of
-`STORE_CONTROL_FILES`: grants, the ledger, the last-run marker, the
-FSEvents cursor, topology, the Docker facts cache, the unowned cache, UI
-state, the scope snapshot, the protect list, a Trash envelope's
-`restore.json`, and the compressed last-report cache. Paths built by
-`format!` (plan files, `plans/<id>.json`) are exempt.
+For every write anywhere (a primitive, or an exact call to a local writer), the names that make up the written path -- literals in the path argument, in the bindings it derives from, in the local path helpers either calls, and in the constants they name -- must not be a JSON file other than the small control files and patterns.
 
-**Limits.** A literal-based check; a filename assembled from fragments
-would slip past it. The runtime test walks the actual store directory,
-which is the real guarantee.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `store_data_is_parquet_not_json_sidecars/01-format-sidecar`, `store_data_is_parquet_not_json_sidecars/02-plain-sidecar`, `store_data_is_parquet_not_json_sidecars/03-jsonl-sidecar`, `store_data_is_parquet_not_json_sidecars/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

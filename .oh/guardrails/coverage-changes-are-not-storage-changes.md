@@ -34,21 +34,11 @@ are enabled. That is a validation hypothesis, not a claim of completed checks.
 
 ## Detection
 
-AST audit `coverage_changes_are_not_storage_changes`, added 2026-09-22:
+Every tombstone (`.present = ` a value that is not provably `true`, including through a `&mut` binding) and every regrowth bump (`.regrowth_count += n`, `= .. + n`, or a binding computed that way) anywhere must sit inside a condition that makes the row this observation's: an `ObservationOwnership` verdict method, a negated membership test on a region the caller declared unconfirmed (a parameter), or, for a regrowth, a keyed lookup of an observed row. `ObservationOwnership` has `excluded_subtrees` and `covers` reads it.
 
-- every statement that writes `present = false` or `regrowth_count + 1`
-  in `growth.rs`, `external.rs`, `report.rs` or `agents/**` must sit in a
-  function that also carries an ownership guard for the family it writes
-  (`ObservationOwnership::owns`/`covers` for the external/agent family,
-  `protected_worktree_ids.contains` for the artifact-row family); and
-- `ObservationOwnership` must carry `excluded_subtrees` and `covers` must
-  consult it. A window that is only a path-prefix test cannot express
-  "inside a covered root, outside this pass", which is exactly how a
-  config-only exclusion under a measured parent got tombstoned.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `coverage_changes_are_not_storage_changes/01-unguarded-tombstone`, `coverage_changes_are_not_storage_changes/02-discarded-ownership-answer`, `coverage_changes_are_not_storage_changes/03-aliased-tombstone-helper`, `coverage_changes_are_not_storage_changes/04-sweep3`.
 
-**Limits.** The audit reads which guard is present in the same function,
-not whether the guard's *argument* is the right region. The runtime family
-below is what proves the semantics.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

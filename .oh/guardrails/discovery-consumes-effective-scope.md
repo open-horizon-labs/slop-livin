@@ -23,24 +23,11 @@ exclusion it refuses.
 
 ## Detection
 
-- No function in `external.rs` or `crates/core/src/agents/**` may
-  reference `LocationStatus::Resolved`, `scope.detectors` or
-  `summary.locations`.
-- `scope.rs` must define `EffectiveScope::authorized_roots()`, and both
-  `external.rs` and `agents/mod.rs` must call it (or its explicit-root
-  companion).
+The discovery region is derived: the modules (and child modules) exactly reachable from `external::discover_and_measure` and `agents::discover_and_measure`, plus the adapters, less the modules that define or produce raw detector output. No function there reads a field that holds raw detector output wholesale (derived from the field types: collections of `DetectorSummary`/`ProposedLocation`), whatever the binding is called, or names a `LocationStatus` variant; both discovery passes reach `EffectiveScope::authorized_roots()`.
 
-**Limits.** The audit proves the *seam* is used, not that the seam's
-semantics are right; `scope.rs`'s own tests and the reviewer
-counterexamples carry that. The 2026-09-22 re-review's CE1 is what that
-limit cost: `authorized_detector_paths_in_explicit_roots` tested
-exclusion only against roots whose *status* was `Excluded`, and under
-`--root <parent>` an excluded home is not a root at all but a
-`PruneNote` inside the explicit root — so `swamp report --root ~` offered
-an excluded agent home's contents for removal. Both entry points now
-route every exclusion decision through the one
-`EffectiveScope::exclusion_for` helper, so explicit and configured scope
-cannot diverge again.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `discovery_consumes_effective_scope/01-raw-detector-candidates`, `discovery_consumes_effective_scope/02-resolved-status-in-an-adapter`, `discovery_consumes_effective_scope/03-summary-locations-one-file-away`, `discovery_consumes_effective_scope/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

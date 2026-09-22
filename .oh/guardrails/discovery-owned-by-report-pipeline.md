@@ -18,14 +18,11 @@ safe; a single pass makes the question not arise.
 
 ## Detection
 
-Three checks, all on non-test code:
+The set of production callers of either discovery pass must be exactly one function, and it must call both. No owner is named: a second caller anywhere, including in the owner's own module, fails.
 
-1. Both `discover_and_measure` functions still exist.
-2. `report.rs::observe_scope` calls **both** of them. Splitting them
-   back into separate observations is how their ownership windows could
-   disagree again, so one owner that runs only one pass fails.
-3. No other function in `crates/core/src`, `crates/cli/src` or
-   `crates/tui/src` calls either.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `discovery_owned_by_report_pipeline/01-second-discovery-pass-in-the-cli`, `discovery_owned_by_report_pipeline/02-second-agent-pass-in-the-tui`, `discovery_owned_by_report_pipeline/03-second-pass-inside-core`, `discovery_owned_by_report_pipeline/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Why this checks call sites and not visibility
 

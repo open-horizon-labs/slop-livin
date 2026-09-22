@@ -21,20 +21,9 @@ guardrail is deliberately kept consistent with.
 
 ## Detection
 
-`human_only_authorization` in `crates/source-audit` parses every `.rs`
-file under `crates/core/src`, `crates/cli/src`, and `crates/tui/src`
-(skipping `crates/core/src/actions.rs` itself, where `approve`/
-`add_standing_grant`/`revoke_grant` are defined and their internal
-`write_grants` wiring is expected) and fails if any function other than
-`cmd_approve`, `cmd_grant_add`, `cmd_grant_revoke`
-(`crates/cli/src/main.rs`) or `execute_one`
-(`crates/tui/src/actions.rs`) calls `actions::approve`,
-`actions::add_standing_grant`, or `actions::revoke_grant`. Adding a new
-call site anywhere else in the workspace fails the audit; adding one
-inside the CLI's or TUI's existing allowed functions is expected and
-passes.
+No production function outside the sinks' own module reaches `actions::approve`, `add_standing_grant` or `revoke_grant` -- by resolved call, re-export (including a local shim module) or value reference -- except the reviewed callers, each of which must still exist.
 
-Unit tests for both the accept and reject paths, plus a
-self-check against the real repository, live in
-`crates/source-audit/src/audits.rs` under
-`human_only_authorization_tests`.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `human_only_authorization/01-aliased-grant-mint`, `human_only_authorization/02-unlisted-caller`, `human_only_authorization/03-moved-one-file-away`, `human_only_authorization/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+

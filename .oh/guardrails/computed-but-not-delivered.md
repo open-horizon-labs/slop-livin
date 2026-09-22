@@ -24,24 +24,11 @@ violates.
 
 ## Detection
 
-AST audit `computed_but_not_delivered`. For every `pub` struct field on a
-delivered-surface type (`artifact.rs`, `external.rs`, `report.rs`,
-`agents/mod.rs`) whose declared type mentions `Evidence`:
+Delivered surfaces are derived: the modules defining the types reachable, through field types, from what `bus::run_report` and `report::observe_scope` return, and their child modules; every public struct in one of them that is serialized or carries an evidence-vocabulary field. A public field whose every struct-literal initializer (including inside macros) is empty and that nothing mutates is written only as a default; a `skip_serializing_if` field must be read somewhere.
 
-- every initializer that field is ever given, anywhere in
-  `crates/{core,cli,tui}/src`, is collected; if all of them are empty
-  (`Vec::new()`, `vec![]`, `Default::default()`, `None`) and no site ever
-  assigns/extends/pushes to it, the audit fails naming the field; and
-- if the field *is* computed but no delivery file (`render.rs`,
-  `agent_json.rs`, `report.rs`, `cli/src/main.rs`) mentions it, the audit
-  fails: a populated struct field nobody renders is a defect.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `computed_but_not_delivered/01-empty-default-only`, `computed_but_not_delivered/02-populated-but-hidden-and-unread`, `computed_but_not_delivered/03-aliased-evidence-type`, `computed_but_not_delivered/04-sweep3`.
 
-**Limits.** Scoped to evidence-typed fields. That is the surface the
-#53-#59 matrix promises row by row and the surface two reviews found holes
-in; it keeps the rule mechanical rather than guessing at every field in
-the crate. A field a delivery file merely *mentions* counts as delivered,
-so the frame goldens and render snapshots below are still what prove the
-value reaches a human.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

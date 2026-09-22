@@ -26,22 +26,11 @@ static registry. Adapters follow.
 
 ## Detection
 
-1. No adapter module references another by path (`super::<adapter>::`,
-   `crate::agents::<adapter>::`). `vscode_family.rs`, `pi_family.rs` and
-   `bounded_io.rs` are neutral helpers that name no tool and are exempt.
-2. Outside the registry, no function in `agents/mod.rs`, `actions.rs` or
-   `crates/tui/src/**` may `match` on a `*_TOOL_ID` constant.
-3. Every adapter module is registered in `agents/registry.rs` exactly
-   once (module set ↔ registration set equality). The count matches
-   `<module> :: Adapter` on a *path-segment* boundary: a naive substring
-   count reported `pi` as registered twice, because `pi::Adapter` occurs
-   inside `oh_my_pi::Adapter`. Precision, not a relaxation — the check
-   still fails on zero registrations and on two.
-4. The registry's ids and `agents::matrix`'s ids are the same set.
+The tool modules are derived. No tool module (or a child module of one) reaches another by resolved call, value reference, re-export, item-level path or written path; nothing outside the registry and the catalog matches on a tool id (a `match` arm naming one, or two ids named in one function), by constant or by the value it holds; the registry names each tool module's `Adapter` exactly once; the catalog exposes tool ids.
 
-**Limits.** Check 2 is "contains a match and the constant", so a
-tool-id match spelled without the constant would slip past; check 4
-compares id *sets*, not capabilities, which the matrix↔docs test covers.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_pluggable/01-adapter-names-another-adapter`, `agent_adapters_are_pluggable/02-central-tool-id-match`, `agent_adapters_are_pluggable/03-duplicate-registration`, `agent_adapters_are_pluggable/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## What replaced the matches
 

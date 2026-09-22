@@ -17,13 +17,11 @@ real tool home.
 
 ## Detection
 
-No adapter module may reference `std::env`, `env::var`, `dirs::` or
-`home_dir`, nor contain the string literal `"HOME"` or a literal
-beginning `/Users/` or `/home/`.
+No adapter function is in the derived environment-reading set (any function that transitively calls `std::env::*`, `dirs::*`, `home::*` or a `home_dir`), and no adapter function or item-level declaration holds a hardcoded home (`"HOME"`, `/Users/`, `/home/`). Adapters include the shared family modules (`vscode_family`, `pi_family`, `bounded_io`).
 
-**Limits.** A helper that reads the environment on the adapter's behalf
-would need to live in a non-adapter module, where it is visible and
-reviewable.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_environment_free/01-aliased-env-var`, `agent_adapters_are_environment_free/02-plain-env-var`, `agent_adapters_are_environment_free/03-hardcoded-home-literal`, `agent_adapters_are_environment_free/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

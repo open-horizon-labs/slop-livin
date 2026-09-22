@@ -20,14 +20,11 @@ can be added in one place.
 
 ## Detection
 
-No function in `consumer_wiring.rs`, `recovery.rs`,
-`external_associations.rs`, `report.rs`, `crates/cli/src/**` or
-`crates/tui/src/**` may reference a `*_DETECTOR_ID` constant. The
-`Detector` trait must declare `manager_conventions()`.
+Detector ids are derived: the constants a `Detector::id()` returns, with their values. Outside the detector implementations' modules, the trait's module and the scope interpreters, no function or item names a detector-id constant, and no function dispatches on two or more detector-id values (match arms or `==` comparisons). The `Detector` trait declares `manager_conventions()`.
 
-**Limits.** Bare id *string literals* ("cargo-home") are not caught by
-the constant check; the capability requirement is what removes the need
-for them.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `detector_ids_only_in_registry/01-wiring-matches-a-detector-id`, `detector_ids_only_in_registry/02-cli-matches-a-detector-id`, `detector_ids_only_in_registry/03-tui-matches-a-detector-id`, `detector_ids_only_in_registry/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

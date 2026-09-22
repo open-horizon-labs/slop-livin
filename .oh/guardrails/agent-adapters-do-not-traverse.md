@@ -17,11 +17,11 @@ rather than quietly re-adding the cost.
 
 ## Detection
 
-No adapter module may reference `fs::read_dir`, `read_dir(`, `walkdir`,
-`jwalk` or `resize_artifact*`.
+No adapter function is in the derived traversal set (every function that transitively calls `read_dir`, `walkdir`, `jwalk`), with the closure stopped only at the bounded primitives -- `locations::shallow_list` (named with `SHALLOW_LIST_CAP`) and `folded_measurement::folded_bytes_bounded_stamped` (named with `max_entries`), each of which must name and stop on its cap and do nothing beyond its one bounded operation -- and at the declared-project handoff (functions returning `ProjectLinkState`, which resolve a path read out of a header through the walker's own identity code and may not traverse themselves).
 
-**Limits.** Same as the sibling guardrail: a syscall-shape check, not
-proof that folded rows are reused. Work counters prove the reuse.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_do_not_traverse/01-aliased-read-dir`, `agent_adapters_do_not_traverse/02-plain-read-dir`, `agent_adapters_do_not_traverse/03-walkdir`, `agent_adapters_do_not_traverse/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

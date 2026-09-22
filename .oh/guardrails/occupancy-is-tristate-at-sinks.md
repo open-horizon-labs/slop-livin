@@ -16,16 +16,11 @@ cannot distinguish "checked, nothing open" from "could not check", and
 
 ## Detection
 
-- `occupancy.rs` must define `OccupancyState` with `Free`, `Occupied`
-  and `Unknown` variants.
-- `actions.rs`, `cargo_cleanup.rs` and `crates/tui/src/actions.rs` must
-  not call the boolean `occupancy::occupied(` or `agents::is_active(`.
-- No empty `Unknown` arm (`Unknown(_) => {}` and its spellings) in those
-  files.
+`OccupancyState` has `Free`, `Occupied` and `Unknown`; no function consumes a boolean occupancy answer (derived: `bool` functions over the tri-state or the probe); no `member_occupancy` answer is discarded; every arm covering `Unknown` refuses; no `matches!`, `==`/`!=` or `if let` that names `Occupied` without `Unknown` collapses the tri-state.
 
-**Limits.** The audit rejects the *empty* `Unknown` arm; it cannot tell
-a refusal from an arm that merely logs. Statement-level review and the
-runtime test cover the rest.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `occupancy_is_tristate_at_sinks/01-discarded-occupancy`, `occupancy_is_tristate_at_sinks/02-boolean-at-a-sink`, `occupancy_is_tristate_at_sinks/03-unknown-falls-through`, `occupancy_is_tristate_at_sinks/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

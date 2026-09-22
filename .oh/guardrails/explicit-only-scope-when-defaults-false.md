@@ -21,16 +21,11 @@ rejected the earlier reading outright (dated correction in
 
 ## Detection
 
-`ScanConfig` must have an `enabled_detectors` field; `scope.rs` must
-define `detectors_permitted(config)`; and `resolve_effective_scope` must
-call it to guard detector inference.
+Every definition of `detectors_permitted` reads `defaults` and `enabled_detectors`. Every function that takes the config type (derived: the `*Config` with `enabled_detectors`) and returns the effective scope, or produces roots by detector inference (reaching a `Detector` implementation) or by listing, must reach the predicate. The two named semantics tests are parsed, running and asserting.
 
-**Limits.** Semantics cannot be proved from the AST — a
-`detectors_permitted` that always returned `true` would pass the
-structural half. The audit therefore also requires two tests to exist by
-name, and CI runs them:
-`crates/core/src/scope.rs::tests::defaults_false_without_includes_or_enabled_detectors_is_empty`
-and the reviewer's `defaults_false_must_mean_explicit_only`.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `explicit_only_scope_when_defaults_false/01-reviewer-test-deleted`, `explicit_only_scope_when_defaults_false/02-second-resolver-without-the-guard`, `explicit_only_scope_when_defaults_false/03-permission-predicate-always-true`, `explicit_only_scope_when_defaults_false/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

@@ -10,9 +10,10 @@ audit: symlinks_never_followed
 Following symlinks double-counts bytes and can loop. Symlinks are either optimized (counted once by inode) or discarded; they are never traversed.
 
 ## Detection
-AST audit `symlinks_never_followed`, over `walk.rs` and `attribution.rs`:
-1. no call to `fs::metadata` (follows links; `symlink_metadata` does not);
-2. no `is_dir()` / `is_file()` / `exists()` on a path expression (`entry.path().is_dir()`, `x.join(y).exists()` stat through the link);
-3. in every directory loop, a discard guard (an `if` naming `is_symlink` that ends in `continue`/`return`) is a top-level statement at or before the first statement that descends on `is_dir`.
 
-Proven by `scripts/audit-mutants.sh`: replacing `symlink_metadata` with `metadata`, deleting the loop guard, deciding `is_dir` on `entry.path()`, and moving the descent above the guard each fail this audit.
+Anywhere: no size is taken from a following `fs::metadata`, and nothing canonicalizes a child (`.join(..)`) path. In every function that lists a directory: no following stat of a listed entry, and no `is_dir`/`is_file`/`exists` on a `.path()` or a `.join(..)`.
+
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `symlinks_never_followed/01-aliased-metadata`, `symlinks_never_followed/02-plain-metadata`, `symlinks_never_followed/03-canonicalize-a-child`, `symlinks_never_followed/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+

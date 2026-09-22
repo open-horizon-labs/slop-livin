@@ -42,37 +42,11 @@ any name.
 
 ## Detection
 
-Three checks in `crates/source-audit`:
+`agents::protection_conflict` tests containment in both directions; every function that persists the protect list goes through `agents::write_atomic`; every function that loads the list and does not manage it reaches the predicate; no loader's error is turned into an empty list (resolved, so an alias is still the loader); in modules that define an execution or proposal entry point, a verdict-returning path-containment test must be, or reach, the one predicate.
 
-1. `agents::protection_conflict` (or `is_human_protected`) must contain
-   both containment tests — `candidate.starts_with(p)` and
-   `p.starts_with(candidate)`. Removing either direction fails.
-2. **One predicate only.** Any top-level `fn` in
-   `crates/{core,cli,tui}/src` whose name contains `protect` and which
-   returns `bool` or `Option<_>` must call `protection_conflict(` in its
-   own body. A second predicate with its own inlined logic is rejected
-   by name. This is the check the integration owner's mutation escaped.
-3. `protect_add` and `protect_remove` must reach a function named
-   `write_atomic` (temp file + rename), following calls transitively
-   within `agents/mod.rs`.
-4. No function anywhere in `crates/{core,cli,tui}/src` may follow a
-   `load_protect(`/`protect_list(` call with `.unwrap_or_default()`,
-   `.unwrap_or(`, `.unwrap_or_else(` or `.ok()` within the next 120
-   tokens.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `protection_fails_closed/01-one-directional-helper`, `protection_fails_closed/02-discarded-error`, `protection_fails_closed/03-aliased-discard`, `protection_fails_closed/04-sweep3`.
 
-**Limits.**
-
-- Check 2 matches on the function *name* containing `protect` and on a
-  `bool`/`Option` return. A predicate named something else entirely
-  (`fn keeps(..) -> bool`) would not be seen. That is a real gap, and
-  the runtime tests below are what close it: they exercise the
-  containing-descendant case through the actual proposal paths, so a
-  second predicate that got the direction wrong would fail them
-  wherever it lived.
-- Check 4 is a bounded textual window after the call, so an error
-  discarded several statements later through an intermediate binding is
-  not caught; `scripts/check.sh` adds a grep layer for
-  `unwrap_or_default()` on any line mentioning `protect`.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

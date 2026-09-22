@@ -19,12 +19,11 @@ told the answer.
 
 ## Detection
 
-Within an adapter, every `locations::<ident>` reference must name one of
-`StorageCategory`, `Platform`, `Provenance`.
+No adapter function's signature or body, and no adapter item-level declaration (const, static, type alias, field), names a path into `locations::` other than the shared vocabulary -- derived as the `locations` data types that the shared agent model's own fields carry -- and the bounded lister. A detector module, a detector id, the `Detector` trait, `Environment` and `Registry` are detector identity.
 
-**Limits.** Re-exports could launder a detector id through another
-module; the sibling `detector_ids_only_in_registry` audit covers the
-consumer side of the same rule.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_do_not_reach_detectors/01-adapter-reads-detector-ids`, `agent_adapters_do_not_reach_detectors/02-adapter-names-a-detector-type`, `agent_adapters_do_not_reach_detectors/03-aliased-locations-reach`, `agent_adapters_do_not_reach_detectors/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

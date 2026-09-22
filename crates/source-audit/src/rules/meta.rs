@@ -186,8 +186,19 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
                     ));
                 }
                 for t in runtime {
-                    let fn_name = t.rsplit("::").next().unwrap_or(&t).to_string();
-                    if !tests.contains(&fn_name) {
+                    // `path/to/test.rs` (a test file with at least one
+                    // running, asserting test) or `path/to/test.rs::name`.
+                    let (file, name) = match t.split_once(".rs::") {
+                        Some((f, n)) => (format!("{f}.rs"), Some(n.to_string())),
+                        None if t.ends_with(".rs") => (t.clone(), None),
+                        None => (String::new(), Some(t.rsplit("::").next().unwrap_or(&t).to_string())),
+                    };
+                    let ok = match (&file, &name) {
+                        (f, Some(n)) if !f.is_empty() => integration_test_exists(root, f, n),
+                        (f, None) => std::fs::read_to_string(root.join(f)).ok().and_then(|text| crate::ast::parse_cached(f, &text).ok()).is_some_and(|ast| test_fns(&ast).iter().any(|(_, ig, asserts)| !ig && *asserts)),
+                        (_, Some(n)) => tests.contains(n),
+                    };
+                    if !ok {
                         problems.push(format!("{rel}: runtime test `{t}` is not a running, asserting #[test]"));
                     }
                 }

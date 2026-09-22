@@ -28,20 +28,11 @@ keeps a fourth sink from being written without it.
 
 ## Detection
 
-For every function in `actions.rs`, `cargo_cleanup.rs` and `docker.rs`
-whose body contains a destructive call (`fs::rename`, `remove_file`,
-`remove_dir`, `remove_dir_all`, `cargo_cleanup::move_reviewed`,
-`docker::remove`), the audit takes the token text of the body up to the
-first destructive call and requires all three recheck calls to appear in
-it — either directly, or inside a helper that is itself called in that
-prefix (the call graph is followed transitively across
-`crates/{core,cli,tui}/src`).
+Every removal (`fs::rename`/`remove_file`/`remove_dir`/`remove_dir_all`, `trash::*`) anywhere in the workspace whose subject is caller-supplied -- a parameter, a field of one, or bindings and iteration over those; not a path the function constructed from a literal, a local path helper or a file it created -- must be preceded by all three live rechecks, honoured, in its body or in a helper called before it (followed transitively), and the removed path must be one the rechecks were about. No whole-file exemptions. Docker removals follow an honoured `docker::still_removable`, and only `docker::remove` builds a destructive `docker` subprocess.
 
-**Limits.** This is statement-order within one token stream, so it
-proves "the recheck code runs before the destructive code on this path",
-not "the recheck's *result* is honoured". That second half is what the
-runtime tests are for. It also cannot see a destructive call made
-through a dynamically dispatched trait object.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `execution_sinks_recheck_live_state/01-discarded-protection`, `execution_sinks_recheck_live_state/02-aliased-rename`, `execution_sinks_recheck_live_state/03-second-destructive-call`, `execution_sinks_recheck_live_state/04-honoured-sink-passes`, `execution_sinks_recheck_live_state/05-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

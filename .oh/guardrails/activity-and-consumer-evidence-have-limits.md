@@ -45,25 +45,11 @@ vocabulary audit does not establish provenance, freshness, or semantic correctne
 
 ## Detection
 
-AST audit `activity_and_consumer_evidence_have_limits`, added 2026-09-22
-(the 2026-09-22 re-review found this `severity: hard` guardrail with no
-`audit:` field at all -- one of the three unwatched ones, and the
-unwatched ones were the ones that broke):
+A `FactStatus` variant is built only in the module that declares it (struct literals anywhere else, including inside macro arguments, fail). The reasoned constructors are derived: every `Evidence` method with a `reason` parameter; the argument in that position must not evaluate empty -- a literal `""`, a constant holding `""` (constants are followed), `String::new()` or `Default::default()`. Every evidence builder in the activity module names an `EvidenceSource` or delegates to one that does, and `render::render_evidence_lines` prints the reason.
 
-- `FactStatus::{Unknown,Unavailable,Conflicting}` may be *constructed*
-  only inside `evidence.rs`; everywhere else it comes from
-  `Evidence::unknown`/`unavailable`/`conflicting`, whose signatures make
-  the reason a required argument. Struct-literal sites are located
-  through the AST, so a `match` arm that reads a reason is not mistaken
-  for a construction that omits one;
-- no call site passes an empty string literal as that reason; and
-- every `*_evidence` builder in `activity.rs` names an `EvidenceSource`,
-  and `render::render_evidence_lines` mentions `reason`, so an unknown is
-  never printed without the limit that makes it readable.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `activity_and_consumer_evidence_have_limits/01-status-struct-literal`, `activity_and_consumer_evidence_have_limits/02-empty-reason`, `activity_and_consumer_evidence_have_limits/03-activity-evidence-without-source`, `activity_and_consumer_evidence_have_limits/04-sweep3`.
 
-**Limits.** The audit proves the reason exists and is non-empty, not that
-it is *informative*. It cannot see a reason assembled at runtime from an
-empty variable.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

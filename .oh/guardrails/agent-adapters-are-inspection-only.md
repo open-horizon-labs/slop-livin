@@ -18,12 +18,11 @@ through.
 
 ## Detection
 
-No adapter module may reference `actions::`, `fs::rename`,
-`remove_file`, `remove_dir`, `trash::`, a `Plan {`/`Grant {` literal, or
-`Ledger`.
+No adapter function is in the derived mutating set: every function that transitively calls a `std::fs` primitive that replaces, removes, copies, links or re-permissions bytes, `File::create`, `OpenOptions` opened for `write`/`truncate`/`append`, `trash::*`, a persisted temp file, `create_dir*`, or a subprocess.
 
-**Limits.** Names, not semantics. An adapter shelling out to `rm` would
-be caught by the repo's existing `scripts/check.sh` grep layer instead.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_inspection_only/01-remove-dir-all-in-identify`, `agent_adapters_are_inspection_only/02-aliased-remove`, `agent_adapters_are_inspection_only/03-plan-in-adapter`, `agent_adapters_are_inspection_only/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

@@ -25,28 +25,11 @@ render.
 
 ## Detection
 
-No function under `crates/tui/src` may call a report entry point that
-takes a bare root and no `EffectiveScope`/pruned-subtree argument
-(`report_with`, `report_with_dirs`, `report_with_observe`,
-`report_with_enrich`, `report_full*`, `report_single_root`). Only the
-scope-carrying entries, or a TUI wrapper that forwards the scope, are
-allowed.
+No TUI function calls a public function of the report module (derived: the modules that run the bus, with child modules) that takes a bare root and no scope, unless it only loads a stored report back; a call into the report module that resolves to nothing fails.
 
-Since 2026-09-22 the audit also checks *what gets replaced*. The
-independent re-review's CE3: `observe_live` correctly narrows the scope
-to the one root a watcher fired under (`EffectiveScope::restricted_to`)
-and then asked `observe_scope` for `ObservationParts::ALL`, so
-`agent_units`/`external_units` came back derived from that one-root
-scope and the event loop applied them unconditionally. The agent view
-emptied on the first file save anywhere in the project. A *correctly*
-narrowed scope must not be allowed to narrow what is replaced, so a
-narrowed refresh must request `ObservationParts::WALK_ONLY` and return
-`None` for both unit vectors. The audit requires exactly that of
-`App::observe_live`.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `tui_refresh_preserves_scope/01-scopeless-report-with`, `tui_refresh_preserves_scope/02-scopeless-full-mode`, `tui_refresh_preserves_scope/03-scopeless-single-root`, `tui_refresh_preserves_scope/04-sweep3`.
 
-**Limits.** The audit is about which entry point is called and which
-parts a narrowed refresh asks for; it cannot tell whether the scope
-forwarded is the right one.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

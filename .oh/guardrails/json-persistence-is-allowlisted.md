@@ -16,24 +16,11 @@ is the thing that quietly becomes a database.
 
 ## Detection
 
-Two layers, both run by `scripts/check.sh`:
+A function persists JSON when a serialized value (`serde_json::to_*` other than `to_value`, or `json!(..).to_string()`, however the serializer is imported) reaches a write: as a write's argument, through a binding (including `if let Ok(x) = ..`), `to_writer` into a file, or `write!`/`writeln!` into anything but a terminal or a string buffer. Every such function must be on the allow-list, and every allow-list entry must still do it.
 
-1. AST: in `crates/{core,cli,tui}/src`, a function that calls
-   `serde_json::to_vec*`/`to_string*`/`to_writer*`/`Serializer` **and**
-   writes (`fs::write`, `write_atomic`, `write_all`, `File::create`,
-   `.persist(`, or a function whose own name contains
-   write/save/persist) must be in `JSON_WRITE_ALLOWLIST`. Printing to
-   stdout or stderr is not persistence and is not flagged. An allow-list
-   entry whose file or function no longer matches fails the audit, so
-   the list cannot rot.
-2. grep: `serde_json::to_(vec|string|writer)` outside the allow-listed
-   files, not followed within three lines by a print, fails
-   `scripts/check.sh`.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `json_persistence_is_allowlisted/01-json-macro-to-string`, `json_persistence_is_allowlisted/02-serializer-outside-allowlist`, `json_persistence_is_allowlisted/03-aliased-writer`, `json_persistence_is_allowlisted/04-sweep3`.
 
-**Limits.** The AST layer's dataflow is "same function body", not a real
-taint analysis: serializing in one function and writing in another,
-through a struct field, is not caught. The store-contents runtime test
-is the backstop.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Allow-list and why each entry is a control artifact
 

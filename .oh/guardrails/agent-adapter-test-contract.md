@@ -20,12 +20,11 @@ matrix has to say `Unverified`.
 
 ## Detection
 
-Each adapter module's text must contain a `fn <name>(` for all five
-names. The failure lists the adapter and the missing names.
+The modules that declare a tool are derived (a `*_TOOL_ID` constant or an `Adapter` type under `agents/`/`build_adapters/`). Each must define the five contract tests as parsed `#[test]` functions inside a `#[cfg(test)]` module, not `#[ignore]`d, each asserting something (an `assert*!`, a `panic!`, an `unwrap_err`, or a `contract::` helper).
 
-**Limits.** Presence by name, not quality. A test that asserts nothing
-passes this audit; that is what review is for. The names are chosen so a
-hollow one is obvious.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapter_test_contract/01-required-test-ignored`, `agent_adapter_test_contract/02-required-test-missing`, `agent_adapter_test_contract/03-required-test-renamed`, `agent_adapter_test_contract/04-sweep3`.
+
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## Runtime tests that complete it
 

@@ -19,61 +19,11 @@ fixture does not test an unchanged large tool home.
 
 ## Detection
 
-`fs::read_dir`, `read_dir(`, `walkdir`, `jwalk` and `resize_artifact*`
-may appear only in the allow-listed traversal modules (`walk.rs`,
-`fs_events.rs`, `attribution.rs`, `cargo_artifacts.rs`,
-`cargo_cleanup.rs`, `recheck.rs`, `folded_measurement.rs`, and the
-store/git/scan helpers). They are forbidden in `external.rs`,
-`consumer_wiring.rs`, `external_associations.rs`,
-`toolchain_declarations.rs`, `agents/**` and `locations/**`.
+Traversal is a dataflow-aware closure: a function that lists a path it was handed, and whatever hands such a function a path it was handed (listing a store path the function constructed is bookkeeping). Stopped at the bounded primitives, the declared-project handoff, readability probes, and `folded_measurement::measure` only while it returns early on a reuse lookup before any walk. On the report path's modules -- exactly reachable from `report::observe_scope`/`bus::run_report`, plus the adapters -- no function outside the bus's work and the folded walk itself may be in it.
 
-`cargo_cleanup.rs` and `recheck.rs` are allow-listed because they list
-the members of one already-selected group at action time — a recheck of
-an exact selection, not an observation pass.
+Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `no_second_traversal_on_report_path/01-adapter-traverses`, `no_second_traversal_on_report_path/02-aliased-read-dir`, `no_second_traversal_on_report_path/03-measure-rewalks-without-consulting-rows`, `no_second_traversal_on_report_path/04-sweep3`.
 
-One further exemption, and it is a `(file, function)` pair rather than a
-whole file: `locations/mod.rs::shallow_list`. The guardrail spec carved
-this out itself — "detector modules that genuinely need one shallow
-listing must go through a bounded helper `locations::shallow_list` which
-is itself allow-listed and capped" — because some layouts really do
-require enumerating exactly one level (a version manager's `versions/`,
-a tool home's top-level entries). Everything that used to call
-`read_dir` in `agents/**` and `locations/**` now calls it, adapters
-reach it only through `agents::IdentifyCtx`, and it is sorted, capped at
-`SHALLOW_LIST_CAP`, never recursive, and refuses to follow a symlink
-into another tree.
-
-The exemption is deliberately narrow in two ways the audit enforces:
-
-- it is scoped to that one function, so a second traversal added
-  *beside* it in the same file still fails (mutation test:
-  `the_one_bounded_lister_is_exempt_but_a_sibling_in_the_same_file_is_not`);
-  and
-- the audit requires `SHALLOW_LIST_CAP` to still exist, so the
-  exemption cannot outlive the bound that earns it (mutation test:
-  `a_bounded_lister_that_lost_its_cap_is_rejected`).
-
-`agents/mod.rs::folded_bytes` moved to
-`folded_measurement::folded_bytes_bounded` for the same reason: the
-recursive stat-only fold is a folded *measurement*, and
-`folded_measurement.rs` is the one module on this path allowed to
-traverse. Adapters reach it through `IdentifyCtx::folded_bytes`.
-
-Since 2026-09-22 the audit also follows the *callee*, not only the
-allow-list. The independent re-review's sharpest audit finding was that
-"where a re-walk is written" is not "whether a re-walk happens":
-`folded_measurement.rs` was on the allow-list and
-`folded_measurement::measure` called `walk::resize_artifact_excluding`
-unconditionally, fully re-walking every external root on every pass,
-while this audit stayed green and the statement above claimed the
-opposite. The audit now requires `measure` to consult the persisted
-folded rows (`reuse_folded_measurement`) *before* it may reach
-`resize_artifact*`, so the statement and the code cannot diverge again.
-
-**Limits.** This is a syscall-shape check plus one call-order check
-inside `measure`. It cannot prove the reuse is *correct* — that an
-unchanged root really is unchanged. That is the job of the work-counter
-tests below and of the gate the reuse now runs behind.
+**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
 
 ## The gate: trusted event coverage, not directory stamps (2026-09-22)
 
