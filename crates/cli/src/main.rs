@@ -934,20 +934,43 @@ fn discover_agent_units_for_propose(
 }
 
 /// External units for the unified `propose` route: the same
-/// detector-resolved discovery `report --view external` uses.
+/// detector-resolved discovery `report --view external` uses, with the
+/// same live tool-version/dependency association wiring (#56/#57) --
+/// a proposed external unit's `PlanUnit.evidence` (#61) should carry the
+/// same consumer facts the `report --view external` text/JSON path
+/// does, not a narrower answer just because this route takes a
+/// different code path to get there.
 fn discover_external_units_for_propose(
     store_dir: &Path,
 ) -> Result<Vec<swamp_core::external::ExternalUnit>> {
     let detector_scope = resolve_scope(&[])?;
     let observed_at = swamp_core::entities::now();
-    swamp_core::external::discover_and_measure(
+    let mut units = swamp_core::external::discover_and_measure(
         &detector_scope,
         Some(store_dir),
         true,
         observed_at,
         swamp_core::growth::load_config(store_dir).retention_days,
         24 * 3600,
+    )?;
+    // Same real report walk `discover_agent_units_for_propose` already
+    // runs for Aider's per-repo units: not an extra walk beyond what
+    // that sibling function costs, and `propose` without a `root` is
+    // already documented as not a hot path.
+    let mut r = swamp_core::report::report_scope(
+        &detector_scope,
+        None,
+        false,
+        Some(store_dir),
+        None,
+        true,
+        false,
+        false,
+        false,
     )
+    .map(|(r, _coverage)| r)?;
+    swamp_core::consumer_wiring::attach_associations(&mut r, &mut units, Some(store_dir));
+    Ok(units)
 }
 
 /// Saves `plan` and prints it (JSON envelope or the plain-text form),
@@ -1334,7 +1357,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|e| (Err(e), Vec::new()))
             };
             progress.stop();
-            let r = r?;
+            let mut r = r?;
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
@@ -1343,7 +1366,7 @@ fn main() -> Result<()> {
             // from the walked root(s): resolved independently so
             // `--view external` works the same whether `report` is
             // scoped to the configured catalog or an explicit root.
-            let external_units = if view == Some(View::External) {
+            let mut external_units = if view == Some(View::External) {
                 let detector_scope = resolve_scope(&[])?;
                 swamp_core::external::discover_and_measure(
                     &detector_scope,
@@ -1359,6 +1382,17 @@ fn main() -> Result<()> {
             } else {
                 Vec::new()
             };
+            // Live tool-version/dependency association wiring (#56/#57):
+            // both `r` and `external_units` are computed above, exactly
+            // the shape `attach_associations` needs -- see its own
+            // module doc for why this cannot run inside the bus.
+            if !external_units.is_empty() {
+                swamp_core::consumer_wiring::attach_associations(
+                    &mut r,
+                    &mut external_units,
+                    Some(&store_dir),
+                );
+            }
             // Agent-tool storage (#91/#92/#100): same "detector-resolved,
             // independent of the walked root(s)" contract as external
             // units above -- a tool home is found regardless of whether

@@ -13,6 +13,7 @@ pub mod bus;
 pub mod cargo_artifacts;
 pub mod cargo_cleanup;
 pub mod compose;
+pub mod consumer_wiring;
 pub mod consumers;
 pub mod coverage;
 pub mod docker;

@@ -22,14 +22,18 @@ use std::path::{Path, PathBuf};
 /// global/default configuration (`~/.tool-versions`, `pyenv`'s
 /// `version` file, ...). Kept distinct so many projects and one global
 /// default are never collapsed into the same "consumer".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeclarationScope {
     Project(PathBuf),
     GlobalDefault,
 }
 
 /// One version reference read from a project or global config file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Serialize`/`Deserialize` (#56 live wiring) so the per-worktree
+/// mtime-keyed cache in `toolchain_wiring.rs` can persist already-parsed
+/// declarations to the current-state report cache without re-reading
+/// unchanged declaration files on every report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolVersionDeclaration {
     /// The version-manager convention this came from (`"asdf"`,
     /// `"mise"`, `"pyenv"`, `"rbenv"`, `"nvm"`, `"rustup"`, ...).
@@ -129,6 +133,35 @@ pub fn match_version(spec: &str, installed: &[String]) -> VersionMatch {
     VersionMatch::NoMatchingInstallation
 }
 
+/// rustup toolchain directories are named `<channel>-<host-triple>`
+/// (`stable-x86_64-apple-darwin`, `1.82.0-aarch64-apple-darwin`) --
+/// rustup's own documented naming convention, never a guess. A
+/// `rust-toolchain(.toml)` declaration names only the channel, so
+/// `match_version`'s exact-string comparison would otherwise never
+/// match a real installed toolchain directory name. Returns the one
+/// installed directory name whose channel prefix (split on the *first*
+/// hyphen only -- rustup channels never contain one: `stable`, `beta`,
+/// `nightly`, or a plain `MAJOR.MINOR.PATCH`) exactly equals `spec`,
+/// when exactly one such directory exists; `None` when zero or more
+/// than one match (left to `match_version`'s own no-match/conflicting
+/// handling rather than guessed here).
+pub fn resolve_rustup_channel_to_dir(
+    spec: &str,
+    installed_toolchain_dirs: &[String],
+) -> Option<String> {
+    if installed_toolchain_dirs.iter().any(|d| d == spec) {
+        return None; // already an exact match; let match_version handle it directly
+    }
+    let mut matches = installed_toolchain_dirs
+        .iter()
+        .filter(|d| d.split_once('-').map(|(channel, _)| channel) == Some(spec));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None; // more than one -- ambiguous, not guessed
+    }
+    Some(first.clone())
+}
+
 fn declaration_evidence(decl: &ToolVersionDeclaration, m: &VersionMatch) -> Evidence {
     let source = EvidenceSource::ConfigDeclaration {
         path: decl.source_path.display().to_string(),
@@ -179,6 +212,27 @@ fn declaration_evidence(decl: &ToolVersionDeclaration, m: &VersionMatch) -> Evid
 /// versions, producing the evidence fact.
 pub fn resolve(decl: ToolVersionDeclaration, installed: &[String]) -> ToolVersionAssociation {
     let match_result = match_version(&decl.version_spec, installed);
+    let evidence = declaration_evidence(&decl, &match_result);
+    ToolVersionAssociation {
+        declaration: decl,
+        match_result,
+        evidence,
+    }
+}
+
+/// Builds a [`ToolVersionAssociation`] from an already-decided
+/// [`VersionMatch`], bypassing [`match_version`]'s own dotted-version/
+/// alias heuristics. Used by `consumer_wiring.rs` for the one manager
+/// (rustup) whose installed-directory naming convention
+/// (`<channel>-<host-triple>`) `match_version` does not model on its
+/// own -- see [`resolve_rustup_channel_to_dir`], which does that
+/// widening explicitly rather than guessing inside `match_version`
+/// itself (which stays unchanged, and every one of its existing tests
+/// keeps passing unmodified).
+pub fn resolve_explicit(
+    decl: ToolVersionDeclaration,
+    match_result: VersionMatch,
+) -> ToolVersionAssociation {
     let evidence = declaration_evidence(&decl, &match_result);
     ToolVersionAssociation {
         declaration: decl,
@@ -580,5 +634,39 @@ mod tests {
         assert!(tools.contains("python"));
         assert!(tools.contains("nodejs"));
         assert!(tools.contains("rust"));
+    }
+
+    #[test]
+    fn rustup_channel_resolves_to_its_one_installed_host_triple_dir() {
+        let installed = vec![
+            "stable-x86_64-apple-darwin".to_string(),
+            "1.82.0-x86_64-apple-darwin".to_string(),
+        ];
+        assert_eq!(
+            resolve_rustup_channel_to_dir("stable", &installed),
+            Some("stable-x86_64-apple-darwin".to_string())
+        );
+        assert_eq!(
+            resolve_rustup_channel_to_dir("1.82.0", &installed),
+            Some("1.82.0-x86_64-apple-darwin".to_string())
+        );
+    }
+
+    #[test]
+    fn rustup_channel_ambiguous_across_two_host_triples_is_not_guessed() {
+        // The tempting shortcut this rejects: picking one host triple's
+        // installation arbitrarily when the same channel is installed
+        // for more than one target.
+        let installed = vec![
+            "stable-x86_64-apple-darwin".to_string(),
+            "stable-aarch64-apple-darwin".to_string(),
+        ];
+        assert_eq!(resolve_rustup_channel_to_dir("stable", &installed), None);
+    }
+
+    #[test]
+    fn rustup_channel_with_no_installed_match_is_none() {
+        let installed = vec!["1.82.0-x86_64-apple-darwin".to_string()];
+        assert_eq!(resolve_rustup_channel_to_dir("beta", &installed), None);
     }
 }

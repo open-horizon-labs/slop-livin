@@ -69,6 +69,23 @@ pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, Str
     Ok(parse_workspace_path_from_plist_xml(&xml))
 }
 
+/// One level of `DerivedData`'s own subdirectories (each named
+/// `<ProjectName>-<hash>`, one per built workspace/project): a single
+/// bounded `read_dir`, never a recursive walk into any one project's
+/// build output. Used to find each subfolder's own `info.plist` for
+/// [`read_workspace_path`]/[`xcode_derived_data_association`].
+pub fn list_derived_data_subfolders(derived_data: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(derived_data)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Builds the Xcode DerivedData -> project consumer evidence: `Known`
 /// when `workspace_path` matches (canonicalized) one of `project_roots`,
 /// `Unknown` when it names a path that matches none of them (moved or
@@ -270,6 +287,58 @@ pub fn parse_go_sum(text: &str) -> Vec<DependencyIdentity> {
     out
 }
 
+/// `pom.xml`'s `<dependencies><dependency>` entries (direct
+/// dependencies only -- `<dependencyManagement>` entries are BOM/version
+/// declarations, not necessarily actually depended on, so they are
+/// deliberately excluded rather than counted as used). Parsed with
+/// `roxmltree` (a real, read-only, non-validating XML parser -- see
+/// `Cargo.toml`; MIT/Apache-2.0, actively maintained), never a
+/// hand-rolled tag scan the way `xcode_derived_data_association`'s
+/// plist reader gets away with for one fixed tag. A version containing
+/// an unresolved Maven property placeholder (`${...}`, e.g. a
+/// multi-module build's `${revision}`) cannot be joined without full
+/// Maven property resolution, which this module does not implement --
+/// that entry is skipped (never fabricated), not treated as a parse
+/// error. `name` is `"group:artifact"`, matching
+/// [`parse_gradle_lockfile`]'s own coordinate convention so both
+/// ecosystems' identities compare the same way.
+pub fn parse_pom_xml(text: &str) -> Result<Vec<DependencyIdentity>, String> {
+    let doc = roxmltree::Document::parse(text).map_err(|e| format!("invalid pom.xml: {e}"))?;
+    let mut out = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("dependency")) {
+        if node
+            .ancestors()
+            .any(|a| a.has_tag_name("dependencyManagement"))
+        {
+            continue;
+        }
+        let child_text = |tag: &str| -> Option<String> {
+            node.children()
+                .find(|c| c.has_tag_name(tag))
+                .and_then(|c| c.text())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (Some(group), Some(artifact), Some(version)) = (
+            child_text("groupId"),
+            child_text("artifactId"),
+            child_text("version"),
+        ) else {
+            continue;
+        };
+        if version.contains("${") {
+            continue; // unresolved Maven property; never guessed
+        }
+        out.push(DependencyIdentity {
+            ecosystem: "maven",
+            name: format!("{group}:{artifact}"),
+            version,
+        });
+    }
+    Ok(out)
+}
+
 /// `gradle.lockfile`: `group:artifact:version=configurations` lines
 /// (the `empty=...` marker line and comments are skipped).
 pub fn parse_gradle_lockfile(text: &str) -> Vec<DependencyIdentity> {
@@ -292,6 +361,99 @@ pub fn parse_gradle_lockfile(text: &str) -> Vec<DependencyIdentity> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// Live shared-store joins (#57 live wiring): given a dependency identity
+// already parsed from a project's lockfile, test whether the shared
+// store actually holds an entry for it via one deterministic candidate
+// path -- a hash lookup (`Path::exists`), never an enumeration of the
+// whole store (which can hold many thousands of unrelated entries from
+// projects outside scanned scope). This is deliberately the reverse of
+// "list the store, then match names back to lockfiles": computing the
+// expected path directly from the parsed identity is both cheaper and
+// unambiguous (a crate name can itself contain hyphens, so splitting a
+// `registry/src` directory's own name back into name+version would be
+// lossy; a name+version pair we already have from the lockfile is not).
+// ---------------------------------------------------------------------
+
+/// Go's documented module-path escaping
+/// (<https://pkg.go.dev/golang.org/x/mod/module#EscapePath>): each
+/// uppercase letter becomes `!` followed by its lowercase form (module
+/// paths are case-sensitive on a case-insensitive filesystem otherwise).
+/// Applied to both the module and version components, since a version
+/// can itself contain uppercase pseudo-version metadata.
+pub fn go_module_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 4);
+    for c in path.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('!');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Cargo registry `src/<index-dir>/<name>-<version>` (one or more index
+/// directories may exist if more than one registry source was ever
+/// configured; every one is checked, still bounded -- typically exactly
+/// one, `index.crates.io-<hash>`). `registry_src` is the already-
+/// resolved `registry/src` unit path.
+pub fn cargo_registry_entry_exists(registry_src: &Path, name: &str, version: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(registry_src) else {
+        return false;
+    };
+    let want = format!("{name}-{version}");
+    entries.filter_map(|e| e.ok()).any(|e| {
+        let idx_dir = e.path();
+        idx_dir.is_dir() && idx_dir.join(&want).exists()
+    })
+}
+
+/// Go module cache `<GOMODCACHE>/<escaped-module>@<version>`.
+/// `gomodcache` is the already-resolved module-cache unit path.
+pub fn go_module_cache_entry_exists(gomodcache: &Path, module: &str, version: &str) -> bool {
+    let candidate = gomodcache.join(format!(
+        "{}@{}",
+        go_module_escape(module),
+        go_module_escape(version)
+    ));
+    candidate.exists()
+}
+
+/// Gradle `modules-2/files-2.1/<group>/<artifact>/<version>` under the
+/// already-resolved Gradle `caches` unit path. `group_artifact` is
+/// `"group:artifact"` ([`parse_gradle_lockfile`]'s own `name` shape).
+pub fn gradle_cache_entry_exists(
+    gradle_caches: &Path,
+    group_artifact: &str,
+    version: &str,
+) -> bool {
+    let Some((group, artifact)) = group_artifact.split_once(':') else {
+        return false;
+    };
+    gradle_caches
+        .join("modules-2/files-2.1")
+        .join(group)
+        .join(artifact)
+        .join(version)
+        .exists()
+}
+
+/// Maven local repository `<group/path>/<artifact>/<version>` under the
+/// already-resolved repository root. `group_artifact` is
+/// `"group:artifact"` ([`parse_pom_xml`]'s own `name` shape).
+pub fn maven_repo_entry_exists(repo_root: &Path, group_artifact: &str, version: &str) -> bool {
+    let Some((group, artifact)) = group_artifact.split_once(':') else {
+        return false;
+    };
+    repo_root
+        .join(group.replace('.', "/"))
+        .join(artifact)
+        .join(version)
+        .exists()
 }
 
 // ---------------------------------------------------------------------
@@ -589,5 +751,132 @@ version = "0.2.155"
         assert!(joined.is_known());
         let unjoined = docker_join_evidence(None, "no matching label");
         assert!(!unjoined.is_known());
+    }
+
+    #[test]
+    fn pom_xml_parses_direct_dependencies_excluding_dependency_management() {
+        let text = r#"<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.example.bom</groupId>
+        <artifactId>bom</artifactId>
+        <version>1.0.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>3.14.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>unresolved</artifactId>
+      <version>${revision}</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let entries = parse_pom_xml(text).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "BOM entry and unresolved property must both be excluded"
+        );
+        assert_eq!(entries[0].name, "org.apache.commons:commons-lang3");
+        assert_eq!(entries[0].version, "3.14.0");
+    }
+
+    #[test]
+    fn pom_xml_invalid_xml_is_a_named_gap() {
+        let err = parse_pom_xml("<project><unterminated>").unwrap_err();
+        assert!(err.contains("invalid pom.xml"));
+    }
+
+    #[test]
+    fn go_module_escape_matches_documented_convention() {
+        // github.com/BurntSushi/toml -> github.com/!burnt!sushi/toml
+        assert_eq!(
+            go_module_escape("github.com/BurntSushi/toml"),
+            "github.com/!burnt!sushi/toml"
+        );
+        assert_eq!(go_module_escape("golang.org/x/text"), "golang.org/x/text");
+    }
+
+    #[test]
+    fn cargo_registry_entry_exists_is_a_targeted_lookup_not_an_enumeration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tmp.path().join("index.crates.io-abc123");
+        std::fs::create_dir_all(idx.join("serde-1.0.203")).unwrap();
+        assert!(cargo_registry_entry_exists(tmp.path(), "serde", "1.0.203"));
+        assert!(!cargo_registry_entry_exists(tmp.path(), "serde", "1.0.150"));
+        assert!(!cargo_registry_entry_exists(tmp.path(), "libc", "0.2.155"));
+    }
+
+    #[test]
+    fn go_module_cache_entry_exists_escapes_uppercase() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("github.com/!burnt!sushi/toml@v0.3.1")).unwrap();
+        assert!(go_module_cache_entry_exists(
+            tmp.path(),
+            "github.com/BurntSushi/toml",
+            "v0.3.1"
+        ));
+        assert!(!go_module_cache_entry_exists(
+            tmp.path(),
+            "github.com/BurntSushi/toml",
+            "v0.4.0"
+        ));
+    }
+
+    #[test]
+    fn gradle_cache_entry_exists_checks_coordinate_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            tmp.path()
+                .join("modules-2/files-2.1/org.jetbrains.kotlin/kotlin-stdlib/1.9.0"),
+        )
+        .unwrap();
+        assert!(gradle_cache_entry_exists(
+            tmp.path(),
+            "org.jetbrains.kotlin:kotlin-stdlib",
+            "1.9.0"
+        ));
+        assert!(!gradle_cache_entry_exists(
+            tmp.path(),
+            "org.jetbrains.kotlin:kotlin-stdlib",
+            "2.0.0"
+        ));
+    }
+
+    #[test]
+    fn maven_repo_entry_exists_checks_group_path_conversion() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("org/apache/commons/commons-lang3/3.14.0"))
+            .unwrap();
+        assert!(maven_repo_entry_exists(
+            tmp.path(),
+            "org.apache.commons:commons-lang3",
+            "3.14.0"
+        ));
+        assert!(!maven_repo_entry_exists(
+            tmp.path(),
+            "org.apache.commons:commons-lang3",
+            "3.0.0"
+        ));
+    }
+
+    #[test]
+    fn list_derived_data_subfolders_is_one_level_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("MyApp-abc123/Build/Products")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("OtherApp-def456")).unwrap();
+        let mut names: Vec<String> = list_derived_data_subfolders(tmp.path())
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["MyApp-abc123", "OtherApp-def456"]);
     }
 }

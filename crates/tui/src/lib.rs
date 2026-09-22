@@ -362,7 +362,7 @@ fn finish_startup(
             swamp_core::entities::now(),
         );
         let retention_days = cfg.retention_days;
-        if let Ok(units) = swamp_core::external::discover_and_measure(
+        if let Ok(mut units) = swamp_core::external::discover_and_measure(
             &detector_scope,
             Some(store),
             !no_observe,
@@ -370,6 +370,15 @@ fn finish_startup(
             retention_days,
             24 * 3600,
         ) {
+            // Live tool-version/dependency association wiring (#56/#57):
+            // `app.report` is already loaded above, at this same startup
+            // point -- see `consumer_wiring`'s own module doc for why
+            // this join lives here rather than inside the bus.
+            swamp_core::consumer_wiring::attach_associations(
+                &mut app.report,
+                &mut units,
+                Some(store),
+            );
             app.set_external_units(units);
         }
         // Aider's per-repo units (#96) need every known worktree root;
