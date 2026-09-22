@@ -102,12 +102,14 @@ Measured, both walkers over the same generated tree, same build profile (debug),
 
 | Shape | Files | swamp | walkdir + swamp's rules | Ratio |
 |---|---|---|---|---|
-| 16 dirs × 2,000 files (macOS, APFS) | 32,000 | 47.8 ms | 126.0 ms | 2.6× |
-| 512 dirs × 40 files (macOS, APFS) | 20,480 | 56.8 ms | 218.0 ms | 3.8× |
+| 16 dirs × 2,000 files — macOS arm64, APFS | 32,000 | 37.7 ms | 80.0 ms | 2.1× |
+| 512 dirs × 40 files — macOS arm64, APFS | 20,480 | 24.5 ms | 58.7 ms | 2.4× |
+| 16 dirs × 2,000 files — Ubuntu 24.04 x86_64, ext4 | 32,000 | 47.9 ms | 92.0 ms | 1.9× |
+| 512 dirs × 40 files — Ubuntu 24.04 x86_64, ext4 | 20,480 | 38.4 ms | 64.5 ms | 1.7× |
 
-Linux numbers for the same two shapes are printed by the **Traversal, accounting and volume identity** step of every CI run (`WALK BENCH os=linux ...`), on the runner that produced them, rather than copied into this file where they would go stale.
+One CI run each, 2026-09-22, on shared runners: the absolute times are worth little and the ratio is the point. Every run prints its own (`WALK BENCH os=... ratio=...`) from the **Traversal, accounting and volume identity** step, so the current numbers are always in the job log rather than only in this file.
 
-**Decision: keep swamp's walker.** It is 2.6–3.8× faster than the alternative *with the same semantics bolted on*, the bounded parallel pool is what makes the difference on the many-directory shape, and swapping it would trade that for no reduction in the code that actually has to exist.
+**Decision: keep swamp's walker.** It is 1.7–2.4× faster than the alternative *with the same semantics bolted on*, the bounded parallel pool is what makes the difference on the many-directory shape, and swapping it would trade that for no reduction in the code that actually has to exist.
 
 ### `jwalk` 0.9.0 — **rejected**
 
@@ -139,7 +141,7 @@ Adopting it would also mean pulling a CLI's presentation stack — `clap`, `colo
 |---|---|---|
 | `trash` 5.2.9 | Adopt in #85 | Implements the spec's cross-device rules correctly, typed errors, never silently permanently deletes. |
 | `notify` 8.2.0 | Do not adopt; use `inotify` directly in #81 | No documented way to surface `IN_Q_OVERFLOW`, which is the one event a coverage claim depends on. |
-| `walkdir` 2.5.0 | Keep as the test reference | Correct but generic; swamp's walker is 2.6–3.8× faster once the same semantics are applied to both. |
+| `walkdir` 2.5.0 | Keep as the test reference | Correct but generic; swamp's walker is 1.7–2.4× faster once the same semantics are applied to both. |
 | `jwalk` 0.9.0 | Reject | Upstream archived and explicitly unmaintained. |
 | `clean-dev-dirs` 2.8.2 | Reuse its conventions, not its scanner | Apparent size, no hardlink dedup, no filesystem boundary; brings a CLI's dependency stack. |
 

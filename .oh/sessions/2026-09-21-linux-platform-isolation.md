@@ -109,17 +109,23 @@ the two agree exactly. A walker is not a measurement. Whatever library
 sat underneath would still need all three rules, so reuse would save
 the traversal loop and nothing else.
 
-Measured, same profile for both, warm cache, macOS/APFS:
+Measured, same profile for both, warm cache, one CI run each on
+2026-09-22:
 
 | Shape | Files | swamp | walkdir + swamp's rules | Ratio |
 |---|---|---|---|---|
-| 16 dirs × 2,000 files | 32,000 | 47.8 ms | 126.0 ms | 2.6× |
-| 512 dirs × 40 files | 20,480 | 56.8 ms | 218.0 ms | 3.8× |
+| 16 dirs × 2,000 files — macOS arm64, APFS | 32,000 | 37.7 ms | 80.0 ms | 2.1× |
+| 512 dirs × 40 files — macOS arm64, APFS | 20,480 | 24.5 ms | 58.7 ms | 2.4× |
+| 16 dirs × 2,000 files — Ubuntu 24.04, ext4 | 32,000 | 47.9 ms | 92.0 ms | 1.9× |
+| 512 dirs × 40 files — Ubuntu 24.04, ext4 | 20,480 | 38.4 ms | 64.5 ms | 1.7× |
 
-The many-directory shape is where the bounded parallel pool earns its
-keep. Linux numbers are printed by CI's own **Traversal, accounting and
-volume identity** step rather than copied into a file where they would
-go stale.
+Shared runners, so the absolute times are worth little and the ratio is
+the point. The margin is narrower on Linux than on macOS -- consistent
+with `getdents64` being cheaper than APFS's directory reads, which is
+where a single-threaded walker loses most -- and it is still a margin,
+in the direction that says the bounded parallel pool is doing work. Every
+CI run prints its own figures, so these do not have to be trusted or
+maintained.
 
 **`trash` 5.2.9 — adopt in #85.** Its source does the spec's cross-device
 rules properly (sticky-bit check, symlink rejection, `.Trash-$uid`
