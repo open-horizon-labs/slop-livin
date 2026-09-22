@@ -329,6 +329,16 @@ fn an_unchanged_pass_over_out_of_scope_detector_roots_costs_nothing() {
         "every authorized unit root must be event-covered: {:?}",
         third.unit_root_coverage
     );
+    // And the report says so, so a surface can explain the cost.
+    assert!(
+        third
+            .merged
+            .notes
+            .iter()
+            .any(|n| n.contains("unit roots:") && n.contains("event-covered")),
+        "the report must carry the coverage fact: {:?}",
+        third.merged.notes
+    );
     assert_eq!(
         cost.header_bytes_read, 0,
         "a replayed container reads no session headers"

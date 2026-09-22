@@ -21,7 +21,9 @@ cargo test -p swamp-core \
   --test store_contents_are_allowlisted \
   --test incremental_external_and_agent_measurement \
   --test agent_matrix_matches_docs \
-  --test agent_storage_validation
+  --test agent_storage_validation \
+  --test agent_container_seams \
+  --test unit_root_event_cursors
 
 # `--test-threads=1` here and nowhere else. This test measures through
 # the *process-global* work counters (`work_counters::reset` +

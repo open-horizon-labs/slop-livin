@@ -2436,6 +2436,32 @@ pub fn observe_scope(
             reason: reason.clone(),
         })
         .collect();
+    // One line on the report saying why the unit families cost what they
+    // cost this pass: how many authorized roots this pass's own replay
+    // could vouch for, and the named refusal behind each one it could
+    // not. A coverage fact, never a storage fact -- a root that loses
+    // its window re-measures, which changes cost and nothing else.
+    if !unit_root_coverage.is_empty() {
+        let covered = unit_root_coverage
+            .iter()
+            .filter(|c| c.event_covered)
+            .count();
+        let mut refused: Vec<String> = unit_root_coverage
+            .iter()
+            .filter(|c| !c.event_covered)
+            .map(|c| format!("{} ({})", c.path.display(), c.reason))
+            .collect();
+        refused.sort();
+        let tail = if refused.is_empty() {
+            String::new()
+        } else {
+            format!(", re-measured: {}", refused.join(", "))
+        };
+        merged.notes.push(format!(
+            "unit roots: {covered}/{} event-covered{tail}",
+            unit_root_coverage.len()
+        ));
+    }
     if observe && want.external && want.agents && external_ok && agents_ok {
         unit_replay.commit()?;
     }

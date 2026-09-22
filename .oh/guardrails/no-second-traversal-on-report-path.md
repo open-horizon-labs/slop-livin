@@ -176,34 +176,55 @@ and under a full walk alike.
   partial stored with the rows
   (`a_partially_replayed_oh_my_pi_home_sums_the_same_blob_counts`,
   `a_replayed_container_without_its_partial_makes_the_count_unknown`).
+- `crates/core/tests/unit_root_event_cursors.rs` — the per-unit-root
+  cursors (2026-09-22, stack/14).
+  `an_unchanged_pass_over_out_of_scope_detector_roots_costs_nothing`
+  measures a 5,000-session home and a 20,000-file cache as detector
+  roots beside the project root: zero header bytes, every container
+  replayed, fewer than 200 stats over 25,000 unit files.
+  `a_walk_only_pass_between_full_passes_keeps_the_unit_window_aligned`
+  is the adversarial one, with its own control: the walk's window alone
+  reuses nothing (it opened after the rows were written), the unit
+  cursor's window reuses all three containers.
+  `a_detector_home_is_a_present_scan_root` records the premise
+  correction — a detector home *is* walked, so the cursors buy
+  independence from the walk's anchor, not reach.
 - `crates/core/tests/reviewer_cost_measurement_stack2.rs` — two
   unchanged full observations over a multi-ecosystem fixture, measured
   with an instrumented `walk.rs` rather than an instrument blind to it.
   Zero header bytes and zero subprocess spawns hold. Its `dirs_listed
-  == 0` / `files_statted == 0` assertions **do not** hold, and after the
-  event gate they hold less well than before. Measured 2026-09-22:
+  == 0` / `files_statted == 0` assertions **do not** hold, because the
+  two passes are back to back and `RefreshRefusal::TooSoon` refuses a
+  replay inside the FSEvents log-lag floor. Measured 2026-09-22:
 
-  | unchanged second pass | `dirs_listed` | `files_statted` | header bytes |
-  |---|---|---|---|
-  | stack/12 (directory stamps) | 40 | 5,605 | 0 |
-  | stack/13 (event gate) | 71 | 36,281 | 0 |
+  | unchanged second pass | `dirs_listed` | `files_statted` | header bytes | spawns |
+  |---|---|---|---|---|
+  | stack/12 (directory stamps) | 40 | 5,605 | 0 | 0 |
+  | stack/13 (event gate) | 71 | 36,281 | 0 | 0 |
+  | stack/14 (unit-root cursors) | 71 | 36,281 | 0 | 0 |
 
-  The stack/13 numbers are **identical to that fixture's first pass**,
-  which is the whole attribution: nothing was reused, because nothing
-  could be. The fixture's one walked root is `src/`, an ordinary project
-  directory; its Claude Code home, Cargo home, npm cache and model store
-  are siblings of it, under no scan root at all. No replay window covers
-  them, so condition 1 above fails for every unit and both families
-  re-measure. A fresh two-pass fixture also has no FSEvents anchor for
-  the walk itself — pass 1 takes the `full_rules_changed` branch of
-  `growth::observe`, which deliberately anchors no id, so pass 2 refuses
-  with `no_stored_event_id` — and the `RefreshRefusal::TooSoon` floor
-  would refuse a back-to-back second pass in any case.
+  The residual is unchanged from stack/13 and is entirely the `TooSoon`
+  floor: the fixture observes twice about a second apart, and the floor
+  is three seconds. It is not a claim that the unit work is still being
+  redone in general. On the **same fixture**, with more than the floor
+  between passes:
 
-  This is the decision's cost, stated rather than smoothed: the gate
-  bought correctness on the appended transcript and gave up the reuse
-  everywhere a window does not reach. Both halves are the integration
-  owner's call of 2026-09-22, implemented as written; the follow-up that
-  would recover the cost without giving back the correctness (a per-unit
-  -root FSEvents cursor) is named above and in the session note. Left
-  failing, with the numbers, for re-review 3 to adjudicate.
+  | pass | stack/13: listings / stats | stack/14: listings / stats |
+  |---|---|---|
+  | 1 (cold) | 71 / 36,281 | 71 / 36,281 |
+  | 2 | 71 / 36,281 | 40 / 5,561 |
+  | 3 | 6 / 8 | 6 / 8 |
+  | 4 | 31 / 10,724 | **6 / 8** |
+
+  Zero header bytes and zero spawns from pass 2 onwards on both.
+  stack/13's pass 4 is the alternating-pass behaviour the cursors
+  remove: the walk's anchor and the unit rows drifted apart, so reuse
+  held on some passes and not others. stack/14 is flat from pass 3.
+
+  The reviewer assertion is therefore still failing, with the numbers
+  above, and the attribution is now a named floor rather than "no window
+  reaches these units". Removing it would mean either lowering the
+  replay-lag floor (which trades a correctness property for a benchmark)
+  or changing the fixture to observe more than three seconds apart
+  (which is the reviewer's test to change, not this chunk's). Left
+  failing for re-review 3 to adjudicate.

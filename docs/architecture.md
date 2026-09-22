@@ -565,13 +565,67 @@ artifact row:
   first observation, a store-less caller -- there is no reuse, and the
   unit is re-measured or re-identified. That is slower and always
   correct; the per-file identification cache still keeps header reads at
-  zero for the files that did not move. **The window comes from the
-  walk**, so reuse applies to a tool home or external cache root that
-  lies under a walked scope root, and not to one outside every scan
-  root. A default install whose scope is a projects directory therefore
-  re-measures `~/.claude` and `~/.cargo` every pass; giving each unit
-  root its own FSEvents cursor is recorded as the open follow-up in
-  `.oh/sessions/2026-09-22-event-gated-reuse.md`.
+  zero for the files that did not move.
+- **Every authorized unit root carries its own cursor.** Since
+  2026-09-22 the windows do not all come from the folded walk.
+  `scope::EffectiveScope::authorized_unit_roots` is the set of
+  detector-resolved roots the external and agent families measure under,
+  and `growth::replay_unit_roots` gives each one an FSEvents anchor of
+  its own, stored in the `unit_root` half of that root's volume-dir
+  `fsevents.json` -- beside the walk's anchor for the same path, never
+  instead of it, with both writers doing a read-modify-write of their
+  own half. Roots on one device are replayed through a single FSEvents
+  stream and the result split per root, so a write under `~/.cargo` is
+  never reported as a change under `~/.claude`.
+
+  The reason they are needed is *not* that the walk cannot see a tool
+  home -- a detector-resolved home is a `Present` scope root and is
+  walked. It is that the walk's anchor advances on passes that measure
+  no units at all (`report::ObservationParts::WALK_ONLY`, which is what
+  the TUI's background refresh uses). Such a pass moves the walk's
+  window past unit rows it never refreshed, and the `observed_at` guard
+  above then correctly refuses them, so a TUI refreshing between full
+  passes permanently prevented unit reuse. A unit cursor does not move
+  on a pass that measured no units, so its window stays aligned with the
+  rows.
+
+  The cursors commit under the same `ReportCached`-gated ordering the
+  walk's checkpoint uses: `report::observe_scope` publishes them only
+  when the pass observed **both** unit families and persisted them, and
+  drops them otherwise. Not advancing is always the safe direction -- it
+  makes the next window wider, never blinder.
+
+  Per root, a pass records whether it is **event-covered** (the window
+  is usable, so a unit under it may be replayed) or, if not, the refusal
+  that explains the re-measurement: `no_stored_event_id`, `too_soon`,
+  `root_mismatch` (the root now resolves to a different device),
+  `unsupported_platform`, `helper_inconclusive`, `full_forced`,
+  `no_store`. `coverage::UnitRootCoverage` carries it on every
+  `report::ScopeObservation`.
+
+  Two floors are deliberate. `RefreshRefusal::TooSoon` applies
+  unchanged, so two passes inside the replay-lag floor honestly refuse
+  reuse and re-measure. And on a platform with no FSEvents the source
+  refuses with `unsupported_platform`, no root is ever covered, and
+  every unit is re-measured -- the "continuity unavailable" contract
+  from stack/09, which stands until the Linux watcher lands (#81/#82).
+
+  Measured on the reviewer's multi-ecosystem fixture (5,000 agent
+  sessions, a 20,000-file Cargo cache, an npm cache, a model store, one
+  walked project root), four observations with more than the `TooSoon`
+  floor between them:
+
+  | pass | before: listings / stats | after: listings / stats |
+  |---|---|---|
+  | 1 (cold) | 71 / 36,281 | 71 / 36,281 |
+  | 2 | 71 / 36,281 | 40 / 5,561 |
+  | 3 | 6 / 8 | 6 / 8 |
+  | 4 | 31 / 10,724 | **6 / 8** |
+
+  Zero header bytes and zero subprocess spawns from pass 2 onwards on
+  both. The "before" column's pass 4 is the alternating-pass behaviour
+  the cursors remove: the walk's anchor and the rows drifted apart, so
+  reuse worked on some passes and not others.
 - **The agent family has the same reuse, keyed per container.** The
   identification cache (`${SWAMP_DIR}/associations/agent_identifications.parquet`)
   removed the header *reads* from an unchanged pass, but its validity

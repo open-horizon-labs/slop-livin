@@ -4,6 +4,54 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Repairs after review 2, part 5
+
+Making the reuse fire, and keeping a count honest while it does.
+
+- **Every external cache and agent tool home now has its own FSEvents
+  cursor**, instead of borrowing the folded walk's. A pass that walks
+  without measuring units -- the TUI's background refresh does exactly
+  this -- used to move the walk's replay window past unit rows it never
+  refreshed, and the freshness guard then correctly refused to reuse
+  them; a TUI refreshing between full observations therefore prevented
+  unit reuse indefinitely. A cursor owned by the unit families does not
+  move on such a pass, so the window stays aligned with the rows.
+  - Measured on the review fixture (5,000 agent sessions, a 20,000-file
+    Cargo cache, an npm cache, a model store, one project root), four
+    observations more than the replay-lag floor apart: listings/stats per
+    pass went from 71/36,281, 71/36,281, 6/8, 31/10,724 to 71/36,281,
+    40/5,561, 6/8, **6/8**. Zero header bytes and zero subprocess spawns
+    from the second pass onwards, before and after. The old fourth pass
+    is the point: reuse used to hold on some passes and not others.
+  - Roots on one volume share a single FSEvents stream, and its result
+    is split per root, so a write under `~/.cargo` is never reported as
+    a change under `~/.claude`.
+  - Each root's report says whether it was event-covered or, if not,
+    why it was re-measured: no stored anchor, too soon after the last
+    pass, the root now resolves to a different volume, no FSEvents on
+    this platform, a forced full pass.
+  - Two passes in quick succession still refuse to reuse anything:
+    FSEvents' own log can lag a write by longer than a second, so a
+    replay that soon cannot tell "nothing changed" from "not logged
+    yet". Unchanged behaviour, stated because it is what the review's
+    back-to-back cost fixture measures.
+  - On a platform without FSEvents nothing is ever covered and every
+    unit is re-measured -- the platform contract is unchanged.
+- **Oh My Pi's session directories are containers too**, the last
+  session tree that was not. Its shared-blob reference counts are a
+  home-wide total, so a pass that replayed some session directories
+  would have counted only the sessions it looked at and printed a number
+  that was wrong rather than unknown. Each container now stores its own
+  partial count, and the home level sums stored partials and fresh ones;
+  a replayed container whose partial is missing makes every blob count
+  unknown rather than short. No blob is offered for removal either way.
+- **The live file watcher opens one stream per root reliably.** Starting
+  an FSEvents stream is a request to `fseventsd` that takes seconds and
+  is serialized per process; the watcher waited for each root's stream
+  before starting the next, against a five-second budget, and so
+  sometimes abandoned a root's stream while it was still starting. All
+  roots' streams now start before any readiness is collected.
+
 ### Repairs after review 2, part 4
 
 What "unchanged" is allowed to mean.
