@@ -404,8 +404,17 @@ fn plan_scope_drift_refuses_at_execute_for_claude_code() {
         let env = Environment::fixture(root.path().to_path_buf(), env_vars, Platform::MacOS);
         let scope = resolve_effective_scope(&env, &only("claude-code"), &[], &registry, 1_000);
         let store = tempfile::tempdir().unwrap();
-        let units =
-            discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+        let units = discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            true,
+            1_000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
 
         let plan = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap();
         actions::save_plan(store.path(), &plan).unwrap();

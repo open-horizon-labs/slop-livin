@@ -55,6 +55,11 @@ impl Consumer for WalkConsumer {
             }
             rewalked = tracked.rewalked.map(Arc::new);
             changed_paths = tracked.changed_paths.map(Arc::new);
+            // The unit families read this after `run_report` returns:
+            // it is the only trusted evidence that lets them replay a
+            // stored measurement instead of re-taking it
+            // (`crate::fs_events::EventCoverage`).
+            *ctx.event_window.lock().unwrap() = tracked.event_window;
             unconfirmed_worktree_ids = tracked.unconfirmed_worktree_ids;
             (tracked.discovered, tracked.attribution)
         } else {

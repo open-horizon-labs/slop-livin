@@ -39,7 +39,16 @@ fn external_units_are_inspection_only_and_execution_refuses() {
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let target = units
         .iter()
         .find(|u| u.detector_id == "cargo-home")
@@ -89,7 +98,16 @@ fn propose_external_with_no_matching_path_is_a_visible_error() {
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
 
     let err =
         actions::propose_external(&units, &[home.path().join("not-a-unit")], "test").unwrap_err();

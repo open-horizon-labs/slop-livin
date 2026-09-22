@@ -1048,6 +1048,46 @@ pub(crate) fn report_full_mode_scoped(
     pruned_subtrees: &[PathBuf],
     docker_in_scope: bool,
 ) -> Result<Report> {
+    report_full_mode_scoped_tracked(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+        pruned_subtrees,
+        docker_in_scope,
+    )
+    .map(|(r, _)| r)
+}
+
+/// [`report_full_mode_scoped`] plus this root's trusted event window --
+/// the replay's unfiltered change list and the observation time it
+/// replays from, or `None` when this walk earned no window.
+///
+/// Only `report_scope_with_parts` wants it: it is what turns the unit
+/// families' stored measurements from "probably still right" into
+/// "shown unchanged by this pass's own replay"
+/// (`crate::fs_events::EventCoverage`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_full_mode_scoped_tracked(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+    pruned_subtrees: &[PathBuf],
+    docker_in_scope: bool,
+) -> Result<(Report, Option<(Vec<PathBuf>, u64)>)> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
     // alias and the next uses its canonical spelling: FSEvents is canonical,
@@ -1079,7 +1119,8 @@ pub(crate) fn report_full_mode_scoped(
     ctx.docker_in_scope = docker_in_scope;
     let mut report = crate::bus::run_report(&ctx)?;
     report.store_dir = store_dir.map(Path::to_path_buf);
-    Ok(report)
+    let window = ctx.event_window.lock().unwrap().clone();
+    Ok((report, window))
 }
 
 /// Fills `track` on every artifact row and top-level Source directory:
@@ -1965,6 +2006,44 @@ pub fn report_scope_with_parts(
     Vec<crate::coverage::RootCoverage>,
     std::collections::HashMap<PathBuf, Report>,
 )> {
+    report_scope_with_parts_covered(
+        scope,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+    )
+    .map(|(r, c, p, _)| (r, c, p))
+}
+
+/// [`report_scope_with_parts`] plus the [`crate::fs_events::EventCoverage`]
+/// this pass's replays earned, one window per root that went
+/// incremental. `observe_scope` hands it to the unit families; nothing
+/// else needs it, and a caller that cannot produce one gets
+/// `EventCoverage::untrusted()` and no reuse.
+#[allow(clippy::too_many_arguments)]
+pub fn report_scope_with_parts_covered(
+    scope: &crate::scope::EffectiveScope,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+) -> Result<(
+    Report,
+    Vec<crate::coverage::RootCoverage>,
+    std::collections::HashMap<PathBuf, Report>,
+    crate::fs_events::EventCoverage,
+)> {
     use crate::coverage::{RegionStatus, RootCoverage};
     use crate::scope::RootStatus;
 
@@ -1976,6 +2055,7 @@ pub fn report_scope_with_parts(
 
     let observed_at = crate::entities::now();
     let mut coverage: Vec<RootCoverage> = Vec::new();
+    let mut events = crate::fs_events::EventCoverage::untrusted();
     let mut merged = Report {
         observed_at,
         root: PathBuf::new(),
@@ -2067,7 +2147,7 @@ pub fn report_scope_with_parts(
                         n.detector_id
                     ));
                 }
-                let r = report_full_mode_scoped(
+                let r = report_full_mode_scoped_tracked(
                     path,
                     docker_facts,
                     verify_du,
@@ -2082,7 +2162,18 @@ pub fn report_scope_with_parts(
                     docker_authorized,
                 );
                 let r = match r {
-                    Ok(r) => r,
+                    Ok((r, window)) => {
+                        if let Some((changed, since)) = window {
+                            // FSEvents answers in canonical paths, and
+                            // so must the window's root: a unit reached
+                            // through a symlinked alias would otherwise
+                            // never match it.
+                            let canonical =
+                                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                            events.trust(canonical, changed, since);
+                        }
+                        r
+                    }
                     Err(e) => {
                         // The walk failed outright: `bus::run_report`'s
                         // checkpoint only commits on `ReportCached`, so no
@@ -2123,7 +2214,7 @@ pub fn report_scope_with_parts(
             }
         }
     }
-    Ok((merged, coverage, per_root))
+    Ok((merged, coverage, per_root, events))
 }
 
 /// One scope observation's whole result: the merged report, per-root
@@ -2219,9 +2310,17 @@ pub fn observe_scope(
     // its report in rather than walking a second time. It has no
     // per-root coverage to contribute, which is honest: coverage
     // describes the scope this function walked, and it did not walk one.
-    let (merged, coverage, per_root) = match base {
-        Some(r) => (r, Vec::new(), std::collections::HashMap::new()),
-        None => report_scope_with_parts(
+    let (merged, coverage, per_root, events) = match base {
+        // A handed-in report brings no replay window with it, so this
+        // observation has no evidence that any unit is unchanged and
+        // reuses nothing. Honest and slower, never wrong.
+        Some(r) => (
+            r,
+            Vec::new(),
+            std::collections::HashMap::new(),
+            crate::fs_events::EventCoverage::untrusted(),
+        ),
+        None => report_scope_with_parts_covered(
             scope,
             docker_facts,
             verify_du,
@@ -2244,6 +2343,7 @@ pub fn observe_scope(
             observed_at,
             retention_days,
             since_secs,
+            &events,
         )
         .unwrap_or_default();
         crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
@@ -2269,6 +2369,7 @@ pub fn observe_scope(
             observed_at,
             retention_days,
             since_secs,
+            &events,
         )
         .unwrap_or_default()
     } else {

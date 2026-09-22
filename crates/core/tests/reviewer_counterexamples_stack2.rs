@@ -87,8 +87,27 @@ fn an_excluded_home_must_stay_excluded_under_an_explicit_root() {
         &Registry::with_builtins(),
         1000,
     );
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
-    let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
+    let ext = external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(
         units.is_empty() && ext.is_empty(),
         "an excluded home was scanned under --root: {} agent units {:?}, {} external units {:?}",
@@ -131,7 +150,17 @@ fn an_in_place_rewrite_of_a_reviewed_member_must_not_spend_the_approval() {
     let store = tempfile::tempdir().unwrap();
     let trash = tempfile::tempdir().unwrap();
     let path = home.join("debug");
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let plan = actions::propose_agents(&units, &[path.clone()], "reviewer").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:reviewer").unwrap();
@@ -202,8 +231,16 @@ fn a_config_only_exclusion_must_not_invent_growth_or_regrowth() {
     let registry = Registry::with_builtins();
 
     let base = resolve_effective_scope(&env, &only(&["cargo-home"]), &[], &registry, 1000);
-    let first =
-        external::discover_and_measure(&base, Some(store.path()), true, 1000, 30, 3600).unwrap();
+    let first = external::discover_and_measure(
+        &base,
+        Some(store.path()),
+        true,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(
         first.len() >= 2,
         "precondition: the parent and the nested location are both measured: {:?}",
@@ -221,9 +258,16 @@ fn a_config_only_exclusion_must_not_invent_growth_or_regrowth() {
         &registry,
         2000,
     );
-    let second =
-        external::discover_and_measure(&excluded, Some(store.path()), true, 2000, 30, 3600)
-            .unwrap();
+    let second = external::discover_and_measure(
+        &excluded,
+        Some(store.path()),
+        true,
+        2000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let invented_growth: Vec<_> = second
         .iter()
         .filter(|u| u.growth_bytes.unwrap_or(0) != 0)
@@ -235,8 +279,16 @@ fn a_config_only_exclusion_must_not_invent_growth_or_regrowth() {
     );
 
     // And restoring the config must not read as the child coming back.
-    let third =
-        external::discover_and_measure(&base, Some(store.path()), true, 3000, 30, 3600).unwrap();
+    let third = external::discover_and_measure(
+        &base,
+        Some(store.path()),
+        true,
+        3000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let invented_regrowth: Vec<_> = third
         .iter()
         .filter(|u| u.regrowth_count > 0)
@@ -288,9 +340,17 @@ fn protect_add_must_not_accept_a_path_it_cannot_enforce() {
             vec![std::path::PathBuf::from("debug")],
             "precondition: the relative entry was stored as given"
         );
-        let units =
-            agents::discover_and_measure(&scope, &[], Some(store.path()), false, 1000, 30, 3600)
-                .unwrap();
+        let units = agents::discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            false,
+            1000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         if let Ok(plan) = actions::propose_agents(&units, &[path.clone()], "reviewer") {
             actions::save_plan(store.path(), &plan).unwrap();
             actions::approve(store.path(), &plan.id, "human:reviewer").unwrap();

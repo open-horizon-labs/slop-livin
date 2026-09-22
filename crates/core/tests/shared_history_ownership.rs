@@ -66,18 +66,50 @@ fn observe(
     agent_first: bool,
 ) -> (UnitRows, UnitRows) {
     let (ext, agents) = if agent_first {
-        let a =
-            swamp_core::agents::discover_and_measure(scope, &[], Some(store), true, at, 30, 3600)
-                .unwrap();
-        let e = swamp_core::external::discover_and_measure(scope, Some(store), true, at, 30, 3600)
-            .unwrap();
+        let a = swamp_core::agents::discover_and_measure(
+            scope,
+            &[],
+            Some(store),
+            true,
+            at,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let e = swamp_core::external::discover_and_measure(
+            scope,
+            Some(store),
+            true,
+            at,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         (e, a)
     } else {
-        let e = swamp_core::external::discover_and_measure(scope, Some(store), true, at, 30, 3600)
-            .unwrap();
-        let a =
-            swamp_core::agents::discover_and_measure(scope, &[], Some(store), true, at, 30, 3600)
-                .unwrap();
+        let e = swamp_core::external::discover_and_measure(
+            scope,
+            Some(store),
+            true,
+            at,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let a = swamp_core::agents::discover_and_measure(
+            scope,
+            &[],
+            Some(store),
+            true,
+            at,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         (e, a)
     };
     let mut e: UnitRows = ext

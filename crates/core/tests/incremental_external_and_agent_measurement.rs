@@ -19,9 +19,24 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use swamp_core::fs_events::EventCoverage;
 use swamp_core::locations::{Environment, Platform, Registry};
 use swamp_core::scope::{EffectiveScope, ScanConfig, resolve_effective_scope};
 use swamp_core::work_counters::{self, WorkCounters};
+
+/// A trusted replay window over `root` that reports nothing changed --
+/// what an ordinary unchanged pass has after its FSEvents replay
+/// succeeded. `since` is the previous observation's time, which is what
+/// `growth::stage_tracked_with_source` passes through.
+fn quiet_window(root: &Path, since: u64) -> EventCoverage {
+    EventCoverage::trusted(root.to_path_buf(), Vec::new(), since)
+}
+
+/// A trusted replay window that names exactly the paths the pass touched
+/// (each reported path and its parent, as FSEvents answers).
+fn window(root: &Path, changed: &[PathBuf], since: u64) -> EventCoverage {
+    EventCoverage::trusted(root.to_path_buf(), changed.to_vec(), since)
+}
 
 /// Enough sessions that a per-session cost is unmistakable in the
 /// counters. The review's objection to the existing evidence was
@@ -70,16 +85,23 @@ fn scope_with(env_vars: HashMap<String, String>, home: &Path, keep: &[&str]) -> 
 /// A synthetic Claude Code home: `SESSIONS` transcripts across a handful
 /// of project directories, each a single JSON header line.
 fn synthetic_claude_home(root: &Path) -> PathBuf {
+    claude_home_with(root, CONTAINERS, SESSIONS / CONTAINERS)
+}
+
+/// [`synthetic_claude_home`] with the shape chosen by the caller, so a
+/// test can vary the container count while holding everything else --
+/// including the home's own structure -- constant.
+fn claude_home_with(root: &Path, containers: usize, per_container: usize) -> PathBuf {
     let home = root.join("claude");
     let projects = home.join("projects");
     let repo = root.join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
     // A few containers, so "re-list only the changed container" is
     // measurable rather than vacuous.
-    for bucket in 0..CONTAINERS {
+    for bucket in 0..containers {
         let dir = projects.join(format!("-bucket-{bucket}"));
         fs::create_dir_all(&dir).unwrap();
-        for i in 0..(SESSIONS / CONTAINERS) {
+        for i in 0..per_container {
             let id = format!("{bucket:04}-{i:08}-4000-8000-000000000000");
             fs::write(
                 dir.join(format!("{id}.jsonl")),
@@ -100,10 +122,23 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, WorkCounters) {
     (out, work_counters::since(before))
 }
 
-fn observe_agents(scope: &EffectiveScope, store: &Path, at: u64) -> usize {
-    swamp_core::agents::discover_and_measure(scope, &[], Some(store), true, at, 30, 3600)
+fn observe_agents(
+    scope: &EffectiveScope,
+    store: &Path,
+    at: u64,
+    coverage: &EventCoverage,
+) -> usize {
+    swamp_core::agents::discover_and_measure(scope, &[], Some(store), true, at, 30, 3600, coverage)
         .expect("agent discovery")
         .len()
+}
+
+fn agent_bytes(scope: &EffectiveScope, store: &Path, at: u64, coverage: &EventCoverage) -> u64 {
+    swamp_core::agents::discover_and_measure(scope, &[], Some(store), true, at, 30, 3600, coverage)
+        .expect("agent discovery")
+        .iter()
+        .map(|u| u.bytes)
+        .sum()
 }
 
 #[test]
@@ -120,7 +155,8 @@ fn a_large_agent_home_reads_headers_once_and_not_again() {
     let store = tempfile::tempdir().unwrap();
 
     let started = std::time::Instant::now();
-    let (units, first) = measure(|| observe_agents(&scope, store.path(), 1_000));
+    let (units, first) =
+        measure(|| observe_agents(&scope, store.path(), 1_000, &EventCoverage::untrusted()));
     let first_elapsed = started.elapsed();
     assert!(
         units > 0,
@@ -132,7 +168,8 @@ fn a_large_agent_home_reads_headers_once_and_not_again() {
     );
 
     let started = std::time::Instant::now();
-    let (_, second) = measure(|| observe_agents(&scope, store.path(), 2_000));
+    let (_, second) =
+        measure(|| observe_agents(&scope, store.path(), 2_000, &quiet_window(&root, 1_000)));
     let second_elapsed = started.elapsed();
 
     // Reported rather than only asserted: a number in the session note
@@ -178,12 +215,12 @@ fn a_large_agent_home_reads_headers_once_and_not_again() {
     // measured 10,580 stats and 46 listings on an unchanged pass.
     //
     // Container-level reuse (`crate::agents::ContainerCache`) replays a
-    // `projects/<encoded-cwd>/` whose watched directories all carry the
-    // stamps they did last pass. The assertions below are the handoff's
-    // words turned into numbers: unchanged work scales with *containers*,
-    // not with files. Both are strict multiples of the container count --
-    // "fewer than last time" would pass with a reuse that worked for four
-    // containers in five.
+    // `projects/<encoded-cwd>/` whose watched directories this pass's
+    // FSEvents window reports untouched. The assertions below are the
+    // handoff's words turned into numbers: unchanged work scales with
+    // *containers*, not with files. Both are strict multiples of the
+    // container count -- "fewer than last time" would pass with a reuse
+    // that worked for four containers in five.
     assert_eq!(
         second.containers_reused, CONTAINERS as u64,
         "every unchanged container must be replayed from the store: {} of {CONTAINERS}",
@@ -200,10 +237,11 @@ fn a_large_agent_home_reads_headers_once_and_not_again() {
          listings over {CONTAINERS} containers and {SESSIONS} sessions",
         second.dirs_listed
     );
-    // One `stat` per watched directory per container, plus the entries of
-    // the handful of home-level listings above. The bound that matters is
-    // that it does not grow with `SESSIONS`: 10 x CONTAINERS is still two
-    // orders of magnitude below one stat per session.
+    // Since the gate became the event window, a replayed container costs
+    // no `stat` at all; what remains is the entries of the handful of
+    // home-level listings above. The bound that matters is that it does
+    // not grow with `SESSIONS`: 10 x CONTAINERS is still two orders of
+    // magnitude below one stat per session.
     assert!(
         second.files_statted <= 10 * CONTAINERS as u64,
         "an unchanged agent home must cost stats per container, not per session: {} stats \
@@ -236,16 +274,25 @@ fn appending_one_session_re_identifies_exactly_one_container() {
         &["claude-code"],
     );
     let store = tempfile::tempdir().unwrap();
-    let (before, _) = measure(|| observe_agents(&scope, store.path(), 1_000));
+    let (before, _) =
+        measure(|| observe_agents(&scope, store.path(), 1_000, &EventCoverage::untrusted()));
 
     let repo = root.join("repo");
+    let added = home.join("projects/-bucket-3/aaaa-99999999-4000-8000-000000000000.jsonl");
     fs::write(
-        home.join("projects/-bucket-3/aaaa-99999999-4000-8000-000000000000.jsonl"),
+        &added,
         format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", repo.display()),
     )
     .unwrap();
 
-    let (after, third) = measure(|| observe_agents(&scope, store.path(), 3_000));
+    // What a real replay would report for that write: the file and its
+    // parent directory, and nothing else.
+    let events = window(
+        &root,
+        &[added.clone(), home.join("projects/-bucket-3")],
+        1_000,
+    );
+    let (after, third) = measure(|| observe_agents(&scope, store.path(), 3_000, &events));
     println!(
         "one appended session: {} containers identified, {} reused, {} dirs listed, {} files \
          statted, {} header bytes",
@@ -315,28 +362,16 @@ fn a_container_that_folds_directories_records_them_and_notices_them() {
         &["claude-code"],
     );
     let store = tempfile::tempdir().unwrap();
-    let total = |at: u64| -> u64 {
-        swamp_core::agents::discover_and_measure(
-            &scope,
-            &[],
-            Some(store.path()),
-            true,
-            at,
-            30,
-            3600,
-        )
-        .expect("agent discovery")
-        .iter()
-        .map(|u| u.bytes)
-        .sum()
+    let total = |at: u64, coverage: &EventCoverage| -> u64 {
+        agent_bytes(&scope, store.path(), at, coverage)
     };
-    let first = total(1_000);
+    let first = total(1_000, &EventCoverage::untrusted());
     assert!(
         first >= 1536,
         "precondition: the folded members count: {first}"
     );
 
-    let (second, cost) = measure(|| total(2_000));
+    let (second, cost) = measure(|| total(2_000, &quiet_window(&root, 1_000)));
     assert_eq!(second, first, "an unchanged home reports the same bytes");
     assert_eq!(
         cost.containers_reused, 1,
@@ -344,15 +379,14 @@ fn a_container_that_folds_directories_records_them_and_notices_them() {
     );
 
     // `file-history/<session-id>/` did not exist when the container was
-    // stored. Creating it moves `file-history/`'s own stamp, which the
-    // container watches precisely so this is not invisible.
-    fs::create_dir_all(home.join("file-history").join(id)).unwrap();
-    fs::write(
-        home.join("file-history").join(id).join("snap.json"),
-        vec![b'f'; 4096],
-    )
-    .unwrap();
-    let (third, cost) = measure(|| total(3_000));
+    // stored. The container *watches* that directory, so an event under
+    // it must re-identify the container even though nothing inside
+    // `projects/-repo` moved.
+    let fh = home.join("file-history");
+    fs::create_dir_all(fh.join(id)).unwrap();
+    fs::write(fh.join(id).join("snap.json"), vec![b'f'; 4096]).unwrap();
+    let events = window(&root, &[fh.join(id), fh.clone()], 2_000);
+    let (third, cost) = measure(|| total(3_000, &events));
     assert_eq!(
         cost.containers_identified, 1,
         "a watched sibling directory gaining an entry must re-identify the container"
@@ -363,14 +397,28 @@ fn a_container_that_folds_directories_records_them_and_notices_them() {
     );
 }
 
-/// The limit this reuse has, asserted rather than only written down: a
-/// session rewritten **in place** does not move its container's stamp,
-/// so its new byte total is not seen until something else in that
-/// container changes. Stated on `crate::agents::ContainerCache` and in
-/// `.oh/guardrails/no-second-traversal-on-report-path.md`; measured here,
-/// because a documented limit nobody tests is a documented guess.
+/// **The 2026-09-22 integration decision, asserted three ways.**
+///
+/// Until this chunk, container reuse was keyed on the container
+/// directory's own `mtime`/`ctime`. A transcript **appended in place**
+/// -- which is how a running agent writes, and therefore the normal case
+/// for this catalog -- moves the file's own size and mtime and not its
+/// parent's, so the growing session kept its stored byte total until
+/// something else happened in that container. The integration owner
+/// ruled that unacceptable for a growth tool: what grew must be seen.
+///
+/// Reuse is now gated on trusted event coverage, so all three branches
+/// below report the appended bytes:
+///
+/// 1. under a replayed/live window that names the appended file, the
+///    container is re-identified;
+/// 2. under no window at all (a full walk, any refusal), nothing is
+///    replayed and the container is re-identified anyway;
+/// 3. a container the window vouches for is replayed, and -- because the
+///    window has already answered the question directory stamps used to
+///    be asked -- costs no listing and no `stat`.
 #[test]
-fn a_session_rewritten_in_place_is_not_seen_until_its_container_moves() {
+fn an_appended_session_is_seen_under_event_coverage_and_under_a_full_walk() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
@@ -381,51 +429,158 @@ fn a_session_rewritten_in_place_is_not_seen_until_its_container_moves() {
         &["claude-code"],
     );
     let store = tempfile::tempdir().unwrap();
-    let bytes = |at: u64| -> u64 {
-        swamp_core::agents::discover_and_measure(
-            &scope,
-            &[],
-            Some(store.path()),
-            true,
-            at,
-            30,
-            3600,
-        )
-        .expect("agent discovery")
-        .iter()
-        .map(|u| u.bytes)
-        .sum()
+    let bytes = |at: u64, coverage: &EventCoverage| -> u64 {
+        agent_bytes(&scope, store.path(), at, coverage)
     };
-    let first = bytes(1_000);
+    let first = bytes(1_000, &EventCoverage::untrusted());
 
-    // Same name, same directory: the file grows, its parent's mtime and
-    // ctime do not move.
-    let victim = home.join("projects/-bucket-1/0001-00000000-4000-8000-000000000000.jsonl");
-    let grown = format!(
-        "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n{}\n",
-        root.join("repo").display(),
-        "x".repeat(50_000)
-    );
-    fs::write(&victim, &grown).unwrap();
-    let second = bytes(2_000);
+    // (3) Nothing touched: replayed, and free.
+    let (unchanged, cost) = measure(|| bytes(2_000, &quiet_window(&root, 1_000)));
+    assert_eq!(unchanged, first, "an untouched home reports the same bytes");
     assert_eq!(
-        second, first,
-        "recorded limit: an in-place rewrite does not move its container's stamp, so the \
-         stored byte total stands until the container changes"
+        cost.containers_reused, CONTAINERS as u64,
+        "every untouched container must be replayed: {}",
+        cost.containers_reused
+    );
+    // The residual work is the adapter's own home-level structure scan
+    // (`~/.claude` itself, `projects/`, and the absent `file-history/`,
+    // `image-cache/`, `uploads/`) -- none of it inside a container.
+    // `replaying_containers_costs_nothing_per_container` below pins the
+    // per-container cost at exactly zero by holding the home level
+    // constant and varying only the container count.
+    assert!(
+        cost.dirs_listed <= 8 && cost.files_statted <= 8,
+        "an untouched home's residual must be the home-level scan, not per-container work: \
+         {} listings and {} stats over {CONTAINERS} containers",
+        cost.dirs_listed,
+        cost.files_statted
+    );
+    assert_eq!(
+        cost.identification_cache_hits, 0,
+        "a replayed container makes no per-file derivation at all: {} hits",
+        cost.identification_cache_hits
     );
 
-    // Anything that changes the container's shape re-identifies it, and
-    // the rewritten file's real size is reported then.
-    fs::write(
-        home.join("projects/-bucket-1/zzzz-00000000-4000-8000-000000000000.jsonl"),
-        b"{}\n",
-    )
-    .unwrap();
-    let third = bytes(3_000);
+    // (1) Append 1 KiB to an existing transcript -- same name, same
+    // directory, so the container's own stamp does not move.
+    let victim = home.join("projects/-bucket-1/0001-00000000-4000-8000-000000000000.jsonl");
+    let append = |bytes: usize| {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(&victim).unwrap();
+        f.write_all(&vec![b'x'; bytes]).unwrap();
+        f.write_all(b"\n").unwrap();
+    };
+    let before_len = fs::metadata(&victim).unwrap().len();
+    append(1024);
+    let after_len = fs::metadata(&victim).unwrap().len();
     assert!(
-        third > first + 40_000,
-        "once the container is re-identified the rewritten session's real size is reported: \
-         {third} vs {first}"
+        after_len >= before_len + 1024,
+        "precondition: the transcript must have grown by about a KiB ({before_len} -> \
+         {after_len})"
+    );
+
+    let events = window(
+        &root,
+        &[victim.clone(), home.join("projects/-bucket-1")],
+        2_000,
+    );
+    let (appended, cost) = measure(|| bytes(3_000, &events));
+    assert_eq!(
+        cost.containers_identified, 1,
+        "the appended session's container must be re-identified, not replayed: {} identified, \
+         {} reused",
+        cost.containers_identified, cost.containers_reused
+    );
+    assert!(
+        appended >= first + 1024,
+        "an in-place append must be reported in the same pass that sees its event: {appended} \
+         vs {first}"
+    );
+
+    // (2) The same append, with no window at all: a full walk reuses
+    // nothing, so it sees the growth for the same reason a fresh
+    // identification would.
+    let store2 = tempfile::tempdir().unwrap();
+    let base = agent_bytes(&scope, store2.path(), 1_000, &EventCoverage::untrusted());
+    append(2048);
+    let (walked, cost) =
+        measure(|| agent_bytes(&scope, store2.path(), 2_000, &EventCoverage::untrusted()));
+    assert_eq!(
+        cost.containers_reused, 0,
+        "a pass with no trusted window must replay nothing: {} reused",
+        cost.containers_reused
+    );
+    assert!(
+        walked >= base + 2048,
+        "a full walk must report the appended bytes: {walked} vs {base}"
+    );
+}
+
+/// Per-container reuse cost, pinned at exactly zero by holding the home
+/// level constant and varying only the container count.
+///
+/// The test above cannot assert `(0, 0)` outright because an unchanged
+/// pass still scans the tool home's own structure, which is real work
+/// and is counted as such. This one subtracts that: two synthetic homes
+/// that differ only in how many `projects/<encoded-cwd>/` containers
+/// they have must cost the *same* number of listings and stats on a pass
+/// their window vouches for. Any per-container `stat` -- the directory
+/// stamp check this chunk removed, for instance -- shows up as a
+/// difference.
+#[test]
+fn replaying_containers_costs_nothing_per_container() {
+    let _serial = serial();
+    let unchanged_cost = |containers: usize, per_container: usize| -> (u64, u64, u64) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let home = claude_home_with(&root, containers, per_container);
+        let scope = scope_with(
+            HashMap::from([("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string())]),
+            &root,
+            &["claude-code"],
+        );
+        let store = tempfile::tempdir().unwrap();
+        let _ = observe_agents(&scope, store.path(), 1_000, &EventCoverage::untrusted());
+        let (_, cost) =
+            measure(|| observe_agents(&scope, store.path(), 2_000, &quiet_window(&root, 1_000)));
+        assert_eq!(
+            cost.containers_reused, containers as u64,
+            "precondition: every container must be replayed"
+        );
+        // Keep the tempdir alive until the measurement is done.
+        drop(tmp);
+        (cost.dirs_listed, cost.files_statted, cost.header_bytes_read)
+    };
+    // Sessions are free: the same containers holding twelve times as
+    // many transcripts cost exactly the same. This is the handoff's
+    // claim -- unchanged work does not scale with files -- and it is an
+    // equality, not a bound.
+    let small = unchanged_cost(3, 4);
+    let dense = unchanged_cost(3, 48);
+    assert_eq!(
+        small, dense,
+        "a replayed container must not cost anything per session: 4 sessions each cost \
+         {small:?}, 48 each cost {dense:?}"
+    );
+
+    // Containers cost exactly one `stat` each, and it is not the
+    // container's: it is the entry `projects/` yields when the home's
+    // own structure is scanned, which is how this pass learns the
+    // container exists at all. Zero extra listings, zero extra header
+    // bytes, and -- since this chunk removed the directory-stamp check
+    // -- zero stats of the container itself.
+    let (one_dirs, one_stats, one_hdr) = unchanged_cost(1, 4);
+    let (many_dirs, many_stats, many_hdr) = unchanged_cost(9, 4);
+    assert_eq!(
+        (one_dirs, one_hdr),
+        (many_dirs, many_hdr),
+        "eight more containers must add no listing and no header read"
+    );
+    assert_eq!(
+        many_stats - one_stats,
+        8,
+        "eight more containers must add exactly their eight `projects/` entries and nothing \
+         else: {one_stats} vs {many_stats}"
     );
 }
 
@@ -441,16 +596,22 @@ fn appending_one_session_reads_exactly_one_header() {
         &["claude-code"],
     );
     let store = tempfile::tempdir().unwrap();
-    let _ = measure(|| observe_agents(&scope, store.path(), 1_000));
+    let _ = measure(|| observe_agents(&scope, store.path(), 1_000, &EventCoverage::untrusted()));
 
     let repo = root.join("repo");
+    let added = home.join("projects/-bucket-0/aaaa-99999999-4000-8000-000000000000.jsonl");
     fs::write(
-        home.join("projects/-bucket-0/aaaa-99999999-4000-8000-000000000000.jsonl"),
+        &added,
         format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", repo.display()),
     )
     .unwrap();
 
-    let (_, third) = measure(|| observe_agents(&scope, store.path(), 3_000));
+    let events = window(
+        &root,
+        &[added.clone(), home.join("projects/-bucket-0")],
+        1_000,
+    );
+    let (_, third) = measure(|| observe_agents(&scope, store.path(), 3_000, &events));
     println!(
         "one appended session: {} header bytes, {} dirs listed",
         third.header_bytes_read, third.dirs_listed
@@ -502,6 +663,7 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
             1_000,
             30,
             3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
         )
         .expect("external discovery")
         .len()
@@ -518,6 +680,7 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
             2_000,
             30,
             3600,
+            &quiet_window(&root, 1_000),
         )
         .expect("external discovery")
         .len()
@@ -551,17 +714,15 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
          files",
         second.dirs_listed, EXTERNAL_FILES
     );
-    // The stat cost is the directory count, not the file count: that is
-    // the whole claim ("scales with roots and changed containers, not
-    // all files"), and a bound of "fewer than the first pass" would not
-    // show it.
-    assert!(
-        second.files_statted < 100,
-        "an unchanged external root costs one stat per directory, not per file: {} stats over \
-         {} files (first pass: {})",
-        second.files_statted,
-        EXTERNAL_FILES,
-        first.files_statted
+    // Since the gate became the event window (2026-09-22) the stat cost
+    // is not the directory count either: it is zero. The claim the
+    // handoff makes ("unchanged work scales with roots and changed
+    // containers, not all files") is now literal.
+    assert_eq!(
+        second.files_statted, 0,
+        "a unit the window vouches for costs no stat at all: {} stats over {} files (first \
+         pass: {})",
+        second.files_statted, EXTERNAL_FILES, first.files_statted
     );
 }
 
@@ -585,22 +746,32 @@ fn a_changed_external_cache_root_is_measured_again() {
         &["cargo-home"],
     );
     let store = tempfile::tempdir().unwrap();
-    let measure_pass = |at: u64| {
-        swamp_core::external::discover_and_measure(&scope, Some(store.path()), true, at, 30, 3600)
-            .expect("external discovery")
-            .into_iter()
-            .map(|u| u.bytes)
-            .sum::<u64>()
+    let measure_pass = |at: u64, coverage: &EventCoverage| {
+        swamp_core::external::discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            at,
+            30,
+            3600,
+            coverage,
+        )
+        .expect("external discovery")
+        .into_iter()
+        .map(|u| u.bytes)
+        .sum::<u64>()
     };
-    let (first_bytes, _) = measure(|| measure_pass(1_000));
-    let (_, second) = measure(|| measure_pass(2_000));
+    let (first_bytes, _) = measure(|| measure_pass(1_000, &EventCoverage::untrusted()));
+    let (_, second) = measure(|| measure_pass(2_000, &quiet_window(&root, 1_000)));
     assert_eq!(
         second.dirs_listed, 0,
         "precondition: the unchanged pass reuses"
     );
 
-    fs::write(registry.join("added.crate"), vec![b'x'; 200_000]).unwrap();
-    let (third_bytes, third) = measure(|| measure_pass(3_000));
+    let added = registry.join("added.crate");
+    fs::write(&added, vec![b'x'; 200_000]).unwrap();
+    let events = window(&root, &[added.clone(), registry.clone()], 2_000);
+    let (third_bytes, third) = measure(|| measure_pass(3_000, &events));
     assert!(
         third.dirs_listed > 0,
         "a directory whose contents changed must be listed again"

@@ -87,6 +87,7 @@ fn real_units_with_canary_content() -> (Report, PathBuf, Vec<swamp_core::agents:
         1_000,
         30,
         3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
     )
     .unwrap();
     assert!(

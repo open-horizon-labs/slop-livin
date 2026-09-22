@@ -191,6 +191,124 @@ pub trait FsEventsSource: Send + Sync {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan;
 }
 
+/// One root this observation replayed successfully, and everything the
+/// replay said changed underneath it.
+#[derive(Debug, Clone)]
+struct EventWindow {
+    /// Canonical, as FSEvents answers.
+    root: PathBuf,
+    /// Every path the replay implicated (each reported path plus its
+    /// parent), unfiltered.
+    changed: Vec<PathBuf>,
+    /// The observation time the window replays *from*. Stored rows older
+    /// than this were written before the window opened, so the window
+    /// cannot vouch for them.
+    since_observed_at: u64,
+}
+
+/// What this observation's FSEvents replays can vouch for -- the
+/// evidence that makes reusing a previous pass's measurement honest
+/// rather than hopeful.
+///
+/// # Why this exists
+///
+/// Both unit families cache a previous pass's answer: the external
+/// family its folded byte totals
+/// (`crate::folded_measurement::reuse_folded_measurement`), the agent
+/// family a whole container's identified units
+/// (`crate::agents::IdentifyCtx::container`). Until 2026-09-22 both
+/// decided "unchanged" from the recorded directories' own
+/// `mtime`/`ctime` stamps. A directory stamp cannot see a file rewritten
+/// **in place**, and for agent storage that is not a corner case: a tool
+/// appends to an open session transcript in place, which moves the
+/// file's own size and mtime and not its parent's. A growth tool that
+/// cannot see the file that is growing is not doing its job, so
+/// stamp-only reuse was removed as a sufficient condition.
+///
+/// Trusted event coverage replaces it, and it is the same rule the Cargo
+/// adapter has always followed (`crate::consumers::cargo`): when this
+/// pass has a successful FSEvents replay (or live window) over a root,
+/// and that window reports no event at or under a path, then nothing
+/// under that path changed since the window opened -- appends included,
+/// because FSEvents reports writes, not just directory-shape changes.
+/// When there is no such window (a full walk, a refusal, an overflow, a
+/// first observation), there is no evidence and there is no reuse: the
+/// caller re-identifies, where the per-file caches still keep header
+/// reads at zero for the files that did not move.
+///
+/// # What it deliberately does not do
+///
+/// It does not fall back to directory stamps when a window is missing. A
+/// stamp is strictly weaker evidence than the window -- it cannot see
+/// the append -- and costs one `stat` per recorded directory per pass,
+/// so keeping it as a second opinion would buy nothing and charge for
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct EventCoverage {
+    windows: Vec<EventWindow>,
+}
+
+impl EventCoverage {
+    /// No evidence at all: every reuse decision must re-derive. This is
+    /// what a store-less caller, a forced full walk, an execution-time
+    /// recheck and every refusal reason get.
+    pub fn untrusted() -> Self {
+        Self::default()
+    }
+
+    /// Records one root whose replay this pass trusted.
+    ///
+    /// `changed` must be the replay's own list (each reported path and
+    /// its parent), *not* one filtered for exclusions or pruning: a path
+    /// this walk chose not to descend into is still a path the window
+    /// has to be able to say "changed" about.
+    pub fn trust(&mut self, root: PathBuf, changed: Vec<PathBuf>, since_observed_at: u64) {
+        self.windows.push(EventWindow {
+            root,
+            changed,
+            since_observed_at,
+        });
+    }
+
+    /// A single-window coverage, for tests and for callers that replay
+    /// exactly one root.
+    pub fn trusted(root: PathBuf, changed: Vec<PathBuf>, since_observed_at: u64) -> Self {
+        let mut c = Self::untrusted();
+        c.trust(root, changed, since_observed_at);
+        c
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// Whether this pass can show that **nothing under `path` changed**
+    /// since `stored_at`, the observation time of the rows a caller
+    /// wants to reuse.
+    ///
+    /// Three things must all hold, and each one is a way reuse goes
+    /// wrong when it is missing:
+    ///
+    /// * some trusted window's root is `path` or an ancestor of it --
+    ///   otherwise nothing was watching this path at all;
+    /// * the rows are no older than that window's start
+    ///   (`stored_at >= since_observed_at`) -- otherwise a change in the
+    ///   gap between when the rows were written and when the window
+    ///   opened is invisible to both. That gap is exactly what a pass
+    ///   which skipped this unit family (`report::ObservationParts`)
+    ///   leaves behind, and it is why a window on its own is not enough;
+    /// * that window reports no event at `path` or under it. An event
+    ///   *above* `path` (a sibling created next door) is not a change to
+    ///   `path`, and is not treated as one.
+    pub fn unchanged_since(&self, path: &Path, stored_at: u64) -> bool {
+        self.windows.iter().any(|w| {
+            path.starts_with(&w.root)
+                && stored_at >= w.since_observed_at
+                && !w.changed.iter().any(|c| c.starts_with(path))
+        })
+    }
+}
+
 /// Returns the platform's real source on macOS, and the always-refusing
 /// stub everywhere else.
 pub fn platform_source() -> Box<dyn FsEventsSource> {

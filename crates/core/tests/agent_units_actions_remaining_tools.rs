@@ -79,6 +79,7 @@ fn units_for(
         1_000,
         30,
         3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
     )
     .unwrap()
 }
@@ -286,6 +287,7 @@ fn aider_disabled_detector_turns_off_both_home_and_repo_units() {
         1_000,
         30,
         3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
     )
     .unwrap();
     assert!(

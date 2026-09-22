@@ -66,8 +66,17 @@ fn units_for(
     let env = Environment::fixture(home_dummy.path().to_path_buf(), env_vars, Platform::MacOS);
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_detector(detector_id), &[], &registry, 1);
-    let units =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let _ = store; // keep tempdir alive for the call above
     units
 }

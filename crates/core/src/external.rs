@@ -245,6 +245,7 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
     (candidates, out_of_scope)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn discover_and_measure(
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
@@ -252,6 +253,7 @@ pub fn discover_and_measure(
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
 ) -> Result<Vec<ExternalUnit>> {
     // Authorized scope only -- never raw detector candidates. The
     // review's `excluded_agent_home_must_not_be_scanned` counterexample
@@ -288,6 +290,11 @@ pub fn discover_and_measure(
 
     let mut units: Vec<ExternalUnit> = Vec::new();
     let mut observed: Vec<crate::growth::ObservedExternal> = Vec::new();
+    // Units whose folded rows this pass replayed rather than re-took.
+    // They are re-stamped below so the next pass's window can still
+    // vouch for them; without that, reuse would only ever work on every
+    // second pass.
+    let mut reused_unit_paths: Vec<String> = Vec::new();
     let mut protected_keys: HashSet<String> = HashSet::new();
     let mut meta_by_key: HashMap<String, MeasuredUnit> = HashMap::new();
 
@@ -341,14 +348,15 @@ pub fn discover_and_measure(
         // measurement seam; nothing in this module lists a directory or
         // re-sizes a tree itself
         // (`.oh/guardrails/no-second-traversal-on-report-path.md`).
-        // `observe_unit` tries the stored folded rows first, so an
-        // unchanged unit costs one stat per directory and no listing at
-        // all -- not even the readability probe's.
+        // `observe_unit` tries the stored folded rows first, so a unit
+        // this pass's event window vouches for costs no listing, no
+        // `stat` and not even the readability probe.
         let row = match crate::folded_measurement::observe_unit(
             swamp_dir,
             &canonical,
             &nested_exclusions,
             observed_at,
+            coverage,
         ) {
             // Genuinely absent: no candidate this pass. If it was
             // measured before, this observation's own owned sweep
@@ -364,6 +372,9 @@ pub fn discover_and_measure(
             }
             crate::folded_measurement::UnitObservation::Unit(row) => row,
         };
+        if row.reused {
+            reused_unit_paths.push(canonical.display().to_string());
+        }
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),
             detector_id: detector_id.clone(),
@@ -400,6 +411,11 @@ pub fn discover_and_measure(
     // Inside a covered root, outside this pass: an excluded nested
     // location keeps its stored row exactly as it is.
     .excluding(out_of_scope.clone());
+    if let Some(dir) = swamp_dir
+        && observe
+    {
+        crate::growth::touch_folded_rows(dir, &reused_unit_paths, observed_at)?;
+    }
     let annotations: HashMap<String, (Option<i64>, u32)> = match swamp_dir {
         Some(dir) if observe => crate::growth::observe_and_annotate_external(
             dir,
@@ -580,6 +596,7 @@ fn save_all_consumers(
                 key.clone(),
                 crate::assoc_store::CachedRows {
                     fingerprint: crate::assoc_store::DECLARED_BY_HAND.to_string(),
+                    observed_at: 0,
                     rows: consumers
                         .iter()
                         .map(|c| vec![c.label.clone(), c.note.clone().unwrap_or_default()])

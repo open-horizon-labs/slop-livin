@@ -142,8 +142,17 @@ fn custom_root_overrides_redirect_discovery_away_from_the_convention_path() {
         env_vars.insert(env_var.to_string(), custom_home.display().to_string());
         let scope = scope_for(root.path(), env_vars, &[detector_id]);
         let store = tempfile::tempdir().unwrap();
-        let units =
-            discover_and_measure(&scope, &[], Some(store.path()), false, 1_000, 30, 3600).unwrap();
+        let units = discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            false,
+            1_000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         assert!(
             units.iter().any(|u| u.tool_home == custom_home),
             "detector {detector_id}: expected a unit whose tool_home is the override path {}, \
@@ -394,8 +403,17 @@ fn canary_never_leaks_across_render_text_json_plan_execute_or_ledger() {
     env_vars.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
     let scope = scope_for(root.path(), env_vars, &["claude-code", "codex"]);
     let store = tempfile::tempdir().unwrap();
-    let units =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(units.iter().any(|u| u.path == claude_jsonl));
     assert!(units.iter().any(|u| u.path == codex_jsonl));
 
@@ -470,8 +488,17 @@ fn project_linked_totals_agree_between_the_flat_view_and_the_project_tree() {
     );
     let scope = scope_for(root.path(), env_vars, &["claude-code"]);
     let store = tempfile::tempdir().unwrap();
-    let units =
-        discover_and_measure(&scope, &[], Some(store.path()), false, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        false,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(units.iter().any(|u| u.path == jsonl));
     assert!(units.iter().any(|u| u.path == extra_jsonl));
 
@@ -527,8 +554,17 @@ fn unchanged_refresh_is_silent_then_a_new_session_reports_only_its_own_growth() 
     let store = tempfile::tempdir().unwrap();
 
     // First observation: no baseline yet.
-    let first =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let first = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let first_unit = first.iter().find(|u| u.path == jsonl).unwrap();
     assert_eq!(
         first_unit.growth_bytes, None,
@@ -539,8 +575,17 @@ fn unchanged_refresh_is_silent_then_a_new_session_reports_only_its_own_growth() 
 
     // Second observation, nothing changed: zero growth, never a
     // fabricated delta from re-observing the exact same bytes.
-    let second =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 2_000, 30, 3600).unwrap();
+    let second = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let second_unit = second.iter().find(|u| u.path == jsonl).unwrap();
     assert_eq!(second_unit.bytes, original_bytes);
     assert!(
@@ -565,8 +610,17 @@ fn unchanged_refresh_is_silent_then_a_new_session_reports_only_its_own_growth() 
         )
         .as_bytes(),
     );
-    let third =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 3_000, 30, 3600).unwrap();
+    let third = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        3_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let third_existing = third.iter().find(|u| u.path == jsonl).unwrap();
     assert!(
         third_existing.growth_bytes.is_none_or(|g| g == 0),
@@ -623,8 +677,17 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
     let scope = scope_for(root.path(), env_vars.clone(), &["claude-code"]);
     let store = tempfile::tempdir().unwrap();
 
-    let before =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let before = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let before_unit = before.iter().find(|u| u.path == jsonl).unwrap();
     let bytes_before = before_unit.bytes;
     assert!(matches!(
@@ -660,29 +723,43 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
         rechecked_unit.project_link
     );
 
-    let after =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 2_000, 30, 3600).unwrap();
-    let after_unit = after.iter().find(|u| u.path == jsonl).unwrap();
-    // THE RECORDED LIMIT of container-level reuse (2026-09-22,
-    // stack/12), asserted rather than only written down. The rewrite is
-    // in place: same name, same directory, same length -- so
-    // `projects/-proj-aaaa-encoded/`'s own mtime and ctime do not move,
-    // the container is replayed from the store, and the declared path
-    // replayed with it is the old one. `crate::agents::ContainerCache`
-    // states this; the fresh re-identification above is why it is a
-    // reporting lag and not an authorization hole.
+    // The ordinary report path, under the event coverage an ordinary
+    // pass has: the replay names the rewritten transcript and its
+    // parent, because a rewrite *is* an event.
     //
-    // This assertion is deliberately the *observed* behaviour and not
-    // the desired one. It used to read "attribution must actually have
-    // moved"; that is now only true of a pass that re-identifies the
-    // container, which the two assertions below cover.
+    // This assertion was weakened in stack/12 to "a replayed container
+    // still reports the declared path it was stored with", because
+    // reuse was then keyed on the container's directory stamp, which an
+    // in-place rewrite does not move. Gating reuse on trusted event
+    // coverage (stack/13) removed the reason for the weakening, and the
+    // original requirement is re-asserted here: the next observation
+    // sees the new project.
+    let events = swamp_core::fs_events::EventCoverage::trusted(
+        root.path().to_path_buf(),
+        vec![
+            jsonl.clone(),
+            claude_home.join("projects").join("-proj-aaaa-encoded"),
+        ],
+        1_000,
+    );
+    let after = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &events,
+    )
+    .unwrap();
+    let after_unit = after.iter().find(|u| u.path == jsonl).unwrap();
     assert!(
         matches!(
             &after_unit.project_link,
-            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-aaaa"
+            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
         ),
-        "recorded limit: a replayed container still reports the declared path it was stored \
-         with: {:?}",
+        "the next ordinary observation under event coverage must see the new project: {:?}",
         after_unit.project_link
     );
     assert_eq!(
@@ -695,26 +772,58 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
         after_unit.growth_bytes
     );
 
-    // Anything that moves the container's own stamp re-identifies it,
-    // and the moved attribution is reported then -- with still no
-    // fabricated growth delta for the session whose bytes did not
-    // change.
-    write(
-        &claude_home
-            .join("projects")
-            .join("-proj-aaaa-encoded")
-            .join("cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl"),
-        b"{\"type\":\"user\"}\n",
+    // And a pass with *no* window reuses nothing, so it sees the same
+    // thing for the same reason a fresh identification does. Two
+    // branches, one answer: there is no pass that reports the stale
+    // project.
+    let store2 = tempfile::tempdir().unwrap();
+    let cold = discover_and_measure(
+        &scope,
+        &[],
+        Some(store2.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
+    let cold_unit = cold.iter().find(|u| u.path == jsonl).unwrap();
+    assert!(
+        matches!(
+            &cold_unit.project_link,
+            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
+        ),
+        "a pass with no trusted window must re-identify and see the new project: {:?}",
+        cold_unit.project_link
     );
-    let later =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 3_000, 30, 3600).unwrap();
+
+    // A later, genuinely quiet pass replays the container -- and what it
+    // replays is the *new* attribution, because the pass above stored
+    // it. A replay can only ever be as stale as the observation that
+    // wrote it, which is the whole point of gating on the window.
+    let later = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        3_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::trusted(
+            root.path().to_path_buf(),
+            Vec::new(),
+            2_000,
+        ),
+    )
+    .unwrap();
     let later_unit = later.iter().find(|u| u.path == jsonl).unwrap();
     assert!(
         matches!(
             &later_unit.project_link,
             swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
         ),
-        "once the container is re-identified the attribution must have moved: {:?}",
+        "a replayed container must carry the attribution the last identification stored: {:?}",
         later_unit.project_link
     );
     assert_eq!(
@@ -723,8 +832,7 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
     );
     assert!(
         later_unit.growth_bytes.is_none_or(|g| g == 0),
-        "a pure attribution change must never fabricate a growth delta, not even on the pass \
-         that finally notices it: {:?}",
+        "a pure attribution change must never fabricate a growth delta, not on any pass: {:?}",
         later_unit.growth_bytes
     );
 }
@@ -770,14 +878,32 @@ fn benchmark_unchanged_refresh_one_session_append_and_blob_growth() {
     let store = tempfile::tempdir().unwrap();
 
     let t0 = std::time::Instant::now();
-    let first =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let first = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let initial_ms = t0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(first.len(), 300);
 
     let t1 = std::time::Instant::now();
-    let _unchanged =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 2_000, 30, 3600).unwrap();
+    let _unchanged = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let unchanged_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     let extra = claude_home
@@ -793,8 +919,17 @@ fn benchmark_unchanged_refresh_one_session_append_and_blob_growth() {
         .as_bytes(),
     );
     let t2 = std::time::Instant::now();
-    let appended =
-        discover_and_measure(&scope, &[], Some(store.path()), true, 3_000, 30, 3600).unwrap();
+    let appended = discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        3_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let append_ms = t2.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(appended.len(), 301);
 

@@ -91,6 +91,7 @@ impl Fixture {
             1_000,
             30,
             3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
         )
         .expect("discovery");
         let plan = actions::propose_agents(

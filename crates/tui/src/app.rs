@@ -2189,7 +2189,17 @@ mod tests {
             enabled_detectors: Vec::new(),
         };
         let scope = swamp_core::scope::resolve_effective_scope(&env, &cfg, &[], &registry, 1);
-        swamp_core::agents::discover_and_measure(&scope, &[], None, false, 1_000, 30, 3600).unwrap()
+        swamp_core::agents::discover_and_measure(
+            &scope,
+            &[],
+            None,
+            false,
+            1_000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap()
     }
 
     #[test]

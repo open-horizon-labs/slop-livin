@@ -80,7 +80,16 @@ fn observe(
 ) -> Snapshot {
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(env, cfg, explicit, &registry, at);
-    let units = external::discover_and_measure(&scope, Some(store), true, at, 30, 3600).unwrap();
+    let units = external::discover_and_measure(
+        &scope,
+        Some(store),
+        true,
+        at,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let mut out: Snapshot = units
         .into_iter()
         .map(|u| (u.path, u.bytes, u.growth_bytes, u.regrowth_count))

@@ -192,6 +192,7 @@ fn cached_declarations(worktree: &Path, cache: &mut CacheMap) -> Vec<ToolVersion
         key,
         crate::assoc_store::CachedRows {
             fingerprint: fp,
+            observed_at: 0,
             rows: declarations.iter().map(declaration_to_row).collect(),
         },
     );
@@ -361,6 +362,7 @@ fn cached_identities(
         key,
         crate::assoc_store::CachedRows {
             fingerprint: fp,
+            observed_at: 0,
             rows,
         },
     );
@@ -1047,6 +1049,7 @@ fn attach_workspace_index(
                     key,
                     crate::assoc_store::CachedRows {
                         fingerprint: fp,
+                        observed_at: 0,
                         rows: vec![vec![fresh.0.clone(), fresh.1.clone()]],
                     },
                 );

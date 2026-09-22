@@ -550,8 +550,8 @@ fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
 
 /// Bumped whenever the *encoding* of a container's persisted units
 /// changes, so rows written by an older binary are a miss rather than a
-/// misread. Part of every container fingerprint.
-const CONTAINER_VERSION: &str = "agent-container/2026-09-22.1";
+/// misread. Part of every container's stored shape key.
+const CONTAINER_VERSION: &str = "agent-container/2026-09-22.2";
 
 /// The memo that makes an unchanged container cost `stat`s instead of a
 /// listing and a `stat` per file.
@@ -572,33 +572,47 @@ const CONTAINER_VERSION: &str = "agent-container/2026-09-22.1";
 ///   (`projects/<encoded-cwd>/`, `sessions/<yyyy>/<mm>/<dd>/`, a tool's
 ///   session parent) in [`IdentifyCtx::container`];
 /// * every directory that identification lists or folds is recorded,
-///   and the container's fingerprint is those directories' own
-///   `mtime`/`ctime` -- the stamp the walk's `stat` already produced;
-/// * an unchanged container is replayed from the stored rows, paying one
-///   `stat` per recorded directory and no listing at all;
-/// * a changed container is re-identified file by file, where the
-///   per-file [`IdentificationCache`] still keeps its header reads at
-///   zero for the sessions that did not move.
+///   and stored alongside the units it produced;
+/// * a container is replayed only when this pass's
+///   [`crate::fs_events::EventCoverage`] can show that **no event
+///   touched any of those directories** since the rows were written --
+///   costing no listing, no `stat` and no header read at all;
+/// * a container with no such evidence is re-identified file by file,
+///   where the per-file [`IdentificationCache`] still keeps its header
+///   reads at zero for the sessions that did not move.
 ///
-/// **What this cannot see**, stated here rather than left for the next
-/// reviewer, and it is exactly the limit
-/// [`crate::folded_measurement::reuse_folded_measurement`] records for
-/// the external family: a file rewritten *in place* -- same name, same
-/// directory -- does not move that directory's stamp. Creating,
-/// deleting, renaming or replacing an entry does; rewriting one does
-/// not. So a session transcript rewritten in place keeps its stored byte
-/// total until something else in its container changes, or the store is
-/// cleared. The per-file identification key still catches it the moment
-/// the container *is* re-visited, and the safety boundary for acting on
-/// any of this is not the cache at all: it is the reviewed snapshot
-/// re-derived from the live filesystem at execution
-/// (`reidentify_for_tool`, which runs with the cache
-/// [`IdentificationCache::disabled`]).
+/// **Why the gate is events and not directory stamps.** The first
+/// version of this cache keyed reuse on the recorded directories' own
+/// `mtime`/`ctime`, mirroring
+/// [`crate::folded_measurement::reuse_folded_measurement`]. A directory
+/// stamp moves when an entry is created, deleted, renamed or replaced
+/// -- and *not* when a file inside it is rewritten or appended to in
+/// place. For agent storage that is not a corner case: appending to an
+/// open session transcript is the normal way these files grow, so a
+/// stamp-keyed cache reported a growing session at its old size until
+/// something else happened in its container. "What grew" is the whole
+/// question this tool answers, so the 2026-09-22 integration decision
+/// removed stamp-only reuse as a sufficient condition and replaced it
+/// with trusted event coverage, which sees the append because FSEvents
+/// reports writes.
+///
+/// **What this still cannot see.** Nothing, within a trusted window --
+/// but a window is available only for paths under a root this pass
+/// replayed successfully. With no window (a full walk, any
+/// [`crate::fs_events::RefreshRefusal`], a first observation, a
+/// store-less caller) there is no reuse and every container is
+/// re-identified, which is slower and always correct. The safety
+/// boundary for *acting* on any of this remains elsewhere: the reviewed
+/// snapshot re-derived from the live filesystem at execution
+/// (`reidentify_for_tool`, which runs with both caches disabled).
 pub struct ContainerCache {
     entries: std::cell::RefCell<HashMap<String, crate::assoc_store::CachedRows>>,
     /// Live re-resolution of declared paths, memoised per distinct
     /// declared path for this pass: see [`LinkBasis`].
     links: std::cell::RefCell<HashMap<(String, String), ProjectLinkState>>,
+    /// The only thing that authorizes a replay. Empty means "no
+    /// evidence", which means "no reuse".
+    coverage: crate::fs_events::EventCoverage,
     enabled: bool,
 }
 
@@ -632,16 +646,22 @@ impl ContainerCache {
         Self {
             entries: std::cell::RefCell::new(HashMap::new()),
             links: std::cell::RefCell::new(HashMap::new()),
+            coverage: crate::fs_events::EventCoverage::untrusted(),
             enabled: false,
         }
     }
 
-    pub fn load(swamp_dir: &Path) -> Self {
+    /// Loads the stored containers and the evidence this pass is allowed
+    /// to replay them on. A caller with no event coverage still gets a
+    /// usable cache: it stores what this pass identifies, so the *next*
+    /// pass -- which may have a window -- has something to replay.
+    pub fn load(swamp_dir: &Path, coverage: crate::fs_events::EventCoverage) -> Self {
         Self {
             entries: std::cell::RefCell::new(
                 crate::assoc_store::ContainerTable::open(swamp_dir).load(),
             ),
             links: std::cell::RefCell::new(HashMap::new()),
+            coverage,
             enabled: true,
         }
     }
@@ -669,49 +689,22 @@ impl ContainerCache {
     }
 }
 
-/// One `stat` per recorded directory, rendered as the single comparable
-/// string [`crate::assoc_store::fingerprint_string`] wants. An absent
-/// directory, or one that has become a file or a symlink, is a distinct
-/// value rather than a missing one, so an appearance and a disappearance
-/// are both changes.
-fn container_fingerprint(dirs: &[PathBuf]) -> String {
+/// The stored key for one container's recorded directory list: the
+/// encoding version plus the directories themselves, and **no `stat` at
+/// all**.
+///
+/// Before 2026-09-22 this was a stamp fingerprint -- one `stat` per
+/// recorded directory, every pass, whose only job was to notice a change
+/// it could not actually see (an in-place append). Trusted event
+/// coverage answers that question properly, so what remains here is the
+/// part a stored row still needs: proof that these rows describe *this*
+/// directory list under *this* encoding, so a container whose watched
+/// set changed shape, or whose rows were written by an older binary, is
+/// a miss rather than a misread.
+fn container_shape_key(dirs: &[PathBuf]) -> String {
     let mut parts: Vec<(String, u64)> = vec![(CONTAINER_VERSION.to_string(), 1)];
-    for d in dirs {
-        crate::work_counters::record_files_statted(1);
-        let rendered = d.display().to_string();
-        match fs::symlink_metadata(d) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                use std::os::unix::fs::MetadataExt;
-                parts.push((
-                    format!("{rendered}\u{2}mtime"),
-                    (meta.mtime() as u64)
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(meta.mtime_nsec() as u64),
-                ));
-                parts.push((
-                    format!("{rendered}\u{2}ctime"),
-                    (meta.ctime() as u64)
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(meta.ctime_nsec() as u64),
-                ));
-            }
-            // A watched path that is not a directory is stamped by its
-            // own size and mtime instead: it is the one case where a
-            // rewrite in place *is* visible, and there is no reason to
-            // throw that away.
-            Ok(meta) => {
-                parts.push((format!("{rendered}\u{2}len"), meta.len()));
-                parts.push((
-                    format!("{rendered}\u{2}file-mtime"),
-                    meta.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0),
-                ));
-            }
-            Err(_) => parts.push((format!("{rendered}\u{2}absent"), 1)),
-        }
+    for (i, d) in dirs.iter().enumerate() {
+        parts.push((format!("{}\u{2}dir", d.display()), i as u64));
     }
     crate::assoc_store::fingerprint_string(&parts)
 }
@@ -803,6 +796,14 @@ impl<'a> IdentifyCtx<'a> {
         let key = format!("{adapter_id}\u{1}{}", container.display());
         if let Some(units) = self.replay(store, &key) {
             crate::work_counters::record_container_reused();
+            // Replayed *and re-verified*: the window vouched for it just
+            // now, so the rows are as fresh as an identification would
+            // have made them. Without this the next pass's window --
+            // which starts where this one ended -- could never vouch for
+            // them again, and reuse would work only on alternate passes.
+            if let Some(entry) = store.entries.borrow_mut().get_mut(&key) {
+                entry.observed_at = self.observed_at;
+            }
             return units;
         }
         crate::work_counters::record_container_identified();
@@ -813,15 +814,28 @@ impl<'a> IdentifyCtx<'a> {
             return units;
         }
         if let Some(rows) = encode_container(&recorder.dirs, &units) {
-            let fingerprint = container_fingerprint(&recorder.dirs);
-            store
-                .entries
-                .borrow_mut()
-                .insert(key, crate::assoc_store::CachedRows { fingerprint, rows });
+            let fingerprint = container_shape_key(&recorder.dirs);
+            store.entries.borrow_mut().insert(
+                key,
+                crate::assoc_store::CachedRows {
+                    fingerprint,
+                    // Identified live, right now: this is the one place
+                    // a container may claim to have been verified as of
+                    // this observation.
+                    observed_at: self.observed_at,
+                    rows,
+                },
+            );
         }
         units
     }
 
+    /// The stored units for `key`, when -- and only when -- this pass's
+    /// event coverage can vouch that every directory the container
+    /// depends on is untouched since the rows were written.
+    ///
+    /// Costs no syscall on either branch: the decision is made from the
+    /// decoded rows and the replay window alone.
     fn replay(&self, store: &ContainerCache, key: &str) -> Option<Vec<CandidateAgentUnit>> {
         // The borrow of `entries` is scoped: `resolve_memoised` below
         // takes `links` mutably, and a future edit that reaches
@@ -831,10 +845,20 @@ impl<'a> IdentifyCtx<'a> {
             let entries = store.entries.borrow();
             let cached = entries.get(key)?;
             let (dirs, units) = decode_container(&cached.rows)?;
-            // The stamps cost one `stat` each and are read *after* the
-            // rows decode, so a corrupt or older-format row set is a miss
-            // that costs nothing.
-            if container_fingerprint(&dirs) != cached.fingerprint {
+            // The shape key is checked first and costs nothing, so a
+            // corrupt or older-format row set is a free miss.
+            if container_shape_key(&dirs) != cached.fingerprint {
+                return None;
+            }
+            // Every directory, not merely the container root: an
+            // adapter's `watch` declares siblings whose contents decide
+            // this container's units (Claude Code's `todos/`,
+            // `file-history/`), and a window that does not cover one of
+            // them cannot vouch for the whole.
+            if !dirs
+                .iter()
+                .all(|d| store.coverage.unchanged_since(d, cached.observed_at))
+            {
                 return None;
             }
             units
@@ -974,6 +998,7 @@ impl<'a> IdentifyCtx<'a> {
                 key,
                 crate::assoc_store::CachedRows {
                     fingerprint,
+                    observed_at: 0,
                     // An absent value is stored as a fingerprint-only
                     // row, which `assoc_store` already round-trips as
                     // "this key genuinely has nothing".
@@ -1792,6 +1817,7 @@ fn tool_name_for(tool_id: &str, scope: &EffectiveScope) -> String {
 /// annotation of existing history; `observe: true` => persist this
 /// pass). Never walks a tool home not resolved by the detector registry,
 /// and never reads past what each adapter's own bounded contract allows.
+#[allow(clippy::too_many_arguments)]
 pub fn discover_and_measure(
     scope: &EffectiveScope,
     project_worktrees: &[PathBuf],
@@ -1800,6 +1826,7 @@ pub fn discover_and_measure(
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
 ) -> Result<Vec<AgentUnit>> {
     // Protection state is consulted here and again, freshly, at every
     // sink. Corrupt/unreadable state is *unknown*, not empty: rather
@@ -1831,8 +1858,13 @@ pub fn discover_and_measure(
     // The container cache is the reason an unchanged pass costs a `stat`
     // per container rather than a `stat` per session file. Same terms as
     // the derivation cache above: no store, no reuse.
+    // The container cache turns an unchanged container from a listing
+    // plus a `stat` per session file into nothing at all -- but only
+    // where this pass's event coverage says nothing under it moved. With
+    // no coverage it still *records* what this pass identifies, so the
+    // next pass has something to replay.
     let containers = match swamp_dir {
-        Some(dir) => ContainerCache::load(dir),
+        Some(dir) => ContainerCache::load(dir, coverage.clone()),
         None => ContainerCache::disabled(),
     };
     let ctx = IdentifyCtx::with_containers(observed_at, &cache, &containers);

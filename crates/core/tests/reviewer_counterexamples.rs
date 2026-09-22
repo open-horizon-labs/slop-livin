@@ -42,11 +42,27 @@ fn unchanged_combined_observation_must_not_invent_regrowth() {
     let (_tmp, _home, scope) = fixture();
     let store = tempfile::tempdir().unwrap();
     for t in [1000, 2000] {
-        let ext =
-            external::discover_and_measure(&scope, Some(store.path()), true, t, 30, 3600).unwrap();
-        let units =
-            agents::discover_and_measure(&scope, &[], Some(store.path()), true, t, 30, 3600)
-                .unwrap();
+        let ext = external::discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            t,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let units = agents::discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            true,
+            t,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         assert!(
             ext.iter().all(|u| u.regrowth_count == 0),
             "unchanged external regrowth: {:?}",
@@ -70,9 +86,17 @@ fn protection_added_after_approval_must_stop_execution() {
     let (_tmp, home, scope) = fixture();
     let store = tempfile::tempdir().unwrap();
     let trash = tempfile::tempdir().unwrap();
-    let units =
-        agents::discover_and_measure(&scope, &[], Some(store.path()), false, 1000, 30, 3600)
-            .unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let path = home.join("debug");
     let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
@@ -92,7 +116,17 @@ fn replacement_directory_must_not_spend_old_approval() {
     let (_tmp, home, scope) = fixture();
     let store = tempfile::tempdir().unwrap();
     let trash = tempfile::tempdir().unwrap();
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let path = home.join("debug");
     let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
@@ -127,8 +161,27 @@ fn excluded_agent_home_must_not_be_scanned() {
         &Registry::with_builtins(),
         1000,
     );
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
-    let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
+    let ext = external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(
         units.is_empty() && ext.is_empty(),
         "excluded home scanned: {} agent units, {} external units",
@@ -142,9 +195,17 @@ fn protected_descendant_must_prevent_parent_cache_proposal() {
     let (_tmp, home, scope) = fixture();
     let store = tempfile::tempdir().unwrap();
     agents::protect_add(store.path(), &home.join("debug/log.txt")).unwrap();
-    let units =
-        agents::discover_and_measure(&scope, &[], Some(store.path()), false, 1000, 30, 3600)
-            .unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(
         actions::propose_agents(&units, &[home.join("debug")], "review-fixture").is_err(),
         "parent of protected file remained actionable"
@@ -182,7 +243,17 @@ fn open_cache_member_must_stop_parent_removal() {
     let store = tempfile::tempdir().unwrap();
     let trash = tempfile::tempdir().unwrap();
     let path = home.join("debug");
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:fixture").unwrap();

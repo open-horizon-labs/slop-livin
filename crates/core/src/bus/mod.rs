@@ -82,6 +82,17 @@ pub struct Ctx<'a> {
     /// scope-aware path (`report::report_scope_with_parts`) derives it
     /// from `EffectiveScope::docker_in_scope()`.
     pub docker_in_scope: bool,
+    /// Where `consumers::walk` leaves this root's trusted event window,
+    /// so the caller can hand it to the unit families as
+    /// `crate::fs_events::EventCoverage`.
+    ///
+    /// `None` means this root produced no trusted window (a full walk,
+    /// any refusal, no store), and the unit families then reuse nothing.
+    /// `Some((changed, since))` is the replay's own change list -- the
+    /// unfiltered one, because a subtree this walk pruned is still a
+    /// subtree the window must be able to speak about -- and the
+    /// observation time it replays from.
+    pub event_window: std::sync::Arc<std::sync::Mutex<Option<(Vec<PathBuf>, u64)>>>,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.
@@ -440,6 +451,7 @@ pub fn ctx_for_excluding<'a>(
         large_file_min_bytes,
         pruned_subtrees: pruned_subtrees.to_vec(),
         docker_in_scope: true,
+        event_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

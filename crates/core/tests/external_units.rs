@@ -74,7 +74,16 @@ fn external_only_root_is_measured_as_one_unit() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
 
     let store = tempfile::tempdir().unwrap();
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let unit = cargo_home_unit(&units);
     // Allocated bytes (disk blocks), not logical file size -- a real
     // measurement, so only a lower/upper sanity bound on the two small
@@ -104,7 +113,16 @@ fn empty_consumer_set_is_empty_not_missing() {
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert_eq!(cargo_home_unit(&units).consumers, Vec::new());
 }
 
@@ -123,7 +141,16 @@ fn shared_consumers_are_counted_once_in_totals() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
 
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let key = unit_key(
         "cargo-home",
         StorageCategory::Installation,
@@ -151,7 +178,16 @@ fn shared_consumers_are_counted_once_in_totals() {
     )
     .unwrap();
 
-    let units2 = discover_and_measure(&scope, Some(store.path()), true, 2_000, 30, 3600).unwrap();
+    let units2 = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let unit2 = cargo_home_unit(&units2);
     assert_eq!(unit2.consumers.len(), 2, "{:?}", unit2.consumers);
     let labels: std::collections::BTreeSet<_> =
@@ -190,7 +226,16 @@ fn association_changes_never_duplicate_the_unit_or_reset_history() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
 
-    let before = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let before = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let before_count = before.len();
     let unit = cargo_home_unit(&before);
     let key = unit_key(
@@ -210,7 +255,16 @@ fn association_changes_never_duplicate_the_unit_or_reset_history() {
     }
     associate_consumer(store.path(), &key, "kept", None).unwrap();
 
-    let after = discover_and_measure(&scope, Some(store.path()), true, 2_000, 30, 3600).unwrap();
+    let after = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert_eq!(
         after.len(),
         before_count,
@@ -262,7 +316,16 @@ fn tool_executable_removed_but_storage_remains_still_measures_it() {
     // (`Environment::fixture` defaults to `NullCommandRunner`): every
     // `brew --prefix` query this detector might attempt fails, exactly
     // as it would with `brew` missing from `PATH`.
-    let units = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let units = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     // #49 refined Homebrew into Cellar/Caskroom as their own units,
     // separate from the bare prefix -- the fixture's file lives under
     // Cellar, so *that* unit (not the prefix unit, which now correctly
@@ -304,13 +367,31 @@ fn incomplete_coverage_preserves_unknown_not_absent() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
 
-    let first = discover_and_measure(&scope, Some(store.path()), true, 1_000, 30, 3600).unwrap();
+    let first = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let bytes_first = cargo_home_unit(&first).bytes;
     assert!(bytes_first > 0);
 
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o000)).unwrap();
-    let during = discover_and_measure(&scope, Some(store.path()), true, 2_000, 30, 3600).unwrap();
+    let during = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
     let protected = during
         .iter()
@@ -318,7 +399,16 @@ fn incomplete_coverage_preserves_unknown_not_absent() {
         .expect("a coverage row is still emitted while access is lost");
     assert!(protected.note.is_some(), "{:?}", protected.note);
 
-    let after = discover_and_measure(&scope, Some(store.path()), true, 3_000, 30, 3600).unwrap();
+    let after = discover_and_measure(
+        &scope,
+        Some(store.path()),
+        true,
+        3_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let unit_after = cargo_home_unit(&after);
     assert_eq!(unit_after.bytes, bytes_first);
     assert_eq!(

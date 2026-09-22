@@ -70,8 +70,8 @@ impl KeyedTable {
         Arc::new(Schema::new(fields))
     }
 
-    /// Every row as `(key, fingerprint, values)`.
-    fn read(&self) -> Result<Vec<(String, String, Vec<String>)>> {
+    /// Every row as `(key, fingerprint, observed_at, values)`.
+    fn read(&self) -> Result<Vec<(String, String, u64, Vec<String>)>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -96,6 +96,13 @@ impl KeyedTable {
             };
             let keys = col("key")?;
             let fps = col("fingerprint")?;
+            // `observed_at` predates every reader of it, so a table
+            // written before this column was consumed reads as 0 --
+            // "older than any window", which refuses reuse rather than
+            // inventing freshness.
+            let times = batch
+                .column_by_name("observed_at")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
             let value_cols: Vec<&StringArray> = self
                 .value_columns
                 .iter()
@@ -105,6 +112,7 @@ impl KeyedTable {
                 out.push((
                     keys.value(i).to_string(),
                     fps.value(i).to_string(),
+                    times.map(|t| t.value(i)).unwrap_or(0),
                     value_cols.iter().map(|c| c.value(i).to_string()).collect(),
                 ));
             }
@@ -112,11 +120,11 @@ impl KeyedTable {
         Ok(out)
     }
 
-    fn write(&self, rows: &[(String, String, Vec<String>)], observed_at: u64) -> Result<()> {
+    fn write(&self, rows: &[(String, String, u64, Vec<String>)]) -> Result<()> {
         let schema = self.schema();
         let keys: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         let fps: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        let times: Vec<u64> = vec![observed_at; rows.len()];
+        let times: Vec<u64> = rows.iter().map(|r| r.2).collect();
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(keys)) as ArrayRef,
             Arc::new(StringArray::from(fps)),
@@ -125,7 +133,7 @@ impl KeyedTable {
         for (n, _) in self.value_columns.iter().enumerate() {
             let vals: Vec<&str> = rows
                 .iter()
-                .map(|r| r.2.get(n).map(String::as_str).unwrap_or_default())
+                .map(|r| r.3.get(n).map(String::as_str).unwrap_or_default())
                 .collect();
             columns.push(Arc::new(StringArray::from(vals)));
         }
@@ -143,6 +151,17 @@ impl KeyedTable {
 /// under. A caller compares the fingerprint before trusting the values.
 pub struct CachedRows {
     pub fingerprint: String,
+    /// The observation that last *verified* these values, carried
+    /// per entry rather than stamped uniformly at save time.
+    ///
+    /// `crate::fs_events::EventCoverage::unchanged_since` needs to know
+    /// whether a replay window opened before or after these rows were
+    /// written, and a uniform save-time stamp would answer "just now"
+    /// for an entry that was merely loaded and carried forward
+    /// unverified -- which is precisely the entry whose age matters.
+    /// A caller that has no freshness claim to make leaves it `0`, and
+    /// the table stamps those rows with the save time.
+    pub observed_at: u64,
     pub rows: Vec<Vec<String>>,
 }
 
@@ -155,15 +174,18 @@ fn load(table: &KeyedTable) -> HashMap<String, CachedRows> {
     let Ok(rows) = table.read() else {
         return out;
     };
-    for (key, fingerprint, values) in rows {
+    for (key, fingerprint, observed_at, values) in rows {
         let entry = out.entry(key).or_insert_with(|| CachedRows {
             fingerprint: fingerprint.clone(),
+            observed_at,
             rows: Vec::new(),
         });
         if entry.fingerprint != fingerprint {
             entry.fingerprint = fingerprint;
+            entry.observed_at = observed_at;
             entry.rows.clear();
         }
+        entry.observed_at = entry.observed_at.min(observed_at);
         // A fingerprint-only row (every value column empty) records
         // "this key genuinely has nothing", which is a cached answer,
         // not a cached value.
@@ -176,11 +198,19 @@ fn load(table: &KeyedTable) -> HashMap<String, CachedRows> {
 }
 
 fn store(table: &KeyedTable, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
-    let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut rows: Vec<(String, String, u64, Vec<String>)> = Vec::new();
     let mut keys: Vec<&String> = cache.keys().collect();
     keys.sort();
     for key in keys {
         let entry = &cache[key];
+        // An entry that made no freshness claim of its own is stamped
+        // with this save; one that did keeps it, so carrying an
+        // unverified entry forward cannot make it look re-verified.
+        let stamped_at = if entry.observed_at == 0 {
+            observed_at
+        } else {
+            entry.observed_at
+        };
         if entry.rows.is_empty() {
             // A key with no values still needs its fingerprint recorded,
             // or "this worktree genuinely declares nothing" would be
@@ -188,15 +218,21 @@ fn store(table: &KeyedTable, cache: &HashMap<String, CachedRows>, observed_at: u
             rows.push((
                 key.clone(),
                 entry.fingerprint.clone(),
+                stamped_at,
                 vec![String::new(); table.value_columns.len()],
             ));
             continue;
         }
         for values in &entry.rows {
-            rows.push((key.clone(), entry.fingerprint.clone(), values.clone()));
+            rows.push((
+                key.clone(),
+                entry.fingerprint.clone(),
+                stamped_at,
+                values.clone(),
+            ));
         }
     }
-    table.write(&rows, observed_at)
+    table.write(&rows)
 }
 
 // ---------------------------------------------------------------------
@@ -383,6 +419,7 @@ mod tests {
             "/proj/a".to_string(),
             CachedRows {
                 fingerprint: "tool-versions@100".into(),
+                observed_at: 0,
                 rows: vec![vec![
                     "nodejs".into(),
                     "20.11.1".into(),
@@ -411,6 +448,7 @@ mod tests {
             "/proj/empty".to_string(),
             CachedRows {
                 fingerprint: "none".into(),
+                observed_at: 0,
                 rows: Vec::new(),
             },
         );

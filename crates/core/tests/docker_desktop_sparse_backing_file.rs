@@ -67,8 +67,16 @@ fn sparse_backing_file_reports_allocated_bytes_not_apparent_size() {
     };
     let scope = resolve_effective_scope(&environment, &cfg, &[], &registry, 1_000);
 
-    let units =
-        swamp_core::external::discover_and_measure(&scope, None, false, 1_000, 30, 3600).unwrap();
+    let units = swamp_core::external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let unit = units
         .iter()
         .find(|u| u.detector_id == "docker-desktop" && u.path.ends_with("data"))

@@ -320,6 +320,7 @@ fn an_unverified_tools_units_are_measured_and_offer_nothing() {
         1_000,
         30,
         3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
     )
     .expect("discovery");
 
@@ -387,6 +388,7 @@ fn an_unverified_tools_units_are_measured_and_offer_nothing() {
         1_000,
         30,
         3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
     )
     .expect("discovery");
     assert!(

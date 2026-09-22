@@ -66,6 +66,11 @@ pub fn access(path: &Path) -> UnitAccess {
 /// separately measured as their own units (so the same bytes are never
 /// counted twice).
 pub struct FoldedUnit {
+    /// The stored measurement was replayed rather than re-taken. The
+    /// caller re-stamps such a unit's rows through
+    /// `crate::growth::touch_folded_rows`, so the next pass's window can
+    /// still vouch for them.
+    pub reused: bool,
     pub bytes: u64,
     pub hardlinked: bool,
     /// Newest recorded modification among the measured children, from
@@ -87,8 +92,9 @@ pub fn measure(
     path: &Path,
     exclusions: &[PathBuf],
     observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
 ) -> FoldedUnit {
-    if let Some(folded) = reuse_folded_measurement(store, path, exclusions) {
+    if let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage) {
         crate::work_counters::record_cache_hit();
         return folded;
     }
@@ -102,6 +108,7 @@ pub fn measure(
     );
     crate::work_counters::record_cache_miss();
     let folded = FoldedUnit {
+        reused: false,
         bytes: row.bytes,
         hardlinked: row.hardlinked,
         mtime_max: row.mtime_max,
@@ -124,34 +131,37 @@ fn exclusions_digest(exclusions: &[PathBuf]) -> String {
     parts.join("\u{1}")
 }
 
-/// The previous pass's folded measurement of `path`, if every directory
-/// it listed still carries the same `mtime`/`ctime` it did then.
+/// The previous pass's folded measurement of `path`, if this pass's
+/// [`crate::fs_events::EventCoverage`] can show that nothing under
+/// `path` has changed since that measurement was taken.
 ///
-/// **Cost.** One `stat` per directory the unit contains and *no*
-/// directory listing at all -- the whole point. A 20,000-file Cargo
-/// registry cache costs four stats on an unchanged pass instead of
-/// 20,000 stats and four listings.
+/// **Cost.** Nothing: no listing, no `stat`, no read. The decision is
+/// made from the stored root row and the replay window.
 ///
-/// **What this detects.** Creating, deleting, renaming or replacing any
-/// entry in a directory moves that directory's own `mtime` and `ctime`,
-/// so any change to the *shape* of the tree -- including a new
-/// subdirectory, whose parent is stamped -- is a miss. A directory that
-/// has been removed fails its `stat` and is a miss. A changed exclusion
-/// set is a miss.
+/// **What this detects.** Everything FSEvents reports under the unit --
+/// creations, deletions, renames, *and writes into existing files*. The
+/// last of those is why this is keyed on events and not on directory
+/// stamps any more. Until 2026-09-22 the key was each recorded
+/// directory's own `mtime`/`ctime`, which moves when an entry is
+/// created, deleted, renamed or replaced and **not** when a file inside
+/// it is appended to or rewritten in place. That is the normal way an
+/// agent session transcript grows, so a growth tool keyed on stamps
+/// reported the growing file at its old size. The integration decision
+/// of 2026-09-22 removed stamp-only reuse as a sufficient condition;
+/// this is its external-family half. A changed exclusion set is still a
+/// miss, for the reason [`exclusions_digest`] gives.
 ///
-/// **What this cannot see**, stated plainly because a cache that
-/// oversells itself is worse than none: a file rewritten *in place*
-/// (same name, same directory) does not move its directory's stamp. If
-/// such a rewrite also changes the file's allocation -- a truncation, a
-/// hole punched, a sparse file grown -- the reused byte total is stale
-/// until something else in that directory changes or the store is
-/// cleared. The alternative is stat'ing every file on every pass, which
-/// is the cost this exists to remove, and is exactly the "scales with
-/// all files" shape the handoff forbids.
+/// **When there is no reuse.** Whenever this pass has no trusted window
+/// over `path` -- a full walk, any [`crate::fs_events::RefreshRefusal`],
+/// a first observation, a store-less caller -- and whenever the stored
+/// rows predate the window (a pass that skipped this unit family leaves
+/// exactly that gap). The unit is then re-measured, which is the slow
+/// answer and always the correct one.
 pub fn reuse_folded_measurement(
     store: Option<&Path>,
     path: &Path,
     exclusions: &[PathBuf],
+    coverage: &crate::fs_events::EventCoverage,
 ) -> Option<FoldedUnit> {
     let dir = store?;
     let unit_path = path.display().to_string();
@@ -160,22 +170,15 @@ pub fn reuse_folded_measurement(
     if root.exclusions != exclusions_digest(exclusions) {
         return None;
     }
-    for row in &rows {
-        let dir_path = if row.rel_dir.is_empty() {
-            path.to_path_buf()
-        } else {
-            path.join(&row.rel_dir)
-        };
-        crate::work_counters::record_files_statted(1);
-        let meta = std::fs::symlink_metadata(&dir_path).ok()?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return None;
-        }
-        if stamp_ns(&meta) != (row.mtime_ns, row.ctime_ns) {
-            return None;
-        }
+    // The gate. Everything below the unit root is covered by one
+    // question, because an event anywhere under the unit -- including a
+    // write into an existing file, which no directory stamp can show --
+    // fails it.
+    if !coverage.unchanged_since(path, root.observed_at) {
+        return None;
     }
     Some(FoldedUnit {
+        reused: true,
         bytes: root.bytes,
         hardlinked: root.hardlinked,
         mtime_max: root.mtime_max,
@@ -254,8 +257,9 @@ pub fn observe_unit(
     path: &Path,
     exclusions: &[PathBuf],
     observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
 ) -> UnitObservation {
-    if let Some(folded) = reuse_folded_measurement(store, path, exclusions) {
+    if let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage) {
         crate::work_counters::record_cache_hit();
         return UnitObservation::Unit(folded);
     }
@@ -263,7 +267,7 @@ pub fn observe_unit(
         UnitAccess::Absent => UnitObservation::Absent,
         UnitAccess::Unreadable(why) => UnitObservation::Unreadable(why),
         UnitAccess::Measurable => {
-            UnitObservation::Unit(measure(store, path, exclusions, observed_at))
+            UnitObservation::Unit(measure(store, path, exclusions, observed_at, coverage))
         }
     }
 }
@@ -397,17 +401,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a"), b"12345").unwrap();
         assert_eq!(access(tmp.path()), UnitAccess::Measurable);
-        let (folded, counted) =
-            crate::work_counters::measured(|| measure(None, tmp.path(), &[], 1_000));
+        let (folded, counted) = crate::work_counters::measured(|| {
+            measure(
+                None,
+                tmp.path(),
+                &[],
+                1_000,
+                &crate::fs_events::EventCoverage::untrusted(),
+            )
+        });
         assert!(folded.bytes >= 5);
         assert!(counted.identification_cache_misses >= 1);
     }
 
-    /// The reuse, end to end: a second measurement of an unchanged tree
-    /// lists no directories at all, and a file added to a subdirectory
-    /// is a miss.
+    /// The reuse, end to end, and its gate: a second measurement of a
+    /// tree an event window vouches for costs nothing at all, the same
+    /// tree with no window is re-measured, and a file added under it is
+    /// a miss even with a window.
     #[test]
-    fn an_unchanged_unit_is_reused_without_listing_anything() {
+    fn an_unchanged_unit_is_reused_only_under_a_trusted_event_window() {
+        use crate::fs_events::EventCoverage;
         let tmp = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let unit = tmp.path().join("cache");
@@ -415,24 +428,57 @@ mod tests {
         std::fs::write(unit.join("a/b/f"), vec![b'x'; 4096]).unwrap();
         std::fs::write(unit.join("a/g"), vec![b'y'; 4096]).unwrap();
 
-        let first = measure(Some(store.path()), &unit, &[], 1_000);
+        let none = EventCoverage::untrusted();
+        let first = measure(Some(store.path()), &unit, &[], 1_000, &none);
         assert!(first.bytes >= 8192, "{}", first.bytes);
+        assert!(!first.reused);
 
-        let (second, cost) =
-            crate::work_counters::measured(|| measure(Some(store.path()), &unit, &[], 2_000));
+        // No window: the stored rows exist and are still ignored.
+        let (again, cost) = crate::work_counters::measured(|| {
+            measure(Some(store.path()), &unit, &[], 2_000, &none)
+        });
+        assert!(
+            !again.reused && cost.dirs_listed > 0,
+            "without event coverage a stored measurement must not be reused"
+        );
+
+        // A window over the unit's parent that reports nothing under it.
+        let quiet = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 1_000);
+        let (second, cost) = crate::work_counters::measured(|| {
+            measure(Some(store.path()), &unit, &[], 3_000, &quiet)
+        });
         assert_eq!(second.bytes, first.bytes);
+        assert!(second.reused);
         assert_eq!(
-            cost.dirs_listed, 0,
-            "an unchanged unit must be answered without listing a directory"
+            (cost.dirs_listed, cost.files_statted),
+            (0, 0),
+            "a unit the window vouches for must cost no listing and no stat"
         );
         assert_eq!(
             cost.identification_cache_hits, 1,
             "the answer must come from the stored rows, not a re-walk"
         );
 
+        // The same quiet window cannot vouch for rows written after it
+        // opened -- that gap is where a skipped pass hides.
+        let stale = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 9_999);
+        assert!(
+            reuse_folded_measurement(Some(store.path()), &unit, &[], &stale).is_none(),
+            "rows older than the window must not be replayed"
+        );
+
+        // A window that names a changed path under the unit is a miss
+        // even though the bytes on disk did not move.
+        let noisy = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("a/b")], 1_000);
+        assert!(
+            reuse_folded_measurement(Some(store.path()), &unit, &[], &noisy).is_none(),
+            "an event under the unit must refuse the reuse"
+        );
+
         std::fs::write(unit.join("a/b/new"), vec![b'z'; 4096]).unwrap();
-        let (third, cost) =
-            crate::work_counters::measured(|| measure(Some(store.path()), &unit, &[], 3_000));
+        let (third, cost) = crate::work_counters::measured(|| {
+            measure(Some(store.path()), &unit, &[], 4_000, &noisy)
+        });
         assert!(third.bytes > second.bytes, "a new file must be measured");
         assert!(
             cost.dirs_listed > 0,
@@ -449,8 +495,16 @@ mod tests {
         let unit = tmp.path().join("cache");
         std::fs::create_dir_all(unit.join("nested")).unwrap();
         std::fs::write(unit.join("nested/f"), vec![b'x'; 8192]).unwrap();
-        let all = measure(Some(store.path()), &unit, &[], 1_000);
-        let excluded = measure(Some(store.path()), &unit, &[unit.join("nested")], 2_000);
+        let quiet =
+            crate::fs_events::EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 1_000);
+        let all = measure(Some(store.path()), &unit, &[], 1_000, &quiet);
+        let excluded = measure(
+            Some(store.path()),
+            &unit,
+            &[unit.join("nested")],
+            2_000,
+            &quiet,
+        );
         assert!(
             excluded.bytes < all.bytes,
             "excluding the only populated subtree must measure fewer bytes, got {} vs {}",

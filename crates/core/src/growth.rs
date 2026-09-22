@@ -1974,6 +1974,18 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
 /// a caller reports in the coverage block and the `observe` log line.
 pub struct TrackedWalk {
     pub changed_paths: Option<Vec<PathBuf>>,
+    /// This root's trusted event window, when the replay earned one:
+    /// the replay's **unfiltered** change list and the observation time
+    /// it replays from.
+    ///
+    /// Distinct from `changed_paths`, which is the same replay narrowed
+    /// to the subtrees this walk was allowed to descend into. The unit
+    /// families (`crate::external`, `crate::agents`) measure paths this
+    /// walk deliberately pruned -- every external location nested under
+    /// a scan root is pruned from it precisely so it can be measured
+    /// once, as its own unit -- so narrowing the list for them would
+    /// hand out a window that cannot see a change it was asked about.
+    pub event_window: Option<(Vec<PathBuf>, u64)>,
     pub discovered: Vec<DiscoveredWorktree>,
     pub attribution: crate::attribution::AttributionResult,
     /// `"incremental"` or `"full"`.
@@ -2196,6 +2208,10 @@ pub fn stage_tracked_with_source(
     let too_soon = prev_state
         .last_observed_at
         .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
+    // The instant the window opens from. Without one there is no window
+    // at all: a stored row cannot be shown to predate a replay whose
+    // start is unknown.
+    let window_since = prev_state.last_observed_at;
     let t_replay = std::time::Instant::now();
     let plan = source.replay(&FsEventsRequest {
         root: root.clone(),
@@ -2281,6 +2297,14 @@ pub fn stage_tracked_with_source(
     };
     result.unconfirmed_worktree_ids =
         compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
+    // A window only where the incremental path was actually taken: a
+    // full walk, a refusal, `too_soon` and `too_many_changes` all mean
+    // this pass cannot say what did *not* change, which is exactly the
+    // claim a reuse rests on.
+    result.event_window = match (result.mode, window_since) {
+        ("incremental", Some(since)) => Some((plan.changed_dirs.clone(), since)),
+        _ => None,
+    };
 
     let checkpoint = observe.then(|| ObservationCheckpoint {
         // Re-anchor for the next call regardless of which path was taken.
@@ -2500,6 +2524,7 @@ fn full_walk(
         attribution,
         mode: "full",
         changed_paths: None,
+        event_window: None,
         reason,
         changed_dirs: 0,
         rewalked: None,
@@ -3406,6 +3431,9 @@ fn apply_incremental(
         discovered,
         attribution,
         mode: "incremental",
+        // Filled in by the caller, which is the only place that still
+        // holds the replay's unfiltered answer.
+        event_window: None,
         changed_paths: Some(changed_dirs.to_vec()),
         reason: "incremental",
         changed_dirs: changed_dirs.len(),
@@ -3681,6 +3709,38 @@ pub fn folded_rows_for(swamp_dir: &Path, unit_path: &str) -> Vec<FoldedRow> {
 /// Replaces the stored folded rows for `unit_path` with `rows`, leaving
 /// every other unit's rows alone. A unit whose rows are dropped simply
 /// re-measures next pass.
+/// Re-stamps the stored folded rows of `unit_paths` as verified at
+/// `observed_at`, in one read and one write for the whole set.
+///
+/// A unit whose measurement was *reused* this pass writes no rows -- the
+/// point of the reuse is that there is nothing new to write -- but its
+/// rows really were re-verified, by this pass's event window. Leaving
+/// their `observed_at` at the value the last full measurement wrote
+/// would make every second pass a miss: the next window starts where
+/// this pass ended, and rows stamped before it cannot be vouched for
+/// (`crate::fs_events::EventCoverage::unchanged_since`).
+pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u64) -> Result<()> {
+    if unit_paths.is_empty() {
+        return Ok(());
+    }
+    let dir = external_dir(swamp_dir);
+    fs::create_dir_all(&dir)?;
+    let path = folded_path(swamp_dir);
+    let wanted: std::collections::HashSet<&str> = unit_paths.iter().map(String::as_str).collect();
+    let mut all: Vec<FoldedRow> = read_folded_rows(&path).unwrap_or_default();
+    let mut touched = false;
+    for row in all.iter_mut() {
+        if wanted.contains(row.unit_path.as_str()) && row.observed_at != observed_at {
+            row.observed_at = observed_at;
+            touched = true;
+        }
+    }
+    if !touched {
+        return Ok(());
+    }
+    write_folded_rows(&path, &all)
+}
+
 pub fn store_folded_rows(swamp_dir: &Path, unit_path: &str, rows: &[FoldedRow]) -> Result<()> {
     let dir = external_dir(swamp_dir);
     fs::create_dir_all(&dir)?;

@@ -71,8 +71,27 @@ fn an_excluded_tool_home_inside_an_explicit_root_yields_no_units() {
         &Registry::with_builtins(),
         1000,
     );
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
-    let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
+    let ext = external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(units.is_empty(), "agent units: {:?}", paths(&units));
     assert!(ext.is_empty(), "external units: {:?}", ext_paths(&ext));
 }
@@ -102,9 +121,27 @@ fn an_exclusion_in_either_path_spelling_covers_both_families() {
         for explicit in [vec![], vec![canonical.clone()]] {
             let scope =
                 resolve_effective_scope(&env, &cfg, &explicit, &Registry::with_builtins(), 1000);
-            let units =
-                agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
-            let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+            let units = agents::discover_and_measure(
+                &scope,
+                &[],
+                None,
+                false,
+                1000,
+                30,
+                3600,
+                &swamp_core::fs_events::EventCoverage::untrusted(),
+            )
+            .unwrap();
+            let ext = external::discover_and_measure(
+                &scope,
+                None,
+                false,
+                1000,
+                30,
+                3600,
+                &swamp_core::fs_events::EventCoverage::untrusted(),
+            )
+            .unwrap();
             assert!(
                 units.is_empty() && ext.is_empty(),
                 "exclude `{spelling}` (explicit roots: {explicit:?}) left {} agent and {} \
@@ -142,7 +179,16 @@ fn an_excluded_nested_external_location_inside_an_explicit_root_yields_no_unit()
         &Registry::with_builtins(),
         1000,
     );
-    let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+    let ext = external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     let canonical_inner = fs::canonicalize(&inner).unwrap();
     assert!(
         !ext.iter().any(|u| u.path == canonical_inner),
@@ -178,8 +224,27 @@ fn a_disabled_detector_inside_an_explicit_root_yields_no_units() {
         ..Default::default()
     };
     let scope = resolve_effective_scope(&env, &cfg, &[tmp.path().to_path_buf()], &registry, 1000);
-    let units = agents::discover_and_measure(&scope, &[], None, false, 1000, 30, 3600).unwrap();
-    let ext = external::discover_and_measure(&scope, None, false, 1000, 30, 3600).unwrap();
+    let units = agents::discover_and_measure(
+        &scope,
+        &[],
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
+    let ext = external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .unwrap();
     assert!(
         units.is_empty() && ext.is_empty(),
         "every detector disabled still produced {:?} / {:?}",
@@ -211,9 +276,17 @@ fn a_protect_entry_in_either_path_spelling_protects_both_families() {
     for spelling in [raw.join("claude"), canonical.join("claude")] {
         let store = tempfile::tempdir().unwrap();
         agents::protect_add(store.path(), &spelling).expect("an absolute path is protectable");
-        let units =
-            agents::discover_and_measure(&scope, &[], Some(store.path()), false, 1000, 30, 3600)
-                .unwrap();
+        let units = agents::discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            false,
+            1000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
         assert!(
             !units.is_empty(),
             "precondition: the tool home is discovered so there is something to protect"

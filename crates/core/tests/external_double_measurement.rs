@@ -137,8 +137,16 @@ fn nested_external_location_is_pruned_from_its_parent_roots_walk() {
     // sum of the two halves must equal one naive, unexcluded measurement
     // of the whole Caches directory -- proving the bytes appear exactly
     // once across the two views, never zero and never twice.
-    let units = swamp_core::external::discover_and_measure(&scope, None, false, 1_000, 30, 3600)
-        .expect("discover_and_measure succeeds");
+    let units = swamp_core::external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .expect("discover_and_measure succeeds");
     let homebrew_unit = units
         .iter()
         .find(|u| u.detector_id == "homebrew" && u.path == homebrew_cache_canonical)
@@ -191,8 +199,16 @@ fn double_measurement_fix_is_order_independent() {
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 2_000);
 
-    let units = swamp_core::external::discover_and_measure(&scope, None, false, 2_000, 30, 3600)
-        .expect("discover_and_measure succeeds");
+    let units = swamp_core::external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        2_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .expect("discover_and_measure succeeds");
     let homebrew_unit = units
         .iter()
         .find(|u| u.detector_id == "homebrew" && u.path == homebrew_cache_canonical)
@@ -263,8 +279,16 @@ fn cargo_homes_own_measurement_excludes_its_separately_measured_subtrees() {
     let cfg = only_config(&["cargo-home"], &registry);
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 3_000);
 
-    let units = swamp_core::external::discover_and_measure(&scope, None, false, 3_000, 30, 3600)
-        .expect("discover_and_measure succeeds");
+    let units = swamp_core::external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        3_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .expect("discover_and_measure succeeds");
     assert_eq!(units.len(), 5, "{units:#?}");
 
     let canonical_cargo_home = fs::canonicalize(&cargo_home).unwrap();
