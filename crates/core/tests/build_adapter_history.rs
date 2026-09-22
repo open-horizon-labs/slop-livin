@@ -317,3 +317,145 @@ fn a_nested_unit_round_trips_through_the_report_json_with_its_contract_fields() 
     assert!(pkg["consequence"].as_str().unwrap().contains("npm ci"));
     assert_eq!(pkg["adapter"], "node");
 }
+
+#[test]
+fn the_json_views_carry_the_same_family_summary_as_the_text_view() {
+    let (_tmp, root) = node_fixture();
+    let report = fresh_full(&root);
+    let deps = swamp_core::agent_json::view_payload(&report, "deps", None);
+    let nm = deps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("node_modules"))
+        })
+        .expect("node_modules row");
+    let families = nm["interior"]["families"].as_array().expect("families");
+    let dependencies = families
+        .iter()
+        .find(|f| f["family"] == "dependencies")
+        .expect("dependencies family");
+    assert_eq!(dependencies["count"], 1);
+    assert_eq!(
+        dependencies["recommendation"],
+        "Review: reinstall from registry"
+    );
+    assert!(
+        dependencies["consequence"]
+            .as_str()
+            .unwrap()
+            .contains("npm ci")
+    );
+    assert_eq!(dependencies["action"], "inspection-only");
+    assert!(nm["interior"]["units"].as_array().unwrap().len() >= 2);
+    // A row nothing identified the inside of carries no `interior` at all.
+    let builds = swamp_core::agent_json::view_payload(&report, "builds", None);
+    assert!(
+        builds
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("interior").is_none() || r["interior"]["units"].as_array().is_some())
+    );
+}
+
+fn dir_bytes(p: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// The benchmark #65 asks for: unchanged and one-group-change refresh,
+/// through the real pipeline, with the store's size. Printed with
+/// `--nocapture` and recorded in
+/// `.oh/sessions/2026-09-21-build-adapters-node-jvm.md`; the assertions
+/// are the parts that must hold on any machine.
+#[test]
+fn cost_report_real_pipeline_unchanged_and_one_group_change() {
+    let (_tmp, root) = node_fixture();
+    // A larger installed tree, so the unchanged/changed contrast is not
+    // lost in fixed per-pass overhead.
+    for i in 0..300 {
+        let pkg = root.join(format!("node_modules/pkg-{i:03}"));
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{"name":"pkg-{i:03}","version":"1.0.{i}"}}"#),
+        )
+        .unwrap();
+        write(&pkg.join("index.js"), 2_000);
+    }
+    let store = tempfile::tempdir().unwrap();
+    let t = std::time::Instant::now();
+    let (_, cold) =
+        swamp_core::work_counters::measured(|| observe(&root, store.path(), vec![], false));
+    let cold_ms = t.elapsed().as_secs_f64() * 1e3;
+    for _ in 0..2 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let store_before = dir_bytes(store.path());
+    let t = std::time::Instant::now();
+    let (_, unchanged) =
+        swamp_core::work_counters::measured(|| observe(&root, store.path(), vec![], false));
+    let unchanged_ms = t.elapsed().as_secs_f64() * 1e3;
+    let store_after_unchanged = dir_bytes(store.path());
+
+    write(&root.join("dist/chunk.js"), 64_000);
+    let t = std::time::Instant::now();
+    let (_, one_group) = swamp_core::work_counters::measured(|| {
+        observe(&root, store.path(), vec![root.join("dist")], false)
+    });
+    let one_group_ms = t.elapsed().as_secs_f64() * 1e3;
+    let store_after_change = dir_bytes(store.path());
+
+    println!("--- BUILD ADAPTER COST (real pipeline) ---");
+    println!("fixture: node_modules with 301 packages, dist, coverage; one walked root");
+    for (name, ms, c) in [
+        ("cold", cold_ms, &cold),
+        ("unchanged", unchanged_ms, &unchanged),
+        ("one group changed (dist)", one_group_ms, &one_group),
+    ] {
+        println!(
+            "{name:<26} {ms:>8.2}ms dirs_listed={} files_statted={} manifest_bytes={} \
+             containers_reused={} containers_identified={}",
+            c.dirs_listed,
+            c.files_statted,
+            c.header_bytes_read,
+            c.containers_reused,
+            c.containers_identified
+        );
+    }
+    println!(
+        "store bytes: before={store_before} after_unchanged={store_after_unchanged} \
+         after_one_group={store_after_change}"
+    );
+    println!("--- END ---");
+
+    assert!(
+        cold.header_bytes_read > 0,
+        "the cold pass reads the manifests"
+    );
+    assert_eq!(unchanged.header_bytes_read, 0);
+    assert_eq!(unchanged.containers_identified, 0);
+    assert_eq!(
+        one_group.containers_identified, 1,
+        "a change inside dist/ re-identifies dist/ and nothing else: {one_group:?}"
+    );
+    assert_eq!(
+        one_group.header_bytes_read, 0,
+        "re-identifying dist/ reads no package.json; node_modules was replayed"
+    );
+}

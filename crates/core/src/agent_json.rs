@@ -272,14 +272,18 @@ pub fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value
                         if !kinds.contains(&a.kind) {
                             continue;
                         }
-                        rows.push(json!({
+                        let mut row = json!({
                             "project": p.name,
                             "kind": kind_label(&a.kind),
                             "path": a.path,
                             "bytes": a.bytes,
                             "growth_bytes": a.growth_bytes,
                             "evidence": a.evidence,
-                        }));
+                        });
+                        if let Some(interior) = build_interior_json(r, &a.path) {
+                            row["interior"] = interior;
+                        }
+                        rows.push(row);
                     }
                 }
             }
@@ -643,6 +647,53 @@ pub fn paginate(value: &mut Value, limit: Option<usize>, offset: usize) -> Optio
     let truncated = start > 0 || end < total;
     *arr = arr[start..end].to_vec();
     Some(PageMeta { total, truncated })
+}
+
+/// The identified interior of one build/dependency row for `--view
+/// builds|deps --json`: the same family summary the text view and the
+/// TUI show, plus every unit with its contract fields (`role`,
+/// `adapter`, `basis`, `time_source`, `action`, `consequence`,
+/// `coverage`). `None` when no adapter identified anything under the
+/// row -- absence stays absence, never an empty object.
+fn build_interior_json(r: &Report, container: &std::path::Path) -> Option<Value> {
+    let units: Vec<crate::artifact::NestedArtifact> = r
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.present && u.path.starts_with(container))
+        .cloned()
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    let summary = crate::build_adapters::summarize_container(container, &units);
+    let families: Vec<Value> = summary
+        .families
+        .iter()
+        .map(|f| {
+            json!({
+                "family": f.family.label(),
+                "title": f.family.title(),
+                "recommendation": f.recommendation,
+                "consequence": f.consequence,
+                "other_consequences": f.other_consequences,
+                "count": f.count,
+                "bytes": (f.basis != crate::artifact::AccountingBasis::Unknown).then_some(f.bytes),
+                "basis": f.basis.label(),
+                "oldest_modified": f.oldest_modified,
+                "unknown_age": f.unknown_age,
+                "complete": f.complete,
+                "action": "inspection-only",
+            })
+        })
+        .collect();
+    Some(json!({
+        "families": families,
+        "unsupported_count": summary.unsupported_count,
+        "unsupported_bytes": summary.unsupported_bytes,
+        "unaccounted_bytes": summary.unaccounted_bytes,
+        "empty": summary.empty,
+        "units": units,
+    }))
 }
 
 #[cfg(test)]
