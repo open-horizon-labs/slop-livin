@@ -40,7 +40,7 @@ impl BoundedCap {
     /// A system table read whole in practice (`/proc/mounts`).
     pub const SYSTEM_TABLE: BoundedCap = BoundedCap(1024 * 1024);
 
-    pub fn bytes(self) -> usize {
+    pub const fn bytes(self) -> usize {
         self.0
     }
 

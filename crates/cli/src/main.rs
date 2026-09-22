@@ -2280,6 +2280,11 @@ mod cleanup_check_tests {
             growth_bytes: None,
             regrowth_count: 0,
             decision_evidence: Vec::new(),
+            adapter: None,
+            basis: Default::default(),
+            time_source: Default::default(),
+            action: Default::default(),
+            consequence: None,
         }
     }
 

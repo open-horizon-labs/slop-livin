@@ -24,6 +24,100 @@ pub enum ArtifactRole {
     CompanionMetadata,
     Residual,
     Unknown,
+    // ---------------------------------------------------------------
+    // The ecosystem-neutral vocabulary (#64). The variants above came
+    // out of Cargo and read like Cargo: a "profile" is a Cargo word, an
+    // "example" is a Cargo target kind, "incremental" is a Cargo
+    // directory. Nothing outside Cargo has any of them, and forcing
+    // `node_modules` into `Dependency` (a *compiled* dependency artifact)
+    // or `coverage/` into `FinalOutput` would be exactly the false
+    // equivalence #64 forbids.
+    //
+    // So the generic roles are added beside the Cargo ones rather than
+    // replacing them, and [`ArtifactRole::family`] maps both sets onto
+    // the same small set of families the aggregation and the views
+    // group by. Adding variants is also all the compatibility work
+    // there is: a stored report deserializes by label, and a label
+    // nothing recognizes was never written by this code.
+    /// A generated build output: `dist/`, `build/`, `.next/`, a Gradle
+    /// `build/libs` jar, a Maven `target/*.jar`.
+    Output,
+    /// Test or coverage output: `coverage/`, `.nyc_output/`,
+    /// `playwright-report/`, Gradle `build/test-results`, Maven
+    /// `target/surefire-reports`.
+    TestOutput,
+    /// A tool's own intermediate or cache directory, kept between builds
+    /// to make the next one faster: `.next/cache`, `.turbo`,
+    /// `node_modules/.cache/<tool>`, Gradle `build/tmp`, `.gradle/`.
+    Intermediate,
+    /// An installed dependency tree inside a project: `node_modules`,
+    /// `vendor`, `bower_components`. Distinct from [`Self::Dependency`],
+    /// which is a *compiled* artifact of one dependency.
+    InstalledDependencies,
+    /// One entry in a store shared across projects: a pnpm
+    /// content-addressed object, an npm `_cacache` entry, a Gradle
+    /// `modules-2` module, a Maven repository artifact. Charged once,
+    /// wherever else it is linked from.
+    SharedStoreEntry,
+    /// Metadata a tool wrote about a build, as a first-class unit rather
+    /// than a companion of one: a `tsconfig.tsbuildinfo`, a
+    /// `maven-metadata-local.xml`, a `.gradle/` task-history file.
+    Metadata,
+}
+
+/// The small set of families every adapter's roles collapse into, for
+/// the collapsed category rows (#64: "collapsed category rows summarize
+/// nonempty supported candidates") and for anything that groups units
+/// without knowing which ecosystem produced them.
+///
+/// A family is a *presentation and aggregation* grouping. It is not an
+/// identity: the unit's identity is its path inside its container, and
+/// reclassifying a unit from one family to another must never look like
+/// growth (`reclassification_never_fabricates_growth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoleFamily {
+    Container,
+    Outputs,
+    Tests,
+    Intermediates,
+    Dependencies,
+    SharedStore,
+    Metadata,
+    Residual,
+    Unknown,
+}
+
+impl RoleFamily {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Outputs => "outputs",
+            Self::Tests => "tests",
+            Self::Intermediates => "intermediates",
+            Self::Dependencies => "dependencies",
+            Self::SharedStore => "shared-store",
+            Self::Metadata => "metadata",
+            Self::Residual => "residual",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Every family, in the order the views show them: what a build
+    /// produced, then what it produced for tests, then what it kept to
+    /// go faster, then what it downloaded, then what is shared, then the
+    /// bookkeeping, then what is not understood. Unknown last, because
+    /// an unknown family is not a small one -- it is an unmeasured one.
+    pub const ALL: &'static [Self] = &[
+        Self::Outputs,
+        Self::Tests,
+        Self::Intermediates,
+        Self::Dependencies,
+        Self::SharedStore,
+        Self::Metadata,
+        Self::Residual,
+        Self::Unknown,
+    ];
 }
 
 impl ArtifactRole {
@@ -40,6 +134,157 @@ impl ArtifactRole {
             Self::CompanionMetadata => "companion-metadata",
             Self::Residual => "residual",
             Self::Unknown => "unknown",
+            Self::Output => "output",
+            Self::TestOutput => "test-output",
+            Self::Intermediate => "intermediate",
+            Self::InstalledDependencies => "installed-dependencies",
+            Self::SharedStoreEntry => "shared-store-entry",
+            Self::Metadata => "metadata",
+        }
+    }
+
+    /// The inverse of [`Self::label`]. Exhaustive by construction, so a
+    /// new variant is a compile error here rather than a value that
+    /// round-trips into `Unknown`.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().find(|r| r.label() == label).cloned()
+    }
+
+    pub const ALL: &'static [Self] = &[
+        Self::Container,
+        Self::Profile,
+        Self::Dependency,
+        Self::TestExecutable,
+        Self::Example,
+        Self::BuildScriptOutput,
+        Self::Incremental,
+        Self::FinalOutput,
+        Self::CompanionMetadata,
+        Self::Residual,
+        Self::Unknown,
+        Self::Output,
+        Self::TestOutput,
+        Self::Intermediate,
+        Self::InstalledDependencies,
+        Self::SharedStoreEntry,
+        Self::Metadata,
+    ];
+
+    /// Which family this role aggregates into.
+    ///
+    /// The Cargo roles map onto the same families as the generic ones,
+    /// which is the whole point: a `--view builds` grouping must not
+    /// have a Rust column and an everything-else column.
+    /// `Profile` maps to `Container` because a profile directory is an
+    /// intermediate *container* of other units -- counting it as an
+    /// output would double-count everything under it.
+    pub fn family(&self) -> RoleFamily {
+        match self {
+            Self::Container | Self::Profile => RoleFamily::Container,
+            Self::FinalOutput | Self::Example | Self::Output => RoleFamily::Outputs,
+            Self::TestExecutable | Self::TestOutput => RoleFamily::Tests,
+            Self::Incremental | Self::BuildScriptOutput | Self::Intermediate => {
+                RoleFamily::Intermediates
+            }
+            Self::Dependency | Self::InstalledDependencies => RoleFamily::Dependencies,
+            Self::SharedStoreEntry => RoleFamily::SharedStore,
+            Self::CompanionMetadata | Self::Metadata => RoleFamily::Metadata,
+            Self::Residual => RoleFamily::Residual,
+            Self::Unknown => RoleFamily::Unknown,
+        }
+    }
+}
+
+/// Which bytes a unit's `bytes` field counts. #65 forbids mixing these
+/// in one total, so the basis travels with the number instead of being
+/// remembered by whoever reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountingBasis {
+    /// Disk blocks this path occupies (`blocks * 512`), summed over a
+    /// folded directory. What every other swamp total uses.
+    #[default]
+    Allocated,
+    /// Apparent size (`st_size`), which is larger than allocated for a
+    /// sparse file and smaller for a small one.
+    Logical,
+    /// Allocated bytes with hardlinked members charged to exactly one
+    /// unit -- so two units' `bytes` can be added without inflating.
+    UniqueAllocated,
+    /// The size could not be established for this unit at all. Not zero:
+    /// a zero that means "unknown" is the bug this variant exists to
+    /// stop.
+    Unknown,
+}
+
+impl AccountingBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allocated => "allocated",
+            Self::Logical => "logical",
+            Self::UniqueAllocated => "unique-allocated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Where a unit's `mtime_max` came from. #64's cleanup-guidance contract
+/// requires the timestamp be labelled "modified", and requires the
+/// *source* to be explicit -- a folded directory's rolled-up minute
+/// resolution is a different fact from one file's `st_mtime`, and
+/// neither is a last-use time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimeSource {
+    /// One path's own `st_mtime`.
+    FileModification,
+    /// The newest modification among a folded directory's measured
+    /// entries, at the walk's minute resolution.
+    FoldedDirectoryModification,
+    /// A timestamp a tool itself recorded in metadata swamp read.
+    ToolRecorded,
+    /// No timestamp could be established. Ranks *last*, never as
+    /// "ancient" (#64: "unknown/future times must not rank as ancient").
+    #[default]
+    Unknown,
+}
+
+impl TimeSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FileModification => "file-modification",
+            Self::FoldedDirectoryModification => "folded-directory-modification",
+            Self::ToolRecorded => "tool-recorded",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What, if anything, swamp can do to a unit -- carried separately from
+/// its identity (#64: "Identification works without a cleanup adapter").
+///
+/// Every build adapter in this chunk declares [`Self::InspectionOnly`].
+/// #73 implements adapter actions; until it does, a unit claiming
+/// anything else would be a promise with no executor behind it, which is
+/// what `build_adapter_matrix_matches_docs` checks the published table
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "capability", rename_all = "kebab-case")]
+pub enum NestedActionCapability {
+    /// Identified and explainable; no action is offered.
+    #[default]
+    InspectionOnly,
+    /// Identified, and an action exists but is not available for this
+    /// unit, for the stated reason (a shared store entry other projects
+    /// link to, an unsupported layout, an incomplete measurement).
+    Unsupported { reason: String },
+}
+
+impl NestedActionCapability {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InspectionOnly => "inspection-only",
+            Self::Unsupported { .. } => "unsupported",
         }
     }
 }
@@ -62,6 +307,12 @@ pub struct ArtifactEvidence {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactVariant {
     pub package: Option<String>,
+    /// The package's own declared version, where a manifest states one.
+    /// Distinct from `generation`: a version is what a package calls
+    /// itself, a generation would be a claim that one build supersedes
+    /// another -- which no ecosystem here records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub target: Option<String>,
     pub profile: Option<String>,
     pub architecture: Option<String>,
@@ -136,6 +387,33 @@ pub struct NestedArtifact {
     /// way as an artifact row's or external unit's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_evidence: Vec<crate::evidence::Evidence>,
+    /// The adapter that identified this unit (`cargo`, `node`,
+    /// `gradle`, `maven`), or `None` for a unit produced before the
+    /// adapter registry existed.
+    ///
+    /// Carried so a view can say *which* support claim a row rests on,
+    /// and so the capability matrix can be joined to real rows rather
+    /// than asserted in prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    /// Which bytes `bytes`/`physical_total` count. Never mix bases in
+    /// one total (#65).
+    #[serde(default)]
+    pub basis: AccountingBasis,
+    /// Where `mtime_max` came from. Always a *modification* fact, never
+    /// a use or access fact.
+    #[serde(default)]
+    pub time_source: TimeSource,
+    /// What swamp can do to this unit, separately from what it knows
+    /// about it (#64).
+    #[serde(default)]
+    pub action: NestedActionCapability,
+    /// What removing this unit would cost, in the ecosystem's own terms
+    /// ("rebuild with `npm run build`"; "reinstall with `npm ci` --
+    /// needs registry access"). A consequence, not a verdict: it says
+    /// what happens if the bytes go, never whether they should.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequence: Option<String>,
 }
 
 impl NestedArtifact {
