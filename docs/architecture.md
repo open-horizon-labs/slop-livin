@@ -1094,6 +1094,73 @@ To add a fact source, implement a consumer and register it before dispatch. If i
 
 To add artifact recognition, update the ecosystem rules and fixtures. Classification changes must invalidate old observations through the rules version. An upstream ignore entry is research input; inspect what a directory can contain before classifying it.
 
+## Source audits
+
+Every technical guardrail in `.oh/guardrails/` names an audit in
+`crates/source-audit` (`cargo run -p swamp-source-audit`, `--list` for
+the names). The audits are rules over one whole-program model, not
+searches of chosen files:
+
+- **The program model** (`src/program.rs`) parses every file under
+  `crates/{core,cli,tui}/src` once. Every definition -- free function,
+  `impl` method, trait default -- is its own record with its module
+  path, `impl` type, resolved calls (including calls written inside
+  macro arguments, with the macro's honour context), value references,
+  assignments, match arms, bindings and struct literals. Item-level
+  constants, statics, type aliases, struct fields and enum variants are
+  records too. Calls resolve through `crate`/`super`/`Self`, `pub use`
+  re-exports (followed to what they name, including a standard-library
+  function re-exported by a local module), `Type::f`, and the receiver
+  type where the code states it (`self`, a parameter, a field, a typed
+  or constructed local); otherwise a method call is possibly every
+  method of that name and arity. The model is rebuilt only when a file
+  changes, so the forty-five audits over one tree share it.
+- **Derived sets, not lists.** Destructive, mutating, traversing,
+  reading-unbounded, emitting, environment-reading and spawning are
+  closures over the call graph of capability predicates on the standard
+  library and the dependencies (`std::fs::rename`, `OpenOptions` opened
+  for writing, `read_dir`, `io::read_to_string`, `panic!` with a
+  formatted message). Regions are derived from structure: adapters are
+  the modules under `agents/`/`build_adapters/` (shared family modules
+  included); consumers are the implementors of `bus::Consumer`; the
+  report path is whatever runs `bus::run_report`; a child module belongs
+  to its parent's region.
+- **Behaviour, not names.** A required call must be honoured (its answer
+  reaches `?`, a `match` or a condition; `let _ =` and a
+  `vec![..]`-wrapped discard do not count); a guard must be the
+  *condition* of the write it guards; a removal's subject must be the
+  path the rechecks were about; a value flows through bindings and the
+  collections it is pushed into.
+- **Declared anchors.** What a guardrail is about is named once and
+  checked to exist: the one protection predicate, the three rechecks, the
+  measured folding entry points, and the bounded primitives, each with
+  the cap constant that earns its exemption -- a primitive that stops
+  naming or stopping on its cap, or does anything beyond its one bounded
+  operation, loses it.
+
+Evidence that an audit rejects anything:
+
+- `tests/mutation_corpus.rs` applies every fixture under
+  `tests/mutations/<audit>/` (including all 45 re-review 3 sweep
+  mutations) to a copy of the real workspace and requires the audit to
+  reject it; every audit has at least three.
+- `tests/mutation_operators.rs` derives variants of every fixture
+  mechanically -- alias, re-export shim, same-file helper, child module,
+  macro wrap, constant hoisting, injection into an exempt bounded
+  primitive, discard of a legitimate shape's answer -- and requires the
+  same verdict. Operators change how a harmful thing is written, never
+  what it does.
+- `tests/reviewer_mutation_sweep_stack3.rs` is the independent
+  reviewer's one-mutation-per-audit sweep.
+
+**Limits.** Resolution is lexical: trait-object dispatch resolves to
+every implementor, a function pointer stored in a struct is followed
+only where its path is written, and a `proc_macro` that generates calls
+is invisible. Where a guardrail is `severity: hard`, the runtime tests
+named in its guardrail file cover what the model cannot see. Every
+subprocess is built by `swamp_core::spawn::command`, which counts it,
+so the spawn counters the cost tests read are structural.
+
 ## Limits of the current implementation
 
 - Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.

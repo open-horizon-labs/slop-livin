@@ -4,6 +4,43 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Audit rule redesign
+
+- Every source audit is now a rule over a whole-program model
+  (`crates/source-audit/src/program.rs`, `src/rules/`): no audit names a
+  file to scan or lists this workspace's function names as its coverage.
+  Destructive, traversing, unbounded-read, emitting and
+  environment-reading functions are derived closures over the call graph;
+  adapters, consumers and the report path are derived regions; a required
+  call must be honoured and a guard must be the write's condition.
+  Re-review 3's sweep had 43 of 45 audits accept a new harmful mutation;
+  all 45 are now rejected, along with 571 operator-generated variants of
+  the 185 corpus fixtures.
+- `adr_validation` fails a `severity: hard` guardrail with no `audit:`
+  (or `audit: none` without a dated reason and resolvable runtime tests),
+  and every guardrail's Detection section names mutation-corpus fixtures.
+- `folding_only_for_artifacts` exempts exactly the measured folding entry
+  points by resolved path; the `resize_artifact*` prefix wildcard is gone.
+- Every subprocess is built by `spawn::command`, which counts it
+  (`every_spawn_is_counted`); three TUI spawns were uncounted.
+- `locations::shallow_list` reports `Truncation::Truncated { n }` at its
+  cap, and Oh My Pi's shared-blob reference count is incomplete, not
+  "full coverage", when any listing it depends on was truncated.
+- Citations match their vendored excerpt by (tool, revision, path), and
+  each pinned citation records the digest of the upstream file it was
+  vendored from (`SWAMP_FETCH_UPSTREAM=1` re-fetches and checks).
+- An unchanged second observation is now as cheap as the third: a root's
+  first observation anchors its FSEvents cursor instead of being treated
+  as a rules change (reviewer fixture: 40 listings / 5,561 stats on pass
+  2 before, 6 / 8 after).
+- Found by the rewritten audits and fixed: a merge of per-root reports
+  on the TUI event thread could reach an Xcode `plutil` spawn; seven
+  messages used verdict words; agent tool ids aliased detector-id
+  constants; the Docker facts cache wrote JSON outside the allow-list;
+  `occupancy::occupied`, `OccupancyState::is_free` and the consumer
+  sidecar writers had no production caller; the evidence inventory was
+  read only by a renderer only a test called (it is now in the TUI help).
+
 ### Repairs after review 2, part 5
 
 Making the reuse fire, and keeping a count honest while it does.

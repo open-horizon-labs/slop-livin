@@ -234,4 +234,4 @@ are retained and refused/unattempted marks remain for explicit retry. Idle Ctrl-
 exits. Observation results are held while busy and pre-deletion results discarded
 so a stale report cannot resurrect removed rows.
 
-Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.
+Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. The help overlay ends with the activity-evidence inventory (which domains this pass can establish a real activity fact for, and which it reports as unknown), the same table `docs/usage.md` carries. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.
