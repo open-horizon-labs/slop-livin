@@ -299,7 +299,19 @@ regression); neither is this chunk's call to make unilaterally.
 
 ---
 
-# 7. Follow-ups, recorded not done
+# 7. One flake seen, not caused
+
+`crates/tui/src/app.rs::tests::start_watch_opens_one_stream_per_root`
+failed once during the final `cargo test --workspace` with "1 watcher
+for 2 roots". It opens two **real** FSEvents streams and already skips
+itself when it gets zero; it has no guard for getting one. Re-run three
+times in isolation immediately afterwards: three passes. Nothing in this
+chunk touches `start_watch`, and the run that failed was the tail of a
+thirteen-minute suite. Recorded as an environment flake with a cheap
+fix available (treat any count below `roots.len()` the way it already
+treats zero), not as a regression and not as something I silenced.
+
+# 8. Follow-ups, recorded not done
 
 - **Per-unit-root FSEvents cursors** (section 3). The one that decides
   whether any of this reuse fires in a default install.
