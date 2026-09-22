@@ -273,6 +273,96 @@ fn appending_one_session_re_identifies_exactly_one_container() {
     );
 }
 
+/// A container whose identification *folds* directories, not only lists
+/// them: Claude Code's per-session companion directory, `file-history/`,
+/// and the always-present `memory/` leftover.
+///
+/// Two things this pins that the flat fixture above cannot. First, the
+/// recorder has to survive `IdentifyCtx::folded_bytes` reaching back
+/// into it for every directory the fold walked (a `RefCell` re-entry
+/// away from a panic). Second, a directory *outside* the container that
+/// its units depend on -- `file-history/<session-id>/` -- has to be
+/// watched, or a session acquiring checkpoint data would be invisible
+/// until something else in the project directory moved.
+#[test]
+fn a_container_that_folds_directories_records_them_and_notices_them() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("claude");
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let project = home.join("projects/-repo");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", repo.display()),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join(id)).unwrap();
+    fs::write(project.join(id).join("subagent.jsonl"), vec![b'a'; 1024]).unwrap();
+    fs::create_dir_all(home.join("projects/-repo/memory")).unwrap();
+    fs::write(
+        home.join("projects/-repo/memory/MEMORY.md"),
+        vec![b'm'; 512],
+    )
+    .unwrap();
+
+    let scope = scope_with(
+        HashMap::from([("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string())]),
+        &root,
+        &["claude-code"],
+    );
+    let store = tempfile::tempdir().unwrap();
+    let total = |at: u64| -> u64 {
+        swamp_core::agents::discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            true,
+            at,
+            30,
+            3600,
+        )
+        .expect("agent discovery")
+        .iter()
+        .map(|u| u.bytes)
+        .sum()
+    };
+    let first = total(1_000);
+    assert!(
+        first >= 1536,
+        "precondition: the folded members count: {first}"
+    );
+
+    let (second, cost) = measure(|| total(2_000));
+    assert_eq!(second, first, "an unchanged home reports the same bytes");
+    assert_eq!(
+        cost.containers_reused, 1,
+        "the container must be replayed, folds and all"
+    );
+
+    // `file-history/<session-id>/` did not exist when the container was
+    // stored. Creating it moves `file-history/`'s own stamp, which the
+    // container watches precisely so this is not invisible.
+    fs::create_dir_all(home.join("file-history").join(id)).unwrap();
+    fs::write(
+        home.join("file-history").join(id).join("snap.json"),
+        vec![b'f'; 4096],
+    )
+    .unwrap();
+    let (third, cost) = measure(|| total(3_000));
+    assert_eq!(
+        cost.containers_identified, 1,
+        "a watched sibling directory gaining an entry must re-identify the container"
+    );
+    assert!(
+        third >= first + 4096,
+        "the new checkpoint data's bytes must be reported: {third} vs {first}"
+    );
+}
+
 /// The limit this reuse has, asserted rather than only written down: a
 /// session rewritten **in place** does not move its container's stamp,
 /// so its new byte total is not seen until something else in that
