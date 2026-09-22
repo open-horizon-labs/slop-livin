@@ -190,6 +190,56 @@ fn one_byte_formatter(root: &Path) -> Result<(), String> {
     if !hb.body.contains("1000") || hb.body.contains("1024") {
         return Err("render::human_bytes must divide by 1000 under SI labels".into());
     }
+    // "One formatter" is about the whole workspace, not about the name
+    // `human_bytes`. The mutation sweep added a *second* formatter
+    // beside the re-export: `n / 1024` with a `KiB` label, which no
+    // check on `human_bytes` could see. Any function anywhere that
+    // divides a byte count by 1024 and labels the result is a second
+    // formatter, whatever it is called.
+    let mut second: Vec<String> = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(sf) = crate::resolve::maybe(root, &rel) else {
+            continue;
+        };
+        let literals = ast::string_literals(&sf.ast);
+        let labels_binary = literals
+            .iter()
+            .any(|l| ["KiB", "MiB", "GiB", "TiB"].iter().any(|u| l.contains(u)));
+        if !labels_binary {
+            continue;
+        }
+        // A *formatter* produces the string; a parser consumes one.
+        // `docker::parse_size` reads the daemon's own "1.5GiB" strings
+        // through `strip_suffix`, which is the opposite job.
+        let formatting_macros: Vec<crate::resolve::MacroSite> =
+            crate::resolve::macro_sites(&sf.ast)
+                .into_iter()
+                .filter(|m| {
+                    !m.in_test
+                        && ["format", "write", "writeln", "push_str"].contains(&m.name.as_str())
+                        && m.literals
+                            .iter()
+                            .any(|l| ["KiB", "MiB", "GiB", "TiB"].iter().any(|u| l.contains(u)))
+                })
+                .collect();
+        for func in ast::functions(&sf.ast) {
+            let divides = func.body.contains("1024");
+            let labels = formatting_macros.iter().any(|m| m.func == func.name);
+            if divides && labels {
+                second.push(format!(
+                    "{rel}::{} formats bytes with a 1024 divisor and a binary unit label: there \
+                     is one byte formatter (render::human_bytes, SI, /1000) and everything else \
+                     re-exports it",
+                    func.name
+                ));
+            }
+        }
+    }
+    if !second.is_empty() {
+        second.sort();
+        second.dedup();
+        return Err(second.join("\n  "));
+    }
     Ok(())
 }
 
@@ -213,21 +263,46 @@ fn legacy_invariants(root: &Path) -> Result<(), String> {
 fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
     let g = core(root, "growth.rs")?;
     let funcs = ast::functions(&g.ast);
-    let entry = ast::function(&funcs, "observe_tracked_with_source")?;
-    if !entry.body.contains("stage_tracked_with_source") || entry.body.contains("full_walk") {
-        return Err("observe_tracked_with_source must delegate replay planning to stage_tracked_with_source".into());
-    }
-    let f = ast::function(&funcs, "stage_tracked_with_source")?;
-    let replay_at = f
-        .stmts
+    // *Every* definition with these names, not the first one found: the
+    // mutation sweep's variants live beside the audited original, and a
+    // rule that stops at the first match inspects whichever one it
+    // happens to reach.
+    let entries: Vec<&ast::Func> = funcs
         .iter()
-        .position(|s| s.contains(". replay (") || s.contains(".replay("))
-        .ok_or("stage_tracked_with_source never calls FSEvents replay")?;
-    for (i, s) in f.stmts.iter().enumerate() {
-        if i < replay_at && s.contains("full_walk") && !s.contains("force_full") {
-            return Err(format!(
-                "stage_tracked_with_source: statement {i} runs full_walk before the FSEvents replay without a force_full guard"
-            ));
+        .filter(|f| f.name == "observe_tracked_with_source")
+        .collect();
+    if entries.is_empty() {
+        return Err("growth.rs defines no `observe_tracked_with_source`".into());
+    }
+    for entry in entries {
+        if !entry.body.contains("stage_tracked_with_source") || entry.body.contains("full_walk") {
+            return Err(
+                "observe_tracked_with_source must delegate replay planning to \
+                 stage_tracked_with_source and must not walk fully itself"
+                    .into(),
+            );
+        }
+    }
+    let staged: Vec<&ast::Func> = funcs
+        .iter()
+        .filter(|f| f.name == "stage_tracked_with_source")
+        .collect();
+    if staged.is_empty() {
+        return Err("growth.rs defines no `stage_tracked_with_source`".into());
+    }
+    for f in staged {
+        let replay_at = f
+            .stmts
+            .iter()
+            .position(|s| s.contains(". replay (") || s.contains(".replay("))
+            .ok_or("stage_tracked_with_source never calls FSEvents replay")?;
+        for (i, s) in f.stmts.iter().enumerate() {
+            if i < replay_at && s.contains("full_walk") && !s.contains("force_full") {
+                return Err(format!(
+                    "stage_tracked_with_source: statement {i} runs full_walk before the FSEvents \
+                     replay without a force_full guard"
+                ));
+            }
         }
     }
     Ok(())

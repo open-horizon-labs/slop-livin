@@ -1764,13 +1764,24 @@ pub fn agent_adapters_are_inspection_only(root: &Path) -> Result<(), String> {
     }
 }
 
+/// Every way an adapter can put bytes on a terminal. `writeln!(stderr())`
+/// and `stdout().write_all(..)` were absent, which is how the mutation
+/// sweep got adapter content onto stderr past a list of three macros.
 const EMITTERS: &[&str] = &[
     "println !",
     "eprintln !",
     "print !",
+    "eprint !",
     "dbg !",
     "log ::",
     "tracing ::",
+    "writeln !",
+    "write !",
+    "io :: stdout",
+    "io :: stderr",
+    "stdout ()",
+    "stderr ()",
+    ". write_all (",
 ];
 
 pub fn agent_adapters_do_not_emit_content(root: &Path) -> Result<(), String> {
