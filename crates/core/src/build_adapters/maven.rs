@@ -8,23 +8,33 @@
 //! # Downloaded, locally installed, or unknown
 //!
 //! The one claim this adapter must get right is *origin*, because it
-//! decides whether removing an artifact is recoverable at all. Maven
-//! leaves three kinds of evidence beside an artifact:
+//! decides whether removing an artifact is recoverable at all. The
+//! evidence Maven (its Resolver's enhanced local repository manager)
+//! leaves beside an artifact, and what each one establishes:
 //!
-//! * `_remote.repositories` -- written by Maven 3 when it resolved the
-//!   artifact from a remote repository. Present means it was downloaded,
-//!   and the same coordinates can be fetched again.
-//! * `*.lastUpdated` -- a record of a *failed* or timestamped remote
-//!   resolution attempt. Also evidence of a remote origin.
-//! * `maven-metadata-local.xml` -- written by `mvn install`. The
-//!   artifact was built on this machine, and if the source is gone, so
-//!   is the artifact.
+//! * `_remote.repositories` -- a properties file with one key per
+//!   artifact file, `<file>><repository-id>=`. A **non-empty** id means
+//!   that file was resolved from that remote repository. An **empty** id
+//!   (`app-1.0.jar>=`) is the Resolver's `LOCAL_REPO_ID`: the file was
+//!   *installed* into the local repository by `mvn install`. So the
+//!   file's presence alone proves nothing; its entries do, and they are
+//!   read (bounded -- it is a named metadata file of a few hundred
+//!   bytes).
+//! * `maven-metadata-local.xml` -- written by `mvn install`, beside a
+//!   snapshot version or at the artifact level listing installed
+//!   versions. Evidence of a local install.
+//! * `*.lastUpdated` -- a record that a remote *resolution was
+//!   attempted* (usually one that failed or found nothing). It is not
+//!   evidence the bytes present were downloaded, so on its own it leaves
+//!   the origin unknown and says an attempt was recorded.
 //!
-//! With none of those, the origin is **unknown**, and this adapter says
-//! unknown. #67 is explicit: "preserve downloaded versus locally
-//! installed or unknown origin without assuming local artifacts can be
-//! downloaded again." A guess in the wrong direction here costs someone
-//! an artifact they cannot rebuild.
+//! Local evidence wins over remote evidence for the same version: an
+//! artifact downloaded once and later installed over carries both, and
+//! "downloaded" would be the guess that costs someone an artifact they
+//! cannot fetch again. With no usable evidence the origin is **unknown**,
+//! and this adapter says unknown. #67 is explicit: "preserve downloaded
+//! versus locally installed or unknown origin without assuming local
+//! artifacts can be downloaded again."
 //!
 //! # What is never done
 //!
@@ -96,42 +106,73 @@ const TARGET_ENTRIES: &[(&str, ArtifactRole, &str)] = &[
 
 /// What the evidence beside a repository artifact establishes about how
 /// it got there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    /// `_remote.repositories` or a `*.lastUpdated` marker: resolved from
-    /// a remote repository.
-    Downloaded,
-    /// `maven-metadata-local.xml`: built and installed on this machine.
+    /// `_remote.repositories` names these remote repositories and no
+    /// entry is local.
+    Downloaded { repositories: Vec<String> },
+    /// An empty repository id in `_remote.repositories`, or a
+    /// `maven-metadata-local.xml` naming this version: installed by a
+    /// local build.
     LocallyInstalled,
-    /// Neither. Swamp does not know, and does not guess.
+    /// No usable evidence. Swamp does not know, and does not guess.
     Unknown,
 }
 
 impl Origin {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
-            Self::Downloaded => "downloaded",
+            Self::Downloaded { .. } => "downloaded",
             Self::LocallyInstalled => "locally-installed",
             Self::Unknown => "unknown-origin",
         }
     }
 
-    fn consequence(self) -> &'static str {
+    fn consequence(&self) -> String {
         match self {
-            Self::Downloaded => {
-                "the next build that needs this version downloads it again -- needs access to the \
-                 repository it came from"
-            }
-            Self::LocallyInstalled => {
-                "this version was installed from a local build; recreating it needs that project's \
-                 source and an `mvn install`"
-            }
-            Self::Unknown => {
-                "swamp found no origin evidence beside this artifact, so it cannot say whether it \
-                 can be downloaded again"
-            }
+            Self::Downloaded { repositories } => format!(
+                "the next build that needs this version downloads it again from {} -- needs \
+                 access to that repository",
+                repositories.join(", ")
+            ),
+            Self::LocallyInstalled => "this version was installed from a local build; recreating \
+                                       it needs that project's source and an `mvn install`"
+                .to_string(),
+            Self::Unknown => "swamp found no origin evidence beside this artifact, so it cannot \
+                              say whether it can be downloaded again"
+                .to_string(),
         }
     }
+}
+
+/// An origin plus what established it, and what could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginEvidence {
+    pub origin: Origin,
+    pub detail: String,
+    pub limits: Vec<String>,
+}
+
+/// Parses `_remote.repositories` text into `(file, repository id)`
+/// pairs. Comment lines (`#`) and anything without a `>` are skipped; an
+/// empty id is kept as `""` because that *is* the local-install marker.
+pub(crate) fn remote_repository_entries(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let key = l.split_once('=').map(|(k, _)| k).unwrap_or(l);
+            let (file, repo) = key.rsplit_once('>')?;
+            (!file.is_empty()).then(|| (file.to_string(), repo.to_string()))
+        })
+        .collect()
+}
+
+/// Whether a `maven-metadata-local.xml` lists `version`, read as text:
+/// `<version>X</version>` anywhere in it. No XML entity or property is
+/// resolved -- an entry that needs resolving does not match.
+pub(crate) fn local_metadata_lists(text: &str, version: &str) -> bool {
+    text.contains(&format!("<version>{version}</version>"))
 }
 
 impl BuildAdapter for Adapter {
@@ -311,11 +352,42 @@ fn identify_repository(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nested
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
+        // An unexpanded POM property where a version belongs
+        // (`${project.version}`, `${revision}`): a build installed an
+        // artifact whose version it never resolved. It is not a
+        // version, and it is not silently dropped either -- the PR #123
+        // review found exactly that shape returning `Ok(vec![])`.
+        if name.contains("${") {
+            let mut variant = ArtifactVariant::default();
+            variant.unknowns.push("version".into());
+            variant.unknowns.push("origin".into());
+            if let Some(c) = crate::build_adapters::jvm_common::coordinates_from_relative(
+                &relative_path(&container.path, dir.path.parent().unwrap_or(&dir.path)),
+                false,
+            ) {
+                variant.package = Some(format!("{}:{}", c.group, c.artifact));
+            }
+            units.push(
+                NestedUnitBuilder::new(container, ArtifactRole::Residual, dir.path.clone())
+                    .folded(dir)
+                    .variant(variant)
+                    .membership(Membership::Unknown)
+                    .unsupported_layout(format!(
+                        "`{name}` is an unresolved POM property, not a version: the build that \
+                         installed this never resolved it, and swamp never evaluates POMs to \
+                         resolve it either"
+                    ))
+                    .consequence(Origin::Unknown.consequence())
+                    .build(),
+            );
+            continue;
+        }
         if !crate::build_adapters::jvm_common::looks_like_version(name) {
             continue;
         }
         let coords = crate::build_adapters::jvm_common::coordinates_from_relative(&rel, false);
-        let origin = origin_of(ctx, &dir.path);
+        let evidence = origin_of(ctx, &dir.path, name);
+        let origin = &evidence.origin;
         let mut variant = ArtifactVariant::default();
         match &coords {
             Some(c) => {
@@ -328,7 +400,7 @@ fn identify_repository(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nested
                 variant.unknowns.push("version".into());
             }
         }
-        if origin == Origin::Unknown {
+        if *origin == Origin::Unknown {
             variant.unknowns.push("origin".into());
         }
         let mut b =
@@ -355,11 +427,15 @@ fn identify_repository(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nested
                 "`{rel}` is not a coordinate layout this adapter can read"
             )),
         };
-        if origin == Origin::Unknown {
+        b = b.evidence("maven-origin", evidence.detail.clone(), Confidence::High);
+        for limit in &evidence.limits {
+            b = b.limit(limit.clone());
+        }
+        if *origin == Origin::Unknown {
             b = b.limit(
-                "no `_remote.repositories`, `*.lastUpdated` or `maven-metadata-local.xml` beside \
-                 this artifact: swamp cannot tell whether it was downloaded or installed locally, \
-                 and does not assume it can be downloaded again",
+                "no usable `_remote.repositories` entry or `maven-metadata-local.xml` for this \
+                 version: swamp cannot tell whether it was downloaded or installed locally, and \
+                 does not assume it can be downloaded again",
             );
         }
         units.push(b.build());
@@ -369,31 +445,100 @@ fn identify_repository(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nested
 
 /// The origin evidence Maven left beside one version directory.
 ///
-/// One capped listing per version directory, no content read: the
-/// *presence* of the marker files is the evidence, and their contents
-/// add nothing this adapter uses.
-pub(crate) fn origin_of(ctx: &BuildCtx, version_dir: &Path) -> Origin {
-    let mut downloaded = false;
-    let mut local = false;
+/// Cost: one capped listing of the version directory; one bounded read
+/// of `_remote.repositories` when it is there (a few hundred bytes); and
+/// only when it is *not* there, one `stat` plus at most one bounded read
+/// of the artifact-level `maven-metadata-local.xml`. `*.lastUpdated`
+/// files are never read -- their presence is the whole fact.
+pub(crate) fn origin_of(ctx: &BuildCtx, version_dir: &Path, version: &str) -> OriginEvidence {
+    let mut remote_file = false;
+    let mut local_metadata = false;
+    let mut attempted = false;
     for e in ctx.list(version_dir) {
         if e.is_dir {
             continue;
         }
-        if e.name == "_remote.repositories" || e.name.ends_with(".lastUpdated") {
-            downloaded = true;
-        }
-        if e.name == "maven-metadata-local.xml" {
-            local = true;
+        remote_file |= e.name == "_remote.repositories";
+        local_metadata |= e.name == "maven-metadata-local.xml";
+        attempted |= e.name.ends_with(".lastUpdated");
+    }
+    let mut limits = Vec::new();
+    if local_metadata {
+        return OriginEvidence {
+            origin: Origin::LocallyInstalled,
+            detail: "maven-metadata-local.xml beside this version (written by `mvn install`)"
+                .into(),
+            limits,
+        };
+    }
+    if remote_file {
+        match ctx.manifest(&version_dir.join("_remote.repositories")) {
+            Some(m) if !m.truncated => {
+                let entries = remote_repository_entries(&m.text);
+                if entries.iter().any(|(_, repo)| repo.is_empty()) {
+                    return OriginEvidence {
+                        origin: Origin::LocallyInstalled,
+                        detail: "_remote.repositories records an empty repository id: installed \
+                                 locally"
+                            .into(),
+                        limits,
+                    };
+                }
+                let mut repositories: Vec<String> =
+                    entries.into_iter().map(|(_, repo)| repo).collect();
+                repositories.sort();
+                repositories.dedup();
+                if !repositories.is_empty() {
+                    return OriginEvidence {
+                        detail: format!(
+                            "_remote.repositories records resolution from {}",
+                            repositories.join(", ")
+                        ),
+                        origin: Origin::Downloaded { repositories },
+                        limits,
+                    };
+                }
+                limits.push("_remote.repositories has no entries this adapter can read".into());
+            }
+            Some(_) => limits.push(
+                "_remote.repositories is larger than the manifest cap and was not parsed".into(),
+            ),
+            None => limits.push("_remote.repositories could not be read".into()),
         }
     }
-    match (downloaded, local) {
-        // Both: Maven records `_remote.repositories` for an installed
-        // artifact too in some layouts, and the local metadata is the
-        // stronger claim about where the bytes came from. Reporting
-        // "downloaded" here would be the guess that costs an artifact.
-        (_, true) => Origin::LocallyInstalled,
-        (true, false) => Origin::Downloaded,
-        (false, false) => Origin::Unknown,
+    // Artifact-level install metadata, consulted only when the version
+    // directory itself said nothing usable.
+    if let Some(artifact_dir) = version_dir.parent() {
+        let meta = artifact_dir.join("maven-metadata-local.xml");
+        if ctx.stat(&meta).is_some_and(|m| m.is_file()) {
+            match ctx.manifest(&meta) {
+                Some(m) if !m.truncated && local_metadata_lists(&m.text, version) => {
+                    return OriginEvidence {
+                        origin: Origin::LocallyInstalled,
+                        detail: "the artifact's maven-metadata-local.xml lists this version".into(),
+                        limits,
+                    };
+                }
+                Some(m) if m.truncated => limits.push(
+                    "the artifact's maven-metadata-local.xml is larger than the manifest cap and \
+                     was not parsed"
+                        .into(),
+                ),
+                _ => {}
+            }
+        }
+    }
+    if attempted {
+        limits.push(
+            "a `*.lastUpdated` file records a remote resolution attempt; that is not evidence the \
+             bytes here were downloaded"
+                .into(),
+        );
+    }
+    OriginEvidence {
+        origin: Origin::Unknown,
+        detail: "no origin evidence".into(),
+        limits,
     }
 }
 
@@ -447,8 +592,9 @@ mod tests {
         let repo = tmp.path().join("repository");
         let v = repo.join("commons-io/commons-io/2.11.0");
         fs::create_dir_all(&v).unwrap();
-        // Evidence files far larger than the cap. Origin is decided by
-        // their *presence*, so nothing reads them at all.
+        // An origin file far larger than the cap: read up to the cap,
+        // reported as unparsed, and the origin stays unknown rather than
+        // being read from a prefix.
         fs::write(v.join("_remote.repositories"), vec![b'x'; 900_000]).unwrap();
         let c = BuildContainer::shared_store("maven", repo.clone());
         let idx = index(&[
@@ -457,15 +603,21 @@ mod tests {
             (&repo.join("commons-io/commons-io"), 900, 500),
             (&v, 900, 500),
         ]);
-        let (_u, counted) = crate::work_counters::measured(|| run(&c, &idx));
+        let (units, counted) = crate::work_counters::measured(|| run(&c, &idx));
         assert!(
             counted.header_bytes_read <= super::super::bounded_io::MAX_MANIFEST_BYTES as u64,
             "read {} bytes",
             counted.header_bytes_read
         );
-        assert_eq!(
-            counted.header_bytes_read, 0,
-            "origin is established by the presence of marker files, never by reading them"
+        let u = units.iter().find(|u| u.path == v).unwrap();
+        assert_eq!(u.variant.configuration.as_deref(), Some("unknown-origin"));
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("larger than the manifest cap")),
+            "{:?}",
+            u.coverage.limits
         );
     }
 
@@ -613,6 +765,247 @@ mod tests {
                 .limits
                 .iter()
                 .any(|l| l.contains("does not assume it can be downloaded again")),
+            "{:?}",
+            u.coverage.limits
+        );
+    }
+
+    #[test]
+    fn an_unresolved_pom_property_is_an_explicit_gap_not_an_empty_result() {
+        // The PR #123 review found `parse_pom_xml` returning
+        // `Ok(vec![])` for a version it could not resolve. The same
+        // shape here is a repository directory named
+        // `${project.version}`: it is not a version, and the unit says
+        // the version is unknown rather than disappearing.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repository");
+        let v = repo.join("com/example/app/${project.version}");
+        fs::create_dir_all(&v).unwrap();
+        let c = BuildContainer::shared_store("maven", repo.clone());
+        let idx = index(&[
+            (&repo, 100, 500),
+            (&repo.join("com"), 100, 500),
+            (&repo.join("com/example"), 100, 500),
+            (&repo.join("com/example/app"), 100, 500),
+            (&v, 100, 500),
+        ]);
+        let units = run(&c, &idx);
+        let gap = units
+            .iter()
+            .find(|u| u.path == v)
+            .expect("the gap is a unit, not a missing row");
+        assert!(!gap.coverage.supported);
+        assert!(gap.variant.unknowns.iter().any(|x| x == "version"));
+        assert_eq!(gap.variant.version, None, "a property is never a version");
+        assert_eq!(gap.variant.package.as_deref(), Some("com.example:app"));
+        assert!(
+            gap.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("unresolved POM property")),
+            "{:?}",
+            gap.coverage.limits
+        );
+        assert!(
+            units.iter().any(|u| u.path == repo),
+            "the repository itself is still identified; the gap is one entry, not the store"
+        );
+    }
+
+    fn one_version(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf, Vec<NestedArtifact>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repository");
+        let v = repo.join("com/example/lib/2.0");
+        fs::create_dir_all(&v).unwrap();
+        for (name, body) in files {
+            fs::write(v.join(name), body).unwrap();
+        }
+        let c = BuildContainer::shared_store("maven", repo.clone());
+        let idx = index(&[
+            (&repo, 100, 500),
+            (&repo.join("com"), 100, 500),
+            (&repo.join("com/example"), 100, 500),
+            (&repo.join("com/example/lib"), 100, 500),
+            (&v, 100, 500),
+        ]);
+        let units = run(&c, &idx);
+        (tmp, v, units)
+    }
+
+    #[test]
+    fn a_remote_repository_entry_means_downloaded_from_that_repository() {
+        let (_t, v, units) = one_version(&[(
+            "_remote.repositories",
+            b"#NOTE: This is a Maven Resolver internal implementation file\n\
+              lib-2.0.jar>central=\nlib-2.0.pom>central=\n",
+        )]);
+        let u = units.iter().find(|u| u.path == v).unwrap();
+        assert_eq!(u.variant.configuration.as_deref(), Some("downloaded"));
+        let consequence = u.consequence.clone().unwrap_or_default();
+        assert!(consequence.contains("central"), "{consequence}");
+    }
+
+    #[test]
+    fn an_empty_repository_id_is_a_local_install_not_a_download() {
+        // The tempting reading: `_remote.repositories` exists, so the
+        // artifact was downloaded. The Resolver writes the same file for
+        // `mvn install`, with an empty repository id -- and promising a
+        // re-download of that is the guess that costs an artifact.
+        let (_t, v, units) =
+            one_version(&[("_remote.repositories", b"lib-2.0.jar>=\nlib-2.0.pom>=\n")]);
+        let u = units.iter().find(|u| u.path == v).unwrap();
+        assert_eq!(
+            u.variant.configuration.as_deref(),
+            Some("locally-installed")
+        );
+        assert!(
+            !u.consequence
+                .clone()
+                .unwrap_or_default()
+                .contains("downloads it again")
+        );
+    }
+
+    #[test]
+    fn a_last_updated_marker_alone_leaves_the_origin_unknown() {
+        let (_t, v, units) = one_version(&[(
+            "lib-2.0.jar.lastUpdated",
+            b"https\\://repo.example/.error=Not found\n",
+        )]);
+        let u = units.iter().find(|u| u.path == v).unwrap();
+        assert_eq!(u.variant.configuration.as_deref(), Some("unknown-origin"));
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("resolution attempt")),
+            "{:?}",
+            u.coverage.limits
+        );
+    }
+
+    #[test]
+    fn a_malformed_origin_file_is_an_explicit_unknown() {
+        let (_t, v, units) = one_version(&[("_remote.repositories", b"garbage without markers")]);
+        let u = units.iter().find(|u| u.path == v).unwrap();
+        assert_eq!(u.variant.configuration.as_deref(), Some("unknown-origin"));
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("no entries this adapter can read")),
+            "{:?}",
+            u.coverage.limits
+        );
+    }
+
+    #[test]
+    fn artifact_level_install_metadata_marks_only_the_versions_it_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repository");
+        let art = repo.join("com/example/lib");
+        let listed = art.join("1.0");
+        let unlisted = art.join("1.1");
+        fs::create_dir_all(&listed).unwrap();
+        fs::create_dir_all(&unlisted).unwrap();
+        fs::write(
+            art.join("maven-metadata-local.xml"),
+            b"<metadata><versioning><versions><version>1.0</version></versions></versioning>\
+              </metadata>",
+        )
+        .unwrap();
+        let c = BuildContainer::shared_store("maven", repo.clone());
+        let idx = index(&[
+            (&repo, 100, 500),
+            (&repo.join("com"), 100, 500),
+            (&repo.join("com/example"), 100, 500),
+            (&art, 100, 500),
+            (&listed, 50, 500),
+            (&unlisted, 50, 500),
+        ]);
+        let units = run(&c, &idx);
+        let a = units.iter().find(|u| u.path == listed).unwrap();
+        let b = units.iter().find(|u| u.path == unlisted).unwrap();
+        assert_eq!(
+            a.variant.configuration.as_deref(),
+            Some("locally-installed")
+        );
+        assert_eq!(
+            b.variant.configuration.as_deref(),
+            Some("unknown-origin"),
+            "install metadata for one version says nothing about its sibling"
+        );
+    }
+
+    #[test]
+    fn a_local_only_artifact_in_a_project_output_and_repository_stays_distinct() {
+        // A project that `mvn install`s itself: its own `target/*.jar`
+        // and the installed copy in the repository are two units with
+        // two consequences, not one artifact seen twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(root.join("pom.xml"), b"<project/>").unwrap();
+        fs::write(target.join("app-1.0.jar"), vec![1u8; 4096]).unwrap();
+        let repo = tmp.path().join("repository");
+        let v = repo.join("com/example/app/1.0");
+        fs::create_dir_all(&v).unwrap();
+        fs::write(v.join("_remote.repositories"), b"app-1.0.jar>=\n").unwrap();
+        let t_units = run(
+            &BuildContainer::project("maven", target.clone(), root.clone()),
+            &index(&[(&target, 8, 500)]),
+        );
+        let r_units = run(
+            &BuildContainer::shared_store("maven", repo.clone()),
+            &index(&[
+                (&repo, 8, 500),
+                (&repo.join("com"), 8, 500),
+                (&repo.join("com/example"), 8, 500),
+                (&repo.join("com/example/app"), 8, 500),
+                (&v, 8, 500),
+            ]),
+        );
+        let jar = t_units
+            .iter()
+            .find(|u| u.path == target.join("app-1.0.jar"))
+            .unwrap();
+        let installed = r_units.iter().find(|u| u.path == v).unwrap();
+        assert_ne!(jar.id, installed.id);
+        assert_ne!(jar.container_id, installed.container_id);
+        assert!(
+            installed
+                .consequence
+                .as_deref()
+                .unwrap()
+                .contains("mvn install")
+        );
+        assert!(jar.consequence.as_deref().unwrap().contains("mvn package"));
+    }
+
+    #[test]
+    fn an_incompletely_measured_target_says_so_and_stays_identified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let partial = FoldedIndex::from_dirs([FoldedDir {
+            path: target.clone(),
+            allocated_total: 2_000,
+            mtime_max: 500,
+            complete: false,
+        }]);
+        let units = run(
+            &BuildContainer::project("maven", target.clone(), tmp.path().to_path_buf()),
+            &partial,
+        );
+        let u = &units[0];
+        assert!(!u.coverage.complete);
+        assert!(u.coverage.supported, "incomplete is not unsupported");
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("could not read all of this directory")),
             "{:?}",
             u.coverage.limits
         );

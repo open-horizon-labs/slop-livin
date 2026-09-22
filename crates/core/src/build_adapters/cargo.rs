@@ -24,8 +24,7 @@
 
 use super::{BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, NestedUnitBuilder};
 use crate::artifact::{
-    AccountingBasis, ArtifactRole, ArtifactVariant, Membership, NestedArtifact,
-    architecture_from_target, relative_path,
+    ArtifactRole, ArtifactVariant, NestedArtifact, architecture_from_target, relative_path,
 };
 use crate::entities::Confidence;
 use std::collections::HashMap;
@@ -168,8 +167,10 @@ impl BuildAdapter for Adapter {
         for d in &measured {
             for ancestor in d.path.ancestors().take_while(|p| p.starts_with(root)) {
                 if let Some(&i) = indexes.get(ancestor) {
-                    units[i].mtime_max = units[i].mtime_max.max(d.mtime_max);
-                    units[i].coverage.complete &= d.complete;
+                    units[i] = NestedUnitBuilder::amend(units[i].clone())
+                        .modified_at_least(d.mtime_max)
+                        .complete_only_if(d.complete)
+                        .build();
                 }
             }
         }
@@ -342,7 +343,7 @@ fn build_file_unit(
     use std::os::unix::fs::MetadataExt;
     let rel = relative_path(&container.path, path);
     let (_, variant) = classify_path(&rel, false);
-    let mut u = NestedUnitBuilder::new(container, role.clone(), path.to_path_buf())
+    let b = NestedUnitBuilder::new(container, role.clone(), path.to_path_buf())
         .from_file_metadata(meta)
         .variant(variant)
         .supported_with_reason("named output position in a Cargo profile directory")
@@ -352,23 +353,20 @@ fn build_file_unit(
             Confidence::High,
         )
         .limit("internal file history and subgroup hardlink attribution are not retained")
-        .consequence(consequence_for(&role))
-        .build();
+        .consequence(consequence_for(&role));
     // A hardlinked member is charged to exactly one unit, and swamp
-    // cannot tell from here which one that is. Charging it here would
-    // inflate the container's total by however many links exist.
+    // cannot tell from here which one that is. `from_file_metadata`
+    // already recorded `SharedHardlink` membership for it; charging it
+    // here would inflate the container's total by however many links
+    // exist.
     if meta.nlink() == 1 {
-        u.physical_total = u.bytes;
-        u.physical_bytes = u.bytes;
-        u.basis = AccountingBasis::UniqueAllocated;
+        b.charged_uniquely().build()
     } else {
-        u.membership = Membership::SharedHardlink;
-        u.action = crate::artifact::NestedActionCapability::Unsupported {
-            reason: "this file has other hardlinks; how much space its removal frees is unknown"
-                .into(),
-        };
+        b.no_action_because(
+            "this file has other hardlinks; how much space its removal frees is unknown",
+        )
+        .build()
     }
-    u
 }
 
 /// Reads the `test-*` fingerprint JSON Cargo wrote beside each test
@@ -392,42 +390,48 @@ fn enrich_fingerprints(
         let Some((target, json_path)) = facts.get(&u.path) else {
             continue;
         };
+        let amend = NestedUnitBuilder::amend(u.clone());
         let Some(manifest) = ctx.manifest(json_path) else {
-            u.coverage
-                .limits
-                .push("this target's fingerprint metadata could not be read".into());
+            *u = amend
+                .limit("this target's fingerprint metadata could not be read")
+                .build();
             continue;
         };
         if manifest.truncated {
-            u.coverage.limits.push(
-                "this target's fingerprint metadata is larger than the manifest cap and was not \
-                 parsed"
-                    .into(),
-            );
+            *u = amend
+                .limit(
+                    "this target's fingerprint metadata is larger than the manifest cap and was \
+                     not parsed",
+                )
+                .build();
             continue;
         }
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest.text) else {
-            u.coverage
-                .limits
-                .push("this target's fingerprint metadata is not valid JSON".into());
+            *u = amend
+                .limit("this target's fingerprint metadata is not valid JSON")
+                .build();
             continue;
         };
-        u.role = ArtifactRole::TestExecutable;
-        u.variant.target = Some((*target).clone());
-        u.variant.features = json.get("features").map(|v| v.to_string());
-        u.variant.toolchain = json.get("rustc").map(|v| format!("fingerprint:{v}"));
-        u.variant
+        let mut variant = u.variant.clone();
+        variant.target = Some((*target).clone());
+        variant.features = json.get("features").map(|v| v.to_string());
+        variant.toolchain = json.get("rustc").map(|v| format!("fingerprint:{v}"));
+        variant
             .unknowns
             .retain(|s| s != "features" && s != "toolchain");
-        u.producer_evidence.push(crate::artifact::ArtifactEvidence {
-            source: "cargo-fingerprint".into(),
-            detail: json_path.display().to_string(),
-            confidence: Confidence::Medium,
-        });
-        u.action_group = Some(NestedArtifact::storage_id(
-            &container.path,
-            &format!("action:{}", u.relative_path),
-        ));
+        *u = amend
+            .role(ArtifactRole::TestExecutable)
+            .variant(variant)
+            .evidence(
+                "cargo-fingerprint",
+                json_path.display().to_string(),
+                Confidence::Medium,
+            )
+            .action_group_id(NestedArtifact::storage_id(
+                &container.path,
+                &format!("action:{}", u.relative_path),
+            ))
+            .build();
     }
 }
 
@@ -499,7 +503,7 @@ pub(crate) fn looks_like_target_triple(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::TimeSource;
+    use crate::artifact::{Membership, TimeSource};
     use crate::build_adapters::{ContainerCache, FoldedDir, FoldedIndex};
     use crate::fs_events::EventCoverage;
     use std::fs;

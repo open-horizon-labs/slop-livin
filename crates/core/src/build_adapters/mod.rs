@@ -559,6 +559,22 @@ impl NestedUnitBuilder {
         self
     }
 
+    /// Charges this file's allocated bytes to this unit alone, on the
+    /// unique-allocated basis. Only for a file with exactly one link:
+    /// a hardlinked member is charged to exactly one unit, and nothing
+    /// here can tell which, so charging it would inflate the container
+    /// by however many links exist. Called after
+    /// [`Self::from_file_metadata`]; a no-op otherwise, because an
+    /// unmeasured unit has nothing honest to charge.
+    pub fn charged_uniquely(mut self) -> Self {
+        if self.unit.membership == Membership::Exclusive && !self.unit.is_dir {
+            self.unit.physical_total = self.unit.bytes;
+            self.unit.physical_bytes = self.unit.bytes;
+            self.unit.basis = AccountingBasis::UniqueAllocated;
+        }
+        self
+    }
+
     pub fn bytes_on_basis(mut self, bytes: u64, basis: AccountingBasis) -> Self {
         self.unit.bytes = bytes;
         self.unit.basis = basis;
@@ -616,6 +632,49 @@ impl NestedUnitBuilder {
         self
     }
 
+    /// Re-opens a unit an adapter already built, so a later enrichment
+    /// pass (Cargo's fingerprints, a budget limit counted after the
+    /// members) goes through the same named methods as construction.
+    ///
+    /// The alternative -- assigning `u.role = ..` or pushing onto
+    /// `u.coverage.limits` after `build()` -- is the builder bypass
+    /// re-review 3 found on the agent side (`u.protected = false`), and
+    /// `build_units_built_through_builder` rejects it. Every change made
+    /// here is a method call visible in the diff.
+    pub fn amend(unit: NestedArtifact) -> Self {
+        Self { unit }
+    }
+
+    /// Replaces the role. For an enrichment that has *read* evidence the
+    /// original classification did not (a fingerprint naming a test
+    /// target); a role is identity-neutral, so this never changes the
+    /// unit's id or history key.
+    pub fn role(mut self, role: ArtifactRole) -> Self {
+        self.unit.role = role;
+        self
+    }
+
+    /// Raises the recorded modification time to at least `mtime`, from
+    /// the same source. For a folded group whose deeper directories were
+    /// measured separately: the group's last change includes theirs.
+    pub fn modified_at_least(mut self, mtime: u64) -> Self {
+        self.unit.mtime_max = self.unit.mtime_max.max(mtime);
+        self
+    }
+
+    /// Narrows completeness: a unit is complete only if every measured
+    /// part of it was. There is deliberately no method that widens it.
+    pub fn complete_only_if(mut self, complete: bool) -> Self {
+        self.unit.coverage.complete &= complete;
+        self
+    }
+
+    /// An action group by its already-computed storage id.
+    pub fn action_group_id(mut self, id: String) -> Self {
+        self.unit.action_group = Some(id);
+        self
+    }
+
     pub fn build(self) -> NestedArtifact {
         self.unit
     }
@@ -627,6 +686,12 @@ impl NestedUnitBuilder {
 
 /// A collapsed family row: what a container holds in one role family,
 /// on one accounting basis, with one oldest *modification* time.
+///
+/// Counted over **nonempty supported candidates** only (#64/#65): a unit
+/// whose layout the adapter does not understand is not a candidate of
+/// any family -- it is reported once, in
+/// [`ContainerSummary::unsupported_bytes`] -- and a unit with nothing in
+/// it is not a candidate of anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FamilySummary {
     pub family: RoleFamily,
@@ -643,10 +708,127 @@ pub struct FamilySummary {
     pub unknown_age: usize,
     /// Whether every unit in this family had complete coverage.
     pub complete: bool,
+    /// What removing this family's bytes costs, in the adapter's own
+    /// words: the largest member's consequence.
+    pub consequence: Option<String>,
+    /// How many *other* distinct consequences the family's members
+    /// state. Non-zero means the one above is not the whole story, and a
+    /// view says so rather than presenting one member's cost as the
+    /// family's.
+    pub other_consequences: usize,
+    /// Review guidance derived from the family alone (see
+    /// [`family_guidance`]). Guidance, never a verdict.
+    pub recommendation: &'static str,
+}
+
+/// One container's interior, collapsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSummary {
+    /// One row per family with at least one nonempty supported
+    /// candidate, in [`RoleFamily::ALL`] order.
+    pub families: Vec<FamilySummary>,
+    /// Outermost units the adapter emitted but could not identify
+    /// (unsupported layout), with their bytes when they share one basis.
+    pub unsupported_count: usize,
+    pub unsupported_bytes: Option<u64>,
+    /// Bytes of the container that **no** outermost unit accounts for:
+    /// the container's own loose files and whatever no unit claims
+    /// (#65: "retain explicit unclassified residuals and reconcile leaf
+    /// totals to container totals"). `None` when the container was not
+    /// measured, when the members are on a different basis from it, or
+    /// when the members add up to *more* than the container -- which
+    /// can only mean a double count upstream, and is not papered over
+    /// with a zero.
+    pub unaccounted_bytes: Option<u64>,
+    /// Outermost units with nothing in them. Not candidates; counted so
+    /// "absent" and "empty" stay different facts.
+    pub empty: usize,
+}
+
+/// Review guidance for a family, from the family alone.
+///
+/// #64's contract: age + size + removal consequence is enough to suggest
+/// a review, and advice is derived from facts rather than persisted as a
+/// verdict. This is the family half of that; the view adds the age and
+/// the size. Nothing here says a family is unused or removable.
+pub fn family_guidance(family: RoleFamily) -> &'static str {
+    match family {
+        RoleFamily::Intermediates => "Start here: slower next build",
+        RoleFamily::Outputs => "Review: a build regenerates these",
+        RoleFamily::Tests => "Review: a test run regenerates these",
+        RoleFamily::Dependencies => "Review: reinstall needs the registry",
+        RoleFamily::SharedStore => "Shared: other projects may link these",
+        RoleFamily::Metadata => "Lower priority: tool bookkeeping",
+        RoleFamily::Container => "Container: see the groups inside",
+        RoleFamily::Residual | RoleFamily::Unknown => "Inspect: not identified",
+    }
+}
+
+/// The units a family row stands for, outermost only, in the order a
+/// person should review them: oldest known modification first, unknown
+/// ages **last** (never ranked as ancient), then larger first.
+pub fn family_members<'a>(
+    container: &Path,
+    units: &'a [NestedArtifact],
+    family: RoleFamily,
+) -> Vec<&'a NestedArtifact> {
+    let mut members: Vec<&NestedArtifact> = outermost(container, units)
+        .into_iter()
+        .filter(|u| is_candidate(u) && u.role.family() == family)
+        .collect();
+    members.sort_by(|a, b| {
+        known_time(a)
+            .is_none()
+            .cmp(&known_time(b).is_none())
+            .then_with(|| known_time(a).cmp(&known_time(b)))
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    members
+}
+
+fn known_time(u: &NestedArtifact) -> Option<u64> {
+    (u.time_source != TimeSource::Unknown && u.mtime_max > 0).then_some(u.mtime_max)
+}
+
+/// A nonempty supported candidate.
+fn is_candidate(u: &NestedArtifact) -> bool {
+    u.coverage.supported && u.bytes > 0 && u.basis != AccountingBasis::Unknown
+}
+
+/// The units inside `container` that no other *directory* unit in the
+/// list contains: the ones whose bytes are not already inside another
+/// unit's total.
+fn outermost<'a>(container: &Path, units: &'a [NestedArtifact]) -> Vec<&'a NestedArtifact> {
+    let inside: Vec<&NestedArtifact> = units
+        .iter()
+        .filter(|u| u.path != container && u.path.starts_with(container))
+        .filter(|u| u.role != ArtifactRole::Container)
+        .collect();
+    let dirs: std::collections::HashSet<&Path> = inside
+        .iter()
+        .filter(|u| u.is_dir)
+        .map(|u| u.path.as_path())
+        .collect();
+    inside
+        .into_iter()
+        .filter(|u| {
+            !u.path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| *a != container)
+                .any(|a| dirs.contains(a))
+        })
+        .collect()
 }
 
 /// Collapses the units *inside* `container` into one row per role
-/// family.
+/// family. See [`summarize_container`]; this is its family rows.
+pub fn summarize_families(container: &Path, units: &[NestedArtifact]) -> Vec<FamilySummary> {
+    summarize_container(container, units).families
+}
+
+/// Collapses the units *inside* `container`.
 ///
 /// `container` is taken explicitly and excluded, rather than inferred.
 /// A container's own row usually does not carry the `Container` role --
@@ -655,8 +837,11 @@ pub struct FamilySummary {
 /// like an ordinary unit, every real member looked like its descendant,
 /// and the summary collapsed to one row holding the container itself.
 ///
-/// Two rules, both from #65:
+/// The rules, all from #64/#65:
 ///
+/// * **only nonempty supported candidates are counted.** An unsupported
+///   unit is reported once, as unidentified; an empty one is counted as
+///   empty. Neither inflates a family.
 /// * **stop at the outermost included unit.** A unit whose ancestor is
 ///   also in the list is not counted again -- otherwise a `dist/` and
 ///   the `dist/assets/` inside it would both be charged and the family
@@ -665,47 +850,44 @@ pub struct FamilySummary {
 ///   accounting basis; a family holding both allocated and logical
 ///   numbers reports [`AccountingBasis::Unknown`] and no total, because
 ///   a mixed number is worse than no number.
-pub fn summarize_families(container: &Path, units: &[NestedArtifact]) -> Vec<FamilySummary> {
-    let units: Vec<&NestedArtifact> = units.iter().filter(|u| u.path != container).collect();
-    let paths: std::collections::HashSet<&Path> = units.iter().map(|u| u.path.as_path()).collect();
+/// * **reconcile to the container.** What the outermost units do not
+///   account for is reported as unaccounted bytes, never dropped.
+pub fn summarize_container(container: &Path, units: &[NestedArtifact]) -> ContainerSummary {
+    let outer = outermost(container, units);
     let mut by_family: HashMap<RoleFamily, Vec<&NestedArtifact>> = HashMap::new();
-    for u in units.iter().copied() {
-        if u.role == ArtifactRole::Container {
-            continue;
+    let mut unsupported: Vec<&NestedArtifact> = Vec::new();
+    let mut empty = 0usize;
+    for u in outer.iter().copied() {
+        if !u.coverage.supported {
+            unsupported.push(u);
+        } else if u.bytes == 0 || u.basis == AccountingBasis::Unknown {
+            empty += 1;
+        } else {
+            by_family.entry(u.role.family()).or_default().push(u);
         }
-        // Descendant of another identified unit in the same list: its
-        // bytes are already inside that one's total.
-        let nested_under_sibling = u
-            .path
-            .ancestors()
-            .skip(1)
-            .any(|a| paths.contains(a) && units.iter().any(|o| o.path == a && o.is_dir));
-        if nested_under_sibling {
-            continue;
-        }
-        by_family.entry(u.role.family()).or_default().push(u);
     }
-    let mut out = Vec::new();
+    let one_basis = |members: &[&NestedArtifact]| -> Option<(u64, AccountingBasis)> {
+        let first = members.first()?;
+        members
+            .iter()
+            .all(|u| u.basis == first.basis)
+            .then(|| (members.iter().map(|u| u.bytes).sum(), first.basis))
+    };
+    let mut families = Vec::new();
     for family in RoleFamily::ALL {
         let Some(members) = by_family.get(family) else {
             continue;
         };
-        if members.is_empty() {
-            continue;
-        }
-        let bases: std::collections::BTreeSet<&str> =
-            members.iter().map(|u| u.basis.label()).collect();
-        let (bytes, basis) = if bases.len() == 1 {
-            (members.iter().map(|u| u.bytes).sum(), members[0].basis)
-        } else {
-            (0, AccountingBasis::Unknown)
-        };
-        let known: Vec<u64> = members
+        let (bytes, basis) = one_basis(members).unwrap_or((0, AccountingBasis::Unknown));
+        let known: Vec<u64> = members.iter().filter_map(|u| known_time(u)).collect();
+        let mut by_size: Vec<&&NestedArtifact> = members.iter().collect();
+        by_size.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+        let consequence = by_size.iter().find_map(|u| u.consequence.clone());
+        let distinct: std::collections::BTreeSet<&str> = members
             .iter()
-            .filter(|u| u.time_source != TimeSource::Unknown && u.mtime_max > 0)
-            .map(|u| u.mtime_max)
+            .filter_map(|u| u.consequence.as_deref())
             .collect();
-        out.push(FamilySummary {
+        families.push(FamilySummary {
             family: *family,
             count: members.len(),
             bytes,
@@ -713,9 +895,36 @@ pub fn summarize_families(container: &Path, units: &[NestedArtifact]) -> Vec<Fam
             oldest_modified: known.iter().copied().min(),
             unknown_age: members.len() - known.len(),
             complete: members.iter().all(|u| u.coverage.complete),
+            other_consequences: distinct.len().saturating_sub(1),
+            consequence,
+            recommendation: family_guidance(*family),
         });
     }
-    out
+    // Reconciliation against the container's own measured row.
+    let root = units.iter().find(|u| u.path == container);
+    let measured: Vec<&NestedArtifact> = outer
+        .iter()
+        .copied()
+        .filter(|u| u.basis != AccountingBasis::Unknown)
+        .collect();
+    let unaccounted_bytes = root
+        .filter(|r| r.basis != AccountingBasis::Unknown && r.bytes > 0)
+        .and_then(|r| {
+            let compatible = measured.iter().all(|u| u.basis == r.basis);
+            let sum: u64 = measured.iter().map(|u| u.bytes).sum();
+            (compatible && sum <= r.bytes).then(|| r.bytes - sum)
+        });
+    ContainerSummary {
+        families,
+        unsupported_count: unsupported.len(),
+        unsupported_bytes: if unsupported.is_empty() {
+            Some(0)
+        } else {
+            one_basis(&unsupported).map(|(b, _)| b)
+        },
+        unaccounted_bytes,
+        empty,
+    }
 }
 
 /// The entry point the report pipeline uses: every registered adapter,
@@ -808,19 +1017,22 @@ mod tests {
         );
     }
 
+    fn supported(c: &BuildContainer, role: ArtifactRole, path: PathBuf) -> NestedUnitBuilder {
+        NestedUnitBuilder::new(c, role, path).supported_with_reason("fixture layout")
+    }
+
     #[test]
     fn a_family_summary_stops_at_the_outermost_unit() {
         let tmp = tempfile::tempdir().unwrap();
         let c = container(tmp.path());
-        let outer = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("dist"))
+        let outer = supported(&c, ArtifactRole::Output, tmp.path().join("dist"))
             .is_dir(true)
             .bytes_on_basis(1000, AccountingBasis::Allocated)
             .build();
-        let inner =
-            NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("dist/assets"))
-                .is_dir(true)
-                .bytes_on_basis(400, AccountingBasis::Allocated)
-                .build();
+        let inner = supported(&c, ArtifactRole::Output, tmp.path().join("dist/assets"))
+            .is_dir(true)
+            .bytes_on_basis(400, AccountingBasis::Allocated)
+            .build();
         let s = summarize_families(tmp.path(), &[outer, inner]);
         let outputs = s.iter().find(|f| f.family == RoleFamily::Outputs).unwrap();
         assert_eq!(outputs.count, 1);
@@ -834,10 +1046,10 @@ mod tests {
     fn a_family_mixing_accounting_bases_reports_no_total() {
         let tmp = tempfile::tempdir().unwrap();
         let c = container(tmp.path());
-        let a = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("a"))
+        let a = supported(&c, ArtifactRole::Output, tmp.path().join("a"))
             .bytes_on_basis(100, AccountingBasis::Allocated)
             .build();
-        let b = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("b"))
+        let b = supported(&c, ArtifactRole::Output, tmp.path().join("b"))
             .bytes_on_basis(100, AccountingBasis::Logical)
             .build();
         let s = summarize_families(tmp.path(), &[a, b]);
@@ -853,19 +1065,153 @@ mod tests {
     fn unknown_ages_are_counted_not_folded_into_the_oldest() {
         let tmp = tempfile::tempdir().unwrap();
         let c = container(tmp.path());
-        let dated = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("a"))
+        let dated = supported(&c, ArtifactRole::Output, tmp.path().join("a"))
             .bytes_on_basis(1, AccountingBasis::Allocated)
             .modified(5_000, TimeSource::FoldedDirectoryModification)
             .build();
-        let undated = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("b"))
+        let undated = supported(&c, ArtifactRole::Output, tmp.path().join("b"))
             .bytes_on_basis(1, AccountingBasis::Allocated)
             .build();
-        let s = summarize_families(tmp.path(), &[dated, undated]);
+        let units = [dated, undated];
+        let s = summarize_families(tmp.path(), &units);
         let outputs = s.iter().find(|f| f.family == RoleFamily::Outputs).unwrap();
         assert_eq!(outputs.oldest_modified, Some(5_000));
         assert_eq!(
             outputs.unknown_age, 1,
             "an unknown age is reported, never treated as epoch and ranked ancient"
         );
+        let order: Vec<&Path> = family_members(tmp.path(), &units, RoleFamily::Outputs)
+            .iter()
+            .map(|u| u.path.as_path())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                tmp.path().join("a").as_path(),
+                tmp.path().join("b").as_path()
+            ],
+            "the undated unit sorts after the dated one, not before it as if it were ancient"
+        );
+    }
+
+    #[test]
+    fn only_nonempty_supported_candidates_are_counted() {
+        // The tempting summary counts every unit an adapter emitted. An
+        // unsupported layout is not a candidate of any family (it is
+        // unidentified), and an empty directory is not a candidate of
+        // anything.
+        let tmp = tempfile::tempdir().unwrap();
+        let c = container(tmp.path());
+        let real = supported(&c, ArtifactRole::Output, tmp.path().join("dist"))
+            .is_dir(true)
+            .bytes_on_basis(700, AccountingBasis::Allocated)
+            .build();
+        let empty = supported(&c, ArtifactRole::Output, tmp.path().join("out"))
+            .is_dir(true)
+            .bytes_on_basis(0, AccountingBasis::Allocated)
+            .build();
+        let unknown = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("weird"))
+            .is_dir(true)
+            .bytes_on_basis(200, AccountingBasis::Allocated)
+            .unsupported_layout("fixture: not a layout this adapter knows")
+            .build();
+        let s = summarize_container(tmp.path(), &[real, empty, unknown]);
+        let outputs = s
+            .families
+            .iter()
+            .find(|f| f.family == RoleFamily::Outputs)
+            .unwrap();
+        assert_eq!(outputs.count, 1, "{s:?}");
+        assert_eq!(outputs.bytes, 700);
+        assert_eq!(s.unsupported_count, 1);
+        assert_eq!(s.unsupported_bytes, Some(200));
+        assert_eq!(s.empty, 1);
+    }
+
+    #[test]
+    fn leaf_totals_reconcile_to_the_container_through_an_explicit_residual() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = container(tmp.path());
+        let root = supported(&c, ArtifactRole::Output, tmp.path().to_path_buf())
+            .is_dir(true)
+            .bytes_on_basis(1_000, AccountingBasis::Allocated)
+            .build();
+        let a = supported(&c, ArtifactRole::Output, tmp.path().join("a"))
+            .is_dir(true)
+            .bytes_on_basis(600, AccountingBasis::Allocated)
+            .build();
+        let a_inner = supported(&c, ArtifactRole::Intermediate, tmp.path().join("a/cache"))
+            .is_dir(true)
+            .bytes_on_basis(500, AccountingBasis::Allocated)
+            .build();
+        let b = NestedUnitBuilder::new(&c, ArtifactRole::Residual, tmp.path().join("b"))
+            .is_dir(true)
+            .bytes_on_basis(150, AccountingBasis::Allocated)
+            .unsupported_layout("fixture")
+            .build();
+        let s = summarize_container(tmp.path(), &[root.clone(), a, a_inner, b]);
+        assert_eq!(
+            s.unaccounted_bytes,
+            Some(250),
+            "1000 in the container, 600 + 150 in its outermost units: 250 are loose files no unit \
+             claims, and saying so is what makes the leaves reconcile"
+        );
+        let over = supported(&c, ArtifactRole::Output, tmp.path().join("big"))
+            .is_dir(true)
+            .bytes_on_basis(5_000, AccountingBasis::Allocated)
+            .build();
+        let s = summarize_container(tmp.path(), &[root, over]);
+        assert_eq!(
+            s.unaccounted_bytes, None,
+            "members adding up to more than their container are a double count upstream, never a \
+             residual of zero"
+        );
+    }
+
+    #[test]
+    fn a_family_with_several_consequences_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = container(tmp.path());
+        let big = supported(&c, ArtifactRole::Intermediate, tmp.path().join(".turbo"))
+            .bytes_on_basis(900, AccountingBasis::Allocated)
+            .consequence("the next task run re-executes")
+            .build();
+        let small = supported(&c, ArtifactRole::Intermediate, tmp.path().join(".vite"))
+            .bytes_on_basis(100, AccountingBasis::Allocated)
+            .consequence("the next dev server start re-optimizes")
+            .build();
+        let s = summarize_families(tmp.path(), &[small, big]);
+        let f = &s[0];
+        assert_eq!(
+            f.consequence.as_deref(),
+            Some("the next task run re-executes"),
+            "the largest member's consequence leads"
+        );
+        assert_eq!(
+            f.other_consequences, 1,
+            "and the family says it has another, rather than presenting one member's cost as all \
+             of them"
+        );
+        assert_eq!(f.recommendation, family_guidance(RoleFamily::Intermediates));
+    }
+
+    #[test]
+    fn amending_a_unit_keeps_its_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = container(tmp.path());
+        let u = supported(&c, ArtifactRole::Dependency, tmp.path().join("deps/x"))
+            .modified(100, TimeSource::FoldedDirectoryModification)
+            .complete(true)
+            .build();
+        let id = u.id.clone();
+        let amended = NestedUnitBuilder::amend(u)
+            .role(ArtifactRole::TestExecutable)
+            .modified_at_least(50)
+            .complete_only_if(false)
+            .build();
+        assert_eq!(amended.id, id, "a role is not identity");
+        assert_eq!(amended.mtime_max, 100, "at least, never earlier");
+        assert!(!amended.coverage.complete);
+        assert_eq!(amended.role, ArtifactRole::TestExecutable);
     }
 }

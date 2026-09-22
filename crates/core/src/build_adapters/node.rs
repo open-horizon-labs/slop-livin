@@ -652,10 +652,12 @@ fn identify_node_modules(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
     if skipped > 0
         && let Some(root) = units.first_mut()
     {
-        root.coverage.limits.push(format!(
-            "{skipped} of this tree's top-level entries were sized but not identified: only the \
-             {PACKAGE_IDENTITY_BUDGET} largest get a manifest read"
-        ));
+        *root = NestedUnitBuilder::amend(root.clone())
+            .limit(format!(
+                "{skipped} of this tree's top-level entries were sized but not identified: only \
+                 the {PACKAGE_IDENTITY_BUDGET} largest get a manifest read"
+            ))
+            .build();
     }
     units
 }
@@ -985,6 +987,94 @@ mod tests {
         assert!(
             !claimed.contains(&"build".to_string()),
             "a Gradle marker at the root means `build/` is Gradle's: {claimed:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_packages_own_output_root_is_claimed_from_the_walks_candidates() {
+        // A monorepo's outputs are not at the project root. The walk
+        // classified `packages/ui/dist` as an artifact; the adapter
+        // claims it from that candidate list rather than by guessing
+        // where a bundler was configured to write -- which it could only
+        // learn by loading a JavaScript config.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("package.json"), b"{}").unwrap();
+        let nested = root.join("packages/ui/dist");
+        fs::create_dir_all(&nested).unwrap();
+        let claimed: Vec<PathBuf> = Adapter
+            .containers(root, &[nested.clone()])
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert!(
+            claimed.contains(&nested),
+            "a custom output root the walk found is claimed: {claimed:?}"
+        );
+    }
+
+    #[test]
+    fn old_output_beside_current_dependencies_is_reported_as_two_separate_ages() {
+        // The tempting inference: `dist` is months older than
+        // `node_modules`, so `dist` must be superseded. It is not --
+        // nobody may have rebuilt because nobody changed the source.
+        // Both ages are reported, and neither unit's role, coverage or
+        // action changes because of the other's timestamp.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dist = root.join("dist");
+        let nm = root.join("node_modules");
+        fs::create_dir_all(&dist).unwrap();
+        fs::create_dir_all(&nm).unwrap();
+        let old = 1_000u64;
+        let recent = 900_000u64;
+        let dist_units = run(&project("dist", root), &index(&[(&dist, 5_000, old)]));
+        let nm_units = run(
+            &project("node_modules", root),
+            &index(&[(&nm, 90_000, recent)]),
+        );
+        let d = &dist_units[0];
+        let n = &nm_units[0];
+        assert_eq!(d.mtime_max, old);
+        assert_eq!(n.mtime_max, recent);
+        assert_eq!(
+            d.action,
+            crate::artifact::NestedActionCapability::InspectionOnly,
+            "being older than the dependency tree changes nothing about what swamp can do"
+        );
+        assert!(d.coverage.supported && n.coverage.supported);
+        assert_eq!(
+            d.consequence.as_deref(),
+            Some("rebuild with this project's build script (commonly `npm run build`)"),
+            "the consequence is the role's, not a comparison with a sibling"
+        );
+    }
+
+    #[test]
+    fn an_incompletely_measured_tree_says_so_and_stays_identified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        let partial = FoldedIndex::from_dirs([FoldedDir {
+            path: nm.clone(),
+            allocated_total: 1_000,
+            mtime_max: 500,
+            complete: false,
+        }]);
+        let units = run(&project("node_modules", tmp.path()), &partial);
+        let u = &units[0];
+        assert!(!u.coverage.complete);
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("could not read all of this directory")),
+            "an incomplete measurement is named, not silently reported as a total: {:?}",
+            u.coverage.limits
+        );
+        assert!(
+            u.coverage.supported,
+            "an incomplete measurement is not an unsupported layout; they are different facts"
         );
     }
 
