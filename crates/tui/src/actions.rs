@@ -727,7 +727,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            std::process::Command::new("git")
+            swamp_core::spawn::command("git")
                 .args(["init", "-q"])
                 .arg(&root)
                 .status()
