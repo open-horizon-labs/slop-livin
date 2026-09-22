@@ -959,7 +959,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = f.sync_all();
     }
     match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Durability of the *rename*, not only of the bytes. Without
+            // an fsync on the parent directory a crash can lose the
+            // directory entry the rename created, leaving the old
+            // contents (or nothing) where protection state should be --
+            // and protection state is exactly the file where that
+            // matters (the 2026-09-22 re-review's P3). Best-effort: a
+            // filesystem that refuses to sync a directory handle must
+            // not fail the write that already succeeded.
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e.into())
@@ -978,15 +991,41 @@ fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
     )
 }
 
-/// Adds `path` to the human keep list, used verbatim (never
-/// canonicalized): `AgentUnit.path`/`AgentMember.path` are themselves
-/// built as non-canonical `home.join(relative)` joins, and canonicalizing
-/// only one side of the comparison risks a silent mismatch wherever the
-/// tool home sits under a symlinked directory (e.g. macOS `/tmp` ->
-/// `/private/tmp`). A caller that wants symlink-independent protection
-/// can canonicalize before calling. Idempotent; a not-yet-observed path
-/// can still be protected in advance.
+/// Adds `path` to the human keep list. Stored verbatim, and **refused
+/// unless it is absolute**.
+///
+/// Verbatim, because `AgentUnit.path`/`AgentMember.path` are built as
+/// `home.join(relative)` and both sides of every comparison are brought
+/// into one spelling by `scope::comparable` at comparison time, not by
+/// rewriting what the human typed.
+///
+/// Absolute, because a relative entry protects nothing. The 2026-09-22
+/// re-review's CE5: `swamp protect add debug` returned `Ok`, `swamp
+/// protect list` showed `debug`, and the very next
+/// propose/approve/execute moved `<home>/debug`.
+/// `protection_conflict` compares against absolute unit paths in both
+/// directions and a relative entry matches neither, so the protection
+/// layer -- which refuses every action on a corrupt protect file --
+/// accepted, confirmed, and then did not protect. The existing "used
+/// verbatim, never canonicalized" rationale is about *symlink*
+/// mismatch; it never justified accepting a path that cannot be
+/// enforced.
+///
+/// Idempotent; a not-yet-observed path can still be protected in
+/// advance.
 pub fn protect_add(swamp_dir: &Path, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("refused: an empty path protects nothing");
+    }
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "refused: `{}` is not an absolute path, and a relative entry protects nothing \
+             (protection is compared against absolute unit paths in both directions). Pass the \
+             full path, e.g. `$PWD/{}`.",
+            path.display(),
+            path.display()
+        );
+    }
     let mut paths = load_protect(swamp_dir)?;
     if !paths.iter().any(|p| p == path) {
         paths.push(path.to_path_buf());
@@ -1035,18 +1074,27 @@ pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
 /// say *why*. A one-directional check is a guardrail violation the
 /// `protection_fails_closed` audit rejects.
 pub fn protection_conflict(protected: &[PathBuf], candidate: &Path) -> Option<String> {
+    // One spelling for both sides. `external::discover_and_measure`
+    // canonicalizes every candidate and `agents::discover_and_measure`
+    // does not, so the same home comes back as `/var/folders/.../claude`
+    // from one pass and `/private/var/folders/.../claude` from the
+    // other. Compared literally, a single `protect` entry covered one
+    // family and not the other (the 2026-09-22 re-review's P2); through
+    // `scope::comparable` it covers both.
+    let cand = crate::scope::comparable(candidate);
     for p in protected {
-        if candidate == p {
+        let prot = crate::scope::comparable(p);
+        if cand == prot {
             return Some(format!("{} is kept by `swamp protect`", p.display()));
         }
-        if candidate.starts_with(p) {
+        if cand.starts_with(&prot) {
             return Some(format!(
                 "{} is beneath the human-protected path {}",
                 candidate.display(),
                 p.display()
             ));
         }
-        if p.starts_with(candidate) {
+        if prot.starts_with(&cand) {
             return Some(format!("contains human-protected path {}", p.display()));
         }
     }

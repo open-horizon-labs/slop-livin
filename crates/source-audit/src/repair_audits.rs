@@ -530,9 +530,32 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
                 .to_string()
         })
     })?;
-    let candidate_under = conflict.body.contains("candidate . starts_with (");
-    let protected_under = conflict.body.contains("p . starts_with (candidate)")
-        || conflict.body.contains("p . starts_with (candidate )");
+    // Both directions, asked structurally rather than by the variable
+    // names the author happened to pick: there must be two
+    // `starts_with` calls whose receiver and argument are swapped.
+    // Pinning the names meant renaming a local defeated the rule.
+    let conflict_calls: Vec<crate::resolve::CallSite> =
+        crate::resolve::production_calls(&agents.ast)
+            .into_iter()
+            .filter(|c| c.func == conflict.name && c.method && c.path == "starts_with")
+            .collect();
+    let pairs: Vec<(String, String)> = conflict_calls
+        .iter()
+        .map(|c| {
+            (
+                crate::resolve::root_ident(&c.receiver),
+                c.args
+                    .first()
+                    .map(|a| crate::resolve::root_ident(a))
+                    .unwrap_or_default(),
+            )
+        })
+        .filter(|(r, a)| !r.is_empty() && !a.is_empty())
+        .collect();
+    let candidate_under = !pairs.is_empty();
+    let protected_under = pairs
+        .iter()
+        .any(|(r, a)| pairs.iter().any(|(r2, a2)| r2 == a && a2 == r));
     if !candidate_under || !protected_under {
         return Err(format!(
             "agents/mod.rs::{} tests protection in only one direction (candidate-under-protected: \
@@ -2166,15 +2189,27 @@ fn public_fn_names(file: &syn::File) -> Vec<String> {
 }
 
 pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
-    let all_files = workspace_src_files(root);
-    // Every non-test function body in the workspace, as one corpus of
-    // call sites.
+    let all_files = crate::resolve::workspace_files(root);
+    // Every *production* function body in the workspace, as one corpus
+    // of call sites. `production_calls`' filter is what matters here:
+    // a function marked `#[allow(dead_code)]` is not a caller, and the
+    // mutation sweep manufactured exactly such a caller to keep a dead
+    // public API looking wired.
     let mut corpus: Vec<(String, String, String)> = Vec::new();
+    let mut dead_code_fns: HashSet<(String, String)> = HashSet::new();
     for rel in &all_files {
         let Some(f) = maybe_parse(root, rel) else {
             continue;
         };
+        for c in crate::resolve::calls(&f.ast) {
+            if c.dead_code_allowed || c.in_test {
+                dead_code_fns.insert((rel.clone(), c.func.clone()));
+            }
+        }
         for func in ast::functions(&f.ast) {
+            if dead_code_fns.contains(&(rel.clone(), func.name.clone())) {
+                continue;
+            }
             corpus.push((rel.clone(), func.name.clone(), func.body));
         }
     }

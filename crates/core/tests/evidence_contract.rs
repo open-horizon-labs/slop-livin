@@ -236,3 +236,71 @@ fn joined_docker_rows_carry_their_own_recovery_evidence() {
         }
     }
 }
+
+/// `docs/usage.md`'s activity-evidence table is generated from
+/// `activity::ACTIVITY_EVIDENCE_INVENTORY` and must match it exactly.
+///
+/// `activity.rs` claimed for months that this file asserted the doc
+/// table listed every inventory entry. It did not: no test referenced
+/// the constant, and the only assertion about it was `len() >= 5`
+/// elsewhere. The 2026-09-22 re-review found the claimed drift test did
+/// not exist and the constant had zero non-test readers, so the #54
+/// inventory deliverable was never rendered anywhere.
+///
+/// If this fails, edit the constant and re-run with
+/// `SWAMP_WRITE_DOCS=1` to regenerate the table.
+#[test]
+fn the_usage_table_matches_the_activity_inventory() {
+    const BEGIN: &str = "<!-- BEGIN ACTIVITY_EVIDENCE_INVENTORY -->";
+    const END: &str = "<!-- END ACTIVITY_EVIDENCE_INVENTORY -->";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("docs/usage.md");
+    let text = std::fs::read_to_string(&path).expect("docs/usage.md");
+    let start = text.find(BEGIN).unwrap_or_else(|| {
+        panic!(
+            "{} has no {BEGIN} marker: the activity-evidence table is generated",
+            path.display()
+        )
+    }) + BEGIN.len();
+    let end = text[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("{} has no {END} marker", path.display()))
+        + start;
+    let generated = swamp_core::render::activity_evidence_inventory_markdown();
+    let expected = format!("\n{generated}");
+    if text[start..end] != expected {
+        if std::env::var("SWAMP_WRITE_DOCS").is_ok() {
+            let mut out = String::new();
+            out.push_str(&text[..start]);
+            out.push_str(&expected);
+            out.push_str(&text[end..]);
+            std::fs::write(&path, out).unwrap();
+            panic!("regenerated {}; re-run the test", path.display());
+        }
+        panic!(
+            "docs/usage.md's activity-evidence table has drifted from \
+             activity::ACTIVITY_EVIDENCE_INVENTORY.\n--- docs ---\n{}\n--- constant ---\n{}",
+            &text[start..end],
+            expected
+        );
+    }
+    // The inventory is a deliverable, not a stub.
+    assert!(
+        swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY.len() >= 5,
+        "the activity inventory lost entries"
+    );
+    for (domain, evidence) in swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY {
+        assert!(!domain.trim().is_empty() && !evidence.trim().is_empty());
+        // Facts, not verdicts, in the inventory too.
+        for banned in ["safe", "unused", "stale"] {
+            assert!(
+                !evidence.to_ascii_lowercase().contains(banned),
+                "inventory entry for {domain} carries the verdict word {banned:?}"
+            );
+        }
+    }
+}

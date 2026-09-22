@@ -664,6 +664,7 @@ fn external_view() {
             provenance: swamp_core::locations::Provenance::BuiltinConvention,
             path: PathBuf::from("/Users/dev/.cargo/registry"),
             bytes: 2_500_000_000,
+            mtime_max: 0,
             hardlinked: true,
             growth_bytes: Some(50_000_000),
             regrowth_count: 0,

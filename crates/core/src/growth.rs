@@ -3593,6 +3593,19 @@ impl KeyFamily {
 pub struct ObservationOwnership {
     pub family: KeyFamily,
     pub covered_roots: Vec<PathBuf>,
+    /// Regions that lie *inside* a covered root but outside what this
+    /// pass actually observed: a nested location the user excluded, one
+    /// whose detector is disabled, one outside the explicit command
+    /// roots.
+    ///
+    /// A path-prefix window alone cannot express this, and that is
+    /// precisely how a one-line `exclude` change became a storage
+    /// change: the excluded child's stored row still lay under the
+    /// measured parent's root, so the owned sweep tombstoned it, and
+    /// removing the line again scored a regrowth. Zero bytes moved on
+    /// disk (the 2026-09-22 re-review's CE4, violating both clauses of
+    /// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    pub excluded_subtrees: Vec<PathBuf>,
 }
 
 impl ObservationOwnership {
@@ -3600,12 +3613,29 @@ impl ObservationOwnership {
         Self {
             family,
             covered_roots,
+            excluded_subtrees: Vec::new(),
         }
     }
 
-    /// Whether `path` lies inside a region this observation covered.
+    /// The same window with the regions this pass did *not* observe
+    /// subtracted.
+    pub fn excluding(mut self, excluded: Vec<PathBuf>) -> Self {
+        self.excluded_subtrees = excluded;
+        self
+    }
+
+    /// Whether `path` lies inside a region this observation covered
+    /// *and* observed. An excluded subtree is inside the window and
+    /// outside the pass, so it is not owned: unobserved is not deleted.
     pub fn covers(&self, path: &str) -> bool {
         let p = Path::new(path);
+        if self
+            .excluded_subtrees
+            .iter()
+            .any(|e| p == e.as_path() || p.starts_with(e))
+        {
+            return false;
+        }
         self.covered_roots
             .iter()
             .any(|r| p == r.as_path() || p.starts_with(r))

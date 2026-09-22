@@ -2401,9 +2401,18 @@ pub fn execute_with_trash_opts(
                 outcomes.push(outcome);
                 continue;
             }
-            Some(m) if m > plan.created_at => {
+            // `>=`, not `>`: a rewrite in the *same second* as plan
+            // creation gives `m == created_at`, which the strict
+            // comparison read as "nothing changed". The 2026-09-22
+            // re-review's CE2 is exactly that second, and the cost of
+            // `>=` is that a plan created in the same second as the
+            // last write asks the human to propose again -- the safe
+            // direction. The member-level nanosecond fingerprint in
+            // `recheck::ReviewedMember` is the precise check; this is
+            // the cheap tree-level gate in front of it.
+            Some(m) if m >= plan.created_at => {
                 outcome.cause = Some(format!(
-                    "activity changed since plan: newest mtime {} > plan {} — propose again",
+                    "activity changed since plan: newest mtime {} >= plan {} — propose again",
                     m, plan.created_at
                 ));
                 outcomes.push(outcome);

@@ -274,6 +274,7 @@ fn external_unit(
         provenance: swamp_core::locations::Provenance::BuiltinConvention,
         path: path.to_path_buf(),
         bytes: 0,
+        mtime_max: 0,
         hardlinked: false,
         growth_bytes: None,
         regrowth_count: 0,

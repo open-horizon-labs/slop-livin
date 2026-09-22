@@ -1884,9 +1884,27 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let source = swamp_core::fs_events::testing::CannedSource(plan);
+            // `ObservationParts::WALK_ONLY`, and `None` for both unit
+            // vectors.
+            //
+            // Narrowing the scope to the one root a watcher fired under
+            // is the right fix for the *scope* half of the earlier
+            // finding. It is the wrong thing to derive unit vectors
+            // from: every tool home outside that root is unauthorized
+            // in the narrowed scope, so `ObservationParts::ALL` came
+            // back with `agent_units: Some(vec![])`, the event loop
+            // applied it unconditionally, and the agent view emptied on
+            // the first file save anywhere in the project (the
+            // 2026-09-22 re-review's CE3).
+            //
+            // A part not asked for is also a part not *swept*
+            // (`growth::ObservationOwnership`), so asking for fewer
+            // parts here cannot invent a disappearance either. The
+            // background refresh, which covers the whole scope, is what
+            // refreshes those vectors.
             let res = swamp_core::report::observe_scope(
                 &scope,
-                swamp_core::report::ObservationParts::ALL,
+                swamp_core::report::ObservationParts::WALK_ONLY,
                 None,
                 None,
                 false,
@@ -1902,8 +1920,8 @@ impl App {
             )
             .map(|o| RefreshedObservation {
                 per_root: o.per_root.into_iter().collect(),
-                external_units: Some(o.external_units),
-                agent_units: Some(o.agent_units),
+                external_units: None,
+                agent_units: None,
             });
             let _ = tx.send(res);
         });
@@ -2915,6 +2933,7 @@ mod tests {
             provenance: swamp_core::locations::Provenance::BuiltinConvention,
             path: "/roots/a/.brew-cache".into(),
             bytes: 12_345,
+            mtime_max: 0,
             hardlinked: false,
             growth_bytes: None,
             regrowth_count: 0,

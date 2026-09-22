@@ -40,6 +40,7 @@ fn every_external_storage_category_is_inspection_only_never_recursive_delete() {
             provenance: Provenance::BuiltinConvention,
             path: "/tmp/does-not-matter".into(),
             bytes: 1,
+            mtime_max: 0,
             hardlinked: false,
             growth_bytes: None,
             regrowth_count: 0,

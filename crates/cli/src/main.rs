@@ -1785,12 +1785,30 @@ fn main() -> Result<()> {
             let store_dir = swamp_dir();
             match cmd {
                 ProtectCmd::Add { path } => {
-                    swamp_core::agents::protect_add(&store_dir, &path)?;
-                    println!("protected: {}", path.display());
+                    // Resolve a relative argument against the cwd before
+                    // storing, rather than printing "protected: debug"
+                    // for an entry that protects nothing (the 2026-09-22
+                    // re-review's CE5). `protect_add` refuses a
+                    // non-absolute path outright; doing the join here
+                    // means `swamp protect add debug` from inside a tool
+                    // home does the obvious thing and *says* which path
+                    // it protected.
+                    let resolved = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()?.join(&path)
+                    };
+                    swamp_core::agents::protect_add(&store_dir, &resolved)?;
+                    println!("protected: {}", resolved.display());
                 }
                 ProtectCmd::Remove { path } => {
-                    swamp_core::agents::protect_remove(&store_dir, &path)?;
-                    println!("no longer protected: {}", path.display());
+                    let resolved = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()?.join(&path)
+                    };
+                    swamp_core::agents::protect_remove(&store_dir, &resolved)?;
+                    println!("no longer protected: {}", resolved.display());
                 }
                 ProtectCmd::List { json } => {
                     let paths = swamp_core::agents::protect_list(&store_dir)?;

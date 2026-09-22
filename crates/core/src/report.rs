@@ -679,6 +679,100 @@ pub fn attach_decision_evidence(report: &mut Report) {
             }
         }
     }
+    attach_nested_decision_evidence(report);
+}
+
+/// The nested build-artifact units' half of [`attach_decision_evidence`].
+///
+/// `CHANGELOG.md` claimed evidence was "attached to ... nested
+/// build-artifact units". It was not:
+/// `NestedArtifact::decision_evidence` was written only as `Vec::new()`,
+/// this function's caller iterated `projects[].worktrees[].artifacts`
+/// and never touched `report.nested_artifacts`,
+/// `skip_serializing_if = "Vec::is_empty"` hid the empty vector from
+/// `--view rust` JSON, and no test existed. The 2026-09-22 re-review
+/// found it, and found it because `computed-but-not-delivered` was the
+/// one guardrail in `.oh/guardrails/` whose frontmatter said
+/// `audit: none`.
+///
+/// Every fact here comes from something the pass already recorded --
+/// `mtime_max`, `physical_bytes`/`bytes`, the unit's own `role` and
+/// `coverage`. No new traversal, no new `stat`: a nested unit's facts
+/// are a projection of the Cargo inspection that produced it.
+fn attach_nested_decision_evidence(report: &mut Report) {
+    use crate::artifact::{ArtifactRole, Membership};
+    let observed_at = report.observed_at;
+    for unit in &mut report.nested_artifacts {
+        // Activity (#54): the newest recorded modification among this
+        // unit's measured children. Labelled modification, never "last
+        // used".
+        unit.decision_evidence
+            .push(crate::activity::modification_evidence(
+                unit.mtime_max,
+                observed_at,
+            ));
+
+        // Activity (#54), tool-reported: a `.fingerprint` entry's own
+        // mtime is Cargo's record of when it last built that unit --
+        // a *tool-reported build time*, not a filesystem age, and kept
+        // as a separate fact beside the modification one.
+        //
+        // `docs/usage.md` and `activity::ACTIVITY_EVIDENCE_INVENTORY`
+        // both claimed this fact; until 2026-09-22
+        // `tool_reported_use_evidence`'s only non-test caller was
+        // `docker_last_used_evidence`, so the Cargo half of the claim
+        // was Docker-only in practice.
+        if unit.relative_path.contains(".fingerprint") {
+            unit.decision_evidence
+                .push(crate::activity::tool_reported_use_evidence(
+                    "cargo",
+                    "the mtime of this unit's own .fingerprint entry: when Cargo last recorded a \
+                     build for it, which is not the same as when a human last used the output",
+                    (unit.mtime_max > 0).then_some(unit.mtime_max),
+                    observed_at,
+                ));
+        }
+
+        // Reclaimability (#59). A container node's `physical_bytes` is
+        // zero by construction and its `physical_total` is a display
+        // aggregate, so the honest number for a group is its aggregate
+        // with the reason it is not exact; a leaf charges its own
+        // physical bytes. `Membership::Unknown` means the subgroup
+        // charge was never estimated, which is a bound of `0..N`, not a
+        // measured zero.
+        let accounting = match unit.membership {
+            Membership::Unknown => crate::reclaimability::hardlink_unresolved_bound(
+                unit.physical_total.max(unit.bytes),
+            ),
+            _ if unit.physical_bytes == 0 && unit.physical_total > 0 => {
+                crate::reclaimability::hardlink_unresolved_bound(unit.physical_total)
+            }
+            _ => crate::reclaimability::exclusive_allocation(unit.physical_bytes),
+        };
+        unit.decision_evidence
+            .extend(crate::reclaimability::accounting_evidence(
+                &accounting,
+                crate::evidence::EvidenceSource::FilesystemMetadata {
+                    detail: "nested build-artifact inspection".into(),
+                },
+            ));
+
+        // Recovery (#58): a nested unit inside a `target/` tree is build
+        // output whose source is present in this report by construction.
+        // Anything the inspection could not classify says so rather than
+        // guessing at a rebuild command.
+        let recovery = match unit.role {
+            ArtifactRole::Unknown => crate::recovery::cache_without_signal_recovery(
+                "the nested unit's role was not established by this pass",
+            ),
+            _ => crate::recovery::build_output_recovery(true, &unit.path),
+        };
+        let ev = match &recovery.follow_up_check {
+            Some(check) => recovery.evidence.with_note(format!("check: {check}")),
+            None => recovery.evidence,
+        };
+        unit.decision_evidence.push(ev);
+    }
 }
 
 /// Same as [`report`], optionally running `du -skPx` on the root as an
@@ -918,6 +1012,42 @@ pub fn report_full_mode_with_exclusions(
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
     pruned_subtrees: &[PathBuf],
 ) -> Result<Report> {
+    report_full_mode_scoped(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+        pruned_subtrees,
+        true,
+    )
+}
+
+/// [`report_full_mode_with_exclusions`] with the Docker probe gated on
+/// the authorized scope. `report_scope_with_parts` is the one caller
+/// that knows the scope; every other entry point keeps `true`, since a
+/// scope-less single-root call has nothing to consult and its behavior
+/// must not change (the 2026-09-22 re-review's CE6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_full_mode_scoped(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+    pruned_subtrees: &[PathBuf],
+    docker_in_scope: bool,
+) -> Result<Report> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
     // alias and the next uses its canonical spelling: FSEvents is canonical,
@@ -933,7 +1063,7 @@ pub fn report_full_mode_with_exclusions(
         .collect();
     // The pipeline is consumers on the event bus (ADR 001); this function
     // only translates its arguments into the run context.
-    let ctx = crate::bus::ctx_for_excluding(
+    let mut ctx = crate::bus::ctx_for_excluding(
         &root,
         docker_facts,
         verify_du,
@@ -946,6 +1076,7 @@ pub fn report_full_mode_with_exclusions(
         fs_events_source,
         &pruned_subtrees,
     );
+    ctx.docker_in_scope = docker_in_scope;
     let mut report = crate::bus::run_report(&ctx)?;
     report.store_dir = store_dir.map(Path::to_path_buf);
     Ok(report)
@@ -1837,6 +1968,10 @@ pub fn report_scope_with_parts(
     use crate::coverage::{RegionStatus, RootCoverage};
     use crate::scope::RootStatus;
 
+    // Asked once for the whole scope, not once per root: the answer is a
+    // property of the invocation's authorization, and
+    // `authorized_roots()` is not free.
+    let docker_authorized = scope.docker_in_scope();
     let mut per_root: std::collections::HashMap<PathBuf, Report> = std::collections::HashMap::new();
 
     let observed_at = crate::entities::now();
@@ -1932,7 +2067,7 @@ pub fn report_scope_with_parts(
                         n.detector_id
                     ));
                 }
-                let r = report_full_mode_with_exclusions(
+                let r = report_full_mode_scoped(
                     path,
                     docker_facts,
                     verify_du,
@@ -1944,6 +2079,7 @@ pub fn report_scope_with_parts(
                     force_full,
                     fs_events_source,
                     &pruned,
+                    docker_authorized,
                 );
                 let r = match r {
                     Ok(r) => r,

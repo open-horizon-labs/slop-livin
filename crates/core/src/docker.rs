@@ -645,6 +645,17 @@ pub fn load(facts_path: Option<&Path>) -> DockerFacts {
 /// the daemon cost ~0.9 s per observation.
 pub const DOCKER_CACHE_TTL_SECS: u64 = 300;
 
+/// How long an *unavailable* answer is reused before the daemon is asked
+/// again.
+///
+/// `load_cached` used to write its cache only when the answer was
+/// successful, so a daemon that is installed and stopped was re-probed
+/// on every single pass with no TTL at all. An unavailable daemon is a
+/// fact with the same shape as any other and deserves the same
+/// treatment; the window is shorter because a daemon that has just been
+/// started should be noticed soon (the 2026-09-22 re-review's CE6).
+pub const DOCKER_UNAVAILABLE_TTL_SECS: u64 = 60;
+
 /// `load`, with the live answer cached under the store
 /// (`docker_facts.json`) for [`DOCKER_CACHE_TTL_SECS`]. `fresh` forces the
 /// daemon (the scheduled `observe`, `--enrich`).
@@ -665,17 +676,22 @@ pub fn load_cached(
         && let Ok(age) = meta
             .modified()
             .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-        && age.as_secs() < DOCKER_CACHE_TTL_SECS
         && let Ok(text) = std::fs::read_to_string(&cache)
         && let Ok(facts) = serde_json::from_str::<DockerFacts>(&text)
-        && facts.unavailable.is_none()
     {
-        return facts;
+        let ttl = if facts.unavailable.is_none() {
+            DOCKER_CACHE_TTL_SECS
+        } else {
+            DOCKER_UNAVAILABLE_TTL_SECS
+        };
+        if age.as_secs() < ttl {
+            return facts;
+        }
     }
     let facts = load_live();
-    if facts.unavailable.is_none()
-        && let Ok(text) = serde_json::to_string(&facts)
-    {
+    // The unavailable answer is cached too. Caching only success meant
+    // an unreachable daemon was re-probed on every pass forever.
+    if let Ok(text) = serde_json::to_string(&facts) {
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::write(&cache, text);
     }

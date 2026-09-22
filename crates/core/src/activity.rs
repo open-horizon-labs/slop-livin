@@ -113,6 +113,17 @@ pub fn atime_reliability_from_mount_options(options: &str) -> AtimeReliability {
     }
 }
 
+/// Whether `path` lies at or under `mount_point`, comparing whole path
+/// components.
+fn under_mount(path: &str, mount_point: &str) -> bool {
+    if mount_point == "/" {
+        return path.starts_with('/');
+    }
+    let mount_point = mount_point.trim_end_matches('/');
+    path == mount_point
+        || (path.starts_with(mount_point) && path.as_bytes().get(mount_point.len()) == Some(&b'/'))
+}
+
 /// Finds the mount-option field for the longest matching mount point
 /// prefix of `path` in `/proc/mounts`-formatted `text`. `None` when no
 /// mount entry matches (should not normally happen for a real path).
@@ -133,7 +144,12 @@ pub fn find_mount_options<'a>(text: &'a str, path: &Path) -> Option<&'a str> {
         let Some(options) = cols.next() else {
             continue;
         };
-        if path_str.starts_with(mount_point)
+        // Component-wise, not a string prefix. `"/variable/foo"
+        // .starts_with("/var")` is true, so a `/var` mount's
+        // `relatime`/`noatime` options were attributed to a path on a
+        // different filesystem (the 2026-09-22 re-review's P3). Same
+        // component-vs-string mistake `protection_conflict` gets right.
+        if under_mount(&path_str, mount_point)
             && best.is_none_or(|(bp, _)| mount_point.len() > bp.len())
         {
             best = Some((mount_point, options));

@@ -65,6 +65,23 @@ pub struct Ctx<'a> {
     /// call with no scope-level exclusion context); populated only by
     /// `report::report_scope`.
     pub pruned_subtrees: Vec<PathBuf>,
+    /// Whether this invocation's authorized scope includes Docker at
+    /// all.
+    ///
+    /// The 2026-09-22 re-review's CE6: `consumers::docker` called
+    /// `docker::load_cached` on every `ProjectsGrouped` event and
+    /// consulted the effective scope nowhere, so `docker-desktop` being
+    /// disabled -- or excluded -- did not stop swamp asking the Docker
+    /// daemon to enumerate the user's images, volumes and containers.
+    /// Measured: five `docker` spawns per observation, on every
+    /// `report`, every `propose` and every TUI startup, permanently, for
+    /// a tool the user did not authorize.
+    ///
+    /// `true` for the pre-scope single-root entry points, which have no
+    /// scope to consult and whose behavior must not change; the
+    /// scope-aware path (`report::report_scope_with_parts`) derives it
+    /// from `EffectiveScope::docker_in_scope()`.
+    pub docker_in_scope: bool,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.
@@ -422,6 +439,7 @@ pub fn ctx_for_excluding<'a>(
         observed_at: crate::entities::now(),
         large_file_min_bytes,
         pruned_subtrees: pruned_subtrees.to_vec(),
+        docker_in_scope: true,
     }
 }
 

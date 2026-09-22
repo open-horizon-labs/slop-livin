@@ -69,6 +69,12 @@ pub fn access(path: &Path) -> UnitAccess {
 pub struct FoldedUnit {
     pub bytes: u64,
     pub hardlinked: bool,
+    /// Newest recorded modification among the measured children, from
+    /// the same folded walk. Carried so an external unit can have an
+    /// Activity fact without a second pass: `docs/usage.md` claimed
+    /// modification age for external locations while `ExternalUnit` had
+    /// no `mtime_max` field at all (the 2026-09-22 re-review).
+    pub mtime_max: u64,
 }
 
 pub fn measure(path: &Path, exclusions: &[PathBuf], observed_at: u64) -> FoldedUnit {
@@ -82,6 +88,7 @@ pub fn measure(path: &Path, exclusions: &[PathBuf], observed_at: u64) -> FoldedU
     FoldedUnit {
         bytes: row.bytes,
         hardlinked: row.hardlinked,
+        mtime_max: row.mtime_max,
     }
 }
 

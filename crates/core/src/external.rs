@@ -58,6 +58,13 @@ pub struct ExternalUnit {
     /// unit is opaque from this chunk's point of view).
     pub path: PathBuf,
     pub bytes: u64,
+    /// Newest recorded modification among this unit's measured children,
+    /// from the folded walk that measured it. The Activity fact
+    /// (`docs/usage.md`'s "modification age of the measured directory
+    /// only") is built from this; before 2026-09-22 the doc claimed the
+    /// fact and the struct had no field to carry it.
+    #[serde(default)]
+    pub mtime_max: u64,
     /// Whether the unit contains hardlinked files (conservative default
     /// `true` mirrors artifact rows -- see `ArtifactRow::hardlinked`).
     pub hardlinked: bool,
@@ -175,6 +182,7 @@ struct MeasuredUnit {
     path: PathBuf,
     bytes: u64,
     hardlinked: bool,
+    mtime_max: u64,
 }
 
 /// Every detector-proposed location the *authorized* scope actually lets
@@ -187,13 +195,38 @@ struct MeasuredUnit {
 /// (`EffectiveScope::authorized_detector_paths_in_explicit_roots`), so
 /// `swamp report <some-project> --view external` cannot quietly widen
 /// itself back out to the whole configured catalog.
-fn authorized_candidates(scope: &EffectiveScope) -> Vec<Candidate> {
-    let roots = if scope.explicit {
-        scope.authorized_detector_paths_in_explicit_roots()
+/// Every detector-proposed location this pass may measure, plus the ones
+/// it deliberately may not.
+///
+/// The second half is not bookkeeping. A nested location the user
+/// excluded has to be subtracted from *two* places or a one-line config
+/// change becomes a storage change (the 2026-09-22 re-review's CE4):
+///
+/// * from the parent's `nested_exclusions`, or the parent silently
+///   absorbs the excluded child's bytes and the growth annotation
+///   reports that absorption as real growth; and
+/// * from the ownership window, or the child's stored row -- still
+///   inside the measured parent's root -- is tombstoned by the owned
+///   sweep, and removing the exclusion again scores a regrowth.
+fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf>) {
+    let (roots, unauthorized) = if scope.explicit {
+        (
+            scope.authorized_detector_paths_in_explicit_roots(),
+            scope.unauthorized_detector_paths_in_explicit_roots(),
+        )
     } else {
-        scope.authorized_roots().0
+        scope.authorized_roots()
     };
-    roots
+    let out_of_scope: Vec<PathBuf> = unauthorized
+        .into_iter()
+        .filter(|u| u.out_of_scope)
+        .map(|u| {
+            // One spelling, so a subtraction written in either form
+            // matches what the measurement pass canonicalized.
+            fs::canonicalize(&u.path).unwrap_or(u.path)
+        })
+        .collect();
+    let candidates = roots
         .into_iter()
         .filter_map(|root| {
             let detector_id = root.detector_id?;
@@ -208,7 +241,8 @@ fn authorized_candidates(scope: &EffectiveScope) -> Vec<Candidate> {
                 path: root.path,
             })
         })
-        .collect()
+        .collect();
+    (candidates, out_of_scope)
 }
 
 pub fn discover_and_measure(
@@ -224,7 +258,7 @@ pub fn discover_and_measure(
     // was exactly this loop reading `scope.detectors` and so never
     // seeing the user's exclusion
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
-    let candidates = authorized_candidates(scope);
+    let (candidates, out_of_scope) = authorized_candidates(scope);
     // Detector display names, captured from the authorized scope before
     // the candidates are consumed: a coverage note for an unreadable
     // unit still needs a human-readable tool name, and must not reach
@@ -277,7 +311,12 @@ pub fn discover_and_measure(
         // (the external-location double-measurement fix alongside
         // #45-#49: e.g. Cargo home's registry/git subtrees, mise's
         // installs/downloads/plugins/shims, or a model store's blobs).
-        let nested_exclusions: Vec<PathBuf> = canon_candidates
+        // ... and, since 2026-09-22, nested locations that are *out of
+        // scope* as well as nested locations that survived. Computing
+        // this from the surviving candidate list alone is what made
+        // excluding a child read as the parent growing by the child's
+        // size.
+        let mut nested_exclusions: Vec<PathBuf> = canon_candidates
             .iter()
             .enumerate()
             .filter(|(j, (_, other_canonical))| {
@@ -287,6 +326,14 @@ pub fn discover_and_measure(
             })
             .map(|(_, (_, other_canonical))| other_canonical.clone())
             .collect();
+        nested_exclusions.extend(
+            out_of_scope
+                .iter()
+                .filter(|p| *p != &canonical && p.starts_with(&canonical))
+                .cloned(),
+        );
+        nested_exclusions.sort();
+        nested_exclusions.dedup();
         let device = device_of(&canonical);
         let key = unit_key(&detector_id, category, device, &canonical);
 
@@ -330,6 +377,7 @@ pub fn discover_and_measure(
                 path: canonical,
                 bytes: row.bytes,
                 hardlinked: row.hardlinked,
+                mtime_max: row.mtime_max,
             },
         );
     }
@@ -342,7 +390,10 @@ pub fn discover_and_measure(
     let ownership = crate::growth::ObservationOwnership::new(
         crate::growth::KeyFamily::External,
         meta_by_key.values().map(|m| m.path.clone()).collect(),
-    );
+    )
+    // Inside a covered root, outside this pass: an excluded nested
+    // location keeps its stored row exactly as it is.
+    .excluding(out_of_scope.clone());
     let annotations: HashMap<String, (Option<i64>, u32)> = match swamp_dir {
         Some(dir) if observe => crate::growth::observe_and_annotate_external(
             dir,
@@ -381,12 +432,21 @@ pub fn discover_and_measure(
             path,
             bytes,
             hardlinked,
+            mtime_max,
         },
     ) in meta_by_key
     {
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
         let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
-        let evidence = consumers_evidence(&consumers);
+        let mut evidence = consumers_evidence(&consumers);
+        // Activity (#54): the folded walk's own newest-child mtime for
+        // this location, labelled modification and never "last used".
+        // `docs/usage.md:660` promised this for external locations and
+        // nothing produced it.
+        evidence.push(crate::activity::modification_evidence(
+            mtime_max,
+            observed_at,
+        ));
         units.push(ExternalUnit {
             detector_id,
             detector_name,
@@ -394,6 +454,7 @@ pub fn discover_and_measure(
             provenance,
             path,
             bytes,
+            mtime_max,
             hardlinked,
             growth_bytes,
             regrowth_count,
@@ -428,6 +489,7 @@ pub fn discover_and_measure(
                 provenance: Provenance::BuiltinConvention,
                 path: path_buf,
                 bytes: last.as_ref().map(|r| r.0).unwrap_or(0),
+                mtime_max: 0,
                 hardlinked: true,
                 growth_bytes: None,
                 regrowth_count: last.as_ref().map(|r| r.1).unwrap_or(0),

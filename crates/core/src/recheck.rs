@@ -48,11 +48,40 @@ pub const EXACT_MEMBER_LIMIT: usize = 512;
 pub const SNAPSHOT_ENTRY_LIMIT: usize = 2_000_000;
 
 /// One member of a reviewed unit: metadata only, never contents.
+///
+/// **Not `(size, mtime_secs, inode)`.** That fingerprint is one this
+/// codebase already rejects in writing: `agents/mod.rs`'s
+/// `file_fingerprint` says, in its own words, that a cache which cannot
+/// see a same-second, same-size rewrite "is a cache that silently lies",
+/// and so uses `mtime_ns`, `ctime_ns` and the inode. The 2026-09-22
+/// re-review found the *identification memo*, where a stale answer
+/// costs a wrong project label, carrying the strong fingerprint while
+/// the *destructive sink*, where a stale answer moves unreviewed user
+/// data, carried the weak one. An in-place `write` of the same byte
+/// count in the same wall-clock second preserved all three fields, so
+/// `reviewed_snapshot` reported the unit unchanged and the content was
+/// moved to the Trash under an approval nobody gave for it.
+///
+/// So this carries `file_fingerprint`'s shape:
+///
+/// * `bytes` -- the obvious one;
+/// * `mtime_ns` -- nanoseconds, not seconds;
+/// * `ctime_ns` -- the inode change time, which moves on a rename-over
+///   even when the content's mtime is preserved; and
+/// * `inode` -- a replaced file is a different file whatever its
+///   timestamps say.
+///
+/// None of it costs a read: it is all in the `stat` already taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewedMember {
     pub path: PathBuf,
     pub bytes: u64,
-    pub mtime: u64,
+    /// Modification time in nanoseconds since the epoch.
+    pub mtime_ns: u64,
+    /// Inode change time in nanoseconds since the epoch (`0` where the
+    /// platform has none).
+    #[serde(default)]
+    pub ctime_ns: u64,
     pub inode: u64,
 }
 
@@ -83,9 +112,19 @@ pub enum ReviewedMembership {
     /// newest-mtime-versus-plan check still catches content churn. Agent
     /// and external units, whose member sets are bounded by
     /// construction, record their membership exactly.
-    Anchor { bytes: u64, mtime: u64 },
+    Anchor {
+        bytes: u64,
+        mtime_ns: u64,
+        #[serde(default)]
+        ctime_ns: u64,
+    },
     /// The unit is a single file (a transcript, a config file).
-    File { bytes: u64, mtime: u64 },
+    File {
+        bytes: u64,
+        mtime_ns: u64,
+        #[serde(default)]
+        ctime_ns: u64,
+    },
     /// Every member, exactly.
     Exact { members: Vec<ReviewedMember> },
     /// Too many members to enumerate; bounded summary + fingerprint.
@@ -105,12 +144,29 @@ pub struct ReviewedIdentity {
     pub membership: ReviewedMembership,
 }
 
-fn mtime_of(meta: &fs::Metadata) -> u64 {
+/// Modification time in **nanoseconds**. Second granularity is what let
+/// a same-second rewrite spend an approval; see [`ReviewedMember`].
+fn mtime_ns_of(meta: &fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Inode change time in nanoseconds, which moves on a rename-over even
+/// when the content's own mtime is preserved.
+#[cfg(unix)]
+fn ctime_ns_of(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime() as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(meta.ctime_nsec() as u64)
+}
+
+#[cfg(not(unix))]
+fn ctime_ns_of(_meta: &fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(unix)]
@@ -156,7 +212,8 @@ pub fn capture_anchor(path: &Path) -> Result<ReviewedIdentity> {
         is_dir: meta.is_dir(),
         membership: ReviewedMembership::Anchor {
             bytes: if meta.is_dir() { 0 } else { meta.len() },
-            mtime: mtime_of(&meta),
+            mtime_ns: mtime_ns_of(&meta),
+            ctime_ns: ctime_ns_of(&meta),
         },
     })
 }
@@ -180,7 +237,8 @@ fn collect(path: &Path) -> Result<(ReviewedIdentity, Vec<ReviewedMember>)> {
                 is_dir: false,
                 membership: ReviewedMembership::File {
                     bytes: meta.len(),
-                    mtime: mtime_of(&meta),
+                    mtime_ns: mtime_ns_of(&meta),
+                    ctime_ns: ctime_ns_of(&meta),
                 },
             },
             Vec::new(),
@@ -213,7 +271,8 @@ fn collect(path: &Path) -> Result<(ReviewedIdentity, Vec<ReviewedMember>)> {
             members.push(ReviewedMember {
                 path: entry.path(),
                 bytes: if m.is_dir() { 0 } else { m.len() },
-                mtime: mtime_of(&m),
+                mtime_ns: mtime_ns_of(&m),
+                ctime_ns: ctime_ns_of(&m),
                 inode: ino,
             });
             if m.is_dir() && !m.file_type().is_symlink() {
@@ -236,11 +295,20 @@ fn collect(path: &Path) -> Result<(ReviewedIdentity, Vec<ReviewedMember>)> {
             let mut newest = 0u64;
             let mut allocated = 0u64;
             for m in &members {
-                hasher.update(m.path.as_os_str().as_encoded_bytes());
+                // Length-prefixed field framing (the re-review's P3).
+                // The fixed-width `u64`s made a collision contrived
+                // rather than practical, but the raw path bytes had no
+                // boundary at all: two members whose paths and fields
+                // concatenate to the same byte string would hash the
+                // same. One length prefix removes the question.
+                let path_bytes = m.path.as_os_str().as_encoded_bytes();
+                hasher.update(&(path_bytes.len() as u64).to_le_bytes());
+                hasher.update(path_bytes);
                 hasher.update(&m.bytes.to_le_bytes());
-                hasher.update(&m.mtime.to_le_bytes());
+                hasher.update(&m.mtime_ns.to_le_bytes());
+                hasher.update(&m.ctime_ns.to_le_bytes());
                 hasher.update(&m.inode.to_le_bytes());
-                newest = newest.max(m.mtime);
+                newest = newest.max(m.mtime_ns);
                 allocated += m.bytes;
             }
             ReviewedMembership::Summary(ReviewedSummary {
@@ -306,16 +374,19 @@ pub fn reviewed_snapshot(
         (
             ReviewedMembership::Anchor {
                 bytes: rb,
-                mtime: rm,
+                mtime_ns: rm,
+                ctime_ns: rc,
             },
             ReviewedMembership::Anchor {
                 bytes: fb,
-                mtime: fm,
+                mtime_ns: fm,
+                ctime_ns: fc,
             },
         ) => {
-            if rb != fb || rm != fm {
+            if rb != fb || rm != fm || rc != fc {
                 bail!(
-                    "{} changed since it was reviewed ({rb} bytes/mtime {rm} -> {fb} bytes/mtime {fm}); propose again",
+                    "{} changed since it was reviewed ({rb} bytes/mtime {rm}ns/ctime {rc}ns -> \
+                     {fb} bytes/mtime {fm}ns/ctime {fc}ns); propose again",
                     path.display()
                 );
             }
@@ -323,16 +394,19 @@ pub fn reviewed_snapshot(
         (
             ReviewedMembership::File {
                 bytes: rb,
-                mtime: rm,
+                mtime_ns: rm,
+                ctime_ns: rc,
             },
             ReviewedMembership::File {
                 bytes: fb,
-                mtime: fm,
+                mtime_ns: fm,
+                ctime_ns: fc,
             },
         ) => {
-            if rb != fb || rm != fm {
+            if rb != fb || rm != fm || rc != fc {
                 bail!(
-                    "{} changed since it was reviewed ({rb} bytes/mtime {rm} -> {fb} bytes/mtime {fm}); propose again",
+                    "{} changed since it was reviewed ({rb} bytes/mtime {rm}ns/ctime {rc}ns -> \
+                     {fb} bytes/mtime {fm}ns/ctime {fc}ns); propose again",
                     path.display()
                 );
             }

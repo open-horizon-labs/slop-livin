@@ -657,14 +657,23 @@ What each domain actually establishes:
 | Recovery | A sourced restoration path (rebuild from present source, network-fetch from a named lockfile, local reinstall from a known version, or "potentially unique local state" for mutable environments) with named prerequisites and a concrete smallest useful follow-up check | Whether the network/registry/credentials needed at restore time are actually available -- always stated as a material unknown, never assumed |
 | Reclaimability | Allocated bytes (always known), an estimated-reclaimable figure that is bounded rather than exact when hardlinks/APFS clones/snapshots are in play, and an observed post-action free-space change (`statvfs` before/after) | An exact reclaimed-byte guarantee from a scan alone; Trash, snapshots, open files and concurrent writers can all suppress the expected change |
 
-Inventory of which artifact/detector domains have real activity
-evidence today versus report unknown: filesystem artifact rows get
-modification age (and access time only where the mount supports it);
-Docker build-cache entries get the daemon's own `last_used`; Docker
-images/volumes report unknown (the daemon has no last-used field for
-them); Cargo nested build artifacts get their fingerprint file's mtime;
-agent-tool and external-location units get modification age only, with
-no per-tool invocation history read.
+Inventory of which artifact/detector domains have real activity evidence
+today versus report unknown. This table is **generated** from
+`activity::ACTIVITY_EVIDENCE_INVENTORY` and checked by
+`crates/core/tests/evidence_contract.rs::the_usage_table_matches_the_activity_inventory`,
+so the constant and the prose cannot drift apart. Edit the constant, not
+the table.
+
+<!-- BEGIN ACTIVITY_EVIDENCE_INVENTORY -->
+| Domain | Activity evidence this pass can establish |
+|---|---|
+| filesystem artifact rows (build output, cache, dependency trees) | modification age (folded mtime_max); access time only where the mount does not suppress atime |
+| Docker build-cache entries | daemon-reported last_used, kept distinct from filesystem mtime |
+| Docker images/volumes | unknown: the daemon reports creation time and container references, not a last-used timestamp |
+| Cargo nested build artifacts | fingerprint file mtime (tool-reported build time), where a .fingerprint entry exists |
+| agent-tool session/category units | modification age of the session/category's own recorded mtime_max; no tool reports a distinct use timestamp |
+| external location detectors (version managers, package caches, SDKs) | modification age of the measured directory only; no per-tool invocation history is read |
+<!-- END ACTIVITY_EVIDENCE_INVENTORY -->
 
 `swamp protect add/remove/list` (previously effective only for
 agent-storage units) now also refuses a plan proposal that names a

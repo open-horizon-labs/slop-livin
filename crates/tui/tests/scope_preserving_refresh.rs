@@ -276,6 +276,7 @@ fn external_unit(path: &Path) -> swamp_core::external::ExternalUnit {
         provenance: swamp_core::locations::Provenance::BuiltinConvention,
         path: path.to_path_buf(),
         bytes: 10,
+        mtime_max: 0,
         hardlinked: false,
         growth_bytes: None,
         regrowth_count: 0,

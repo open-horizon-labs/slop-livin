@@ -29,11 +29,29 @@ impl Consumer for DockerConsumer {
             return Ok(vec![]);
         };
         let mut notes = Vec::new();
-        let facts = crate::docker::load_cached(
-            ctx.docker_facts.as_deref(),
-            ctx.store_dir.as_deref(),
-            ctx.enrich,
-        );
+        // Docker is probed only when the authorized scope includes it.
+        // A disabled or excluded `docker-desktop` detector means the
+        // user did not authorize asking the daemon about their images,
+        // volumes and containers -- and asking cost ~0.9 s per
+        // observation, forever, when the daemon is installed and
+        // stopped (the 2026-09-22 re-review's CE6). A mocked facts file
+        // is a test/CLI input, not a probe, so it is still honoured.
+        let facts = if ctx.docker_in_scope || ctx.docker_facts.is_some() {
+            crate::docker::load_cached(
+                ctx.docker_facts.as_deref(),
+                ctx.store_dir.as_deref(),
+                ctx.enrich,
+            )
+        } else {
+            crate::docker::DockerFacts {
+                unavailable: Some(
+                    "docker: not in scope this invocation (the docker-desktop detector is \
+                     disabled or excluded), so the daemon was not asked"
+                        .to_string(),
+                ),
+                ..Default::default()
+            }
+        };
         if let Some(reason) = &facts.unavailable {
             notes.push(reason.clone());
         }

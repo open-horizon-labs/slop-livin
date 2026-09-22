@@ -302,6 +302,10 @@ pub struct CallSite {
     /// destructive calls are rechecked" is satisfied by rechecking one
     /// path and deleting another.
     pub args: Vec<String>,
+    /// For a method call, the receiver's token text. Lets a rule ask
+    /// whether a containment test is written in both directions without
+    /// pinning the variable names the author happened to choose.
+    pub receiver: String,
 }
 
 struct CallVisitor<'a> {
@@ -336,10 +340,15 @@ fn has_dead_code_allow(attrs: &[syn::Attribute]) -> bool {
 
 impl CallVisitor<'_> {
     fn record_with_args(&mut self, written: String, method: bool, args: Vec<String>) {
+        self.record_full(written, method, args, String::new());
+    }
+
+    fn record_full(&mut self, written: String, method: bool, args: Vec<String>, receiver: String) {
         let before = self.out.len();
         self.record(written, method);
         if self.out.len() > before {
             self.out[before].args = args;
+            self.out[before].receiver = receiver;
         }
     }
 
@@ -360,6 +369,7 @@ impl CallVisitor<'_> {
             stmt: self.stmt,
             conditions: self.conditions.clone(),
             args: Vec::new(),
+            receiver: String::new(),
         });
     }
 
@@ -444,7 +454,12 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
             .iter()
             .map(|a| a.to_token_stream().to_string())
             .collect();
-        self.record_with_args(m.method.to_string(), true, args);
+        self.record_full(
+            m.method.to_string(),
+            true,
+            args,
+            m.receiver.to_token_stream().to_string(),
+        );
         // `f(..).unwrap()` / `.expect()` / `.map_err()` / `.context()`
         // all make the answer matter, so the receiver is honoured.
         let honours_receiver = matches!(

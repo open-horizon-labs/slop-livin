@@ -256,6 +256,18 @@ pub struct EffectiveScope {
     /// [`ExternalPruneNote`].
     #[serde(default)]
     pub external_pruned_subtrees: Vec<ExternalPruneNote>,
+    /// Every `configured_exclude` entry after tilde expansion and
+    /// normalization, in the one spelling every exclusion comparison
+    /// uses.
+    ///
+    /// Carried on the scope because [`EffectiveScope::exclusion_for`]
+    /// needs it and has no `Environment` to expand `~` with. The 2026-09-22
+    /// re-review's CE1 was exactly a comparison that could not reach
+    /// this list: `authorized_detector_paths_in_explicit_roots` tested
+    /// exclusion only against roots whose *status* was `Excluded`, and
+    /// under `--root <parent>` an excluded home is not a root at all.
+    #[serde(default)]
+    pub normalized_exclude: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,12 +356,6 @@ impl EffectiveScope {
     pub fn authorized_roots(&self) -> (Vec<AuthorizedRoot>, Vec<UnauthorizedRoot>) {
         let mut authorized = Vec::new();
         let mut unauthorized = Vec::new();
-        let excluded_prefixes: Vec<&PathBuf> = self
-            .roots
-            .iter()
-            .filter(|r| matches!(r.status, RootStatus::Excluded { .. }))
-            .map(|r| &r.path)
-            .collect();
 
         for root in &self.roots {
             let detector_id = root.reasons.iter().find_map(|r| match r {
@@ -379,17 +385,16 @@ impl EffectiveScope {
                     reason: format!("could not be read ({reason})"),
                 }),
                 RootStatus::Present | RootStatus::SkippedAsNested { .. } => {
-                    // Defence in depth: a root whose ancestor is excluded
-                    // is out of scope even if resolution recorded it as
-                    // present.
-                    if let Some(ex) = excluded_prefixes
-                        .iter()
-                        .find(|ex| root.path.starts_with(ex.as_path()))
-                    {
+                    // Defence in depth: a root whose ancestor is
+                    // excluded is out of scope even if resolution
+                    // recorded it as present. Through the one predicate,
+                    // so this path and the explicit-root path below
+                    // cannot disagree.
+                    if let Some(pattern) = self.exclusion_for(&root.path) {
                         unauthorized.push(UnauthorizedRoot {
                             path: root.path.clone(),
                             out_of_scope: true,
-                            reason: format!("beneath the excluded root {}", ex.display()),
+                            reason: format!("excluded by {pattern}"),
                         });
                         continue;
                     }
@@ -471,6 +476,77 @@ impl EffectiveScope {
         narrowed
     }
 
+    /// Why `path` is excluded from this scope, or `None`.
+    ///
+    /// **The only** exclusion predicate. Every caller -- the default
+    /// path, the explicit-root path, and the ownership window the growth
+    /// store sweeps with -- routes through here, so explicit and
+    /// configured scope cannot diverge. It consults all three places an
+    /// exclusion can be recorded:
+    ///
+    /// * a root whose status is [`RootStatus::Excluded`] (the ordinary
+    ///   case: the excluded path was itself a candidate root);
+    /// * a [`PruneNote`], which is how an `exclude` entry *inside* a
+    ///   kept root is recorded -- the case `--root <parent>` produces
+    ///   and the case the re-review's CE1 walked through; and
+    /// * `normalized_exclude` directly, so an entry that matched neither
+    ///   of the above (a path that does not exist yet, an entry outside
+    ///   every root) still excludes.
+    ///
+    /// Both sides are compared through [`comparable`], so an entry
+    /// written as `/var/folders/...` covers a unit the external pass
+    /// reports as `/private/var/folders/...`. The two discovery families
+    /// disagreed about spelling before (external canonicalizes its
+    /// candidates, agents does not), which meant one `exclude` entry
+    /// could cover one family and not the other -- the re-review's P2.
+    pub fn exclusion_for(&self, path: &Path) -> Option<String> {
+        let candidate = comparable(path);
+        for root in &self.roots {
+            if let RootStatus::Excluded { pattern } = &root.status
+                && under(&candidate, &comparable(&root.path))
+            {
+                return Some(pattern.clone());
+            }
+        }
+        for note in &self.pruned_subtrees {
+            let pattern = PathBuf::from(&note.pattern);
+            if under(&candidate, &comparable(&pattern)) {
+                return Some(note.pattern.clone());
+            }
+        }
+        for ex in &self.normalized_exclude {
+            if under(&candidate, &comparable(ex)) {
+                return Some(ex.display().to_string());
+            }
+        }
+        None
+    }
+
+    /// Whether this invocation's authorized scope includes Docker.
+    ///
+    /// The detector must be enabled *and* its resolved home must not be
+    /// excluded, and under `--root` it must lie inside an explicit root
+    /// -- the same three tests every other location passes. Consulted by
+    /// the report pipeline so `consumers::docker` never asks the daemon
+    /// about a tool the user did not authorize
+    /// (the 2026-09-22 re-review's CE6).
+    pub fn docker_in_scope(&self) -> bool {
+        let id = crate::locations::docker_desktop::DOCKER_DESKTOP_DETECTOR_ID;
+        if !self.detector_enabled(id) {
+            return false;
+        }
+        let authorized = if self.explicit {
+            self.authorized_detector_paths_in_explicit_roots()
+        } else {
+            self.authorized_roots().0
+        };
+        // A detector that is enabled but resolved no present home has
+        // nothing in scope -- and nothing to ask the daemon about.
+        authorized
+            .iter()
+            .any(|r| r.detector_id.as_deref() == Some(id))
+    }
+
     /// Whether this scope lets a detector contribute at all.
     ///
     /// Distinct from "did it resolve a present home": a detector can be
@@ -511,11 +587,15 @@ impl EffectiveScope {
                 }
                 let Some(path) = &loc.path else { continue };
                 let path = lexically_normalize(path);
-                if self.inside_explicit(&path)
-                    && !self.roots.iter().any(|r| {
-                        matches!(r.status, RootStatus::Excluded { .. }) && path.starts_with(&r.path)
-                    })
-                {
+                // The one exclusion predicate, not a second
+                // reimplementation of it. This function used to test
+                // `self.roots` entries whose status was `Excluded` and
+                // nothing else, so under `--root <parent>` an excluded
+                // home -- recorded as a `PruneNote` inside the explicit
+                // root, never as a root of its own -- matched nothing
+                // and was discovered, measured and made actionable
+                // (the 2026-09-22 re-review's CE1).
+                if self.inside_explicit(&path) && self.exclusion_for(&path).is_none() {
                     out.push(AuthorizedRoot {
                         detector_id: Some(summary.detector_id.clone()),
                         detector_name: Some(summary.name.clone()),
@@ -524,6 +604,46 @@ impl EffectiveScope {
                         nested_in: None,
                         pruned_subtrees: Vec::new(),
                         path,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The detector-proposed paths inside the explicit command roots
+    /// that are *out of scope* this invocation, with the reason.
+    ///
+    /// The explicit-root path needs this for the same reason
+    /// `authorized_roots` returns `UnauthorizedRoot`s: a nested location
+    /// that is excluded must be subtracted from its parent's absorbed
+    /// bytes and from the ownership window, or a config-only change
+    /// reads as growth and then as regrowth
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    pub fn unauthorized_detector_paths_in_explicit_roots(&self) -> Vec<UnauthorizedRoot> {
+        if !self.explicit {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for summary in &self.detectors {
+            for loc in &summary.locations {
+                if loc.status != LocationStatus::Resolved {
+                    continue;
+                }
+                let Some(path) = &loc.path else { continue };
+                let path = lexically_normalize(path);
+                if let Some(pattern) = self.exclusion_for(&path) {
+                    out.push(UnauthorizedRoot {
+                        path,
+                        out_of_scope: true,
+                        reason: format!("excluded by {pattern}"),
+                    });
+                } else if !self.inside_explicit(&path) {
+                    out.push(UnauthorizedRoot {
+                        path,
+                        out_of_scope: true,
+                        reason: "outside the explicit command roots, which replace inferred roots"
+                            .to_string(),
                     });
                 }
             }
@@ -613,6 +733,53 @@ fn stat_root(path: &Path) -> RootStatus {
             reason: e.to_string(),
         },
     }
+}
+
+/// The one spelling every scope comparison uses.
+///
+/// `fs::canonicalize` when the path exists, lexical normalization
+/// otherwise. This is *not* the walker following symlinks -- the walker
+/// still never dereferences anything it finds inside a directory
+/// (`.oh/guardrails/symlinks-never-followed.md`). It is the comparison
+/// namespace: `external::discover_and_measure` canonicalizes every
+/// candidate and `agents::discover_and_measure` does not, so the same
+/// fixture home comes back as `/var/folders/.../claude` from one pass
+/// and `/private/var/folders/.../claude` from the other. With both sides
+/// of every `exclude`/`protect` comparison passed through here, an entry
+/// written in either spelling covers both families (the 2026-09-22
+/// re-review's P2).
+pub fn comparable(path: &Path) -> PathBuf {
+    let normalized = lexically_normalize(path);
+    if let Ok(c) = fs::canonicalize(&normalized) {
+        return c;
+    }
+    // A path that does not exist yet still has to land in the same
+    // namespace as one that does, or a `protect` entry on an existing
+    // directory would not cover a member below it that has not been
+    // created -- and protecting in advance is explicitly supported.
+    // Canonicalize the longest existing ancestor and re-append the rest.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = normalized.as_path();
+    while let Some(parent) = cursor.parent() {
+        let Some(name) = cursor.file_name() else {
+            break;
+        };
+        tail.push(name.to_os_string());
+        if let Ok(c) = fs::canonicalize(parent) {
+            let mut out = c;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        cursor = parent;
+    }
+    normalized
+}
+
+/// Component-wise containment: `/a/bc` is not under `/a/b`.
+pub fn under(candidate: &Path, ancestor: &Path) -> bool {
+    candidate == ancestor || candidate.starts_with(ancestor)
 }
 
 fn is_excluded(path: &Path, excludes: &[PathBuf]) -> Option<PathBuf> {
@@ -843,6 +1010,7 @@ pub fn resolve_effective_scope(
         detectors,
         pruned_subtrees,
         external_pruned_subtrees,
+        normalized_exclude: excludes,
     }
 }
 

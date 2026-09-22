@@ -1117,6 +1117,7 @@ mod tests {
             provenance: Provenance::BuiltinConvention,
             path: path.to_path_buf(),
             bytes: 0,
+            mtime_max: 0,
             hardlinked: false,
             growth_bytes: None,
             regrowth_count: 0,
