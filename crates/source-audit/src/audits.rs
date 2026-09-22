@@ -194,6 +194,13 @@ pub const AUDITS: &[(&str, Audit)] = &[
         "build_adapters_reuse_under_event_coverage",
         crate::build_audits::build_adapters_reuse_under_event_coverage,
     ),
+    // Landed before the store join it governs, failing: machine-wide
+    // stores reach an adapter by declared capability, never by an id
+    // (`.oh/sessions/2026-09-21-build-adapters-python-go-apple-android-docker.md`).
+    (
+        "build_stores_join_by_capability",
+        crate::build_audits::build_stores_join_by_capability,
+    ),
 ];
 
 /// The guardrail-level umbrella: the three bus audits together.

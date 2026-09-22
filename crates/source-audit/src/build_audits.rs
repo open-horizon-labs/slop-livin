@@ -543,8 +543,30 @@ struct Reachability {
     tainted: HashMap<Node, String>,
 }
 
+type Edges = HashMap<Node, BTreeSet<Node>>;
+
 impl Reachability {
     fn build(root: &Path, forbidden: &[(Target, &str)], seeds: &[(Node, String)]) -> Self {
+        let (edges, mut tainted) = Self::graph(root, forbidden);
+        tainted.extend(seeds.iter().cloned());
+        Self::propagate(&edges, tainted)
+    }
+
+    /// Several seed sets over one call graph: the graph is the expensive
+    /// part, and the mutation corpus runs every rule once per fixture.
+    fn build_many(root: &Path, seed_sets: &[&[(Node, String)]]) -> Vec<Self> {
+        let (edges, base) = Self::graph(root, &[]);
+        seed_sets
+            .iter()
+            .map(|seeds| {
+                let mut tainted = base.clone();
+                tainted.extend(seeds.iter().cloned());
+                Self::propagate(&edges, tainted)
+            })
+            .collect()
+    }
+
+    fn graph(root: &Path, forbidden: &[(Target, &str)]) -> (Edges, HashMap<Node, String>) {
         let files = crate::resolve::workspace_files(root);
         let facts: Vec<(String, Arc<FileFacts>)> = files
             .iter()
@@ -570,8 +592,8 @@ impl Reachability {
                     .extend(types.iter().cloned());
             }
         }
-        let mut tainted: HashMap<Node, String> = seeds.iter().cloned().collect();
-        let mut edges: HashMap<Node, BTreeSet<Node>> = HashMap::new();
+        let mut tainted: HashMap<Node, String> = HashMap::new();
+        let mut edges: Edges = HashMap::new();
         for (rel, f) in &facts {
             for c in &f.calls {
                 let node = (rel.clone(), c.func.clone());
@@ -614,9 +636,13 @@ impl Reachability {
                 }
             }
         }
+        (edges, tainted)
+    }
+
+    fn propagate(edges: &Edges, mut tainted: HashMap<Node, String>) -> Self {
         loop {
             let mut grew = false;
-            for (caller, callees) in &edges {
+            for (caller, callees) in edges {
                 if tainted.contains_key(caller) {
                     continue;
                 }
@@ -2025,6 +2051,488 @@ pub fn build_adapters_reuse_under_event_coverage(root: &Path) -> Result<(), Stri
              containers to be replayed (zero listings), gated on EventCoverage"
                 .into(),
         );
+    }
+    finish(problems)
+}
+
+// ---------------------------------------------------------------------
+// build_stores_join_by_capability
+// ---------------------------------------------------------------------
+
+const LOCATIONS_DIR: &str = "crates/core/src/locations";
+
+/// The `BuildContainer` constructors that make a *shared* container:
+/// the inherent functions of `BuildContainer` in the build-adapter model
+/// whose body sets `shared: true`. Derived, so a new constructor for a
+/// machine-wide store is governed the day it is written.
+fn shared_container_ctors(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(f) = load(root, &format!("{BUILD_ADAPTERS_DIR}/mod.rs")) else {
+        return out;
+    };
+    for item in &f.ast.items {
+        let syn::Item::Impl(imp) = item else { continue };
+        if imp.trait_.is_some() || imp.self_ty.to_token_stream().to_string() != "BuildContainer" {
+            continue;
+        }
+        for it in &imp.items {
+            if let syn::ImplItem::Fn(m) = it
+                && m.block
+                    .to_token_stream()
+                    .to_string()
+                    .contains("shared : true")
+            {
+                out.insert(m.sig.ident.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Every detector id, read from each `impl Detector for T`'s `fn id`
+/// under `crates/core/src/locations/` -- the literal it returns, or the
+/// literal of the `const` it returns. Derived, so a detector added
+/// tomorrow is a forbidden join key tomorrow.
+fn detector_ids(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for rel in crate::resolve::rust_files_recursive(root, LOCATIONS_DIR) {
+        let Some(f) = load(root, &rel) else { continue };
+        let consts: HashMap<String, String> = f
+            .ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Const(c) => {
+                    let v = c.expr.to_token_stream().to_string();
+                    (v.starts_with('"') && v.ends_with('"'))
+                        .then(|| (c.ident.to_string(), v.trim_matches('"').to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        for ty in ast::impls_of(&f.ast, "Detector") {
+            if let Some(id) = adapter_id(&f.ast, &ty) {
+                out.insert(id);
+                continue;
+            }
+            // `fn id(&self) -> &'static str { GO_DETECTOR_ID }`
+            for item in &f.ast.items {
+                let syn::Item::Impl(i) = item else { continue };
+                if i.self_ty.to_token_stream().to_string() != ty {
+                    continue;
+                }
+                for it in &i.items {
+                    if let syn::ImplItem::Fn(m) = it
+                        && m.sig.ident == "id"
+                    {
+                        let body = m.block.to_token_stream().to_string();
+                        for (name, value) in &consts {
+                            if body
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|t| t == name)
+                            {
+                                out.insert(value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// String-literal comparisons in a body: `x == "lit"`, `"lit" != x`,
+/// `.ends_with("lit")`/`.starts_with("lit")`/`.contains("lit")`/`.eq("lit")`,
+/// and `match` arms whose pattern is a string literal. A join that
+/// decides which adapter gets a store from a path shape or a name is
+/// the heuristic the capability exists to replace.
+fn literal_comparisons(file: &syn::File) -> Vec<(String, String)> {
+    struct V {
+        func: String,
+        in_test: usize,
+        out: Vec<(String, String)>,
+    }
+    fn is_str_lit(e: &syn::Expr) -> bool {
+        match e {
+            syn::Expr::Lit(l) => matches!(l.lit, syn::Lit::Str(_)),
+            syn::Expr::Reference(r) => is_str_lit(&r.expr),
+            syn::Expr::Paren(p) => is_str_lit(&p.expr),
+            _ => false,
+        }
+    }
+    fn pat_has_str(p: &syn::Pat) -> bool {
+        match p {
+            syn::Pat::Lit(l) => matches!(l.lit, syn::Lit::Str(_)),
+            syn::Pat::Or(o) => o.cases.iter().any(pat_has_str),
+            syn::Pat::Tuple(t) => t.elems.iter().any(pat_has_str),
+            syn::Pat::TupleStruct(t) => t.elems.iter().any(pat_has_str),
+            syn::Pat::Reference(r) => pat_has_str(&r.pat),
+            syn::Pat::Paren(p) => pat_has_str(&p.pat),
+            syn::Pat::Slice(s) => s.elems.iter().any(pat_has_str),
+            _ => false,
+        }
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_test -= usize::from(test);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+            if self.in_test == 0
+                && matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+                && (is_str_lit(&b.left) || is_str_lit(&b.right))
+            {
+                self.out
+                    .push((self.func.clone(), b.to_token_stream().to_string()));
+            }
+            syn::visit::visit_expr_binary(self, b);
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            let name = m.method.to_string();
+            if self.in_test == 0
+                && [
+                    "ends_with",
+                    "starts_with",
+                    "contains",
+                    "eq",
+                    "ne",
+                    "matches",
+                ]
+                .contains(&name.as_str())
+                && m.args.iter().any(is_str_lit)
+            {
+                self.out
+                    .push((self.func.clone(), m.to_token_stream().to_string()));
+            }
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
+            if self.in_test == 0 && m.arms.iter().any(|a| pat_has_str(&a.pat)) {
+                self.out.push((
+                    self.func.clone(),
+                    format!("match {} {{ \"..\" => .. }}", m.expr.to_token_stream()),
+                ));
+            }
+            syn::visit::visit_expr_match(self, m);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for e in macro_exprs(&m.tokens) {
+                self.visit_expr(&e);
+            }
+        }
+    }
+    let mut v = V {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+type SiteCache = Mutex<HashMap<(String, u64, String), Arc<Vec<Node>>>>;
+static JOIN_SITES: OnceLock<SiteCache> = OnceLock::new();
+
+/// The functions in one file that call a shared-container constructor,
+/// excluding the constructors' own `impl` in the model file.
+fn join_sites_in(
+    rel: &str,
+    f: &Parsed,
+    ctors: &BTreeSet<String>,
+    ctors_key: &str,
+    is_model: bool,
+) -> Arc<Vec<Node>> {
+    let key = (rel.to_string(), text_hash(&f.text), ctors_key.to_string());
+    let cache = JOIN_SITES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key).cloned() {
+        return hit;
+    }
+    let ctor_fns: HashSet<String> = if is_model {
+        f.ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Impl(imp)
+                    if imp.self_ty.to_token_stream().to_string() == "BuildContainer" =>
+                {
+                    Some(imp.items.iter().filter_map(|it| match it {
+                        syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut out: Vec<Node> = Vec::new();
+    // Cheap pre-filter: a file that never writes a constructor's name
+    // cannot call it.
+    if ctors.iter().any(|c| f.text.contains(c.as_str())) {
+        for c in crate::resolve::production_calls(&f.ast) {
+            let last = c.path.rsplit("::").next().unwrap_or(&c.path);
+            if !c.method && ctors.contains(last) && !ctor_fns.contains(&c.func) {
+                let node = (rel.to_string(), c.func.clone());
+                if !out.contains(&node) {
+                    out.push(node);
+                }
+            }
+        }
+    }
+    let out = Arc::new(out);
+    let mut c = cache.lock().unwrap();
+    if c.len() > 8192 {
+        c.clear();
+    }
+    c.insert(key, Arc::clone(&out));
+    out
+}
+
+type SeedSets = (
+    Vec<(Node, String)>,
+    Vec<(Node, String)>,
+    Vec<(Node, String)>,
+);
+type SeedCache = Mutex<HashMap<(String, u64, String), Arc<SeedSets>>>;
+static STORE_SEEDS: OnceLock<SeedCache> = OnceLock::new();
+
+/// One file's contribution to the three seed sets of
+/// [`build_stores_join_by_capability`].
+fn store_join_seeds(rel: &str, f: &Parsed, ids: &BTreeSet<String>, ids_key: &str) -> Arc<SeedSets> {
+    let key = (rel.to_string(), text_hash(&f.text), ids_key.to_string());
+    let cache = STORE_SEEDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key).cloned() {
+        return hit;
+    }
+    let rel = rel.to_string();
+    let mut id_seeds: Vec<(Node, String)> = Vec::new();
+    let mut kinds_seeds: Vec<(Node, String)> = Vec::new();
+    let mut stores_seeds: Vec<(Node, String)> = Vec::new();
+    let aliases: Vec<(String, String)> = f
+        .ast
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            syn::Item::Const(c) => {
+                let v = c.expr.to_token_stream().to_string();
+                ids.iter()
+                    .find(|id| v == format!("\"{id}\""))
+                    .map(|id| (c.ident.to_string(), id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (func, path) in referenced_paths_by_fn(&rel, &f.ast) {
+        if func.is_empty() {
+            continue;
+        }
+        let last = path.rsplit("::").next().unwrap_or(&path);
+        if last.ends_with("_DETECTOR_ID") {
+            id_seeds.push((
+                (rel.clone(), func.clone()),
+                format!("{rel}::{func} names `{path}`"),
+            ));
+        }
+        if let Some((name, id)) = aliases.iter().find(|(n, _)| n == last) {
+            id_seeds.push((
+                (rel.clone(), func.clone()),
+                format!("{rel}::{func} names `{name}`, a const holding the detector id \"{id}\""),
+            ));
+        }
+    }
+    for func in ast::functions(&f.ast) {
+        if let Some(id) = ids
+            .iter()
+            .find(|id| func.body.contains(&format!("\"{id}\"")))
+        {
+            id_seeds.push((
+                (rel.clone(), func.name.clone()),
+                format!(
+                    "{rel}::{} holds the detector id literal \"{id}\"",
+                    func.name
+                ),
+            ));
+        }
+    }
+    for c in crate::resolve::production_calls(&f.ast) {
+        if c.honoured == crate::resolve::Honoured::Discarded {
+            continue;
+        }
+        let last = c.path.rsplit("::").next().unwrap_or(&c.path);
+        let node = (rel.clone(), c.func.clone());
+        if last == "store_kinds" {
+            kinds_seeds.push((node.clone(), "asks the adapter's store_kinds".into()));
+        }
+        if last == "build_stores" {
+            stores_seeds.push((node, "asks the detector's build_stores".into()));
+        }
+    }
+    let out = Arc::new((id_seeds, kinds_seeds, stores_seeds));
+    let mut c = cache.lock().unwrap();
+    if c.len() > 8192 {
+        c.clear();
+    }
+    c.insert(key, Arc::clone(&out));
+    out
+}
+
+/// Statement: a machine-wide store reaches a build adapter only through
+/// two declared capabilities -- the detector's `build_stores()` (which
+/// of its locations is which kind of store) and the adapter's
+/// `store_kinds()` (which kinds it identifies) -- never through a
+/// detector id, an adapter id, or a path shape.
+///
+/// Derived: the *join sites* are every production function in the
+/// workspace that calls a shared-container constructor of
+/// `BuildContainer` (the inherent constructors whose body sets
+/// `shared: true`), other than those constructors themselves. For each
+/// join site, over everything it reaches through the whole-workspace
+/// call graph:
+///
+/// 1. nothing names a `*_DETECTOR_ID` path (resolved, so a `use .. as`
+///    rename counts) or a detector-id literal, or a `const` holding one
+///    -- the detector ids are read from every `impl Detector`'s `fn id`;
+/// 2. an honoured `store_kinds` call and an honoured `build_stores` call
+///    are reached -- a join that never asks, or asks and throws the
+///    answer away (`let _ = a.store_kinds();`), matched on something
+///    else;
+/// 3. the join site itself and its same-file helpers compare no string
+///    literal (`== "npm"`, `.ends_with("caches")`, a `"..." =>` arm):
+///    choosing an adapter by a path suffix is the heuristic the
+///    capability replaces, and a custom `GOMODCACHE` defeats it.
+pub fn build_stores_join_by_capability(root: &Path) -> Result<(), String> {
+    let _ = derived_or_err(root)?;
+    let ctors = shared_container_ctors(root);
+    if ctors.is_empty() {
+        return Err(format!(
+            "{BUILD_ADAPTERS_DIR}/mod.rs defines no `BuildContainer` constructor that sets \
+             `shared: true`; the rule cannot say how a machine-wide store is handed to an adapter"
+        ));
+    }
+    let ids = detector_ids(root);
+    let files = crate::resolve::workspace_files(root);
+    let model = format!("{BUILD_ADAPTERS_DIR}/mod.rs");
+
+    // Join sites.
+    let ctors_key = ctors.iter().cloned().collect::<Vec<_>>().join("\u{1}");
+    let mut sites: Vec<Node> = Vec::new();
+    for rel in &files {
+        let Some(f) = load(root, rel) else { continue };
+        for node in join_sites_in(rel, &f, &ctors, &ctors_key, *rel == model).iter() {
+            if !sites.contains(node) {
+                sites.push(node.clone());
+            }
+        }
+    }
+    if sites.is_empty() {
+        return Err(
+            "no production function hands a machine-wide store to a build adapter: the \
+             adapters identify npm/pnpm stores, Gradle homes, Maven repositories, Go and Python \
+             caches, DerivedData and the Android SDK, and none of it reaches a live report \
+             until the external observation joins its measured stores to them by capability"
+                .into(),
+        );
+    }
+
+    // Seeds: functions that name a detector id, directly or through a
+    // const alias; and functions that honour each capability question.
+    // Per-file and cached by exact text: the corpus runs this rule once
+    // per fixture over an otherwise unchanged workspace.
+    let ids_key = ids.iter().cloned().collect::<Vec<_>>().join("\u{1}");
+    let mut id_seeds: Vec<(Node, String)> = Vec::new();
+    let mut kinds_seeds: Vec<(Node, String)> = Vec::new();
+    let mut stores_seeds: Vec<(Node, String)> = Vec::new();
+    for rel in &files {
+        let Some(f) = load(root, rel) else { continue };
+        let seeds = store_join_seeds(rel, &f, &ids, &ids_key);
+        id_seeds.extend(seeds.0.iter().cloned());
+        kinds_seeds.extend(seeds.1.iter().cloned());
+        stores_seeds.extend(seeds.2.iter().cloned());
+    }
+    let mut graphs =
+        Reachability::build_many(root, &[&id_seeds, &kinds_seeds, &stores_seeds]).into_iter();
+    let (Some(by_id), Some(asks_kinds), Some(asks_stores)) =
+        (graphs.next(), graphs.next(), graphs.next())
+    else {
+        return Err("internal: three seed sets, three graphs".into());
+    };
+
+    let mut problems = Vec::new();
+    for (rel, func) in &sites {
+        if let Some(why) = by_id.why(rel, func) {
+            problems.push(format!(
+                "{rel}::{func} hands a store to a build adapter and reaches a detector id ({why}): \
+                 the join goes through the detector's declared `build_stores()` and the adapter's \
+                 `store_kinds()`, never an id"
+            ));
+        }
+        if asks_kinds.why(rel, func).is_none() {
+            problems.push(format!(
+                "{rel}::{func} hands a store to a build adapter without an honoured \
+                 `store_kinds()` call anywhere it reaches: which adapter identifies a store is \
+                 the adapter's declared capability, not the join's choice"
+            ));
+        }
+        if asks_stores.why(rel, func).is_none() {
+            problems.push(format!(
+                "{rel}::{func} hands a store to a build adapter without an honoured \
+                 `build_stores()` call anywhere it reaches: which location is which kind of store \
+                 is the detector's declaration, not a guess from its path"
+            ));
+        }
+    }
+    // (3) literal comparisons in the join sites and their same-file
+    // helpers.
+    for rel in sites
+        .iter()
+        .map(|(r, _)| r.clone())
+        .collect::<BTreeSet<_>>()
+    {
+        let f = load_or_err(root, &rel)?;
+        let calls = crate::resolve::production_calls(&f.ast);
+        let local: HashSet<String> = ast::functions(&f.ast).into_iter().map(|x| x.name).collect();
+        let mut reach: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = sites
+            .iter()
+            .filter(|(r, _)| *r == rel)
+            .map(|(_, n)| n.clone())
+            .collect();
+        while let Some(n) = stack.pop() {
+            if !reach.insert(n.clone()) {
+                continue;
+            }
+            for c in calls.iter().filter(|c| c.func == n) {
+                let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
+                if local.contains(&callee) {
+                    stack.push(callee);
+                }
+            }
+        }
+        for (func, text) in literal_comparisons(&f.ast) {
+            if reach.contains(&func) {
+                problems.push(format!(
+                    "{rel}::{func} compares a string literal (`{text}`) on the way to handing a \
+                     store to an adapter: a path shape or a name is exactly what a custom \
+                     GOMODCACHE, GRADLE_USER_HOME or maven.repo.local defeats"
+                ));
+            }
+        }
+        problems.extend(unknown_macro_problems(&rel, &f.ast));
     }
     finish(problems)
 }
