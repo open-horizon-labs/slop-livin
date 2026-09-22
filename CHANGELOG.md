@@ -4,6 +4,50 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Repairs after review 2, part 4
+
+What "unchanged" is allowed to mean.
+
+- **A session transcript that is being appended to is now reported at
+  its real size, on the pass that sees the append.** Container and
+  external-unit reuse used to be keyed on the recorded directories'
+  `mtime`/`ctime`. A directory stamp moves when an entry is created,
+  deleted, renamed or replaced -- and not when a file inside it is
+  appended to in place, which is exactly how a running agent writes its
+  session. So a growing session kept its old byte total until something
+  else happened in its project directory. Reuse is now permitted only
+  under **trusted event coverage**: this pass's own FSEvents replay must
+  cover the path, report no event at or under it, and have opened no
+  later than the stored rows were written. FSEvents reports writes, so
+  the append is seen.
+  - A vouched-for container or external unit now costs *nothing* --
+    no listing, no `stat`, no header read. Measured: an unchanged
+    5,000-session home in five project directories, 11 listings and
+    5,006 stats on the first pass, 5 listings and 6 stats on the second,
+    none of them per container; a 20,000-file Cargo registry cache, 6
+    listings and 20,004 stats on the first pass, **0 and 0** on the
+    second.
+  - Where there is no window there is no reuse, and the unit is
+    re-measured. The window comes from the walk, so a tool home or cache
+    root that lies outside every scan root is re-measured on every pass
+    -- correct, and slower than the previous release. Giving each unit
+    root its own event cursor is the recorded follow-up.
+- **Codex, OpenCode and Pi session trees are now containers too.** Codex
+  wraps each `sessions/<yyyy>/<mm>/<dd>/`, OpenCode each
+  `storage/session/<project-id>/`, Pi each `sessions/<dir>/`. Each
+  container has its own entry budget: Codex's was shared across
+  `sessions/` and `archived_sessions/`, which made a day's contents
+  depend on how many files the days before it produced. Oh My Pi
+  deliberately stays off the seam, because its session bodies feed a
+  home-wide shared-blob reference count that a partially replayed pass
+  would report wrongly rather than as unknown.
+- **The "no subprocess spawns" check no longer needs a PATH shim.**
+  Every `Command::new` in the core crate records itself, so the
+  disabled-detector test measures spawns through a thread-scoped counter
+  instead of a process-wide `PATH` and a shared log file -- which made
+  it fail under the ordinary test harness whenever a sibling test
+  probed occupancy.
+
 ### Repairs after review 2, part 3
 
 The container-level half of the incrementality work, and a support
