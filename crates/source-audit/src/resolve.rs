@@ -233,6 +233,16 @@ impl Resolver {
     }
 }
 
+/// The first identifier in an argument's token text: the variable a
+/// destructive call is actually about, once `&`, `*` and `mut` are
+/// stripped.
+pub fn root_ident(arg: &str) -> String {
+    arg.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .find(|t| !t.is_empty() && !["mut", "ref"].contains(t))
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Segment-wise suffix match: `a::b::c` ends with `b::c` and with `c`,
 /// but `a::bb::c` does not end with `b::c`.
 pub fn path_ends_with(path: &str, suffix: &str) -> bool {
@@ -287,6 +297,11 @@ pub struct CallSite {
     /// sits inside, so a rule can require a guard to be *the condition*
     /// of the write rather than merely earlier in the body.
     pub conditions: Vec<String>,
+    /// Each argument's token text, so a rule can ask *which path* was
+    /// rechecked and *which path* is being removed. Without it, "all
+    /// destructive calls are rechecked" is satisfied by rechecking one
+    /// path and deleting another.
+    pub args: Vec<String>,
 }
 
 struct CallVisitor<'a> {
@@ -320,6 +335,14 @@ fn has_dead_code_allow(attrs: &[syn::Attribute]) -> bool {
 }
 
 impl CallVisitor<'_> {
+    fn record_with_args(&mut self, written: String, method: bool, args: Vec<String>) {
+        let before = self.out.len();
+        self.record(written, method);
+        if self.out.len() > before {
+            self.out[before].args = args;
+        }
+    }
+
     fn record(&mut self, written: String, method: bool) {
         let path = if method {
             written.clone()
@@ -336,6 +359,7 @@ impl CallVisitor<'_> {
             honoured: *self.honour.last().unwrap_or(&Honoured::Discarded),
             stmt: self.stmt,
             conditions: self.conditions.clone(),
+            args: Vec::new(),
         });
     }
 
@@ -397,7 +421,12 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*c.func {
-            self.record(p.path.to_token_stream().to_string(), false);
+            let args = c
+                .args
+                .iter()
+                .map(|a| a.to_token_stream().to_string())
+                .collect();
+            self.record_with_args(p.path.to_token_stream().to_string(), false, args);
         }
         // The callee's own path is not an argument; arguments are
         // propagated values, never discarded.
@@ -410,7 +439,12 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
     }
 
     fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
-        self.record(m.method.to_string(), true);
+        let args = m
+            .args
+            .iter()
+            .map(|a| a.to_token_stream().to_string())
+            .collect();
+        self.record_with_args(m.method.to_string(), true, args);
         // `f(..).unwrap()` / `.expect()` / `.map_err()` / `.context()`
         // all make the answer matter, so the receiver is honoured.
         let honours_receiver = matches!(
@@ -991,4 +1025,232 @@ mod tests {
         let site = calls(&f).into_iter().find(|c| c.path == "owns").unwrap();
         assert_eq!(site.honoured, Honoured::Yes);
     }
+}
+
+// ---------------------------------------------------------------------
+// Binding flow: which values a function derived from which
+// ---------------------------------------------------------------------
+
+/// One `let x = <expr>` or `for x in <expr>` in a function: the name
+/// bound and the token text it was derived from.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub func: String,
+    pub name: String,
+    pub from: String,
+}
+
+struct BindingVisitor {
+    func: String,
+    in_test: usize,
+    out: Vec<Binding>,
+}
+
+impl<'ast> Visit<'ast> for BindingVisitor {
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let test = is_test_attr(&m.attrs);
+        if test {
+            self.in_test += 1;
+        }
+        syn::visit::visit_item_mod(self, m);
+        if test {
+            self.in_test -= 1;
+        }
+    }
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if self.in_test == 0
+            && let Some(init) = &l.init
+        {
+            let from = init.expr.to_token_stream().to_string();
+            for name in pattern_names(&l.pat) {
+                self.out.push(Binding {
+                    func: self.func.clone(),
+                    name,
+                    from: from.clone(),
+                });
+            }
+        }
+        syn::visit::visit_local(self, l);
+    }
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        if self.in_test == 0 {
+            let from = f.expr.to_token_stream().to_string();
+            for name in pattern_names(&f.pat) {
+                self.out.push(Binding {
+                    func: self.func.clone(),
+                    name,
+                    from: from.clone(),
+                });
+            }
+        }
+        syn::visit::visit_expr_for_loop(self, f);
+    }
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        // A closure's parameters are bound from whatever the iterator
+        // adaptor was applied to; conservatively taint them from the
+        // whole closure body's context by recording the receiver text is
+        // not available here, so record them as derived from the
+        // enclosing function (empty `from` means "unknown origin").
+        syn::visit::visit_expr_closure(self, c);
+    }
+}
+
+fn pattern_names(pat: &syn::Pat) -> Vec<String> {
+    match pat {
+        syn::Pat::Ident(i) => vec![i.ident.to_string()],
+        syn::Pat::Type(t) => pattern_names(&t.pat),
+        syn::Pat::Reference(r) => pattern_names(&r.pat),
+        syn::Pat::Tuple(t) => t.elems.iter().flat_map(pattern_names).collect(),
+        syn::Pat::TupleStruct(t) => t.elems.iter().flat_map(pattern_names).collect(),
+        syn::Pat::Struct(s) => s
+            .fields
+            .iter()
+            .flat_map(|f| pattern_names(&f.pat))
+            .collect(),
+        syn::Pat::Slice(s) => s.elems.iter().flat_map(pattern_names).collect(),
+        syn::Pat::Or(o) => o.cases.iter().flat_map(pattern_names).collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn bindings(file: &syn::File) -> Vec<Binding> {
+    let mut v = BindingVisitor {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+/// Every name in `func` that is derived, transitively, from one of
+/// `seeds`.
+///
+/// This is what makes "the path you removed is a path you rechecked"
+/// checkable in real code, where a sink rechecks the unit and then
+/// renames each `member` of it: `member` is bound from `covered`, which
+/// is bound from `fresh`, which is the recheck's own result.
+pub fn derived_from(
+    all: &[Binding],
+    func: &str,
+    seeds: &[String],
+) -> std::collections::HashSet<String> {
+    let mut tainted: std::collections::HashSet<String> = seeds.iter().cloned().collect();
+    let here: Vec<&Binding> = all.iter().filter(|b| b.func == func).collect();
+    loop {
+        let before = tainted.len();
+        for b in &here {
+            if tainted.contains(&b.name) {
+                continue;
+            }
+            let mentions = b
+                .from
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|t| !t.is_empty() && tainted.contains(t));
+            if mentions {
+                tainted.insert(b.name.clone());
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+    tainted
+}
+
+// ---------------------------------------------------------------------
+// Assignments, with the conditions that guard them
+// ---------------------------------------------------------------------
+
+/// One assignment (`row.present = false`) with the token text of every
+/// `if`/`match`/`while` condition enclosing it.
+///
+/// "The guard appears earlier in the body" is not the same as "the guard
+/// is the condition of the write": the sweep kept `ownership.owns(key)`
+/// in the function and moved the tombstone out from under it.
+#[derive(Debug, Clone)]
+pub struct Assignment {
+    pub func: String,
+    pub lhs: String,
+    pub rhs: String,
+    pub conditions: Vec<String>,
+}
+
+struct AssignVisitor {
+    func: String,
+    in_test: usize,
+    conditions: Vec<String>,
+    out: Vec<Assignment>,
+}
+
+impl<'ast> Visit<'ast> for AssignVisitor {
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let test = is_test_attr(&m.attrs);
+        if test {
+            self.in_test += 1;
+        }
+        syn::visit::visit_item_mod(self, m);
+        if test {
+            self.in_test -= 1;
+        }
+    }
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        self.visit_expr(&i.cond);
+        self.conditions.push(i.cond.to_token_stream().to_string());
+        self.visit_block(&i.then_branch);
+        self.conditions.pop();
+        if let Some((_, e)) = &i.else_branch {
+            self.visit_expr(e);
+        }
+    }
+    fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
+        self.visit_expr(&m.expr);
+        self.conditions.push(m.expr.to_token_stream().to_string());
+        for arm in &m.arms {
+            self.visit_arm(arm);
+        }
+        self.conditions.pop();
+    }
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        if self.in_test == 0 {
+            self.out.push(Assignment {
+                func: self.func.clone(),
+                lhs: a.left.to_token_stream().to_string(),
+                rhs: a.right.to_token_stream().to_string(),
+                conditions: self.conditions.clone(),
+            });
+        }
+        syn::visit::visit_expr_assign(self, a);
+    }
+}
+
+pub fn assignments(file: &syn::File) -> Vec<Assignment> {
+    let mut v = AssignVisitor {
+        func: String::new(),
+        in_test: 0,
+        conditions: Vec::new(),
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
 }

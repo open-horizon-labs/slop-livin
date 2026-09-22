@@ -272,8 +272,35 @@ fn rechecks_of(
     r
 }
 
+/// The names a function binds from a recheck's own result
+/// (`let fresh = reviewed_snapshot(..)`), which seed the "derived from a
+/// recheck" set alongside the rechecks' arguments.
+fn recheck_result_bindings(root: &Path, rel: &str, func: &str) -> Vec<String> {
+    let Some(f) = crate::resolve::maybe(root, rel) else {
+        return Vec::new();
+    };
+    crate::resolve::bindings(&f.ast)
+        .into_iter()
+        .filter(|b| {
+            b.func == func
+                && (RECHECK_PATHS.iter().any(|(_, p)| {
+                    b.from
+                        .replace(' ', "")
+                        .contains(&p.replace("::", "::").replace(' ', ""))
+                }) || b.from.contains("covered_paths"))
+        })
+        .map(|b| b.name)
+        .collect()
+}
+
 pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
     let functions = workspace_functions(root);
+    let mut all_bindings: Vec<crate::resolve::Binding> = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        if let Some(f) = crate::resolve::maybe(root, &rel) {
+            all_bindings.extend(crate::resolve::bindings(&f.ast));
+        }
+    }
     let mut index: HashMap<String, Vec<crate::resolve::CallSite>> = HashMap::new();
     for (_, name, calls) in &functions {
         index.entry(name.clone()).or_default().extend(calls.clone());
@@ -330,6 +357,77 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
                      discarded does not count)",
                     d.written,
                     have.missing().join(" + ")
+                ));
+                continue;
+            }
+            // Rechecking one path and removing another satisfies "the
+            // rechecks happen first" while rechecking nothing that
+            // matters. The path the destructive call names has to be one
+            // the rechecks were about, or derived from their result.
+            let subject = d
+                .args
+                .first()
+                .map(|a| crate::resolve::root_ident(a))
+                .unwrap_or_default();
+            if subject.is_empty() {
+                continue;
+            }
+            let rechecked_subjects: String = calls
+                .iter()
+                .filter(|c| {
+                    c.stmt <= d.stmt
+                        && honoured_recheck(c)
+                        && (RECHECK_PATHS
+                            .iter()
+                            .any(|(_, p)| crate::resolve::path_ends_with(&c.path, p))
+                            || crate::resolve::path_ends_with(&c.path, "recheck::covered_paths"))
+                })
+                .flat_map(|c| c.args.clone())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let derived_from_recheck = calls.iter().any(|c| {
+                c.stmt <= d.stmt
+                    && honoured_recheck(c)
+                    && RECHECK_PATHS
+                        .iter()
+                        .any(|(_, p)| crate::resolve::path_ends_with(&c.path, p))
+            }) && rechecked_subjects.is_empty();
+            // When the rechecks were provided by a helper, this
+            // function cannot say which path the helper was about, so
+            // the subject rule does not apply here -- the helper is
+            // audited where it lives.
+            let direct = calls
+                .iter()
+                .filter(|c| c.stmt <= d.stmt && honoured_recheck(c))
+                .fold(Rechecks::default(), |acc, c| {
+                    let mut acc = acc;
+                    for (i, (_, path)) in RECHECK_PATHS.iter().enumerate() {
+                        if crate::resolve::path_ends_with(&c.path, path) {
+                            match i {
+                                0 => acc.snapshot = true,
+                                1 => acc.protection = true,
+                                _ => acc.occupancy = true,
+                            }
+                        }
+                    }
+                    acc
+                });
+            if !direct.complete() {
+                continue;
+            }
+            let seeds: Vec<String> = rechecked_subjects
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .chain(recheck_result_bindings(root, rel, name))
+                .collect();
+            let tainted = crate::resolve::derived_from(&all_bindings, name, &seeds);
+            let mentioned = tainted.contains(&subject);
+            if !mentioned && !derived_from_recheck {
+                violations.push(format!(
+                    "{rel}::{name} performs `{}` on `{subject}`, which none of its rechecks were \
+                     about: rechecking one path and removing another is not a recheck",
+                    d.written
                 ));
             }
         }
@@ -408,6 +506,17 @@ const ERROR_DISCARDS: &[&str] = &[
     ". unwrap_or_else (",
     ". ok ()",
     ". unwrap_or_default()",
+];
+
+/// `(file, fn)`: the functions that legitimately load the protect list
+/// without testing a candidate against it -- they manage the list
+/// itself. Everything else that loads it is about to make a decision,
+/// and that decision goes through `protection_conflict`.
+const PROTECT_LIST_MANAGERS: &[(&str, &str)] = &[
+    ("crates/core/src/agents/mod.rs", "protect_add"),
+    ("crates/core/src/agents/mod.rs", "protect_remove"),
+    ("crates/core/src/agents/mod.rs", "protect_list"),
+    ("crates/core/src/agents/mod.rs", "load_protect"),
 ];
 
 pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
@@ -544,6 +653,51 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
                 }
             }
         }
+    }
+    // Every function that loads the protect list and is not managing
+    // the list itself must reach the one predicate. The mutation sweep
+    // re-implemented `live_protection` with a single `starts_with`
+    // direction: it returns `Result`, not `bool`, and lives in
+    // `recheck.rs`, so a rule that inspected only the bool-returning
+    // predicate in `agents/mod.rs` could not see it.
+    let mut open_coded: Vec<String> = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(sf) = crate::resolve::maybe(root, &rel) else {
+            continue;
+        };
+        let mut by_fn: HashMap<String, Vec<crate::resolve::CallSite>> = HashMap::new();
+        for c in crate::resolve::production_calls(&sf.ast) {
+            by_fn.entry(c.func.clone()).or_default().push(c);
+        }
+        for (name, calls) in by_fn {
+            let loads = calls
+                .iter()
+                .any(|c| crate::resolve::path_ends_with(&c.path, "agents::load_protect"));
+            if !loads {
+                continue;
+            }
+            if PROTECT_LIST_MANAGERS
+                .iter()
+                .any(|(f, n)| *f == rel && *n == name)
+            {
+                continue;
+            }
+            let uses_predicate = calls
+                .iter()
+                .any(|c| crate::resolve::path_ends_with(&c.path, "protection_conflict"));
+            if !uses_predicate {
+                open_coded.push(format!(
+                    "{rel}::{name} loads the protect list and decides for itself instead of \
+                     calling `agents::protection_conflict`; a second predicate is a second place \
+                     to get one direction wrong"
+                ));
+            }
+        }
+    }
+    if !open_coded.is_empty() {
+        open_coded.sort();
+        open_coded.dedup();
+        return Err(open_coded.join("\n  "));
     }
     Ok(())
 }
@@ -697,30 +851,74 @@ pub fn history_sweeps_are_owned(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    // The tombstone loop -- the code that sets `present = false` -- must
-    // be guarded by the ownership test.
-    let Some(sweep_at) = f.body.find("present = false") else {
-        return Err("growth::observe_and_annotate_external no longer tombstones anything".into());
-    };
-    let prefix = &f.body[..sweep_at];
-    let guard_at = prefix
-        .rfind("ownership . owns (")
-        .or_else(|| prefix.rfind("ownership . covers ("));
-    if guard_at.is_none() {
-        return Err(
-            "growth::observe_and_annotate_external marks rows absent without an \
-             `ownership.owns(..)` guard: one family's sweep would tombstone another's rows"
-                .into(),
-        );
+    // The tombstone write -- the code that sets `present = false`, or
+    // increments `regrowth_count` -- must be guarded by the ownership
+    // test *as its condition*, in every function in the workspace, not
+    // only in the one this audit used to name. The sweep kept
+    // `ownership.owns(key)` in the body and moved the write out from
+    // under it (`let _owned = ownership.owns(key); row.present = false;`).
+    let mut ungated: Vec<String> = Vec::new();
+    let mut found_a_sweep = false;
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(sf) = crate::resolve::maybe(root, &rel) else {
+            continue;
+        };
+        for a in crate::resolve::assignments(&sf.ast) {
+            // A tombstone is marking a row absent, or *incrementing* the
+            // regrowth counter. Copying an already-stored count onto a
+            // display row is neither.
+            let tombstone = (a.lhs.ends_with(". present") && a.rhs.trim() == "false")
+                || (a.lhs.ends_with(". regrowth_count") && a.rhs.replace(' ', "").contains("+1"));
+            if !tombstone {
+                continue;
+            }
+            found_a_sweep = true;
+            let guarded = a.conditions.iter().any(|c| {
+                let c = c.replace(' ', "");
+                c.contains("ownership.owns(")
+                    || c.contains("ownership.covers(")
+                    || c.contains("protected_keys.contains(")
+                    || c.contains("protected_worktree_ids.contains(")
+                    || c.contains("!prev.present")
+                    || c.contains("changed")
+            });
+            if !guarded {
+                ungated.push(format!(
+                    "{rel}::{} writes `{} = {}` with no ownership test in the condition that \
+                     guards it",
+                    a.func,
+                    a.lhs.replace(' ', ""),
+                    a.rhs.replace(' ', "")
+                ));
+            }
+        }
     }
+    if !found_a_sweep {
+        return Err("nothing in the workspace tombstones a row any more".into());
+    }
+    if !ungated.is_empty() {
+        ungated.sort();
+        ungated.dedup();
+        return Err(format!(
+            "one family's sweep must never tombstone another's rows, and a coverage change is \
+             never a deletion:\n  {}",
+            ungated.join("\n  ")
+        ));
+    }
+    let _ = f;
     // No wildcard ownership outside tests.
     for rel in workspace_src_files(root) {
         let Some(sf) = maybe_parse(root, &rel) else {
             continue;
         };
         for func in ast::functions(&sf.ast) {
-            if func.body.contains("ObservationOwnership :: all (")
-                || func.body.contains("ObservationOwnership :: wildcard (")
+            let body = func.body.replace(' ', "");
+            if body.contains("ObservationOwnership::all(")
+                || body.contains("ObservationOwnership::wildcard(")
+                // A window seeded with the filesystem root covers
+                // everything, which is the wildcard written as data.
+                || (body.contains("ObservationOwnership::new(")
+                    && (body.contains("PathBuf::from(\"/\")") || body.contains("Path::new(\"/\")")))
             {
                 return Err(format!(
                     "{rel}::{} constructs a wildcard ObservationOwnership; a sweep that owns \
@@ -990,6 +1188,13 @@ const STORE_CONTROL_FILES: &[&str] = &[
     "report.json.zst",
 ];
 
+/// Control files whose name carries an id. Written with the placeholder
+/// in place, because that is what the audit sees after `format!`
+/// expansion -- and because an allow-list that skips *every* literal
+/// containing `{}` is the escape the mutation sweep used to add
+/// `format!("project-{}.json")` as a per-project sidecar.
+const STORE_CONTROL_PATTERNS: &[&str] = &["plans/{}.json", "{}.json.zst"];
+
 pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String> {
     let mut files = workspace_src_files(root);
     files.retain(|r| r.starts_with("crates/core/src") || r.starts_with("crates/tui/src"));
@@ -1001,20 +1206,25 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
         // layouts; a Claude Code `settings.json` an adapter identifies
         // is someone else's file, not swamp's store. Everything else in
         // core/tui that joins a `.json` name is building a store path.
-        if rel.starts_with("crates/core/src/agents/")
-            || rel.starts_with("crates/core/src/locations")
-        {
-            continue;
-        }
+        // Adapters and detectors used to be skipped wholesale, which
+        // meant a sidecar written from `agents/mod.rs` was invisible.
+        // The function-level "does this function handle a store path"
+        // test below is the real discriminator, so the directory skip is
+        // gone.
         for func in ast::functions(&f.ast) {
             // Only a function that actually handles a store path can be
             // naming a store file. `read_identities(root)` joining
             // `package-lock.json` is reading the *user's project*, which
             // is this tool's whole job.
-            if !["swamp_dir", "store_dir", "store"]
-                .iter()
-                .any(|s| func.body.contains(s))
-            {
+            // Whole-token match, not substring: OpenCode's own
+            // `storage/` directory is not swamp's store, and an adapter
+            // naming another tool's `auth.json` is doing its job.
+            let handles_store = ["swamp_dir", "store_dir", "swamp_path"].iter().any(|s| {
+                func.body
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|t| t == *s)
+            });
+            if !handles_store {
                 continue;
             }
             for lit in string_literals_in(&func.body) {
@@ -1034,7 +1244,10 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
                 if STORE_CONTROL_FILES.contains(&name) {
                     continue;
                 }
-                if lit.contains("{}") || lit.contains("{id}") {
+                if STORE_CONTROL_PATTERNS
+                    .iter()
+                    .any(|p| lit.ends_with(p) || &lit.as_str() == p)
+                {
                     continue;
                 }
                 return Err(format!(
@@ -1157,11 +1370,17 @@ pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Every way a value becomes JSON bytes. `serde_json :: json !` is here
+/// because the mutation sweep used `json!(..).to_string()` -- which
+/// produces exactly the same bytes and contains none of the other three
+/// needles.
 const JSON_SERIALIZE_CALLS: &[&str] = &[
     "serde_json :: to_vec",
     "serde_json :: to_string",
     "serde_json :: to_writer",
     "serde_json :: Serializer",
+    "serde_json :: json !",
+    "json ! (",
 ];
 
 const WRITE_SINKS: &[&str] = &[
@@ -1436,23 +1655,35 @@ pub fn agent_adapters_do_not_traverse(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-const ACTION_REFERENCES: &[&str] = &[
-    "actions ::",
-    "fs :: rename (",
-    "remove_file (",
-    "remove_dir (",
-    "trash ::",
-    "Plan {",
-    "Grant {",
-    "Ledger",
+/// Text shapes that are not calls (a struct literal, a type name).
+const ACTION_REFERENCES: &[&str] = &["actions ::", "trash ::", "Plan {", "Grant {", "Ledger"];
+
+/// Resolved paths an adapter may never call. `remove_dir_all` was
+/// missing from the old token list entirely, which is how the sweep got
+/// `fs::remove_dir_all(home.join("logs"))` into an adapter's `identify`:
+/// identification deleting the user's logs, passing an audit named
+/// "inspection only".
+const ADAPTER_FORBIDDEN_CALLS: &[&str] = &[
+    "fs::rename",
+    "fs::remove_file",
+    "fs::remove_dir",
+    "fs::remove_dir_all",
+    "fs::write",
+    "fs::create_dir",
+    "fs::create_dir_all",
+    "fs::set_permissions",
+    "fs::copy",
+    "fs::hard_link",
+    "Command::new",
 ];
 
 pub fn agent_adapters_are_inspection_only(root: &Path) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
     for rel in agent_adapter_files(root) {
         let f = parse(root, &rel)?;
         for func in ast::functions(&f.ast) {
             if let Some((_, call)) = find_first(&func.body, ACTION_REFERENCES) {
-                return Err(format!(
+                problems.push(format!(
                     "{rel}::{} references `{}`: identification never acts. An adapter declares an \
                      action capability; only the shared sink executes it",
                     func.name,
@@ -1460,8 +1691,32 @@ pub fn agent_adapters_are_inspection_only(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+        // Resolved calls, so an alias cannot rename the primitive out of
+        // sight, and every mutating filesystem call is covered rather
+        // than the three that happened to be listed.
+        for c in crate::resolve::production_calls(&f.ast) {
+            if c.method {
+                continue;
+            }
+            if let Some(bad) = ADAPTER_FORBIDDEN_CALLS
+                .iter()
+                .find(|p| crate::resolve::path_ends_with(&c.path, p))
+            {
+                problems.push(format!(
+                    "{rel}::{} calls `{}` (resolved: {bad}): an adapter identifies, it never \
+                     writes, deletes or spawns",
+                    c.func, c.written
+                ));
+            }
+        }
     }
-    Ok(())
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        problems.sort();
+        problems.dedup();
+        Err(problems.join("\n  "))
+    }
 }
 
 const EMITTERS: &[&str] = &[
@@ -1492,20 +1747,39 @@ pub fn agent_adapters_do_not_emit_content(root: &Path) -> Result<(), String> {
 }
 
 pub fn agent_units_built_through_builder(root: &Path) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
     for rel in agent_adapter_files(root) {
         let f = parse(root, &rel)?;
-        for what in ["CandidateAgentUnit", "AgentUnit"] {
-            for site in ast::guarded_sites(&f.ast, what) {
-                // `guarded_sites` reports struct literals and calls; a
-                // struct literal is what we forbid.
-                if f.text.contains(&format!("{what} {{")) {
-                    return Err(format!(
-                        "{rel}::{} builds a `{what} {{ .. }}` struct literal: units are built with \
-                         `AgentUnitBuilder::new(tool, category, path)`, whose constructor applies \
-                         protected-by-default categories that a literal can silently omit",
-                        site.func
+        let res = crate::resolve::resolver(&f.ast);
+        // Struct-literal *expressions*, with their path resolved: `use
+        // super::CandidateAgentUnit as Unit; Unit { protected: false,
+        // .. }` is the sweep's mutation and the old text match could not
+        // see it.
+        for (func, path) in ast::struct_literal_sites(&f.ast) {
+            let resolved = res.resolve(&path);
+            for what in ["CandidateAgentUnit", "AgentUnit"] {
+                if crate::resolve::path_ends_with(&resolved, what) {
+                    problems.push(format!(
+                        "{rel}::{func} builds a `{what} {{ .. }}` struct literal (written \
+                         `{path}`): units are built with `AgentUnitBuilder::new(tool, category, \
+                         path)`, whose constructor applies protected-by-default categories that a \
+                         literal can silently omit"
                     ));
                 }
+            }
+        }
+        // Lifting a default protection is a reviewed, explicit act; an
+        // empty reason is the same silent unprotect written differently.
+        for c in crate::resolve::production_calls(&f.ast) {
+            if c.path == "unprotect_with_reason"
+                && c.args
+                    .iter()
+                    .all(|a| a.replace(' ', "").is_empty() || a.replace(' ', "") == "\"\"")
+            {
+                problems.push(format!(
+                    "{rel}::{} lifts protected-by-default with no stated reason",
+                    c.func
+                ));
             }
         }
     }
@@ -1513,16 +1787,13 @@ pub fn agent_units_built_through_builder(root: &Path) -> Result<(), String> {
     if !modrs.text.contains("AgentUnitBuilder") {
         return Err("agents/mod.rs does not define `AgentUnitBuilder`".into());
     }
-    for rel in agent_adapter_files(root) {
-        let f = parse(root, &rel)?;
-        if f.text.contains("unprotect_with_reason") {
-            // Lifting a default protection is a reviewed, explicit act;
-            // it may appear, but never silently -- the audit records it
-            // by requiring a stated reason in the same call.
-            continue;
-        }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        problems.sort();
+        problems.dedup();
+        Err(problems.join("\n  "))
     }
-    Ok(())
 }
 
 const ENVIRONMENT_REACHES: &[&str] = &["std :: env", "env :: var", "dirs ::", "home_dir"];
@@ -2215,15 +2486,15 @@ mod mutation_tests {
     /// wrote `let _ = recheck::live_protection(..)` is now a *rejection*
     /// fixture, because that is the mutation the sweep used.
     const GOOD_SINK: &str = r#"
-        pub fn execute_x(dir: &std::path::Path) -> anyhow::Result<()> {
+        pub fn execute_x(dir: &std::path::Path, path: &std::path::Path) -> anyhow::Result<()> {
             let fresh = recheck::reviewed_snapshot(path, reviewed)?;
+            let paths = recheck::covered_paths(&fresh);
             recheck::live_protection(dir, &paths)?;
             match recheck::member_occupancy(&paths) {
                 OccupancyState::Free => {}
                 _ => anyhow::bail!("refused"),
             }
-            let _ = fresh;
-            fs::rename(a, b)?;
+            fs::rename(path, dir)?;
             Ok(())
         }
     "#;
@@ -2281,8 +2552,8 @@ mod mutation_tests {
         let tmp = workspace(&[
             (
                 "crates/core/src/actions.rs",
-                "pub fn execute_x() -> R { gate()?; fs::rename(a, b)?; Ok(()) }\n\
-                 fn gate() -> R { recheck::reviewed_snapshot(p, r)?; \
+                "pub fn execute_x(a: &Path, b: &Path) -> R { gate(a)?; fs::rename(a, b)?; Ok(()) }\n\
+                 fn gate(a: &Path) -> R { recheck::reviewed_snapshot(a, r)?; \
                  recheck::live_protection(d, &v)?; \
                  match recheck::member_occupancy(&v) { S::Free => {} _ => bail!(\"no\") } Ok(()) }",
             ),
@@ -2447,7 +2718,10 @@ mod mutation_tests {
         let mutated = GOOD_SWEEP.replace("&& ownership.owns(key) ", "");
         let tmp = workspace(&[("crates/core/src/growth.rs", &mutated)]);
         let err = history_sweeps_are_owned(tmp.path()).unwrap_err();
-        assert!(err.contains("ownership.owns"), "{err}");
+        assert!(
+            err.contains("ownership") && err.contains("condition"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2765,7 +3039,12 @@ mod mutation_tests {
             "fn identify() { let _ = fs::rename(a, b); }",
         )]);
         let err = agent_adapters_are_inspection_only(tmp.path()).unwrap_err();
-        assert!(err.contains("identification never acts"), "{err}");
+        assert!(
+            err.contains("it never \nwrites")
+                || err.contains("never acts")
+                || err.contains("writes, deletes or spawns"),
+            "{err}"
+        );
     }
 
     #[test]
