@@ -274,23 +274,33 @@ fn identify_sessions(
     };
     let mut loose = Vec::new();
     let mut containers = 0usize;
-    for entry in ctx.list(&base) {
+    let (listed, truncation) = ctx.list_checked(&base);
+    // Containers past the listing's cap are never folded -- with a
+    // partial or without one -- so a count over the rest is short and
+    // must not be printed as complete (re-review 3, F1).
+    if truncation.is_truncated() {
+        refs.complete = false;
+    }
+    for entry in listed {
         let path = base.join(&entry.name);
         if entry.is_dir {
             if containers >= MAX_CONTAINERS {
                 // A pass-level cap on how many containers are identified
                 // at all. Decided by the tree alone, never by what a
                 // sibling produced, so a container's contents can be
-                // replayed into a pass that reached it differently.
+                // replayed into a pass that reached it differently. The
+                // containers it skips are unfolded, so the aggregate is
+                // no longer complete either.
+                refs.complete = false;
                 break;
             }
             containers += 1;
             let (units, facts) = ctx.container_with_facts(OH_MY_PI_TOOL_ID, &path, &|| {
                 let mut files = Vec::new();
-                collect_files(&path, 1, ctx, &mut files);
+                let listing_truncated = collect_files(&path, 1, ctx, &mut files);
                 let mut units = Vec::new();
                 let (counts, truncated) = session_units(home, files, ctx, &mut units);
-                (units, encode_refs(&counts, truncated))
+                (units, encode_refs(&counts, truncated || listing_truncated))
             });
             match &facts {
                 super::ContainerFacts::Recorded(f) => fold_refs(&mut refs, Some(f)),
@@ -370,21 +380,28 @@ fn session_units(
     (counts, any_truncated)
 }
 
-fn collect_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
+/// Collects a container's session files within its depth and entry
+/// bounds. Returns whether any bound or listing cap cut the collection
+/// short: a container whose files were not all seen has an incomplete
+/// reference partial, exactly as a truncated session body does.
+fn collect_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) -> bool {
     if depth > MAX_WALK_DEPTH || out.len() >= MAX_CONTAINER_ENTRIES {
-        return;
+        return true;
     }
-    for entry in ctx.list(dir) {
+    let (listed, truncation) = ctx.list_checked(dir);
+    let mut cut = truncation.is_truncated();
+    for entry in listed {
         if out.len() >= MAX_CONTAINER_ENTRIES {
-            return;
+            return true;
         }
         let path = dir.join(&entry.name);
         if entry.is_dir {
-            collect_files(&path, depth + 1, ctx, out);
+            cut |= collect_files(&path, depth + 1, ctx, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
     }
+    cut
 }
 
 /// The two facts this adapter takes from one session file, from **one**

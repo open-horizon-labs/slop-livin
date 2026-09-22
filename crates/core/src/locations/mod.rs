@@ -95,14 +95,64 @@ pub struct ShallowEntry {
     pub is_dir: bool,
 }
 
-pub fn shallow_list(dir: &std::path::Path) -> Vec<ShallowEntry> {
+/// Whether a bounded listing saw everything.
+///
+/// Re-review 3 (F1): `shallow_list` stopped at the cap and said nothing,
+/// so a caller summing over the entries -- Oh My Pi's shared-blob
+/// reference count -- reported a short number as complete. The cap is
+/// the bound that earns the listing its exemption from the traversal
+/// guardrails; saying when it was hit is what keeps the bound honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    Complete,
+    /// The listing stopped at the cap with more entries left; `n` is how
+    /// many it kept.
+    Truncated { n: usize },
+}
+
+impl Truncation {
+    pub fn is_truncated(self) -> bool {
+        matches!(self, Truncation::Truncated { .. })
+    }
+}
+
+/// A [`shallow_list`]: its entries, and whether they are all of them.
+/// Iterates and dereferences as the entries, so a caller that needs only
+/// the names reads it as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShallowListing {
+    pub entries: Vec<ShallowEntry>,
+    pub truncation: Truncation,
+}
+
+impl std::ops::Deref for ShallowListing {
+    type Target = [ShallowEntry];
+    fn deref(&self) -> &[ShallowEntry] {
+        &self.entries
+    }
+}
+
+impl IntoIterator for ShallowListing {
+    type Item = ShallowEntry;
+    type IntoIter = std::vec::IntoIter<ShallowEntry>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+pub fn shallow_list(dir: &std::path::Path) -> ShallowListing {
     crate::work_counters::record_dir_listed();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return ShallowListing {
+            entries: Vec::new(),
+            truncation: Truncation::Complete,
+        };
     };
     let mut out: Vec<ShallowEntry> = Vec::new();
+    let mut truncation = Truncation::Complete;
     for entry in entries.flatten() {
         if out.len() >= SHALLOW_LIST_CAP {
+            truncation = Truncation::Truncated { n: out.len() };
             break;
         }
         let Ok(ft) = entry.file_type() else { continue };
@@ -116,7 +166,10 @@ pub fn shallow_list(dir: &std::path::Path) -> Vec<ShallowEntry> {
     }
     crate::work_counters::record_files_statted(out.len() as u64);
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    ShallowListing {
+        entries: out,
+        truncation,
+    }
 }
 
 /// Just the subdirectory names, the shape most callers want.
@@ -827,6 +880,29 @@ impl Default for Registry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_listing_past_its_cap_says_it_was_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(super::SHALLOW_LIST_CAP + 7) {
+            std::fs::write(dir.path().join(format!("e{i:05}")), b"").unwrap();
+        }
+        let listing = super::shallow_list(dir.path());
+        assert_eq!(listing.len(), super::SHALLOW_LIST_CAP);
+        assert_eq!(
+            listing.truncation,
+            super::Truncation::Truncated {
+                n: super::SHALLOW_LIST_CAP
+            },
+            "a capped listing that stays silent turns every aggregate over it into a short \
+             number presented as complete"
+        );
+        std::fs::remove_file(dir.path().join("e00000")).unwrap();
+        for i in 1..8 {
+            std::fs::remove_file(dir.path().join(format!("e{i:05}"))).unwrap();
+        }
+        assert_eq!(super::shallow_list(dir.path()).truncation, super::Truncation::Complete);
+    }
+
     use super::*;
 
     /// The guardrail this capability exists for

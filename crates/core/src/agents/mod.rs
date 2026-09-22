@@ -964,14 +964,26 @@ impl<'a> IdentifyCtx<'a> {
     /// One bounded, single-level, symlink-refusing listing. Sorted, so
     /// identification output does not depend on directory order.
     pub fn list(&self, dir: &Path) -> Vec<Entry> {
+        self.list_checked(dir).0
+    }
+
+    /// [`IdentifyCtx::list`], with whether the listing stopped at its cap.
+    /// A caller whose output is an aggregate over the entries -- a count
+    /// someone could act on -- must read this, not assume completeness.
+    pub fn list_checked(&self, dir: &Path) -> (Vec<Entry>, crate::locations::Truncation) {
         self.watch(dir);
-        crate::locations::shallow_list(dir)
-            .into_iter()
-            .map(|e| Entry {
-                name: e.name,
-                is_dir: e.is_dir,
-            })
-            .collect()
+        let listing = crate::locations::shallow_list(dir);
+        let truncation = listing.truncation;
+        (
+            listing
+                .into_iter()
+                .map(|e| Entry {
+                    name: e.name,
+                    is_dir: e.is_dir,
+                })
+                .collect(),
+            truncation,
+        )
     }
 
     pub fn dir_names(&self, dir: &Path) -> Vec<String> {
