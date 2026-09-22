@@ -1,6 +1,6 @@
 //! target: crates/core/src/schedule.rs
 //! mode: replace
-//! why: the check is present and honoured, but runs after the plist is on disk -- a refusal after a write leaves the state behind and reports failure
+//! why: move-to-helper variant -- install itself writes nothing; the plist is written by a helper it calls before the check, so a rule reading only install's own body sees the check come first
 use anyhow::{Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,9 +32,14 @@ pub fn status(_store: &Path) -> Result<String> {
 }
 
 
-pub fn install(interval: &str, _roots: &[PathBuf]) -> Result<String> {
+fn write_agent(interval: &str) -> Result<()> {
     fs::create_dir_all(log_dir())?;
     fs::write(plist_path(), render_plist(interval))?;
+    Ok(())
+}
+
+pub fn install(interval: &str, _roots: &[PathBuf]) -> Result<String> {
+    write_agent(interval)?;
     if let Some(refusal) = scheduling().refusal() {
         bail!("{refusal}");
     }

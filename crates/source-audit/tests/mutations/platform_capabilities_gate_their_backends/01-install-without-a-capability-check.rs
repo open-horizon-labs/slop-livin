@@ -1,19 +1,40 @@
 //! target: crates/core/src/schedule.rs
-//! mode: append
-//! why: an installer that never asks whether this platform has a scheduler writes a LaunchAgent plist into a directory no daemon reads and reports success
+//! mode: replace
+//! why: an installer that never asks whether this platform has a scheduler writes a LaunchAgent plist no daemon reads and reports success
+use anyhow::{Result, bail};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-/// Installs the scheduled observation. Looks complete; asks nothing.
-pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
-    let seconds = parse_interval(interval_raw)?;
-    let exe = current_exe()?;
-    let plist = plist_path();
-    let log = log_file();
-    fs::create_dir_all(log_dir()).context("create log dir")?;
-    if let Some(parent) = plist.parent() {
-        fs::create_dir_all(parent).context("create LaunchAgents dir")?;
+pub fn scheduling() -> crate::platform::Scheduling {
+    crate::platform::Scheduling::for_os(crate::platform::Os::current())
+}
+fn plist_path() -> PathBuf {
+    PathBuf::from("/tmp/agent.plist")
+}
+fn log_dir() -> PathBuf {
+    PathBuf::from("/tmp/logs")
+}
+fn render_plist(interval: &str) -> String {
+    format!("<plist>{interval}</plist>")
+}
+fn load_plist(path: &Path) -> Result<()> {
+    std::process::Command::new("launchctl").arg("load").arg(path).status()?;
+    Ok(())
+}
+pub fn uninstall() -> Result<String> {
+    if let Some(refusal) = scheduling().refusal() {
+        bail!("{refusal}");
     }
-    let body = render_plist(&exe, roots, seconds, &log, None);
-    fs::write(&plist, body)?;
-    load_plist(&plist)?;
-    Ok(format!("Scheduled observation every {}\n", format_interval(seconds)))
+    Ok(String::new())
+}
+pub fn status(_store: &Path) -> Result<String> {
+    Ok(String::new())
+}
+
+
+pub fn install(interval: &str, _roots: &[PathBuf]) -> Result<String> {
+    fs::create_dir_all(log_dir())?;
+    fs::write(plist_path(), render_plist(interval))?;
+    load_plist(&plist_path())?;
+    Ok(format!("Scheduled observation every {interval}\n"))
 }

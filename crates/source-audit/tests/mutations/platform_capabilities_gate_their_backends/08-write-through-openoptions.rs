@@ -1,6 +1,6 @@
 //! target: crates/core/src/schedule.rs
 //! mode: replace
-//! why: the check is present and honoured, but runs after the plist is on disk -- a refusal after a write leaves the state behind and reports failure
+//! why: a write through OpenOptions::truncate, which a hand-written list of fs::write/create_dir_all does not name -- the std::fs set is inverted so an unlisted mutation fails closed
 use anyhow::{Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,11 +33,15 @@ pub fn status(_store: &Path) -> Result<String> {
 
 
 pub fn install(interval: &str, _roots: &[PathBuf]) -> Result<String> {
-    fs::create_dir_all(log_dir())?;
-    fs::write(plist_path(), render_plist(interval))?;
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(plist_path())?;
+    f.write_all(render_plist(interval).as_bytes())?;
     if let Some(refusal) = scheduling().refusal() {
         bail!("{refusal}");
     }
-    load_plist(&plist_path())?;
     Ok(String::new())
 }

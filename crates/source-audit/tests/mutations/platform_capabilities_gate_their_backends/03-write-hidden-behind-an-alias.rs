@@ -1,20 +1,45 @@
 //! target: crates/core/src/schedule.rs
-//! mode: append
-//! why: alias/rename variant -- the write is spelled through `use std::fs::write as emit`, so a text-matching rule sees no write before the capability check and passes a mutation that installs on a platform with no scheduler
+//! mode: replace
+//! why: alias/rename variant -- the writes are spelled through `use std::fs::write as emit` and `create_dir_all as ensure`, so a text-matching rule sees no write before the check
+use anyhow::{Result, bail};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub fn scheduling() -> crate::platform::Scheduling {
+    crate::platform::Scheduling::for_os(crate::platform::Os::current())
+}
+fn plist_path() -> PathBuf {
+    PathBuf::from("/tmp/agent.plist")
+}
+fn log_dir() -> PathBuf {
+    PathBuf::from("/tmp/logs")
+}
+fn render_plist(interval: &str) -> String {
+    format!("<plist>{interval}</plist>")
+}
+fn load_plist(path: &Path) -> Result<()> {
+    std::process::Command::new("launchctl").arg("load").arg(path).status()?;
+    Ok(())
+}
+pub fn uninstall() -> Result<String> {
+    if let Some(refusal) = scheduling().refusal() {
+        bail!("{refusal}");
+    }
+    Ok(String::new())
+}
+pub fn status(_store: &Path) -> Result<String> {
+    Ok(String::new())
+}
+
 
 use std::fs::create_dir_all as ensure;
 use std::fs::write as emit;
 
-pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
-    let seconds = parse_interval(interval_raw)?;
-    let exe = current_exe()?;
-    let plist = plist_path();
-    let log = log_file();
-    ensure(log_dir()).context("create log dir")?;
-    let body = render_plist(&exe, roots, seconds, &log, None);
-    emit(&plist, body)?;
+pub fn install(interval: &str, _roots: &[PathBuf]) -> Result<String> {
+    ensure(log_dir())?;
+    emit(plist_path(), render_plist(interval))?;
     if let Some(refusal) = scheduling().refusal() {
         bail!("{refusal}");
     }
-    Ok(format!("Scheduled observation every {}\n", format_interval(seconds)))
+    Ok(String::new())
 }
