@@ -5,9 +5,52 @@ Continues `.oh/sessions/2026-09-21-foundation-repairs.md`, which left
 list of what the next worker starts from. All nine are closed.
 
 ```
-cargo run -q -p swamp-source-audit
-42 ok, 0 failed
+$ cargo run -q -p swamp-source-audit
+ok    tui_actions_off_event_thread
+ok    one_byte_formatter
+ok    legacy_invariants
+ok    fsevents_before_full_walk
+ok    column_store_parquet_zstd
+ok    reverse_delta_current_plus_deltas
+ok    scheduled_refresh_launchagent
+ok    folding_only_for_artifacts
+ok    symlinks_never_followed
+ok    incremental_walk_only_changed_subtrees
+ok    walk_optimized_parallel_pool
+ok    dir_mtime_int32_minutes
+ok    agent_interface_facts_not_verdicts
+ok    human_only_authorization
+ok    no_consumer_knows_other_consumers
+ok    static_registration_only
+ok    all_report_paths_through_bus
+ok    extractors_are_pluggable
+ok    event_bus_pluggable_consumers
+ok    adr_validation
+ok    execution_sinks_recheck_live_state
+ok    protection_fails_closed
+ok    discovery_consumes_effective_scope
+ok    explicit_only_scope_when_defaults_false
+ok    history_sweeps_are_owned
+ok    no_second_traversal_on_report_path
+ok    occupancy_is_tristate_at_sinks
+ok    tui_refresh_preserves_scope
+ok    store_data_is_parquet_not_json_sidecars
+ok    json_persistence_is_allowlisted
+ok    agent_adapters_are_pluggable
+ok    agent_adapters_read_bounded_headers_only
+ok    agent_adapters_do_not_traverse
+ok    agent_adapters_are_inspection_only
+ok    agent_adapters_do_not_emit_content
+ok    agent_units_built_through_builder
+ok    agent_adapters_are_environment_free
+ok    agent_adapters_do_not_reach_detectors
+ok    agent_adapter_test_contract
+ok    detector_ids_only_in_registry
+ok    discovery_owned_by_report_pipeline
+ok    no_dead_public_evidence_api
 ```
+
+Forty-two audits, no failures, exit 0.
 
 Three of the nine were one piece of work with three names, one was a
 rule that could not be satisfied as written, one was seventeen dead
