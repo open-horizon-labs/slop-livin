@@ -108,8 +108,11 @@ fi
 # The spawn counter cannot be allowed to rot: a `Command::new` added
 # without its `record_spawn()` would make
 # `a_disabled_detector_must_not_probe_its_tool` pass while the spawn it
-# guards against happens. The AST audit's resolver does not follow
-# `Command` builders, so this is the check.
+# guards against happens. Production code builds every subprocess
+# through `spawn::command`, which counts it, and the test-only rule
+# `every_spawn_is_counted` (run by the `mutation_corpus` test above)
+# rejects a bare `Command::new`; this line check still covers
+# the test-module fixtures that construct `Command` directly.
 missing_spawn_counts=$(
   grep -rn 'Command::new(' crates/core/src |
     awk '{ code = $0; sub(/^[^:]*:[0-9]+:/, "", code); if (code !~ /^[[:space:]]*\/\//) print }' |
