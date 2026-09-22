@@ -420,23 +420,37 @@ authorize nothing and leave the fixture passing vacuously, so the ids
 are asserted against the catalog.
 
 **Not fixed, and left as a finding.** The same leak exists one level up,
-in `crates/cli/tests/agent_storage_cli.rs`. Those tests spawn the real
-binary with `HOME` set to a tempdir, which confines the per-user
-detectors but not the machine-wide ones, and the binary reads its
-`[scan]` config from the fixture `SWAMP_DIR` -- which does not exist, so
-it runs the default catalog. Any route that reaches external discovery
-(`swamp propose --external`, and `propose --path` when no agent unit
-matches, which falls through to it) therefore measures the developer's
-real Homebrew prefix and simulator runtimes: one test took **six
-minutes** on the machine where this was found. It is correct, just slow
-and reading things it should not.
+in `crates/cli/tests/agent_storage_cli.rs`, and it is worse than the
+unit-test one because it is not about external discovery at all -- it is
+the *walk*.
+
+Those tests spawn the real binary with `HOME` set to a tempdir and a
+fixture `SWAMP_DIR` holding no `config.toml`, so the binary resolves the
+default catalog. Measured with `swamp scope --json` under exactly that
+fixture: four roots are `present`, and two of them are
+**`/opt/homebrew`** and **`/Library/Developer/CoreSimulator/Volumes`** --
+absolute machine-wide paths that no `HOME` override can remove. `swamp
+report --json` on an otherwise-empty fixture home therefore takes
+
+```
+116s user  163s system  298% cpu   1:33.83 total
+```
+
+on this machine, and every one of the twelve tests in that binary pays
+it. That accounts for the whole of `scripts/check.sh`'s runtime beyond
+about a minute.
+
+This is *not* a regression from this branch: plain `report --json` with
+no `--view` never enters the code path this chunk changed
+(`ObservationParts::WALK_ONLY` short-circuits before `observe_scope`)
+and is equally slow. And it is correct behaviour for a real user --
+Homebrew's prefix and the simulator runtime volumes genuinely are
+developer storage. It is only wrong in a test.
 
 The fix is to write an explicit-only `config.toml` into each test's
 fixture store, which changes what those tests exercise, so it is a
 decision rather than a cleanup and it is recorded here instead of made
-at the end of an unrelated chunk. `scripts/check.sh` passes either way;
-it just takes several minutes longer than it should on any machine with
-Xcode installed.
+at the end of an unrelated chunk. `scripts/check.sh` passes either way.
 
 ## Audit changes, and why each is precision rather than a loophole
 
