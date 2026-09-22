@@ -175,13 +175,29 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         note: "current documented layout as of this chunk; the transcript JSONL schema itself \
                is explicitly documented upstream as internal/unstable across versions",
-        verification: &[Verification {
-            checked: "the ~/.claude directory table (projects/, todos/, file-history/, \
-                      shell-snapshots/, plugins/, settings.json, .credentials.json) and the \
-                      $CLAUDE_CONFIG_DIR override",
-            source: "https://code.claude.com/docs/en/claude-directory",
-            revision: "retrieved 2026-09-21",
-        }],
+        verification: &[
+            Verification {
+                checked: "the ~/.claude directory table (projects/, \
+                          sessions/, file-history/, shell-snapshots/, \
+                          plugins/, settings.json, .credentials.json) and \
+                          the CLAUDE_CONFIG_DIR override, which the page \
+                          states re-roots every path on it",
+                source: "docs/en/claude-directory",
+                revision: "code.claude.com, retrieved 2026-09-22",
+            },
+            Verification {
+                checked: "todos/, statsig/ and logs/ are documented in one \
+                          row as legacy directories from older versions, \
+                          no longer written -- so they are NOT \
+                          auto-regenerating caches, and the what-you-lose \
+                          table answers Nothing for all of them plus \
+                          image-cache/. This adapter previously called \
+                          statsig community-documented and modelled it as \
+                          regenerating; both halves were wrong",
+                source: "docs/en/claude-directory",
+                revision: "code.claude.com, retrieved 2026-09-22",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::Codex,
@@ -189,18 +205,22 @@ pub const MATRIX: &[MatrixEntry] = &[
         support: SupportLevel::Supported,
         home_note: "CODEX_HOME, default ~/.codex; sessions/ and archived_sessions/ (year/month/ \
                      day rollout-*.jsonl trees), auth.json, history.jsonl, config.toml, log/ \
-                     (overridable by the log_dir config key), a deprecated skills/, six SQLite \
-                     state stores (state_5/logs_2/goals_1/memories_1/queue_1/ \
+                     (overridable by the log_dir config key), a deprecated skills/ (current \
+                     root: ~/.agents/skills), seven SQLite state stores \
+                     (state_5/logs_2/goals_1/memories_1/memories_v2_1/queue_1/ \
                      thread_history_1.sqlite) relocatable via the separate CODEX_SQLITE_HOME",
         sources: &[
-            "https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/lib.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/rollout_file_name.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/metadata.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/state/src/lib.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/core/src/config/mod.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/ext/skills/src/host_roots.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/utils/home-dir/src/lib.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/rollout/src/lib.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/rollout/src/list.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/rollout/src/rollout_file_name.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/rollout/src/metadata.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/protocol/src/protocol.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/state/src/sqlite.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/state/src/lib.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/config/src/config_toml.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/core/src/config/mod.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/ext/skills/src/host_roots.rs",
         ],
         note: "#93; crate::agents::codex implements identification. The session-header envelope \
                nesting around `cwd` is not pinned to one shape (internal, version-varying wire \
@@ -209,21 +229,92 @@ pub const MATRIX: &[MatrixEntry] = &[
                can be moved by config -- both are identified where they are, never assumed",
         verification: &[
             Verification {
-                checked: "CODEX_SQLITE_HOME is a real env var (SQLITE_HOME_ENV)",
+                checked: "CODEX_HOME and the ~/.codex default \
+                          (find_codex_home)",
+                source: "codex-rs/utils/home-dir/src/lib.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "SESSIONS_SUBDIR / ARCHIVED_SESSIONS_SUBDIR, and \
+                          the year/month/day directory walk beneath them",
+                source: "codex-rs/rollout/src/lib.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "the YYYY/MM/DD rollout tree is walked as three \
+                          nested numeric directory levels",
+                source: "codex-rs/rollout/src/list.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "the rollout filename shape \
+                          rollout-{timestamp}-{thread_id}.jsonl",
+                source: "codex-rs/rollout/src/rollout_file_name.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "a session's declared working directory is \
+                          session_meta.meta.cwd",
+                source: "codex-rs/rollout/src/metadata.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "SessionMeta declares cwd: PathBuf",
+                source: "codex-rs/protocol/src/protocol.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "RUNTIME_DBS is declared [RuntimeDbSpec; 7] -- \
+                          SEVEN runtime databases, each \
+                          codex_home.join(filename): state_5, logs_2, \
+                          goals_1, memories_1, memories_v2_1, queue_1, \
+                          thread_history_1. This row said six; \
+                          memories_v2_1.sqlite is easy to miss because its \
+                          filename is an inline literal rather than one of \
+                          the six *_DB_FILENAME consts, and it was neither \
+                          folded with its -wal/-shm sidecars nor protected",
+                source: "codex-rs/state/src/sqlite.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "CODEX_SQLITE_HOME is a real env var \
+                          (SQLITE_HOME_ENV) and this file holds only that \
+                          -- NOT the database filenames, which this row \
+                          previously cited it for",
                 source: "codex-rs/state/src/lib.rs",
-                revision: "openai/codex main @ 30daed37ad8035f041f65a4c4615fbc590dc8552",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
             },
             Verification {
-                checked: "log/ defaults to codex_home.join(\"log\") and is overridable by the \
-                          log_dir config key",
+                checked: "the sqlite_home and log_dir config keys, the \
+                          latter documented as defaulting to \
+                          $CODEX_HOME/log",
+                source: "codex-rs/config/src/config_toml.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "log/ resolves to codex_home.join(\"log\") when \
+                          log_dir is unset",
                 source: "codex-rs/core/src/config/mod.rs",
-                revision: "openai/codex main @ 30daed37ad8035f041f65a4c4615fbc590dc8552",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
             },
             Verification {
-                checked: "skills/ under the user config folder exists and is commented upstream \
-                          as the deprecated location (current: ~/.agents/skills)",
+                checked: "skills/ under CODEX_HOME carries the upstream \
+                          comment Deprecated user skills location; the \
+                          current root is ~/.agents/skills \
+                          (AGENTS_DIR_NAME + SKILLS_DIR_NAME)",
                 source: "codex-rs/ext/skills/src/host_roots.rs",
-                revision: "openai/codex main @ 30daed37ad8035f041f65a4c4615fbc590dc8552",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
             },
         ],
     },
@@ -231,21 +322,45 @@ pub const MATRIX: &[MatrixEntry] = &[
         id: AgentToolId::CodexDesktop,
         display_name: "Codex desktop app",
         support: SupportLevel::Supported,
-        home_note: "macOS only, confirmed: ~/Library/Logs/com.openai.codex (date-tree session \
-                     logs). Settings/session storage beyond logs is not confirmed by primary \
-                     source and is not modeled -- logs-only support, stated explicitly rather \
-                     than silently treated as empty",
+        home_note: "logs only, and only the two platforms upstream confirms: macOS \
+                     ~/Library/Logs/<identity> and Windows %LOCALAPPDATA%/Codex/Logs, each \
+                     day-partitioned YYYY/MM/DD. Linux is genuinely unconfirmed (the upstream \
+                     match returns None for it). Settings/session storage beyond logs is not \
+                     confirmed by primary source and is not modeled -- logs-only support, \
+                     stated explicitly rather than silently treated as empty. This adapter \
+                     identifies the macOS root; the Windows one is confirmed by source but \
+                     belongs to the Windows track",
         sources: &[
-            "https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop.rs",
-            "https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop/platform.rs",
+            "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/cli/src/doctor/desktop.rs",
         ],
         note: "#93; crate::agents::codex_desktop implements identification for the confirmed \
                log directory only, a deliberately partial Supported row",
-        verification: &[Verification {
-            checked: "the macOS desktop log directory ~/Library/Logs/com.openai.codex",
-            source: "codex-rs/cli/src/doctor/desktop/platform.rs",
-            revision: "openai/codex main, read during chunk #93",
-        }],
+        verification: &[
+            Verification {
+                checked: "desktop_log_root is defined in \
+                          doctor/desktop.rs, not \
+                          doctor/desktop/platform.rs -- which contains no \
+                          log_root at all and is what this row previously \
+                          cited",
+                source: "codex-rs/cli/src/doctor/desktop.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+            Verification {
+                checked: "the function matches exactly two platforms: \
+                          macos -> $HOME/Library/Logs/<identity>, windows \
+                          -> %LOCALAPPDATA%/Codex/Logs (falling back to \
+                          %USERPROFILE%/AppData/Local). Both are \
+                          confirmed, so this row's previous \
+                          no-Windows-build-confirmed claim was false; \
+                          every other platform returns None, so Linux is \
+                          the only genuinely unconfirmed one. Both roots \
+                          are then day-partitioned YYYY/MM/DD",
+                source: "codex-rs/cli/src/doctor/desktop.rs",
+                revision: "openai/codex main @ \
+                           ac7634b9f73ec1bf96466be7a5869f0949d20b30",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::OhMyPi,
@@ -255,37 +370,64 @@ pub const MATRIX: &[MatrixEntry] = &[
                      pi-mono), or the whole of PI_CODING_AGENT_DIR when set; sessions/ \
                      <encoded-cwd>/<ts>_<session-id>.jsonl, content-addressed blobs/<sha256>, \
                      terminal-sessions/, config.yml/config.yaml, models.yml, agent.db (SQLite \
-                     auth store)",
+                     auth store). Two upstream relocations are UNMODELLED and stated rather \
+                     than left silent: a named profile (--profile / OMP_PROFILE) re-roots \
+                     everything under ~/.omp/profiles/<name>/, and an existing XDG \
+                     data/state/cache directory relocates the corresponding subtrees",
         sources: &[
-            "https://github.com/can1357/oh-my-pi/blob/main/docs/session.md",
-            "https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md",
+            "https://github.com/can1357/oh-my-pi/blob/fd3f8e3c569b511611081e16b181b740a4c98599/packages/utils/src/dirs.ts",
+            "https://github.com/can1357/oh-my-pi/blob/fd3f8e3c569b511611081e16b181b740a4c98599/docs/config-usage.md",
         ],
         note: "#94; crate::agents::oh_my_pi implements identification, including a content-marker \
                check that reports an explicit unknown-format unit rather than guessing when \
                ~/.omp is not actually Oh My Pi's own layout, and bounded per-session blob-\
                reference accounting that never offers blob removal in this chunk",
-        verification: &[Verification {
-            checked: "the session file layout and the PI_CODING_AGENT_DIR override, against the \
-                      project's own documentation",
-            source: "https://github.com/can1357/oh-my-pi/blob/main/docs/session.md",
-            revision: "main, read during chunk #94; not re-fetched 2026-09-21",
-        }],
+        verification: &[
+            Verification {
+                checked: "the whole directory layout in upstream's own \
+                          path helpers: CONFIG_DIR_NAME = .omp, \
+                          getAgentDir, getSessionsDir, getBlobsDir, \
+                          getLogsDir, getReportsDir, and the \
+                          agent.db/history.db/models.db SQLite stores",
+                source: "packages/utils/src/dirs.ts",
+                revision: "can1357/oh-my-pi main @ \
+                           fd3f8e3c569b511611081e16b181b740a4c98599",
+            },
+            Verification {
+                checked: "PI_CODING_AGENT_DIR is honoured for the default \
+                          profile only; a named profile (--profile / \
+                          OMP_PROFILE) re-roots everything under \
+                          ~/.omp/profiles/<name>/, and an existing XDG \
+                          data/state/cache directory can relocate the \
+                          corresponding subtrees. Neither is modelled by \
+                          this adapter, which is why this row's home_note \
+                          now says so",
+                source: "docs/config-usage.md",
+                revision: "can1357/oh-my-pi main @ \
+                           fd3f8e3c569b511611081e16b181b740a4c98599",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::OpenCode,
         display_name: "OpenCode",
         support: SupportLevel::Supported,
         home_note: "data: ${XDG_DATA_HOME:-~/.local/share}/opencode (auth.json, log/, \
-                     storage/{session,message,part,session_diff,project}/ or opencode.db \
-                     depending on version, snapshot/<project-id>/<hash> git-backed checkpoints); \
-                     config ${XDG_CONFIG_HOME:-~/.config}/opencode, also settable by \
+                     storage/{session,message,part,project}/ directories plus \
+                     storage/session_diff/<session-id>.json FILES, or opencode.db depending on \
+                     version, snapshot/<project-id>/<hash> git-backed checkpoints); config \
+                     ${XDG_CONFIG_HOME:-~/.config}/opencode, also settable by \
                      OPENCODE_CONFIG_DIR (opaque external unit); cache \
-                     ${XDG_CACHE_HOME:-~/.cache}/opencode (opaque external unit)",
+                     ${XDG_CACHE_HOME:-~/.cache}/opencode (opaque external unit). Upstream \
+                     defines more roots than this catalog models: state \
+                     (${XDG_STATE_HOME:-~/.local/state}/opencode) and tmp are UNMODELLED, \
+                     stated here rather than left silent",
         sources: &[
-            "https://github.com/sst/opencode/blob/dev/packages/core/src/global.ts",
-            "https://github.com/sst/opencode/blob/dev/packages/core/src/flag/flag.ts",
+            "https://github.com/sst/opencode/blob/fe3f3a41f79ad292cc3c7c629567385a20ec5130/packages/core/src/global.ts",
+            "https://github.com/sst/opencode/blob/fe3f3a41f79ad292cc3c7c629567385a20ec5130/packages/opencode/src/storage/storage.ts",
+            "https://github.com/sst/opencode/blob/fe3f3a41f79ad292cc3c7c629567385a20ec5130/packages/opencode/src/session/revert.ts",
+            "https://github.com/sst/opencode/blob/fe3f3a41f79ad292cc3c7c629567385a20ec5130/packages/core/src/database/database.ts",
             "https://opencode.ai/docs/config/",
-            "https://github.com/sst/opencode/blob/dev/packages/opencode/src/storage/storage.ts",
         ],
         note: "#95; crate::agents::opencode implements identification for both the older file- \
                tree layout and the newer SQLite-backed one, version-gated by which markers are \
@@ -295,17 +437,44 @@ pub const MATRIX: &[MatrixEntry] = &[
                variable exists upstream and the claim is withdrawn",
         verification: &[
             Verification {
-                checked: "the data directory is $XDG_DATA_HOME/opencode via the xdg-basedir \
-                          package -- there is no OPENCODE_DATA_DIR",
+                checked: "the roots, and there are more than the three \
+                          this row claimed: data \
+                          ($XDG_DATA_HOME/opencode), config, cache, state \
+                          ($XDG_STATE_HOME/opencode) and tmp, plus derived \
+                          bin (under cache), log and repos. state/ is real \
+                          and is NOT modelled by this catalog -- listed \
+                          explicitly rather than left silent. There is no \
+                          OPENCODE_DATA_DIR",
                 source: "packages/core/src/global.ts",
-                revision: "sst/opencode dev @ fe3f3a41f79ad292cc3c7c629567385a20ec5130",
+                revision: "sst/opencode dev @ \
+                           fe3f3a41f79ad292cc3c7c629567385a20ec5130",
             },
             Verification {
-                checked: "the complete env-var registry: OPENCODE_CONFIG_DIR, OPENCODE_CONFIG, \
-                          OPENCODE_CONFIG_CONTENT, OPENCODE_DB, OPENCODE_TEST_HOME, and no \
-                          data-dir variable",
-                source: "packages/core/src/flag/flag.ts",
-                revision: "sst/opencode dev @ fe3f3a41f79ad292cc3c7c629567385a20ec5130",
+                checked: "every storage key becomes path.join(dir, ...key) \
+                          + \".json\", so \
+                          storage/session_diff/<session-id> is a FILE and \
+                          not, as this row said, a companion directory -- \
+                          the adapter gated on is_dir() and those bytes \
+                          appeared in no unit at all",
+                source: "packages/opencode/src/storage/storage.ts",
+                revision: "sst/opencode dev @ \
+                           fe3f3a41f79ad292cc3c7c629567385a20ec5130",
+            },
+            Verification {
+                checked: "the runtime writer is \
+                          storage.write([session_diff, sessionID], diffs), \
+                          which is the same key-to-path builder",
+                source: "packages/opencode/src/session/revert.ts",
+                revision: "sst/opencode dev @ \
+                           fe3f3a41f79ad292cc3c7c629567385a20ec5130",
+            },
+            Verification {
+                checked: "the newer SQLite-backed layout puts opencode.db \
+                          in the data root (or opencode-<channel>.db, or \
+                          OPENCODE_DB)",
+                source: "packages/core/src/database/database.ts",
+                revision: "sst/opencode dev @ \
+                           fe3f3a41f79ad292cc3c7c629567385a20ec5130",
             },
         ],
     },
@@ -314,16 +483,18 @@ pub const MATRIX: &[MatrixEntry] = &[
         display_name: "Gemini CLI",
         support: SupportLevel::Supported,
         home_note: "~/.gemini, or the whole of GEMINI_CLI_HOME when set (settings.json, \
-                     GEMINI.md, extensions/, trustedFolders.json, bin/, oauth_creds.json); \
+                     GEMINI.md, extensions/, trustedFolders.json, oauth_creds.json, and \
+                     tmp/bin -- NOT bin/, which no version writes); \
                      tmp/<project-id>/ (shell_history, checkpoints/, chats/) and \
                      history/<project-id>/ (shadow Git checkpoint repos), where <project-id> is \
                      a legacy sha256 of the project root or, in current versions, a short slug \
-                     registered in projects.json",
+                     registered in projects.json. Under SANDBOX=sandbox-exec the whole runtime \
+                     dir (tmp/, history/, projects.json) moves to ~/.cache/.gemini while \
+                     settings and credentials stay put",
         sources: &[
-            "https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md",
-            "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md",
-            "https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts",
-            "https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/config/storage.ts",
+            "https://github.com/google-gemini/gemini-cli/blob/d5b3e3accb26000d273abf16e0f1dd83aa5428a9/packages/core/src/config/storage.ts",
+            "https://github.com/google-gemini/gemini-cli/blob/d5b3e3accb26000d273abf16e0f1dd83aa5428a9/packages/core/src/utils/paths.ts",
+            "https://github.com/google-gemini/gemini-cli/blob/d5b3e3accb26000d273abf16e0f1dd83aa5428a9/packages/core/src/config/projectRegistry.ts",
         ],
         note: "#96; crate::agents::gemini_cli implements identification. GEMINI_CLI_HOME is the \
                real override; GEMINI_DIR is a plain '.gemini' constant upstream, not an env \
@@ -333,24 +504,43 @@ pub const MATRIX: &[MatrixEntry] = &[
                and is not read by this adapter",
         verification: &[
             Verification {
-                checked: "the OAuth credential filename is oauth_creds.json (OAUTH_FILE, \
-                          getOAuthCredsPath)",
+                checked: "the downloaded-tools cache is at tmp/bin, not \
+                          bin: getGlobalBinDir() = \
+                          join(getGlobalTempDir(), BIN_DIR_NAME) and \
+                          getGlobalTempDir() = join(getGlobalRuntimeDir(), \
+                          TMP_DIR_NAME). This row and the adapter both \
+                          said ~/.gemini/bin, a path no version writes",
                 source: "packages/core/src/config/storage.ts",
                 revision: "google-gemini/gemini-cli main @ \
                            d5b3e3accb26000d273abf16e0f1dd83aa5428a9",
             },
             Verification {
-                checked: "homedir() honours GEMINI_CLI_HOME; GEMINI_DIR is a constant, not an \
+                checked: "under SANDBOX=sandbox-exec getGlobalRuntimeDir() \
+                          returns ~/.cache/.gemini, so tmp/ (with \
+                          tmp/bin), history/ and projects.json move there \
+                          while settings and credentials stay at the home \
+                          root. Modelled by crate::locations::gemini_cli \
+                          as a second location, proposed only when this \
+                          process is itself under that sandbox",
+                source: "packages/core/src/config/storage.ts",
+                revision: "google-gemini/gemini-cli main @ \
+                           d5b3e3accb26000d273abf16e0f1dd83aa5428a9",
+            },
+            Verification {
+                checked: "GEMINI_DIR is a plain '.gemini' constant, not an \
                           env var",
                 source: "packages/core/src/utils/paths.ts",
                 revision: "google-gemini/gemini-cli main @ \
                            d5b3e3accb26000d273abf16e0f1dd83aa5428a9",
             },
             Verification {
-                checked: "tmp/<hash> and history/<hash> are the legacy naming; current versions \
-                          use short ids from a ProjectRegistry at <runtimeDir>/projects.json and \
-                          migrate the hash directories across",
-                source: "packages/core/src/config/storage.ts",
+                checked: "the current per-project id is a slug from a \
+                          registry at <runtimeDir>/projects.json \
+                          (slugify); the legacy form is a sha256 of the \
+                          project root, migrated across. Both are one-way \
+                          from the directory name alone, so linkage stays \
+                          Unresolved rather than guessed",
+                source: "packages/core/src/config/projectRegistry.ts",
                 revision: "google-gemini/gemini-cli main @ \
                            d5b3e3accb26000d273abf16e0f1dd83aa5428a9",
             },
@@ -364,11 +554,13 @@ pub const MATRIX: &[MatrixEntry] = &[
                      primary-source name, shared with Oh My Pi's own override -- see \
                      crate::locations::pi; PI_AGENT_DIR, the issue text's name, is honored as an \
                      unconfirmed secondary override); sessions/ (organized by working directory), \
-                     settings.json, trust.json, models.json, npm/ (badlogic/pi-mono, also \
-                     published as earendil-works/pi)",
+                     settings.json, trust.json, models.json, auth.json, tools/, bin/, \
+                     prompts/, npm/, and the single debug log pi-debug.log (there is no logs/ \
+                     directory). Upstream repository: earendil-works/pi",
         sources: &[
-            "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md",
-            "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md",
+            "https://github.com/earendil-works/pi/blob/d201760ffee16564aa8d9a759e0c85b70db33674/packages/coding-agent/docs/environment-variables.md",
+            "https://github.com/earendil-works/pi/blob/d201760ffee16564aa8d9a759e0c85b70db33674/packages/coding-agent/src/config.ts",
+            "https://github.com/earendil-works/pi/blob/d201760ffee16564aa8d9a759e0c85b70db33674/packages/coding-agent/docs/sessions.md",
         ],
         note: "#96; crate::agents::pi implements identification, distinct from Oh My Pi (a fork \
                of this project) even though the two share an override variable name -- see \
@@ -379,12 +571,36 @@ pub const MATRIX: &[MatrixEntry] = &[
                removed, because one tool's format change must never silently change another \
                tool's identification. The shared byte-offset mechanics live in the neutral \
                crate::agents::pi_family, which names no tool",
-        verification: &[Verification {
-            checked: "the PI_CODING_AGENT_DIR override and the settings/session layout, against \
-                      the project's own documentation",
-            source: "packages/coding-agent/docs/settings.md",
-            revision: "badlogic/pi-mono main, read during chunk #96; not re-fetched 2026-09-21",
-        }],
+        verification: &[
+            Verification {
+                checked: "PI_CODING_AGENT_DIR overrides the config \
+                          directory, default ~/.pi/agent. This row \
+                          previously cited settings.md, a file that does \
+                          not contain the string at all -- the claim was \
+                          true, the citation did not establish it",
+                source: "packages/coding-agent/docs/environment-variables.md",
+                revision: "earendil-works/pi main @ \
+                           d201760ffee16564aa8d9a759e0c85b70db33674",
+            },
+            Verification {
+                checked: "the layout in upstream's own path helpers: \
+                          CONFIG_DIR_NAME = .pi, getAgentDir() = \
+                          ~/.pi/agent, getSessionsDir, getToolsDir, \
+                          getBinDir, getPromptsDir, settings.json, \
+                          models.json, auth.json",
+                source: "packages/coding-agent/src/config.ts",
+                revision: "earendil-works/pi main @ \
+                           d201760ffee16564aa8d9a759e0c85b70db33674",
+            },
+            Verification {
+                checked: "sessions are JSONL files under \
+                          ~/.pi/agent/sessions/, organised by working \
+                          directory",
+                source: "packages/coding-agent/docs/sessions.md",
+                revision: "earendil-works/pi main @ \
+                           d201760ffee16564aa8d9a759e0c85b70db33674",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::Aider,
@@ -394,23 +610,55 @@ pub const MATRIX: &[MatrixEntry] = &[
                      wholly re-downloadable), plus an optional home-level .aider.conf.yml; \
                      per-repo .aider.chat.history.md / .aider.input.history and \
                      .aider.tags.cache.v{3,4}/ at the git root -- project-local, not under the \
-                     home directory",
+                     home directory. .aider.llm.history is opt-in upstream (--llm-history-file \
+                     defaults to None), so it is identified where present and never assumed",
         sources: &[
-            "https://github.com/Aider-AI/aider/blob/main/aider/models.py",
-            "https://github.com/Aider-AI/aider/blob/main/aider/versioncheck.py",
-            "https://github.com/Aider-AI/aider/blob/main/aider/args.py",
-            "https://github.com/Aider-AI/aider/blob/main/aider/repomap.py",
+            "https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/args.py",
+            "https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py",
+            "https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/models.py",
+            "https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/main.py",
         ],
         note: "#96; crate::agents::aider implements both halves: identify() for the home-level \
                caches, and the adapter's declared project_local_units capability, called per \
                known project worktree root, for the per-repo files -- this issue's own explicit \
                'attach to the worktree artifact model' acceptance",
-        verification: &[Verification {
-            checked: "the per-repo history/tags-cache filenames and the home-level cache \
-                      directory, in Aider's own source",
-            source: "aider/args.py, aider/repomap.py, aider/models.py",
-            revision: "Aider-AI/aider main, read during chunk #96; not re-fetched 2026-09-21",
-        }],
+        verification: &[
+            Verification {
+                checked: "the per-repo history filenames \
+                          .aider.input.history and .aider.chat.history.md, \
+                          both defaulting to the git root. \
+                          .aider.llm.history is opt-in (default None) and \
+                          appears only inside a help string, so it is not \
+                          an always-present file",
+                source: "aider/args.py",
+                revision: "Aider-AI/aider main @ \
+                           5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+            },
+            Verification {
+                checked: "TAGS_CACHE_DIR = \
+                          .aider.tags.cache.v{CACHE_VERSION}, v3 or v4 \
+                          depending on the tree-sitter pack, at the repo \
+                          root",
+                source: "aider/repomap.py",
+                revision: "Aider-AI/aider main @ \
+                           5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+            },
+            Verification {
+                checked: "the home-level cache \
+                          ~/.aider/caches/model_prices_and_context_window.json, \
+                          with a 24-hour TTL -- wholly re-downloadable",
+                source: "aider/models.py",
+                revision: "Aider-AI/aider main @ \
+                           5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+            },
+            Verification {
+                checked: "the home-level .aider.conf.yml, searched cwd \
+                          then git root then home",
+                source: "aider/main.py",
+                revision: "Aider-AI/aider main @ \
+                           5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::GithubCopilotCli,
@@ -422,19 +670,49 @@ pub const MATRIX: &[MatrixEntry] = &[
                      installed-plugins/, plugin-data/, mcp-oauth-config/, mcp-secrets/, ide/, \
                      session-state/, command-history-state/, session-store.db, logs/); separate \
                      platform-conventional cache (~/Library/Caches/copilot on macOS), \
-                     overridable via COPILOT_CACHE_HOME, independent of COPILOT_HOME",
+                     overridable via COPILOT_CACHE_HOME, independent of COPILOT_HOME. The \
+                     directory names are documented; what is inside session-state/ is not, so \
+                     project linkage is Unresolved and no selective action is offered on it",
         sources: &[
+            "https://github.com/github/docs/blob/72e940d15a9aff06b6e84216f3c97dac25c47d9b/content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md",
             "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference",
         ],
         note: "#97; crate::agents::copilot_cli implements identification. session-state/ and \
                command-history-state/ are the real directory names, correcting this row's own \
                prior history-session-state/ guess",
-        verification: &[Verification {
-            checked: "the full config-directory listing and the COPILOT_HOME / \
-                      COPILOT_CACHE_HOME overrides, in GitHub's own CLI reference",
-            source: "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference",
-            revision: "retrieved during chunk #97",
-        }],
+        verification: &[
+            Verification {
+                checked: "the ~/.copilot directory listing -- agents/, \
+                          config.json, logs/, session-state/, \
+                          command-history-state/, session-store.db, \
+                          settings.json, mcp-config.json, \
+                          permissions-config.json and the rest -- and the \
+                          --config-dir > COPILOT_HOME > ~/.copilot \
+                          precedence",
+                source: "content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md",
+                revision: "github/docs main @ \
+                           72e940d15a9aff06b6e84216f3c97dac25c47d9b",
+            },
+            Verification {
+                checked: "what it does NOT contain: any field name inside \
+                          session state. The page documents directory \
+                          names only; re-checked 2026-09-22 across four \
+                          pinned pages (this one, \
+                          cli-command-reference.md, chronicle.md, \
+                          acp-server.md), workspaceFolder and \
+                          workingDirectory appear zero times and every cwd \
+                          hit is the /cwd slash command, prose, an MCP \
+                          launch key or an ACP wire parameter. The CLI \
+                          itself is closed source. So the \
+                          cwd/workspace/workspaceFolder fields this \
+                          adapter parsed were a guess at an undocumented \
+                          schema: linkage is now Unresolved and no \
+                          selective action is offered on session state",
+                source: "content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md",
+                revision: "github/docs main @ \
+                           72e940d15a9aff06b6e84216f3c97dac25c47d9b",
+            },
+        ],
     },
     MatrixEntry {
         id: AgentToolId::Cursor,
@@ -471,11 +749,11 @@ pub const MATRIX: &[MatrixEntry] = &[
         id: AgentToolId::Windsurf,
         display_name: "Windsurf",
         support: SupportLevel::Unverified,
-        home_note: "~/.codeium/windsurf (MCP/agent config, not decomposed) plus the VS-Code-fork \
-                     editor profile at ~/Library/Application Support/Windsurf, macOS only this \
-                     chunk. Upstream renamed the product Devin Desktop on 2026-06-02 and moved \
-                     the read-write profile to ~/Library/Application Support/Devin, keeping the \
-                     Windsurf directory as a legacy read-only location",
+        home_note: "macOS only this chunk: the current VS-Code-fork editor profile at \
+                     ~/Library/Application Support/Devin AND the legacy one at .../Windsurf \
+                     (both modelled -- an installation mid-migration has bytes in each), plus \
+                     ~/.codeium/windsurf (MCP/workflow/skills/bin config, not decomposed), \
+                     which upstream states is NOT changing in the rename and stays read-write",
         sources: &[
             "https://docs.devin.ai/desktop/devin-desktop-faq",
             "https://registry.coder.com/modules/coder/windsurf",
@@ -507,14 +785,18 @@ pub const MATRIX: &[MatrixEntry] = &[
                      ~/.vscode-server/data/... for a remote/devcontainer target): \
                      globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/ holding \
                      api_conversation_history.json, ui_messages.json, task_metadata.json, \
-                     context_history.json, checkpoints. Cline 4.x adds a second root -- \
-                     CLINE_DATA_DIR, else CLINE_DIR/data, else ~/.cline/data -- which this \
-                     catalog does not model yet",
+                     context_history.json, checkpoints, plus state/taskHistory.json -- the \
+                     task-history array this adapter reads linkage from, one bounded read per \
+                     host. Cline 4.x adds a second root -- CLINE_DATA_DIR, else CLINE_DIR/data, \
+                     else ~/.cline/data -- which is now modelled as its own location; upstream \
+                     states it does NOT hold the VS Code host's task history",
         sources: &[
-            "https://github.com/cline/cline/blob/main/apps/vscode/src/core/storage/disk.ts",
-            "https://github.com/cline/cline/blob/main/apps/vscode/src/core/context/context-tracking/ContextTrackerTypes.ts",
-            "https://github.com/cline/cline/blob/main/apps/vscode/src/shared/HistoryItem.ts",
-            "https://github.com/cline/cline/blob/main/apps/vscode/src/shared/storage/storage-context.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/apps/vscode/src/sdk/legacy-state-reader.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/apps/vscode/src/hosts/vscode/vscode-to-file-migration.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/apps/vscode/src/shared/HistoryItem.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/apps/vscode/src/shared/storage/storage-context.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/sdk/packages/shared/src/storage/paths.ts",
+            "https://github.com/cline/cline/blob/254f40c4b592d1e662b84f2ba06fe45dca77cab3/.clinerules/storage.md",
         ],
         note: "#99; crate::agents::cline identifies through crate::agents::vscode_family, \
                decomposing every resolved host location rather than just the first (the \
@@ -524,26 +806,65 @@ pub const MATRIX: &[MatrixEntry] = &[
                Unresolved link whose reason names the store that does hold the answer",
         verification: &[
             Verification {
-                checked: "GlobalFileNames and ensureTaskDirectoryExists -> \
-                          <globalStorage>/tasks/<taskId> with api_conversation_history.json, \
-                          ui_messages.json, task_metadata.json, context_history.json",
-                source: "apps/vscode/src/core/storage/disk.ts",
-                revision: "cline/cline main @ d4d3d9f31f309f89d0327e2b48ab6f775030595e",
+                checked: "the per-task files under tasks/<taskId>/: \
+                          api_conversation_history.json, ui_messages.json, \
+                          context_history.json, task_metadata.json -- and \
+                          the task-history store at \
+                          <dataDir>/state/taskHistory.json",
+                source: "apps/vscode/src/sdk/legacy-state-reader.ts",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
             },
             Verification {
-                checked: "TaskMetadata is { files_in_context, model_usage, environment_history } \
-                          -- there is NO workspace field, refuting this row's previous linkage \
-                          claim",
-                source: "apps/vscode/src/core/context/context-tracking/ContextTrackerTypes.ts",
-                revision: "cline/cline main @ d4d3d9f31f309f89d0327e2b48ab6f775030595e",
+                checked: "taskHistory is NOT migrated to the shared store: \
+                          it uses its own file-based storage at \
+                          {globalStorageFsPath}/state/taskHistory.json, \
+                          and for VS Code globalStorageFsPath is the \
+                          VS-Code-managed path, NOT ~/.cline/data. So the \
+                          store this adapter needs is inside the directory \
+                          it already walks, and the previous \
+                          it-lives-in-state.vscdb reason was wrong",
+                source: "apps/vscode/src/hosts/vscode/vscode-to-file-migration.ts",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
             },
             Verification {
-                checked: "the working directory is HistoryItem.cwdOnTaskInitialization (optional) \
-                          in the taskHistory extension state, which lives in state.vscdb or \
-                          ~/.cline/data/state/taskHistory.json",
-                source: "apps/vscode/src/shared/HistoryItem.ts, \
-                         apps/vscode/src/shared/storage/storage-context.ts",
-                revision: "cline/cline main @ d4d3d9f31f309f89d0327e2b48ab6f775030595e",
+                checked: "the working-directory field is \
+                          HistoryItem.cwdOnTaskInitialization, and it is \
+                          optional -- not cwd, workspace or \
+                          workspaceFolder, none of which exist in the type",
+                source: "apps/vscode/src/shared/HistoryItem.ts",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
+            },
+            Verification {
+                checked: "the second root: CLINE_DATA_DIR, else CLINE_DIR \
+                          + /data, else ~/.cline/data",
+                source: "apps/vscode/src/shared/storage/storage-context.ts",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
+            },
+            Verification {
+                checked: "the same resolution order in the SDK \
+                          (resolveClineDir / resolveClineDataDir), so the \
+                          two stores cannot drift",
+                source: "sdk/packages/shared/src/storage/paths.ts",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
+            },
+            Verification {
+                checked: "upstream's own spelling is ambiguous and this \
+                          row records it rather than picking one: the File \
+                          Layout here says \
+                          ~/.cline/data/tasks/taskHistory.json, \
+                          vscode-to-file-migration.ts's comment says \
+                          {globalStorage}/state/taskHistory.json and its \
+                          skip list says tasks/taskHistory.json. The \
+                          adapter follows the executable code (state/) and \
+                          says so in the unresolved reason",
+                source: ".clinerules/storage.md",
+                revision: "cline/cline main @ \
+                           254f40c4b592d1e662b84f2ba06fe45dca77cab3",
             },
         ],
     },
@@ -559,10 +880,10 @@ pub const MATRIX: &[MatrixEntry] = &[
                      customStoragePath setting can relocate tasks/ entirely, in which case this \
                      catalog simply does not find it",
         sources: &[
-            "https://github.com/RooCodeInc/Roo-Code/blob/main/src/shared/globalFileNames.ts",
-            "https://github.com/RooCodeInc/Roo-Code/blob/main/src/utils/storage.ts",
-            "https://github.com/RooCodeInc/Roo-Code/blob/main/src/core/task-persistence/TaskHistoryStore.ts",
-            "https://github.com/RooCodeInc/Roo-Code/blob/main/src/core/context-tracking/FileContextTrackerTypes.ts",
+            "https://github.com/RooCodeInc/Roo-Code/blob/b867ec9145750d0ae1ff7f02d35406e9bf2a0b16/src/utils/storage.ts",
+            "https://github.com/RooCodeInc/Roo-Code/blob/b867ec9145750d0ae1ff7f02d35406e9bf2a0b16/src/shared/globalFileNames.ts",
+            "https://github.com/RooCodeInc/Roo-Code/blob/b867ec9145750d0ae1ff7f02d35406e9bf2a0b16/packages/types/src/history.ts",
+            "https://github.com/RooCodeInc/Roo-Code/blob/b867ec9145750d0ae1ff7f02d35406e9bf2a0b16/src/core/task-persistence/TaskHistoryStore.ts",
         ],
         note: "#99; crate::agents::roo_code identifies through crate::agents::vscode_family. \
                Per-task project linkage is now read from the confirmed \
@@ -571,19 +892,38 @@ pub const MATRIX: &[MatrixEntry] = &[
                checkpoint repo, so its folded byte total is not necessarily small",
         verification: &[
             Verification {
-                checked: "the per-task filenames including history_item.json and _index.json, \
-                          and getTaskDirectoryPath -> <basePath>/tasks/<taskId> with the \
-                          roo-cline.customStoragePath override",
-                source: "src/shared/globalFileNames.ts, src/utils/storage.ts",
-                revision: "RooCodeInc/Roo-Code main @ b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+                checked: "getTaskDirectoryPath places tasks at \
+                          <globalStorage>/tasks/<taskId>, through \
+                          getStorageBasePath -- which honours a \
+                          customStoragePath setting, so a relocated store \
+                          is simply not found by this catalog",
+                source: "src/utils/storage.ts",
+                revision: "RooCodeInc/Roo-Code main @ \
+                           b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
             },
             Verification {
-                checked: "the workspace path is written to tasks/<id>/history_item.json (and \
-                          indexed in tasks/_index.json), while TaskMetadata is \
-                          { files_in_context } only",
-                source: "src/core/task-persistence/TaskHistoryStore.ts, \
-                         src/core/context-tracking/FileContextTrackerTypes.ts",
-                revision: "RooCodeInc/Roo-Code main @ b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+                checked: "the per-task filenames \
+                          api_conversation_history.json, ui_messages.json, \
+                          task_metadata.json, history_item.json and the \
+                          tasks/_index.json index",
+                source: "src/shared/globalFileNames.ts",
+                revision: "RooCodeInc/Roo-Code main @ \
+                           b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+            },
+            Verification {
+                checked: "HistoryItem carries an optional workspace field \
+                          -- which is what this adapter reads, from \
+                          history_item.json, not from task_metadata.json",
+                source: "packages/types/src/history.ts",
+                revision: "RooCodeInc/Roo-Code main @ \
+                           b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+            },
+            Verification {
+                checked: "upstream keys its own linkage off the same field \
+                          (getByWorkspace), written into history_item.json",
+                source: "src/core/task-persistence/TaskHistoryStore.ts",
+                revision: "RooCodeInc/Roo-Code main @ \
+                           b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
             },
         ],
     },
@@ -596,10 +936,9 @@ pub const MATRIX: &[MatrixEntry] = &[
                      embeddings/tag caches, dev_data/ anonymized usage events with \
                      devdata.sqlite)",
         sources: &[
-            "https://github.com/continuedev/continue/blob/main/core/util/paths.ts",
-            "https://github.com/continuedev/continue/blob/main/core/util/history.ts",
-            "https://github.com/continuedev/continue/blob/main/core/index.d.ts",
-            "https://docs.continue.dev/customize/deep-dives/configuration",
+            "https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/core/index.d.ts",
+            "https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/core/util/history.ts",
+            "https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/core/util/paths.ts",
         ],
         note: "#99; crate::agents::continue_dev implements identification. This row previously \
                said no confirmed per-session workspace-linkage field was found; one exists and \
@@ -607,17 +946,30 @@ pub const MATRIX: &[MatrixEntry] = &[
                mirrored into the sessions index",
         verification: &[
             Verification {
-                checked: "getContinueGlobalPath (CONTINUE_GLOBAL_DIR else ~/.continue), \
-                          getSessionsFolderPath, getSessionFilePath, getSessionsListPath, \
-                          getIndexFolderPath and getDevDataPath",
-                source: "core/util/paths.ts",
-                revision: "continuedev/continue main @ 5522c6f44ca0ac3528b37244818fbfa39b5af470",
+                checked: "Session.workspaceDirectory is a REQUIRED string \
+                          field (no ?), and BaseSessionMetadata carries it \
+                          too",
+                source: "core/index.d.ts",
+                revision: "continuedev/continue main @ \
+                           5522c6f44ca0ac3528b37244818fbfa39b5af470",
             },
             Verification {
-                checked: "Session.workspaceDirectory and BaseSessionMetadata.workspaceDirectory \
-                          are required fields, written and filtered on by the history module",
-                source: "core/index.d.ts, core/util/history.ts",
-                revision: "continuedev/continue main @ 5522c6f44ca0ac3528b37244818fbfa39b5af470",
+                checked: "upstream itself writes workspaceDirectory: \"\" \
+                          from the catch of load(sessionId), so an empty \
+                          string is an expected on-disk value. It resolves \
+                          to Unresolved, never Missing -- Missing would \
+                          claim a path was named and has since disappeared",
+                source: "core/util/history.ts",
+                revision: "continuedev/continue main @ \
+                           5522c6f44ca0ac3528b37244818fbfa39b5af470",
+            },
+            Verification {
+                checked: "the layout and the override: ~/.continue or \
+                          CONTINUE_GLOBAL_DIR, sessions/<id>.json and the \
+                          sessions/sessions.json index",
+                source: "core/util/paths.ts",
+                revision: "continuedev/continue main @ \
+                           5522c6f44ca0ac3528b37244818fbfa39b5af470",
             },
         ],
     },

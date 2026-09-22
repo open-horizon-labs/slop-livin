@@ -400,3 +400,122 @@ fn an_unverified_tools_units_are_measured_and_offer_nothing() {
             .collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------
+// Prose agreement: a paragraph about a Supported tool may not assert the
+// doubt its own table row has resolved.
+// ---------------------------------------------------------------------
+
+/// Phrases that assert a layout is unconfirmed, guessed or unmodelled.
+/// Legitimate next to an `Unverified` row; a contradiction next to a
+/// `Supported` one.
+/// Deliberately *not* "not confirmed" / "unconfirmed" on their own. A
+/// partial `Supported` row is a legitimate thing -- Codex desktop models
+/// the log directory and says plainly that settings/session storage
+/// beyond it is not confirmed and not modeled. What a `Supported` row
+/// may not do is describe the layout it *does* model as guessed,
+/// second-hand or unchecked.
+const DOUBT_PHRASES: &[&str] = &[
+    "no confirmed",
+    "assumed",
+    "community-documented",
+    "not re-fetched",
+    "not modeled yet",
+    "not modelled yet",
+    "not independently re-confirmed",
+];
+
+/// Phrases that mark a doubt as *reported history* rather than an
+/// assertion. A doc that records what it used to get wrong is doing the
+/// right thing; this check must not punish it for quoting itself.
+const PAST_TENSE_MARKERS: &[&str] = &[
+    "previously",
+    "used to",
+    "was wrong",
+    "were wrong",
+    "superseded",
+    "no longer",
+    "corrected",
+    "withdrawn",
+    "refuted",
+    "this row's own prior",
+    "the previous tracking note",
+    "the claim is withdrawn",
+];
+
+/// The stale-prose check the 2026-09-22 re-review asked for.
+///
+/// Its finding was not only that citations went unchecked: three
+/// paragraphs in this same document contradicted the table above them.
+/// `docs:680-682` said Continue had "no confirmed per-session
+/// workspace-linkage field" while the row, the adapter and
+/// `core/index.d.ts` all said it was required; `docs:604-609` said no
+/// primary Windsurf layout documentation was reachable while the table
+/// cited it; `docs:316` called Claude Code's `statsig` community-
+/// documented while the page it cited documents it explicitly. Nothing
+/// checked any of that, because the table and the prose were only ever
+/// read by people.
+///
+/// So: every paragraph outside the table that names a `Supported` tool
+/// and no `Unverified` one must not assert doubt about it -- unless the
+/// same paragraph marks that doubt as history, which is how a correction
+/// is written.
+#[test]
+fn no_prose_paragraph_asserts_doubt_a_supported_row_has_resolved() {
+    use swamp_core::agents::matrix::{MATRIX, SupportLevel};
+    let text = std::fs::read_to_string(doc_path()).expect("read doc");
+    // The table itself is checked cell by cell by the tests above; this
+    // one is about the prose around it.
+    let prose: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('|'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let names: Vec<(&str, &str, SupportLevel)> = MATRIX
+        .iter()
+        .map(|e| (e.display_name, e.id.slug(), e.support))
+        .collect();
+
+    let mut problems: Vec<String> = Vec::new();
+    for (n, para) in prose.split("\n\n").enumerate() {
+        let lower = para.to_lowercase();
+        let mentions =
+            |name: &str, slug: &str| para.contains(name) || para.contains(&format!("`{slug}`"));
+        let supported: Vec<&str> = names
+            .iter()
+            .filter(|(n, s, lvl)| *lvl == SupportLevel::Supported && mentions(n, s))
+            .map(|(n, _, _)| *n)
+            .collect();
+        if supported.is_empty() {
+            continue;
+        }
+        // A paragraph that also names an Unverified tool is allowed its
+        // doubt: it is very probably about that one.
+        if names
+            .iter()
+            .any(|(n, s, lvl)| *lvl == SupportLevel::Unverified && mentions(n, s))
+        {
+            continue;
+        }
+        if PAST_TENSE_MARKERS.iter().any(|m| lower.contains(m)) {
+            continue;
+        }
+        for phrase in DOUBT_PHRASES {
+            if lower.contains(phrase) {
+                problems.push(format!(
+                    "paragraph {n} names the Supported tool(s) {supported:?} and asserts \
+                     `{phrase}`, with nothing marking it as history. Either the row is not \
+                     Supported, or this paragraph is stale:\n{}\n",
+                    para.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "{}\n{} stale paragraph(s)",
+        problems.join("\n"),
+        problems.len()
+    );
+}

@@ -89,11 +89,18 @@ fn load_manifest(path: &Path) -> Vec<Citation> {
         let key = key.trim().to_string();
         let value = value.trim();
         if key == "symbols" {
+            // Single-quoted entries, so a symbol may itself contain a
+            // double quote -- which several of them must: the claim
+            // being checked is often a string literal in the upstream
+            // source (`workspaceDirectory: ""`, `"state", "taskHistory.json"`).
+            // A double-quoted list could not express those, and dropping
+            // the quotes from the symbol would weaken exactly the
+            // citations that need to be strongest.
             symbols = value
                 .trim_start_matches('[')
                 .trim_end_matches(']')
-                .split("\",")
-                .map(|s| s.trim().trim_matches('"').trim().to_string())
+                .split("', '")
+                .map(|s| s.trim().trim_matches('\'').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             continue;
@@ -219,6 +226,57 @@ fn every_supported_row_pins_its_citation_and_vendors_the_file() {
                     ));
                 }
             }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// No vendored file without a citation, and no citation without a
+/// vendored file.
+///
+/// The second half is covered above. This is the first: a stray excerpt
+/// nobody cites is either evidence for a claim that is not in the
+/// manifest -- which is the 30-character check again, in file form -- or
+/// dead weight that will rot. Exactly one exception, named here rather
+/// than pattern-matched loosely: a `NO-VENDOR-*` file, which records
+/// line numbers and symbol strings for a source whose licence forbids
+/// redistribution. Such a file backs no claim, by construction.
+#[test]
+fn every_vendored_file_is_cited_by_the_manifest() {
+    let dir = fixtures();
+    let citations = load_manifest(&dir.join("citations.toml"));
+    let mut files: Vec<PathBuf> = Vec::new();
+    fn walk(at: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    walk(&dir, &mut files);
+    let mut problems: Vec<String> = Vec::new();
+    for f in &files {
+        let rel = f.strip_prefix(&dir).unwrap_or(f).display().to_string();
+        if rel == "citations.toml" {
+            continue;
+        }
+        if f.file_name()
+            .map(|n| n.to_string_lossy().starts_with("NO-VENDOR-"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if !citations.iter().any(|c| c.excerpt == rel) {
+            problems.push(format!(
+                "{rel} is vendored but cited by nothing in citations.toml: either cite it, or \
+                 delete it -- an uncited excerpt is evidence for a claim CI cannot see"
+            ));
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
