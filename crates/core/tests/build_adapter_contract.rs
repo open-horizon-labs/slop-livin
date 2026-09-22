@@ -488,3 +488,85 @@ fn the_builds_view_leads_with_the_consequence_and_states_its_basis() {
     let text = swamp_core::render::render_view_builds(&empty, None);
     assert!(!text.contains("Inside these build containers"), "{text}");
 }
+
+/// #65: every adapter's units get nested history through the *existing*
+/// current + reverse-delta store, on the same key family Cargo's units
+/// already used, and without inflating the container they sit inside.
+///
+/// Written for a Node unit deliberately: the history wiring in
+/// `consumers/growth.rs` never looked at a unit's role or adapter, but
+/// nothing proved that until there was a second adapter to prove it
+/// with.
+#[test]
+fn a_node_unit_gets_nested_history_on_the_existing_key_family() {
+    let store = tempfile::tempdir().unwrap();
+    // The synthetic artifact row a nested unit becomes on its way into
+    // the growth store: keyed by `nested-id=`, never by its path.
+    let row = |bytes: u64| {
+        serde_json::json!([{
+            "project_id": "p", "name": "p", "worktrees": [{
+                "worktree_id": "w", "path": "/fixture", "kind": "Main", "signals": [],
+                "artifacts": [{
+                    "kind": "Unknown",
+                    "path": "/fixture/node_modules/.pnpm",
+                    "bytes": bytes, "mtime_max": 0, "observed_at": 1000,
+                    "confidence": "Medium", "regrowth_count": 0,
+                    "source": {"tool": "cargo.layout"},
+                    "note": "nested-id=node-pnpm-unit"
+                }]
+            }]
+        }])
+    };
+    let mut projects: Vec<swamp_core::report::ProjectRow> =
+        serde_json::from_value(row(4096)).unwrap();
+    swamp_core::growth::observe_and_annotate(
+        store.path(),
+        1,
+        &mut projects,
+        1_000,
+        30,
+        100,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        projects[0].worktrees[0].artifacts[0].growth_bytes, None,
+        "a first observation has nothing to compare against"
+    );
+
+    projects[0].worktrees[0].artifacts[0].bytes = 12_288;
+    swamp_core::growth::observe_and_annotate(
+        store.path(),
+        1,
+        &mut projects,
+        1_100,
+        30,
+        100,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        projects[0].worktrees[0].artifacts[0].growth_bytes,
+        Some(8_192),
+        "a Node unit's growth comes from the same store Cargo's units use"
+    );
+
+    // Coverage is not storage: re-observing the same bytes, however the
+    // unit is classified, is not a delta.
+    swamp_core::growth::observe_and_annotate(
+        store.path(),
+        1,
+        &mut projects,
+        1_200,
+        30,
+        100,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        projects[0].worktrees[0].artifacts[0].growth_bytes,
+        Some(0),
+        "re-observing the same bytes is zero growth, not the previous delta repeated: \
+         coverage changes are not storage changes"
+    );
+}
