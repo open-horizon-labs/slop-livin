@@ -304,12 +304,17 @@ Same fixture as the baseline table above, now with the instrumented walker:
 
 | | pass 1 | pass 2 (unchanged) |
 |---|---|---|
-| wall time | 586 ms | 981 ms |
+| wall time | 639 ms | 497 ms |
 | session-header bytes | 205,000 | **0** |
 | identification cache hits / misses | 0 / 5,006 | 5,006 / **0** |
 | `dirs_listed` | 71 | 46 |
 | `files_statted` | 36,281 | 10,580 |
 | subprocess spawns | **0** | **0** |
+
+(Numbers from the final `scripts/check.sh` run, 2026-09-22. The
+baseline table further up reported `dirs_listed` 18 / `files_statted`
+5,008 for the same fixture; that was the blind instrument, not a
+smaller cost.)
 
 ## Measured, not satisfied: two assertions in the reviewer cost test
 
