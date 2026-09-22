@@ -15,7 +15,7 @@
 //! mean something: an `unverified` row offers no action, and every
 //! documented id is an id the registry actually has an adapter for.
 
-use swamp_core::agents::matrix;
+use swamp_core::agents::matrix::{self, SupportLevel};
 use swamp_core::agents::registry::Registry;
 
 /// One parsed documentation row.
@@ -240,4 +240,163 @@ fn every_row_records_what_it_was_verified_against() {
         }
     }
     assert_eq!(checked, matrix::MATRIX.len());
+}
+
+/// An `Unverified` tool is identified and measured, and offers nothing.
+///
+/// The doc/constant comparisons above check that the *claim* is
+/// consistent. This checks the behaviour the claim is about, through the
+/// real `agents::discover_and_measure`, because "no action is offered"
+/// is enforced in one shared place and a test of the adapter alone
+/// would not see it: Cursor's adapter still *produces* a cache unit with
+/// `CacheOrTrash`, and the shared layer is what withholds it.
+#[test]
+fn an_unverified_tools_units_are_measured_and_offer_nothing() {
+    use swamp_core::agents::{AgentActionCapability, ProjectLinkState};
+    use swamp_core::locations::{Environment, Platform, Registry as Detectors};
+    use swamp_core::scope::{ScanConfig, resolve_effective_scope};
+
+    let unverified: Vec<&str> = matrix::MATRIX
+        .iter()
+        .filter(|e| e.support == SupportLevel::Unverified)
+        .map(|e| e.id.slug())
+        .collect();
+    assert!(
+        unverified.contains(&"cursor"),
+        "this test is written against Cursor; if its level changed, change the fixture too"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    // A Cursor editor profile, plus a real checkout its workspace
+    // metadata declares -- so linkage *would* resolve if the tool were
+    // verified, which is what makes the assertion below meaningful
+    // rather than vacuous.
+    let profile = home.join("Library/Application Support/Cursor");
+    let repo = home.join("declared-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    for (rel, body) in [
+        ("User/globalStorage/state.vscdb", b"sqlite".to_vec()),
+        ("User/History/e1/snapshot", b"bytes".to_vec()),
+        ("Cache/blob", vec![b'x'; 4096]),
+    ] {
+        let p = profile.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let ws = profile.join("User/workspaceStorage/w1");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("workspace.json"),
+        format!("{{\"folder\":\"file://{}\"}}", repo.display()),
+    )
+    .unwrap();
+    std::fs::write(ws.join("state.vscdb"), b"sqlite").unwrap();
+
+    let detectors = Detectors::with_builtins();
+    let scope = resolve_effective_scope(
+        &Environment::fixture(
+            home.clone(),
+            std::collections::HashMap::new(),
+            Platform::MacOS,
+        ),
+        &ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: Vec::new(),
+            enabled_detectors: vec!["cursor".into()],
+        },
+        &[],
+        &detectors,
+        1_000,
+    );
+    let store = tempfile::tempdir().unwrap();
+    let units = swamp_core::agents::discover_and_measure(
+        &scope,
+        &[],
+        Some(store.path()),
+        true,
+        1_000,
+        30,
+        3600,
+    )
+    .expect("discovery");
+
+    assert!(
+        !units.is_empty(),
+        "an unverified tool is still identified and measured -- withholding actions is not the \
+         same as pretending the bytes are not there"
+    );
+    assert!(
+        units.iter().any(|u| u.bytes > 0),
+        "and the bytes are real: {:?}",
+        units
+            .iter()
+            .map(|u| (u.relative_path.clone(), u.bytes))
+            .collect::<Vec<_>>()
+    );
+    for u in &units {
+        assert_eq!(
+            u.action,
+            AgentActionCapability::None,
+            "{} offers {:?} for an unverified tool",
+            u.relative_path,
+            u.action
+        );
+        assert!(
+            !matches!(u.project_link, ProjectLinkState::Linked { .. }),
+            "{} claims a project link on an unverified layout: {:?}",
+            u.relative_path,
+            u.project_link
+        );
+        assert!(
+            u.note.as_deref().is_some_and(|n| n.contains("unverified")),
+            "{} does not say why it offers nothing: {:?}",
+            u.relative_path,
+            u.note
+        );
+    }
+
+    // The control: the same fixture shape under a *verified* tool does
+    // link and does offer an action, so the assertions above are about
+    // the support level and not about this fixture being unactionable.
+    let cline_home =
+        home.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev");
+    std::fs::create_dir_all(cline_home.join("tasks/t1")).unwrap();
+    std::fs::write(cline_home.join("tasks/t1/ui_messages.json"), b"[]").unwrap();
+    let cline_scope = resolve_effective_scope(
+        &Environment::fixture(home, std::collections::HashMap::new(), Platform::MacOS),
+        &ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: Vec::new(),
+            enabled_detectors: vec!["cline".into()],
+        },
+        &[],
+        &detectors,
+        1_000,
+    );
+    let store2 = tempfile::tempdir().unwrap();
+    let cline_units = swamp_core::agents::discover_and_measure(
+        &cline_scope,
+        &[],
+        Some(store2.path()),
+        true,
+        1_000,
+        30,
+        3600,
+    )
+    .expect("discovery");
+    assert!(
+        cline_units
+            .iter()
+            .any(|u| u.action == AgentActionCapability::SessionRemoval),
+        "a Supported tool must still offer its action: {:?}",
+        cline_units
+            .iter()
+            .map(|u| (u.relative_path.clone(), u.action))
+            .collect::<Vec<_>>()
+    );
 }

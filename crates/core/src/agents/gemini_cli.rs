@@ -501,7 +501,15 @@ mod tests {
             .expect("the confirmed credential file is identified on its own");
         assert!(u.protected);
         assert_eq!(u.action, AgentActionCapability::None);
-        let reason = u.protect_reason.as_deref().unwrap_or_default();
+        // Not `.unwrap_or_default()`: an absent reason is a failure of
+        // this assertion, not an empty string to search. `check.sh`'s
+        // grep layer also rejects that pattern on any line mentioning
+        // protection, deliberately without exception
+        // (`.oh/guardrails/protection-fails-closed.md`).
+        let reason = u
+            .protect_reason
+            .as_deref()
+            .expect("a protected unit must carry a stated reason");
         assert!(
             reason.contains("storage.ts") && reason.contains("OAUTH_FILE"),
             "the confirmed file must carry its primary-source citation: {reason}"
