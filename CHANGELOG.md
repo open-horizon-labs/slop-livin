@@ -61,6 +61,34 @@ where the symptoms appeared.
   parent-inherited version is a stated identity gap rather than a
   silently dropped dependency. Consumer facts survive a per-root report
   refresh.
+- **Every evidence capability is now reached by the pipeline, or
+  gone.** Seventeen public functions across the evidence modules had no
+  production caller while the docs described them as delivered. Access
+  time is now read for every filesystem artifact row, stating the mount
+  option when `noatime`/`relatime` makes the answer unavailable rather
+  than omitting the question. Docker rows carry the daemon's own
+  `last_used` and running-container facts, and only Docker rows do. A
+  proposal for an external unit takes its manager-lock and
+  simulator-booted readings then, not during identification, so an
+  ordinary report still spawns no process per detected unit; it also
+  names each installed toolchain version as separately reinstallable and
+  states Maven's own downloaded-versus-`mvn install` ambiguity. On a
+  copy-on-write volume, a unit's allocated bytes are now reported as a
+  ceiling on what removal frees rather than an exact figure, and a
+  sparse unit's apparent length is kept apart from the blocks actually
+  charged. A plan carries `selection`, reconciling its per-unit sum
+  against shared inodes so one physical file cannot count twice; an
+  execution carries the `statvfs` before/after reading as a sourced
+  observation, distinct from any estimate. Rendered facts are grouped by
+  domain in a fixed order, and a short-lived reading past its own
+  recheck window now says so at the confirmation.
+  `external_associations::{parse_pom_xml, join_cache_entry}` and
+  `toolchain_declarations::conflicting_tools` were deleted instead: the
+  first two were strictly worse duplicates of `parse_pom_xml_with_gaps`
+  and of the per-unit consumer join that `consumer_wiring` actually
+  performs, and the third's capability is delivered by
+  `VersionMatch::Conflicting`. The claims that named them are corrected
+  in `.oh/sessions/2026-09-21-decision-evidence-follow-ups.md`.
 - **The store holds Parquet tables and small control files, nothing
   else.** `external_consumers.json`,
   `toolchain_declarations_cache.json` and
@@ -70,11 +98,74 @@ where the symptoms appeared.
   is now cached at all: it used to spawn one `plutil` per locally-built
   project on every report, propose and TUI refresh. No migration --
   derived data is re-derived, and the removed files are ignored.
+- **Agent adapters are a registry, not a match.** One tool's
+  identification code is now one `agents::AgentAdapter`, registered
+  once in `agents::registry::Registry::with_builtins`. This replaced a
+  fourteen-arm `match tool_id` in `agents/mod.rs`, a **second**
+  fourteen-arm match in `actions.rs` for the execution recheck, a
+  hardcoded two-id `multi_location_tool`, and a bespoke call path for
+  Aider -- four places to edit per tool, and forgetting the recheck one
+  produced a tool that identified fine and then refused to re-verify at
+  execution. Multi-host decomposition (Cline, Roo Code) and
+  project-local units (Aider) are now declared capabilities. Pi no
+  longer falls back to Oh My Pi's header shape: the shared byte-offset
+  mechanics live in a neutral helper, and a format an adapter cannot
+  identify is an explicit unknown-format outcome.
+- **An unchanged agent home now costs zero header reads.** A new
+  Parquet identification table memoises each adapter's derived
+  value -- a session's declared `cwd`, a task's workspace path --
+  against the source file's own `(len, mtime_ns, ctime_ns, inode)` plus
+  an adapter version. Measured on 5,000 synthetic sessions: 740,000
+  header bytes on the first pass, **0** on an unchanged second pass,
+  and one capped read for one appended session. Two independent
+  adversarial passes found the first fingerprint (`size`,
+  whole-second `mtime`) could not see a same-length rewrite inside the
+  same second and would serve a stale project; the fingerprint and a
+  no-sleep regression test both come from that.
+- **Adapters cannot reach past their own context.** Every adapter takes
+  an `IdentifyCtx`: bounded single-level listings, folded byte totals,
+  and content only through the capped header reader. No adapter calls
+  `read_dir`, `read_to_string`, `std::env`, `actions::` or a logging
+  macro, and units are built by `AgentUnitBuilder`, whose constructor
+  applies protected-by-default categories that a struct literal could
+  silently omit. Each adapter proves the same five things about itself
+  by name.
+- **Two tools lost their "Supported" badge, and three had a false claim
+  withdrawn.** New `SupportLevel::Unverified` means an adapter exists
+  but the layout it models is not confirmed against the tool's own
+  source or documentation: units are still identified and measured, and
+  **no action is offered, with project linkage reported unresolved**.
+  Cursor is `Unverified` (no official documentation names any of the
+  paths it models) and Windsurf is `Unverified` (its profile root and
+  `globalStorage` are now officially documented -- under the product's
+  new Devin Desktop name -- but `workspaceStorage` and the cache/log
+  siblings are not). Corrected against upstream source: Cline and Roo
+  Code both read a `task_metadata.json` `workspace` field that exists in
+  neither schema, so Cline now says which store holds the answer and
+  Roo Code reads the confirmed `history_item.json`; Continue's
+  per-session `workspaceDirectory` does exist and is now read, so
+  Continue sessions link for the first time; `OPENCODE_DATA_DIR` does
+  not exist and the detector no longer looks for it; Gemini CLI's
+  credential file is confirmed `oauth_creds.json` and its project-id
+  directories are slugs, not only hashes. Every row cites what it was
+  verified against, and a test parses the published table back.
+- **Consumers match on detector capabilities, not detector ids.**
+  `Detector::manager_conventions()` and `Detector::recovery_hint()`
+  replaced 22 `*_DETECTOR_ID` matches in `consumer_wiring.rs`, so
+  adding a detector no longer means editing a wiring table.
+- **One human protection predicate, everywhere.** The integration
+  owner's own mutation check found that removing one containment
+  direction passed every audit and every test, because the ordinary
+  filesystem proposal path went through a second `bool` predicate the
+  audit was not reading. That predicate is deleted; marking an ordinary
+  row that contains a protected file is now refused in the TUI at the
+  moment you mark it, with the reason, rather than at execution.
 - **Enforcement landed before the repairs.** 22 new AST audits, each
   with a `.oh/guardrails/<id>.md` and mutation tests proving both
-  directions, plus five runtime test files named explicitly in
-  `scripts/check.sh`. 13 of the 22 pass; the rest enumerate the work
-  that remains, which is recorded rather than described.
+  directions, plus runtime test files named explicitly in
+  `scripts/check.sh`. All 22 pass as of this entry; the two that could
+  not be satisfied as first written are recorded as decisions in their
+  guardrail docs rather than quietly weakened.
 
 - **Closed the decision-evidence follow-ups** (#56-#58, #60): live
   wiring of tool-version declarations and dependency-lockfile/shared-

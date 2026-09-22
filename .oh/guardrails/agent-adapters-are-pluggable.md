@@ -32,15 +32,45 @@ static registry. Adapters follow.
 2. Outside the registry, no function in `agents/mod.rs`, `actions.rs` or
    `crates/tui/src/**` may `match` on a `*_TOOL_ID` constant.
 3. Every adapter module is registered in `agents/registry.rs` exactly
-   once (module set ↔ registration set equality).
+   once (module set ↔ registration set equality). The count matches
+   `<module> :: Adapter` on a *path-segment* boundary: a naive substring
+   count reported `pi` as registered twice, because `pi::Adapter` occurs
+   inside `oh_my_pi::Adapter`. Precision, not a relaxation — the check
+   still fails on zero registrations and on two.
 4. The registry's ids and `agents::matrix`'s ids are the same set.
 
 **Limits.** Check 2 is "contains a match and the constant", so a
 tool-id match spelled without the constant would slip past; check 4
 compares id *sets*, not capabilities, which the matrix↔docs test covers.
 
+## What replaced the matches
+
+- `agents::AgentAdapter` (`id`, `name`, `capabilities`, `identify`,
+  `reidentify`, `project_local_units`) with static registration in
+  `agents::registry::Registry::with_builtins`.
+- `multi_location_tool`'s hardcoded Cline/Roo Code match became
+  `AdapterCapabilities::decomposes_every_location`, declared by the
+  adapter.
+- Aider's bespoke per-repo path became
+  `AdapterCapabilities::project_local_units` plus
+  `AgentAdapter::project_local_units`.
+- `actions.rs`'s duplicate fourteen-arm match became
+  `agents::reidentify_for_tool`, one registry lookup, which runs with
+  the identification cache **disabled** so an approval is never spent
+  against a cached derivation.
+- Pi's fallback to Oh My Pi's header shape is gone: the shared
+  byte-offset mechanics live in the neutral `pi_family.rs`, each adapter
+  passes only the layouts its own tool documents, and a header an
+  adapter cannot parse is an explicit unknown-format outcome.
+
 ## Runtime tests that complete it
 
-- `crates/core/tests/agent_matrix_matches_docs.rs`
+- `crates/core/tests/agent_matrix_matches_docs.rs` — the published
+  support matrix, parsed back and compared with the matrix constant and
+  the registry's ids.
+- `agents::registry::tests` — exactly-once registration, registry ids ==
+  matrix ids, every adapter id is also a detector id, and the two
+  capabilities are declared by exactly the adapters that should have
+  them (so replacing the hardcoded match did not quietly widen it).
 - each adapter's own five required tests (see
   `agent-adapter-test-contract.md`)

@@ -32,16 +32,26 @@ This is the hard rule everything else in this document sits on top of:
   that reads further into a session body (bounded to 64 KiB per
   session), and only to extract opaque `blob:sha256:<hash>` reference
   tokens -- never any other content, never persisted as text anywhere.
-  #96-#99's nine adapters follow the same discipline: Pi tries its own
-  offset-zero header, then Oh My Pi's title-slot shape, for one `cwd`
-  field, exactly like the tools it shares lineage with; Aider,
-  Cursor/Windsurf and GitHub Copilot CLI's `session-store.db` never read
-  transcript content at all (declared metadata or a protected,
-  never-opened database); GitHub Copilot CLI's `session-state/` and
-  Cline/Roo Code/Cursor/Windsurf's `workspace.json`/`task_metadata.json`
-  linkage each read one small, bounded metadata file (never the
-  conversation body) looking for one declared path field. Nothing else,
-  in any adapter, is ever read.
+  #96-#99's nine adapters follow the same discipline: Pi reads one
+  `cwd` field out of its own documented offset-zero header, and **only**
+  that shape -- it no longer falls back to Oh My Pi's title-slot layout,
+  because one tool's format change must never silently change another
+  tool's identification; Aider, Cursor/Windsurf and GitHub Copilot CLI's
+  `session-store.db` never read transcript content at all (declared
+  metadata or a protected, never-opened database); GitHub Copilot CLI's
+  `session-state/`, Cursor/Windsurf's `workspace.json`, Roo Code's
+  `history_item.json` and Continue's session header each read one small,
+  bounded metadata file (never the conversation body) looking for one
+  declared path field. Cline reads none, because Cline records the
+  working directory somewhere this catalog does not read (see its matrix
+  row). Nothing else, in any adapter, is ever read.
+
+  Every one of those bounded reads is also *memoised*: the derived value
+  is cached against the source file's own `(len, mtime_ns, ctime_ns,
+  inode)` plus the adapter version, in the Parquet identification table,
+  so an unchanged session costs **zero** bytes on the next pass. That is
+  a privacy property as much as a cost one -- the fewer times a header is
+  read, the fewer chances there are to read it wrongly.
 - No prompt, response, attachment, tool-output, or credential *content*
   is put into a report, a plan, the ledger, a log, or a test fixture.
   Every fixture used to build and test this feature is synthetic:
@@ -63,40 +73,87 @@ This is the hard rule everything else in this document sits on top of:
 
 ## Required tool matrix
 
-Source of truth: `crates/core/src/agents/matrix.rs` (`MATRIX`). This
-table is kept in sync with it by hand; a test
-(`matrix::tests::every_named_tool_is_present_exactly_once`) enforces
-that every one of the required tools has exactly one row.
+Source of truth: `crates/core/src/agents/matrix.rs` (`MATRIX`). The table
+below is **parsed back** by
+`crates/core/tests/agent_matrix_matches_docs.rs`, which compares every
+row's id, support level and "actions" column against that constant and
+against `agents::Registry`'s registered adapter ids. The two cannot
+drift: a level changed in one place and not the other fails the test.
 
-| Tool | Status | Home / override | Sources |
-|---|---|---|---|
-| Claude Code | **Supported** | `~/.claude`, or `$CLAUDE_CONFIG_DIR` if set | [claude-directory](https://code.claude.com/docs/en/claude-directory), [settings](https://code.claude.com/docs/en/settings), [checkpointing](https://code.claude.com/docs/en/checkpointing), [authentication](https://code.claude.com/docs/en/authentication) |
-| Codex | **Supported** | `CODEX_HOME`, default `~/.codex` (`sessions/`+`archived_sessions/` year/month/day rollout trees, `auth.json`, `history.jsonl`, `config.toml`, `log/`, six `*.sqlite` state stores relocatable via the separate `CODEX_SQLITE_HOME`) | [home-dir/lib.rs](https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs), [rollout/lib.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/lib.rs), [rollout/list.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs), [rollout_file_name.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/rollout_file_name.rs), [rollout/metadata.rs](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/metadata.rs), [state/sqlite.rs](https://github.com/openai/codex/blob/main/codex-rs/state/src/sqlite.rs), [codex_home_metrics.rs](https://github.com/openai/codex/blob/main/codex-rs/app-server/src/codex_home_metrics.rs) |
-| Codex desktop app | **Supported** (log directory only) | macOS `~/Library/Logs/com.openai.codex`; settings/session storage beyond logs is unconfirmed and not modeled | [doctor/desktop.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop.rs), [desktop/platform.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/doctor/desktop/platform.rs) |
-| Oh My Pi | **Supported** | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set (user-confirmed identity: a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md), [docs/settings.md](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) |
-| OpenCode | **Supported** | data: `OPENCODE_DATA_DIR` (unconfirmed env var name, honored defensively), else `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode` and cache `${XDG_CACHE_HOME:-~/.cache}/opencode` reported as opaque external units, not decomposed | [opencode.ai/docs/troubleshooting](https://opencode.ai/docs/troubleshooting/), [opencode#6669](https://github.com/anomalyco/opencode/issues/6669), [opencode#18633](https://github.com/anomalyco/opencode/issues/18633), [storage.ts](https://github.com/sst/opencode/blob/dev/packages/opencode/src/storage/storage.ts), [DeepWiki storage-and-database](https://deepwiki.com/sst/opencode/2.9-storage-and-database) |
-| Gemini CLI | **Supported** | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `bin/`; `tmp/<hash>/{shell_history,checkpoints/,chats/}` and `history/<hash>/` shadow-Git repos, both keyed by `sha256(project root)`) | [configuration.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md), [checkpointing.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md), [session-management.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md), [paths.ts](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts) |
-| Pi | **Supported** | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (confirmed primary-source name, shared with Oh My Pi's own override; `badlogic/pi-mono`, distinct from Oh My Pi which forks it) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md), [README.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md) |
-| Aider | **Supported** | `~/.aider/caches` (model-price/version-check caches); per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v{3,4}/` at the git root -- project-local, attached to the worktree artifact model, not the tool home | [models.py](https://github.com/Aider-AI/aider/blob/main/aider/models.py), [versioncheck.py](https://github.com/Aider-AI/aider/blob/main/aider/versioncheck.py), [args.py](https://github.com/Aider-AI/aider/blob/main/aider/args.py), [repomap.py](https://github.com/Aider-AI/aider/blob/main/aider/repomap.py) |
-| GitHub Copilot CLI | **Supported** | `~/.copilot`, overridable via `COPILOT_HOME` (`config.json`, `settings.json`, `mcp-config.json`, `session-state/`, `command-history-state/`, `session-store.db`, `logs/`, ...); separate platform-conventional cache via `COPILOT_CACHE_HOME` | [cli-config-dir-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference) |
-| Cursor | **Supported** (macOS only) | editor-profile storage: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | community-sourced (no official layout doc found): [cursor-chat-browser](https://github.com/thomas-pedersen/cursor-chat-browser), [cursaves](https://github.com/Callum-Ward/cursaves/blob/main/docs/how-cursor-stores-chats.md) |
-| Windsurf | **Supported** (macOS only, lower confidence) | `~/.codeium/windsurf` (not decomposed), plus an *assumed* VS-Code-fork profile at `~/Library/Application Support/Windsurf` -- not independently confirmed | [coder module](https://registry.coder.com/modules/coder/windsurf) (docs.windsurf.com redirects to docs.devin.ai as of this chunk) |
-| Cline | **Supported** (macOS hosts) | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/` | community-sourced: [cline#7101](https://github.com/cline/cline/issues/7101), [cline#14135](https://github.com/cline/cline/issues/14135) |
-| Roo Code | **Supported** (macOS hosts) | Same per-host modeling as Cline: `globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` | community-sourced: [Roo-Code#4174](https://github.com/RooCodeInc/Roo-Code/issues/4174) |
-| Continue | **Supported** | `~/.continue` (`config.yaml`/`config.json`, `sessions/<id>` + a session index file, `index/` embeddings/tag caches, `dev_data/` usage events) | [continue configuration](https://docs.continue.dev/customize/deep-dives/configuration), [reference](https://docs.continue.dev/reference) |
+`Support` is one of:
 
-Every named tool in this matrix is now `Supported`; a test
-(`matrix::tests::every_named_tool_is_now_supported`) enforces it. Two
-rows are honestly narrower than the rest, stated rather than hidden:
-Windsurf's editor-profile shape is *assumed* (VS Code fork), not
-independently confirmed this chunk -- a real installation that differs
-surfaces as an explicit "(unsupported layout version)" residual, never
-a silent miscount; Cursor/Windsurf/Cline/Roo Code are macOS-only this
-chunk, with Linux paths deferred to the independent Linux track
-(#77-#89). Extending this list for a tool *beyond* the fourteen rows
-above (Codex and its desktop app count separately, per #93's "do not
-extrapolate one client's schema to all clients" acceptance) is ordinary
-catalog review, not a change to this contract.
+- **supported** -- an adapter exists *and* the layout it models is
+  confirmed against that tool's own source or documentation, cited in the
+  row's `Verified against` column. Actions are available.
+- **unverified** -- an adapter exists, but the layout it models could not
+  be confirmed. Units are still identified and measured; **no action is
+  offered and project linkage is reported `unresolved`**, because both
+  would be claims resting on a layout we have just said is unconfirmed.
+  Enforced once, in `agents::discover_and_measure`, not left to each
+  adapter.
+
+Every row said **supported** before 2026-09-21. Two had not earned it,
+and three more carried a claim that turned out to be false. What changed
+is recorded per row below and in
+`.oh/sessions/2026-09-21-foundation-repairs-part-2.md`.
+
+| Tool | Id | Support | Actions | Home / override | Verified against |
+|---|---|---|---|---|---|
+| Claude Code | `claude-code` | supported | yes | `~/.claude`, or `$CLAUDE_CONFIG_DIR` if set | [claude-directory](https://code.claude.com/docs/en/claude-directory) (retrieved 2026-09-21): the directory table and the override |
+| Codex | `codex` | supported | yes | `CODEX_HOME`, default `~/.codex` (`sessions/`+`archived_sessions/` year/month/day rollout trees, `auth.json`, `history.jsonl`, `config.toml`, `log/`, a deprecated `skills/`, six `*.sqlite` state stores relocatable via `CODEX_SQLITE_HOME`) | openai/codex `main` @ `30daed37ad8035f041f65a4c4615fbc590dc8552`: `codex-rs/state/src/lib.rs` (`CODEX_SQLITE_HOME`), `codex-rs/core/src/config/mod.rs` (`log/`, overridable by `log_dir`), `codex-rs/ext/skills/src/host_roots.rs` (`skills/`, upstream-deprecated in favour of `~/.agents/skills`) |
+| Codex desktop app | `codex-desktop` | supported | yes | macOS `~/Library/Logs/com.openai.codex`; settings/session storage beyond logs is unconfirmed and not modeled | openai/codex `codex-rs/cli/src/doctor/desktop/platform.rs` (read during #93): the log directory only -- a deliberately partial row |
+| Oh My Pi | `oh-my-pi` | supported | yes | `~/.omp/agent`, or the whole of `PI_CODING_AGENT_DIR` when set (a fork of `badlogic/pi-mono`) | [oh-my-pi/docs/session.md](https://github.com/can1357/oh-my-pi/blob/main/docs/session.md) `main`, read during #94; **not re-fetched 2026-09-21** |
+| OpenCode | `opencode` | supported | yes | data `${XDG_DATA_HOME:-~/.local/share}/opencode`; config `${XDG_CONFIG_HOME:-~/.config}/opencode`, also settable by `OPENCODE_CONFIG_DIR`; cache `${XDG_CACHE_HOME:-~/.cache}/opencode` -- config and cache reported as opaque external units | sst/opencode `dev` @ `fe3f3a41f79ad292cc3c7c629567385a20ec5130`: `packages/core/src/global.ts` (data dir is `$XDG_DATA_HOME/opencode` via `xdg-basedir`), `packages/core/src/flag/flag.ts` (the complete env-var registry). **`OPENCODE_DATA_DIR` does not exist** -- this row claimed it was "honored defensively"; the claim is withdrawn |
+| Gemini CLI | `gemini-cli` | supported | yes | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `bin/`, `oauth_creds.json`); `tmp/<project-id>/` and `history/<project-id>/`, where the id is a legacy `sha256` or a current registry slug | google-gemini/gemini-cli `main` @ `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`: `packages/core/src/config/storage.ts` (`OAUTH_FILE = oauth_creds.json`; the `projects.json` registry and the hash-to-slug migration), `packages/core/src/utils/paths.ts` (`GEMINI_CLI_HOME`; `GEMINI_DIR` is a constant, not an env var) |
+| Pi | `pi` | supported | yes | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (shared with Oh My Pi's own override; `badlogic/pi-mono`, which Oh My Pi forks) | [pi-mono settings.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md) `main`, read during #96; **not re-fetched 2026-09-21** |
+| Aider | `aider` | supported | yes | `~/.aider/caches` and an optional home-level `.aider.conf.yml`; per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v*/` at the git root -- project-local, attached to the worktree model | Aider-AI/aider `main` `aider/args.py`, `aider/repomap.py`, `aider/models.py`, read during #96; **not re-fetched 2026-09-21** |
+| GitHub Copilot CLI | `github-copilot-cli` | supported | yes | `~/.copilot`, overridable via `COPILOT_HOME`; separate platform-conventional cache via `COPILOT_CACHE_HOME` | [cli-config-dir-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), retrieved during #97: the full config-directory listing and both overrides |
+| Cursor | `cursor` | unverified | no | editor-profile storage, macOS only: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | [cursor.com troubleshooting guide](https://cursor.com/docs/troubleshooting/troubleshooting-guide), retrieved 2026-09-21: **NOT CONFIRMED** -- it says data is cached locally and names no path; the page contains none of `Application Support/Cursor`, `globalStorage`, `workspaceStorage` or `state.vscdb`. Only `forum.cursor.com` community threads corroborate it |
+| Windsurf | `windsurf` | unverified | no | `~/.codeium/windsurf` (not decomposed) plus the VS-Code-fork profile at `~/Library/Application Support/Windsurf`, macOS only. Upstream renamed the product **Devin Desktop** on 2026-06-02 and moved the read-write profile to `~/Library/Application Support/Devin` | [docs.devin.ai desktop FAQ](https://docs.devin.ai/desktop/devin-desktop-faq), retrieved 2026-09-21 (`docs.windsurf.com` 307-redirects here): **PARTIALLY CONFIRMED** -- the profile root and `globalStorage/` are named, along with `User/settings.json`, `User/keybindings.json`, `User/snippets/`, `Workspaces/` and `argv.json`. `workspaceStorage` is **not** on the page, and neither are the `Cache`/`CachedData`/`CachedExtensionVSIXs`/`logs` siblings this adapter also models |
+| Cline | `cline` | supported | yes | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/`. Cline 4.x adds a second root -- `CLINE_DATA_DIR`, else `CLINE_DIR/data`, else `~/.cline/data` -- **not modeled yet** | cline/cline `main` @ `d4d3d9f31f309f89d0327e2b48ab6f775030595e`: `apps/vscode/src/core/storage/disk.ts` (the task filenames and directory), `apps/vscode/package.json` (the extension id). **`task_metadata.json` has no `workspace` field** (`apps/vscode/src/core/context/context-tracking/ContextTrackerTypes.ts`: `{ files_in_context, model_usage, environment_history }`), refuting this row's previous linkage claim; the working directory is `HistoryItem.cwdOnTaskInitialization` (optional) in the `taskHistory` extension state, inside `state.vscdb` or `~/.cline/data/state/taskHistory.json` |
+| Roo Code | `roo-code` | supported | yes | Same per-host modeling as Cline: `globalStorage/rooveterinaryinc.roo-cline/tasks/<task-id>/` (`api_conversation_history.json`, `ui_messages.json`, `task_metadata.json`, `history_item.json`, plus `tasks/_index.json`). The `roo-cline.customStoragePath` setting can relocate `tasks/` entirely, in which case this catalog simply does not find it | RooCodeInc/Roo-Code `main` @ `b867ec9145750d0ae1ff7f02d35406e9bf2a0b16`: `src/shared/globalFileNames.ts`, `src/utils/storage.ts` (`getTaskDirectoryPath` and the override), `src/core/task-persistence/TaskHistoryStore.ts` (the `workspace` field is in `history_item.json`, **not** `task_metadata.json`, which `src/core/context-tracking/FileContextTrackerTypes.ts` defines as `{ files_in_context }`) |
+| Continue | `continue` | supported | yes | `~/.continue`, or `CONTINUE_GLOBAL_DIR` when set (`config.yaml`/`config.json`, `sessions/<id>.json` + a `sessions/sessions.json` index, `index/` embeddings/tag caches, `dev_data/` with `devdata.sqlite`) | continuedev/continue `main` @ `5522c6f44ca0ac3528b37244818fbfa39b5af470`: `core/util/paths.ts` (the whole layout and the override), `core/index.d.ts` + `core/util/history.ts` (`Session.workspaceDirectory` is a required field, written per session and mirrored into the index) -- so this row's previous "no confirmed per-session workspace-linkage field was found" is superseded, and the adapter reads it |
+
+### What the 2026-09-21 re-verification changed
+
+Five rows carried a claim that was wrong rather than merely unconfirmed:
+
+- **Cline** read `task_metadata.json`'s `workspace` field for project
+  linkage. That field is in neither extension's schema, so it resolved
+  nothing, ever -- while reporting an `unresolved` reason that named the
+  wrong file. Cline tasks now say which store actually holds the answer.
+- **Roo Code** had the same wrong file. It *does* record the workspace
+  per task, in `history_item.json`, which the adapter now reads -- so Roo
+  Code task linkage works for the first time.
+- **Continue** said no per-session workspace field existed. One does, it
+  is required, and the adapter now reads it from its bounded header.
+- **OpenCode** claimed an `OPENCODE_DATA_DIR` override "honored
+  defensively". No such variable exists upstream; the detector no longer
+  looks for it.
+- **Gemini CLI** described `tmp/<hash>`/`history/<hash>` as
+  `sha256(project root)`. That is the legacy form; current versions use
+  short registry slugs from `projects.json`. The adapter treats the name
+  as opaque either way and does not read `projects.json`, which its
+  `unresolved` reason now says.
+
+Two rows lost their **supported** status because the layout they model is
+not confirmed: **Cursor** (no official documentation names any of these
+paths) and **Windsurf** (the profile root and `globalStorage` are now
+officially documented, but `workspaceStorage` and the cache/log siblings
+are not). Identification still runs for both; no action is offered and
+linkage is `unresolved`.
+
+Three rows are **supported** on research from an earlier chunk that was
+not re-fetched on 2026-09-21 -- Oh My Pi, Pi and Aider. Their
+`Verified against` column says so. That is a smaller claim than "checked
+today" and a bigger one than "assumed".
+
+Cursor, Windsurf, Cline and Roo Code are macOS-only in this chunk, with
+Linux paths deferred to the independent Linux track (#77-#89). Extending
+this list for a tool *beyond* the fourteen rows above (Codex and its
+desktop app count separately, per #93's "do not extrapolate one client's
+schema to all clients" acceptance) is ordinary catalog review, not a
+change to this contract.
 
 ## Categories
 
@@ -457,10 +514,18 @@ limitation (see `crate::locations::pi`'s doc comment).
 - **Explicit format/version detection:** Pi's own README documents
   session files only as JSONL with `id`/`parentId` tree structure -- it
   does **not** document Oh My Pi's 256-byte title slot. This adapter
-  tries Pi's own offset-zero JSON header first, then Oh My Pi's
-  title-slot-skip shape as an explicit fallback (reused, not assumed),
-  and reports `unresolved` naming both shapes checked when neither
-  matches.
+  therefore parses **only** Pi's own offset-zero JSON header, and reports
+  an explicit unknown-format outcome (`unresolved`, naming the shape it
+  expected) when that does not match.
+
+  It used to fall back to Oh My Pi's title-slot shape "as an explicit
+  fallback (reused, not assumed)". That was adapter-to-adapter
+  knowledge: a change to Oh My Pi's format would have changed *Pi's*
+  identification, for no reason a reader of either file could see. The
+  shared byte-offset mechanics now live in the neutral
+  `crate::agents::pi_family`, which names no tool, and each adapter
+  passes only the layouts its own tool documents
+  (`.oh/guardrails/agent-adapters-are-pluggable.md`).
 - **Sessions:** `sessions/`, organized by working directory per Pi's own
   docs; this adapter does not decode a directory name into a project
   path (no encoding scheme is confirmed), relying only on each session
@@ -582,10 +647,23 @@ task directories -- which can share the exact same UUID-shaped name --
 never collide in identity or display.
 
 - **Sessions:** `globalStorage/<extension-id>/tasks/<task-id>/`, folded
-  as one unit per task. Linked via `task_metadata.json`'s `workspace`
-  field -- this chunk's own research (from the issue text), not
-  independently re-confirmed against a schema doc; `unresolved` when
-  missing, never a guess.
+  as one unit per task. Project linkage is **per extension**, because
+  the two extensions do not record it in the same place -- so the shared
+  module takes a declared `TaskLinkSource` from each adapter rather than
+  assuming one field name for everybody:
+  - **Roo Code** declares `tasks/<id>/history_item.json`'s `workspace`
+    field, confirmed in `src/core/task-persistence/TaskHistoryStore.ts`.
+  - **Cline** declares "not in any file we read". Its working directory
+    lives in the `taskHistory` extension state
+    (`HistoryItem.cwdOnTaskInitialization`, itself optional), inside
+    `state.vscdb` -- the SQLite store this catalog refuses to open -- or
+    under `~/.cline/data/state/taskHistory.json`, a root not modeled
+    yet. Cline tasks carry an `unresolved` link whose reason names that
+    store.
+
+  Both adapters previously read `task_metadata.json`'s `workspace`
+  field. That field exists in neither extension's schema, so it resolved
+  nothing, ever, while reporting a reason that named the wrong file.
 - Roo Code's own community reports note a task directory can embed a
   full Git checkpoint repository, so its folded byte total is not
   necessarily small the way a Claude Code session usually is --
@@ -680,11 +758,15 @@ tools this chunk added.
   `propose` without a `root` is not a hot path. See
   `discover_agent_units_for_propose` in `crates/cli/src/main.rs`.
 - Windsurf's editor-profile shape and the `task_metadata.json`
-  `workspace` field Cline/Roo Code use for project linkage are this
-  chunk's own best-available research, not independently re-confirmed
-  against an official schema/layout document -- both degrade to an
-  honest "unresolved"/"(unsupported layout version)" outcome rather than
-  a wrong guess when they do not match a real installation.
+  `workspace` field Cline/Roo Code used for project linkage were this
+  chunk's own best-available research. **Both were re-checked against
+  upstream on 2026-09-21 and neither survived intact**: the
+  `task_metadata.json` field does not exist in either schema (Roo Code's
+  is in `history_item.json`; Cline's is not in any file this catalog
+  reads), and Windsurf's `workspaceStorage` is still not named by the
+  official documentation that now covers the rest of that profile. See
+  the support matrix for the citations. Windsurf and Cursor are
+  `unverified` as a result.
 - Cursor, Windsurf, Cline and Roo Code are macOS-only this chunk; their
   Linux paths are the independent Linux track's job (#77-#89), not
   re-derived here as a guess.
@@ -707,10 +789,17 @@ tools this chunk added.
   a deliberate scope boundary, not an oversight: reference-based blob
   GC and per-hash snapshot removal both need reference/coverage
   guarantees this chunk does not implement.
-- Codex's `CODEX_SQLITE_HOME` and OpenCode's `OPENCODE_DATA_DIR` exact
-  env var name are both documented as unconfirmed/partially-followed in
-  their sections above, not silently treated as settled facts. This
-  chunk corrected two more env var guesses against primary source:
+- Both of the env var names this list once called unconfirmed were
+  checked against upstream source on 2026-09-21 and are now settled:
+  Codex's `CODEX_SQLITE_HOME` is real (`codex-rs/state/src/lib.rs`,
+  openai/codex `main` @ `30daed37ad8035f041f65a4c4615fbc590dc8552`),
+  and OpenCode's `OPENCODE_DATA_DIR` is **not** -- no such variable
+  exists (`packages/core/src/global.ts` and
+  `packages/core/src/flag/flag.ts`, sst/opencode `dev` @
+  `fe3f3a41f79ad292cc3c7c629567385a20ec5130`), so the detector no
+  longer looks for it and the data root is `$XDG_DATA_HOME/opencode`
+  unconditionally. Earlier chunks corrected two more env var guesses
+  against primary source:
   Gemini CLI's real override is `GEMINI_CLI_HOME` (not
   `GEMINI_CONFIG_HOME`), and Pi's real override is `PI_CODING_AGENT_DIR`
   (not `PI_AGENT_DIR`, which is still honored defensively as an
@@ -823,21 +912,29 @@ notes and `FOLLOWUPS.md` rather than silently resolved by guessing:
   and honest to a human deciding whether to delete a session, or are
   they too technical, too reassuring, or missing a consequence a real
   user would care about? Not evaluated by any automated test.
-- **Unresolved format assumptions**, verbatim from
-  `FOLLOWUPS.md`'s own tracking note (chunk E): "Windsurf layout
-  assumed; Cline/Roo Code `task_metadata.json` workspace field
-  unconfirmed; Gemini OAuth credential filename unconfirmed;
-  Cursor/Windsurf/Cline/Roo Code macOS-only paths (Linux track)." None
-  of these were resolved this chunk -- each still degrades to an honest
-  "unresolved"/"(unsupported layout version)" outcome rather than a
+- **Format assumptions, as of the 2026-09-21 re-verification.** The
+  previous tracking note read: "Windsurf layout assumed; Cline/Roo Code
+  `task_metadata.json` workspace field unconfirmed; Gemini OAuth
+  credential filename unconfirmed; Cursor/Windsurf/Cline/Roo Code
+  macOS-only paths (Linux track)." Three of the four were resolved, and
+  not in the direction the note expected: the Gemini credential filename
+  is confirmed (`oauth_creds.json`), the `task_metadata.json` workspace
+  field was **refuted** for both extensions, and Windsurf's profile root
+  is now officially documented while its `workspaceStorage` is not.
+  Cursor and Windsurf are `unverified` in consequence; the macOS-only
+  paths remain a Linux-track item. What is left still degrades to an
+  honest "unresolved"/"(unsupported layout version)" outcome rather than
+  a
   wrong guess when a real installation does not match, but whether the
   *assumption itself* is correct needs a maintainer with an actual
   installation of the tool in question (or a reachable primary-source
   layout doc this chunk could not find) to confirm.
 - **Other named unknowns, verbatim from `FOLLOWUPS.md`**: "`~/.claude.json`
   sibling file and `todos/` prefix heuristic are named unknowns"
-  (Claude Code); "Codex `skills/`/`log/` names + `CODEX_SQLITE_HOME`;
-  OpenCode `OPENCODE_DATA_DIR` env var name" are unverified; "Oh My Pi
+  (Claude Code); Codex's `skills/`/`log/` names and `CODEX_SQLITE_HOME`
+  are now confirmed, and OpenCode's `OPENCODE_DATA_DIR` is confirmed
+  **not to exist** (see the support matrix's `Verified against` column
+  for both); "Oh My Pi
   blob GC and OpenCode snapshot/`storage/part` removal deliberately not
   offered (complete-reference requirement)" remains a scope boundary,
   not a bug.

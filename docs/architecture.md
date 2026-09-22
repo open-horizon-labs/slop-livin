@@ -91,9 +91,9 @@ reusing facts a pass already has in hand:
 | `activity.rs` (#54) | Activity | `ArtifactRow`/`ExternalUnit`/`AgentUnit`'s already-recorded `mtime_max`; `statfs` flags (macOS) / `/proc/mounts` (Linux) to detect `noatime`/`relatime` before ever trusting an access-time read; Docker's own `last_used`, kept as a separate fact from filesystem mtime |
 | `occupancy.rs` (#55) | CurrentUse | `lsof` (existing `occupied()`'s underlying command, now also exposed as structured evidence distinguishing "no match" from "query failed"), already-collected Docker `ContainerRef`s, a non-blocking `flock` probe for manager lock files, and the bounded, allow-listed `xcrun simctl list devices -j` query (new `locations::ALLOWED_COMMANDS` entry) for simulator booted state |
 | `toolchain_declarations.rs` (#56) | Consumer | Read-only parsers for `.tool-versions`/`mise.toml`, `.python-version`, `.ruby-version`, `.nvmrc`/`.node-version`, `rust-toolchain(.toml)`, rustup's global `default_toolchain`; matched against measured installations with manager semantics (an alias/range like `lts/*` or a bare `3.12` stays an explicit unresolved range unless exactly one installation uniquely matches); `resolve_rustup_channel_to_dir` widens a bare channel (`stable`) to its one installed `<channel>-<host-triple>` directory only when unambiguous |
-| `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml` via the `roxmltree` dependency) joined by exact name+version; targeted existence-check joins (`cargo_registry_entry_exists`, `go_module_cache_entry_exists`, `gradle_cache_entry_exists`, `maven_repo_entry_exists` -- one `Path::exists()` hash lookup per declared identity, never a store enumeration); `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
+| `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml` via the `roxmltree` dependency -- `parse_pom_xml_with_gaps` returns both the resolved identities and the ones it could not resolve, such as a `${property}` or parent-inherited version) joined by exact name+version; targeted existence-check joins (`cargo_registry_entry_exists`, `go_module_cache_entry_exists`, `gradle_cache_entry_exists`, `maven_repo_entry_exists` -- one `Path::exists()` hash lookup per declared identity, never a store enumeration); `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
 | `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven `_remote.repositories` marker (network fetch vs. unknown -- directory category alone never decides this), a known toolchain version string (local reinstall), Docker image/build-cache/volume context (`docker_image_recovery` names pull-vs-rebuild as two candidate, never-picked-for-you prerequisites; `docker_build_cache_recovery` requires a present joined worktree; `docker_volume_recovery` is always potentially-unique local state with no Trash); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
-| `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice |
+| `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice, and `actions::propose*` carries its result on the `Plan` as `selection` next to the plain `planned_bytes` sum |
 | `consumer_wiring.rs` (#56/#57 live wiring) | Consumer | The caller that actually runs the two modules above against real worktrees/external units: a per-worktree mtime-keyed cache (`toolchain_declarations_cache.json`/`dependency_identities_cache.json` sidecars under `${SWAMP_DIR}`, mirroring `external.rs`'s existing `external_consumers.json` precedent) so an unchanged worktree's declaration/lockfile files are never re-parsed; attaches consumer evidence both ways (an installation/shared-store `ExternalUnit` <- every project declaring/depending on it; a project's own `Source` row -> the installations/dependencies it declares); a rustup `settings.toml` global default gets its own role, distinct from any project's declaration; Xcode DerivedData subfolders are enumerated (one `plutil` read per subfolder) and joined by `WorkspacePath` |
 
 Attachment point: `report::attach_decision_evidence`, called exactly
@@ -101,19 +101,43 @@ once from `bus::run_report` -- the single choke point every report
 caller (CLI text/JSON, TUI, single- and multi-root) goes through --
 populates every `ArtifactRow.evidence` with Activity, Reclaimability
 and (for `BuildOutput`/`DependencyTree`/`Cache`/`DockerImage`/
-`DockerBuildCache`/`DockerVolume` kinds) Recovery facts. The Docker-join
-site in `report.rs` and `external::discover_and_measure` attach Consumer
-facts from data they already collected; a Recovery assessment's own
-`follow_up_check` ("the smallest useful check") is carried into the
-attached `Evidence::note` rather than dropped, so it survives into
-every presentation surface that already renders `note` (CLI text, the
-TUI detail area, JSON). `CurrentUse` is deliberately *not* attached
-during a passive report (a live process/lock/container check is
-short-lived and only meaningful right before an action):
-`actions::plan_unit_evidence` takes it fresh at proposal time, and
-`execute_with_trash_opts` takes it fresh *again* immediately before
-acting, so a fact that changes between propose and execute is always
-caught rather than compared against a possibly-stale snapshot.
+`DockerBuildCache`/`DockerVolume` kinds) Recovery facts. Activity is
+two facts, not one: the folded walk's own `mtime_max`, plus the unit's
+own anchor-path access time (one extra `stat` and one `statfs` per
+row -- never a per-file pass), which on a `noatime`/`relatime` mount is
+an `Unavailable` fact naming the mount option rather than an omitted
+question. A Docker row is excluded from anything that stats a path: its
+"path" is a repo tag, image id or volume name the daemon owns.
+Reclaimability's estimate is a bound rather than an exact figure
+whenever hardlink membership is unresolved *or* the row sits on a
+copy-on-write volume, where a clone or snapshot outside the unit can
+retain every extent.
+
+The Docker-join site in `report.rs` and `external::discover_and_measure`
+attach Consumer facts from data they already collected; a Recovery
+assessment's own `follow_up_check` ("the smallest useful check") is
+carried into the attached `Evidence::note` rather than dropped, so it
+survives into every presentation surface that already renders `note`
+(CLI text, the TUI detail area, JSON). That same Docker-join site
+attaches the two facts only the raw `docker::DockerFacts` can answer --
+the daemon's own `last_used` on a build-cache row (Activity,
+`ToolReportedUse`) and its running-container references on an image or
+volume row (CurrentUse, `RunningContainer`) -- to joined and unjoined
+rows alike, since "no project claims it" is a consumer fact rather than
+a reason to drop the object's own evidence.
+
+No `CurrentUse` fact that requires a *live* query is attached during a
+passive report (a process, lock, container-state or booted-device check
+is short-lived, and one query per detected unit on every report is a
+cost identification must not pay): `actions::plan_unit_evidence` takes
+the `lsof` reading fresh at proposal time, `actions::unit_from_external`
+takes an external unit's manager-lock and simulator-booted readings
+there too, and `execute_with_trash_opts` takes occupancy fresh *again*
+immediately before acting, so a fact that changes between propose and
+execute is always caught rather than compared against a possibly-stale
+snapshot. `execute_with_trash_opts` also records the one *measured*
+reclaimability number, `reclaimability::observed_free_space_change`
+over its own `statvfs` before/after readings, on `ExecuteResult`.
 
 `consumer_wiring::attach_associations(report, external_units, swamp_dir)`
 is called once per call site that has *both* a computed `Report` and a
@@ -240,6 +264,26 @@ external and agent discovery.
 detector inference runs at all. See
 [explicit-only-scope-when-defaults-false](../.oh/guardrails/explicit-only-scope-when-defaults-false.md).
 
+Precisely what `detectors_permitted` reads as "explicit", because the
+two config lists differ and the difference matters:
+
+- `enabled_detectors`, when non-empty, is an **allow-list**: only those
+  detectors run.
+- `disabled_detectors`, under `defaults = false`, is a **deny-list**:
+  the catalog minus the named ones. Naming what you do not want is
+  itself an explicit statement about the rest, and the reviewer's own
+  fixtures rely on this reading.
+- Neither list set, with `defaults = false`, is an empty scope, and
+  every command says so rather than falling back to the current
+  directory.
+
+All three are pinned by name:
+`scope.rs::tests::defaults_false_without_includes_or_enabled_detectors_is_empty`,
+`defaults_false_with_only_disabled_detectors_still_runs_the_rest`, and
+the reviewer's `defaults_false_must_mean_explicit_only`. `docs/usage.md`
+says the same thing to a user, including which list to reach for if you
+want the strict reading.
+
 ### Observation ownership: who may tombstone a row
 
 External units and agent units share one key family in one Parquet
@@ -297,16 +341,40 @@ reads them over a 5,000-session agent home and a 20k-file cache root, so
 `agents::bounded_io` is the only way an adapter may read file contents,
 capped at `MAX_HEADER_BYTES`. The association layer's caches
 (`assoc_store`) are Parquet current-state tables keyed by identity plus
-a source `(size, mtime)` fingerprint, so an unchanged worktree is a
-table lookup and an unchanged Xcode DerivedData folder costs no `plutil`
-subprocess.
+a source fingerprint, so an unchanged worktree is a table lookup and an
+unchanged Xcode DerivedData folder costs no `plutil` subprocess.
+
+**The agent identification cache** is the fifth of those tables
+(`assoc_store::IdentificationTable`), reached through
+`agents::IdentifyCtx::derived`. An adapter asks for a *derived value* --
+a session's declared `cwd`, a task's workspace path -- rather than for
+bytes, and the value is memoised against the source file's own identity.
+Measured on the 5,000-session fixture: the first pass reads 740,000
+header bytes, an unchanged second pass reads **0**, and appending one
+session costs one capped read and exactly one cache miss
+(`crates/core/tests/incremental_external_and_agent_measurement.rs`,
+which asserts the strict `== 0`).
+
+That fingerprint is `(len, mtime_ns, ctime_ns, inode)` plus
+`agents::ADAPTER_VERSION`, not `(size, mtime_secs)`. Two independent
+adversarial passes over the first version found the same hole: rewriting
+a session's declared `cwd` to a path of the *same length* within the
+same wall-clock second left size and whole-second mtime unchanged, so
+the stale project was served and a re-linked session never moved. A
+cache that cannot see a same-second, same-size rewrite silently lies,
+and the only reason the unit tests missed it was that they slept a
+second first. `agents::mod::tests::a_same_second_same_size_rewrite_invalidates_the_cached_derivation`
+has no sleep, on purpose.
+
+Execution-time rechecks run with `IdentificationCache::disabled`, so an
+approval is never spent against a cached derivation
+(`agents::reidentify_for_tool`).
 
 What is *not* yet incremental, measured rather than asserted: an
-unchanged agent home still re-reads its session headers, and an
-unchanged external root is still folded afresh. See the "still open"
-section of `.oh/sessions/2026-09-21-foundation-repairs.md` for the
-numbers and why the remaining half belongs with the `AgentAdapter`
-trait.
+unchanged external root is still folded afresh on every pass. The work
+counters make that visible (`dirs_listed`, `files_statted`) and
+`an_unchanged_external_cache_root_is_not_re_traversed` pins that the
+work is at least counted.
 
 ### Location detector registry
 
@@ -524,6 +592,63 @@ one two chunks above already established:
   uses -- the `"agent:"` prefix only keeps an agent category string
   from ever colliding with `locations::StorageCategory`'s own kebab
   strings, since both live in the same Parquet store.
+- **Adapters are a registry, not a match.** One tool's identification
+  code is one `agents::AgentAdapter` (`id`, `name`, `capabilities`,
+  `identify`, `reidentify`, `project_local_units`), registered exactly
+  once in `agents::registry::Registry::with_builtins` -- the same shape
+  as `locations::Registry`, and for the same reason. Before this there
+  was a fourteen-arm `match tool_id` in `agents/mod.rs`, a second
+  fourteen-arm match in `actions.rs` for the execution recheck, a
+  hardcoded two-id `multi_location_tool`, and a bespoke call path for
+  Aider: adding a tool meant editing four places, and forgetting the
+  recheck one produced a tool that identified fine and then refused to
+  re-verify at execution -- a safety boundary that silently did not
+  cover a tool.
+
+  What the matches became:
+
+  | was | is |
+  |---|---|
+  | `identify_for_tool`'s 14 arms | `Registry::get(tool_id)` |
+  | `actions.rs`'s 14 arms | `agents::reidentify_for_tool` |
+  | `multi_location_tool` (Cline/Roo) | `AdapterCapabilities::decomposes_every_location` |
+  | Aider's bespoke per-repo path | `AdapterCapabilities::project_local_units` |
+  | `pi.rs` falling back to Oh My Pi's header shape | neutral `pi_family` mechanics; each adapter passes only its own tool's layouts |
+
+  Four audits keep it that way: no adapter names another adapter, no
+  central tool-id match outside the registry, every adapter registered
+  exactly once, and the registry's ids equal the matrix's ids
+  ([agent-adapters-are-pluggable](../.oh/guardrails/agent-adapters-are-pluggable.md)).
+
+- **An adapter sees only its `IdentifyCtx`.** Listings come from
+  `ctx.list`/`dir_names`/`file_names`/`has_entries` (one bounded,
+  capped, symlink-refusing level via `locations::shallow_list`); byte
+  totals from `ctx.folded_bytes`; content **only** from
+  `ctx.read_header`/`ctx.derived`, capped at `MAX_HEADER_BYTES`. No
+  adapter calls `read_dir`, `read_to_string`, `std::env`, `actions::`,
+  or `println!` -- each is a separate audit rather than a convention,
+  because the privacy contract is worth more than fifteen careful
+  authors.
+
+- **Units are built by a constructor, not a literal.**
+  `agents::AgentUnitBuilder::new(tool, category, path)` applies
+  `AgentCategory::default_protected` with a stated reason; lifting it
+  requires `unprotect_with_reason`. A `CandidateAgentUnit { .. }`
+  literal would let a new adapter ship a credentials file with
+  `protected: false` and nothing would notice
+  ([agent-units-built-through-builder](../.oh/guardrails/agent-units-built-through-builder.md)).
+
+- **Support level is a level, not a footnote.**
+  `agents::matrix::SupportLevel::Unverified` means "an adapter exists,
+  the layout it models is not confirmed against the tool's own source or
+  documentation". `agents::discover_and_measure` withholds every action
+  and reports project linkage `unresolved` for such a tool, in one place
+  rather than in each adapter. Cursor and Windsurf are `Unverified` as
+  of 2026-09-21; `crates/core/tests/agent_matrix_matches_docs.rs` parses
+  the published table in `docs/agent-storage.md` back and compares it
+  with the constant and the registry, so the claim and the code cannot
+  drift.
+
 - **Session identity, when a tool has sessions.** Claude Code's
   category granularity is a folded directory total for everything
   *except* sessions: a session unit's identity is its transcript file's
@@ -665,11 +790,12 @@ both deliberately narrow rather than a general redesign:
 See `docs/agent-storage.md` for the rendered table, category/linkage
 semantics, and documented gaps (`~/.claude.json` living outside the
 home directory; `todos/` matching by filename-prefix heuristic since
-the naming convention is undocumented upstream; Codex's
-`CODEX_SQLITE_HOME`, OpenCode's `OPENCODE_DATA_DIR`, Gemini CLI's
-project-hash reversal, and Windsurf's assumed-not-confirmed layout;
-Oh My Pi's blob-GC and OpenCode's snapshot/part actions both
-deliberately out of scope this chunk).
+the naming convention is undocumented upstream; Gemini CLI's one-way
+project id; Oh My Pi's blob-GC and OpenCode's snapshot/part actions
+both deliberately out of scope this chunk). Cursor and Windsurf are
+`SupportLevel::Unverified` there -- identified and measured, but no
+action offered and linkage reported `unresolved`, because their modeled
+layout is not confirmed against the tool's own documentation.
 
 ## Observation pipeline
 

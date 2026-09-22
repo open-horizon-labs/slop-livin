@@ -85,6 +85,25 @@ defines `build:` or `image:`); a build-cache entry needs its joined
 project's worktree present; a volume is always potentially-unique local
 state with no Trash recovery.
 
+## Which rows carry which facts
+
+Not every fact applies to every unit, and a fact is attached only where
+its source can actually answer for that unit -- a Docker fact never
+lands on a filesystem row, and vice versa.
+
+| Fact | Attached to | Taken when |
+|---|---|---|
+| `activity`/`modified` | every artifact row, external unit and agent unit | every report (from the folded walk's own stat) |
+| `activity`/`accessed` | every filesystem artifact row (never a Docker row, whose "path" is a repo tag or volume name) | every report -- one `stat` plus one `statfs` per row. `unavailable`, naming the mount option, on a `noatime`/`relatime` volume |
+| `activity`/`tool-reported-use` | Docker build-cache rows (the daemon's own `LastUsedAt`) | whenever Docker facts are read |
+| `current-use`/`running-container` | Docker image and volume rows | whenever Docker facts are read |
+| `current-use`/`open-file` | any unit reaching a proposal | `swamp propose` (bounded `lsof +D`), re-taken by `swamp execute` |
+| `current-use`/`lock`, `current-use`/`booted` | an external unit reaching a proposal: a manager lock file in the unit's own directory; each CoreSimulator device directory in a device store | `swamp propose` only -- never during identification, so an ordinary report spawns no process per detected unit |
+| `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | report (artifact rows), proposal (external units) |
+| `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | report / proposal |
+| `reclaimability`/`estimated-reclaimable` | every unit. A bounded range, not an exact figure, when hardlink membership is unresolved or the volume is copy-on-write (APFS extents can be retained by a clone or snapshot outside the unit) | report / proposal |
+| `reclaimability`/`observed-freed` | the `ExecuteResult` of a real execution | `swamp execute` (`statvfs` before and after) |
+
 ## Acting on it
 
 Never summarize evidence away or round it into "safe"/"unused"/"stale"

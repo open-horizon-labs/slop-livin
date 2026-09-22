@@ -106,6 +106,27 @@ default roots, keep inferring from every other detector", which put
 paths in scope that nothing in the config had asked for. That reading is
 gone.
 
+The two lists are read differently, and it is worth being precise about
+which, because "explicit" can mean either:
+
+- **`enabled_detectors` is an allow-list.** When it is non-empty, only
+  the detectors it names run. Adding a detector to the catalog later
+  changes nothing for you.
+- **`disabled_detectors` is a deny-list**, even under
+  `defaults = false`: the catalog *minus* the ones you named. So
+  `defaults = false` with only `disabled_detectors = ["homebrew"]` runs
+  every other detector -- naming what you do not want is itself an
+  explicit statement about the rest.
+
+Both readings are pinned by name:
+`scope.rs::tests::defaults_false_without_includes_or_enabled_detectors_is_empty`
+(neither list set means empty),
+`defaults_false_with_only_disabled_detectors_still_runs_the_rest` (the
+deny-list reading), and the reviewer's own
+`defaults_false_must_mean_explicit_only`. If you want the strict
+reading, set `enabled_detectors` rather than relying on
+`disabled_detectors`.
+
 Passing an explicit root (`swamp report ~/other-tree`) replaces sources
 1-3 entirely for that invocation -- `exclude` still applies. A root that
 sits inside another in-scope root is folded into its parent for

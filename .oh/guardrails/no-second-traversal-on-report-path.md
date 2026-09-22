@@ -31,6 +31,34 @@ store/git/scan helpers). They are forbidden in `external.rs`,
 the members of one already-selected group at action time — a recheck of
 an exact selection, not an observation pass.
 
+One further exemption, and it is a `(file, function)` pair rather than a
+whole file: `locations/mod.rs::shallow_list`. The guardrail spec carved
+this out itself — "detector modules that genuinely need one shallow
+listing must go through a bounded helper `locations::shallow_list` which
+is itself allow-listed and capped" — because some layouts really do
+require enumerating exactly one level (a version manager's `versions/`,
+a tool home's top-level entries). Everything that used to call
+`read_dir` in `agents/**` and `locations/**` now calls it, adapters
+reach it only through `agents::IdentifyCtx`, and it is sorted, capped at
+`SHALLOW_LIST_CAP`, never recursive, and refuses to follow a symlink
+into another tree.
+
+The exemption is deliberately narrow in two ways the audit enforces:
+
+- it is scoped to that one function, so a second traversal added
+  *beside* it in the same file still fails (mutation test:
+  `the_one_bounded_lister_is_exempt_but_a_sibling_in_the_same_file_is_not`);
+  and
+- the audit requires `SHALLOW_LIST_CAP` to still exist, so the
+  exemption cannot outlive the bound that earns it (mutation test:
+  `a_bounded_lister_that_lost_its_cap_is_rejected`).
+
+`agents/mod.rs::folded_bytes` moved to
+`folded_measurement::folded_bytes_bounded` for the same reason: the
+recursive stat-only fold is a folded *measurement*, and
+`folded_measurement.rs` is the one module on this path allowed to
+traverse. Adapters reach it through `IdentifyCtx::folded_bytes`.
+
 **Limits.** This is a syscall-shape check. It cannot prove the folded
 rows are actually reused, only that a second traversal is not open-coded
 here; the work-counter tests prove the reuse.
@@ -40,6 +68,7 @@ here; the work-counter tests prove the reuse.
 - `crates/core/tests/incremental_external_and_agent_measurement.rs` —
   work counters (`crate::work_counters`) over a synthetic 5,000-session
   agent home and a 20k-file external cache root: first observation reads
-  headers; an unchanged second observation reads zero headers and lists
-  zero directories beyond the coverage check; appending one session
-  reads exactly one header and re-lists only its container.
+  headers; an unchanged second observation reads **zero** header bytes
+  (asserted as `== 0` since the identification cache landed, with
+  `identification_cache_hits >= SESSIONS`); appending one session costs
+  at most one capped header read and exactly one cache miss.

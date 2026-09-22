@@ -94,9 +94,11 @@ verbatim, never as "unsafe" or "can't be deleted".
 
 `docs/agent-storage.md` (in the repo, not this skill) has the complete
 category table, project-linkage state table, the required 14-row tool
-matrix with sources (every row now `Supported`), and every documented
-gap (Oh My Pi's shared-blob GC and OpenCode's snapshot/`storage/part`
-actions are both deliberately out of scope; Codex's `CODEX_SQLITE_HOME`,
-OpenCode's `OPENCODE_DATA_DIR`, Gemini CLI's project-hash reversal and
-Windsurf's assumed-not-confirmed layout are all flagged as explicit
-unknowns there, never silently treated as settled).
+matrix with a per-tool support level and the upstream source each was
+verified against, and every documented gap (Oh My Pi's shared-blob GC
+and OpenCode's snapshot/`storage/part` actions are both deliberately out
+of scope; Gemini CLI's project id is one-way). Twelve of the fourteen
+rows are `supported`; **Cursor and Windsurf are `unverified`** -- their
+units are identified and measured, but no action is offered and project
+linkage is reported `unresolved`, because no primary source confirms the
+layout those adapters model.

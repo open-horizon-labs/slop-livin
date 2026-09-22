@@ -15,6 +15,8 @@ cargo test -p swamp-core \
   --test shared_history_ownership \
   --test store_contents_are_allowlisted \
   --test incremental_external_and_agent_measurement \
+  --test agent_matrix_matches_docs \
+  --test agent_storage_validation \
   -- --test-threads=1
 cargo test -p swamp-tui --test scope_preserving_refresh
 

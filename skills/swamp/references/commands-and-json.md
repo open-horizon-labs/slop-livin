@@ -197,6 +197,8 @@ treat a `--limit`-bounded call as an exhaustive inventory.
     "growth_bytes": null, "recovery": "local_rebuild", "verb": "delete",
     "warnings": ["dirty"], "...": "..."} ],
   "refused": [ {"path": "...", "cause": "..."} ],
+  "selection": {"naive_sum_bytes": 0, "deduplicated_bytes": 0,
+    "double_counted_bytes": 0, "unknown_sharing": false},
   "state": "awaiting-authorization",
   "planned_bytes": 0,
   "next_step": "a human authorizes with `swamp approve <id>` (this plan) or a standing `swamp grant add ...`; then run `swamp execute <id>` (add --json for machine output). Proposing never authorizes removal.",
@@ -208,16 +210,33 @@ Proposing never deletes or authorizes anything, ever -- `state` is
 always `awaiting-authorization` on a fresh plan. Plans expire (default
 30 minutes) and are single-use.
 
+`planned_bytes` is the plain per-unit sum -- the figure a grant budget
+is spent against. `selection` reconciles that sum against shared
+storage: `deduplicated_bytes` has bytes charged to an inode an earlier
+unit already accounted for removed, `double_counted_bytes` is the
+difference, and `unknown_sharing` is `true` when a selected unit may
+hardlink files whose other links were never enumerated (so
+`deduplicated_bytes` is a lower bound on double-counting removed, not a
+guarantee none remains). Never read any of these as promised free
+space; see `cleanup-and-recovery.md`.
+
 ## `swamp execute <plan_id> --json`
 
 Returns `ExecuteResult`: `state` (`executed` | `awaiting-authorization`
 | `expired` | `already-executed`), `next_step`, `outcomes` (per-unit
 `status`: `completed` | `refused` | `failed`, with `cause` when not
 completed), `planned_bytes`, `trashed_bytes`,
-`removed_permanently_bytes`, `freed_measured`. An unauthorized plan
-executes with `state: "awaiting-authorization"` and an empty
-`outcomes` array -- nothing is touched. See `cleanup-and-recovery.md`
-for refusal causes and Trash recovery.
+`removed_permanently_bytes`, `freed_measured`, and `evidence` -- the
+`free_before`/`free_after` reading as a sourced `reclaimability`
+/`observed-freed` fact (`source: "statvfs"`), carrying the note that a
+Trash move on the same volume, an open file, a snapshot or a concurrent
+writer can each keep the change from matching what was planned. It is
+`unknown` rather than `0` when either reading was unavailable, and it is
+deliberately a different fact from a plan's `estimated-reclaimable`
+figure: one was measured, the other estimated. An unauthorized plan
+executes with `state: "awaiting-authorization"`, an empty `outcomes`
+array and no `evidence` -- nothing is touched and nothing is measured.
+See `cleanup-and-recovery.md` for refusal causes and Trash recovery.
 
 ## `swamp plans --json` / `swamp grant list --json`
 

@@ -189,6 +189,16 @@ validation.
 
 Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a single inline row with selected paths, sizes, warnings, and destinations. Enter authorizes the action; Esc cancels it.
 
+Human keep/protect intent (`swamp protect`) is checked before **any**
+row is marked, in both directions: a row beneath a protected path, and a
+row that *contains* one. Protecting a single file inside a build
+directory therefore refuses the directory, in the footer, at the moment
+you press Space -- not silently at execution. Protection state that
+cannot be read is *unknown*, so it refuses too. This used to be reached
+only for the two row kinds that happened to propose through core, which
+is how a one-directional protection bug survived every test; see
+`.oh/guardrails/protection-fails-closed.md`.
+
 Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk marking with `A` skips that fallback. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
 
 Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.

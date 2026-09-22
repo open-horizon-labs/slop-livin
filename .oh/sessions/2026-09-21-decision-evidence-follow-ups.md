@@ -25,8 +25,8 @@ populated struct field nobody renders is a defect."
   resolved match attaches a `consumer` fact both ways: the project's
   own `Source` row gets "this project declares X, resolved to
   installation/dependency Y" (reusing `toolchain_declarations::resolve`/
-  `resolve_explicit` and `external_associations::join_cache_entry`'s
-  same evidence shape); the installation/shared-store `ExternalUnit`
+  `resolve_explicit`'s evidence shape); the installation/shared-store
+  `ExternalUnit`
   gets "declared by project(s) [...]" (deduplicated, listed once per
   unit regardless of how many worktrees resolved to it).
 - **Shared-store joins are hash lookups, not enumerations** (#57's own
@@ -47,12 +47,12 @@ populated struct field nobody renders is a defect."
 - **Maven `pom.xml` dependency parsing** (#57's other named gap):
   added the `roxmltree` dependency (0.21, MIT/Apache-2.0, actively
   maintained -- used by the resvg/usvg SVG toolchain) to
-  `crates/core/Cargo.toml`. `external_associations::parse_pom_xml`
+  `crates/core/Cargo.toml`. `external_associations::parse_pom_xml_with_gaps`
   reads direct `<dependencies>` (never `<dependencyManagement>`, which
   is a BOM/version declaration, not necessarily actually depended on)
-  and skips any entry whose version is an unresolved Maven property
-  (`${...}`) rather than fabricating a value this module cannot
-  actually resolve.
+  and reports any entry whose version is an unresolved Maven property
+  (`${...}`) or inherited from an absent parent POM as a named gap,
+  rather than fabricating a value this module cannot actually resolve.
 - **`toolchain_declarations::resolve_rustup_channel_to_dir`**: rustup's
   installed-toolchain directories are named `<channel>-<host-triple>`
   (`stable-x86_64-apple-darwin`), but a `rust-toolchain(.toml)`
@@ -138,6 +138,33 @@ populated struct field nobody renders is a defect."
   list but the same kind of bespoke-shaped gap, and exactly where a
   Docker recovery fact from this same chunk would otherwise be
   invisible in JSON) got the same treatment.
+
+## Correction (2026-09-21, chunk H3)
+
+Three function names this note used no longer exist. The behaviour it
+describes is still delivered; the names were wrong, and a claim naming a
+function nobody calls is worse than no claim
+(`.oh/guardrails/no-dead-public-evidence-api.md`):
+
+- `external_associations::join_cache_entry` is **deleted**. It joined one
+  cache entry's identity to the projects declaring it, but
+  `consumer_wiring::attach_associations` aggregates consumers per *unit*
+  rather than per entry and never went through it, so it had no
+  production caller. The consumer evidence described above is real; it is
+  built in `attach_associations` itself. A per-entry join, if wanted
+  later, belongs in `consumer_wiring.rs` beside `match_identity`.
+- `external_associations::parse_pom_xml` is **deleted** in favour of
+  `parse_pom_xml_with_gaps`, the same parse plus the named gaps. The thin
+  wrapper dropped exactly the gaps the PR #123 review required be stated,
+  and nothing called it.
+- `toolchain_declarations::conflicting_tools` is **deleted** for the same
+  reason: it named tools declared at two different versions within one
+  project, and nothing surfaced its result. #56's "conflicting
+  declarations remain explicit" is delivered by
+  `VersionMatch::Conflicting` -> `FactStatus::Conflicting` through
+  `declaration_evidence`, which is wired. Re-adding the
+  two-files-disagree check belongs in `consumer_wiring.rs`, the only
+  caller that holds a worktree's whole declaration list at once.
 
 ## Decisions that needed to be made explicitly
 
