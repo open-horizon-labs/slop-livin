@@ -310,7 +310,14 @@ pub(crate) fn unowned_history_writes(p: &Program) -> (Vec<HistoryWrite>, usize) 
     let mut seen = 0usize;
     for f in p.funs.iter() {
         for a in &f.assigns {
-            let lhs = a.lhs.replace(' ', "");
+            // `let present = &mut r.present; *present = false;` writes the
+            // field through a reference: follow the binding.
+            let mut lhs = a.lhs.replace(' ', "");
+            if let Some(name) = lhs.strip_prefix('*')
+                && let Some(b) = f.bindings.iter().rev().find(|b| b.name == name)
+            {
+                lhs = b.from.replace(' ', "").trim_start_matches("&mut").trim_start_matches('&').to_string();
+            }
             let rhs = a.rhs.replace(' ', "");
             let tombstone = lhs.ends_with(".present") && a.op == "=" && falsy(p, &a.rhs);
             let bump = lhs.ends_with(".regrowth_count")

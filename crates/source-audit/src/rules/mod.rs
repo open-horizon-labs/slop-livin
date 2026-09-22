@@ -88,7 +88,13 @@ pub(crate) fn is_bounded_by(f: &Fun, cap: &str) -> bool {
 /// Resolved paths a definition names, including its signature: every
 /// `a :: b :: c` run in the token text.
 pub(crate) fn named_paths(text: &str) -> Vec<String> {
-    let toks: Vec<&str> = text.split_whitespace().collect();
+    // Punctuation other than `::` separates tokens (`Detector)`).
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == ':' { c } else { ' ' })
+        .collect();
+    let cleaned = cleaned.replace("::", " :: ");
+    let toks: Vec<&str> = cleaned.split_whitespace().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < toks.len() {

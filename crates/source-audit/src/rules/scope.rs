@@ -55,11 +55,14 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         .collect();
     // The discovery region: every module a discovery pass reaches, less
     // the interpreters themselves.
+    // The adapters are discovery's per-tool code, reached by trait
+    // dispatch the exact graph does not follow.
     let region = p.reachable_exact(&entries.iter().copied().collect::<Vec<_>>(), &HashSet::new());
     let region_files: HashSet<String> = region
         .iter()
         .map(|i| p.funs[*i].rel.clone())
         .chain(entries.iter().map(|i| p.funs[*i].rel.clone()))
+        .chain(p.adapter_files())
         .filter(|r| !interp.contains(r))
         .collect();
     for f in p.funs.iter() {
@@ -106,7 +109,9 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
     if config.is_empty() {
         problems.push("no config type has an `enabled_detectors` allow-list field".into());
     }
-    let predicate = anchors(&p, &["scope::detectors_permitted"], &mut problems);
+    let _ = anchors(&p, &["scope::detectors_permitted"], &mut problems);
+    // Every definition of the predicate, wherever written.
+    let predicate: HashSet<usize> = p.named("detectors_permitted").into_iter().collect();
     for i in &predicate {
         let f = &p.funs[*i];
         if !(f.fields.iter().any(|x| x == "defaults") && f.fields.iter().any(|x| x == "enabled_detectors")) {
@@ -130,7 +135,10 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
         if !takes_config || f.ret.is_empty() || predicate.contains(&i) || detector_methods.contains(&i) {
             continue;
         }
-        let produces = (infers.contains(&i) && !detector_methods.contains(&i)) || walks.contains(&i);
+        // A resolver: it produces roots by inference or by listing, or it
+        // returns the scope itself.
+        let returns_scope = contains_token(&f.ret, "EffectiveScope");
+        let produces = (infers.contains(&i) && !detector_methods.contains(&i)) || walks.contains(&i) || returns_scope;
         let guarded = !p.reachable(&[i], &HashSet::new()).is_disjoint(&predicate);
         if produces && !guarded {
             problems.push(format!(
@@ -290,8 +298,19 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
         }
         for (ci, c) in f.calls.iter().enumerate() {
             let t = p.target(i, ci);
-            if t.possible {
+            if t.possible && !t.abs.contains("::report::") {
                 continue;
+            }
+            // A call into the report module this audit cannot resolve is
+            // not a pass.
+            let into_report = report_files.iter().any(|r| t.abs.starts_with(&format!("{}::", Program::file_module(r))));
+            if into_report && t.local.is_empty() {
+                problems.push(format!(
+                    "{} calls `{}` in the report module, which resolves to nothing: an entry point \
+                     this audit cannot see is not a scope-preserving one",
+                    f.display(),
+                    t.abs
+                ));
             }
             if let Some(g) = t.local.iter().find(|g| scopeless(**g)) {
                 problems.push(format!(

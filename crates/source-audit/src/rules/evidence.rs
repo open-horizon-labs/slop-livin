@@ -210,6 +210,13 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
             queue.extend(idents(ty));
         }
     }
+    // The evidence vocabulary: types declared beside `Evidence`.
+    let vocab_types: Vec<String> = p
+        .types
+        .iter()
+        .filter(|t| p.types.iter().any(|e| e.name == "Evidence" && e.rel == t.rel))
+        .map(|t| t.name.clone())
+        .collect();
     let delivery_modules: HashSet<String> = p.types.iter().filter(|t| graph.contains(&t.name)).map(|t| t.rel.clone()).collect();
     if delivery_modules.is_empty() {
         problems.push("the pipeline's report types are not found: nothing to audit as delivered".into());
@@ -217,7 +224,10 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
     let surfaces: Vec<&crate::program::TypeDecl> = p
         .types
         .iter()
-        .filter(|t| t.krate == "swamp_core" && t.kind == TypeKind::Struct && t.is_pub && t.derives("Serialize") && delivery_modules.contains(&t.rel))
+        .filter(|t| {
+            let carries_facts = t.fields.iter().any(|(_, ty, _, _)| vocab_types.iter().any(|v| contains_token(ty, v)));
+            t.krate == "swamp_core" && t.kind == TypeKind::Struct && t.is_pub && (t.derives("Serialize") || carries_facts) && delivery_modules.contains(&t.rel)
+        })
         .collect();
     for t in surfaces {
         for (field, _ty, is_pub, attrs) in &t.fields {

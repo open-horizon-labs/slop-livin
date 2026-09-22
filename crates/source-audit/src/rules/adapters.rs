@@ -233,10 +233,21 @@ pub fn agent_adapters_do_not_reach_detectors(root: &Path) -> Result<(), String> 
     // and the bounded lister. Everything else under `locations` --
     // a detector module, a detector id, the `Detector` trait, a
     // resolution function -- is detector identity.
+    // Vocabulary is what the shared agent model itself carries: a type
+    // declared in `locations` that a field of an `agents/mod.rs` type
+    // names. `Environment`, `Registry` and `Detector` are how homes are
+    // resolved; no unit carries them.
+    let model_fields: Vec<&str> = p
+        .items
+        .iter()
+        .filter(|d| d.kind == DeclKind::Field && d.rel == "crates/core/src/agents/mod.rs")
+        .map(|d| d.ty.as_str())
+        .collect();
     let vocabulary: HashSet<String> = p
         .types
         .iter()
         .filter(|t| t.krate == "swamp_core" && t.module == "locations" && t.kind != TypeKind::Trait)
+        .filter(|t| model_fields.iter().any(|ty| contains_token(ty, &t.name)))
         .map(|t| t.name.clone())
         .chain(BOUNDED_LISTERS.iter().filter(|(a, _)| a.starts_with("locations::")).map(|(a, _)| a.rsplit("::").next().unwrap_or(a).to_string()))
         .collect();
@@ -424,6 +435,17 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
             })
             .map(|(n, _)| n.as_str())
             .collect();
+        // A `match` arm on a tool id outside the tool's own module is a
+        // dispatch table, however many arms it has.
+        let own = |n: &str| p.items.iter().any(|d| d.name == n && d.rel == f.rel);
+        if let Some((n, _)) = ids.iter().find(|(n, v)| {
+            !own(n) && f.arms.iter().any(|a| contains_token(&a.pattern, n) || (!v.is_empty() && a.pattern.contains(&format!("\"{v}\""))))
+        }) {
+            problems.push(format!(
+                "{} matches on the tool id `{n}`: adapter dispatch goes through `agents::Registry`",
+                f.display()
+            ));
+        }
         if named.len() >= 2 {
             let mut named: Vec<&str> = named.into_iter().collect();
             named.sort();

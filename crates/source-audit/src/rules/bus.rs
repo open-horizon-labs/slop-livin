@@ -16,6 +16,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 struct Bus {
+    handlers: HashSet<String>,
+    sink_names: HashSet<String>,
+    registrar_names: HashSet<String>,
     consumers: Vec<(String, String)>,
     consumer_files: HashSet<String>,
     bus_types: HashSet<String>,
@@ -75,7 +78,21 @@ fn bus(p: &Program) -> Result<Bus, String> {
         })
         .map(|(i, _)| i)
         .collect();
+    // The event handlers: the methods the `Consumer` trait declares that
+    // take an event.
+    let handlers: HashSet<String> = p
+        .types
+        .iter()
+        .filter(|t| t.name == "Consumer" && t.kind == crate::program::TypeKind::Trait)
+        .flat_map(|t| t.variants.iter().cloned())
+        .filter(|m| m.starts_with("on_"))
+        .collect();
+    let sink_names: HashSet<String> = register.iter().map(|i| p.funs[*i].name.clone()).collect();
+    let registrar_names: HashSet<String> = registrars.iter().map(|i| p.funs[*i].name.clone()).collect();
     Ok(Bus {
+        handlers,
+        sink_names,
+        registrar_names,
         consumers,
         consumer_files,
         bus_types,
@@ -125,6 +142,13 @@ pub fn no_consumer_knows_other_consumers(root: &Path) -> Result<(), String> {
                 problems.push(format!("{} names consumer `{c}` from {rel}", f.display()));
             }
         }
+        // Registration knowledge by name: a consumer module calling
+        // anything spelled like the bus's registrar or its sink.
+        for c in &f.calls {
+            if b.registrar_names.contains(c.callee()) || (c.method && b.sink_names.contains(c.callee())) {
+                problems.push(format!("{} calls `{}`, which is registration knowledge a consumer must not have", f.display(), c.written));
+            }
+        }
     }
     // Item level: a const or a field in a consumer module naming another.
     for d in &p.items {
@@ -162,6 +186,23 @@ pub fn static_registration_only(root: &Path) -> Result<(), String> {
                 problems.push(format!(
                     "{} registers a consumer (`{}`) outside the bus's static registrar: the \
                      registered set is decided before the first event, not while events flow",
+                    f.display(),
+                    c.written
+                ));
+            }
+        }
+    }
+    // An event handler (a method named as the `Consumer` trait's
+    // handlers are) never registers, however the bus it holds is typed.
+    for f in p.funs.iter() {
+        if !b.handlers.contains(&f.name) {
+            continue;
+        }
+        for c in &f.calls {
+            if b.registrar_names.contains(c.callee()) || (c.method && b.sink_names.contains(c.callee())) {
+                problems.push(format!(
+                    "{} registers at event time (`{}`): the registered set is decided before the \
+                     first event",
                     f.display(),
                     c.written
                 ));
@@ -213,6 +254,13 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
             .flat_map(|ci| p.target(i, ci).local.clone())
             .chain(p.ref_targets(i).iter().copied())
             .collect();
+        let consumer_mods: Vec<String> = b.consumer_files.iter().map(|r| Program::file_module(r)).collect();
+        for path in super::named_paths(&f.body) {
+            let (abs, _) = crate::program::absolute(&path, &f.krate, &f.module, None);
+            if let Some(m) = consumer_mods.iter().find(|m| abs.starts_with(&format!("{m}::"))) {
+                problems.push(format!("{} names `{path}` in consumer module {m}: stages never depend on consumers", f.display()));
+            }
+        }
         for g in exact {
             if b.consumer_files.contains(&p.funs[g].rel) && !b.consumer_files.contains(&f.rel) {
                 problems.push(format!(
@@ -279,18 +327,37 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
         .chain(p.unbounded_reads(&none).iter())
         .copied()
         .collect();
-    let mut stages: HashSet<usize> = HashSet::new();
-    for (i, f) in p.funs.iter().enumerate() {
-        if !(b.consumer_files.contains(&f.rel) && f.trait_.is_some()) {
-            continue;
-        }
-        for g in reached(&p, i) {
-            let gf = &p.funs[g];
-            if !b.consumer_files.contains(&gf.rel) && !gf.module.starts_with("bus") && !report_files.contains(&gf.rel) && heavy.contains(&g) {
-                stages.insert(g);
-            }
-        }
-    }
+    // Everything the consumers' handlers reach that does that work.
+    let handlers: Vec<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| b.consumer_files.contains(&f.rel) && f.trait_.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let stages: HashSet<usize> = p
+        .reachable_exact(&handlers, &HashSet::new())
+        .into_iter()
+        .filter(|g| {
+            let gf = &p.funs[*g];
+            !b.consumer_files.contains(&gf.rel) && !gf.module.starts_with("bus") && !report_files.contains(&gf.rel) && heavy.contains(g)
+        })
+        .collect();
+    // ... and the entry points that wrap them in their own modules
+    // (`observe_tracked_with_source` over `stage_tracked_with_source`).
+    // A stage *entry* is one a handler calls directly; a wrapper is a
+    // function beside it that calls it directly.
+    let entries: HashSet<usize> = handlers.iter().flat_map(|h| p.callees(*h).to_vec()).filter(|g| stages.contains(g)).collect();
+    let wrappers: Vec<usize> = entries
+        .iter()
+        .flat_map(|e| p.callers(*e))
+        .filter(|g| {
+            entries.iter().any(|e| p.funs[*e].rel == p.funs[*g].rel)
+                && !report_files.contains(&p.funs[*g].rel)
+                && !b.consumer_files.contains(&p.funs[*g].rel)
+        })
+        .collect();
+    let stages: HashSet<usize> = stages.into_iter().chain(wrappers).collect();
     // A stage the report module itself defines (a consumer calls it) may
     // call other stages: it *is* the bus's work.
     let consumer_methods: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| b.consumer_files.contains(&f.rel) && f.trait_.is_some()).map(|(i, _)| i).collect();

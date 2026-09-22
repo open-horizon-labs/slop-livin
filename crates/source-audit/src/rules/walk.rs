@@ -757,7 +757,14 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
         problems.push("neither `report::observe_scope` nor `bus::run_report` is defined".into());
     }
     let on_path = p.reachable_exact(&entries, &stop_all);
-    let path_files: HashSet<String> = on_path.iter().filter(|i| !sanctioned.contains(i)).map(|i| p.funs[*i].rel.clone()).collect();
+    // The adapters are on the report path by construction (discovery
+    // dispatches to them by trait object).
+    let path_files: HashSet<String> = on_path
+        .iter()
+        .filter(|i| !sanctioned.contains(i))
+        .map(|i| p.funs[*i].rel.clone())
+        .chain(p.adapter_files())
+        .collect();
     // A wrapper in the walk's own modules that reaches the walk only by
     // entering it is the walk, not a second traversal.
     let walker_files: HashSet<String> = walker.iter().map(|i| p.funs[*i].rel.clone()).collect();

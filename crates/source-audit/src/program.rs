@@ -1000,7 +1000,15 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             kind: TypeKind::Trait,
             is_pub: is_pub(&t.vis),
             attrs: attrs_text(&t.attrs),
-            variants: Vec::new(),
+            // A trait's "variants" are its method names.
+            variants: t
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    syn::TraitItem::Fn(f) => Some(f.sig.ident.to_string()),
+                    _ => None,
+                })
+                .collect(),
             fields: Vec::new(),
         });
         for it in &t.items {
@@ -1483,6 +1491,20 @@ impl Program {
                     };
                 }
             }
+        }
+        // A path into this workspace's own crates that names nothing
+        // defined there (a stale or mistaken path, a fixture's shorthand)
+        // is possibly every free function of that name: unknown is not
+        // absent.
+        if segs.len() >= 2
+            && ["swamp_core", "swamp_tui", "swamp"].contains(&segs[0])
+            && let Some(ix) = self.free_by_name.get(segs[segs.len() - 1])
+        {
+            return Target {
+                local: ix.clone(),
+                abs,
+                possible: true,
+            };
         }
         Target {
             local: Vec::new(),

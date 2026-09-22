@@ -45,3 +45,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The source audits and their mutation corpus are CPU-bound in this one
+# crate (a whole-program model rebuilt per corpus fixture). Optimizing it
+# in the dev/test profile keeps `scripts/check.sh` fast without changing
+# how any product crate is built.
+[profile.dev.package.swamp-source-audit]
+opt-level = 3
