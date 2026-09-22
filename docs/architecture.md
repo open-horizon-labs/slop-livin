@@ -599,11 +599,22 @@ artifact row:
     would make a container's contents depend on how many files the
     containers before it produced, so its stored rows would mean
     something different from a live identification of the same
-    directory. Oh My Pi has a session tree and deliberately does not use
-    the seam: its session bodies feed a home-wide shared-blob reference
-    count, and a partially replayed pass would report a count that is
-    wrong rather than unknown. That is recorded in
-    `oh_my_pi_declares_why_it_does_not_use_the_container_seam`.
+    directory. Oh My Pi (`sessions/<dir>/`) joined them on 2026-09-22.
+  - **A home-level aggregate survives a partial replay.** Oh My Pi's
+    session bodies feed a home-wide shared-blob reference count, which is
+    why it was off the seam until 2026-09-22: a pass that replayed some
+    containers would have counted only the sessions it identified and
+    printed a number that was *wrong* rather than unknown -- and that is
+    the number a future reference-based GC would act on.
+    `IdentifyCtx::container_with_facts` stores each container's **partial**
+    reference count alongside its rows and hands it back verbatim on
+    replay, so the home level sums stored partials and fresh ones and
+    prints one right total. A replayed container whose rows carry no
+    partial at all is `ContainerFacts::Unrecorded`, which makes every
+    blob count unknown rather than short.
+    `a_partially_replayed_oh_my_pi_home_sums_the_same_blob_counts` and
+    `a_replayed_container_without_its_partial_makes_the_count_unknown`
+    are the two halves.
   - Project linkage is *not* replayed. It is resolved against a declared
     path somewhere else on the disk entirely, so a unit records the
     declared path (`agents::LinkBasis::Declared`) and a replayed

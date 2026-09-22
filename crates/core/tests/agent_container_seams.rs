@@ -301,52 +301,190 @@ fn a_codex_day_container_does_not_depend_on_its_siblings() {
     );
 }
 
-/// Oh My Pi has a session tree and deliberately does **not** use the
-/// container seam. Recorded here rather than left as an omission a
-/// reader has to notice.
+/// Oh My Pi's session directories are containers too, since 2026-09-22.
 ///
-/// Its session identification produces a home-wide aggregate that a
-/// per-container replay cannot reconstruct: each session's body
-/// contributes references to the shared blob store, and the reference
-/// count reported for a blob is the sum across every session. A pass
-/// that replayed some containers would count only the sessions it
-/// identified, so the number it printed would be *wrong* rather than
-/// unknown -- and "a number that is wrong" is the failure this catalog's
-/// guardrails exist to prevent. The honest alternatives are to carry the
-/// per-unit blob references through the container rows (a stored-shape
-/// change) or to report every blob count as unknown on any reused pass
-/// (a user-visible regression); neither was taken here.
+/// Its conversion needed one thing the others did not: its session
+/// bodies feed a **home-wide** shared-blob reference count, so a pass
+/// that replayed some containers would have counted only the sessions it
+/// identified and printed a number that was *wrong* rather than unknown.
+/// The route taken is the one the previous chunk named first -- each
+/// container stores its own partial reference count with its rows, and
+/// the home level sums stored partials and fresh ones.
+/// `a_partially_replayed_oh_my_pi_home_sums_the_same_blob_counts` is the
+/// test that route exists for; this one is the ordinary seam contract.
 #[test]
-fn oh_my_pi_declares_why_it_does_not_use_the_container_seam() {
+fn oh_my_pi_session_directories_are_containers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let home = root.join("omp");
-    write(&home.join("settings.json"), "{}\n");
-    for i in 0..3 {
+    write(&home.join("config.yml"), "model: x\n");
+    let mut victim = PathBuf::new();
+    for bucket in ["a", "b"] {
+        for i in 0..3 {
+            let p = home
+                .join("sessions")
+                .join(bucket)
+                .join(format!("s{i}.jsonl"));
+            write(
+                &p,
+                &format!("{{\"cwd\":\"{}\",\"type\":\"user\"}}\n", root.display()),
+            );
+            if bucket == "a" && i == 0 {
+                victim = p;
+            }
+        }
+    }
+    seam_behaves(
+        &swamp_core::agents::oh_my_pi::identify,
+        &root,
+        &home,
+        2,
+        &victim,
+        &home.join("sessions/a"),
+    );
+}
+
+/// **The conversion's whole point.** A pass that replays one session
+/// container and re-identifies another must report exactly the blob
+/// reference counts a fully identified pass reports.
+///
+/// The failure this is written against is the tempting one: sum only
+/// what this pass identified. That prints `1` for a blob two sessions
+/// reference, which is the number a reference-based GC would act on. The
+/// partial stored with each container is what makes the sum whole.
+#[test]
+fn a_partially_replayed_oh_my_pi_home_sums_the_same_blob_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("omp");
+    write(&home.join("config.yml"), "model: x\n");
+    let hash = "a".repeat(64);
+    // One blob, referenced once from each of two session containers.
+    write(&home.join("blobs").join(&hash), "png-bytes");
+    for bucket in ["a", "b"] {
         write(
-            &home.join(format!("sessions/a/s{i}.jsonl")),
-            "{\"type\":\"user\"}\n",
+            &home.join("sessions").join(bucket).join("s0.jsonl"),
+            &format!(
+                "{{\"cwd\":\"{}\",\"type\":\"user\",\"image_url\":\"blob:sha256:{hash}\"}}\n",
+                root.display()
+            ),
         );
     }
+
+    let blob_note = |units: &[swamp_core::agents::CandidateAgentUnit]| -> String {
+        units
+            .iter()
+            .find(|u| u.path.ends_with(&hash))
+            .and_then(|u| u.note.clone())
+            .unwrap_or_else(|| "<no blob unit>".to_string())
+    };
+
     let store = tempfile::tempdir().unwrap();
-    let _ = pass(
-        &swamp_core::agents::oh_my_pi::identify,
-        &home,
-        store.path(),
-        1_000,
-        EventCoverage::untrusted(),
+    let identify_with = |at: u64, coverage: EventCoverage| {
+        let cache = IdentificationCache::load(store.path());
+        let containers = ContainerCache::load(store.path(), coverage);
+        let (units, counted) = work_counters::measured(|| {
+            let ctx = IdentifyCtx::with_containers(at, &cache, &containers);
+            swamp_core::agents::oh_my_pi::identify(&home, &ctx)
+        });
+        cache.save(store.path(), at).unwrap();
+        containers.save(store.path(), at).unwrap();
+        (units, counted)
+    };
+
+    let (cold, _) = identify_with(1_000, EventCoverage::untrusted());
+    let full = blob_note(&cold);
+    assert!(
+        full.contains("referenced by 2 known session(s)"),
+        "precondition: a fully identified pass counts both references: {full}"
     );
-    let (_, _, second) = pass(
-        &swamp_core::agents::oh_my_pi::identify,
-        &home,
-        store.path(),
+
+    // Touch only container `a`. Container `b` is replayed and must still
+    // contribute its stored reference.
+    let touched_file = home.join("sessions/a/s0.jsonl");
+    append(&touched_file, 16);
+    let (mixed, cost) = identify_with(
         2_000,
-        quiet(&root, 1_000),
+        touched(
+            &root,
+            &[touched_file.clone(), home.join("sessions/a")],
+            1_000,
+        ),
     );
     assert_eq!(
-        (second.containers_reused, second.containers_identified),
-        (0, 0),
-        "Oh My Pi must not silently acquire the container seam without the blob-reference \
-         aggregate being carried through it: {second:?}"
+        (cost.containers_identified, cost.containers_reused),
+        (1, 1),
+        "precondition: exactly one container replayed and one re-identified: {cost:?}"
+    );
+    assert_eq!(
+        blob_note(&mixed),
+        full,
+        "a partially replayed pass must print the same reference count, not the count of \
+         the sessions it happened to identify"
+    );
+}
+
+/// The fail-closed half: a replayed container whose stored rows carry no
+/// reference partial makes every blob count **unknown**, never a smaller
+/// number presented as complete.
+///
+/// Reached by stripping the fact rows out of the stored container, which
+/// is what rows written by a shape that predates the partial look like.
+#[test]
+fn a_replayed_container_without_its_partial_makes_the_count_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("omp");
+    write(&home.join("config.yml"), "model: x\n");
+    let hash = "b".repeat(64);
+    write(&home.join("blobs").join(&hash), "png-bytes");
+    write(
+        &home.join("sessions/a/s0.jsonl"),
+        &format!(
+            "{{\"cwd\":\"{}\",\"type\":\"user\",\"image_url\":\"blob:sha256:{hash}\"}}\n",
+            root.display()
+        ),
+    );
+
+    let store = tempfile::tempdir().unwrap();
+    let run = |at: u64, coverage: EventCoverage| {
+        let cache = IdentificationCache::load(store.path());
+        let containers = ContainerCache::load(store.path(), coverage);
+        let ctx = IdentifyCtx::with_containers(at, &cache, &containers);
+        let units = swamp_core::agents::oh_my_pi::identify(&home, &ctx);
+        cache.save(store.path(), at).unwrap();
+        containers.save(store.path(), at).unwrap();
+        units
+    };
+    let cold = run(1_000, EventCoverage::untrusted());
+    assert!(
+        cold.iter().any(|u| u.path.ends_with(&hash)
+            && u.note
+                .as_deref()
+                .is_some_and(|n| n.contains("referenced by 1"))),
+        "precondition: the cold pass counts the reference"
+    );
+
+    // Strip the fact rows from the stored container, leaving rows that
+    // look exactly like a shape that never recorded a partial.
+    let table = swamp_core::assoc_store::ContainerTable::open(store.path());
+    let mut entries = table.load();
+    for rows in entries.values_mut() {
+        rows.rows.retain(|row| {
+            row.first().map(String::as_str) != Some("facts")
+                && row.first().map(String::as_str) != Some("fact")
+        });
+    }
+    table.save(&entries, 1_000).unwrap();
+
+    let replayed = run(2_000, quiet(&root, 1_000));
+    let note = replayed
+        .iter()
+        .find(|u| u.path.ends_with(&hash))
+        .and_then(|u| u.note.clone())
+        .unwrap_or_default();
+    assert!(
+        note.contains("unknown"),
+        "a missing partial must make the count unknown, not short: {note}"
     );
 }

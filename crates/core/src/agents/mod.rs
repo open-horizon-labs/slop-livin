@@ -408,6 +408,13 @@ pub enum LinkBasis {
     /// live whenever the container is reused.
     Declared {
         declared: Option<String>,
+        /// Further workspace roots the same unit declared, when the tool
+        /// records more than one (Oh My Pi's `additionalDirectories`).
+        /// Resolved alongside `declared`, and widening the answer to
+        /// [`ProjectLinkState::Shared`] when they name a different
+        /// project -- never fabricating single ownership for a session
+        /// whose own metadata names two.
+        additional: Vec<String>,
         missing_reason: String,
     },
     /// Nothing to recompute. Only a state that cannot go stale --
@@ -616,6 +623,25 @@ pub struct ContainerCache {
     enabled: bool,
 }
 
+/// One container's partial contribution to a home-level aggregate, as
+/// [`IdentifyCtx::container_with_facts`] hands it back.
+///
+/// Two states and not one `Vec`, because "this container contributed
+/// nothing" and "this container's contribution is not in the stored rows
+/// at all" are different answers with different consequences. A caller
+/// summing partials may add the first and must refuse to print a total
+/// on the second: a shared-blob reference count that is quietly short is
+/// worse than an absent one, because it is the number a future GC would
+/// act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerFacts {
+    /// The adapter's fact strings for this container, fresh or replayed.
+    Recorded(Vec<String>),
+    /// Replayed rows that carry no fact section at all (rows an earlier
+    /// stored shape wrote). Unknown, never empty.
+    Unrecorded,
+}
+
 /// The directories one container's identification depended on, recorded
 /// while it ran. Paths only: the stamps are read when the fingerprint is
 /// built, so a recording costs nothing on the hot path.
@@ -678,12 +704,24 @@ impl ContainerCache {
     /// container declared it. This is why replaying a container does not
     /// have to replay its linkage: the honest answer costs one
     /// resolution per *project*, not one per session.
-    fn resolve_memoised(&self, declared: &Option<String>, reason: &str) -> ProjectLinkState {
-        let key = (declared.clone().unwrap_or_default(), reason.to_string());
+    fn resolve_memoised(
+        &self,
+        declared: &Option<String>,
+        additional: &[String],
+        reason: &str,
+    ) -> ProjectLinkState {
+        let key = (
+            format!(
+                "{}{DECLARED_SEP}{}",
+                declared.clone().unwrap_or_default(),
+                additional.join(&DECLARED_SEP.to_string())
+            ),
+            reason.to_string(),
+        );
         if let Some(hit) = self.links.borrow().get(&key) {
             return hit.clone();
         }
-        let resolved = resolve_declared_path(declared.clone(), reason);
+        let resolved = resolve_declared_workspace(declared, additional, reason);
         self.links.borrow_mut().insert(key, resolved.clone());
         resolved
     }
@@ -787,14 +825,45 @@ impl<'a> IdentifyCtx<'a> {
         container: &Path,
         identify: &dyn Fn() -> Vec<CandidateAgentUnit>,
     ) -> Vec<CandidateAgentUnit> {
+        self.container_with_facts(adapter_id, container, &|| (identify(), Vec::new()))
+            .0
+    }
+
+    /// [`Self::container`] for an adapter whose home-level output is an
+    /// **aggregate over its containers** rather than just their units.
+    ///
+    /// `identify` returns its units and a list of adapter-private fact
+    /// strings -- the container's partial contribution to that aggregate
+    /// -- which are stored with the rows and handed back verbatim when
+    /// the container is replayed. The caller sums stored partials and
+    /// fresh ones and prints one total, so a pass that replayed some
+    /// containers and re-identified others still prints a *right* total
+    /// rather than the total of the containers it happened to look at.
+    ///
+    /// The returned facts are [`ContainerFacts::Unrecorded`] when the
+    /// replayed rows carry no fact section at all (rows an earlier shape
+    /// wrote). That is not the same as an empty list, and the caller
+    /// must treat it as unknown: a missing partial makes the whole sum
+    /// unknown, never a smaller number presented as complete. Oh My Pi's
+    /// shared-blob reference count is the case this exists for -- a
+    /// count that is quietly short is worse than no count, because it is
+    /// the number a future GC would act on.
+    pub fn container_with_facts(
+        &self,
+        adapter_id: &str,
+        container: &Path,
+        identify: &dyn Fn() -> (Vec<CandidateAgentUnit>, Vec<String>),
+    ) -> (Vec<CandidateAgentUnit>, ContainerFacts) {
         let Some(store) = self.containers.filter(|c| c.enabled) else {
-            return identify();
+            let (units, facts) = identify();
+            return (units, ContainerFacts::Recorded(facts));
         };
         if self.recording.borrow().is_some() {
-            return identify();
+            let (units, facts) = identify();
+            return (units, ContainerFacts::Recorded(facts));
         }
         let key = format!("{adapter_id}\u{1}{}", container.display());
-        if let Some(units) = self.replay(store, &key) {
+        if let Some((units, facts)) = self.replay(store, &key) {
             crate::work_counters::record_container_reused();
             // Replayed *and re-verified*: the window vouched for it just
             // now, so the rows are as fresh as an identification would
@@ -804,16 +873,17 @@ impl<'a> IdentifyCtx<'a> {
             if let Some(entry) = store.entries.borrow_mut().get_mut(&key) {
                 entry.observed_at = self.observed_at;
             }
-            return units;
+            return (units, facts);
         }
         crate::work_counters::record_container_identified();
         *self.recording.borrow_mut() = Some(ContainerRecorder::default());
-        let units = identify();
+        let (units, facts) = identify();
         let recorder = self.recording.borrow_mut().take().unwrap_or_default();
+        let facts = ContainerFacts::Recorded(facts);
         if recorder.unstorable {
-            return units;
+            return (units, facts);
         }
-        if let Some(rows) = encode_container(&recorder.dirs, &units) {
+        if let Some(rows) = encode_container(&recorder.dirs, &facts, &units) {
             let fingerprint = container_shape_key(&recorder.dirs);
             store.entries.borrow_mut().insert(
                 key,
@@ -827,7 +897,7 @@ impl<'a> IdentifyCtx<'a> {
                 },
             );
         }
-        units
+        (units, facts)
     }
 
     /// The stored units for `key`, when -- and only when -- this pass's
@@ -836,15 +906,19 @@ impl<'a> IdentifyCtx<'a> {
     ///
     /// Costs no syscall on either branch: the decision is made from the
     /// decoded rows and the replay window alone.
-    fn replay(&self, store: &ContainerCache, key: &str) -> Option<Vec<CandidateAgentUnit>> {
+    fn replay(
+        &self,
+        store: &ContainerCache,
+        key: &str,
+    ) -> Option<(Vec<CandidateAgentUnit>, ContainerFacts)> {
         // The borrow of `entries` is scoped: `resolve_memoised` below
         // takes `links` mutably, and a future edit that reaches
         // `entries` again would otherwise panic at runtime rather than
         // fail to compile.
-        let units = {
+        let (units, facts) = {
             let entries = store.entries.borrow();
             let cached = entries.get(key)?;
-            let (dirs, units) = decode_container(&cached.rows)?;
+            let (dirs, facts, units) = decode_container(&cached.rows)?;
             // The shape key is checked first and costs nothing, so a
             // corrupt or older-format row set is a free miss.
             if container_shape_key(&dirs) != cached.fingerprint {
@@ -861,23 +935,26 @@ impl<'a> IdentifyCtx<'a> {
             {
                 return None;
             }
-            units
+            (units, facts)
         };
-        Some(
+        Some((
             units
                 .into_iter()
                 .map(|mut u| {
                     if let LinkBasis::Declared {
                         declared,
+                        additional,
                         missing_reason,
                     } = &u.link_basis
                     {
-                        u.project_link = store.resolve_memoised(declared, missing_reason);
+                        u.project_link =
+                            store.resolve_memoised(declared, additional, missing_reason);
                     }
                     u
                 })
                 .collect(),
-        )
+            facts,
+        ))
     }
 
     pub fn observed_at(&self) -> u64 {
@@ -1050,6 +1127,64 @@ fn decode_opt(value: &str) -> Option<String> {
     value.strip_prefix('=').map(str::to_string)
 }
 
+/// Separates a unit's primary declared path from the further workspace
+/// roots it declared, inside the one stored column. A C0 control, which
+/// no path a tool writes into its own metadata contains; rows written
+/// before this existed carry no separator and decode to an empty
+/// `additional`.
+const DECLARED_SEP: char = '\u{1}';
+
+fn encode_declared(declared: &Option<String>, additional: &[String]) -> String {
+    let mut out = encode_opt(declared);
+    for extra in additional {
+        out.push(DECLARED_SEP);
+        out.push_str(extra);
+    }
+    out
+}
+
+fn decode_declared(value: &str) -> (Option<String>, Vec<String>) {
+    let mut parts = value.split(DECLARED_SEP);
+    let declared = decode_opt(parts.next().unwrap_or_default());
+    (declared, parts.map(str::to_string).collect())
+}
+
+/// Resolves a unit's declared workspace: its primary path, widened to
+/// [`ProjectLinkState::Shared`] when any further declared root resolves
+/// to a *different* project identity.
+///
+/// Lives here rather than in an adapter because the widening is a
+/// property of linkage, not of any one tool's file format, and because
+/// a replayed container must be able to redo it without re-running the
+/// adapter that produced the unit.
+pub fn resolve_declared_workspace(
+    declared: &Option<String>,
+    additional: &[String],
+    missing_reason: &str,
+) -> ProjectLinkState {
+    let primary = resolve_declared_path(declared.clone(), missing_reason);
+    if additional.is_empty() {
+        return primary;
+    }
+    let mut project_ids: Vec<String> = Vec::new();
+    if let ProjectLinkState::Linked { project_id, .. } = &primary {
+        project_ids.push(project_id.clone());
+    }
+    for extra in additional {
+        if let ProjectLinkState::Linked { project_id, .. } =
+            resolve_declared_path(Some(extra.clone()), "")
+            && !project_ids.contains(&project_id)
+        {
+            project_ids.push(project_id);
+        }
+    }
+    if project_ids.len() > 1 {
+        ProjectLinkState::Shared { project_ids }
+    } else {
+        primary
+    }
+}
+
 fn col(row: &[String], n: usize) -> &str {
     row.get(n).map(String::as_str).unwrap_or_default()
 }
@@ -1061,7 +1196,11 @@ fn col(row: &[String], n: usize) -> &str {
 /// project link cannot be recomputed on replay and cannot go stale
 /// either: see [`LinkBasis`]. Refusing to store is the conservative
 /// outcome -- the container is simply re-identified next pass.
-fn encode_container(dirs: &[PathBuf], units: &[CandidateAgentUnit]) -> Option<Vec<Vec<String>>> {
+fn encode_container(
+    dirs: &[PathBuf],
+    facts: &ContainerFacts,
+    units: &[CandidateAgentUnit],
+) -> Option<Vec<Vec<String>>> {
     let n = crate::assoc_store::ContainerTable::COLUMNS.len();
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(dirs.len() + units.len());
     let blank = || vec![String::new(); n];
@@ -1071,15 +1210,35 @@ fn encode_container(dirs: &[PathBuf], units: &[CandidateAgentUnit]) -> Option<Ve
         row[1] = dir.display().to_string();
         rows.push(row);
     }
+    // The marker row is written even for an empty fact list, so a
+    // replayed container can tell "this adapter contributed no facts"
+    // from "these rows predate facts entirely", which is the difference
+    // between a partial aggregate of zero and an unknown one.
+    if let ContainerFacts::Recorded(facts) = facts {
+        let mut marker = blank();
+        marker[0] = "facts".to_string();
+        rows.push(marker);
+        for fact in facts {
+            let mut row = blank();
+            row[0] = "fact".to_string();
+            row[1] = fact.clone();
+            rows.push(row);
+        }
+    }
     for unit in units {
         let (link_kind, link_declared, link_reason) = match (&unit.link_basis, &unit.project_link) {
             (
                 LinkBasis::Declared {
                     declared,
+                    additional,
                     missing_reason,
                 },
                 _,
-            ) => ("declared", encode_opt(declared), missing_reason.clone()),
+            ) => (
+                "declared",
+                encode_declared(declared, additional),
+                missing_reason.clone(),
+            ),
             (LinkBasis::Fixed, ProjectLinkState::NotApplicable) => {
                 ("not-applicable", String::new(), String::new())
             }
@@ -1123,16 +1282,21 @@ fn encode_container(dirs: &[PathBuf], units: &[CandidateAgentUnit]) -> Option<Ve
 /// exactly -- an unknown category, kind or action, a `member` row with
 /// no unit above it, a malformed number. A cache that cannot be decoded
 /// is a cache miss, never a wrong answer and never an error.
-fn decode_container(rows: &[Vec<String>]) -> Option<(Vec<PathBuf>, Vec<CandidateAgentUnit>)> {
+fn decode_container(
+    rows: &[Vec<String>],
+) -> Option<(Vec<PathBuf>, ContainerFacts, Vec<CandidateAgentUnit>)> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut facts: Option<Vec<String>> = None;
     let mut units: Vec<CandidateAgentUnit> = Vec::new();
     for row in rows {
         match col(row, 0) {
             "dir" => dirs.push(PathBuf::from(col(row, 1))),
+            "facts" => facts = Some(Vec::new()),
+            "fact" => facts.as_mut()?.push(col(row, 1).to_string()),
             "unit" => {
                 let category = AgentCategory::from_label(col(row, 2))?;
                 let action = AgentActionCapability::from_label(col(row, 6))?;
-                let link_declared = decode_opt(col(row, 11));
+                let (link_declared, link_additional) = decode_declared(col(row, 11));
                 let link_reason = col(row, 12).to_string();
                 let (project_link, link_basis) = match col(row, 10) {
                     "declared" => (
@@ -1143,6 +1307,7 @@ fn decode_container(rows: &[Vec<String>]) -> Option<(Vec<PathBuf>, Vec<Candidate
                         },
                         LinkBasis::Declared {
                             declared: link_declared,
+                            additional: link_additional,
                             missing_reason: link_reason,
                         },
                     ),
@@ -1181,7 +1346,14 @@ fn decode_container(rows: &[Vec<String>]) -> Option<(Vec<PathBuf>, Vec<Candidate
             _ => return None,
         }
     }
-    Some((dirs, units))
+    Some((
+        dirs,
+        match facts {
+            Some(f) => ContainerFacts::Recorded(f),
+            None => ContainerFacts::Unrecorded,
+        },
+        units,
+    ))
 }
 
 /// What an adapter's storage *shape* requires of the shared layer.
@@ -1339,10 +1511,26 @@ impl AgentUnitBuilder {
     /// live instead of replaying a state that may since have gone stale
     /// ([`LinkBasis`]). The only form of linkage a container may be
     /// reused around.
-    pub fn project_link_declared(mut self, declared: Option<String>, missing_reason: &str) -> Self {
-        self.unit.project_link = resolve_declared_path(declared.clone(), missing_reason);
+    pub fn project_link_declared(self, declared: Option<String>, missing_reason: &str) -> Self {
+        self.project_link_declared_workspace(declared, Vec::new(), missing_reason)
+    }
+
+    /// [`Self::project_link_declared`] for a unit that declares several
+    /// workspace roots. The resolved state widens to
+    /// [`ProjectLinkState::Shared`] when they resolve to different
+    /// projects, and every declared path is stored so a replayed
+    /// container re-resolves all of them rather than replaying a
+    /// widening that may since have stopped being true.
+    pub fn project_link_declared_workspace(
+        mut self,
+        declared: Option<String>,
+        additional: Vec<String>,
+        missing_reason: &str,
+    ) -> Self {
+        self.unit.project_link = resolve_declared_workspace(&declared, &additional, missing_reason);
         self.unit.link_basis = LinkBasis::Declared {
             declared,
+            additional,
             missing_reason: missing_reason.to_string(),
         };
         self

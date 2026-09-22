@@ -170,8 +170,12 @@ and under a full walk alike.
   its own entry budget, so its stored rows mean the same thing as a live
   identification of the same directory. A budget shared across
   containers — which Codex's session walk used to carry — did not.
-  `oh_my_pi_declares_why_it_does_not_use_the_container_seam` records the
-  one session tree deliberately left off the seam, and why.
+  Oh My Pi joined the seam on 2026-09-22
+  (`oh_my_pi_session_directories_are_containers`); the home-wide
+  shared-blob reference count that kept it off is now a per-container
+  partial stored with the rows
+  (`a_partially_replayed_oh_my_pi_home_sums_the_same_blob_counts`,
+  `a_replayed_container_without_its_partial_makes_the_count_unknown`).
 - `crates/core/tests/reviewer_cost_measurement_stack2.rs` — two
   unchanged full observations over a multi-ecosystem fixture, measured
   with an instrumented `walk.rs` rather than an instrument blind to it.

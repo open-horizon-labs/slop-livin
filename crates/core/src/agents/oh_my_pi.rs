@@ -66,8 +66,7 @@
 
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
-    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
-    mtime_secs, pi_family, resolve_declared_path,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs, pi_family,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -75,6 +74,18 @@ use std::path::{Path, PathBuf};
 
 pub const OH_MY_PI_TOOL_ID: &str = crate::locations::oh_my_pi::OH_MY_PI_DETECTOR_ID;
 
+/// Entry budget owned outright by **one** container, never shared with a
+/// sibling: a day directory's contents must not depend on how many files
+/// the directories before it produced, or rows stored under that rule
+/// could not be replayed into a pass that reached the container
+/// differently.
+const MAX_CONTAINER_ENTRIES: usize = 20_000;
+/// How many containers one pass identifies at all. Also decided by the
+/// tree alone.
+const MAX_CONTAINERS: usize = 20_000;
+/// The fold bound for the whole-directory measurements below (terminal
+/// breadcrumbs, the home residual): unchanged, and unrelated to the
+/// per-container session budget above.
 const MAX_FOLD_ENTRIES: usize = 200_000;
 const MAX_WALK_DEPTH: usize = 4;
 /// Bound on how many bytes of a session's *body* (from the very start of
@@ -128,10 +139,71 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     // One pass over the session files: the same single bounded read per
     // session yields its header and its blob references, so the blob
     // accounting below costs no extra bytes.
-    let (referenced, any_truncated) = identify_sessions(home, ctx, &mut units);
-    identify_blobs(home, ctx, &referenced, any_truncated, &mut units);
+    let refs = identify_sessions(home, ctx, &mut units);
+    identify_blobs(home, ctx, &refs, &mut units);
     identify_static_categories(home, ctx, &mut units);
     units
+}
+
+/// The home-wide shared-blob reference picture, summed from one partial
+/// per session container plus the loose sessions.
+///
+/// `complete` is what makes a count printable: it is false as soon as
+/// any session's body exceeded the scan bound or could not be read
+/// **and** as soon as any replayed container's stored partial is
+/// missing. Either way every blob's count is reported as unknown; a
+/// count that is quietly short is the number a future reference-based GC
+/// would act on, so it must never be presented as complete.
+#[derive(Default)]
+struct BlobReferences {
+    counts: HashMap<String, usize>,
+    complete: bool,
+}
+
+/// One container's partial, as the strings
+/// [`IdentifyCtx::container_with_facts`] stores and replays verbatim:
+/// `"<64-hex hash> <count>"` per referenced blob, plus the single token
+/// [`TRUNCATED_FACT`] when that container's own coverage was incomplete.
+const TRUNCATED_FACT: &str = "truncated";
+
+fn encode_refs(counts: &HashMap<String, usize>, truncated: bool) -> Vec<String> {
+    let mut out: Vec<String> = counts
+        .iter()
+        .map(|(hash, n)| format!("{hash} {n}"))
+        .collect();
+    // Sorted so a container's stored partial does not depend on hash-map
+    // iteration order: an unstable encoding would make two identical
+    // passes store different rows.
+    out.sort();
+    if truncated {
+        out.push(TRUNCATED_FACT.to_string());
+    }
+    out
+}
+
+/// Folds one container's partial into the running total. `None` is an
+/// unrecorded partial, which makes the whole aggregate incomplete.
+fn fold_refs(into: &mut BlobReferences, facts: Option<&[String]>) {
+    let Some(facts) = facts else {
+        into.complete = false;
+        return;
+    };
+    for fact in facts {
+        if fact == TRUNCATED_FACT {
+            into.complete = false;
+            continue;
+        }
+        let Some((hash, n)) = fact.split_once(' ') else {
+            // A partial this binary cannot read back is a partial it
+            // does not have.
+            into.complete = false;
+            continue;
+        };
+        match n.parse::<usize>() {
+            Ok(n) => *into.counts.entry(hash.to_string()).or_insert(0) += n,
+            Err(_) => into.complete = false,
+        }
+    }
 }
 
 fn has_format_markers(home: &Path) -> bool {
@@ -174,18 +246,79 @@ fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgent
 // Sessions (and, from the same bounded read, blob references)
 // ---------------------------------------------------------------------
 
-/// Identifies every session unit, returning the blob-reference counts
-/// this pass observed and whether *any* session's coverage was
-/// incomplete (its body larger than the scan bound, or unreadable) --
-/// in which case no blob's count may be reported as a number.
+/// Identifies every session unit and returns the home-wide blob
+/// reference picture.
+///
+/// Each immediate subdirectory of `sessions/` is a container, and each
+/// container carries its **own** blob-reference partial in its stored
+/// rows. That is what lets a pass replay some containers and re-identify
+/// others and still print one right total: the replayed containers
+/// contribute the partials they were stored with, the re-identified ones
+/// contribute fresh partials, and a container whose stored partial is
+/// missing makes the total unknown rather than short.
+///
+/// Before 2026-09-22 this adapter opted out of the container seam for
+/// exactly this reason -- a partially replayed pass would have counted
+/// only the sessions it identified and printed a number that was wrong
+/// rather than unknown. Storing the partial with the container is the
+/// conversion route that keeps the count honest.
 fn identify_sessions(
     home: &Path,
     ctx: &IdentifyCtx,
     out: &mut Vec<CandidateAgentUnit>,
-) -> (HashMap<String, usize>, bool) {
+) -> BlobReferences {
     let base = home.join("sessions");
-    let mut files = Vec::new();
-    collect_files(&base, 0, ctx, &mut files);
+    let mut refs = BlobReferences {
+        counts: HashMap::new(),
+        complete: true,
+    };
+    let mut loose = Vec::new();
+    let mut containers = 0usize;
+    for entry in ctx.list(&base) {
+        let path = base.join(&entry.name);
+        if entry.is_dir {
+            if containers >= MAX_CONTAINERS {
+                // A pass-level cap on how many containers are identified
+                // at all. Decided by the tree alone, never by what a
+                // sibling produced, so a container's contents can be
+                // replayed into a pass that reached it differently.
+                break;
+            }
+            containers += 1;
+            let (units, facts) = ctx.container_with_facts(OH_MY_PI_TOOL_ID, &path, &|| {
+                let mut files = Vec::new();
+                collect_files(&path, 1, ctx, &mut files);
+                let mut units = Vec::new();
+                let (counts, truncated) = session_units(home, files, ctx, &mut units);
+                (units, encode_refs(&counts, truncated))
+            });
+            match &facts {
+                super::ContainerFacts::Recorded(f) => fold_refs(&mut refs, Some(f)),
+                super::ContainerFacts::Unrecorded => fold_refs(&mut refs, None),
+            }
+            out.extend(units);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            loose.push(path);
+        }
+    }
+    // Session files sitting directly in `sessions/` belong to no
+    // container and are identified every pass; their partial is always
+    // fresh.
+    let (counts, truncated) = session_units(home, loose, ctx, out);
+    fold_refs(&mut refs, Some(&encode_refs(&counts, truncated)));
+    refs
+}
+
+/// The session units for `files`, and this group's blob-reference
+/// partial: the counts it observed, and whether any of its sessions'
+/// coverage was incomplete (body larger than the scan bound, or
+/// unreadable).
+fn session_units(
+    home: &Path,
+    files: Vec<PathBuf>,
+    ctx: &IdentifyCtx,
+    out: &mut Vec<CandidateAgentUnit>,
+) -> (HashMap<String, usize>, bool) {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut any_truncated = false;
     for jsonl in files {
@@ -205,7 +338,11 @@ fn identify_sessions(
             *counts.entry(hash).or_insert(0) += 1;
         }
         let unknown_format = header.is_empty();
-        let project_link = resolve_session_link(header);
+        // Declared, not resolved: a container may only be replayed
+        // around linkage the shared layer can re-resolve live, or a
+        // replay would report a worktree that was deleted or moved
+        // between two passes. `additionalDirectories` rides along, so
+        // the `Shared` widening is redone on replay rather than frozen.
         let mut unit =
             AgentUnitBuilder::new(OH_MY_PI_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
                 .relative_to(home)
@@ -215,7 +352,11 @@ fn identify_sessions(
                     kind: AgentMemberKind::Transcript,
                 }])
                 .mtime_max(mtime)
-                .project_link(project_link)
+                .project_link_declared_workspace(
+                    header.cwd.clone(),
+                    header.additional_directories.clone(),
+                    &pi_family::no_layout_matched_reason(ACCEPTED_LAYOUTS),
+                )
                 .action(AgentActionCapability::SessionRemoval);
         if unknown_format {
             unit = unit.note(
@@ -230,11 +371,11 @@ fn identify_sessions(
 }
 
 fn collect_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
-    if depth > MAX_WALK_DEPTH || out.len() > MAX_FOLD_ENTRIES {
+    if depth > MAX_WALK_DEPTH || out.len() >= MAX_CONTAINER_ENTRIES {
         return;
     }
     for entry in ctx.list(dir) {
-        if out.len() > MAX_FOLD_ENTRIES {
+        if out.len() >= MAX_CONTAINER_ENTRIES {
             return;
         }
         let path = dir.join(&entry.name);
@@ -283,34 +424,6 @@ fn session_facts(ctx: &IdentifyCtx, path: &Path) -> (pi_family::SessionHeader, V
     (header, hashes)
 }
 
-/// Resolves a session's project linkage from its `cwd`, widening to
-/// `ProjectLinkState::Shared` when `additionalDirectories` names a
-/// workspace root that resolves to a *different* project identity --
-/// never fabricating single ownership when the session's own metadata
-/// names more than one project.
-fn resolve_session_link(header: pi_family::SessionHeader) -> ProjectLinkState {
-    let primary = resolve_declared_path(
-        header.cwd,
-        &pi_family::no_layout_matched_reason(ACCEPTED_LAYOUTS),
-    );
-    let mut project_ids: Vec<String> = Vec::new();
-    if let ProjectLinkState::Linked { project_id, .. } = &primary {
-        project_ids.push(project_id.clone());
-    }
-    for extra in header.additional_directories {
-        if let ProjectLinkState::Linked { project_id, .. } = resolve_declared_path(Some(extra), "")
-            && !project_ids.contains(&project_id)
-        {
-            project_ids.push(project_id);
-        }
-    }
-    if project_ids.len() > 1 {
-        ProjectLinkState::Shared { project_ids }
-    } else {
-        primary
-    }
-}
-
 // ---------------------------------------------------------------------
 // Shared blobs
 // ---------------------------------------------------------------------
@@ -339,10 +452,11 @@ fn extract_blob_hashes(text: &str) -> Vec<String> {
 fn identify_blobs(
     home: &Path,
     ctx: &IdentifyCtx,
-    referenced: &HashMap<String, usize>,
-    any_truncated: bool,
+    refs: &BlobReferences,
     out: &mut Vec<CandidateAgentUnit>,
 ) {
+    let referenced = &refs.counts;
+    let any_truncated = !refs.complete;
     let base = home.join("blobs");
     for entry in ctx.list(&base) {
         if entry.is_dir {
@@ -524,7 +638,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{IdentificationCache, contract};
+    use crate::agents::{IdentificationCache, ProjectLinkState, contract};
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
