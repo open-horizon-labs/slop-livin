@@ -295,10 +295,12 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
     // Producing evidence, not consuming it: a renderer that takes
     // evidence is a delivery surface, audited by what calls *it*.
     let speaks = |f: &crate::program::Fun| vocab.iter().any(|v| contains_token(&f.ret, v));
+    // ... or that build facts: a module whose code constructs `Evidence`.
+    let builds = |f: &crate::program::Fun| f.calls.iter().any(|c| !c.method && ["known", "unknown", "unavailable", "conflicting"].iter().any(|k| c.is(&format!("Evidence::{k}"))));
     let modules: HashSet<String> = p
         .funs
         .iter()
-        .filter(|f| f.krate == "swamp_core" && f.is_pub && speaks(f))
+        .filter(|f| f.krate == "swamp_core" && ((f.is_pub && speaks(f)) || builds(f)))
         .map(|f| f.rel.clone())
         .collect();
     // Entries: every binary's `main`, every trait method (dispatched by

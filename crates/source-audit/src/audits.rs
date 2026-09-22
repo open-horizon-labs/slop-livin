@@ -7,6 +7,10 @@
 //! mutation-corpus fixture, and every ADR `validate:` entry resolves.
 
 use crate::rules::{adapters, bus, evidence, execution, meta, scope, store, tui, walk};
+
+/// Rules that run as tests rather than as registered audits (see each
+/// rule's guardrail for why).
+pub const TEST_ONLY_RULES: &[(&str, Audit)] = &[("every_spawn_is_counted", execution::every_spawn_is_counted)];
 use std::path::Path;
 
 pub type Audit = fn(&Path) -> Result<(), String>;
@@ -57,5 +61,4 @@ pub const AUDITS: &[(&str, Audit)] = &[
     ("computed_but_not_delivered", evidence::computed_but_not_delivered),
     ("coverage_changes_are_not_storage_changes", store::coverage_changes_are_not_storage_changes),
     ("activity_and_consumer_evidence_have_limits", evidence::activity_and_consumer_evidence_have_limits),
-    ("every_spawn_is_counted", execution::every_spawn_is_counted),
 ];

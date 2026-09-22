@@ -37,11 +37,20 @@ fn bus(p: &Program) -> Result<Bus, String> {
         .funs
         .iter()
         .enumerate()
+        // The registration sink: a method that takes a consumer and
+        // stores it in the bus itself. A method that merely forwards one
+        // (`fn register_late(&mut self, c) { self.register(c) }`) is a
+        // caller of the sink, not the sink.
         .filter(|(_, f)| {
             f.self_ty.is_some()
                 && f.params
                     .iter()
                     .any(|(_, t)| t.contains("dyn") && contains_token(t, "Consumer"))
+                && f.calls.iter().any(|c| {
+                    c.method
+                        && ["push", "insert", "push_back", "extend"].contains(&c.path.as_str())
+                        && c.receiver.replace(' ', "").starts_with("self.")
+                })
         })
         .map(|(i, _)| i)
         .collect();

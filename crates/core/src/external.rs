@@ -11,11 +11,14 @@
 //! Consumer associations (project/tool <-> external unit) are evidence
 //! a *separate* system supplies (#57's job for real ecosystem-sourced
 //! evidence: manifests, lockfiles, Docker joins). This module's own
-//! association sidecar (`associate_consumer`/`dissociate_consumer`) is a
-//! deliberately minimal, explicit, non-evidence-based mechanism that
-//! exists to prove and test the required shape (zero/one/many consumers,
-//! counted once, association changes never duplicate the unit or reset
-//! its history) without inventing a competing discovery pipeline.
+//! association sidecar is read here (`load_consumers`); its writers
+//! (`associate_consumer`/`dissociate_consumer`) are test-only, because
+//! nothing in the product declares a consumer by hand. They exist to
+//! prove the required shape (zero/one/many consumers, counted once,
+//! association changes never duplicate the unit or reset its history)
+//! without inventing a competing discovery pipeline. Until 2026-09-22
+//! they were `pub` with no production caller, which is the dead-API shape
+//! `no_dead_public_evidence_api` rejects once "called" means reachable.
 //!
 //! Action boundary (#43's acceptance criterion 5): `actions::unit_from_external`
 //! and `actions::propose_external` let a plan *name* an external unit;
@@ -588,6 +591,7 @@ fn load_all_consumers(swamp_dir: &Path) -> Result<HashMap<String, Vec<ExternalCo
     Ok(out)
 }
 
+#[cfg(test)]
 fn save_all_consumers(
     swamp_dir: &Path,
     map: &HashMap<String, Vec<ExternalConsumer>>,
@@ -622,7 +626,8 @@ pub fn load_consumers(swamp_dir: &Path, key: &str) -> Result<Vec<ExternalConsume
 /// Idempotent (associating the same label twice is a no-op, not a
 /// duplicate entry). Never touches the growth store: byte history and
 /// regrowth for this unit are completely unaffected by this call.
-pub fn associate_consumer(
+#[cfg(test)]
+pub(crate) fn associate_consumer(
     swamp_dir: &Path,
     key: &str,
     label: &str,
@@ -643,7 +648,8 @@ pub fn associate_consumer(
 
 /// Removes `label` from the external unit identified by `key`, if
 /// present. Never touches the growth store.
-pub fn dissociate_consumer(swamp_dir: &Path, key: &str, label: &str) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn dissociate_consumer(swamp_dir: &Path, key: &str, label: &str) -> Result<()> {
     let mut map = load_all_consumers(swamp_dir)?;
     if let Some(entry) = map.get_mut(key) {
         entry.retain(|c| c.label != label);
@@ -659,4 +665,206 @@ pub fn dissociate_consumer(swamp_dir: &Path, key: &str, label: &str) -> Result<(
 /// consumer association never duplicates the unit).
 pub fn total_bytes(units: &[ExternalUnit]) -> u64 {
     units.iter().map(|u| u.bytes).sum()
+}
+
+#[cfg(test)]
+mod consumer_sidecar_tests {
+    //! Moved from `tests/external_units.rs` when the sidecar writers
+    //! became test-only: the same two #43 adversarial tests.
+    use super::*;
+    use crate::locations::{Environment, Platform, Registry, StorageCategory};
+    use crate::scope::{ScanConfig, resolve_effective_scope};
+    use std::collections::HashMap;
+
+    fn fixture_env(home: &std::path::Path, extra: &[(&str, &str)]) -> Environment {
+        let mut env: HashMap<String, String> = HashMap::new();
+        for (k, v) in extra {
+            env.insert((*k).to_string(), (*v).to_string());
+        }
+        Environment::fixture(home.to_path_buf(), env, Platform::MacOS)
+    }
+
+    /// An allow-list (see `tests/external_units.rs`): exactly the
+    /// detector under test.
+    fn only_cargo_home_config() -> ScanConfig {
+        ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: Vec::new(),
+            enabled_detectors: vec!["cargo-home".into()],
+        }
+    }
+
+    fn write_pattern(path: &std::path::Path, bytes: u64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![7u8; bytes as usize]).unwrap();
+    }
+
+    fn cargo_home_unit(units: &[ExternalUnit]) -> &ExternalUnit {
+        units
+            .iter()
+            .find(|u| u.detector_id == "cargo-home" && u.category == StorageCategory::Installation)
+            .expect("cargo home's own unit (not registry/git) is present")
+    }
+
+    #[test]
+    fn shared_consumers_are_counted_once_in_totals() {
+        let home = tempfile::tempdir().unwrap();
+        let cargo_home = home.path().join("fixture-cargo");
+        write_pattern(&cargo_home.join("bin/cargo"), 3_000);
+        let env = fixture_env(
+            home.path(),
+            &[("CARGO_HOME", &cargo_home.display().to_string())],
+        );
+        let registry = Registry::with_builtins();
+        let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
+        let store = tempfile::tempdir().unwrap();
+
+        let units = discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            1_000,
+            30,
+            3600,
+            &crate::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let key = unit_key(
+            "cargo-home",
+            StorageCategory::Installation,
+            0,
+            &fs::canonicalize(&cargo_home).unwrap(),
+        );
+        // Device is baked into the real key by `discover_and_measure`
+        // internally; recover the *actual* key from the unit itself instead
+        // of recomputing the device by hand.
+        let unit = cargo_home_unit(&units);
+        let real_key = unit_key(
+            &unit.detector_id,
+            unit.category,
+            real_device(&unit.path),
+            &unit.path,
+        );
+        let _ = key; // illustrative only; `real_key` is what associate_consumer needs
+
+        associate_consumer(store.path(), &real_key, "project-a", None).unwrap();
+        associate_consumer(
+            store.path(),
+            &real_key,
+            "project-b",
+            Some("declared in config"),
+        )
+        .unwrap();
+
+        let units2 = discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            2_000,
+            30,
+            3600,
+            &crate::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let unit2 = cargo_home_unit(&units2);
+        assert_eq!(unit2.consumers.len(), 2, "{:?}", unit2.consumers);
+        let labels: std::collections::BTreeSet<_> =
+            unit2.consumers.iter().map(|c| c.label.clone()).collect();
+        assert_eq!(
+            labels,
+            ["project-a", "project-b"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        // The unit itself is still exactly one row: total_bytes counts its
+        // bytes once, not once per consumer.
+        assert_eq!(total_bytes(&units2), unit2.bytes);
+    }
+
+    #[cfg(unix)]
+    fn real_device(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().dev()
+    }
+
+    /// Associating and later dissociating a consumer must never duplicate
+    /// the unit or perturb its byte history: growth/regrowth before and
+    /// after the association churn must match exactly.
+    #[test]
+    fn association_changes_never_duplicate_the_unit_or_reset_history() {
+        let home = tempfile::tempdir().unwrap();
+        let cargo_home = home.path().join("fixture-cargo");
+        write_pattern(&cargo_home.join("bin/cargo"), 4_000);
+        let env = fixture_env(
+            home.path(),
+            &[("CARGO_HOME", &cargo_home.display().to_string())],
+        );
+        let registry = Registry::with_builtins();
+        let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
+        let store = tempfile::tempdir().unwrap();
+
+        let before = discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            1_000,
+            30,
+            3600,
+            &crate::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        let before_count = before.len();
+        let unit = cargo_home_unit(&before);
+        let key = unit_key(
+            &unit.detector_id,
+            unit.category,
+            real_device(&unit.path),
+            &unit.path,
+        );
+        let bytes_before = unit.bytes;
+        let regrowth_before = unit.regrowth_count;
+
+        for i in 0..3 {
+            associate_consumer(store.path(), &key, &format!("consumer-{i}"), None).unwrap();
+        }
+        for i in 0..3 {
+            dissociate_consumer(store.path(), &key, &format!("consumer-{i}")).unwrap();
+        }
+        associate_consumer(store.path(), &key, "kept", None).unwrap();
+
+        let after = discover_and_measure(
+            &scope,
+            Some(store.path()),
+            true,
+            2_000,
+            30,
+            3600,
+            &crate::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap();
+        assert_eq!(
+            after.len(),
+            before_count,
+            "association churn must not create or drop unit rows"
+        );
+        let unit_after = cargo_home_unit(&after);
+        assert_eq!(unit_after.bytes, bytes_before, "bytes must be unaffected");
+        assert_eq!(
+            unit_after.regrowth_count, regrowth_before,
+            "regrowth_count must be unaffected by consumer association changes"
+        );
+        assert_eq!(
+            unit_after
+                .consumers
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"]
+        );
+    }
+
+
 }
