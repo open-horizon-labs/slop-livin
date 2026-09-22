@@ -276,6 +276,27 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
     walk(&fx.store, &fx.store, &mut files);
     assert!(!files.is_empty(), "the cycle must have written *something*");
 
+    // Reported, not only asserted: the brief for this work asks for the
+    // store's size on this fixture, and a number in a session note is
+    // worth more than "small". Printed per file so a table that starts
+    // growing per row is visible rather than hidden in a total.
+    let mut total = 0u64;
+    let mut listed: Vec<(String, u64)> = files
+        .iter()
+        .map(|rel| {
+            let size = fs::metadata(fx.store.join(rel))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            total += size;
+            (rel.display().to_string(), size)
+        })
+        .collect();
+    listed.sort();
+    println!("store after observe/report/propose/approve/execute: {total} bytes total");
+    for (rel, size) in &listed {
+        println!("  {size:>9}  {rel}");
+    }
+
     let unexpected: Vec<String> = files
         .iter()
         .filter(|rel| !allowed(rel))

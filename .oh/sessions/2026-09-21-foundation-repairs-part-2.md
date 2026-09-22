@@ -376,6 +376,25 @@ allow-lists' *validity* check: an unknown id in an allow-list would
 authorize nothing and leave the fixture passing vacuously, so the ids
 are asserted against the catalog.
 
+**Not fixed, and left as a finding.** The same leak exists one level up,
+in `crates/cli/tests/agent_storage_cli.rs`. Those tests spawn the real
+binary with `HOME` set to a tempdir, which confines the per-user
+detectors but not the machine-wide ones, and the binary reads its
+`[scan]` config from the fixture `SWAMP_DIR` -- which does not exist, so
+it runs the default catalog. Any route that reaches external discovery
+(`swamp propose --external`, and `propose --path` when no agent unit
+matches, which falls through to it) therefore measures the developer's
+real Homebrew prefix and simulator runtimes: one test took **six
+minutes** on the machine where this was found. It is correct, just slow
+and reading things it should not.
+
+The fix is to write an explicit-only `config.toml` into each test's
+fixture store, which changes what those tests exercise, so it is a
+decision rather than a cleanup and it is recorded here instead of made
+at the end of an unrelated chunk. `scripts/check.sh` passes either way;
+it just takes several minutes longer than it should on any machine with
+Xcode installed.
+
 ## Audit changes, and why each is precision rather than a loophole
 
 Four audits were adjusted. A reader should be able to tell these from
@@ -398,19 +417,44 @@ weakening, so each is stated with what it still rejects:
 
 ## Measurements
 
-Store contents after a full observe → report → propose → approve →
-execute cycle on the multi-ecosystem fixture
-(`crates/core/tests/store_contents_are_allowlisted.rs`): every file is a
-`.parquet` table or one of the named small control files, no `.json`
-exceeds 64 KiB, and the association directory now holds five tables
-(declarations, dependency identities, Xcode join, external consumers,
-and the new agent identifications) where this work started with four.
+Store contents after a full observe -> report -> propose -> approve ->
+execute cycle on the multi-ecosystem fixture, printed by
+`crates/core/tests/store_contents_are_allowlisted.rs` rather than
+described (it now reports per file, so a table that starts growing per
+row is visible instead of hidden in a total):
+
+```
+store after observe/report/propose/approve/execute: 43,940 bytes total
+         88  <root-hash>/fsevents.json          (x3 roots)
+          2  <root-hash>/topology.json          (x3 roots)
+      1,637  <root-hash>/unowned.json           (largest of 3)
+        564  associations/agent_identifications.parquet   <- new
+        813  associations/declarations.parquet
+        823  associations/dependency_identities.parquet
+        648  associations/xcode_derived_data.parquet
+      3,030  external/current.parquet
+      2,919  external/deltas/delta-000000000000.parquet
+      2,920  external/deltas/delta-000000000001.parquet
+        405  grants.json
+        402  last_report-*.json.zst             (x3)
+        676  ledger.jsonl
+      3,314  plans/<id>.json
+     24,169  scope.json
+```
+
+Every file is a `.parquet` table or one of the named small control
+files, and no `.json` exceeds 64 KiB. `scope.json` is more than half the
+store, which is worth noticing: it is a snapshot of the whole resolved
+detector catalog, and it is a control file rather than per-row data, so
+it is allowed -- but it is the one thing here that grows with the
+catalog.
 
 The identification table is the only one that grows with *session*
 count rather than worktree count: one row per (adapter, derivation,
-session file), holding one derived string. On the 5,000-session fixture
-that is 5,000 rows of a path, a fingerprint and a short path value --
-which is why it is a columnar table and not a JSON sidecar.
+session file), holding one derived string. 564 bytes for this fixture's
+handful of sessions; on the 5,000-session fixture it is 5,000 such
+rows -- which is exactly why it is a columnar table and not a JSON
+sidecar.
 
 ## Still open, honestly
 
