@@ -471,8 +471,10 @@ fn identify_modules(
             // `modules-2/metadata-2.106/`: Gradle's resolution metadata
             // for the cached modules (descriptors, resolved versions),
             // keyed by the metadata format version in its name.
-            let mut variant = ArtifactVariant::default();
-            variant.configuration = Some(format!("module metadata {files_name}"));
+            let variant = ArtifactVariant {
+                configuration: Some(format!("module metadata {files_name}")),
+                ..Default::default()
+            };
             units.push(
                 NestedUnitBuilder::new(container, ArtifactRole::Metadata, files.path.clone())
                     .folded(files)

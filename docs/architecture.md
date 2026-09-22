@@ -80,10 +80,31 @@ capability, and a removal consequence in the ecosystem's own words.
 Identity stays the unit's path inside its container, so a
 reclassification changes no bytes and reaches no history as a delta.
 
+Units are built through `NestedUnitBuilder` and only through it: its
+defaults understate (unsupported, unknown basis, unknown time source,
+inspection only), lifting one is a named method, and a later enrichment
+re-opens the unit with `NestedUnitBuilder::amend` rather than writing a
+field after `build()`.
+
+Aggregation (`build_adapters::summarize_container`) counts nonempty
+supported candidates only, stops at the outermost unit, never sums
+across accounting bases, and reconciles to the container: unsupported
+units and bytes no unit accounts for are an explicit residual, and
+members exceeding their container is reported as unreconciled, never as
+a zero residual. CLI text, `--json` (`interior`) and the TUI family
+groups all read this one summary, and choose Cargo purpose groups or
+neutral family groups by the roles the units carry, never by adapter id.
+
 Reuse is gated on `fs_events::EventCoverage`, the same gate the agent
-containers use. An unchanged container is replayed with zero listings
-and zero manifest reads; a replay window that cannot say when it opened
-is not evidence that nothing changed, and buys no reuse.
+containers use, **and** on the stored units having been written by the
+adapter that claims the container this pass (the claim depends on
+marker files outside the container, which no event under it reports).
+An unchanged container is replayed with zero listings and zero manifest
+reads; a replay window that cannot say when it opened is not evidence
+that nothing changed, and buys no reuse. A directory the walk cannot
+list inside a container is recorded as an incomplete row and rolls
+completeness up to every ancestor, so coverage gaps reach the units
+instead of reading as a smaller tree.
 
 Shared stores (a pnpm object store, an npm `_cacache`, a Gradle user
 home, a Maven local repository) are identified by the adapters and are
@@ -264,11 +285,13 @@ global-default parser for); npm's cacache and pnpm's content-addressed
 store cannot be matched to a specific declared name+version (stated as
 `Unknown`/a coarse per-worktree-declared fact respectively, per #57's
 own acceptance criteria); a Gradle/Maven artifact's downloaded-vs-
-locally-installed distinction would need the per-artifact
-`_remote.repositories` marker, which swamp does **not** read (reading
-one per artifact is a traversal of the whole local repository, which the
-report path forbids); the recovery fact for a Maven store is therefore
-`Unknown` with that limit named, per `docs/locations.md`'s row; a
+locally-installed distinction needs the per-artifact
+`_remote.repositories` entries; the Maven build adapter reads them
+(bounded, per version directory the folded walk already listed) when it
+identifies a repository container, but machine-wide stores are not yet
+joined into the report pass (see the build-adapter section above), so
+the *external* recovery fact for a Maven store is still `Unknown` with
+that limit named, per `docs/locations.md`'s row; a
 custom (non-default) `GOMODCACHE`/pnpm per-volume store is identified
 via its documented sibling-directory shape, not guessed, but an
 unconventional override could still miss.

@@ -316,33 +316,51 @@ fn docs_table_equals_the_capability_matrix() {
     )
     .expect("docs/build-artifacts.md");
 
-    let rows: Vec<(String, String)> = doc
+    // Support-matrix rows: `| id | status | families | layouts | limits |
+    // granularity | actions |`.
+    let rows: Vec<(String, Vec<String>)> = doc
         .lines()
         .filter(|l| l.starts_with('|'))
         .filter_map(|l| {
-            let cells: Vec<&str> = l.split('|').map(str::trim).collect();
-            if cells.len() < 4 {
+            let cells: Vec<String> = l.split('|').map(|c| c.trim().to_string()).collect();
+            if cells.len() != 9 {
                 return None;
             }
             let id = cells[1].strip_prefix('`')?.split('`').next()?.to_string();
-            Some((id, cells[2].to_string()))
+            Some((id, cells))
         })
         .filter(|(id, _)| matrix::MATRIX.iter().any(|e| e.id == *id))
         .collect();
 
     for e in matrix::MATRIX {
-        let row = rows
+        let (_, cells) = rows
             .iter()
             .find(|(id, _)| id == e.id)
             .unwrap_or_else(|| panic!("docs/build-artifacts.md has no row for `{}`", e.id));
         assert_eq!(
-            row.1,
+            cells[2],
             e.status.label(),
             "`{}` is {} in code and {} in the docs",
             e.id,
             e.status.label(),
-            row.1
+            cells[2]
         );
+        let families = if e.families.is_empty() {
+            "--".to_string()
+        } else {
+            e.families
+                .iter()
+                .map(|f| f.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        assert_eq!(cells[3], families, "`{}`: families column", e.id);
+        assert_eq!(
+            cells[6], e.operation_granularity,
+            "`{}`: operation granularity column",
+            e.id
+        );
+        assert_eq!(cells[7], e.actions, "`{}`: actions column", e.id);
     }
     let mut ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
     ids.sort_unstable();

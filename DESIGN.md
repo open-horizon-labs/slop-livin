@@ -39,16 +39,23 @@ back newly added marks, preserving earlier selections. No virtual group is a
 directory deletion target. Age ordering applies within groups; individual members
 can be selected instead of the whole group.
 
-A build container an adapter other than Cargo identified (a `node_modules`,
-a `dist`, a Gradle `build/`, a Maven `target/`) expands the same way, into one
-row per role family. Each row leads with the family and what removing it would
-cost in that ecosystem's own words, then the count, the size with its accounting
-basis, and the oldest known modification. That order is the point: a narrow
-terminal truncates the numbers, never the consequence. These rows are never
-selectable -- no adapter has an action, so none of them reaches the confirmation
-path -- and they say `inspection only`, or name the reason an action is
-unavailable (a shared store entry other projects may link to). A `node_modules`
-that is mostly pnpm store shows that before it shows a total.
+A build container whose interior an adapter identified in the neutral role
+vocabulary (a `node_modules`, a `dist`, a Gradle `build/`, a Maven `target/`)
+expands into one group per role family -- Build outputs, Test & coverage output,
+Caches & intermediates, Installed dependencies, Shared store entries, Tool
+metadata -- plus a Not identified group for unrecognised entries and bytes no
+unit claims. Groups start closed. Each group row leads with review guidance of at
+most 32 characters ("Start here: slower next build", "Review: reinstall from
+registry", "Shared: other projects may link"), then the count and oldest known
+modification; the adapter's own consequence, the accounting basis and
+"inspection only" are the row's details. That order is the point: an 80-column
+advice column shows the guidance whole and gives up the numbers first. An opened
+group lists its members oldest first (unknown ages last), each leading with its
+consequence in that ecosystem's words. None of these rows is selectable -- Space
+is refused as inspection-only -- because no neutral-vocabulary adapter has an
+action. Which presentation a container gets follows the roles its units carry,
+never a comparison with an adapter id; Cargo containers keep the purpose groups
+above.
 
 The physical tree remains under a collapsed Inspect directories row; it is a
 second view of the same bytes, not additional storage. Physical category rows
