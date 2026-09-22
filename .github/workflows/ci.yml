@@ -68,21 +68,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Build tests
-        run: cargo test --workspace --locked --no-run
-
-      - name: Test (native Linux)
-        run: cargo test --workspace --locked
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Source audit
-        run: cargo run --locked -p swamp-source-audit
-
-      - name: Repo gate (scripts/check.sh)
-        run: ./scripts/check.sh
-
+      # Ordered cheapest-and-most-specific first. The workspace suite
+      # takes minutes and one failing test hides every later step, so the
+      # platform-isolation evidence this workflow exists for runs before
+      # it rather than behind it.
       - name: Platform isolation — dependency graph
         run: ./scripts/platform-isolation.sh deps x86_64-unknown-linux-gnu
 
@@ -91,6 +80,23 @@ jobs:
           set -euo pipefail
           cargo build --locked -p swamp
           ./scripts/platform-isolation.sh linkage target/debug/swamp
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Source audit
+        run: cargo run --locked -p swamp-source-audit
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      # `--no-fail-fast`: bringing a second platform up, the useful
+      # signal is every test that fails, not the first binary that does.
+      - name: Test (native Linux)
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Repo gate (scripts/check.sh)
+        run: ./scripts/check.sh
 
   macos-arm64:
     name: macOS arm64
@@ -123,21 +129,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Build tests
-        run: cargo test --workspace --locked --no-run
-
-      - name: Test (native macOS)
-        run: cargo test --workspace --locked
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Source audit
-        run: cargo run --locked -p swamp-source-audit
-
-      - name: Repo gate (scripts/check.sh)
-        run: ./scripts/check.sh
-
+      # Ordered cheapest-and-most-specific first. The workspace suite
+      # takes minutes and one failing test hides every later step, so the
+      # platform-isolation evidence this workflow exists for runs before
+      # it rather than behind it.
       - name: Platform isolation — dependency graph
         run: ./scripts/platform-isolation.sh deps aarch64-apple-darwin
 
@@ -146,3 +141,20 @@ jobs:
           set -euo pipefail
           cargo build --locked -p swamp
           ./scripts/platform-isolation.sh linkage target/debug/swamp
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Source audit
+        run: cargo run --locked -p swamp-source-audit
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      # `--no-fail-fast`: bringing a second platform up, the useful
+      # signal is every test that fails, not the first binary that does.
+      - name: Test (native macOS)
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Repo gate (scripts/check.sh)
+        run: ./scripts/check.sh

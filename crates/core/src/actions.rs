@@ -1938,28 +1938,52 @@ fn newest_mtime(path: &Path, max_entries: usize) -> Option<u64> {
     Some(newest)
 }
 
+/// The directory a recoverable removal moves things into.
+///
+/// `~/.Trash` on macOS, what Finder reads. On Linux the freedesktop
+/// Trash spec's *home trash* (`$XDG_DATA_HOME/Trash`, default
+/// `~/.local/share/Trash`), resolved through [`crate::platform::trash`]
+/// so the two conventions have one implementation rather than two
+/// spellings of `~/.Trash`.
+///
+/// This is the same-filesystem answer. An item on another mount belongs
+/// in that mount's own `.Trash-$uid`
+/// ([`crate::platform::trash::resolve`]); performing that cross-device
+/// move, and writing the `.trashinfo` record a file manager restores
+/// from, is #85. Until then a Linux build reports the `trash` capability
+/// as planned rather than claiming freedesktop compliance.
 pub fn trash_root() -> PathBuf {
     if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".Trash")
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+    let ctx = crate::platform::trash::Context {
+        os: crate::platform::Os::current(),
+        home: home.clone(),
+        xdg_data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        uid: current_uid(),
+    };
+    // Same-device resolution: the home trash (or `~/.Trash`). The
+    // cross-device branch needs the item's own device, which only a
+    // caller performing a move knows, and is #85's to supply.
+    crate::platform::trash::resolve(&ctx, &home, 0, 0, Path::new("/"), false).dir
 }
 
+fn current_uid() -> u32 {
+    // SAFETY: getuid() cannot fail and reads no caller-owned memory.
+    unsafe { libc::getuid() }
+}
+
+/// Bytes an unprivileged process can still write to the filesystem
+/// holding `path`.
+///
+/// Was `df -k` parsed by field index, which is a macOS column layout:
+/// GNU coreutils prints a different header and wraps long device rows,
+/// so the fourth field there can be the capacity percentage or nothing.
+/// Now one `statvfs` call, no subprocess, the same answer on both
+/// targets -- see [`crate::platform::fs_space`].
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    crate::work_counters::record_spawn();
-    let out = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
-    let available_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(available_kb * 1024)
+    crate::platform::fs_space::available_bytes(path)
 }
 
 fn ledger_path(dir: &Path) -> PathBuf {

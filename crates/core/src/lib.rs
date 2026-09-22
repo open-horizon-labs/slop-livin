@@ -37,6 +37,7 @@ pub mod ledger;
 pub mod locations;
 pub mod measurement;
 pub mod occupancy;
+pub mod platform;
 pub mod recheck;
 pub mod reclaimability;
 pub mod recovery;

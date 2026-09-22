@@ -28,11 +28,12 @@ impl Detector for HomebrewDetector {
     }
 
     fn platforms(&self) -> &'static [Platform] {
-        &[Platform::MacOS]
+        &[Platform::MacOS, Platform::Linux]
     }
 
     fn version_note(&self) -> &'static str {
-        "Homebrew manpage, current stable prefixes"
+        "Homebrew manpage, current stable prefixes (macOS /opt/homebrew, /usr/local; \
+         Linux /home/linuxbrew/.linuxbrew)"
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
@@ -54,7 +55,16 @@ impl Detector for HomebrewDetector {
             });
             prefixes.push(path);
         } else {
-            for prefix in ["/opt/homebrew", "/usr/local"] {
+            // Homebrew on Linux installs to one prefix, not two: the
+            // Apple-silicon/Intel split does not exist there, and
+            // /usr/local on Linux is a distribution-owned directory
+            // Homebrew does not claim. Proposing it would be a scan root
+            // that has nothing to do with Homebrew.
+            let conventional: &[&str] = match env.platform {
+                Platform::MacOS => &["/opt/homebrew", "/usr/local"],
+                Platform::Linux => &["/home/linuxbrew/.linuxbrew"],
+            };
+            for prefix in conventional.iter().copied() {
                 out.push(ProposedLocation {
                     detector_id: HOMEBREW_DETECTOR_ID.to_string(),
                     path: Some(std::path::PathBuf::from(prefix)),

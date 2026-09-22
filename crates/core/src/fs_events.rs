@@ -61,6 +61,16 @@ pub enum RefreshRefusal {
     /// platform (non-macOS). Always refuses; there is no fallback stream
     /// to try.
     UnsupportedPlatform,
+    /// This platform's kernel keeps no persisted change history to
+    /// replay from. Linux: inotify reports only what happens while a
+    /// watch is open, so a period with no running watch is a gap, not a
+    /// quiet period. Distinct from [`RefreshRefusal::UnsupportedPlatform`]
+    /// (which says a backend is missing) because this one says the
+    /// backend cannot exist: no amount of implementation work makes a
+    /// Linux kernel able to answer "what changed while you were not
+    /// running". #81 adds the live watch, which narrows the gap to the
+    /// time before the watch opened; it does not remove it.
+    NoPersistedChangeHistory,
 }
 
 impl RefreshRefusal {
@@ -76,6 +86,20 @@ impl RefreshRefusal {
             RefreshRefusal::TooManyChanges => "too_many_changes",
             RefreshRefusal::TooSoon => "too_soon",
             RefreshRefusal::UnsupportedPlatform => "unsupported_platform",
+            RefreshRefusal::NoPersistedChangeHistory => "no_persisted_change_history",
+        }
+    }
+
+    /// The sentence a coverage note or `--json` explanation carries
+    /// beside the code. A reason code tells a script what happened; this
+    /// tells a person why a Linux run walks fully every time and that it
+    /// is the platform, not a misconfiguration.
+    pub fn explanation(self) -> Option<&'static str> {
+        match self {
+            RefreshRefusal::NoPersistedChangeHistory => {
+                crate::platform::ContinuitySource::LiveWatchEpochOnly.no_history_reason()
+            }
+            _ => None,
         }
     }
 }
@@ -385,11 +409,29 @@ pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Wat
 
 /// The non-macOS fallback: always refuses, naming the platform as the
 /// cause, never a bug in the replay itself.
+///
+/// The refusal it gives is the one the platform's continuity source
+/// justifies, not a generic "unsupported": on Linux there is no
+/// persisted kernel change history to replay from
+/// ([`RefreshRefusal::NoPersistedChangeHistory`]), which is a different
+/// statement from "nobody has written the backend yet" and leads to a
+/// different answer for the user.
 pub struct UnsupportedPlatformSource;
 
 impl FsEventsSource for UnsupportedPlatformSource {
     fn replay(&self, _request: &FsEventsRequest) -> FsEventsPlan {
-        FsEventsPlan::refuse(RefreshRefusal::UnsupportedPlatform, 0, None)
+        FsEventsPlan::refuse(platform_refusal(), 0, None)
+    }
+}
+
+/// Why *this* build cannot replay history. Derived from the platform's
+/// continuity source rather than from the target triple, so a future
+/// backend changes one table instead of every refusal site.
+pub fn platform_refusal() -> RefreshRefusal {
+    if crate::platform::ContinuitySource::for_os(crate::platform::Os::current()).replays_history() {
+        RefreshRefusal::UnsupportedPlatform
+    } else {
+        RefreshRefusal::NoPersistedChangeHistory
     }
 }
 
@@ -892,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_platform_source_always_refuses() {
+    fn a_platform_without_a_backend_always_refuses_and_names_which_kind() {
         let source = UnsupportedPlatformSource;
         let plan = source.replay(&FsEventsRequest {
             root: PathBuf::from("/tmp"),
@@ -904,8 +946,47 @@ mod tests {
             },
         });
         assert!(!plan.incremental);
-        assert_eq!(plan.refusal, Some(RefreshRefusal::UnsupportedPlatform));
-        assert_eq!(plan.reason_str(), "unsupported_platform");
+        assert!(
+            plan.changed_dirs.is_empty(),
+            "a refusal never carries a change list"
+        );
+        // Which refusal depends on *why* there is no replay. A build on
+        // a kernel that keeps no change history says so; only a target
+        // with no backend written for it says "unsupported".
+        assert_eq!(plan.refusal, Some(platform_refusal()));
+        assert_eq!(plan.reason_str(), platform_refusal().as_str());
+    }
+
+    /// The distinction that must not collapse: "no backend yet" invites
+    /// someone to write one; "the kernel keeps no history" is a fact
+    /// about Linux that #81's watcher narrows but does not remove. A
+    /// build that reported the first where the second is true would
+    /// promise a Linux user an incremental refresh that can never come.
+    #[test]
+    fn a_kernel_without_persisted_history_says_so_rather_than_unsupported() {
+        assert_eq!(
+            RefreshRefusal::NoPersistedChangeHistory.as_str(),
+            "no_persisted_change_history"
+        );
+        let why = RefreshRefusal::NoPersistedChangeHistory
+            .explanation()
+            .expect("this refusal must explain itself in words");
+        assert!(why.contains("inotify"), "{why}");
+        assert!(
+            RefreshRefusal::UnsupportedPlatform.explanation().is_none(),
+            "only the platform-history refusal carries that explanation"
+        );
+
+        // And the mapping is derived from the continuity source, not
+        // from a hand-written per-target list.
+        let expected = if crate::platform::ContinuitySource::for_os(crate::platform::Os::current())
+            .replays_history()
+        {
+            RefreshRefusal::UnsupportedPlatform
+        } else {
+            RefreshRefusal::NoPersistedChangeHistory
+        };
+        assert_eq!(platform_refusal(), expected);
     }
 
     #[test]
@@ -935,6 +1016,10 @@ mod tests {
             (RefreshRefusal::TooManyChanges, "too_many_changes"),
             (RefreshRefusal::TooSoon, "too_soon"),
             (RefreshRefusal::UnsupportedPlatform, "unsupported_platform"),
+            (
+                RefreshRefusal::NoPersistedChangeHistory,
+                "no_persisted_change_history",
+            ),
         ] {
             assert_eq!(reason.as_str(), expected);
         }

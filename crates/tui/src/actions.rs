@@ -531,35 +531,27 @@ pub fn execute_plan_progress(
     results
 }
 
-/// The default Trash root: `~/.Trash` on macOS. Overridable via
-/// `SWAMP_TRASH_DIR` for tests and CI, which never wants a real
-/// `~/.Trash`.
+/// The default Trash root, per platform: `~/.Trash` on macOS, the
+/// freedesktop home trash on Linux. Overridable via `SWAMP_TRASH_DIR`
+/// for tests and CI, which never wants a real one.
+///
+/// Delegates to `swamp_core::actions::trash_root` rather than repeating
+/// it: the TUI and the CLI executing the same plan must put a unit in
+/// the same place, and two copies of a path convention is how they stop
+/// doing that.
 pub fn trash_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".Trash")
+    swamp_core::actions::trash_root()
 }
 
-/// Free space on the volume containing `path`, in bytes, via `df -k`.
-/// Returns `None` if `df` cannot be read (kept read-only/advisory: a
-/// missing measurement never blocks or fakes the reported result).
+/// Free space on the volume containing `path`, in bytes.
+///
+/// One `statvfs` call through `swamp_core::platform::fs_space` -- no
+/// subprocess on a TUI code path, and no `df` column-layout assumption
+/// (GNU coreutils' columns differ from macOS's). Kept read-only and
+/// advisory: `None` means "not measured", and no caller may read that
+/// as zero or as plenty.
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    // macOS `df -k`: Filesystem 1024-blocks Used Available Capacity ...
-    let available_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(available_kb * 1024)
+    swamp_core::platform::fs_space::available_bytes(path)
 }
 
 /// Human summary line for the confirm banner: `delete 3 units · 1.9 GB

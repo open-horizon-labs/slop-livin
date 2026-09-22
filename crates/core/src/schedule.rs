@@ -41,8 +41,44 @@ pub fn plist_path() -> PathBuf {
     agents_dir().join(format!("{LABEL}.plist"))
 }
 
+/// Where a scheduled `observe` writes its log.
+///
+/// `~/Library/Logs/swamp` on macOS, where Console.app looks. On Linux
+/// the XDG base directory spec's *state* directory --
+/// `$XDG_STATE_HOME/swamp`, default `~/.local/state/swamp` -- which is
+/// what that spec's state category is for ("logs, history, recently
+/// used files"), rather than data (`$XDG_DATA_HOME`, where the growth
+/// store lives) or cache. A relative `$XDG_STATE_HOME` is ignored, as
+/// the spec requires. `SWAMP_LOG_DIR` still overrides both.
 pub fn log_dir() -> PathBuf {
-    env_dir("SWAMP_LOG_DIR", home().join("Library/Logs/swamp"))
+    env_dir("SWAMP_LOG_DIR", default_log_dir())
+}
+
+fn default_log_dir() -> PathBuf {
+    match crate::platform::Os::current() {
+        crate::platform::Os::MacOs => home().join("Library/Logs/swamp"),
+        crate::platform::Os::Linux => xdg_dir("XDG_STATE_HOME", ".local/state").join("swamp"),
+    }
+}
+
+/// An XDG base directory, honouring the spec's rule that a relative
+/// value "should be considered invalid and ignored".
+fn xdg_dir(var: &str, fallback_rel: &str) -> PathBuf {
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        _ => home().join(fallback_rel),
+    }
+}
+
+/// Whether this build can install an unattended periodic observation,
+/// and -- when it cannot -- the sentence that says so.
+///
+/// One answer shared by `install`, `uninstall` and `status`. A platform
+/// with no scheduler must refuse: writing a LaunchAgent plist into a
+/// `~/Library/LaunchAgents` no daemon reads would report success for a
+/// job that will never run, which is worse than having no scheduler.
+pub fn scheduling() -> crate::platform::Scheduling {
+    crate::platform::Scheduling::for_os(crate::platform::Os::current())
 }
 
 pub fn log_file() -> PathBuf {
@@ -212,6 +248,13 @@ fn current_exe() -> Result<PathBuf> {
 /// the configured scope for one invocation, and that includes a
 /// scheduled one.
 pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
+    // Before anything is parsed, created or written: a platform with no
+    // scheduling backend refuses and leaves no state behind. The
+    // interval is still validated first on a platform that has one, so
+    // the error a user sees is about their input, not their OS.
+    if let Some(refusal) = scheduling().refusal() {
+        bail!("{refusal}");
+    }
     let seconds = parse_interval(interval_raw)?;
     let exe = current_exe()?;
     let plist = plist_path();
@@ -253,6 +296,14 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
 
 /// `swamp schedule --off`.
 pub fn uninstall() -> Result<String> {
+    // Nothing could have been installed, so there is nothing to remove
+    // and no `launchctl` to call. Saying so beats a bare "not installed"
+    // that reads like the feature exists and is merely switched off.
+    if let crate::platform::Scheduling::Unavailable { reason, planned } = scheduling() {
+        return Ok(format!(
+            "Scheduled observation is not available on this platform: {reason}.\n  Planned in {planned}.\n  Nothing was installed, so nothing was removed.\n"
+        ));
+    }
     let plist = plist_path();
     if !plist.exists() {
         unload_plist(&plist);
@@ -459,6 +510,16 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
 /// `swamp schedule` with no arguments: report installed/loaded
 /// state, interval, roots, last run, and the next expected run.
 pub fn status(store_dir: &Path) -> Result<String> {
+    if let crate::platform::Scheduling::Unavailable { reason, planned } = scheduling() {
+        // The last-run block below still runs on macOS only because it
+        // is keyed to the installed plist. On a platform that cannot
+        // install one, reporting "not installed / enable it with ..."
+        // would advertise a command that refuses.
+        let _ = store_dir;
+        return Ok(format!(
+            "Scheduled observation: not available on this platform\n  Reason:  {reason}\n  Planned: {planned}\n  Until then: run `swamp observe` from your own timer.\n"
+        ));
+    }
     let plist = plist_path();
     if !plist.exists() {
         return Ok(

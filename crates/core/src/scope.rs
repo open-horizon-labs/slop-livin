@@ -20,7 +20,7 @@
 //! *observation* of that scope coherent.
 
 use crate::locations::{
-    Environment, LocationStatus, ProposedLocation, Provenance, Registry, StorageCategory,
+    Environment, LocationStatus, Platform, ProposedLocation, Provenance, Registry, StorageCategory,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -228,6 +228,14 @@ pub struct DetectorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectiveScope {
     pub catalog_version: String,
+    /// The platform this scope was resolved for. A scope is a set of
+    /// platform conventions as much as a set of paths (`~/Library/...`
+    /// on macOS, `$XDG_CACHE_HOME` on Linux), so the persisted and
+    /// `--json` forms say which one produced it -- otherwise a scope
+    /// read on the other machine looks like a pile of missing roots
+    /// with no explanation.
+    #[serde(default = "default_scope_platform")]
+    pub platform: Platform,
     pub generated_at: u64,
     pub defaults_enabled: bool,
     pub disabled_detectors: Vec<String>,
@@ -1000,6 +1008,7 @@ pub fn resolve_effective_scope(
 
     EffectiveScope {
         catalog_version: crate::locations::CATALOG_VERSION.to_string(),
+        platform: env.platform,
         generated_at,
         defaults_enabled: config.defaults,
         disabled_detectors: effective_disabled,
@@ -1012,6 +1021,14 @@ pub fn resolve_effective_scope(
         external_pruned_subtrees,
         normalized_exclude: excludes,
     }
+}
+
+/// A scope persisted before this field existed was necessarily written
+/// by the build that wrote it, on the machine it ran on. Defaulting to
+/// the running platform is the only answer that is not a guess about
+/// someone else's machine.
+fn default_scope_platform() -> Platform {
+    Platform::current()
 }
 
 /// A change to what's in scope between two resolutions -- never a claim

@@ -1304,17 +1304,20 @@ pub(crate) fn aggregate_dir_totals(
     }
 }
 
-/// `${SWAMP_DIR}` (or `~/.local/share/swamp`): the same
-/// resolution the CLI uses on its own, duplicated here only as a
-/// fallback for GitHub enrichment's cache when no `store_dir` was
-/// supplied (see the call site in `report_with`).
+/// `${SWAMP_DIR}`, or the platform's per-user data directory.
+///
+/// Reached through [`crate::platform::data_dir`] rather than repeated
+/// here: two spellings of the store path is how an enrichment cache
+/// ends up somewhere the store is not, and the Linux answer honours
+/// `$XDG_DATA_HOME` while the macOS one does not.
+///
+/// A fallback only for GitHub enrichment's cache when no `store_dir`
+/// was supplied (see the call site in `report_with`). `None` when there
+/// is no home to derive one from: enrichment then runs uncached, which
+/// is slower and correct, rather than caching into the current
+/// directory.
 pub(crate) fn default_github_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("SWAMP_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".local/share/swamp"))
+    crate::platform::data_dir().ok()
 }
 
 /// Renders a `PrStatus` for the `pull_request` signal row and the

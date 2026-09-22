@@ -457,6 +457,7 @@ fn every_refusal_reason_falls_back_to_a_full_walk() {
         RefreshRefusal::HelperInconclusive,
         RefreshRefusal::TooManyChanges,
         RefreshRefusal::UnsupportedPlatform,
+        RefreshRefusal::NoPersistedChangeHistory,
     ] {
         let store = tempfile::tempdir().expect("tmp store");
 
