@@ -715,6 +715,31 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
             let _ = writeln!(out, "  {:<12} {:<10} {}", d.detector_id, status, path);
         }
     }
+    // "Not applicable" is its own answer, distinct from "found nothing"
+    // and from "could not tell" (#84). Omitting these would leave a
+    // Linux user wondering whether Xcode detection failed rather than
+    // knowing it does not apply.
+    if !scope.not_applicable_detectors.is_empty() {
+        let _ = writeln!(
+            out,
+            "not applicable on this platform (not failures, and not absences):"
+        );
+        for d in &scope.not_applicable_detectors {
+            let applies: Vec<&str> = d
+                .applies_to
+                .iter()
+                .map(|p| swamp_core::platform::Os::from(*p).as_str())
+                .collect();
+            let _ = writeln!(
+                out,
+                "  {:<12} {:<10} {} (applies to: {})",
+                d.detector_id,
+                "n/a",
+                d.name,
+                applies.join(", ")
+            );
+        }
+    }
     out
 }
 

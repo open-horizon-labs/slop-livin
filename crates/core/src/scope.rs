@@ -221,6 +221,24 @@ pub struct DetectorSummary {
     pub locations: Vec<ProposedLocation>,
 }
 
+/// A detector that exists in the catalog and does not apply to the
+/// platform this scope was resolved for.
+///
+/// Reported, not omitted (#84). "Not applicable" and "found nothing"
+/// are different answers and a user is entitled to tell them apart: a
+/// Linux user who does not see Xcode in their scope should be able to
+/// learn that Xcode is a macOS detector, rather than wonder whether
+/// detection failed, whether a permission was missing, or whether they
+/// configured something wrong. Silence reads as the third.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotApplicableDetector {
+    pub detector_id: String,
+    pub name: String,
+    /// The platforms it does apply to, so the note is a fact rather
+    /// than a shrug.
+    pub applies_to: Vec<Platform>,
+}
+
 /// A reusable, serde-serializable description of exactly what swamp will
 /// scan for one invocation, and why -- shared by every command
 /// (`scope`, `report`, `observe`, `ui`, `schedule`) through
@@ -252,6 +270,11 @@ pub struct EffectiveScope {
     /// Full per-detector transparency, independent of whether a
     /// detector's output became a root (see `DetectorSummary`).
     pub detectors: Vec<DetectorSummary>,
+    /// Detectors that do not apply to [`EffectiveScope::platform`],
+    /// reported rather than silently absent. Empty on the platform a
+    /// detector was written for.
+    #[serde(default)]
+    pub not_applicable_detectors: Vec<NotApplicableDetector>,
     /// Subtrees an `exclude` entry names that fall *inside* an in-scope
     /// root, i.e. a subtree the walker should prune once #50 wires
     /// exclusion patterns into the walk itself. Exposed now so the
@@ -850,6 +873,23 @@ pub fn resolve_effective_scope(
         })
         .collect();
 
+    // The other half of per-detector transparency: what this platform
+    // does not have, named. Deliberately independent of
+    // `disabled_detectors` -- a detector can be both, and "you turned
+    // this off" is a different sentence from "this OS has no such
+    // thing".
+    let mut not_applicable_detectors: Vec<NotApplicableDetector> = registry
+        .detectors()
+        .iter()
+        .filter(|d| !d.platforms().contains(&env.platform))
+        .map(|d| NotApplicableDetector {
+            detector_id: d.id().to_string(),
+            name: d.name().to_string(),
+            applies_to: d.platforms().to_vec(),
+        })
+        .collect();
+    not_applicable_detectors.sort_by(|a, b| a.detector_id.cmp(&b.detector_id));
+
     // candidate: (normalized path, reason)
     let mut candidates: Vec<(PathBuf, RootReason)> = Vec::new();
 
@@ -1017,6 +1057,7 @@ pub fn resolve_effective_scope(
         explicit: !explicit_roots.is_empty(),
         roots,
         detectors,
+        not_applicable_detectors,
         pruned_subtrees,
         external_pruned_subtrees,
         normalized_exclude: excludes,
@@ -1651,5 +1692,111 @@ mod tests {
         let loaded = load_last_effective_scope(&store).expect("round trip");
         assert_eq!(loaded.catalog_version, scope.catalog_version);
         assert_eq!(loaded.roots.len(), scope.roots.len());
+    }
+
+    /// #84: "not applicable" is a third answer, beside "found nothing"
+    /// and "could not tell". A macOS-only detector is absent from a
+    /// Linux scope's `detectors` list entirely, which on its own is
+    /// indistinguishable from a detector that ran and resolved nothing
+    /// -- and a user chasing "why is Xcode not in my scope" would have
+    /// no way to learn that the answer is "because this is Linux".
+    #[test]
+    fn a_detector_that_does_not_apply_to_this_platform_is_named_not_omitted() {
+        use crate::locations::{Environment, Platform, Registry};
+        let registry = Registry::with_builtins();
+
+        let linux = resolve_effective_scope(
+            &Environment::fixture(
+                std::path::PathBuf::from("/home/dev"),
+                std::collections::HashMap::new(),
+                Platform::Linux,
+            ),
+            &ScanConfig::default(),
+            &[],
+            &registry,
+            1,
+        );
+        let named: Vec<&str> = linux
+            .not_applicable_detectors
+            .iter()
+            .map(|d| d.detector_id.as_str())
+            .collect();
+        for expected in ["xcode", "core-simulator", "docker-desktop"] {
+            assert!(
+                named.contains(&expected),
+                "a Linux scope must say `{expected}` does not apply here, got {named:?}"
+            );
+        }
+        // And it must not appear in both lists: a detector is either
+        // something this platform has or something it does not.
+        for d in &linux.not_applicable_detectors {
+            assert!(
+                !linux
+                    .detectors
+                    .iter()
+                    .any(|s| s.detector_id == d.detector_id),
+                "`{}` is reported both as applicable and as not applicable",
+                d.detector_id
+            );
+            assert!(
+                d.applies_to.contains(&Platform::MacOS) && !d.applies_to.contains(&Platform::Linux),
+                "`{}` is listed as not applicable to Linux but claims to apply to it",
+                d.detector_id
+            );
+        }
+
+        // Symmetrically, a macOS scope must not report a macOS detector
+        // as inapplicable -- otherwise this list is noise rather than an
+        // answer.
+        let macos = resolve_effective_scope(
+            &Environment::fixture(
+                std::path::PathBuf::from("/Users/dev"),
+                std::collections::HashMap::new(),
+                Platform::MacOS,
+            ),
+            &ScanConfig::default(),
+            &[],
+            &registry,
+            1,
+        );
+        let macos_named: Vec<&str> = macos
+            .not_applicable_detectors
+            .iter()
+            .map(|d| d.detector_id.as_str())
+            .collect();
+        for unexpected in ["xcode", "core-simulator", "docker-desktop"] {
+            assert!(
+                !macos_named.contains(&unexpected),
+                "`{unexpected}` applies on macOS and must not be listed as not applicable: \
+                 {macos_named:?}"
+            );
+        }
+    }
+
+    /// The other half of the same fact: a scope records which
+    /// platform's conventions produced it, so a scope read on the other
+    /// machine is not just a list of missing paths.
+    #[test]
+    fn a_scope_records_the_platform_it_was_resolved_for() {
+        use crate::locations::{Environment, Platform, Registry};
+        let registry = Registry::with_builtins();
+        for platform in [Platform::MacOS, Platform::Linux] {
+            let home = match platform {
+                Platform::MacOS => "/Users/dev",
+                Platform::Linux => "/home/dev",
+            };
+            let scope = resolve_effective_scope(
+                &Environment::fixture(
+                    std::path::PathBuf::from(home),
+                    std::collections::HashMap::new(),
+                    platform,
+                ),
+                &ScanConfig::default(),
+                &[],
+                &registry,
+                1,
+            );
+            assert_eq!(scope.platform, platform);
+        }
     }
 }
