@@ -187,6 +187,59 @@ Making the reuse fire, and keeping a count honest while it does.
   before starting the next, against a five-second budget, and so
   sometimes abandoned a root's stream while it was still starting. All
   roots' streams now start before any readiness is collected.
+### Build artifacts get adapters (#64, #65, #67, #68)
+
+What is inside a build container, for four ecosystems instead of one.
+
+- **`node_modules`, `dist`, `.next`, `coverage`, `.turbo`, a Gradle
+  `build/`, a Maven `target/` and a Maven local repository now have an
+  interior.** A build container used to be one row and one number. It
+  now expands into one row per role family -- outputs, tests,
+  intermediates, dependencies, shared store, metadata, residual -- each
+  with what removing it would cost *in that ecosystem's own words*
+  ("rebuild with `next build`", "reinstall with `npm ci` -- needs
+  registry access", "a test rerun with coverage enabled regenerates
+  it"), a size with its accounting basis stated, and the oldest known
+  **modification** time. Visible in `swamp report --view builds`,
+  `--view deps`, their `--json`, and the TUI project tree.
+- **Nothing here is actionable.** No build adapter implements an action;
+  every unit says inspection only, and a published capability table that
+  said otherwise would fail the build's own audit. Cargo's existing
+  purpose groups are unchanged and remain the only build-artifact
+  cleanup swamp supports.
+- **A Maven artifact with no origin evidence is reported as unknown
+  origin, not as re-downloadable.** `_remote.repositories` or a
+  `*.lastUpdated` marker means downloaded; `maven-metadata-local.xml`
+  means installed from a local build and *not* recoverable from a
+  repository; neither means swamp does not know and says so. Where both
+  are present the local claim wins, because guessing the other way costs
+  someone an artifact they cannot rebuild.
+- **A package is named by its own manifest, never by its directory.**
+  An unreadable or oversized `package.json` leaves the identity unknown
+  rather than guessing from the folder name. No build generation is
+  invented anywhere: npm, pnpm, Gradle and Maven record none, and a
+  newer similarly-named output does not supersede an older one.
+- **pnpm and npm store entries are charged once.** A project's
+  `node_modules/.pnpm` is hardlinked into pnpm's content-addressed
+  store; those entries carry shared-hardlink membership and no physical
+  charge, so no view adds a project's copy to the store's own total.
+- **Identification never runs your build.** No `npm`, `gradle`, `mvn` or
+  `cargo` subprocess, no JavaScript config loaded, no Gradle script or
+  Maven plugin evaluated -- each of those executes code from whatever
+  repository is on disk. Where the answer is only available that way,
+  the row is an explicit residual with the reason attached, rather than
+  a silent omission.
+- **An unchanged build container now costs nothing to re-report**, and a
+  stale one is no longer replayed forever. Reuse is gated on the same
+  trusted FSEvents coverage the agent containers use. The Cargo
+  consumer previously reused when the replay's change list happened to
+  be empty, which is not the same claim as "nothing changed since your
+  rows were written" when the window cannot say when it opened; that
+  case now re-identifies.
+- Docs: `docs/build-artifacts.md` (new -- the checked capability matrix,
+  per-ecosystem layouts, attribution limits and origin evidence),
+  `docs/architecture.md`, `docs/usage.md`, and a new
+  `skills/swamp/references/build-artifacts.md`.
 
 ### Repairs after review 2, part 4
 

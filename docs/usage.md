@@ -427,7 +427,30 @@ swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
 ```
 
-Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs are inspection-only.
+Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals.
+
+`--view builds` now ends with a per-container breakdown for every build
+container swamp could identify the interior of -- Cargo, Node, Gradle
+and Maven. Each container prints one collapsed row per role family
+(outputs, tests, intermediates, dependencies, shared store, metadata,
+residual): what the family is, what removing it would cost in that
+ecosystem's own words, then the count, the size **with its accounting
+basis stated**, and the oldest known *modification* time. Units of
+unknown age are counted separately and never rank as ancient. Nothing
+in this section is actionable: build-artifact cleanup beyond Cargo's own
+groups is not implemented, and every row says "inspection only". See
+[docs/build-artifacts.md](build-artifacts.md) for the capability matrix,
+the per-ecosystem layouts that are covered, and the attribution limits.
+
+Identification never runs `npm`, `gradle`, `mvn` or `cargo`, never loads
+a JavaScript config file, and never evaluates a Gradle build script or a
+Maven plugin. Where the answer is only available that way, the row says
+so: a `build/` subdirectory a plugin chose is an unidentified residual,
+a `package.json` that cannot be read leaves the package's identity
+unknown rather than guessed from its directory name, and a Maven
+artifact with no `_remote.repositories`, `*.lastUpdated` or
+`maven-metadata-local.xml` beside it has **unknown origin** -- swamp
+does not promise it can be downloaded again. The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs are inspection-only.
 
 Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. Opening a project in the TUI shows cleanup groups under each build profile: **Compiler caches**, **Compiled tests & examples**, and **Build-script output**, when supported members exist. Space marks a group's exact members for review; Backspace opens confirmation. Expand with → to choose Tests, Examples, or individual age-ranked members instead. Unrelated dependencies are not part of these groups. **Inspect directories** retains the physical layout as another view of the same bytes. No switch to Builds is required. The selected-row details explain cleanup recommendations and rebuilding consequences. Incremental compiler caches are suggested as a starting point if slower subsequent builds are an acceptable trade-off—not because Swamp has proved them obsolete. Compiled dependencies remain a folded aggregate without selective dependency cleanup.
 

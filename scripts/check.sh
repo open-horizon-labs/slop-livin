@@ -72,6 +72,8 @@ for t in \
   core/tests/agent_container_seams \
   core/tests/unit_root_event_cursors \
   core/tests/fsevents_incremental \
+  core/tests/build_adapter_contract \
+  core/tests/build_adapter_cost \
   tui/tests/scope_preserving_refresh \
   tui/tests/reviewer_counterexamples_stack2_tui \
   source-audit/tests/compile_fail \
