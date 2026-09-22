@@ -313,6 +313,9 @@ pub struct CallSite {
     /// whether a containment test is written in both directions without
     /// pinning the variable names the author happened to choose.
     pub receiver: String,
+    /// Written inside a closure handed to `thread::spawn`: it runs on
+    /// another thread, not the caller's.
+    pub in_spawn: bool,
 }
 
 struct CallVisitor<'a> {
@@ -330,6 +333,8 @@ struct CallVisitor<'a> {
     /// text after the binding, so `let x = f(); if x { .. }` is honoured
     /// while `let _owned = f();` is not.
     body_text: String,
+    /// Depth of `thread::spawn(|| ..)` closures being visited.
+    spawned: usize,
 }
 
 fn is_test_attr(attrs: &[syn::Attribute]) -> bool {
@@ -377,6 +382,7 @@ impl CallVisitor<'_> {
             conditions: self.conditions.clone(),
             args: Vec::new(),
             receiver: String::new(),
+            in_spawn: self.spawned > 0,
         });
     }
 
@@ -446,9 +452,21 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
             self.record_with_args(p.path.to_token_stream().to_string(), false, args);
         }
         // The callee's own path is not an argument; arguments are
-        // propagated values, never discarded.
+        // propagated values, never discarded. A closure handed to
+        // `thread::spawn` runs on another thread.
+        let spawns = matches!(&*c.func, syn::Expr::Path(p) if {
+            let w = self.res.resolve(&p.path.to_token_stream().to_string());
+            path_ends_with(&w, "thread::spawn")
+        });
         for a in &c.args {
+            let boundary = spawns && matches!(a, syn::Expr::Closure(_));
+            if boundary {
+                self.spawned += 1;
+            }
             self.with(Honoured::Propagated, |v| v.visit_expr(a));
+            if boundary {
+                self.spawned -= 1;
+            }
         }
         if !matches!(&*c.func, syn::Expr::Path(_)) {
             self.with(Honoured::Propagated, |v| v.visit_expr(&c.func));
@@ -601,6 +619,7 @@ pub fn calls(file: &syn::File) -> Vec<CallSite> {
         conditions: Vec::new(),
         honour: Vec::new(),
         body_text: String::new(),
+        spawned: 0,
     };
     v.visit_file(file);
     v.out
@@ -1428,6 +1447,7 @@ pub fn calls_in_fn(item: &syn::ItemFn, res: &Resolver) -> Vec<CallSite> {
         conditions: Vec::new(),
         honour: Vec::new(),
         body_text: String::new(),
+        spawned: 0,
     };
     v.visit_item_fn(item);
     let name = item.sig.ident.to_string();

@@ -83,6 +83,8 @@ pub struct PCall {
     /// The call was written inside a macro's arguments, where
     /// `syn::visit` does not go.
     pub via_macro: bool,
+    /// Written inside a closure handed to `thread::spawn`.
+    pub in_spawn: bool,
 }
 
 impl PCall {
@@ -723,6 +725,7 @@ impl Collector<'_> {
                 stmt: c.stmt,
                 conditions: c.conditions,
                 via_macro: false,
+                in_spawn: c.in_spawn,
             })
             .collect();
         let mut macros = Vec::new();
@@ -748,6 +751,7 @@ impl Collector<'_> {
                     stmt: 0,
                     conditions: Vec::new(),
                     via_macro: true,
+                    in_spawn: false,
                 });
             }
             if !resolve::KNOWN_MACROS.contains(&m.name.as_str()) {
@@ -1524,8 +1528,19 @@ impl Program {
             }
         }
         match self.methods_by_name.get(name) {
+            // Unknown receiver: every method of that name *that takes this
+            // many arguments*. `.all(|x| ..)` on an iterator is not
+            // `Ledger::all(&self)`.
             Some(ix) => Target {
-                local: ix.clone(),
+                local: ix
+                    .iter()
+                    .copied()
+                    .filter(|i| {
+                        let g = &self.funs[*i];
+                        let arity = g.params.iter().filter(|(p, _)| p != "self").count();
+                        arity == c.args.len()
+                    })
+                    .collect(),
                 abs: name.to_string(),
                 possible: true,
             },
