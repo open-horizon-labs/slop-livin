@@ -2401,18 +2401,30 @@ pub fn execute_with_trash_opts(
                 outcomes.push(outcome);
                 continue;
             }
-            // `>=`, not `>`: a rewrite in the *same second* as plan
-            // creation gives `m == created_at`, which the strict
-            // comparison read as "nothing changed". The 2026-09-22
-            // re-review's CE2 is exactly that second, and the cost of
-            // `>=` is that a plan created in the same second as the
-            // last write asks the human to propose again -- the safe
-            // direction. The member-level nanosecond fingerprint in
-            // `recheck::ReviewedMember` is the precise check; this is
-            // the cheap tree-level gate in front of it.
-            Some(m) if m >= plan.created_at => {
+            // Strictly `>`, and the same-second case is *not* this
+            // gate's job.
+            //
+            // The 2026-09-22 re-review's CE2 is a rewrite inside the
+            // same whole second as plan creation, which `>` reads as
+            // "nothing changed". The first repair made this `>=`, and
+            // that over-refuses catastrophically: `plan.created_at` is
+            // whole seconds, so an ordinary propose-then-execute on a
+            // tree written moments earlier -- the normal case --
+            // refused itself. Two existing tests caught it
+            // (`evidence_action_recheck.rs`), and a user would have
+            // caught it the first time they used the tool.
+            //
+            // The review named the alternative and it is the right one:
+            // resolve the same second where the resolution exists. Every
+            // member carries `recheck::ReviewedMember`'s nanosecond
+            // fingerprint (`mtime_ns`, `ctime_ns`, inode, len), and the
+            // recheck below compares it before anything is moved, so a
+            // same-second in-place rewrite is caught there -- precisely,
+            // rather than by refusing every plan that shares a second
+            // with its own tree.
+            Some(m) if m > plan.created_at => {
                 outcome.cause = Some(format!(
-                    "activity changed since plan: newest mtime {} >= plan {} — propose again",
+                    "activity changed since plan: newest mtime {} > plan {} — propose again",
                     m, plan.created_at
                 ));
                 outcomes.push(outcome);
