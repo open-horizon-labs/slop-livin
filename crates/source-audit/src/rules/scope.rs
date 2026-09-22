@@ -20,6 +20,8 @@ fn interpreters(p: &Program) -> HashSet<String> {
         .iter()
         .filter(|t| RAW_DETECTOR_OUTPUT.contains(&t.name.as_str()))
         .map(|t| t.rel.clone())
+        // The detectors themselves produce the raw output.
+        .chain(p.impls.iter().filter(|i| i.implements("Detector")).map(|i| i.rel.clone()))
         .collect()
 }
 
@@ -39,7 +41,10 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|t| t.kind == TypeKind::Struct)
         .flat_map(|t| t.fields.iter())
-        .filter(|(_, ty, _, _)| RAW_DETECTOR_OUTPUT.iter().any(|r| contains_token(ty, r)))
+        // A field holding detector output wholesale -- a collection of
+        // summaries or proposed locations. (A single status field inside a
+        // proposed location is only reachable through one of these.)
+        .filter(|(_, ty, _, _)| RAW_DETECTOR_OUTPUT[..2].iter().any(|r| contains_token(ty, r)) && ty.contains("Vec"))
         .map(|(n, _, _, _)| n.clone())
         .collect();
     let variants: Vec<String> = p
@@ -50,7 +55,7 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         .collect();
     // The discovery region: every module a discovery pass reaches, less
     // the interpreters themselves.
-    let region = p.reachable(&entries.iter().copied().collect::<Vec<_>>(), &HashSet::new());
+    let region = p.reachable_exact(&entries.iter().copied().collect::<Vec<_>>(), &HashSet::new());
     let region_files: HashSet<String> = region
         .iter()
         .map(|i| p.funs[*i].rel.clone())
@@ -260,12 +265,24 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
     }
     // A scopeless report entry: a public function of the report module
     // that takes a bare path and no scope.
+    // A scopeless entry: a public function of the report module that
+    // takes a bare root (one path, not a list) and no scope -- unless it
+    // only loads a stored report back (reads a file, returns the report),
+    // which carries whatever scope computed it.
+    let reads = p.unbounded_reads(&HashSet::new());
     let scopeless = |g: usize| {
         let f = &p.funs[g];
+        let bare_root = f.params.iter().any(|(_, t)| {
+            let t = t.replace(' ', "");
+            (t.ends_with("Path") || t.ends_with("PathBuf")) && !t.contains('[') && !t.contains("Vec<")
+        });
+        let opens = reads.contains(&g) || f.calls.iter().any(|c| c.is("File::open"));
+        let cache_load = f.ret.contains("Report") && opens && !p.destructive().contains(&g) && !p.traversal(&HashSet::new()).contains(&g);
         f.is_pub
             && report_files.contains(&f.rel)
-            && f.params.iter().any(|(_, t)| contains_token(t, "Path") || contains_token(t, "PathBuf"))
-            && !f.params.iter().any(|(_, t)| contains_token(t, "EffectiveScope") || t.contains("Scope"))
+            && bare_root
+            && !cache_load
+            && !f.params.iter().any(|(_, t)| t.contains("Scope"))
     };
     for (i, f) in p.funs.iter().enumerate() {
         if f.krate != "swamp_tui" {

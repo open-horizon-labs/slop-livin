@@ -192,11 +192,19 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
     }
     // Nothing outside the consumers and the registrar reaches into a
     // consumer module: a new source must not need walker changes.
+    let registrar_files: HashSet<String> = b.registrars.iter().map(|i| p.funs[*i].rel.clone()).collect();
     for (i, f) in p.funs.iter().enumerate() {
-        if b.consumer_files.contains(&f.rel) || b.registrars.contains(&i) {
+        // The bus dispatches to consumers by trait object; that is what
+        // it is for.
+        if b.consumer_files.contains(&f.rel) || registrar_files.contains(&f.rel) {
             continue;
         }
-        for g in reached(&p, i) {
+        let exact: Vec<usize> = (0..f.calls.len())
+            .filter(|ci| !p.target(i, *ci).possible)
+            .flat_map(|ci| p.target(i, ci).local.clone())
+            .chain(p.ref_targets(i).iter().copied())
+            .collect();
+        for g in exact {
             if b.consumer_files.contains(&p.funs[g].rel) && !b.consumer_files.contains(&f.rel) {
                 problems.push(format!(
                     "{} reaches into consumer module {}: stages never depend on consumers",
@@ -250,7 +258,18 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
     if report_files.is_empty() {
         problems.push("nothing runs the bus (`bus::run_report`)".into());
     }
-    // Stages: what the consumers call, outside the bus and the consumers.
+    // Stages: what the consumers call, outside the bus and the consumers,
+    // that does observation work -- walks, reads a store, writes history
+    // or runs a process. `entities::now()` is a consumer's helper, not a
+    // stage.
+    let none = HashSet::new();
+    let heavy: HashSet<usize> = p
+        .traversal(&none)
+        .iter()
+        .chain(p.destructive().iter())
+        .chain(p.unbounded_reads(&none).iter())
+        .copied()
+        .collect();
     let mut stages: HashSet<usize> = HashSet::new();
     for (i, f) in p.funs.iter().enumerate() {
         if !(b.consumer_files.contains(&f.rel) && f.trait_.is_some()) {
@@ -258,13 +277,17 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
         }
         for g in reached(&p, i) {
             let gf = &p.funs[g];
-            if !b.consumer_files.contains(&gf.rel) && !gf.module.starts_with("bus") && !report_files.contains(&gf.rel) {
+            if !b.consumer_files.contains(&gf.rel) && !gf.module.starts_with("bus") && !report_files.contains(&gf.rel) && heavy.contains(&g) {
                 stages.insert(g);
             }
         }
     }
+    // A stage the report module itself defines (a consumer calls it) may
+    // call other stages: it *is* the bus's work.
+    let consumer_methods: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| b.consumer_files.contains(&f.rel) && f.trait_.is_some()).map(|(i, _)| i).collect();
+    let bus_work = p.reachable_exact(&consumer_methods, &HashSet::new());
     for (i, f) in p.funs.iter().enumerate() {
-        if !report_files.contains(&f.rel) {
+        if !report_files.contains(&f.rel) || bus_work.contains(&i) {
             continue;
         }
         for (ci, c) in f.calls.iter().enumerate() {

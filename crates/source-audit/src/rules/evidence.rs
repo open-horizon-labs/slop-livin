@@ -35,6 +35,11 @@ const NEGATED_VERDICTS: &[&str] = &[
 ];
 
 fn verdict_in(lit: &str) -> Option<&'static str> {
+    // A snake_case identifier (a column or field name) is a name, not
+    // prose a person reads.
+    if lit.contains('_') && !lit.contains(' ') && lit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
     let mut l = lit.to_ascii_lowercase();
     for n in NEGATED_VERDICTS {
         l = l.replace(n, "");
@@ -183,11 +188,36 @@ fn empty_init(e: &str) -> bool {
 pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
-    // A delivered surface: every public struct the core crate serializes.
+    // The delivered report graph: every local type reachable, through
+    // field types, from what the pipeline returns (the bus's report and
+    // the scope observation). The modules that define those types are the
+    // delivery modules, and every public serialized struct in one of them
+    // is a delivered surface -- a new row type beside the report's own is
+    // promised the moment it is written there.
+    let mut graph: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = p
+        .defs("bus::run_report")
+        .into_iter()
+        .chain(p.defs("report::observe_scope"))
+        .flat_map(|i| idents(&p.funs[i].ret))
+        .collect();
+    while let Some(n) = queue.pop() {
+        let Some(t) = p.types.iter().find(|t| t.name == n && t.krate == "swamp_core") else { continue };
+        if !graph.insert(n.clone()) {
+            continue;
+        }
+        for (_, ty, _, _) in &t.fields {
+            queue.extend(idents(ty));
+        }
+    }
+    let delivery_modules: HashSet<String> = p.types.iter().filter(|t| graph.contains(&t.name)).map(|t| t.rel.clone()).collect();
+    if delivery_modules.is_empty() {
+        problems.push("the pipeline's report types are not found: nothing to audit as delivered".into());
+    }
     let surfaces: Vec<&crate::program::TypeDecl> = p
         .types
         .iter()
-        .filter(|t| t.krate == "swamp_core" && t.kind == TypeKind::Struct && t.is_pub && t.derives("Serialize"))
+        .filter(|t| t.krate == "swamp_core" && t.kind == TypeKind::Struct && t.is_pub && t.derives("Serialize") && delivery_modules.contains(&t.rel))
         .collect();
     for t in surfaces {
         for (field, _ty, is_pub, attrs) in &t.fields {
@@ -237,6 +267,14 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
     verdict("what is computed for a delivered surface is delivered", problems)
 }
 
+/// The identifiers in a type's token text.
+fn idents(ty: &str) -> Vec<String> {
+    ty.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .map(str::to_string)
+        .collect()
+}
+
 // ---------------------------------------------------------------------
 // no_dead_public_evidence_api
 // ---------------------------------------------------------------------
@@ -254,7 +292,9 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
         .map(|t| t.name.clone())
         .chain(["OccupancyState".to_string()])
         .collect();
-    let speaks = |f: &crate::program::Fun| vocab.iter().any(|v| contains_token(&f.ret, v) || f.params.iter().any(|(_, t)| contains_token(t, v)));
+    // Producing evidence, not consuming it: a renderer that takes
+    // evidence is a delivery surface, audited by what calls *it*.
+    let speaks = |f: &crate::program::Fun| vocab.iter().any(|v| contains_token(&f.ret, v));
     let modules: HashSet<String> = p
         .funs
         .iter()

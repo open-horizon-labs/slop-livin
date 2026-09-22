@@ -96,7 +96,7 @@ fn rechecks_of(p: &Program, g: usize, memo: &mut HashMap<usize, Have>, seen: &mu
 /// by rename, an expired delta, its own lock file. The whole-file skips
 /// of `recheck.rs`, `store.rs` and `growth.rs` are gone: re-review 3 put
 /// a bare `remove_dir_all(path)` in `growth.rs`.
-fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) -> bool {
+pub(crate) fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) -> bool {
     if depth > 8 {
         return true;
     }
@@ -104,15 +104,13 @@ fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) -> bool {
     if text.contains('"') || text.contains("format !") {
         return false;
     }
-    // A call to a local path helper that names a literal, or a path this
-    // function created.
+    // A call to a local path helper that constructs a path from a name
+    // it chose (directly or through the helpers it calls).
     for c in &f.calls {
-        if !c.method && text.contains(&format!("{} (", c.written.replace("::", " :: "))) {
+        if !c.method && text.contains(&format!("{} (", crate::program::spaced(&c.written))) {
             let local = p.resolve_path(f, &c.path).local;
-            if local
-                .iter()
-                .any(|g| !p.funs[*g].literals.is_empty() || p.funs[*g].body.contains("format !"))
-            {
+            let helpers = p.reachable_exact(&local, &HashSet::new());
+            if helpers.iter().any(|g| names_a_path(&p.funs[*g])) {
                 return false;
             }
         }
@@ -143,6 +141,16 @@ fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) -> bool {
         // trace: treat it as handed in.
         None => true,
     }
+}
+
+/// A function that builds a path from a name it chose: a literal joined,
+/// formatted, given as an extension, or used to select directory entries.
+fn names_a_path(f: &Fun) -> bool {
+    let b = &f.body;
+    ["join (\"", "with_extension (\"", "format !", "ends_with (\"", "starts_with (\"", "extension () == Some (\""]
+        .iter()
+        .any(|s| b.contains(s))
+        || b.contains("== \"") && b.contains("extension")
 }
 
 /// `self.field`: owned when every struct literal of `Self` in the
@@ -334,13 +342,17 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
     // taking the list that reaches a write).
     let list_type: Vec<String> = loaders.iter().map(|i| p.funs[*i].ret.replace(' ', "")).collect();
     let mutating = p.mutating();
+    // A persister: something a function that loads the list calls, in the
+    // list's own module, handing it a path list, that writes.
+    let load_callers: HashSet<usize> = loaders.iter().flat_map(|l| p.callers(*l)).collect();
     let persisters: HashSet<usize> = p
         .funs
         .iter()
         .enumerate()
         .filter(|(i, f)| {
             loaders.iter().any(|l| p.funs[*l].rel == f.rel)
-                && f.params.iter().any(|(_, t)| t.replace(' ', "").contains("[PathBuf]"))
+                && load_callers.iter().any(|c| p.callees(*c).contains(i))
+                && f.params.iter().any(|(_, t)| t.replace(' ', "").contains("PathBuf]"))
                 && mutating.contains(i)
         })
         .map(|(i, _)| i)
@@ -396,7 +408,7 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
             if !p.target(i, ci).local.iter().any(|g| loaders.contains(g)) {
                 continue;
             }
-            let spelled = format!("{} (", c.written.replace("::", " :: "));
+            let spelled = format!("{} (", crate::program::spaced(&c.written));
             for m in &f.calls {
                 if m.method && discards_error(&m.path) && m.receiver.contains(spelled.trim_end_matches(" (")) {
                     problems.push(format!(

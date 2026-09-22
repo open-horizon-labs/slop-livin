@@ -18,7 +18,7 @@
 //! never saw).
 
 use super::{load, verdict};
-use crate::program::{PCall, Program, spawn_call, traversal_call};
+use crate::program::{PCall, spawn_call, traversal_call};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -45,7 +45,15 @@ pub fn tui_actions_off_event_thread(root: &Path) -> Result<(), String> {
     let mut problems = Vec::new();
     // Core code that blocks: subprocesses, sleeps, waits, and traversal,
     // transitively.
-    let core_blocking = p.closure("tui_blocking", &HashSet::new(), |_, c| {
+    // The one-level, capped `locations::shallow_list` is the bounded
+    // listing the guardrails sanction everywhere; it is not a scan.
+    let mut bounded: HashSet<usize> = HashSet::new();
+    for i in super::anchors(&p, &["locations::shallow_list"], &mut problems) {
+        if super::is_bounded_by(&p.funs[i], "SHALLOW_LIST_CAP") {
+            bounded.insert(i);
+        }
+    }
+    let core_blocking = p.closure("tui_blocking", &bounded, |_, c| {
         (spawn_call(c) || c.is("thread::sleep") || traversal_call(c) || (c.method && ["recv", "recv_timeout", "wait_with_output"].contains(&c.path.as_str())))
             && !c.in_spawn
     });

@@ -228,6 +228,12 @@ impl Fun {
     }
 }
 
+/// A written path in `syn`'s spaced token rendering (`a :: b`), however
+/// it was written.
+pub fn spaced(written: &str) -> String {
+    written.replace(' ', "").replace("::", " :: ")
+}
+
 /// Whether `needle` occurs in `hay` as a whole token sequence (not as
 /// part of a longer identifier on either side).
 pub fn contains_token(hay: &str, needle: &str) -> bool {
@@ -377,6 +383,8 @@ pub struct Program {
     free_by_name: HashMap<String, Vec<usize>>,
     by_name: HashMap<String, Vec<usize>>,
     reexport_index: HashMap<String, String>,
+    /// Every module path (`swamp_core::agents::claude_code`).
+    modules: HashSet<String>,
     consts: HashMap<String, Vec<usize>>,
     /// `targets[f][c]`: where `funs[f].calls[c]` can land.
     targets: Vec<Vec<Target>>,
@@ -461,6 +469,7 @@ impl Program {
             free_by_name: HashMap::new(),
             by_name: HashMap::new(),
             reexport_index: HashMap::new(),
+            modules: HashSet::new(),
             consts: HashMap::new(),
             targets: Vec::new(),
             ref_targets: Vec::new(),
@@ -489,6 +498,27 @@ impl Program {
                 p.consts.entry(d.name.clone()).or_default().push(i);
             }
         }
+        for f in &p.funs {
+            let mut m = f.krate.clone();
+            p.modules.insert(m.clone());
+            for seg in f.module_segments() {
+                m = format!("{m}::{seg}");
+                p.modules.insert(m.clone());
+            }
+        }
+        for t in &p.types {
+            p.modules.insert(qualify(&t.krate, &t.module));
+        }
+        // A `use` path in 2018 Rust is relative to the module it is written
+        // in: `pub use report::report;` in `lib.rs` names the child
+        // module's function, `swamp_core::report::report`.
+        for r in p.reexports.iter_mut() {
+            let first = r.target.split("::").next().unwrap_or("").to_string();
+            let child = format!("{}::{first}", r.module);
+            if !r.target.starts_with("swamp_core::") && !r.target.starts_with("swamp_tui::") && !r.target.starts_with("swamp::") && p.modules.contains(&child) {
+                r.target = format!("{}::{}", r.module, r.target);
+            }
+        }
         for r in &p.reexports {
             p.reexport_index
                 .insert(format!("{}::{}", r.module, r.alias), r.target.clone());
@@ -498,9 +528,18 @@ impl Program {
         let mut edges = Vec::with_capacity(p.funs.len());
         for f in &p.funs {
             let ts: Vec<Target> = f.calls.iter().map(|c| p.resolve_call(f, c)).collect();
+            // A bare name that is a parameter or a local binding is a
+            // value, not a function.
+            let local_names: HashSet<String> = f
+                .params
+                .iter()
+                .map(|(n, _)| resolve::root_ident(n))
+                .chain(f.bindings.iter().map(|b| b.name.clone()))
+                .collect();
             let rs: Vec<usize> = f
                 .refs
                 .iter()
+                .filter(|r| r.contains("::") || !local_names.contains(r.as_str()))
                 .flat_map(|r| p.resolve_path(f, r).local)
                 .collect();
             let mut e: Vec<usize> = ts.iter().flat_map(|t| t.local.iter().copied()).collect();
@@ -629,6 +668,12 @@ pub fn absolute(path: &str, krate: &str, module: &str, self_ty: Option<&str>) ->
     }
 }
 
+/// Macros whose literal pieces become one string.
+const STRING_MACROS: &[&str] = &[
+    "concat", "format", "format_args", "write", "writeln", "print", "println", "eprint",
+    "eprintln", "panic", "bail", "anyhow", "ensure",
+];
+
 /// Converts an `impl` method into the free-function shape the
 /// per-function extractors take.
 fn as_item_fn(
@@ -681,7 +726,7 @@ impl Collector<'_> {
                 extra.push_str(l);
                 extra.push_str("\" ");
             }
-            if m.literals.len() > 1 {
+            if m.literals.len() > 1 && STRING_MACROS.contains(&m.name.as_str()) {
                 extra.push_str(" \"");
                 extra.push_str(&m.literals.concat());
                 extra.push_str("\" ");
@@ -758,7 +803,9 @@ impl Collector<'_> {
                 unknown_macros.push(m.name.clone());
             }
             literals.extend(m.literals.iter().cloned());
-            if m.literals.len() > 1 {
+            // A string-building macro produces one string from its
+            // pieces; a `vec![..]` of names does not.
+            if m.literals.len() > 1 && STRING_MACROS.contains(&m.name.as_str()) {
                 literals.push(m.literals.concat());
             }
             macros.push(MacroUse {
@@ -1125,7 +1172,27 @@ impl<'ast> Visit<'ast> for RefVisitor<'_> {
         if let syn::Pat::Ident(id) = pat {
             let ty = annotated.or_else(|| {
                 let init = l.init.as_ref()?;
-                match &*init.expr {
+                // Look through `?`, `.unwrap()`, `.expect(..)`,
+                // `.with_context(..)` and friends to the constructor.
+                let mut e: &syn::Expr = &init.expr;
+                loop {
+                    match e {
+                        syn::Expr::Try(t) => e = &t.expr,
+                        syn::Expr::Paren(p) => e = &p.expr,
+                        syn::Expr::Reference(r) => e = &r.expr,
+                        syn::Expr::MethodCall(m)
+                            if [
+                                "unwrap", "expect", "with_context", "context", "map_err",
+                                "unwrap_or_default", "unwrap_or_else", "clone",
+                            ]
+                            .contains(&m.method.to_string().as_str()) =>
+                        {
+                            e = &m.receiver
+                        }
+                        _ => break,
+                    }
+                }
+                match e {
                     syn::Expr::Call(c) => match &*c.func {
                         syn::Expr::Path(p) if p.path.segments.len() >= 2 => {
                             let segs: Vec<String> = p
@@ -1333,10 +1400,13 @@ impl Program {
             for n in (1..=segs.len()).rev() {
                 let prefix = segs[..n].join("::");
                 if let Some(t) = self.reexport_index.get(&prefix) {
-                    if *t == prefix {
-                        break;
-                    }
                     let rest = &segs[n..];
+                    // A re-exported *item* only replaces the whole path; a
+                    // prefix is replaced only when the target is a module
+                    // (a function and a module can share a path).
+                    if *t == prefix || (!rest.is_empty() && !self.modules.contains(t)) {
+                        continue;
+                    }
                     cur = if rest.is_empty() {
                         t.clone()
                     } else {
@@ -1359,21 +1429,23 @@ impl Program {
         if known {
             return vec![abs];
         }
-        let mut out = Vec::new();
-        let segs = f.module_segments();
-        for n in (0..=segs.len()).rev() {
-            let mut p = vec![f.krate.as_str()];
-            p.extend(&segs[..n]);
-            out.push(format!("{}::{abs}", p.join("::")));
-        }
-        out.push(abs);
-        out
+        // A relative path names something in scope in the writing module
+        // (a child module, a sibling item); it never climbs to an
+        // ancestor without `super::`.
+        vec![format!("{}::{abs}", qualify(&f.krate, &f.module)), abs]
     }
 
     /// Where a path, written in `f`, can land.
     pub fn resolve_path(&self, f: &Fun, path: &str) -> Target {
         let written = path.replace(' ', "");
         for cand in self.candidates(f, &written) {
+            if let Some(ix) = self.free_by_path.get(&cand) {
+                return Target {
+                    local: ix.clone(),
+                    abs: cand,
+                    possible: false,
+                };
+            }
             let c = self.follow(&cand);
             if let Some(ix) = self.free_by_path.get(&c) {
                 return Target {
@@ -1824,6 +1896,32 @@ impl Program {
             for g in &self.edges[f] {
                 if set.insert(*g) {
                     queue.push_back(*g);
+                }
+            }
+        }
+        set
+    }
+
+    /// [`Program::reachable`] through exactly resolved calls and value
+    /// references only: no "possibly this method" edges. What a region
+    /// *is* (the report path, the discovery region) is decided by what
+    /// is certainly called, or one `.name()` would pull in every
+    /// definition of `name`.
+    pub fn reachable_exact(&self, entries: &[usize], stop: &HashSet<usize>) -> HashSet<usize> {
+        let mut set: HashSet<usize> = entries.iter().copied().collect();
+        let mut queue: VecDeque<usize> = entries.iter().copied().collect();
+        while let Some(f) = queue.pop_front() {
+            if stop.contains(&f) {
+                continue;
+            }
+            let next = self.targets[f]
+                .iter()
+                .filter(|t| !t.possible)
+                .flat_map(|t| t.local.iter().copied())
+                .chain(self.ref_targets[f].iter().copied());
+            for g in next.collect::<Vec<_>>() {
+                if set.insert(g) {
+                    queue.push_back(g);
                 }
             }
         }

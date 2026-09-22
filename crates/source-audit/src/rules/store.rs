@@ -28,8 +28,9 @@ pub const STORE_CONTROL_FILES: &[&str] = &[
     "report.json.zst",
 ];
 
-/// Control files whose name carries an id, with the placeholder in place.
-pub const STORE_CONTROL_PATTERNS: &[&str] = &["plans/{}.json", "{}.json.zst"];
+/// Control files whose name carries an id, with the placeholder in place,
+/// and the directory literal the same function must name beside it.
+pub const STORE_CONTROL_PATTERNS: &[(&str, &str)] = &[("plans", "{}.json"), ("", "{}.json.zst")];
 
 /// `(file, fn, justification)`: every function allowed to persist JSON.
 /// Each names a control or recovery artifact; none names per-row data.
@@ -157,25 +158,51 @@ pub fn json_persistence_is_allowlisted(root: &Path) -> Result<(), String> {
     verdict("JSON persistence is allow-listed", problems)
 }
 
-/// Every `*.json`/`*.jsonl`/`*.json.zst` file name a function can write:
-/// its own literals, the constants it names, and the literals of the
-/// local path helpers it calls.
-fn json_names(p: &Program, i: usize) -> Vec<String> {
+/// The literals that name the path a write goes to: in its path argument,
+/// in the bindings that argument derives from, and in the local path
+/// helpers either of them calls.
+fn written_names(p: &Program, i: usize, arg: &str) -> Vec<String> {
     let f = &p.funs[i];
-    let mut lits: Vec<String> = f.literals.clone();
-    for d in p.consts_reached(f) {
-        lits.extend(d.literals.iter().cloned());
+    let mut texts: Vec<String> = vec![arg.to_string()];
+    let roots = super::walk::taint_back(f, arg);
+    for b in f.bindings.iter().filter(|b| roots.contains(&b.name)) {
+        texts.push(b.from.clone());
     }
-    for g in p.callees(i) {
-        let gf = &p.funs[*g];
-        if contains_token(&gf.ret, "PathBuf") {
-            lits.extend(gf.literals.iter().cloned());
+    let mut lits: Vec<String> = Vec::new();
+    for t in &texts {
+        lits.extend(quoted(t));
+        for c in &f.calls {
+            if !c.method && t.contains(&format!("{} (", crate::program::spaced(&c.written))) {
+                let helpers = p.reachable_exact(&p.resolve_path(f, &c.path).local, &HashSet::new());
+                for g in helpers {
+                    if contains_token(&p.funs[g].ret, "PathBuf") {
+                        lits.extend(p.funs[g].literals.iter().cloned());
+                    }
+                }
+            }
+        }
+        for d in p.consts_reached(&Fun { body: t.clone(), ..(**f).clone() }) {
+            lits.extend(d.literals.iter().cloned());
         }
     }
-    lits.into_iter()
-        .map(|l| resolve::strip_placeholders(&l))
-        .filter(|l| (l.ends_with(".json") || l.ends_with(".jsonl") || l.ends_with(".json.zst")) && !l.contains(' ') && !l.starts_with('.'))
-        .collect()
+    lits.into_iter().map(|l| resolve::strip_placeholders(&l)).collect()
+}
+
+/// String literals inside token text.
+fn quoted(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(a) = rest.find('"') {
+        let tail = &rest[a + 1..];
+        let Some(b) = tail.find('"') else { break };
+        out.push(tail[..b].to_string());
+        rest = &tail[b + 1..];
+    }
+    out
+}
+
+fn is_json_name(l: &str) -> bool {
+    (l.ends_with(".json") || l.ends_with(".jsonl") || l.ends_with(".json.zst")) && !l.contains(' ') && !l.starts_with('.')
 }
 
 pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String> {
@@ -183,25 +210,31 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
     let mut problems = Vec::new();
     let writes = p.destructive();
     for (i, f) in p.funs.iter().enumerate() {
-        // Only a function that writes can create a sidecar; an adapter
-        // naming another tool's `settings.json` is reading it.
-        let writes_here = f.calls.iter().enumerate().any(|(ci, c)| {
-            (program::destructive_call(f, c) && !program::spawn_call(c))
-                || (!p.target(i, ci).possible && p.target(i, ci).local.iter().any(|g| writes.contains(g)))
-        });
-        if !writes_here {
-            continue;
-        }
-        for name in json_names(&p, i) {
-            let file = name.rsplit('/').next().unwrap_or(&name);
-            if STORE_CONTROL_FILES.contains(&file) || STORE_CONTROL_PATTERNS.iter().any(|pat| name.ends_with(pat) || name == *pat) {
+        for (ci, c) in f.calls.iter().enumerate() {
+            // A write, and the path it writes: a primitive's first
+            // argument, or the first argument handed to a local writer.
+            let primitive = program::destructive_call(f, c) && !program::spawn_call(c);
+            let writer = !p.target(i, ci).possible && p.target(i, ci).local.iter().any(|g| writes.contains(g));
+            if !(primitive || writer) || c.method {
                 continue;
             }
-            problems.push(format!(
-                "{} writes the JSON file {name:?}, which is not one of the small control files: \
-                 per-unit/per-row data belongs in the Parquet current + reverse-delta store",
-                f.display()
-            ));
+            let Some(arg) = c.args.first() else { continue };
+            let names = written_names(&p, i, arg);
+            for name in names.iter().filter(|n| is_json_name(n)) {
+                let file = name.rsplit('/').next().unwrap_or(name);
+                let pattern_ok = STORE_CONTROL_PATTERNS.iter().any(|(dir, pat)| {
+                    name.ends_with(pat) && (dir.is_empty() || names.iter().any(|n| n == dir || n.ends_with(&format!("/{dir}")) || n.starts_with(&format!("{dir}/"))))
+                });
+                if STORE_CONTROL_FILES.contains(&file) || pattern_ok {
+                    continue;
+                }
+                problems.push(format!(
+                    "{} writes the JSON file {name:?} (`{}`), which is not one of the small control \
+                     files: per-unit/per-row data belongs in the Parquet current + reverse-delta store",
+                    f.display(),
+                    c.written
+                ));
+            }
         }
     }
     verdict("store data is Parquet, never JSON sidecars", problems)
