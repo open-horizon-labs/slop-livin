@@ -923,7 +923,7 @@ pub fn render_view_builds(report: &Report, only_project: Option<&str>) -> String
 /// containers prints nothing here, and a family with no members prints
 /// no line.
 fn render_build_containers(report: &Report, only_project: Option<&str>) -> String {
-    use crate::build_adapters::summarize_families;
+    use crate::build_adapters::summarize_container;
     let mut out = String::new();
     if report.nested_artifacts.is_empty() {
         return out;
@@ -966,8 +966,10 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
         };
         let owned: Vec<crate::artifact::NestedArtifact> =
             units.iter().map(|u| (*u).clone()).collect();
-        let families = summarize_families(&root.path, &owned);
-        if families.is_empty() {
+        let summary = summarize_container(&root.path, &owned);
+        let residual =
+            summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
+        if summary.families.is_empty() && summary.unsupported_count == 0 && residual == 0 {
             continue;
         }
         let mut section = String::new();
@@ -982,12 +984,14 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
         for limit in &root.coverage.limits {
             let _ = writeln!(section, "  limit: {limit}");
         }
-        for f in families {
-            let consequence = owned
-                .iter()
-                .find(|u| u.role.family() == f.family && u.consequence.is_some())
-                .and_then(|u| u.consequence.clone())
-                .unwrap_or_else(|| "consequence not established".to_string());
+        for f in &summary.families {
+            // Guidance and consequence first: that is the question. The
+            // numbers follow on their own line.
+            let consequence = match (&f.consequence, f.other_consequences) {
+                (Some(c), 0) => c.clone(),
+                (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
+                (None, _) => "consequence not established".to_string(),
+            };
             let size = match f.basis {
                 crate::artifact::AccountingBasis::Unknown => {
                     "size mixed-basis (not summed)".to_string()
@@ -1003,16 +1007,44 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
             } else {
                 String::new()
             };
-            let _ = writeln!(section, "  {:<14} {consequence}", f.family.label());
             let _ = writeln!(
                 section,
-                "  {:<14} {} item(s), {size}, {oldest}{unknowns}{}",
+                "  {:<24} {} -- {consequence}",
+                f.family.title(),
+                f.recommendation
+            );
+            let _ = writeln!(
+                section,
+                "  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; inspection only",
                 "",
                 f.count,
                 if f.complete {
                     ""
                 } else {
                     " (measurement incomplete)"
+                }
+            );
+        }
+        if summary.unsupported_count > 0 || residual > 0 {
+            let _ = writeln!(
+                section,
+                "  {:<24} {} -- {} unrecognised entr{}, {}",
+                crate::artifact::RoleFamily::Residual.title(),
+                crate::build_adapters::family_guidance(crate::artifact::RoleFamily::Residual),
+                summary.unsupported_count,
+                if summary.unsupported_count == 1 { "y" } else { "ies" },
+                match summary.unaccounted_bytes {
+                    Some(b) => format!(
+                        "{} {} in total, {} of it claimed by no unit",
+                        human_bytes(residual),
+                        root.basis.label(),
+                        human_bytes(b)
+                    ),
+                    None => format!(
+                        "{} {} unrecognised; the remainder of the container was not reconciled",
+                        human_bytes(residual),
+                        root.basis.label()
+                    ),
                 }
             );
         }

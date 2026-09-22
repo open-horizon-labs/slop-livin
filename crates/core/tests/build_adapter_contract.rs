@@ -470,6 +470,15 @@ fn the_builds_view_leads_with_the_consequence_and_states_its_basis() {
         text.contains("reinstall with `npm ci`"),
         "the consequence is in the view, not only in the JSON: {text}"
     );
+    let line = text
+        .lines()
+        .find(|l| l.contains("reinstall with `npm ci`"))
+        .unwrap();
+    assert!(
+        line.trim_start().starts_with("Installed dependencies")
+            && line.find("Review: reinstall from registry") < line.find("reinstall with `npm ci`"),
+        "family, then guidance, then the adapter's consequence -- the numbers come after: {line}"
+    );
     assert!(
         text.contains("allocated"),
         "every family row states its accounting basis: {text}"

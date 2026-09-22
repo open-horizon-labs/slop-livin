@@ -733,6 +733,10 @@ pub struct ContainerSummary {
 
 /// Review guidance for a family, from the family alone.
 ///
+/// Each phrase is at most 32 characters: it is what the 80-column
+/// frame's advice column shows whole, and the count and age that follow
+/// are what a narrow terminal gives up first.
+///
 /// #64's contract: age + size + removal consequence is enough to suggest
 /// a review, and advice is derived from facts rather than persisted as a
 /// verdict. This is the family half of that; the view adds the age and
@@ -740,12 +744,12 @@ pub struct ContainerSummary {
 pub fn family_guidance(family: RoleFamily) -> &'static str {
     match family {
         RoleFamily::Intermediates => "Start here: slower next build",
-        RoleFamily::Outputs => "Review: a build regenerates these",
-        RoleFamily::Tests => "Review: a test run regenerates these",
-        RoleFamily::Dependencies => "Review: reinstall needs the registry",
-        RoleFamily::SharedStore => "Shared: other projects may link these",
+        RoleFamily::Outputs => "Review: a build regenerates",
+        RoleFamily::Tests => "Review: a test run regenerates",
+        RoleFamily::Dependencies => "Review: reinstall from registry",
+        RoleFamily::SharedStore => "Shared: other projects may link",
         RoleFamily::Metadata => "Lower priority: tool bookkeeping",
-        RoleFamily::Container => "Container: see the groups inside",
+        RoleFamily::Container => "Container: see groups inside",
         RoleFamily::Residual | RoleFamily::Unknown => "Inspect: not identified",
     }
 }
@@ -1179,6 +1183,18 @@ mod tests {
              of them"
         );
         assert_eq!(f.recommendation, family_guidance(RoleFamily::Intermediates));
+    }
+
+    #[test]
+    fn family_guidance_fits_the_narrow_advice_column() {
+        for f in RoleFamily::ALL.iter().chain([&RoleFamily::Container]) {
+            assert!(
+                family_guidance(*f).chars().count() <= 32,
+                "{:?}: `{}` is truncated at 80 columns",
+                f,
+                family_guidance(*f)
+            );
+        }
     }
 
     #[test]
