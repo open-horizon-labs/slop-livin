@@ -296,7 +296,24 @@ impl<'a> BuildCtx<'a> {
             return None;
         }
         let key = container.scope();
-        let stored_at = self.cache.entries.borrow().get(&key).map(|(at, _)| *at)?;
+        let entries = self.cache.entries.borrow();
+        let (stored_at, units) = entries.get(&key)?;
+        let stored_at = *stored_at;
+        // The rows must also have been written by the adapter that
+        // claims this container *now*. Which adapter claims a directory
+        // is decided by marker files beside it (`settings.gradle`
+        // appearing next to a Node project's `build/`), and those live
+        // outside the container, so no event under it says the claim
+        // changed. Replaying the old adapter's rows would keep calling a
+        // Gradle build directory a Node output -- forever, if nothing
+        // inside it is ever touched.
+        if !units
+            .iter()
+            .all(|u| u.adapter.as_deref() == Some(container.adapter_id))
+        {
+            return None;
+        }
+        drop(entries);
         // The whole gate, in one condition: a trusted window that
         // covers this container, opened no later than the rows were
         // written, reporting no event under it.
@@ -1009,6 +1026,26 @@ mod tests {
 
     fn supported(c: &BuildContainer, role: ArtifactRole, path: PathBuf) -> NestedUnitBuilder {
         NestedUnitBuilder::new(c, role, path).supported_with_reason("fixture layout")
+    }
+
+    #[test]
+    fn rows_written_by_another_adapter_are_never_replayed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = BuildContainer::project("node", tmp.path().join("build"), tmp.path().into());
+        let gradle = BuildContainer::project("gradle", tmp.path().join("build"), tmp.path().into());
+        let prior = vec![
+            NestedUnitBuilder::new(&node, ArtifactRole::Output, tmp.path().join("build")).build(),
+        ];
+        let cache = ContainerCache::from_previous(prior, 100);
+        let folded = FoldedIndex::default();
+        let trusted = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 100);
+        let ctx = BuildCtx::new(200, &folded, &trusted, &cache);
+        assert!(ctx.can_reuse(&node));
+        assert!(
+            !ctx.can_reuse(&gradle),
+            "the claim moved to another adapter through a marker outside the container; no event \
+             under the container can say so, so the old adapter's rows are not evidence"
+        );
     }
 
     #[test]

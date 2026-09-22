@@ -1007,6 +1007,34 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         return;
     }
     let Ok(entries) = fs::read_dir(&path) else {
+        // The unit is still sized best-effort, but the directory that
+        // could not be listed is recorded as an *incomplete* row rather
+        // than silently absent: without it every ancestor's rollup said
+        // `complete: true` over bytes it never saw, and a `node_modules`
+        // with one unreadable package read as a complete, smaller tree
+        // (#65: partial/unreadable containers are incomplete coverage,
+        // never a disappearance or a quiet shrink).
+        if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
+            let rel_path = rel_path_string(root, &path);
+            let parent_rel_path = parent_rel_path_of(&rel_path);
+            shared.dirs.lock().unwrap().insert(
+                (worktree_id.clone(), rel_path.clone()),
+                DirRollup {
+                    worktree_id: worktree_id.clone(),
+                    track: None,
+                    rel_path,
+                    parent_rel_path,
+                    allocated_total: 0,
+                    own_allocated: 0,
+                    file_count: 0,
+                    entry_count: 0,
+                    symlink_count: 0,
+                    mod_time_min: 0,
+                    complete: false,
+                    growth_bytes: None,
+                },
+            );
+        }
         finish_size_job(group, shared);
         return;
     };
