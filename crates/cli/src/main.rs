@@ -1177,6 +1177,7 @@ fn report_json_envelope(
     scope_coverage: &[swamp_core::coverage::RootCoverage],
     external_units: &[swamp_core::external::ExternalUnit],
     agent_units: &[swamp_core::agents::AgentUnit],
+    store_interiors: &[swamp_core::artifact::NestedArtifact],
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -1203,6 +1204,16 @@ fn report_json_envelope(
             View::External => serde_json::json!({
                 "units": external_units,
                 "total_bytes": swamp_core::external::total_bytes(external_units),
+                // Each machine-wide build store's identified interior,
+                // keyed by the external unit's path, in the shape
+                // `--view builds --json` uses for a project container.
+                "interiors": external_units
+                    .iter()
+                    .filter_map(|u| {
+                        swamp_core::agent_json::interior_json(&u.path, store_interiors)
+                            .map(|i| (u.path.display().to_string(), i))
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
             }),
             View::Agents => {
                 let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
@@ -1231,6 +1242,9 @@ fn report_json_envelope(
         }
         if !scope_coverage.is_empty() {
             envelope["scope_coverage"] = serde_json::json!(scope_coverage);
+        }
+        if v == View::Docker && project.is_none() {
+            envelope["buildkit"] = swamp_core::agent_json::buildkit_payload(&rr);
         }
         if v == View::Grown {
             envelope["coverage"] = serde_json::json!({
@@ -1458,9 +1472,9 @@ fn main() -> Result<()> {
                 external: view == Some(View::External),
                 agents: view == Some(View::Agents) || project.is_some(),
             };
-            let (r, external_units, agent_units) =
+            let (r, external_units, agent_units, store_interiors) =
                 if want == swamp_core::report::ObservationParts::WALK_ONLY {
-                    (r, Vec::new(), Vec::new())
+                    (r, Vec::new(), Vec::new(), Vec::new())
                 } else {
                     let observation = observe_for_cli(
                         &resolve_scope(&[])?,
@@ -1477,6 +1491,7 @@ fn main() -> Result<()> {
                         observation.merged,
                         observation.external_units,
                         observation.agent_units,
+                        observation.store_interiors,
                     )
                 };
             if !json
@@ -1515,6 +1530,7 @@ fn main() -> Result<()> {
                         &coverage,
                         &external_units,
                         &agent_units,
+                        &store_interiors,
                     )?)?
                 );
             } else if let Some(wt_path) = worktree {
@@ -1571,7 +1587,11 @@ fn main() -> Result<()> {
                     Some(View::External) => {
                         print!(
                             "{}",
-                            swamp_core::render::render_view_external(&external_units)
+                            swamp_core::render::render_view_external_with(
+                                &external_units,
+                                &store_interiors,
+                                r.observed_at,
+                            )
                         )
                     }
                     Some(View::Agents) => {
@@ -1616,7 +1636,11 @@ fn main() -> Result<()> {
                     Some(View::External) => {
                         print!(
                             "{}",
-                            swamp_core::render::render_view_external(&external_units)
+                            swamp_core::render::render_view_external_with(
+                                &external_units,
+                                &store_interiors,
+                                r.observed_at,
+                            )
                         )
                     }
                     Some(View::Agents) => {

@@ -95,6 +95,21 @@ a zero residual. CLI text, `--json` (`interior`) and the TUI family
 groups all read this one summary, and choose Cargo purpose groups or
 neutral family groups by the roles the units carry, never by adapter id.
 
+**Machine-wide stores.** A detector declares which of its locations are
+build stores (`Detector::build_stores`, a `BuildStoreKind` with a
+`StoreAnchor`), and an adapter declares which kinds it identifies
+(`BuildAdapter::store_kinds`). `build_stores::containers_for` compares
+the two declarations and nothing else; `external::observe_external`,
+which already measures those locations, keeps the per-directory rows its
+folded walk produces for a store whose units cannot be replayed, hands
+them to the adapter, replays unchanged stores' units from
+`associations/build_stores.parquet` under the same event window, and
+records interior history on the `KeyFamily::BuildStore` rows of the
+external current table, swept only inside stores it identified
+(`.oh/guardrails/build-stores-join-by-capability.md`). The one
+daemon-answered store, BuildKit, is joined the same way from the Docker
+consumer's facts in the per-root pass (`BuildContainer::daemon_store`).
+
 Reuse is gated on `fs_events::EventCoverage`, the same gate the agent
 containers use, **and** on the stored units having been written by the
 adapter that claims the container this pass (the claim depends on
@@ -107,12 +122,10 @@ completeness up to every ancestor, so coverage gaps reach the units
 instead of reading as a smaller tree.
 
 Shared stores (a pnpm object store, an npm `_cacache`, a Gradle user
-home, a Maven local repository) are identified by the adapters and are
-**not yet joined into the report pass**: they are detector-resolved
-locations whose measurement and history window `external` already owns,
-and a second pass over them from the build consumer would be a double
-observation. The gap is stated in `consumers/cargo.rs` rather than
-closed by a second traversal.
+home, a Maven local repository, Go's and Python's caches, DerivedData,
+the Android SDK) are joined in the external observation's own pass, as
+described under "Machine-wide stores" above -- never from the per-root
+build consumer, which would observe the same bytes twice.
 
 `docs/build-artifacts.md` is the published capability matrix, checked
 against the code in both directions.
@@ -120,10 +133,11 @@ against the code in both directions.
 ## Cross-ecosystem decision contract
 
 The reusable decision aid is **age + size + removal consequences**.
-Cargo, Node, Gradle and Maven supply it through the adapter registry;
-Python, Go, Xcode/Swift, Android and Docker/BuildKit are measured as
-whole artifact rows with no interior identification, and the capability
-matrix says so per family rather than implying parity.
+Cargo, Node, Gradle, Maven, Python, Go, Xcode/Swift, Android and
+Docker/BuildKit supply it through the adapter registry; the capability
+matrix states each family's layouts and attribution limits rather than
+implying parity (a Go build-cache entry's key identifies nothing; a
+BuildKit record's times are the daemon's).
 
 Modification age is enough to recommend reviewing a supported generated-output or cache unit. It is not proof of obsolescence, and access time is not a prerequisite. Recent units remain reviewable; unknown or future timestamps must not look ancient. Unique data and active writers still require their specific protections. A recommendation never supplies deletion authority.
 

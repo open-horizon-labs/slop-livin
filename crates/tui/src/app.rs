@@ -107,6 +107,9 @@ pub struct RefreshedObservation {
     /// clear them); `Some` replaces them wholesale.
     pub external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
     pub agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+    /// The machine-wide build stores' interiors from the same pass;
+    /// `None` exactly when `external_units` is.
+    pub store_interiors: Option<Vec<swamp_core::artifact::NestedArtifact>>,
 }
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
@@ -128,6 +131,7 @@ impl RefreshedObservation {
         per_root: Vec<(PathBuf, Report)>,
         external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
         agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+        store_interiors: Option<Vec<swamp_core::artifact::NestedArtifact>>,
     ) -> Self {
         let merged = (!per_root.is_empty()).then(|| {
             for (root, r) in &per_root {
@@ -144,6 +148,7 @@ impl RefreshedObservation {
             merged,
             external_units,
             agent_units,
+            store_interiors,
         }
     }
 }
@@ -261,6 +266,10 @@ pub struct App {
     /// detector resolution is disk I/O and never runs on this struct's
     /// own event/render path).
     pub external_units: Vec<swamp_core::external::ExternalUnit>,
+    /// The identified interiors of the machine-wide build stores among
+    /// `external_units` (`ScopeObservation::store_interiors`), set with
+    /// them, from the same pass.
+    pub store_interiors: Vec<swamp_core::artifact::NestedArtifact>,
     /// Agent-tool storage units (#91/#100), for `ViewKind::Agents`. Same
     /// startup-only population contract as `external_units`.
     pub agent_units: Vec<swamp_core::agents::AgentUnit>,
@@ -429,6 +438,7 @@ impl App {
             track: std::collections::HashMap::new(),
             history_secs: None,
             external_units: Vec::new(),
+            store_interiors: Vec::new(),
             agent_units: Vec::new(),
             scope_note: None,
             scope: None,
@@ -440,6 +450,12 @@ impl App {
     /// resolution and measurement are disk I/O.
     pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
         self.external_units = units;
+    }
+
+    /// Sets the store interiors shown under `ViewKind::External`. Same
+    /// contract as `set_external_units`, and always from the same pass.
+    pub fn set_store_interiors(&mut self, units: Vec<swamp_core::artifact::NestedArtifact>) {
+        self.store_interiors = units;
     }
 
     /// Sets `agent_units` for `ViewKind::Agents` (#91/#100). Same
@@ -582,6 +598,9 @@ impl App {
         if let Some(units) = fresh.external_units {
             self.set_external_units(units);
         }
+        if let Some(units) = fresh.store_interiors {
+            self.set_store_interiors(units);
+        }
         if let Some(units) = fresh.agent_units {
             self.set_agent_units(units);
         }
@@ -639,10 +658,15 @@ impl App {
             ViewKind::Builds => model::builds_rows(&self.report, &self.filter),
             ViewKind::Deps => model::deps_rows(&self.report, &self.filter),
             ViewKind::Kinds => model::kinds_rows(&self.report, &self.filter),
-            ViewKind::Docker => model::docker_rows(&self.report),
+            ViewKind::Docker => model::docker_rows_with(&self.report, &self.collapsed),
             ViewKind::Unowned => model::unowned_rows(&self.report),
             ViewKind::Types => model::types_rows(&self.report, &self.filter),
-            ViewKind::External => model::external_rows(&self.external_units),
+            ViewKind::External => model::external_rows_with(
+                &self.external_units,
+                &self.store_interiors,
+                &self.collapsed,
+                self.report.observed_at,
+            ),
             ViewKind::Agents => model::agent_rows(&self.agent_units),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
@@ -849,7 +873,13 @@ impl App {
     }
 
     pub fn toggle_expand(&mut self) {
-        if self.view != ViewKind::Tree {
+        // The tree, and the two views whose rows open onto an identified
+        // interior: a machine-wide store (External) and a BuildKit
+        // builder (Docker).
+        if !matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::External | ViewKind::Docker
+        ) {
             return;
         }
         if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
@@ -2027,6 +2057,7 @@ impl App {
                     o.per_root.into_iter().collect(),
                     None,
                     None,
+                    None,
                 )
             });
             let _ = tx.send(res);
@@ -2087,6 +2118,7 @@ impl App {
                     o.per_root.into_iter().collect(),
                     Some(o.external_units),
                     Some(o.agent_units),
+                    Some(o.store_interiors),
                 )
             });
             let _ = tx.send(res);
@@ -3072,6 +3104,85 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+    }
+
+    /// A machine-wide store's identified interior opens under its row in
+    /// the External view, in the same family groups a project container
+    /// uses -- closed until opened, every row blocked, and nothing
+    /// selectable -- at both a narrow and a wide terminal.
+    #[test]
+    fn a_store_interior_opens_under_its_external_row_and_stays_inspection_only() {
+        use swamp_core::artifact::{AccountingBasis, ArtifactRole, TimeSource};
+        use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        let repo = std::path::PathBuf::from("/fixture/.m2/repository");
+        app.set_external_units(vec![swamp_core::external::ExternalUnit {
+            detector_id: "maven".into(),
+            detector_name: "Maven".into(),
+            category: swamp_core::locations::StorageCategory::Unclassified,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: repo.clone(),
+            bytes: 100_000,
+            mtime_max: 0,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1000,
+            consumers: Vec::new(),
+            note: None,
+            evidence: Vec::new(),
+        }]);
+        let c = BuildContainer::shared_store_of(
+            "maven",
+            repo.clone(),
+            swamp_core::locations::BuildStoreKind::MavenRepository,
+        );
+        let root = NestedUnitBuilder::new(&c, ArtifactRole::SharedStoreEntry, repo.clone())
+            .is_dir(true)
+            .bytes_on_basis(100_000, AccountingBasis::Allocated)
+            .supported_with_reason("fixture repository")
+            .build();
+        let entry = NestedUnitBuilder::new(
+            &c,
+            ArtifactRole::SharedStoreEntry,
+            repo.join("org/example/lib/1.0"),
+        )
+        .is_dir(true)
+        .bytes_on_basis(60_000, AccountingBasis::Allocated)
+        .modified(500, TimeSource::FoldedDirectoryModification)
+        .supported_with_reason("fixture artifact")
+        .consequence("downloaded again on the next build")
+        .no_action_because("shared")
+        .build();
+        app.set_store_interiors(vec![root, entry]);
+        app.set_view(ViewKind::External);
+        let closed = app.rows();
+        assert_eq!(closed.len(), 1, "closed until opened");
+        assert!(closed[0].expandable);
+        app.selected = 0;
+        app.enter_row();
+        let open = app.rows();
+        assert!(
+            open.iter()
+                .any(|r| r.label == swamp_core::artifact::RoleFamily::SharedStore.title()),
+            "the family group appears: {:?}",
+            open.iter().map(|r| r.label.clone()).collect::<Vec<_>>()
+        );
+        for r in open.iter().skip(1) {
+            assert!(
+                r.unit.is_none(),
+                "{}: an interior row is never selectable",
+                r.label
+            );
+            assert!(r.signals.iter().any(|s| s == "blocked"), "{}", r.label);
+        }
+        for width in [80u16, 160] {
+            let backend = ratatui::backend::TestBackend::new(width, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        }
     }
 
     /// `start_watch` opens one FSEvents stream per root in `self.roots`

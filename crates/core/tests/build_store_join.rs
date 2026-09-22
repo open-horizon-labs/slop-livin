@@ -289,6 +289,29 @@ fn every_declared_store_reaches_the_report_through_its_adapter() {
     );
     assert_eq!(sdk.role, ArtifactRole::Installation);
 
+    // The CLI's text and JSON surfaces carry the interiors.
+    let text = swamp_core::render::render_view_external_with(
+        &o.external_units,
+        &o.store_interiors,
+        o.merged.observed_at,
+    );
+    assert!(
+        text.contains("inside (identification only -- no cleanup is offered here)"),
+        "{text}"
+    );
+    assert!(text.contains("Shared store entries"), "{text}");
+    assert!(text.contains("Installed SDKs & runtimes"), "{text}");
+    let m2 = f.located("maven", StorageCategory::Unclassified, "repository");
+    let json = swamp_core::agent_json::interior_json(&m2, &o.store_interiors).expect("json");
+    assert!(json["units"].as_array().unwrap().len() >= 2);
+    assert!(
+        json["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["action"] == "inspection-only")
+    );
+
     // Every interior unit belongs to an external unit the same pass
     // measured, and names its container.
     for u in units {
@@ -687,5 +710,121 @@ fn store_units_persist_as_a_parquet_table_and_replay_across_passes() {
         o.interiors
             .iter()
             .any(|u| u.variant.package.as_deref() == Some("org.example:lib"))
+    );
+}
+
+/// A daemon's answers in the documented CLI shapes: two builders, a
+/// shared parent, an in-use child cache mount.
+const DOCKER_FACTS: &str = r#"{
+  "Images": [], "Volumes": [],
+  "BuildCache": [
+    {"ID": "p1", "CacheType": "regular", "Description": "[build 2/5] RUN make", "Size": "120MB",
+     "CreatedAt": "2024-01-15T10:32:00Z", "LastUsedAt": "2024-02-01T08:00:00Z", "UsageCount": 4,
+     "InUse": false, "Shared": true},
+    {"ID": "c1", "CacheType": "exec.cachemount", "Size": "30MB", "Parents": ["p1"],
+     "CreatedAt": "2024-01-15T10:33:00Z", "InUse": true, "Shared": false}
+  ],
+  "Version": {"Server": {"ApiVersion": "1.45"}},
+  "Builders": [{"Name": "ci", "Driver": "docker-container", "Nodes": [{"Status": "running"}]}],
+  "BuildxDu": [{"Builder": "ci", "Records": [
+     {"ID": "x1", "Type": "source.local", "Size": 5000000, "Reclaimable": true, "Shared": false,
+      "CreatedAt": "2024-03-01T09:00:00Z"}]}]
+}"#;
+
+fn docker_report(facts: &Path) -> swamp_core::Report {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap().join("src");
+    fs::create_dir_all(&root).unwrap();
+    swamp_core::report::report_full_mode_with_source(
+        &root,
+        Some(facts),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+        &swamp_core::fs_events::UnsupportedPlatformSource,
+    )
+    .unwrap()
+}
+
+#[test]
+fn buildkit_records_reach_the_report_as_daemon_facts_never_filesystem_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let facts = tmp.path().join("docker.json");
+    fs::write(&facts, DOCKER_FACTS).unwrap();
+    let r = docker_report(&facts);
+    let records: Vec<&NestedArtifact> = r
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.reported_by.is_some())
+        .collect();
+    let rel: Vec<&str> = records.iter().map(|u| u.relative_path.as_str()).collect();
+    for want in ["p1", "c1", "x1"] {
+        assert!(rel.contains(&want), "{want} missing from {rel:?}");
+    }
+    let p1 = records.iter().find(|u| u.relative_path == "p1").unwrap();
+    let c1 = records.iter().find(|u| u.relative_path == "c1").unwrap();
+    assert_eq!(
+        (p1.bytes, c1.bytes),
+        (120_000_000, 30_000_000),
+        "each record's own size"
+    );
+    assert_ne!(
+        p1.container_id,
+        records
+            .iter()
+            .find(|u| u.relative_path == "x1")
+            .unwrap()
+            .container_id,
+        "two builders are two containers"
+    );
+    let text = swamp_core::render::render_view_docker(&r, None);
+    assert!(
+        text.contains("BuildKit build cache, as the daemon reports it"),
+        "{text}"
+    );
+    assert!(text.contains("exec.cachemount"), "{text}");
+    assert!(text.contains("in use"), "{text}");
+    let payload = swamp_core::agent_json::buildkit_payload(&r);
+    let builders: Vec<&str> = payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["builder"].as_str().unwrap())
+        .collect();
+    assert_eq!(builders, vec!["ci", "default"]);
+    for u in &records {
+        assert!(
+            !format!("{:?}", u.decision_evidence).contains("FilesystemMetadata"),
+            "{}: a daemon record carries no filesystem provenance: {:?}",
+            u.relative_path,
+            u.decision_evidence
+        );
+        assert!(
+            matches!(
+                u.action,
+                swamp_core::artifact::NestedActionCapability::Unsupported { .. }
+            ),
+            "{}: an inspectable record never receives a delete action",
+            u.relative_path
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_daemon_is_a_note_not_an_empty_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = docker_report(&tmp.path().join("missing.json"));
+    assert!(
+        !r.nested_artifacts.iter().any(|u| u.reported_by.is_some()),
+        "no records are invented for a daemon that did not answer"
+    );
+    assert!(
+        r.notes.iter().any(|n| n.contains("docker: unavailable")),
+        "{:?}",
+        r.notes
     );
 }

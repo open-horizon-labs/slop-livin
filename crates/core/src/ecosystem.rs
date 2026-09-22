@@ -185,7 +185,9 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "go",
         name: "Go",
         markers: &["go.mod"],
-        cleans: &[("vendor", Deps)],
+        // `bin/` beside go.mod is where `go build -o bin/` writes; the Go
+        // build adapter identifies each binary in it (#69).
+        cleans: &[("vendor", Deps), ("bin", Build)],
         glyph: "🐹",
         name_source: Some(("go.mod", NameField::GoModule)),
     },

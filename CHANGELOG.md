@@ -187,6 +187,55 @@ Making the reuse fire, and keeping a count honest while it does.
   before starting the next, against a five-second budget, and so
   sometimes abandoned a root's stream while it was still starting. All
   roots' streams now start before any readiness is collected.
+### Python, Go, Apple, Android and BuildKit interiors, and machine-wide stores in the report (#69, #70, #71)
+
+- **Five more ecosystems have an interior.** Python: `dist/` wheels and
+  sdists named by their filename conventions, setuptools `build/` per
+  interpreter/platform, `*.egg-info` by its `PKG-INFO`, bytecode, pytest,
+  mypy (per Python version) and Ruff (per Ruff version) caches, `.venv`
+  and tox/nox environments by their `pyvenv.cfg`, with site-packages
+  entries named through each distribution's `top_level.txt` and editable
+  installs through `direct_url.json`. Go: `vendor/modules.txt`, `bin/`,
+  goreleaser `dist/`. Xcode/SwiftPM: DerivedData project folders by their
+  `info.plist` `WorkspacePath` (XML or binary, without `plutil`),
+  products per configuration and platform, test bundles, `.xcresult`s,
+  `.dSYM`s, intermediates, index, Swift package checkouts from
+  `workspace-state.json`; SwiftPM `.build`. Android: module `build/`
+  directories (the Gradle table plus the plugin's `outputs/apk`,
+  `bundle`, `mapping` and `intermediates` per variant), `.cxx` per
+  variant and ABI.
+- **Machine-wide stores now reach the report.** A Maven repository, a
+  Gradle home, npm and pnpm stores, Go's module/download/build caches,
+  pip and uv caches (and uv's interpreters and tools), DerivedData, Xcode
+  archives and device support, CoreSimulator, Android SDK packages and
+  AVDs show their identified interior under their unit in `--view
+  external` (text, `--json` `interiors`, and the TUI's External view).
+  The join is by declared capability -- the detector says which location
+  is which store, the adapter says which kinds it identifies -- so custom
+  locations work like defaults. Interior units keep their own
+  size/growth/regrowth history, and an unchanged store is replayed with
+  no listing and no read.
+- **Archives, SDKs, simulator runtimes and devices are never build
+  output.** Two new role families say what they are: `installations`
+  (a reinstall, usually a download) and `state` (nothing regenerates
+  it).
+- **BuildKit records, in the daemon's terms.** `--view docker` (and its
+  `--json` `buildkit`, and the TUI) lists each builder's build-cache
+  records: type, logical size (a record's own -- a parent's size is never
+  inside a child's), the daemon's created and last-used records, shared,
+  in-use and reclaimable as reported. Builders come from `docker buildx
+  ls`, per-builder records from `docker buildx du --verbose`, the API
+  version from `docker version` -- all bounded, allow-listed and cached
+  with the rest of the Docker facts. An unavailable daemon, a missing
+  buildx, a builder that did not answer, an old API or aging cached facts
+  are stated. No record is actionable and no Docker file is touched.
+- **Still inspection only.** No new adapter declares an action; #73 is
+  where build-artifact actions land.
+- The Go build cache's location is now categorized `build-output`
+  rather than `cache`, which is what distinguishes it from the module
+  cache (whose path is just as free-form); its external history key
+  changes with it.
+
 ### Build artifacts get adapters (#64, #65, #67, #68)
 
 What is inside a build container, for four ecosystems instead of one.

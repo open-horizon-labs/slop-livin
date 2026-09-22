@@ -403,6 +403,35 @@ pub fn docker_objects_payload(r: &Report, unowned_only: bool, only_project: Opti
     json!(rows)
 }
 
+/// `--view docker --json`'s BuildKit half: one entry per builder, its
+/// interior in the shared shape, every size the daemon's logical figure.
+/// Empty when the daemon was not asked or did not answer.
+pub fn buildkit_payload(r: &Report) -> Value {
+    let mut containers: Vec<&crate::artifact::NestedArtifact> = r
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.reported_by.is_some() && Some(u.id.as_str()) == u.container_id.as_deref())
+        .collect();
+    containers.sort_by(|a, b| a.path.cmp(&b.path));
+    json!(
+        containers
+            .iter()
+            .filter_map(|root| {
+                let interior = interior_json(&root.path, &r.nested_artifacts)?;
+                Some(json!({
+                    "builder": root.path.to_string_lossy()
+                        .strip_prefix(crate::build_adapters::DAEMON_STORE_SCHEME)
+                        .unwrap_or_default(),
+                    "reported_by": root.reported_by,
+                    "logical_bytes": root.bytes,
+                    "limits": root.coverage.limits,
+                    "interior": interior,
+                }))
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
 /// Ranked list of every discovered project: name, id, total bytes,
 /// growth, checkout+worktree count, and remote, ranked by growth then
 /// bytes desc -- the same ordering the overview text render uses.
@@ -643,8 +672,18 @@ pub fn paginate(value: &mut Value, limit: Option<usize>, offset: usize) -> Optio
 /// `coverage`). `None` when no adapter identified anything under the
 /// row -- absence stays absence, never an empty object.
 fn build_interior_json(r: &Report, container: &std::path::Path) -> Option<Value> {
-    let units: Vec<crate::artifact::NestedArtifact> = r
-        .nested_artifacts
+    interior_json(container, &r.nested_artifacts)
+}
+
+/// [`build_interior_json`] over any set of units -- a machine-wide
+/// store's interior (`--view external --json`) or one BuildKit builder's
+/// records (`--view docker --json`) -- so every surface serializes an
+/// interior the same way.
+pub fn interior_json(
+    container: &std::path::Path,
+    all: &[crate::artifact::NestedArtifact],
+) -> Option<Value> {
+    let units: Vec<crate::artifact::NestedArtifact> = all
         .iter()
         .filter(|u| u.present && u.path.starts_with(container))
         .cloned()

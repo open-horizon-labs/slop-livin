@@ -316,7 +316,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "Build/Intermediates.noindex, Index.noindex, ModuleCache.noindex, Logs/Test/*.xcresult, \
              SourcePackages/{checkouts,repositories,artifacts} with workspace-state.json",
             "a project-local DerivedData or -derivedDataPath folder",
-            "SwiftPM .build/{<triple>/<debug|release>,checkouts,repositories,artifacts,.lock}",
+            "SwiftPM .build/{<triple>/<debug or release>,checkouts,repositories,artifacts,.lock}",
             "Archives/<date>/*.xcarchive with Info.plist; iOS/watchOS DeviceSupport/<version (build)>",
             "CoreSimulator Devices/<UDID>/device.plist, Profiles/Runtimes/*.simruntime, Caches",
         ],
@@ -360,7 +360,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "daemon-side only: `docker buildx prune --filter id=<id>` \
                                 removes a record with its dependents; `docker builder prune` \
-                                removes every record its own filters match",
+                                removes every record not in use that matches its filters",
         actions: INSPECTION_ONLY,
     },
 ];

@@ -191,6 +191,15 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("inspect"), DockerRefs, Lit("--format"), Lit("json")],
             &[Lit("image"), Lit("inspect"), DockerRef],
             &[Lit("volume"), Lit("inspect"), DockerRef],
+            &[Lit("version"), Lit("--format"), Lit("json")],
+            &[Lit("buildx"), Lit("ls"), Lit("--format"), Lit("json")],
+            &[
+                Lit("buildx"),
+                Lit("du"),
+                Lit("--verbose"),
+                Lit("--builder"),
+                DockerRef,
+            ],
         ],
         Program::Gh => &[
             &[Lit("auth"), Lit("status")],
@@ -441,6 +450,12 @@ mod tests {
                 vec!["--host", "tcp://x", "ps", "-a", "--format", "json"],
             ),
             (Program::Docker, vec!["image", "inspect", "--help"]),
+            (Program::Docker, vec!["builder", "prune", "-f"]),
+            (Program::Docker, vec!["buildx", "prune", "--filter", "id=x"]),
+            (
+                Program::Docker,
+                vec!["buildx", "du", "--verbose", "--builder", "-ci"],
+            ),
             // A GraphQL mutation through the read-only query shape.
             (
                 Program::Gh,
@@ -476,6 +491,12 @@ mod tests {
             (
                 Program::Docker,
                 vec!["system", "df", "-v", "--format", "json"],
+            ),
+            (Program::Docker, vec!["version", "--format", "json"]),
+            (Program::Docker, vec!["buildx", "ls", "--format", "json"]),
+            (
+                Program::Docker,
+                vec!["buildx", "du", "--verbose", "--builder", "ci"],
             ),
             (Program::Gh, vec!["auth", "status"]),
             (
