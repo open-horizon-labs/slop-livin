@@ -399,9 +399,9 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
         // above one that grew by 1GB, at the top of a screen the human
         // is reading for things to delete. Shrinkage sorts last.
         Sort::Growth => {
-            rows.sort_by(|a, b| b.growth.unwrap_or(0).cmp(&a.growth.unwrap_or(0)));
+            rows.sort_by_key(|a| std::cmp::Reverse(a.growth.unwrap_or(0)));
         }
-        Sort::Size => rows.sort_by(|a, b| b.bytes.cmp(&a.bytes)),
+        Sort::Size => rows.sort_by_key(|a| std::cmp::Reverse(a.bytes)),
         Sort::Name => rows.sort_by(|a, b| {
             // Labels may carry ecosystem tags ("[rs][js] owner/repo");
             // sort on the name after the last tag so tags don't cluster rows.
@@ -1308,7 +1308,7 @@ fn source_children<'a>(
         .iter()
         .filter(|d| !d.rel_path.is_empty() && d.rel_path != "." && !d.rel_path.contains('/'))
         .collect();
-    top.sort_by(|a, b| b.allocated_total.cmp(&a.allocated_total));
+    top.sort_by_key(|a| std::cmp::Reverse(a.allocated_total));
     top
 }
 
@@ -1642,7 +1642,7 @@ pub fn types_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             row
         })
         .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
 }
 
@@ -1706,7 +1706,7 @@ pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
             row
         })
         .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
 }
 
@@ -1752,7 +1752,7 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             row
         })
         .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
 }
 

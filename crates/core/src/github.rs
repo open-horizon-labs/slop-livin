@@ -417,12 +417,11 @@ pub fn github_owner_repo(remote_url: &str) -> Option<(String, String)> {
         .unwrap_or(remote_url.trim());
     let rest = if let Some(rest) = url.strip_prefix("git@github.com:") {
         rest
-    } else if let Some(idx) = url.find("://") {
+    } else {
+        let idx = url.find("://")?;
         let after_scheme = &url[idx + 3..];
         let after_scheme = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
         after_scheme.strip_prefix("github.com/")?
-    } else {
-        return None;
     };
     let mut parts = rest.splitn(2, '/');
     let owner = parts.next()?.to_string();

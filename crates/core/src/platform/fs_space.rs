@@ -9,77 +9,118 @@
 //! depend on. And every call was a subprocess spawn on a path that
 //! already counts its spawns.
 //!
-//! `statvfs(3)` is POSIX, present on both targets with the same struct in
-//! the `libc` crate, and answers directly. The one real difference is the
-//! multiplier: POSIX defines `f_blocks`/`f_bfree`/`f_bavail` in units of
-//! `f_frsize`, and Darwin's `statvfs` shim reports `f_frsize` too, so
-//! `f_frsize` is correct on both -- with a fallback to `f_bsize` for the
-//! filesystem that reports `f_frsize` as zero.
-//!
 //! Semantics, kept explicit because the two are not the same number:
 //!
-//! * **available** (`f_bavail`) is what an unprivileged process may
-//!   actually use -- what `df`'s "Avail" column shows and what a "you
-//!   would get this much back" statement must be measured against.
-//! * **free** (`f_bfree`) includes blocks reserved for root. Reporting it
-//!   as "free space" would overstate what a cleanup can recover.
+//! * **available** is what an unprivileged process may actually use --
+//!   what `df`'s "Avail" column shows, and what "you would get this much
+//!   back" has to be measured against.
+//! * **free** includes blocks reserved for root. Reporting it as free
+//!   space would overstate what a cleanup can recover.
 //!
-//! Only `available` is exposed: nothing in swamp has a use for the
-//! reserved blocks, and offering both invites picking the flattering one.
+//! Only *available* is exposed: nothing here has a use for the reserved
+//! blocks, and offering both invites picking the flattering one.
+//!
+//! ## Why two syscalls rather than one
+//!
+//! POSIX `statvfs` is on both targets and was the obvious single answer.
+//! It is the wrong one on macOS: Darwin's `fsblkcnt_t` is `c_uint`, so
+//! `statvfs`'s `f_blocks`/`f_bavail` are **32-bit**, and on a volume with
+//! more than 2^32 blocks the call either overflows silently or fails with
+//! `EOVERFLOW`. A 16 TB volume is an ordinary external disk. Darwin's
+//! native `statfs` has 64-bit counts and no such ceiling, so macOS uses
+//! that; Linux's `statvfs` counts are already 64-bit and it uses that.
+//!
+//! The multiplier differs with the call, which is the other reason they
+//! are not interchangeable: POSIX defines `statvfs`'s counts in units of
+//! `f_frsize`, while Darwin's `statfs` counts are in units of `f_bsize`.
 
 use std::path::Path;
 
 /// Bytes an unprivileged process can still write to the filesystem
 /// holding `path`.
 ///
-/// `None` when the filesystem cannot answer (the path does not exist,
+/// `None` when the filesystem cannot answer -- the path does not exist,
 /// permission is denied, the path contains a NUL byte, or the filesystem
-/// reports a zero block size). A missing measurement stays missing: no
-/// caller may substitute zero, and none may treat `None` as "plenty".
+/// reports a zero block size. A missing measurement stays missing: no
+/// caller may substitute zero, and none may read `None` as "plenty".
 pub fn available_bytes(path: &Path) -> Option<u64> {
-    let stat = statvfs(path)?;
-    // POSIX: block counts are in f_frsize units. A filesystem that
-    // reports f_frsize = 0 is answering with f_bsize instead.
-    let unit = if stat.f_frsize > 0 {
-        stat.f_frsize
-    } else {
-        stat.f_bsize
-    };
-    if unit == 0 {
-        return None;
-    }
-    (stat.f_bavail as u64).checked_mul(unit as u64)
+    let s = space(path)?;
+    s.available_blocks.checked_mul(s.block_size)
 }
 
-/// Total bytes the filesystem holding `path` can hold, for the "x of y"
-/// shape a report uses when it has both numbers. Same `None` discipline
-/// as [`available_bytes`].
+/// Total bytes the filesystem holding `path` holds, for the "x of y"
+/// shape a report uses when it has both. Same `None` discipline as
+/// [`available_bytes`].
 pub fn total_bytes(path: &Path) -> Option<u64> {
-    let stat = statvfs(path)?;
-    let unit = if stat.f_frsize > 0 {
-        stat.f_frsize
-    } else {
-        stat.f_bsize
-    };
-    if unit == 0 {
-        return None;
-    }
-    (stat.f_blocks as u64).checked_mul(unit as u64)
+    let s = space(path)?;
+    s.total_blocks.checked_mul(s.block_size)
 }
 
-fn statvfs(path: &Path) -> Option<libc::statvfs> {
+/// The three numbers both backends produce, already widened to `u64`.
+struct Space {
+    available_blocks: u64,
+    total_blocks: u64,
+    block_size: u64,
+}
+
+fn cpath(path: &Path) -> Option<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// Darwin: `statfs`, whose block counts are 64-bit and whose unit is
+/// `f_bsize`.
+#[cfg(target_os = "macos")]
+fn space(path: &Path) -> Option<Space> {
+    let cpath = cpath(path)?;
+    let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: `cpath` is a NUL-terminated C string alive for the call and
+    // `buf` is a correctly sized, writable `statfs`. The return value is
+    // checked before `assume_init`.
+    let stat = unsafe {
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init()
+    };
+    let block_size = u64::from(stat.f_bsize);
+    if block_size == 0 {
+        return None;
+    }
+    Some(Space {
+        available_blocks: stat.f_bavail,
+        total_blocks: stat.f_blocks,
+        block_size,
+    })
+}
+
+/// Linux: POSIX `statvfs`, whose counts are 64-bit and whose unit is
+/// `f_frsize` -- falling back to `f_bsize` for a filesystem that reports
+/// `f_frsize` as zero.
+#[cfg(target_os = "linux")]
+fn space(path: &Path) -> Option<Space> {
+    let cpath = cpath(path)?;
     let mut buf: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
-    // SAFETY: `cpath` is a NUL-terminated C string that outlives the
-    // call, and `buf` is a correctly sized, writable statvfs. The return
-    // value is checked before `assume_init`.
-    unsafe {
+    // SAFETY: as above, with a `statvfs`.
+    let stat = unsafe {
         if libc::statvfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
             return None;
         }
-        Some(buf.assume_init())
+        buf.assume_init()
+    };
+    let block_size = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    if block_size == 0 {
+        return None;
     }
+    Some(Space {
+        available_blocks: stat.f_bavail,
+        total_blocks: stat.f_blocks,
+        block_size,
+    })
 }
 
 #[cfg(test)]
@@ -101,6 +142,59 @@ mod tests {
         assert!(
             (1 << 20..1 << 60).contains(&total),
             "implausible total {total}"
+        );
+    }
+
+    /// The block-size multiplier is the one thing a unit mistake hides
+    /// inside a plausible-looking number, and it differs by backend
+    /// (`f_bsize` on Darwin's `statfs`, `f_frsize` on Linux's
+    /// `statvfs`). `df -k` is the independent oracle: it asks the same
+    /// kernel through a different program, and it is what the old
+    /// implementation parsed, so agreeing with it is also the evidence
+    /// that replacing it changed no answer.
+    ///
+    /// A 5% band, because a busy machine genuinely moves blocks between
+    /// the two calls. A factor-of-512 or factor-of-1024 mistake -- the
+    /// ones actually on offer here -- is nowhere near it.
+    #[test]
+    fn the_figure_agrees_with_df() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ours = available_bytes(tmp.path()).expect("space for a temp dir");
+
+        let Ok(out) = std::process::Command::new("df")
+            .arg("-k")
+            .arg(tmp.path())
+            .output()
+        else {
+            eprintln!("SKIPPED: no `df` on this machine to cross-check against");
+            return;
+        };
+        if !out.status.success() {
+            eprintln!("SKIPPED: `df -k` failed on this machine");
+            return;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Not by field index: GNU df wraps a long device name onto a
+        // second line, which is the bug this module exists to remove.
+        // The available figure is the third number on the row, whichever
+        // line it landed on.
+        let numbers: Vec<u64> = text
+            .lines()
+            .skip(1)
+            .flat_map(|l| l.split_whitespace())
+            .filter_map(|f| f.parse::<u64>().ok())
+            .collect();
+        let Some(&avail_kib) = numbers.get(2) else {
+            eprintln!("SKIPPED: could not read an available figure out of `df -k`:\n{text}");
+            return;
+        };
+        let theirs = avail_kib * 1024;
+
+        let (hi, lo) = (ours.max(theirs), ours.min(theirs).max(1));
+        assert!(
+            (hi - lo) * 20 <= hi,
+            "statvfs/statfs says {ours} bytes available, `df -k` says {theirs}; \
+             that is not measurement drift, it is a different unit"
         );
     }
 

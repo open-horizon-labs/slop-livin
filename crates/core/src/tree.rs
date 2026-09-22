@@ -242,7 +242,7 @@ pub fn agent_rows_for_project(
         }
     }
     let mut rows: Vec<ProjectAgentToolRow> = by_tool.into_values().collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
 }
 

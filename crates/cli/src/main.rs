@@ -2130,7 +2130,7 @@ fn render_dirs(
                         .collect()
                 })
                 .unwrap_or_default();
-            file_rows.sort_by(|a, b| b.growth_bytes.cmp(&a.growth_bytes));
+            file_rows.sort_by_key(|a| std::cmp::Reverse(a.growth_bytes));
             for f in file_rows {
                 let _ = writeln!(
                     out,

@@ -192,6 +192,13 @@ impl FsEventsPlan {
         }
     }
 
+    /// The successful counterpart of [`FsEventsPlan::refuse`], built
+    /// only by a backend that actually replayed something. Target-gated
+    /// because on a platform with no replay backend there is no caller
+    /// and no way to reach it -- and an unreachable constructor for
+    /// "incremental: true" is exactly the thing a Linux build should
+    /// not contain.
+    #[cfg(target_os = "macos")]
     fn ok(changed_dirs: Vec<PathBuf>, current_event_id: u64, device: Option<u64>) -> Self {
         Self {
             incremental: true,
@@ -442,6 +449,7 @@ pub fn platform_refusal() -> RefreshRefusal {
 /// `docs/fsevents-helper.md`'s "every path contributes itself and its
 /// parent"); adding both costs one extra listing on re-walk and closes
 /// both a creation and a deletion.
+#[cfg(target_os = "macos")]
 fn add_with_parent(changes: &mut std::collections::HashSet<PathBuf>, root: &Path, path: &Path) {
     for candidate in [
         Some(path.to_path_buf()),
@@ -902,6 +910,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::time::Duration;
 
     #[cfg(target_os = "macos")]
@@ -989,6 +998,7 @@ mod tests {
         assert_eq!(platform_refusal(), expected);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn add_with_parent_stays_within_root() {
         let root = Path::new("/root");

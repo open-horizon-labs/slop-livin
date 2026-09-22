@@ -247,7 +247,7 @@ pub fn render_types(report: &Report) -> String {
         "type", "name", "projects", "artifacts", "bytes", "growth"
     );
     let mut rows: Vec<_> = report.summary.by_type.iter().collect();
-    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.1.bytes));
     if rows.is_empty() {
         let _ = writeln!(out, "0");
         return out;
@@ -312,16 +312,14 @@ pub fn render_overview_sorted(
             let gb = b.1.growth.unwrap_or(i64::MIN);
             gb.cmp(&ga).then_with(|| b.1.bytes.cmp(&a.1.bytes))
         }),
-        OverviewSort::Size => rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes)),
-        OverviewSort::Name => {
-            rows.sort_by(|a, b| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
-        }
+        OverviewSort::Size => rows.sort_by_key(|a| std::cmp::Reverse(a.1.bytes)),
+        OverviewSort::Name => rows.sort_by_key(|a| a.0.name.to_lowercase()),
         OverviewSort::Type => rows.sort_by(|a, b| {
             type_rank(a.0)
                 .cmp(&type_rank(b.0))
                 .then_with(|| b.1.bytes.cmp(&a.1.bytes))
         }),
-        OverviewSort::Age => rows.sort_by(|a, b| age_key(a.0).cmp(&age_key(b.0))),
+        OverviewSort::Age => rows.sort_by_key(|a| age_key(a.0)),
     }
     if reverse {
         rows.reverse();
@@ -549,7 +547,7 @@ pub fn render_kinds(report: &Report) -> String {
         return out;
     }
     let mut rows: Vec<(&str, (u64, u64))> = agg.into_iter().collect();
-    rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.1.0));
     for (kind, (bytes, count)) in rows {
         let _ = writeln!(out, "{:<16} {:>12} {:>8}", kind, human_bytes(bytes), count);
     }
@@ -1061,7 +1059,7 @@ fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[Artifa
             }
         }
     }
-    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.3));
     if rows.is_empty() {
         let _ = writeln!(out, "0");
         return out;
@@ -1208,7 +1206,7 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
             ),
         });
     }
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     if rows.is_empty() {
         let _ = writeln!(out, "0");
         return out;
@@ -1314,7 +1312,7 @@ pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
         return out;
     }
     let mut sorted: Vec<&crate::external::ExternalUnit> = units.iter().collect();
-    sorted.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let mut total = 0u64;
     for u in &sorted {
         total += u.bytes;

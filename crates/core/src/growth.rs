@@ -3702,7 +3702,7 @@ pub fn folded_rows_for(swamp_dir: &Path, unit_path: &str) -> Vec<FoldedRow> {
         .into_iter()
         .filter(|r| r.unit_path == unit_path)
         .collect();
-    rows.sort_by(|a, b| a.rel_dir.len().cmp(&b.rel_dir.len()));
+    rows.sort_by_key(|a| a.rel_dir.len());
     rows
 }
 
