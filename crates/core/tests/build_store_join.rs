@@ -289,6 +289,8 @@ fn every_declared_store_reaches_the_report_through_its_adapter() {
     );
     assert_eq!(sdk.role, ArtifactRole::Installation);
 
+    assert_no_verdict(units);
+
     // The CLI's text and JSON surfaces carry the interiors.
     let text = swamp_core::render::render_view_external_with(
         &o.external_units,
@@ -338,6 +340,39 @@ fn every_declared_store_reaches_the_report_through_its_adapter() {
 
 /// `(path, bytes, growth, regrowth)` for one adapter's units *inside*
 /// stores, on the store family's keys.
+/// The facts-not-verdicts contract over every string a unit can put in
+/// front of a person (`build_adapter_contract::no_unit_renders_a_verdict`,
+/// for the store and daemon units).
+fn assert_no_verdict(units: &[NestedArtifact]) {
+    let banned = [
+        "safe to delete",
+        "can be deleted",
+        "unused",
+        "obsolete",
+        "no longer needed",
+        "stale",
+    ];
+    for u in units {
+        let mut text = vec![
+            u.role.label().to_string(),
+            u.consequence.clone().unwrap_or_default(),
+        ];
+        text.extend(u.coverage.limits.clone());
+        text.extend(u.producer_evidence.iter().map(|e| e.detail.clone()));
+        if let swamp_core::artifact::NestedActionCapability::Unsupported { reason } = &u.action {
+            text.push(reason.clone());
+        }
+        let joined = text.join(" ").to_ascii_lowercase();
+        for word in banned {
+            assert!(
+                !joined.contains(word),
+                "{} renders {word:?}: {joined}",
+                u.path.display()
+            );
+        }
+    }
+}
+
 fn history(
     o: &swamp_core::report::ScopeObservation,
     adapter: &str,
@@ -781,6 +816,7 @@ fn buildkit_records_reach_the_report_as_daemon_facts_never_filesystem_ones() {
             .container_id,
         "two builders are two containers"
     );
+    assert_no_verdict(&r.nested_artifacts);
     let text = swamp_core::render::render_view_docker(&r, None);
     assert!(
         text.contains("BuildKit build cache, as the daemon reports it"),
