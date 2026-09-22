@@ -2261,6 +2261,8 @@ mod cleanup_check_tests {
             time_source: Default::default(),
             action: Default::default(),
             consequence: None,
+            reported_by: None,
+            writer_lock: None,
         }
     }
 

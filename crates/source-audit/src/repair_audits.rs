@@ -2057,7 +2057,20 @@ const DISCOVERY_OWNER: (&str, &str) = ("crates/core/src/report.rs", "observe_sco
 
 const DISCOVERY_CALLS: &[&str] = &[
     "external :: discover_and_measure (",
+    "external :: observe_external (",
     "agents :: discover_and_measure (",
+];
+
+/// The passes the owner must run, each satisfied by any one of its
+/// spellings: `external::observe_external` is `discover_and_measure`
+/// plus the store interiors it identifies in the same pass. Every
+/// spelling stays forbidden everywhere else.
+const DISCOVERY_PASSES: &[&[&str]] = &[
+    &[
+        "external :: discover_and_measure (",
+        "external :: observe_external (",
+    ],
+    &["agents :: discover_and_measure ("],
 ];
 
 /// Statement: one observation owns discovery.
@@ -2111,14 +2124,14 @@ pub fn discovery_owned_by_report_pipeline(root: &Path) -> Result<(), String> {
                 DISCOVERY_OWNER.0, DISCOVERY_OWNER.1
             )
         })?;
-    for call in DISCOVERY_CALLS {
-        if !owner_fn.body.contains(call) {
+    for pass in DISCOVERY_PASSES {
+        if !pass.iter().any(|call| owner_fn.body.contains(call)) {
             return Err(format!(
                 "{}::{} does not call `{}`: one observation owns *both* passes, or their \
                  ownership windows can disagree again",
                 DISCOVERY_OWNER.0,
                 DISCOVERY_OWNER.1,
-                call.trim()
+                pass[0].trim()
             ));
         }
     }

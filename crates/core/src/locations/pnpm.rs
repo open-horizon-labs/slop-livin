@@ -13,9 +13,9 @@
 //! a real, named gap, not silently claimed as covered.
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    BuildStoreDecl, BuildStoreKind, ConventionRole, Detector, Environment, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 use std::path::PathBuf;
 
@@ -77,6 +77,13 @@ impl Detector for PnpmDetector {
             command: "pnpm install",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::PnpmStore,
+            anchor: StoreAnchor::SoleLocation,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

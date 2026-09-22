@@ -16,9 +16,9 @@
 //! A failed/absent query still leaves the conventional path proposed.
 
 use super::{
-    CommandOutcome, ConventionRole, Detector, Environment, LocationStatus, ManagerConvention,
-    Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
-    StoreAnchor,
+    BuildStoreDecl, BuildStoreKind, CommandOutcome, ConventionRole, Detector, Environment,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory, StoreAnchor,
 };
 
 pub const XCODE_DETECTOR_ID: &str = "xcode";
@@ -63,6 +63,32 @@ impl Detector for XcodeDetector {
             command: "xcodebuild build",
             cost: RecoveryCost::LocalRebuild,
         })
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::XcodeDerivedData,
+                anchor: StoreAnchor::CategorizedExcept {
+                    category: StorageCategory::BuildOutput,
+                    except: &[&["Archives"]],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::XcodeArchives,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::BuildOutput,
+                    suffix: &["Archives"],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::XcodeDeviceSupport,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &[],
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

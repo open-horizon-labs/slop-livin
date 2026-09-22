@@ -6,7 +6,8 @@
 //! not a detector at all -- see `docs/locations.md`.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const PIP_DETECTOR_ID: &str = "pip";
@@ -28,6 +29,13 @@ impl Detector for PipDetector {
 
     fn version_note(&self) -> &'static str {
         "pip user guide, current stable cache directory defaults"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::PipCache,
+            anchor: StoreAnchor::SoleLocation,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

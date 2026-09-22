@@ -64,7 +64,7 @@ pub mod windsurf;
 pub mod xcode;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -572,6 +572,201 @@ pub enum StoreAnchor {
         up: usize,
         category: StorageCategory,
     },
+    /// The detector's locations in `category` whose path ends with none
+    /// of `except`: for a category that holds one fixed-shape location
+    /// beside free-form ones (Xcode's `Archives` beside the default *and*
+    /// a custom `IDECustomDerivedDataLocation`).
+    CategorizedExcept {
+        category: StorageCategory,
+        except: &'static [&'static [&'static str]],
+    },
+}
+
+impl StoreAnchor {
+    /// Which of one detector's locations -- given as `(category, path)`,
+    /// in the detector's own order -- this anchor selects. The one
+    /// evaluation of the anchor vocabulary, so a consumer never holds a
+    /// path shape of its own.
+    pub fn select(&self, locations: &[(StorageCategory, &Path)]) -> Vec<usize> {
+        fn ends_with(path: &Path, suffix: &[&str]) -> bool {
+            let comps: Vec<String> = path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            suffix.len() <= comps.len()
+                && comps[comps.len() - suffix.len()..]
+                    .iter()
+                    .zip(suffix.iter())
+                    .all(|(a, b)| a == b)
+        }
+        let of = |category: StorageCategory, pred: &dyn Fn(&Path) -> bool| -> Vec<usize> {
+            locations
+                .iter()
+                .enumerate()
+                .filter(|(_, (c, p))| *c == category && pred(p))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        match *self {
+            Self::SoleLocation => (0..locations.len()).collect(),
+            Self::Categorized { category, suffix } => of(category, &|p| ends_with(p, suffix)),
+            Self::CategorizedExcept { category, except } => {
+                of(category, &|p| !except.iter().any(|s| ends_with(p, s)))
+            }
+            Self::AncestorOfSibling {
+                sibling,
+                up,
+                category,
+            } => {
+                let Some((_, sib)) = locations.iter().find(|(c, _)| *c == sibling) else {
+                    return Vec::new();
+                };
+                let mut path: &Path = sib;
+                for _ in 0..up {
+                    let Some(parent) = path.parent() else {
+                        return Vec::new();
+                    };
+                    path = parent;
+                }
+                of(category, &|p| p == path)
+            }
+        }
+    }
+}
+
+/// Which kind of machine-wide build store a detector location is: the
+/// capability a detector declares (`Detector::build_stores`) and a build
+/// adapter claims (`build_adapters::BuildAdapter::store_kinds`), so the
+/// external observation can hand a measured store to the adapter that
+/// identifies its interior without either side naming the other
+/// (`.oh/guardrails/build-stores-join-by-capability.md`).
+///
+/// A kind names a *layout*, not a tool: a second tool that writes the
+/// same layout declares the same kind and needs no adapter change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildStoreKind {
+    /// npm's content-addressed `_cacache`.
+    NpmCache,
+    /// pnpm's content-addressable store.
+    PnpmStore,
+    /// `<gradle-user-home>/caches`.
+    GradleCaches,
+    /// `<gradle-user-home>/wrapper/dists`.
+    GradleWrapperDists,
+    /// `<gradle-user-home>/daemon`.
+    GradleDaemon,
+    /// `<gradle-user-home>/native`.
+    GradleNative,
+    /// A Maven-layout local repository.
+    MavenRepository,
+    /// Go's extracted module cache (`GOMODCACHE`, minus `cache/download`).
+    GoModuleCache,
+    /// Go's raw module downloads (`GOMODCACHE/cache/download`).
+    GoModuleDownloads,
+    /// Go's build cache (`GOCACHE`).
+    GoBuildCache,
+    /// pip's HTTP and wheel cache.
+    PipCache,
+    /// uv's cache directory.
+    UvCache,
+    /// uv-managed Python installations.
+    UvPythonInstallations,
+    /// uv-installed tool environments.
+    UvToolEnvironments,
+    /// Xcode's DerivedData directory (default or custom location).
+    XcodeDerivedData,
+    /// Xcode's `Archives` directory.
+    XcodeArchives,
+    /// `iOS DeviceSupport` / `watchOS DeviceSupport` symbol caches.
+    XcodeDeviceSupport,
+    /// CoreSimulator's `Devices` directory.
+    SimulatorDevices,
+    /// CoreSimulator runtime installations.
+    SimulatorRuntimes,
+    /// CoreSimulator's own cache.
+    SimulatorCaches,
+    /// One Android SDK package directory (`platforms`, `build-tools`,
+    /// `system-images`, `emulator`, `ndk`, ...).
+    AndroidSdkPackages,
+    /// Android Virtual Device data (`~/.android/avd`).
+    AndroidVirtualDevices,
+    /// A BuildKit build cache, answered by the Docker daemon rather than
+    /// measured on disk.
+    BuildKitCache,
+}
+
+impl BuildStoreKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NpmCache => "npm-cache",
+            Self::PnpmStore => "pnpm-store",
+            Self::GradleCaches => "gradle-caches",
+            Self::GradleWrapperDists => "gradle-wrapper-dists",
+            Self::GradleDaemon => "gradle-daemon",
+            Self::GradleNative => "gradle-native",
+            Self::MavenRepository => "maven-repository",
+            Self::GoModuleCache => "go-module-cache",
+            Self::GoModuleDownloads => "go-module-downloads",
+            Self::GoBuildCache => "go-build-cache",
+            Self::PipCache => "pip-cache",
+            Self::UvCache => "uv-cache",
+            Self::UvPythonInstallations => "uv-python-installations",
+            Self::UvToolEnvironments => "uv-tool-environments",
+            Self::XcodeDerivedData => "xcode-derived-data",
+            Self::XcodeArchives => "xcode-archives",
+            Self::XcodeDeviceSupport => "xcode-device-support",
+            Self::SimulatorDevices => "simulator-devices",
+            Self::SimulatorRuntimes => "simulator-runtimes",
+            Self::SimulatorCaches => "simulator-caches",
+            Self::AndroidSdkPackages => "android-sdk-packages",
+            Self::AndroidVirtualDevices => "android-virtual-devices",
+            Self::BuildKitCache => "buildkit-cache",
+        }
+    }
+
+    /// Whether a daemon answers for this store's contents rather than a
+    /// directory swamp walks. Such a store is joined from the daemon's
+    /// already-fetched facts, never measured on disk.
+    pub fn answered_by_daemon(self) -> bool {
+        matches!(self, Self::BuildKitCache)
+    }
+
+    pub const ALL: &'static [Self] = &[
+        Self::NpmCache,
+        Self::PnpmStore,
+        Self::GradleCaches,
+        Self::GradleWrapperDists,
+        Self::GradleDaemon,
+        Self::GradleNative,
+        Self::MavenRepository,
+        Self::GoModuleCache,
+        Self::GoModuleDownloads,
+        Self::GoBuildCache,
+        Self::PipCache,
+        Self::UvCache,
+        Self::UvPythonInstallations,
+        Self::UvToolEnvironments,
+        Self::XcodeDerivedData,
+        Self::XcodeArchives,
+        Self::XcodeDeviceSupport,
+        Self::SimulatorDevices,
+        Self::SimulatorRuntimes,
+        Self::SimulatorCaches,
+        Self::AndroidSdkPackages,
+        Self::AndroidVirtualDevices,
+        Self::BuildKitCache,
+    ];
+}
+
+/// One declaration: which of a detector's locations is a store of
+/// `kind`, expressed with the same [`StoreAnchor`] vocabulary
+/// `manager_conventions` uses -- against what the detector already
+/// publishes, never a path literal the joining code has to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildStoreDecl {
+    pub kind: BuildStoreKind,
+    pub anchor: StoreAnchor,
 }
 
 /// How a shared package store answers "do you hold this exact package
@@ -720,6 +915,15 @@ pub trait Detector: Send + Sync {
     /// none rather than picking one to stand for the rest.
     fn recovery_hint(&self) -> Option<RecoveryHint> {
         None
+    }
+    /// Which of this detector's locations are machine-wide build stores,
+    /// and of which kind. The external observation hands each such
+    /// measured location to the build adapter that claims the kind
+    /// (`.oh/guardrails/build-stores-join-by-capability.md`); a detector
+    /// that declares nothing contributes no interior, only its whole
+    /// external units.
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[]
     }
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation>;
 }

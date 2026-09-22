@@ -8,7 +8,8 @@
 //! https://docs.astral.sh/uv/reference/storage/
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const UV_DETECTOR_ID: &str = "uv";
@@ -40,6 +41,32 @@ impl Detector for UvDetector {
 
     fn version_note(&self) -> &'static str {
         "uv storage reference, current stable (cache dir is ~/.cache/uv on macOS too)"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::UvCache,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::UvPythonInstallations,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::UvToolEnvironments,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Environments,
+                    suffix: &[],
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

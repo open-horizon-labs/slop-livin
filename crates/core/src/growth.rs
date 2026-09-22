@@ -3766,14 +3766,25 @@ pub enum KeyFamily {
     External,
     /// Units *inside* a tool home (`crate::agents`).
     Agent,
+    /// Identified units *inside* a machine-wide build store
+    /// (`crate::build_stores`): a Maven artifact version, a Go module, a
+    /// DerivedData project folder. Written by the external observation
+    /// that measured the store, and swept only inside stores whose
+    /// interior that observation identified this pass.
+    BuildStore,
 }
+
+/// The category prefix of [`KeyFamily::BuildStore`] rows.
+pub const BUILD_STORE_CATEGORY_PREFIX: &str = "build-store:";
 
 impl KeyFamily {
     fn matches(self, category: &str) -> bool {
         let is_agent = category.starts_with("agent:");
+        let is_build_store = category.starts_with(BUILD_STORE_CATEGORY_PREFIX);
         match self {
             Self::Agent => is_agent,
-            Self::External => !is_agent,
+            Self::BuildStore => is_build_store,
+            Self::External => !is_agent && !is_build_store,
         }
     }
 }

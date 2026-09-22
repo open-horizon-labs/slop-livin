@@ -328,6 +328,11 @@ impl BuildAdapter for Adapter {
         }
     }
 
+    fn store_kinds(&self) -> &'static [crate::locations::BuildStoreKind] {
+        use crate::locations::BuildStoreKind;
+        &[BuildStoreKind::NpmCache, BuildStoreKind::PnpmStore]
+    }
+
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
         if !project_root.join("package.json").is_file() {
             return Vec::new();

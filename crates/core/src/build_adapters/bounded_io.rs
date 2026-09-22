@@ -34,6 +34,9 @@ pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub text: String,
+    /// The same bytes, undecoded, for a format that is not text (a
+    /// binary property list). Never more than the cap.
+    pub raw: Vec<u8>,
     /// The file was at least as large as the cap, so `text` may end
     /// mid-token.
     pub truncated: bool,
@@ -71,6 +74,7 @@ pub fn read_manifest(path: &Path, cap: usize) -> Option<Manifest> {
     Some(Manifest {
         truncated: filled == cap,
         text: String::from_utf8_lossy(&buf).into_owned(),
+        raw: buf,
     })
 }
 

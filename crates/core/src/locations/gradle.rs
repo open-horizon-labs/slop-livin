@@ -6,9 +6,9 @@
 //! cache). https://docs.gradle.org/current/userguide/directory_layout.html
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    BuildStoreDecl, BuildStoreKind, ConventionRole, Detector, Environment, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 
 pub const GRADLE_DETECTOR_ID: &str = "gradle";
@@ -50,6 +50,39 @@ impl Detector for GradleDetector {
             command: "gradle build",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::GradleCaches,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["caches"],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::GradleWrapperDists,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &["wrapper", "dists"],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::GradleDaemon,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::LocalState,
+                    suffix: &["daemon"],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::GradleNative,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["native"],
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

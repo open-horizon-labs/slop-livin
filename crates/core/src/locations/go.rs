@@ -15,9 +15,9 @@
 //! https://pkg.go.dev/cmd/go
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    BuildStoreDecl, BuildStoreKind, ConventionRole, Detector, Environment, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -90,6 +90,33 @@ impl Detector for GoDetector {
         })
     }
 
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::GoModuleCache,
+                anchor: StoreAnchor::AncestorOfSibling {
+                    sibling: StorageCategory::Downloads,
+                    up: 2,
+                    category: StorageCategory::Cache,
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::GoModuleDownloads,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Downloads,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::GoBuildCache,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::BuildOutput,
+                    suffix: &[],
+                },
+            },
+        ]
+    }
+
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let goenv: HashMap<String, String> = std::fs::read_to_string(goenv_path(env))
             .ok()
@@ -155,7 +182,11 @@ impl Detector for GoDetector {
             ProposedLocation {
                 detector_id: GO_DETECTOR_ID.to_string(),
                 path: Some(gocache),
-                category: StorageCategory::Cache,
+                // Compiled package and test outputs, keyed by action
+                // hash: a build cache, not a download cache. Its own
+                // category is also what lets `build_stores` tell it from
+                // the module cache, whose path is just as free-form.
+                category: StorageCategory::BuildOutput,
                 provenance: gocache_prov,
                 status: LocationStatus::Resolved,
                 note: Some("build cache".to_string()),

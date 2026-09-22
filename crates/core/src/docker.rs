@@ -59,6 +59,15 @@ pub struct DockerImageFact {
     pub dangling: bool,
 }
 
+/// One BuildKit build-cache record, as the daemon reported it.
+///
+/// Every field is the daemon's own fact, kept in the daemon's terms:
+/// `created_at`/`last_used` are the daemon's records (RFC 3339 strings,
+/// unparsed here), `bytes` is its logical size for this record alone --
+/// a record's parents are separate records with their own sizes, never
+/// included -- and `in_use`/`shared`/`reclaimable` are what the daemon
+/// said, not inferences. `None` means the daemon (or the CLI version
+/// asked) did not report that field, which is different from `false`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerCacheFact {
     pub id: String,
@@ -67,6 +76,75 @@ pub struct DockerCacheFact {
     pub usage_count: Option<u64>,
     pub in_use: bool,
     pub shared: bool,
+    /// BuildKit's record type: `regular`, `internal`, `frontend`,
+    /// `source.local`, `source.git.checkout`, `exec.cachemount`, ...
+    #[serde(default)]
+    pub cache_type: Option<String>,
+    /// The daemon's description (`[build 2/5] RUN apt-get ...`,
+    /// `local source for context`). Producer evidence, never parsed for
+    /// identity.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Parent record ids. A child's size never includes a parent's.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// `docker buildx du` only: whether the daemon would reclaim it.
+    #[serde(default)]
+    pub reclaimable: Option<bool>,
+    /// `docker buildx du` only: whether the record is a mutable snapshot.
+    #[serde(default)]
+    pub mutable: Option<bool>,
+    /// The buildx builder whose BuildKit instance holds this record;
+    /// `None` for the daemon's own (default) builder, as `docker system
+    /// df` reports it.
+    #[serde(default)]
+    pub builder: Option<String>,
+}
+
+/// One buildx builder, from `docker buildx ls`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DockerBuilderFact {
+    pub name: String,
+    pub driver: Option<String>,
+    pub status: Option<String>,
+}
+
+/// What this daemon and CLI could answer, stated rather than inferred
+/// from an empty list (#71: "unavailable daemon/version capability
+/// explicit").
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DockerCapabilities {
+    /// The daemon's API version (`docker version`'s `Server.ApiVersion`),
+    /// when it answered.
+    pub api_version: Option<String>,
+    /// Why per-builder BuildKit records are not listed, when they are
+    /// not: buildx missing, `buildx ls` failed, a builder's `du` timed
+    /// out. Empty when every builder answered.
+    pub buildx_limits: Vec<String>,
+}
+
+/// The oldest daemon API that reports build-cache records in `docker
+/// system df -v` (API 1.39, Docker 18.09). An older daemon's records are
+/// listed, if at all, without the detail this layer identifies by.
+pub const MIN_BUILD_CACHE_API: (u32, u32) = (1, 39);
+
+impl DockerCapabilities {
+    /// Whether the daemon's API is known to predate build-cache record
+    /// detail. Unknown (no version reported) is not "unsupported".
+    pub fn build_cache_api_unsupported(&self) -> bool {
+        let Some(v) = &self.api_version else {
+            return false;
+        };
+        let mut parts = v.trim().split('.');
+        let major: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+        let minor: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+        match (major, minor) {
+            (Some(a), Some(b)) => (a, b) < MIN_BUILD_CACHE_API,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -87,6 +165,47 @@ pub struct DockerFacts {
     /// Set when the daemon/file could not be read: the reason text is
     /// surfaced as a report-level coverage note, never an error.
     pub unavailable: Option<String>,
+    /// Builders `docker buildx ls` listed. Empty when buildx is absent or
+    /// was not asked; the daemon's own builder is always implied.
+    #[serde(default)]
+    pub builders: Vec<DockerBuilderFact>,
+    #[serde(default)]
+    pub capabilities: DockerCapabilities,
+    /// When these facts were fetched from the daemon, in seconds. `None`
+    /// for a facts file, whose capture time swamp does not know.
+    #[serde(default)]
+    pub captured_at: Option<u64>,
+}
+
+/// The name `docker system df`'s own build cache is reported under.
+pub const DEFAULT_BUILDER: &str = "default";
+
+impl DockerFacts {
+    /// Every builder a record or `buildx ls` names, the daemon's own
+    /// first. A builder with no records is still a builder: its empty
+    /// cache is a fact, not an absence.
+    pub fn builder_names(&self) -> Vec<String> {
+        let mut out = vec![DEFAULT_BUILDER.to_string()];
+        for name in self
+            .builders
+            .iter()
+            .map(|b| b.name.clone())
+            .chain(self.build_cache.iter().filter_map(|r| r.builder.clone()))
+        {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// The records one builder holds.
+    pub fn records_of(&self, builder: &str) -> Vec<&DockerCacheFact> {
+        self.build_cache
+            .iter()
+            .filter(|r| r.builder.as_deref().unwrap_or(DEFAULT_BUILDER) == builder)
+            .collect()
+    }
 }
 
 /// One container as read from `docker ps -a --format json` plus a
@@ -244,8 +363,52 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
                 usage_count,
                 in_use,
                 shared,
+                cache_type: entry.get("CacheType").and_then(opt_value_str),
+                description: entry.get("Description").and_then(opt_value_str),
+                parents: parents_of(entry),
+                created_at: entry.get("CreatedAt").and_then(opt_value_str),
+                reclaimable: None,
+                mutable: None,
+                builder: None,
             });
         }
+    }
+
+    if let Some(v) = value.get("Version") {
+        facts.capabilities.api_version = api_version_of(v);
+    }
+    if let Some(rows) = value.get("Builders").and_then(|v| v.as_array()) {
+        facts.builders = rows.iter().filter_map(parse_builder).collect();
+    }
+    if let Some(entries) = value.get("BuildxDu").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let builder = entry.get("Builder").map(value_str).unwrap_or_default();
+            if builder.is_empty() {
+                continue;
+            }
+            if let Some(reason) = entry.get("Unavailable").and_then(opt_value_str) {
+                facts
+                    .capabilities
+                    .buildx_limits
+                    .push(format!("builder `{builder}`: {reason}"));
+                continue;
+            }
+            let records = match (entry.get("Verbose"), entry.get("Records")) {
+                (Some(text), _) => parse_buildx_du_verbose(&value_str(text)),
+                (None, Some(rows)) => rows
+                    .as_array()
+                    .map(|a| a.iter().map(parse_buildx_record).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            merge_builder_records(&mut facts, &builder, records);
+        }
+    }
+    if let Some(limits) = value.get("BuildxLimits").and_then(|v| v.as_array()) {
+        facts
+            .capabilities
+            .buildx_limits
+            .extend(limits.iter().filter_map(opt_value_str));
     }
 
     if let Some(entries) = value.get("Volumes").and_then(|v| v.as_array()) {
@@ -302,6 +465,166 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
 /// {"Layers": [...]}}, ...]`, the same shape `docker image inspect
 /// --format json` returns) into the df-sourced image facts, matching by
 /// image ID first and falling back to a shared repo:tag.
+/// `Parents` (an array, API >= 1.42) or the deprecated single `Parent`.
+fn parents_of(entry: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = entry.get("Parents").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect();
+    }
+    match entry.get("Parents").or_else(|| entry.get("Parent")) {
+        Some(v) => value_str(v)
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn api_version_of(v: &serde_json::Value) -> Option<String> {
+    v.get("Server")
+        .and_then(|s| s.get("ApiVersion"))
+        .and_then(opt_value_str)
+}
+
+fn parse_builder(row: &serde_json::Value) -> Option<DockerBuilderFact> {
+    let name = row.get("Name").and_then(opt_value_str)?;
+    let status = row
+        .get("Nodes")
+        .and_then(|n| n.as_array())
+        .and_then(|n| n.first())
+        .and_then(|n| n.get("Status"))
+        .and_then(opt_value_str)
+        .or_else(|| row.get("Status").and_then(opt_value_str));
+    Some(DockerBuilderFact {
+        name,
+        driver: row.get("Driver").and_then(opt_value_str),
+        status,
+    })
+}
+
+fn opt_bool(v: Option<&serde_json::Value>) -> Option<bool> {
+    let v = v?;
+    v.as_bool().or_else(|| match v.as_str()? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    })
+}
+
+/// One record of `docker buildx du --verbose --format json`.
+fn parse_buildx_record(r: &serde_json::Value) -> DockerCacheFact {
+    DockerCacheFact {
+        id: r.get("ID").map(value_str).unwrap_or_default(),
+        bytes: r
+            .get("Size")
+            .map(|v| v.as_u64().unwrap_or_else(|| parse_size(&value_str(v))))
+            .unwrap_or(0),
+        last_used: r.get("LastUsedAt").and_then(opt_value_str),
+        usage_count: r.get("UsageCount").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }),
+        in_use: opt_bool(r.get("InUse")).unwrap_or(false),
+        shared: opt_bool(r.get("Shared")).unwrap_or(false),
+        cache_type: r
+            .get("Type")
+            .or_else(|| r.get("CacheType"))
+            .and_then(opt_value_str),
+        description: r.get("Description").and_then(opt_value_str),
+        parents: parents_of(r),
+        created_at: r.get("CreatedAt").and_then(opt_value_str),
+        reclaimable: opt_bool(r.get("Reclaimable")),
+        mutable: opt_bool(r.get("Mutable")),
+        builder: None,
+    }
+}
+
+/// `docker buildx du --verbose`'s documented text shape: one block per
+/// record, `Key:\tvalue` lines, blocks separated by a blank line, and a
+/// trailing `Shared:`/`Private:`/`Reclaimable:`/`Total:` summary that
+/// is not a record.
+pub fn parse_buildx_du_verbose(text: &str) -> Vec<DockerCacheFact> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for line in block.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                fields.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        let Some(id) = fields.get("ID").filter(|v| !v.is_empty()).cloned() else {
+            continue;
+        };
+        let flag = |k: &str| fields.get(k).and_then(|v| v.parse::<bool>().ok());
+        out.push(DockerCacheFact {
+            id,
+            bytes: fields.get("Size").map(|s| parse_size(s)).unwrap_or(0),
+            last_used: fields.get("Last used").filter(|v| !v.is_empty()).cloned(),
+            usage_count: fields.get("Usage count").and_then(|v| v.parse().ok()),
+            in_use: flag("In use").unwrap_or(false),
+            shared: flag("Shared").unwrap_or(false),
+            cache_type: fields.get("Type").filter(|v| !v.is_empty()).cloned(),
+            description: fields.get("Description").filter(|v| !v.is_empty()).cloned(),
+            parents: fields
+                .get("Parents")
+                .or_else(|| fields.get("Parent"))
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            created_at: fields.get("Created at").filter(|v| !v.is_empty()).cloned(),
+            reclaimable: flag("Reclaimable"),
+            mutable: flag("Mutable"),
+            builder: None,
+        });
+    }
+    out
+}
+
+/// One builder's records, attributed to it. The daemon's own builder is
+/// already reported by `docker system df`; `buildx du` for it describes
+/// the same records, so its extra fields are merged onto them by id
+/// rather than listed twice.
+fn merge_builder_records(facts: &mut DockerFacts, builder: &str, records: Vec<DockerCacheFact>) {
+    let is_default = builder == DEFAULT_BUILDER
+        || facts
+            .builders
+            .iter()
+            .any(|b| b.name == builder && b.driver.as_deref() == Some("docker"));
+    for mut r in records {
+        if is_default
+            && let Some(existing) = facts
+                .build_cache
+                .iter_mut()
+                .find(|e| e.builder.is_none() && e.id == r.id)
+        {
+            existing.reclaimable = r.reclaimable.or(existing.reclaimable);
+            existing.mutable = r.mutable.or(existing.mutable);
+            if existing.parents.is_empty() {
+                existing.parents = r.parents;
+            }
+            if existing.cache_type.is_none() {
+                existing.cache_type = r.cache_type;
+            }
+            continue;
+        }
+        if !is_default {
+            r.builder = Some(builder.to_string());
+        }
+        facts.build_cache.push(r);
+    }
+}
+
 fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_json::Value]) {
     for entry in inspect_entries {
         let id = entry

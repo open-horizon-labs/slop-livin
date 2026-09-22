@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod assoc_store;
 pub mod attribution;
 pub mod build_adapters;
+pub(crate) mod build_stores;
 pub mod bus;
 pub mod cargo_artifacts;
 pub mod cargo_cleanup;

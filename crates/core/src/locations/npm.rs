@@ -12,9 +12,9 @@
 //! get cache` (no npm process is ever spawned by this detector).
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    BuildStoreDecl, BuildStoreKind, ConventionRole, Detector, Environment, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 
 pub const NPM_DETECTOR_ID: &str = "npm";
@@ -71,6 +71,13 @@ impl Detector for NpmDetector {
             command: "npm install",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::NpmCache,
+            anchor: StoreAnchor::SoleLocation,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
