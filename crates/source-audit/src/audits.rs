@@ -157,6 +157,43 @@ pub const AUDITS: &[(&str, Audit)] = &[
         "activity_and_consumer_evidence_have_limits",
         crate::repair_audits::activity_and_consumer_evidence_have_limits,
     ),
+    // GUARDRAILS_SPEC.md section 18: the build-artifact adapter set,
+    // the mirror of sections 13/14 for `crates/core/src/build_adapters/`.
+    // Landed before the adapters themselves, deliberately failing, so
+    // the baseline is the audit's own enumeration
+    // (`.oh/sessions/2026-09-21-build-adapters-node-jvm.md`).
+    (
+        "build_adapters_are_pluggable",
+        crate::build_audits::build_adapters_are_pluggable,
+    ),
+    (
+        "build_adapters_are_inspection_only",
+        crate::build_audits::build_adapters_are_inspection_only,
+    ),
+    (
+        "build_adapters_read_bounded_manifests_only",
+        crate::build_audits::build_adapters_read_bounded_manifests_only,
+    ),
+    (
+        "build_adapters_do_not_traverse",
+        crate::build_audits::build_adapters_do_not_traverse,
+    ),
+    (
+        "build_units_built_through_builder",
+        crate::build_audits::build_units_built_through_builder,
+    ),
+    (
+        "build_adapter_test_contract",
+        crate::build_audits::build_adapter_test_contract,
+    ),
+    (
+        "build_adapter_matrix_matches_docs",
+        crate::build_audits::build_adapter_matrix_matches_docs,
+    ),
+    (
+        "build_adapters_reuse_under_event_coverage",
+        crate::build_audits::build_adapters_reuse_under_event_coverage,
+    ),
 ];
 
 /// The guardrail-level umbrella: the three bus audits together.
