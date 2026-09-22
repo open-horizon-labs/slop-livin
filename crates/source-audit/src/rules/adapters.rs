@@ -592,7 +592,7 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
                 .flat_map(|d| d.literals.iter()),
         )
         .any(|s| s.chars().all(|c| c.is_ascii_lowercase() || c == '-') && s.contains('-'));
-    if !matrix_ids.then_some(()).is_some() {
+    if !matrix_ids {
         problems.push("agents/matrix.rs exposes no tool ids to compare with the registry".into());
     }
     verdict(

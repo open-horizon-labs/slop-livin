@@ -403,12 +403,15 @@ pub struct Program {
 // Loading
 // ---------------------------------------------------------------------
 
+/// The exact set of parsed files a program was assembled from.
+type FilesKey = Vec<(String, u64)>;
+
 thread_local! {
     /// The last program assembled on this thread, keyed on the exact set
     /// of parsed files (their paths and the ids of their contents). The
     /// forty-five audits over one tree share one model; a different tree
     /// (a mutation-corpus fixture) gets its own.
-    static LAST: RefCell<Option<(Vec<(String, u64)>, Rc<Program>)>> = const { RefCell::new(None) };
+    static LAST: RefCell<Option<(FilesKey, Rc<Program>)>> = const { RefCell::new(None) };
 }
 
 impl Program {
@@ -890,6 +893,7 @@ impl Collector<'_> {
         self.funs.push(Rc::new(fun));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decl(
         &mut self,
         kind: DeclKind,
@@ -2117,9 +2121,7 @@ impl Program {
             .funs
             .iter()
             .enumerate()
-            .filter(|(_, f)| {
-                f.calls.iter().any(|c| emitter_call(c)) || f.macros.iter().any(macro_emits)
-            })
+            .filter(|(_, f)| f.calls.iter().any(emitter_call) || f.macros.iter().any(macro_emits))
             .map(|(i, _)| i)
             .collect();
         let key = "emitters".to_string();

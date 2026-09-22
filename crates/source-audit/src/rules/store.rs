@@ -387,10 +387,10 @@ fn observed_lookup(f: &Fun, cond: &str) -> bool {
         let Some(at) = c.find(m) else { continue };
         let map = resolve::root_ident(&c[..at]);
         let arg = resolve::root_ident(&c[at + m.len()..]);
-        if let Some(b) = f.bindings.iter().find(|b| b.name == arg) {
-            if resolve::root_ident(&b.from) != map {
-                return true;
-            }
+        if let Some(b) = f.bindings.iter().find(|b| b.name == arg)
+            && resolve::root_ident(&b.from) != map
+        {
+            return true;
         }
     }
     false

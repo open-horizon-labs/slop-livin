@@ -179,8 +179,8 @@ fn self_field_supplied(p: &Program, f: &Fun, field: &str) -> bool {
     let mut seen = false;
     for g in p.funs.iter() {
         for l in &g.struct_lits {
-            if !resolve::path_ends_with(&l.path, ty)
-                && !(l.path == "Self" && g.self_ty.as_deref() == Some(ty))
+            if !(resolve::path_ends_with(&l.path, ty)
+                || (l.path == "Self" && g.self_ty.as_deref() == Some(ty)))
             {
                 continue;
             }

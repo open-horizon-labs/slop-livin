@@ -39,6 +39,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # the smallest way to keep `-D warnings` meaningful everywhere else.
 [workspace.lints.clippy]
 cloned_ref_to_slice_refs = "allow"
+# Re-review 3's reviewer_counterexamples_stack3.rs builds a fixture line
+# with `format!` and no arguments; the same reasoning as above applies.
+useless_format = "allow"
 
 [profile.release]
 opt-level = 3
