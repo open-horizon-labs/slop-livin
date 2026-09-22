@@ -142,6 +142,21 @@ pub const AUDITS: &[(&str, Audit)] = &[
         "no_dead_public_evidence_api",
         crate::repair_audits::no_dead_public_evidence_api,
     ),
+    // The 2026-09-22 re-review: the three guardrails with no audit were
+    // the three it broke. Landed before their repairs, deliberately
+    // failing (`.oh/sessions/2026-09-22-review-2-repairs.md`).
+    (
+        "computed_but_not_delivered",
+        crate::repair_audits::computed_but_not_delivered,
+    ),
+    (
+        "coverage_changes_are_not_storage_changes",
+        crate::repair_audits::coverage_changes_are_not_storage_changes,
+    ),
+    (
+        "activity_and_consumer_evidence_have_limits",
+        crate::repair_audits::activity_and_consumer_evidence_have_limits,
+    ),
 ];
 
 /// The guardrail-level umbrella: the three bus audits together.

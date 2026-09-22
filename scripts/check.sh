@@ -11,6 +11,12 @@ cargo run -q -p swamp-source-audit
 cargo test -p swamp-core \
   --test reviewer_counterexamples \
   --test reviewer_counterexamples_123 \
+  --test reviewer_counterexamples_stack2 \
+  --test reviewer_cost_measurement_stack2 \
+  --test coverage_changes_are_not_storage_changes \
+  --test explicit_root_scope_exclusions \
+  --test nested_artifact_evidence_is_delivered \
+  --test upstream_citations_are_checked \
   --test execution_rechecks \
   --test shared_history_ownership \
   --test store_contents_are_allowlisted \
@@ -18,7 +24,8 @@ cargo test -p swamp-core \
   --test agent_matrix_matches_docs \
   --test agent_storage_validation \
   -- --test-threads=1
-cargo test -p swamp-tui --test scope_preserving_refresh
+cargo test -p swamp-tui --test scope_preserving_refresh \
+  --test reviewer_counterexamples_stack2_tui
 
 # These checks intentionally fail obvious safety regressions in source
 # review: a raw recursive delete, and verdict vocabulary the tool never

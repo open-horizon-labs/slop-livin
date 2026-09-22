@@ -692,8 +692,52 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
             }
         }
     }
+    // The allow-list says *where* a re-walk may be written. The 2026-09-22
+    // re-review's sharpest audit finding is that this is not the same as
+    // *whether* it happens: `folded_measurement::measure` sat on the
+    // allow-list and re-walked every external root on every pass while
+    // this audit stayed green and the guardrail above it claimed reuse.
+    // So the audit now follows the callee: `measure` must consult the
+    // persisted folded rows before it may call `resize_artifact*`.
+    let fm = maybe_parse(root, "crates/core/src/folded_measurement.rs");
+    let funcs = fm
+        .as_ref()
+        .map(|f| ast::functions(&f.ast))
+        .unwrap_or_default();
+    let measure = funcs.iter().find(|f| f.name == "measure");
+    if let Some(measure) = measure
+        && let Some(resize_at) = measure.body.find("resize_artifact")
+    {
+        let reuse_at = REUSE_LOOKUPS
+            .iter()
+            .filter_map(|n| measure.body.find(n))
+            .min();
+        match reuse_at {
+            Some(i) if i < resize_at => {}
+            _ => {
+                return Err(
+                    "folded_measurement::measure calls `resize_artifact*` without first \
+                     consulting the persisted folded rows (one of: \
+                     reuse_folded_measurement / persisted_folded_bytes / \
+                     record_cache_hit-guarded lookup). The allow-list proves only where a \
+                     re-walk is written, not whether it happens -- \
+                     `.oh/guardrails/no-second-traversal-on-report-path.md` claims reuse, so \
+                     the reuse has to be in the code"
+                        .into(),
+                );
+            }
+        }
+    }
     Ok(())
 }
+
+/// The lookup names that count as "consulted the rows the walk already
+/// persisted" in `folded_measurement::measure`.
+const REUSE_LOOKUPS: &[&str] = &[
+    "reuse_folded_measurement",
+    "persisted_folded_bytes",
+    "reusable_measurement",
+];
 
 // ---------------------------------------------------------------------
 // 7. occupancy_is_tristate_at_sinks
@@ -1619,6 +1663,27 @@ const EVIDENCE_MODULES: &[&str] = &[
 /// contract's own serde plumbing).
 const EVIDENCE_API_EXEMPT: &[&str] = &["fmt", "clone", "default", "serialize", "deserialize"];
 
+/// Every `pub const` / `pub static` declared at module level.
+///
+/// The 2026-09-22 re-review found `ACTIVITY_EVIDENCE_INVENTORY` -- the
+/// #54 inventory deliverable -- with zero non-test readers, slipping past
+/// this audit because it only ever scanned `pub fn`. A dead constant is
+/// exactly as undelivered as a dead function.
+fn public_const_names(file: &syn::File) -> Vec<String> {
+    fn is_pub(vis: &syn::Visibility) -> bool {
+        matches!(vis, syn::Visibility::Public(_))
+    }
+    let mut out = Vec::new();
+    for item in &file.items {
+        match item {
+            syn::Item::Const(c) if is_pub(&c.vis) => out.push(c.ident.to_string()),
+            syn::Item::Static(st) if is_pub(&st.vis) => out.push(st.ident.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn public_fn_names(file: &syn::File) -> Vec<String> {
     fn is_pub(vis: &syn::Visibility) -> bool {
         matches!(vis, syn::Visibility::Public(_))
@@ -1674,6 +1739,16 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
                 dead.push(format!("{rel}::{name}"));
             }
         }
+        for name in public_const_names(&f.ast) {
+            // A constant is *read*, not called: any mention of its name
+            // in another non-test function body counts.
+            let read = corpus.iter().any(|(_, _, body)| body.contains(&name));
+            if !read {
+                dead.push(format!(
+                    "{rel}::{name} (pub const/static, no non-test reader)"
+                ));
+            }
+        }
     }
     if dead.is_empty() {
         Ok(())
@@ -1684,6 +1759,298 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
              CHANGELOG claims that say they are delivered:\n  {}",
             dead.join("\n  ")
         ))
+    }
+}
+
+// ---------------------------------------------------------------------
+// 17. computed_but_not_delivered
+// ---------------------------------------------------------------------
+
+/// Types whose `pub` fields are a *delivered* surface: a report row, a
+/// unit, a plan. A field declared here is something a user or an agent
+/// is promised, so it has to reach a renderer or a JSON path.
+const DELIVERED_SURFACE_TYPES: &[&str] = &[
+    "crates/core/src/artifact.rs",
+    "crates/core/src/external.rs",
+    "crates/core/src/report.rs",
+    "crates/core/src/agents/mod.rs",
+];
+
+/// Files that *deliver*: they render to a terminal, build the JSON/agent
+/// contract, or attach the facts a renderer then reads.
+const DELIVERY_FILES: &[&str] = &[
+    "crates/core/src/render.rs",
+    "crates/core/src/agent_json.rs",
+    "crates/core/src/report.rs",
+    "crates/cli/src/main.rs",
+];
+
+/// Initializers that mean "nothing was computed here".
+const EMPTY_INITS: &[&str] = &[
+    "Vec :: new ()",
+    "vec ! []",
+    "Default :: default ()",
+    "Vec :: default ()",
+    "None",
+];
+
+/// A `pub` evidence field on a delivered surface type that is written
+/// only as an empty default, or that no delivery file ever reads, is the
+/// defect `.oh/guardrails/computed-but-not-delivered.md` names.
+///
+/// Scoped to fields whose declared type mentions `Evidence`: that is the
+/// surface the #53-#59 evidence matrix promises row by row, it is the
+/// surface the 2026-09-21 and 2026-09-22 reviews both found holes in, and
+/// it keeps the rule mechanical instead of guessing at every struct field
+/// in the crate.
+pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
+    let all_files = workspace_src_files(root);
+    let mut corpus: Vec<(String, String)> = Vec::new();
+    for rel in &all_files {
+        let Some(f) = maybe_parse(root, rel) else {
+            continue;
+        };
+        corpus.push((rel.clone(), f.text.clone()));
+    }
+    let mut problems: Vec<String> = Vec::new();
+    for rel in DELIVERED_SURFACE_TYPES {
+        let Some(f) = maybe_parse(root, rel) else {
+            continue;
+        };
+        for field in ast::pub_struct_fields(&f.ast) {
+            if !field.ty.contains("Evidence") {
+                continue;
+            }
+            // Every initializer this field is ever given, anywhere.
+            let mut inits: Vec<String> = Vec::new();
+            for rel2 in &all_files {
+                let Some(f2) = maybe_parse(root, rel2) else {
+                    continue;
+                };
+                inits.extend(ast::struct_field_inits(&f2.ast, &field.field));
+            }
+            let has_real_write = inits
+                .iter()
+                .any(|i| !EMPTY_INITS.iter().any(|e| i.trim() == *e));
+            // ... plus a later mutation (`row.evidence = ...`,
+            // `unit.evidence.extend(..)`) counts as a real write.
+            let mutated = corpus.iter().any(|(_, text)| {
+                text.contains(&format!(".{} = ", field.field))
+                    || text.contains(&format!(".{}.extend(", field.field))
+                    || text.contains(&format!(".{}.push(", field.field))
+            });
+            if !has_real_write && !mutated {
+                problems.push(format!(
+                    "{rel}::{}.{} is written only as an empty default ({} site(s)); compute it or \
+                     remove it together with the docs/CHANGELOG claim that it is delivered",
+                    field.struct_name,
+                    field.field,
+                    inits.len()
+                ));
+                continue;
+            }
+            // A field serde always emits (no `skip_serializing_if`) is
+            // delivered by whole-struct serialization on the JSON path,
+            // whether or not a renderer names it. A field serde *hides*
+            // when empty has to be named by something that delivers it.
+            let hidden_when_empty = field.attrs.contains("skip_serializing_if");
+            let delivered = !hidden_when_empty
+                || DELIVERY_FILES.iter().any(|d| {
+                    corpus.iter().any(|(rel2, text)| {
+                        rel2 == d && text.contains(&format!(".{}", field.field))
+                    })
+                });
+            if !delivered {
+                problems.push(format!(
+                    "{rel}::{}.{} is populated but no delivery file ({}) reads it: a populated \
+                     struct field nobody renders is a defect",
+                    field.struct_name,
+                    field.field,
+                    DELIVERY_FILES.join(", ")
+                ));
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n  "))
+    }
+}
+
+// ---------------------------------------------------------------------
+// 18. coverage_changes_are_not_storage_changes
+// ---------------------------------------------------------------------
+
+/// Statements that write a disappearance or a return-from-the-dead into
+/// byte history. Every one of them has to sit inside a loop the
+/// observation's own `ObservationOwnership` guards, because a row outside
+/// what this pass covered is a *coverage* fact, not a storage fact.
+const TOMBSTONE_WRITES: &[&str] = &["present = false", "regrowth_count + 1"];
+
+/// The guards that make such a write legitimate. The external/agent
+/// family uses `ObservationOwnership`; the artifact-row family expresses
+/// the same idea per worktree (`protected_worktree_ids`, #42's
+/// could-not-confirm set). Both say "this pass covered the region the row
+/// lives in"; neither is a licence to tombstone outside it.
+const OWNERSHIP_GUARDS: &[&str] = &[
+    "ownership . owns (",
+    "ownership . covers (",
+    "owns (",
+    "protected_keys . contains (",
+    "protected_worktree_ids . contains (",
+    "protected . contains (",
+];
+
+pub fn coverage_changes_are_not_storage_changes(root: &Path) -> Result<(), String> {
+    let mut files: Vec<String> = vec![
+        "crates/core/src/growth.rs".to_string(),
+        "crates/core/src/external.rs".to_string(),
+        "crates/core/src/report.rs".to_string(),
+    ];
+    files.extend(ast::rust_files_under(root, "crates/core/src/agents"));
+    let mut problems: Vec<String> = Vec::new();
+    for rel in &files {
+        let Some(f) = maybe_parse(root, rel) else {
+            continue;
+        };
+        for func in ast::functions(&f.ast) {
+            let Some((_, write)) = find_first(&func.body, TOMBSTONE_WRITES) else {
+                continue;
+            };
+            if !OWNERSHIP_GUARDS.iter().any(|g| func.body.contains(g)) {
+                problems.push(format!(
+                    "{rel}::{} writes `{}` with no `ObservationOwnership` guard in the same \
+                     function: a row this pass did not cover is a coverage change, never an \
+                     observed deletion or regrowth",
+                    func.name,
+                    write.trim()
+                ));
+            }
+        }
+    }
+    // The ownership window itself must be able to *subtract* a region
+    // that is inside a covered root but out of this pass's scope -- the
+    // 2026-09-22 CE4 shape (a config-only exclusion under a measured
+    // parent). A window that is only a prefix test cannot.
+    let growth = parse(root, "crates/core/src/growth.rs")?;
+    let has_field = ast::pub_struct_fields(&growth.ast)
+        .iter()
+        .any(|f| f.struct_name == "ObservationOwnership" && f.field == "excluded_subtrees");
+    if !has_field {
+        problems.push(
+            "growth.rs: `ObservationOwnership` has no `excluded_subtrees`; a path-prefix window \
+             cannot express \"inside a covered root, outside this pass\" and will tombstone an \
+             excluded nested location (CE4)"
+                .to_string(),
+        );
+    }
+    let covers = ast::functions(&growth.ast)
+        .into_iter()
+        .find(|f| f.name == "covers");
+    match covers {
+        Some(f) if f.body.contains("excluded_subtrees") => {}
+        Some(_) => problems.push(
+            "growth.rs: `ObservationOwnership::covers` does not consult `excluded_subtrees`"
+                .to_string(),
+        ),
+        None => problems.push("growth.rs: `ObservationOwnership::covers` is missing".to_string()),
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n  "))
+    }
+}
+
+// ---------------------------------------------------------------------
+// 19. activity_and_consumer_evidence_have_limits
+// ---------------------------------------------------------------------
+
+/// `FactStatus` variants that exist precisely to carry a reason.
+const REASONED_STATUSES: &[&str] = &["Unknown", "Unavailable", "Conflicting"];
+
+pub fn activity_and_consumer_evidence_have_limits(root: &Path) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    // 1. The reasoned statuses are constructed only inside `evidence.rs`,
+    //    through `Evidence::{unknown,unavailable,conflicting}`, whose
+    //    signatures make the reason mandatory. A struct literal anywhere
+    //    else can omit it.
+    for rel in workspace_src_files(root) {
+        if rel == "crates/core/src/evidence.rs" {
+            continue;
+        }
+        let Some(f) = maybe_parse(root, &rel) else {
+            continue;
+        };
+        for (func_name, path) in ast::struct_literal_sites(&f.ast) {
+            let Some(variant) = path.rsplit("::").next() else {
+                continue;
+            };
+            if path.contains("FactStatus") && REASONED_STATUSES.contains(&variant) {
+                problems.push(format!(
+                    "{rel}::{func_name} builds `{path}` as a struct literal; construct it \
+                     through `Evidence::unknown`/`unavailable`/`conflicting`, whose signature \
+                     makes the reason mandatory"
+                ));
+            }
+        }
+        for func in ast::functions(&f.ast) {
+            // 2. An empty reason is the same defect written differently.
+            for ctor in [
+                "Evidence :: unknown (",
+                "Evidence :: unavailable (",
+                "Evidence :: conflicting (",
+            ] {
+                let mut rest = func.body.as_str();
+                while let Some(i) = rest.find(ctor) {
+                    let tail = &rest[i + ctor.len()..];
+                    let end = tail.find(')').unwrap_or(tail.len());
+                    let args = &tail[..end];
+                    if args.contains("\"\"") {
+                        problems.push(format!(
+                            "{rel}::{} passes an empty reason to `{}`: \"not observed\" has to say \
+                             why it was not observed",
+                            func.name,
+                            ctor.trim_end_matches(" (")
+                        ));
+                    }
+                    rest = &tail[end.min(tail.len())..];
+                }
+            }
+        }
+    }
+    // 3. Every Activity fact carries a source: `activity.rs`'s evidence
+    //    builders must name an `EvidenceSource`.
+    let act = parse(root, "crates/core/src/activity.rs")?;
+    for func in ast::functions(&act.ast) {
+        if !func.name.ends_with("_evidence") {
+            continue;
+        }
+        if !func.body.contains("EvidenceSource ::") && !func.body.contains("_evidence (") {
+            problems.push(format!(
+                "activity.rs::{} returns evidence without naming an `EvidenceSource`",
+                func.name
+            ));
+        }
+    }
+    // 4. The rendering side must print the reason with the status; a bare
+    //    "unknown" is the fact without its limit.
+    let render = parse(root, "crates/core/src/render.rs")?;
+    let renders_reason = ast::functions(&render.ast)
+        .iter()
+        .any(|f| f.name == "render_evidence_lines" && f.body.contains("reason"));
+    if !renders_reason {
+        problems.push(
+            "render.rs::render_evidence_lines does not mention `reason`: an unknown printed \
+             without its reason reads as \"nothing there\""
+                .to_string(),
+        );
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n  "))
     }
 }
 
@@ -2514,5 +2881,266 @@ mod mutation_tests {
             let _ = std::panic::catch_unwind(|| audit(root))
                 .unwrap_or_else(|_| panic!("audit `{name}` panicked on the real repository"));
         }
+    }
+}
+
+/// Mutation tests for the three audits added after the 2026-09-22
+/// re-review. Each proves both halves: the shape the guardrail forbids is
+/// rejected, and the shape it requires passes.
+#[cfg(test)]
+mod review2_mutation_tests {
+    use super::*;
+    use std::fs;
+
+    fn workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (rel, text) in files {
+            let p = tmp.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+        tmp
+    }
+
+    // -- computed_but_not_delivered -------------------------------------
+
+    const RENDERER_READING_IT: &str =
+        "pub fn render_view_x(u: &Unit) { for e in &u.decision_evidence { let _ = e; } }";
+
+    fn surface(field_init: &str, renderer: &str) -> tempfile::TempDir {
+        workspace(&[
+            (
+                "crates/core/src/artifact.rs",
+                "pub struct NestedArtifact { #[serde(default, skip_serializing_if = \"Vec::is_empty\")] \
+                 pub decision_evidence: Vec<crate::evidence::Evidence> }",
+            ),
+            (
+                "crates/core/src/cargo_artifacts.rs",
+                &format!(
+                    "pub fn build() -> NestedArtifact {{ NestedArtifact {{ decision_evidence: {field_init} }} }}"
+                ),
+            ),
+            ("crates/core/src/render.rs", renderer),
+            ("crates/core/src/external.rs", ""),
+            ("crates/core/src/report.rs", ""),
+            ("crates/cli/src/main.rs", ""),
+        ])
+    }
+
+    #[test]
+    fn an_evidence_field_written_only_as_an_empty_vec_is_rejected() {
+        let tmp = surface("Vec::new()", RENDERER_READING_IT);
+        let err = computed_but_not_delivered(tmp.path()).unwrap_err();
+        assert!(err.contains("decision_evidence"), "{err}");
+        assert!(err.contains("empty default"), "{err}");
+    }
+
+    #[test]
+    fn an_evidence_field_nobody_renders_is_rejected() {
+        let tmp = surface("attach(unit)", "pub fn render_view_x() {}");
+        let err = computed_but_not_delivered(tmp.path()).unwrap_err();
+        assert!(err.contains("no delivery file"), "{err}");
+    }
+
+    #[test]
+    fn an_evidence_field_computed_and_rendered_passes() {
+        let tmp = surface("attach(unit)", RENDERER_READING_IT);
+        assert_eq!(computed_but_not_delivered(tmp.path()), Ok(()));
+    }
+
+    // -- coverage_changes_are_not_storage_changes -----------------------
+
+    const GOOD_GROWTH: &str = r#"
+        pub struct ObservationOwnership {
+            pub family: u8,
+            pub covered_roots: Vec<String>,
+            pub excluded_subtrees: Vec<String>,
+        }
+        impl ObservationOwnership {
+            pub fn covers(&self, path: &str) -> bool {
+                if self.excluded_subtrees.iter().any(|e| path.starts_with(e)) {
+                    return false;
+                }
+                self.covered_roots.iter().any(|r| path.starts_with(r))
+            }
+        }
+        pub fn sweep(ownership: &ObservationOwnership) {
+            for (key, row) in current.iter_mut() {
+                if ownership.owns(key) { row.present = false; }
+            }
+        }
+    "#;
+
+    #[test]
+    fn an_unguarded_tombstone_write_is_rejected() {
+        let tmp = workspace(&[(
+            "crates/core/src/growth.rs",
+            &GOOD_GROWTH.replace(
+                "if ownership.owns(key) { row.present = false; }",
+                "row.present = false;",
+            ),
+        )]);
+        let err = coverage_changes_are_not_storage_changes(tmp.path()).unwrap_err();
+        assert!(err.contains("ObservationOwnership` guard"), "{err}");
+    }
+
+    #[test]
+    fn an_ownership_window_without_excluded_subtrees_is_rejected() {
+        let tmp = workspace(&[(
+            "crates/core/src/growth.rs",
+            &GOOD_GROWTH
+                .replace("            pub excluded_subtrees: Vec<String>,\n", "")
+                .replace(
+                    "if self.excluded_subtrees.iter().any(|e| path.starts_with(e)) {\n                    return false;\n                }\n",
+                    "",
+                ),
+        )]);
+        let err = coverage_changes_are_not_storage_changes(tmp.path()).unwrap_err();
+        assert!(err.contains("excluded_subtrees"), "{err}");
+    }
+
+    #[test]
+    fn a_guarded_sweep_with_a_subtractable_window_passes() {
+        let tmp = workspace(&[("crates/core/src/growth.rs", GOOD_GROWTH)]);
+        assert_eq!(coverage_changes_are_not_storage_changes(tmp.path()), Ok(()));
+    }
+
+    // -- activity_and_consumer_evidence_have_limits ---------------------
+
+    const GOOD_EVIDENCE: &[(&str, &str)] = &[
+        (
+            "crates/core/src/evidence.rs",
+            "pub enum FactStatus { Known(u8), Unknown { reason: String } }",
+        ),
+        (
+            "crates/core/src/activity.rs",
+            "pub fn modification_evidence() -> Evidence { Evidence::known(EvidenceSource::FilesystemMetadata { detail: d }) }",
+        ),
+        (
+            "crates/core/src/render.rs",
+            "pub fn render_evidence_lines(e: &Evidence) { match &e.status { FactStatus::Unknown { reason } => out.push(reason.clone()), _ => {} } }",
+        ),
+    ];
+
+    #[test]
+    fn a_hand_built_unknown_status_outside_evidence_rs_is_rejected() {
+        let mut files: Vec<(&str, &str)> = GOOD_EVIDENCE.to_vec();
+        files.push((
+            "crates/core/src/occupancy.rs",
+            "pub fn probe() -> Evidence { Evidence { status: FactStatus::Unknown { reason: r }, ..d } }",
+        ));
+        let tmp = workspace(&files);
+        let err = activity_and_consumer_evidence_have_limits(tmp.path()).unwrap_err();
+        assert!(err.contains("struct literal"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_reason_is_rejected() {
+        let mut files: Vec<(&str, &str)> = GOOD_EVIDENCE.to_vec();
+        files.push((
+            "crates/core/src/occupancy.rs",
+            "pub fn probe() -> Evidence { Evidence::unknown(k, s, src, at, \"\") }",
+        ));
+        let tmp = workspace(&files);
+        let err = activity_and_consumer_evidence_have_limits(tmp.path()).unwrap_err();
+        assert!(err.contains("empty reason"), "{err}");
+    }
+
+    #[test]
+    fn an_activity_fact_without_a_source_is_rejected() {
+        let mut files: Vec<(&str, &str)> = GOOD_EVIDENCE.to_vec();
+        files[1] = (
+            "crates/core/src/activity.rs",
+            "pub fn modification_evidence() -> Evidence { Evidence::known(k, s, v, at) }",
+        );
+        let tmp = workspace(&files);
+        let err = activity_and_consumer_evidence_have_limits(tmp.path()).unwrap_err();
+        assert!(err.contains("EvidenceSource"), "{err}");
+    }
+
+    #[test]
+    fn a_renderer_that_drops_the_reason_is_rejected() {
+        let mut files: Vec<(&str, &str)> = GOOD_EVIDENCE.to_vec();
+        files[2] = (
+            "crates/core/src/render.rs",
+            "pub fn render_evidence_lines(e: &Evidence) { out.push(\"unknown\".to_string()) }",
+        );
+        let tmp = workspace(&files);
+        let err = activity_and_consumer_evidence_have_limits(tmp.path()).unwrap_err();
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    #[test]
+    fn evidence_built_through_the_constructors_with_reasons_passes() {
+        let tmp = workspace(GOOD_EVIDENCE);
+        assert_eq!(
+            activity_and_consumer_evidence_have_limits(tmp.path()),
+            Ok(())
+        );
+    }
+
+    // -- no_dead_public_evidence_api, extended to pub const ------------
+
+    #[test]
+    fn a_pub_const_with_no_reader_is_rejected() {
+        let tmp = workspace(&[
+            (
+                "crates/core/src/activity.rs",
+                "pub const ACTIVITY_EVIDENCE_INVENTORY: &[(&str, &str)] = &[];",
+            ),
+            ("crates/core/src/render.rs", "pub fn r() {}"),
+        ]);
+        let err = no_dead_public_evidence_api(tmp.path()).unwrap_err();
+        assert!(err.contains("ACTIVITY_EVIDENCE_INVENTORY"), "{err}");
+        assert!(err.contains("pub const/static"), "{err}");
+    }
+
+    #[test]
+    fn a_pub_const_a_renderer_reads_passes() {
+        let tmp = workspace(&[
+            (
+                "crates/core/src/activity.rs",
+                "pub const ACTIVITY_EVIDENCE_INVENTORY: &[(&str, &str)] = &[];",
+            ),
+            (
+                "crates/core/src/render.rs",
+                "pub fn r() { for e in crate::activity::ACTIVITY_EVIDENCE_INVENTORY { let _ = e; } }",
+            ),
+        ]);
+        assert_eq!(no_dead_public_evidence_api(tmp.path()), Ok(()));
+    }
+
+    // -- no_second_traversal, extended to the callee -------------------
+
+    #[test]
+    fn a_measure_that_re_walks_without_consulting_the_rows_is_rejected() {
+        let tmp = workspace(&[
+            (
+                "crates/core/src/locations/mod.rs",
+                "pub const SHALLOW_LIST_CAP: usize = 64; pub fn shallow_list() {}",
+            ),
+            (
+                "crates/core/src/folded_measurement.rs",
+                "pub fn measure(p: &Path) -> u64 { crate::walk::resize_artifact_excluding(p) }",
+            ),
+        ]);
+        let err = no_second_traversal_on_report_path(tmp.path()).unwrap_err();
+        assert!(err.contains("without first consulting"), "{err}");
+    }
+
+    #[test]
+    fn a_measure_that_consults_the_rows_first_passes() {
+        let tmp = workspace(&[
+            (
+                "crates/core/src/locations/mod.rs",
+                "pub const SHALLOW_LIST_CAP: usize = 64; pub fn shallow_list() {}",
+            ),
+            (
+                "crates/core/src/folded_measurement.rs",
+                "pub fn measure(p: &Path) -> u64 { if let Some(b) = reuse_folded_measurement(p) { return b; } \
+                 crate::walk::resize_artifact_excluding(p) }",
+            ),
+        ]);
+        assert_eq!(no_second_traversal_on_report_path(tmp.path()), Ok(()));
     }
 }

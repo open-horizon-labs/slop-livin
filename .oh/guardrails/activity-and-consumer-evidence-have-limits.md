@@ -9,6 +9,7 @@ sufficiency_group: G2
 owner: null
 review_trigger: "A new detector, scope change, contradictory fact, or real user decision exposes a failure."
 tactic_disposition: selected
+audit: activity_and_consumer_evidence_have_limits
 ---
 
 # Activity and consumer evidence have limits
@@ -42,9 +43,37 @@ This elaborates the existing
 [facts-not-verdicts guardrail](agent-interface-facts-not-verdicts.md); its existing
 vocabulary audit does not establish provenance, freshness, or semantic correctness.
 
+## Detection
+
+AST audit `activity_and_consumer_evidence_have_limits`, added 2026-09-22
+(the 2026-09-22 re-review found this `severity: hard` guardrail with no
+`audit:` field at all -- one of the three unwatched ones, and the
+unwatched ones were the ones that broke):
+
+- `FactStatus::{Unknown,Unavailable,Conflicting}` may be *constructed*
+  only inside `evidence.rs`; everywhere else it comes from
+  `Evidence::unknown`/`unavailable`/`conflicting`, whose signatures make
+  the reason a required argument. Struct-literal sites are located
+  through the AST, so a `match` arm that reads a reason is not mistaken
+  for a construction that omits one;
+- no call site passes an empty string literal as that reason; and
+- every `*_evidence` builder in `activity.rs` names an `EvidenceSource`,
+  and `render::render_evidence_lines` mentions `reason`, so an unknown is
+  never printed without the limit that makes it readable.
+
+**Limits.** The audit proves the reason exists and is non-empty, not that
+it is *informative*. It cannot see a reason assembled at runtime from an
+empty variable.
+
+## Runtime tests that complete it
+
+- `crates/core/tests/evidence_contract.rs` — the rendered form of an
+  `Unknown`/`Unavailable` fact contains its reason, and the docs table
+  lists every `ACTIVITY_EVIDENCE_INVENTORY` entry.
+
 ## Validation gap
 
-No executable validation is declared for the full evidence contract. Check stale
+What remains unvalidated is whether users read these limits correctly. Check stale
 facts, unavailable activity records, configuration-only references, command-line
 usage without persistent configuration, shared consumers, and out-of-scope projects.
 Test whether users can distinguish what was observed from what was inferred.

@@ -515,3 +515,147 @@ pub fn enum_has_variant(file: &syn::File, enum_name: &str, variant: &str) -> boo
         matches!(i, syn::Item::Enum(e) if e.ident == enum_name && e.variants.iter().any(|v| v.ident == variant))
     })
 }
+
+/// One `pub` field of a `pub` struct in this file: the struct's name, the
+/// field's name, and the token text of its declared type.
+pub struct PubField {
+    pub struct_name: String,
+    pub field: String,
+    pub ty: String,
+    /// The field's attribute text (`#[serde(...)]` and friends), so an
+    /// audit can tell a field serde always emits from one it hides.
+    pub attrs: String,
+}
+
+/// Every `pub` field of every struct in the file (test modules excluded).
+/// What an audit needs to ask "is this declared surface actually
+/// delivered?".
+pub fn pub_struct_fields(file: &syn::File) -> Vec<PubField> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        let syn::Item::Struct(s) = item else { continue };
+        let syn::Fields::Named(named) = &s.fields else {
+            continue;
+        };
+        for f in &named.named {
+            if !matches!(f.vis, syn::Visibility::Public(_)) {
+                continue;
+            }
+            let Some(ident) = &f.ident else { continue };
+            out.push(PubField {
+                struct_name: s.ident.to_string(),
+                field: ident.to_string(),
+                ty: f.ty.to_token_stream().to_string(),
+                attrs: f
+                    .attrs
+                    .iter()
+                    .map(|a| a.to_token_stream().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            });
+        }
+    }
+    out
+}
+
+/// For every struct literal in the file, the token text of the
+/// initializer given to field `field` (one entry per literal that names
+/// it). `..Default::default()` and shorthand `field` are returned as the
+/// field name itself.
+pub fn struct_field_inits(file: &syn::File, field: &str) -> Vec<String> {
+    struct V<'s> {
+        field: &'s str,
+        in_tests: usize,
+        out: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = m.attrs.iter().any(|a| {
+                a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test")
+            });
+            if test {
+                self.in_tests += 1;
+                syn::visit::visit_item_mod(self, m);
+                self.in_tests -= 1;
+            } else {
+                syn::visit::visit_item_mod(self, m);
+            }
+        }
+        fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+            if self.in_tests == 0 {
+                for fv in &s.fields {
+                    if let syn::Member::Named(n) = &fv.member
+                        && n == self.field
+                    {
+                        self.out.push(fv.expr.to_token_stream().to_string());
+                    }
+                }
+            }
+            syn::visit::visit_expr_struct(self, s);
+        }
+    }
+    let mut v = V {
+        field,
+        in_tests: 0,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+/// Every struct-literal *expression* in the file (not a pattern), as
+/// `(enclosing function, full path)`. Patterns like
+/// `FactStatus::Unknown { reason }` in a `match` arm are matches, not
+/// constructions, and are deliberately absent.
+pub fn struct_literal_sites(file: &syn::File) -> Vec<(String, String)> {
+    struct V {
+        func: String,
+        in_tests: usize,
+        out: Vec<(String, String)>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = m.attrs.iter().any(|a| {
+                a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test")
+            });
+            if test {
+                self.in_tests += 1;
+                syn::visit::visit_item_mod(self, m);
+                self.in_tests -= 1;
+            } else {
+                syn::visit::visit_item_mod(self, m);
+            }
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+            if self.in_tests == 0 {
+                self.out.push((
+                    self.func.clone(),
+                    s.path
+                        .segments
+                        .iter()
+                        .map(|x| x.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                ));
+            }
+            syn::visit::visit_expr_struct(self, s);
+        }
+    }
+    let mut v = V {
+        func: String::new(),
+        in_tests: 0,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}

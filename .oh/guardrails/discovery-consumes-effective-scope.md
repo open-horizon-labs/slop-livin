@@ -32,13 +32,28 @@ exclusion it refuses.
 
 **Limits.** The audit proves the *seam* is used, not that the seam's
 semantics are right; `scope.rs`'s own tests and the reviewer
-counterexample carry that.
+counterexamples carry that. The 2026-09-22 re-review's CE1 is what that
+limit cost: `authorized_detector_paths_in_explicit_roots` tested
+exclusion only against roots whose *status* was `Excluded`, and under
+`--root <parent>` an excluded home is not a root at all but a
+`PruneNote` inside the explicit root — so `swamp report --root ~` offered
+an excluded agent home's contents for removal. Both entry points now
+route every exclusion decision through the one
+`EffectiveScope::exclusion_for` helper, so explicit and configured scope
+cannot diverge again.
 
 ## Runtime tests that complete it
 
 - `crates/core/tests/reviewer_counterexamples.rs::excluded_agent_home_must_not_be_scanned`
 - `crates/core/src/scope.rs::tests::authorized_roots_drops_excluded_and_explains_missing`
 - `crates/core/src/scope.rs::tests::explicit_roots_do_not_authorize_detector_paths_outside_them`
+- `crates/core/tests/reviewer_counterexamples_stack2.rs::an_excluded_home_must_stay_excluded_under_an_explicit_root`
+  — the CE1 case the prior test could not see, because it passed `&[]`
+  for explicit roots.
+- `crates/core/tests/explicit_root_scope_exclusions.rs` — every
+  exclusion case (an excluded home, an excluded nested location, a
+  disabled detector, a protected path in either spelling) under an
+  explicit root that *contains* it.
 - `crates/cli/tests/` — `report <root> --view agents --json` on a
   fixture root that does not contain the agent home returns zero units
   with a coverage note saying why.

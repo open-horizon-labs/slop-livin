@@ -9,6 +9,7 @@ sufficiency_group: G1
 owner: null
 review_trigger: "A new detector, scope change, contradictory fact, or real user decision exposes a failure."
 tactic_disposition: selected
+audit: coverage_changes_are_not_storage_changes
 ---
 
 # Coverage changes are not storage changes
@@ -31,9 +32,41 @@ These distinctions are necessary; a particular persistence schema is not selecte
 Deterministic fixtures can exercise the observation sequences before broad defaults
 are enabled. That is a validation hypothesis, not a claim of completed checks.
 
+## Detection
+
+AST audit `coverage_changes_are_not_storage_changes`, added 2026-09-22:
+
+- every statement that writes `present = false` or `regrowth_count + 1`
+  in `growth.rs`, `external.rs`, `report.rs` or `agents/**` must sit in a
+  function that also carries an ownership guard for the family it writes
+  (`ObservationOwnership::owns`/`covers` for the external/agent family,
+  `protected_worktree_ids.contains` for the artifact-row family); and
+- `ObservationOwnership` must carry `excluded_subtrees` and `covers` must
+  consult it. A window that is only a path-prefix test cannot express
+  "inside a covered root, outside this pass", which is exactly how a
+  config-only exclusion under a measured parent got tombstoned.
+
+**Limits.** The audit reads which guard is present in the same function,
+not whether the guard's *argument* is the right region. The runtime family
+below is what proves the semantics.
+
+## Runtime tests that complete it
+
+`crates/core/tests/coverage_changes_are_not_storage_changes.rs` — three
+passes over an unchanged tree, with the coverage changing between them
+(add an exclusion, disable a detector, make a location inaccessible,
+switch to an explicit root) produce zero growth, zero regrowth and zero
+tombstones. Run by name from `scripts/check.sh`. Plus
+`crates/core/tests/reviewer_counterexamples_stack2.rs::a_config_only_exclusion_must_not_invent_growth_or_regrowth`,
+the 2026-09-22 re-review's CE4: excluding a nested Cargo location reported
+the parent as having grown 64 KB and un-excluding it scored a regrowth,
+with zero bytes changed on disk.
+
 ## Validation gap
 
-No executable validation is declared for this complete contract. Check nested and
+The remaining gap after 2026-09-22 is concurrent mutation during a pass
+and shared physical-storage accounting across volumes; neither has an
+executable check. Check nested and
 aliased roots, root-order changes, scope additions/removals, permission failures,
 disconnected volumes, partial runs, and identity changes against actual filesystem
 changes. Preserve the distinction between incomplete observations and tombstones.

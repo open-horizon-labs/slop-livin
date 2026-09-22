@@ -59,9 +59,21 @@ recursive stat-only fold is a folded *measurement*, and
 `folded_measurement.rs` is the one module on this path allowed to
 traverse. Adapters reach it through `IdentifyCtx::folded_bytes`.
 
-**Limits.** This is a syscall-shape check. It cannot prove the folded
-rows are actually reused, only that a second traversal is not open-coded
-here; the work-counter tests prove the reuse.
+Since 2026-09-22 the audit also follows the *callee*, not only the
+allow-list. The independent re-review's sharpest audit finding was that
+"where a re-walk is written" is not "whether a re-walk happens":
+`folded_measurement.rs` was on the allow-list and
+`folded_measurement::measure` called `walk::resize_artifact_excluding`
+unconditionally, fully re-walking every external root on every pass,
+while this audit stayed green and the statement above claimed the
+opposite. The audit now requires `measure` to consult the persisted
+folded rows (`reuse_folded_measurement`) *before* it may reach
+`resize_artifact*`, so the statement and the code cannot diverge again.
+
+**Limits.** This is a syscall-shape check plus one call-order check
+inside `measure`. It cannot prove the reuse is *correct* — that an
+unchanged root really is unchanged; the work-counter tests below prove
+that.
 
 ## Runtime tests that complete it
 
@@ -71,4 +83,13 @@ here; the work-counter tests prove the reuse.
   headers; an unchanged second observation reads **zero** header bytes
   (asserted as `== 0` since the identification cache landed, with
   `identification_cache_hits >= SESSIONS`); appending one session costs
-  at most one capped header read and exactly one cache miss.
+  at most one capped header read and exactly one cache miss; and, since
+  2026-09-22, an unchanged external cache root lists **zero**
+  directories and stats **zero** files
+  (`an_unchanged_external_cache_root_is_not_re_traversed`, no longer a
+  measured known gap).
+- `crates/core/tests/reviewer_cost_measurement_stack2.rs` — two
+  unchanged full observations over a multi-ecosystem fixture: zero
+  header bytes, zero directories listed, zero files statted, zero
+  subprocess spawns, measured with an instrumented `walk.rs` rather than
+  an instrument that is blind to it.

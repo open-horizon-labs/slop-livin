@@ -1,7 +1,7 @@
 ---
 id: tui-refresh-preserves-scope
 severity: hard
-statement: "Every TUI observation -- startup, background refresh, live watch, post-action re-observe -- goes through the scope-aware report path. Excluded subtrees and pruned external locations stay absent on refresh, and external/agent unit vectors are refreshed from the same observation."
+statement: "Every TUI observation -- startup, background refresh, live watch, post-action re-observe -- goes through the scope-aware report path. Excluded subtrees and pruned external locations stay absent on refresh. External/agent unit vectors are refreshed only from an observation that covered the whole scope; a refresh narrowed to one root asks for no unit parts and leaves those vectors alone."
 outcome: coverage-aware-storage-history
 audit: tui_refresh_preserves_scope
 ---
@@ -32,8 +32,21 @@ takes a bare root and no `EffectiveScope`/pruned-subtree argument
 scope-carrying entries, or a TUI wrapper that forwards the scope, are
 allowed.
 
-**Limits.** The audit is about which entry point is called; it cannot
-tell whether the scope forwarded is the right one.
+Since 2026-09-22 the audit also checks *what gets replaced*. The
+independent re-review's CE3: `observe_live` correctly narrows the scope
+to the one root a watcher fired under (`EffectiveScope::restricted_to`)
+and then asked `observe_scope` for `ObservationParts::ALL`, so
+`agent_units`/`external_units` came back derived from that one-root
+scope and the event loop applied them unconditionally. The agent view
+emptied on the first file save anywhere in the project. A *correctly*
+narrowed scope must not be allowed to narrow what is replaced, so a
+narrowed refresh must request `ObservationParts::WALK_ONLY` and return
+`None` for both unit vectors. The audit requires exactly that of
+`App::observe_live`.
+
+**Limits.** The audit is about which entry point is called and which
+parts a narrowed refresh asks for; it cannot tell whether the scope
+forwarded is the right one.
 
 ## Runtime tests that complete it
 
@@ -41,3 +54,6 @@ tell whether the scope forwarded is the right one.
   and an external location pruned from its parent root stay absent after
   a background refresh and after a successful action; `prune_removed`
   removes exactly the successful agent/external rows.
+- `crates/tui/tests/reviewer_counterexamples_stack2_tui.rs::a_live_refresh_of_one_root_must_not_empty_the_agent_view`
+  — the 2026-09-22 CE3, driving the real `observe_live` and applying its
+  result exactly as `tui::lib`'s event loop does.
