@@ -481,6 +481,13 @@ fn format_ago(now: u64, then: u64) -> String {
 /// right after `observed_at=...`. `suggested_root` is used only in the
 /// "no schedule" suggestion text.
 pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String {
+    if !scheduling().is_available() {
+        // Never suggest `swamp schedule --every ...` on a platform where
+        // that command refuses. A header that advertises a command the
+        // tool will not run is worse than one that says nothing.
+        return "no schedule (not available on this platform; run `swamp observe` from your own timer)"
+            .to_string();
+    }
     if !plist_path().exists() {
         return format!(
             "no schedule (swamp schedule --every 30m {})",
@@ -750,6 +757,7 @@ mod tests {
     // never observe each other's env var.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn header_line_reports_no_schedule_when_plist_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -767,6 +775,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn off_removes_plist_and_issues_bootout_in_test_mode() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -789,6 +802,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn off_with_no_plist_still_reports_no_schedule() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -805,6 +823,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn status_parses_a_fixture_log_and_installed_plist() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -854,6 +877,11 @@ mod tests {
     /// resolving the scope once at install time and freezing the result
     /// into the plist, which would silently stop tracking a later config
     /// edit until `schedule --every` was run again.
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_with_no_roots_freezes_nothing_and_status_says_so() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -902,6 +930,11 @@ mod tests {
 
     /// An explicit root list must still be frozen into the plist exactly
     /// as before -- only the *no-roots* case changed behavior.
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_with_explicit_roots_still_freezes_them() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -925,6 +958,175 @@ mod tests {
             std::env::remove_var("SWAMP_LOG_DIR");
             std::env::remove_var("SWAMP_TEST_MODE");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // The platform that has no scheduler
+    // ---------------------------------------------------------------
+
+    /// The whole contract on a platform without a scheduling backend:
+    /// refuse, say why, name what would change it, and leave nothing
+    /// behind. The tempting shortcut is to write the plist anyway --
+    /// `install` succeeds, the user believes they have a scheduled
+    /// observation, and no baseline is ever recorded.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn install_refuses_and_writes_nothing_where_there_is_no_scheduler() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_LOG_DIR", logs.path());
+            std::env::set_var("SWAMP_TEST_MODE", "1");
+        }
+
+        let err = install("30m", &[]).expect_err("install must refuse on this platform");
+        let message = format!("{err}");
+        assert!(
+            message.contains("not available on this platform"),
+            "{message}"
+        );
+        assert!(
+            message.contains("#86"),
+            "the refusal must name what would change it: {message}"
+        );
+        assert!(
+            message.contains("nothing has been installed"),
+            "the refusal must say no state was left behind: {message}"
+        );
+
+        assert!(
+            !plist_path().exists(),
+            "a refused install wrote a plist anyway"
+        );
+        assert!(
+            std::fs::read_dir(agents.path()).unwrap().next().is_none(),
+            "a refused install left something in the agents directory"
+        );
+        assert!(
+            std::fs::read_dir(logs.path()).unwrap().next().is_none(),
+            "a refused install created the log directory it would have written to"
+        );
+
+        unsafe {
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
+        }
+    }
+
+    /// An interval this platform cannot honour is refused for the
+    /// platform, not accepted and then dropped. The refusal must not
+    /// depend on the argument being valid either.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn install_refuses_before_it_validates_the_interval() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let err = install("not-an-interval", &[]).expect_err("must refuse");
+        let message = format!("{err}");
+        assert!(
+            message.contains("not available on this platform"),
+            "the platform refusal comes first, so the user is not told to fix an interval \
+             that would be refused anyway: {message}"
+        );
+    }
+
+    /// `--off` and the status line say the same thing `install` does:
+    /// the feature is absent, not switched off.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn uninstall_and_status_report_the_capability_not_an_empty_installation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let off = uninstall().unwrap();
+        assert!(off.contains("not available on this platform"), "{off}");
+        assert!(off.contains("nothing was removed"), "{off}");
+
+        let text = status(store.path()).unwrap();
+        assert!(text.contains("not available on this platform"), "{text}");
+        assert!(text.contains("#86"), "{text}");
+        assert!(
+            !text.contains("swamp schedule --every"),
+            "status must not advertise a command that refuses: {text}"
+        );
+
+        let header = header_line(store.path(), Path::new("/home/dev/src"), 0);
+        assert!(
+            !header.contains("swamp schedule --every"),
+            "the header must not advertise a command that refuses: {header}"
+        );
+    }
+
+    /// Portable across both: whatever the platform, the log directory is
+    /// derived from the platform's own convention and `SWAMP_LOG_DIR`
+    /// overrides it. Neither platform's convention may appear in the
+    /// other's build.
+    #[test]
+    fn the_log_directory_follows_this_platforms_convention_and_the_override_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+        }
+        let derived = log_dir();
+        let text = derived.display().to_string();
+        match crate::platform::Os::current() {
+            crate::platform::Os::MacOs => {
+                assert!(text.contains("Library/Logs/swamp"), "{text}");
+                assert!(
+                    !text.contains(".local/state"),
+                    "an XDG state path on macOS: {text}"
+                );
+            }
+            crate::platform::Os::Linux => {
+                assert!(text.ends_with("swamp"), "{text}");
+                assert!(
+                    !text.contains("Library/Logs"),
+                    "a macOS log path on Linux: {text}"
+                );
+                assert!(
+                    text.contains(".local/state") || std::env::var_os("XDG_STATE_HOME").is_some(),
+                    "Linux logs belong under $XDG_STATE_HOME, not data or cache: {text}"
+                );
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SWAMP_LOG_DIR", tmp.path());
+        }
+        assert_eq!(log_dir(), tmp.path());
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+        }
+    }
+
+    /// A relative `$XDG_STATE_HOME` is invalid per the XDG base
+    /// directory spec and must be ignored, not joined to whatever
+    /// directory the process happens to be in.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_relative_xdg_state_home_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::set_var("XDG_STATE_HOME", "relative/state");
+        }
+        let derived = log_dir();
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        assert!(
+            derived.is_absolute(),
+            "a relative XDG_STATE_HOME produced a relative log directory: {}",
+            derived.display()
+        );
+        assert!(
+            derived.display().to_string().contains(".local/state/swamp"),
+            "{}",
+            derived.display()
+        );
     }
 
     #[test]

@@ -54,6 +54,13 @@ pub const AUDITS: &[(&str, Audit)] = &[
     // The 2026-09-21 review repairs (`repair_audits.rs`). Landed before
     // the repairs themselves, deliberately failing, so the baseline is
     // the audit's own enumeration rather than a prose list.
+    // #79: the platform-capability invariants, stated in terms of the
+    // contract both platforms implement rather than in macOS's
+    // vocabulary (`platform_audits.rs`).
+    (
+        "platform_capabilities_gate_their_backends",
+        crate::platform_audits::platform_capabilities_gate_their_backends,
+    ),
     (
         "execution_sinks_recheck_live_state",
         crate::repair_audits::execution_sinks_recheck_live_state,
