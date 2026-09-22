@@ -322,7 +322,10 @@ fn linux_contract(
             );
         }
         if let Some(mode) = r.strip_prefix("walk:") {
-            assert_ne!(mode, "incremental", "no Linux walk claims an incremental replay: {reasons:?}");
+            assert_ne!(
+                mode, "incremental",
+                "no Linux walk claims an incremental replay: {reasons:?}"
+            );
         }
     }
 }

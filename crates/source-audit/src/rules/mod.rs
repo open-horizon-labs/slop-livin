@@ -83,16 +83,30 @@ pub(crate) fn bounded_primitives(
     reader: bool,
     problems: &mut Vec<String>,
 ) -> HashSet<usize> {
-    let set = anchors(p, &table.iter().map(|(a, _)| *a).collect::<Vec<_>>(), problems);
+    let set = anchors(
+        p,
+        &table.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+        problems,
+    );
     let walks_anywhere = p.traversal(&HashSet::new());
     let reads_anywhere = p.unbounded_reads(&HashSet::new());
     for (path, cap) in table {
         for i in p.defs(path) {
             let f = &p.funs[i];
             let reads = f.calls.iter().any(crate::program::unbounded_read)
-                || p.callees(i).iter().any(|g| *g != i && reads_anywhere.contains(g));
-            let listings = f.calls.iter().filter(|c| crate::program::traversal_call(c)).count();
-            let other_walk = p.callees(i).iter().any(|g| *g != i && walks_anywhere.contains(g)) || p.callees(i).contains(&i);
+                || p.callees(i)
+                    .iter()
+                    .any(|g| *g != i && reads_anywhere.contains(g));
+            let listings = f
+                .calls
+                .iter()
+                .filter(|c| crate::program::traversal_call(c))
+                .count();
+            let other_walk = p
+                .callees(i)
+                .iter()
+                .any(|g| *g != i && walks_anywhere.contains(g))
+                || p.callees(i).contains(&i);
             let one_level = path.contains("shallow_list");
             let excess = if reader {
                 reads || listings > 0 || other_walk
@@ -137,7 +151,13 @@ pub(crate) fn named_paths(text: &str) -> Vec<String> {
     // Punctuation other than `::` separates tokens (`Detector)`).
     let cleaned: String = text
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == ':' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == ':' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     let cleaned = cleaned.replace("::", " :: ");
     let toks: Vec<&str> = cleaned.split_whitespace().collect();
@@ -180,8 +200,15 @@ pub(crate) fn empty_text(p: &Program, expr: &str) -> bool {
     let e = expr.replace(' ', "");
     if matches!(
         e.as_str(),
-        "\"\"" | "String::new()" | "Default::default()" | "String::default()" | "\"\".into()"
-            | "\"\".to_string()" | "\"\".to_owned()" | "&\"\"" | "Some(String::new())"
+        "\"\""
+            | "String::new()"
+            | "Default::default()"
+            | "String::default()"
+            | "\"\".into()"
+            | "\"\".to_string()"
+            | "\"\".to_owned()"
+            | "&\"\""
+            | "Some(String::new())"
     ) {
         return true;
     }

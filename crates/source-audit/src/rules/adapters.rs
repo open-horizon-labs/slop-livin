@@ -80,7 +80,12 @@ fn members(
 
 /// Handoff functions written in the agent tree must not use the
 /// capability themselves: the exemption is for what lies beyond them.
-fn handoffs_direct(p: &Program, stop: &HashSet<usize>, pred: impl Fn(&program::Fun, &program::PCall) -> bool, what: &str) -> Vec<String> {
+fn handoffs_direct(
+    p: &Program,
+    stop: &HashSet<usize>,
+    pred: impl Fn(&program::Fun, &program::PCall) -> bool,
+    what: &str,
+) -> Vec<String> {
     stop.iter()
         .filter(|i| p.funs[**i].rel.starts_with("crates/core/src/agents/"))
         .filter(|i| p.funs[**i].calls.iter().any(|c| pred(&p.funs[**i], c)))
@@ -93,7 +98,12 @@ pub fn agent_adapters_read_bounded_headers_only(root: &Path) -> Result<(), Strin
     let mut problems = Vec::new();
     let mut stop = bounded(&p, BOUNDED_READERS, &mut problems);
     let h = handoff(&p);
-    problems.extend(handoffs_direct(&p, &h, |_, c| program::unbounded_read(c), "reads a whole file"));
+    problems.extend(handoffs_direct(
+        &p,
+        &h,
+        |_, c| program::unbounded_read(c),
+        "reads a whole file",
+    ));
     stop.extend(h);
     let set = p.unbounded_reads(&stop);
     problems.extend(members(
@@ -105,7 +115,9 @@ pub fn agent_adapters_read_bounded_headers_only(root: &Path) -> Result<(), Strin
     // The cap itself: at most 64 KiB.
     match p.const_value("MAX_HEADER_BYTES").map(eval_product) {
         Some(Some(n)) if n <= 64 * 1024 => {}
-        Some(Some(n)) => problems.push(format!("MAX_HEADER_BYTES is {n}, above the 64 KiB contract")),
+        Some(Some(n)) => problems.push(format!(
+            "MAX_HEADER_BYTES is {n}, above the 64 KiB contract"
+        )),
         _ => problems.push("MAX_HEADER_BYTES is not a constant this audit can evaluate".into()),
     }
     verdict(
@@ -127,7 +139,12 @@ pub fn agent_adapters_do_not_traverse(root: &Path) -> Result<(), String> {
     let mut problems = Vec::new();
     let mut stop = bounded(&p, BOUNDED_LISTERS, &mut problems);
     let h = handoff(&p);
-    problems.extend(handoffs_direct(&p, &h, |_, c| program::traversal_call(c), "enumerates a directory"));
+    problems.extend(handoffs_direct(
+        &p,
+        &h,
+        |_, c| program::traversal_call(c),
+        "enumerates a directory",
+    ));
     stop.extend(h);
     let set = p.traversal(&stop);
     problems.extend(members(
@@ -203,7 +220,10 @@ pub fn agent_adapters_are_environment_free(root: &Path) -> Result<(), String> {
     }
     for d in p.adapter_items() {
         if let Some(l) = d.literals.iter().find(|l| hardcoded(l)) {
-            problems.push(format!("{}::{} hardcodes the home path {l:?}", d.rel, d.name));
+            problems.push(format!(
+                "{}::{} hardcodes the home path {l:?}",
+                d.rel, d.name
+            ));
         }
     }
     verdict(
@@ -236,7 +256,12 @@ pub fn agent_adapters_do_not_reach_detectors(root: &Path) -> Result<(), String> 
         .filter(|t| t.krate == "swamp_core" && t.module == "locations" && t.kind != TypeKind::Trait)
         .filter(|t| model_fields.iter().any(|ty| contains_token(ty, &t.name)))
         .map(|t| t.name.clone())
-        .chain(BOUNDED_LISTERS.iter().filter(|(a, _)| a.starts_with("locations::")).map(|(a, _)| a.rsplit("::").next().unwrap_or(a).to_string()))
+        .chain(
+            BOUNDED_LISTERS
+                .iter()
+                .filter(|(a, _)| a.starts_with("locations::"))
+                .map(|(a, _)| a.rsplit("::").next().unwrap_or(a).to_string()),
+        )
         .collect();
     let offending = |text: &str| -> Option<String> {
         super::named_paths(text).into_iter().find(|path| {
@@ -260,7 +285,10 @@ pub fn agent_adapters_do_not_reach_detectors(root: &Path) -> Result<(), String> 
     // function, and re-review 3 put a detector id there.
     for d in p.adapter_items() {
         if let Some(path) = offending(&format!("{} {}", d.ty, d.value)) {
-            problems.push(format!("{}::{} names `{path}` at item level", d.rel, d.name));
+            problems.push(format!(
+                "{}::{} names `{path}` at item level",
+                d.rel, d.name
+            ));
         }
     }
     verdict(
@@ -292,7 +320,12 @@ pub fn running_tests(file: &syn::File) -> Vec<String> {
     }
     impl<'ast> Visit<'ast> for V {
         fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
-            let t = m.attrs.iter().any(|a| a.to_token_stream().to_string().replace(' ', "").contains("cfg(test)"));
+            let t = m.attrs.iter().any(|a| {
+                a.to_token_stream()
+                    .to_string()
+                    .replace(' ', "")
+                    .contains("cfg(test)")
+            });
             if t {
                 self.in_test_mod += 1;
             }
@@ -305,16 +338,27 @@ pub fn running_tests(file: &syn::File) -> Vec<String> {
             let is_test = f.attrs.iter().any(|a| a.path().is_ident("test"));
             let ignored = f.attrs.iter().any(|a| a.path().is_ident("ignore"));
             let body = f.block.to_token_stream().to_string();
-            let asserts = ["assert !", "assert_eq !", "assert_ne !", "panic !", "unwrap_err", "contract ::", "expect_err"]
-                .iter()
-                .any(|a| body.contains(a));
+            let asserts = [
+                "assert !",
+                "assert_eq !",
+                "assert_ne !",
+                "panic !",
+                "unwrap_err",
+                "contract ::",
+                "expect_err",
+            ]
+            .iter()
+            .any(|a| body.contains(a));
             if self.in_test_mod > 0 && is_test && !ignored && asserts {
                 self.out.push(f.sig.ident.to_string());
             }
             syn::visit::visit_item_fn(self, f);
         }
     }
-    let mut v = V { in_test_mod: 0, out: Vec::new() };
+    let mut v = V {
+        in_test_mod: 0,
+        out: Vec::new(),
+    };
     v.visit_file(file);
     v.out
 }
@@ -347,12 +391,15 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
     let tools = p.tool_modules();
     // A tool module's children are that tool's code.
     let tool_family = |rel: &str| -> Option<String> {
-        tools.iter().find(|t| {
-            *t == rel || {
-                let m = Program::file_module(t);
-                Program::file_module(rel).starts_with(&format!("{m}::"))
-            }
-        }).cloned()
+        tools
+            .iter()
+            .find(|t| {
+                *t == rel || {
+                    let m = Program::file_module(t);
+                    Program::file_module(rel).starts_with(&format!("{m}::"))
+                }
+            })
+            .cloned()
     };
     if tools.is_empty() {
         problems.push("no module under agents/ declares a tool".into());
@@ -392,7 +439,11 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
                 reached.push(rel.clone());
             }
         }
-        if let Some(other) = reached.iter().filter_map(|r| tool_family(r)).find(|t| *t != me) {
+        if let Some(other) = reached
+            .iter()
+            .filter_map(|r| tool_family(r))
+            .find(|t| *t != me)
+        {
             problems.push(format!(
                 "{} reaches into adapter {other}: one tool's format change must never change \
                  another tool's identification",
@@ -406,7 +457,10 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
             && let Some(other) = module_of(&r.target).and_then(|rel| tool_family(rel))
             && other != me
         {
-            problems.push(format!("{} re-exports `{}` from adapter {other}", r.rel, r.target));
+            problems.push(format!(
+                "{} re-exports `{}` from adapter {other}",
+                r.rel, r.target
+            ));
         }
     }
     for d in &p.items {
@@ -418,7 +472,10 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
             if let Some(rel) = module_of(&abs)
                 && *rel != d.rel
             {
-                problems.push(format!("{}::{} names adapter {rel} at item level", d.rel, d.name));
+                problems.push(format!(
+                    "{}::{} names adapter {rel} at item level",
+                    d.rel, d.name
+                ));
             }
         }
     }
@@ -428,10 +485,18 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
     let ids: Vec<(String, String)> = p
         .items
         .iter()
-        .filter(|d| tools.contains(&d.rel) && d.kind == DeclKind::Const && d.name.ends_with("_TOOL_ID"))
-        .map(|d| (d.name.clone(), d.literals.first().cloned().unwrap_or_default()))
+        .filter(|d| {
+            tools.contains(&d.rel) && d.kind == DeclKind::Const && d.name.ends_with("_TOOL_ID")
+        })
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.literals.first().cloned().unwrap_or_default(),
+            )
+        })
         .collect();
-    let catalog = |rel: &str| rel.ends_with("agents/registry.rs") || rel.ends_with("agents/matrix.rs");
+    let catalog =
+        |rel: &str| rel.ends_with("agents/registry.rs") || rel.ends_with("agents/matrix.rs");
     for f in p.funs.iter() {
         if catalog(&f.rel) {
             continue;
@@ -440,7 +505,10 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
             .iter()
             .filter(|(n, v)| {
                 contains_token(&f.body, n)
-                    || (!v.is_empty() && f.arms.iter().any(|a| a.pattern.contains(&format!("\"{v}\""))))
+                    || (!v.is_empty()
+                        && f.arms
+                            .iter()
+                            .any(|a| a.pattern.contains(&format!("\"{v}\""))))
             })
             .map(|(n, _)| n.as_str())
             .collect();
@@ -448,7 +516,11 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
         // dispatch table, however many arms it has.
         let own = |n: &str| p.items.iter().any(|d| d.name == n && d.rel == f.rel);
         if let Some((n, _)) = ids.iter().find(|(n, v)| {
-            !own(n) && f.arms.iter().any(|a| contains_token(&a.pattern, n) || (!v.is_empty() && a.pattern.contains(&format!("\"{v}\""))))
+            !own(n)
+                && f.arms.iter().any(|a| {
+                    contains_token(&a.pattern, n)
+                        || (!v.is_empty() && a.pattern.contains(&format!("\"{v}\"")))
+                })
         }) {
             problems.push(format!(
                 "{} matches on the tool id `{n}`: adapter dispatch goes through `agents::Registry`",
@@ -466,8 +538,19 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
         }
     }
     // (3) The registry registers each tool module exactly once.
-    let registry_files = p.family(&p.files.iter().filter(|f| f.rel.ends_with("agents/registry.rs")).map(|f| f.rel.clone()).collect());
-    let registry: Vec<&program::Fun> = p.funs.iter().filter(|f| registry_files.contains(&f.rel)).map(|f| &**f).collect();
+    let registry_files = p.family(
+        &p.files
+            .iter()
+            .filter(|f| f.rel.ends_with("agents/registry.rs"))
+            .map(|f| f.rel.clone())
+            .collect(),
+    );
+    let registry: Vec<&program::Fun> = p
+        .funs
+        .iter()
+        .filter(|f| registry_files.contains(&f.rel))
+        .map(|f| &**f)
+        .collect();
     if registry.is_empty() {
         problems.push("agents/registry.rs defines no function: section 13 requires a static `Registry::with_builtins()`".into());
     }
@@ -491,7 +574,9 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
             })
             .sum();
         if count != 1 {
-            problems.push(format!("agents/registry.rs registers `{name}` {count} times; exactly once"));
+            problems.push(format!(
+                "agents/registry.rs registers `{name}` {count} times; exactly once"
+            ));
         }
     }
     // (4) The catalog exposes ids to compare against.
@@ -500,7 +585,12 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|f| f.rel.ends_with("agents/matrix.rs"))
         .flat_map(|f| f.literals.iter())
-        .chain(p.items.iter().filter(|d| d.rel.ends_with("agents/matrix.rs")).flat_map(|d| d.literals.iter()))
+        .chain(
+            p.items
+                .iter()
+                .filter(|d| d.rel.ends_with("agents/matrix.rs"))
+                .flat_map(|d| d.literals.iter()),
+        )
         .any(|s| s.chars().all(|c| c.is_ascii_lowercase() || c == '-') && s.contains('-'));
     if !matrix_ids.then_some(()).is_some() {
         problems.push("agents/matrix.rs exposes no tool ids to compare with the registry".into());
@@ -525,11 +615,19 @@ pub fn agent_units_built_through_builder(root: &Path) -> Result<(), String> {
     // unit type whose name the builder's constructor sets from its
     // defaults. Derived from the builder's own struct literals.
     let mut decided: HashSet<String> = HashSet::new();
-    for f in p.funs.iter().filter(|f| f.self_ty.as_deref() == Some("AgentUnitBuilder")) {
+    for f in p
+        .funs
+        .iter()
+        .filter(|f| f.self_ty.as_deref() == Some("AgentUnitBuilder"))
+    {
         // What the constructor derives from the category it was given.
-        let from_category = crate::resolve::derived_from(&f.bindings, &f.name, &["category".to_string()]);
+        let from_category =
+            crate::resolve::derived_from(&f.bindings, &f.name, &["category".to_string()]);
         for l in &f.struct_lits {
-            if unit_types.iter().any(|u| crate::resolve::path_ends_with(&l.path, u)) {
+            if unit_types
+                .iter()
+                .any(|u| crate::resolve::path_ends_with(&l.path, u))
+            {
                 for (field, init) in &l.fields {
                     let root = crate::resolve::root_ident(init);
                     if root != "category" && from_category.contains(&root) {
@@ -542,7 +640,10 @@ pub fn agent_units_built_through_builder(root: &Path) -> Result<(), String> {
     for i in p.adapter_funs() {
         let f = &p.funs[i];
         for l in &f.struct_lits {
-            if let Some(u) = unit_types.iter().find(|u| crate::resolve::path_ends_with(&l.path, u)) {
+            if let Some(u) = unit_types
+                .iter()
+                .find(|u| crate::resolve::path_ends_with(&l.path, u))
+            {
                 problems.push(format!(
                     "{} builds a `{u} {{ .. }}` literal: units are built with \
                      `AgentUnitBuilder::new(tool, category, path)`, whose constructor applies the \
@@ -565,13 +666,24 @@ pub fn agent_units_built_through_builder(root: &Path) -> Result<(), String> {
             }
         }
         for c in &f.calls {
-            if c.method && c.path == "unprotect_with_reason" && c.args.iter().all(|a| super::empty_text(&p, a)) {
-                problems.push(format!("{} lifts protected-by-default with no stated reason", f.display()));
+            if c.method
+                && c.path == "unprotect_with_reason"
+                && c.args.iter().all(|a| super::empty_text(&p, a))
+            {
+                problems.push(format!(
+                    "{} lifts protected-by-default with no stated reason",
+                    f.display()
+                ));
             }
         }
     }
     if decided.is_empty() && builder_ok {
-        problems.push("AgentUnitBuilder no longer decides any protection field from the category".into());
+        problems.push(
+            "AgentUnitBuilder no longer decides any protection field from the category".into(),
+        );
     }
-    verdict("agent units are built through the builder and its protection decision stands", problems)
+    verdict(
+        "agent units are built through the builder and its protection decision stands",
+        problems,
+    )
 }

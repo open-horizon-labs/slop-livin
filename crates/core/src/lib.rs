@@ -46,12 +46,12 @@ pub mod scan;
 pub mod schedule;
 pub mod scope;
 pub mod signals;
+pub mod spawn;
 pub mod store;
 pub mod toolchain_declarations;
 pub mod tree;
 pub mod volume;
 pub mod walk;
-pub mod spawn;
 pub mod work_counters;
 
 pub use entities::*;

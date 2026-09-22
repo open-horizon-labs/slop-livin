@@ -518,7 +518,11 @@ impl Program {
         for r in p.reexports.iter_mut() {
             let first = r.target.split("::").next().unwrap_or("").to_string();
             let child = format!("{}::{first}", r.module);
-            if !r.target.starts_with("swamp_core::") && !r.target.starts_with("swamp_tui::") && !r.target.starts_with("swamp::") && p.modules.contains(&child) {
+            if !r.target.starts_with("swamp_core::")
+                && !r.target.starts_with("swamp_tui::")
+                && !r.target.starts_with("swamp::")
+                && p.modules.contains(&child)
+            {
                 r.target = format!("{}::{}", r.module, r.target);
             }
         }
@@ -564,8 +568,13 @@ impl Program {
                 .enumerate()
                 .filter(|(ci, t)| {
                     let c = &p.funs[fi].calls[*ci];
-                    !c.method && t.local.is_empty() && t.abs != c.path && !t.abs.starts_with("swamp")
-                        && p.reexports.iter().any(|r| resolve::path_ends_with(&t.abs, &r.target) || t.abs == r.target)
+                    !c.method
+                        && t.local.is_empty()
+                        && t.abs != c.path
+                        && !t.abs.starts_with("swamp")
+                        && p.reexports.iter().any(|r| {
+                            resolve::path_ends_with(&t.abs, &r.target) || t.abs == r.target
+                        })
                 })
                 .map(|(ci, t)| (ci, t.abs.clone()))
                 .collect();
@@ -696,8 +705,19 @@ pub fn absolute(path: &str, krate: &str, module: &str, self_ty: Option<&str>) ->
 
 /// Macros whose literal pieces become one string.
 const STRING_MACROS: &[&str] = &[
-    "concat", "format", "format_args", "write", "writeln", "print", "println", "eprint",
-    "eprintln", "panic", "bail", "anyhow", "ensure",
+    "concat",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "panic",
+    "bail",
+    "anyhow",
+    "ensure",
 ];
 
 /// Converts an `impl` method into the free-function shape the
@@ -1201,8 +1221,14 @@ impl<'ast> Visit<'ast> for RefVisitor<'_> {
                         syn::Expr::Reference(r) => e = &r.expr,
                         syn::Expr::MethodCall(m)
                             if [
-                                "unwrap", "expect", "with_context", "context", "map_err",
-                                "unwrap_or_default", "unwrap_or_else", "clone",
+                                "unwrap",
+                                "expect",
+                                "with_context",
+                                "context",
+                                "map_err",
+                                "unwrap_or_default",
+                                "unwrap_or_else",
+                                "clone",
                             ]
                             .contains(&m.method.to_string().as_str()) =>
                         {
@@ -1320,8 +1346,9 @@ fn macro_struct_lits(tokens: &str, res: &resolve::Resolver, out: &mut Vec<Struct
                             .filter_map(|f| {
                                 let (n, v) = f.split_once(':').unwrap_or((f.as_str(), f.as_str()));
                                 let n = n.trim();
-                                (!n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                                    .then(|| (n.to_string(), v.trim().to_string()))
+                                (!n.is_empty()
+                                    && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                                .then(|| (n.to_string(), v.trim().to_string()))
                             })
                             .collect();
                         out.push(StructLit {

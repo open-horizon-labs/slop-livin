@@ -104,7 +104,10 @@ fn parse_fixture(audit: &str, path: &Path) -> Fixture {
                 if files.is_empty() {
                     files.push((
                         header.get("target").cloned().unwrap_or_default(),
-                        header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+                        header
+                            .get("mode")
+                            .cloned()
+                            .unwrap_or_else(|| "append".into()),
                         std::mem::take(&mut body),
                     ));
                 } else {
@@ -129,7 +132,10 @@ fn parse_fixture(audit: &str, path: &Path) -> Fixture {
                 .get("target")
                 .unwrap_or_else(|| panic!("{} has no `//! target:` header", path.display()))
                 .clone(),
-            header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+            header
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "append".into()),
             body,
         ));
     } else {

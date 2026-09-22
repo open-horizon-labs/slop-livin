@@ -37,26 +37,90 @@ pub const STORE_CONTROL_PATTERNS: &[(&str, &str)] = &[("plans", "{}.json"), ("",
 /// An entry that no longer serializes JSON into a write fails, so the
 /// list cannot rot.
 pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
-    ("crates/core/src/actions.rs", "save_plan", "one unapproved plan per file; a control artifact a human reviews and approves"),
-    ("crates/core/src/actions.rs", "write_restore_manifest", "Trash envelope recovery manifest, written next to the moved members"),
-    ("crates/core/src/actions.rs", "write_grants", "the authorization grant list: small, human-auditable control state"),
-    ("crates/core/src/ledger.rs", "append", "append-only action ledger (jsonl); a durable record, not a queryable table"),
-    ("crates/core/src/schedule.rs", "write_last_run", "last scheduled-run marker: a single timestamp record"),
-    ("crates/core/src/scope.rs", "persist_effective_scope", "the resolved scope snapshot, for the next run's coverage diff"),
-    ("crates/core/src/agents/mod.rs", "save_protect", "human keep/protect list: small control state, written atomically"),
-    ("crates/core/src/cargo_cleanup.rs", "move_reviewed", "Trash envelope recovery manifest for an exact reviewed Cargo group"),
-    ("crates/core/src/growth.rs", "write_fsevents_state", "the FSEvents cursor: one event id and a mode, read once per observation"),
-    ("crates/core/src/growth.rs", "write_unit_root_cursor", "the unit-root half of the same FSEvents cursor file"),
-    ("crates/core/src/growth.rs", "write_topology", "the worktree topology snapshot an incremental replay diffs against"),
-    ("crates/core/src/growth.rs", "write_unowned", "the unowned-paths cache an incremental pass carries forward"),
-    ("crates/core/src/report.rs", "write_last_report", "the compressed last-report cache the TUI paints from before observing"),
-    ("crates/core/src/report.rs", "write_last_scope_report", "the same last-report cache, keyed by a multi-root scope"),
-    ("crates/tui/src/app.rs", "persist_ui_state", "the remembered filter/sort/reverse of the last TUI session"),
+    (
+        "crates/core/src/actions.rs",
+        "save_plan",
+        "one unapproved plan per file; a control artifact a human reviews and approves",
+    ),
+    (
+        "crates/core/src/actions.rs",
+        "write_restore_manifest",
+        "Trash envelope recovery manifest, written next to the moved members",
+    ),
+    (
+        "crates/core/src/actions.rs",
+        "write_grants",
+        "the authorization grant list: small, human-auditable control state",
+    ),
+    (
+        "crates/core/src/ledger.rs",
+        "append",
+        "append-only action ledger (jsonl); a durable record, not a queryable table",
+    ),
+    (
+        "crates/core/src/schedule.rs",
+        "write_last_run",
+        "last scheduled-run marker: a single timestamp record",
+    ),
+    (
+        "crates/core/src/scope.rs",
+        "persist_effective_scope",
+        "the resolved scope snapshot, for the next run's coverage diff",
+    ),
+    (
+        "crates/core/src/agents/mod.rs",
+        "save_protect",
+        "human keep/protect list: small control state, written atomically",
+    ),
+    (
+        "crates/core/src/cargo_cleanup.rs",
+        "move_reviewed",
+        "Trash envelope recovery manifest for an exact reviewed Cargo group",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_fsevents_state",
+        "the FSEvents cursor: one event id and a mode, read once per observation",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_unit_root_cursor",
+        "the unit-root half of the same FSEvents cursor file",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_topology",
+        "the worktree topology snapshot an incremental replay diffs against",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_unowned",
+        "the unowned-paths cache an incremental pass carries forward",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_report",
+        "the compressed last-report cache the TUI paints from before observing",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_scope_report",
+        "the same last-report cache, keyed by a multi-root scope",
+    ),
+    (
+        "crates/tui/src/app.rs",
+        "persist_ui_state",
+        "the remembered filter/sort/reverse of the last TUI session",
+    ),
     // Found by the program-model dataflow on 2026-09-22: `load_cached`
     // serialized the Docker facts inside an `if let` and wrote them in the
     // next statement, which the old statement-split heuristic could not
     // connect. It is the `docker_facts.json` control file with a TTL.
-    ("crates/core/src/docker.rs", "load_cached", "the Docker facts cache: one small document with a TTL, re-probed when stale"),
+    (
+        "crates/core/src/docker.rs",
+        "load_cached",
+        "the Docker facts cache: one small document with a TTL, re-probed when stale",
+    ),
 ];
 
 /// A call that turns a value into JSON bytes: any `serde_json::to_*`
@@ -64,7 +128,9 @@ pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
 /// / `.to_vec()` on a `json!` value.
 fn serializes(c: &PCall) -> bool {
     (program::serializes_json(c) && !c.is("serde_json::to_value"))
-        || (c.method && ["to_string", "to_vec"].contains(&c.path.as_str()) && c.receiver.contains("json !"))
+        || (c.method
+            && ["to_string", "to_vec"].contains(&c.path.as_str())
+            && c.receiver.contains("json !"))
 }
 
 /// Does a serialized value reach a write in `f`?
@@ -72,7 +138,10 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
     let f = &p.funs[i];
     let writes = p.destructive();
     let ser: Vec<&PCall> = f.calls.iter().filter(|c| serializes(c)).collect();
-    let macro_ser = f.macros.iter().any(|m| m.tokens.contains("serde_json :: to_") || m.tokens.contains("json !"));
+    let macro_ser = f
+        .macros
+        .iter()
+        .any(|m| m.tokens.contains("serde_json :: to_") || m.tokens.contains("json !"));
     if ser.is_empty() && !macro_ser {
         return false;
     }
@@ -95,7 +164,11 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
     let mut rest = body.as_str();
     while let Some(at) = rest.find("if let Ok (") {
         let tail = &rest[at + "if let Ok (".len()..];
-        let name: String = tail.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let name: String = tail
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
         let init = tail.split('{').next().unwrap_or("");
         if !name.is_empty() && spellings.iter().any(|s| init.contains(s.as_str())) {
             seeds.push(name);
@@ -105,20 +178,28 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
     let tainted = resolve::derived_from(&f.bindings, &f.name, &seeds);
     for (ci, c) in f.calls.iter().enumerate() {
         let is_write = program::destructive_call(f, c)
-            || (!p.target(i, ci).possible && p.target(i, ci).local.iter().any(|g| writes.contains(g)));
+            || (!p.target(i, ci).possible
+                && p.target(i, ci).local.iter().any(|g| writes.contains(g)));
         if !is_write {
             continue;
         }
         let args = c.args.join(" , ");
         if spellings.iter().any(|s| args.contains(s.as_str()))
-            || args.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|t| tainted.contains(t))
+            || args
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .any(|t| tainted.contains(t))
         {
             return true;
         }
     }
     // `to_writer(file, ..)` writes as it serializes.
-    if f.calls.iter().any(|c| c.is("serde_json::to_writer") || c.is("serde_json::to_writer_pretty"))
-        && !f.calls.iter().any(|c| c.is("io::stdout") || c.is("io::stderr"))
+    if f.calls
+        .iter()
+        .any(|c| c.is("serde_json::to_writer") || c.is("serde_json::to_writer_pretty"))
+        && !f
+            .calls
+            .iter()
+            .any(|c| c.is("io::stdout") || c.is("io::stderr"))
     {
         return true;
     }
@@ -129,8 +210,16 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
             && m.tokens.contains("serde_json :: to_")
             && {
                 let target = resolve::root_ident(m.tokens.split(',').next().unwrap_or(""));
-                let param_ty = f.params.iter().find(|(n, _)| resolve::root_ident(n) == target).map(|(_, t)| t.clone()).unwrap_or_default();
-                !(target.contains("stdout") || target.contains("stderr") || contains_token(&param_ty, "String") || contains_token(&param_ty, "Formatter"))
+                let param_ty = f
+                    .params
+                    .iter()
+                    .find(|(n, _)| resolve::root_ident(n) == target)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
+                !(target.contains("stdout")
+                    || target.contains("stderr")
+                    || contains_token(&param_ty, "String")
+                    || contains_token(&param_ty, "Formatter"))
             }
     })
 }
@@ -144,7 +233,9 @@ pub fn json_persistence_is_allowlisted(root: &Path) -> Result<(), String> {
             continue;
         }
         found.insert((f.rel.clone(), f.name.clone()));
-        let allowed = JSON_WRITE_ALLOWLIST.iter().any(|(rel, name, _)| *rel == f.rel && *name == f.name);
+        let allowed = JSON_WRITE_ALLOWLIST
+            .iter()
+            .any(|(rel, name, _)| *rel == f.rel && *name == f.name);
         if !allowed {
             problems.push(format!(
                 "{} serializes JSON into a file write without a JSON_WRITE_ALLOWLIST entry: JSON \
@@ -187,11 +278,16 @@ fn written_names(p: &Program, i: usize, arg: &str) -> Vec<String> {
                 }
             }
         }
-        for d in p.consts_reached(&Fun { body: t.clone(), ..(**f).clone() }) {
+        for d in p.consts_reached(&Fun {
+            body: t.clone(),
+            ..(**f).clone()
+        }) {
             lits.extend(d.literals.iter().cloned());
         }
     }
-    lits.into_iter().map(|l| resolve::strip_placeholders(&l)).collect()
+    lits.into_iter()
+        .map(|l| resolve::strip_placeholders(&l))
+        .collect()
 }
 
 /// String literals inside token text.
@@ -208,7 +304,9 @@ fn quoted(text: &str) -> Vec<String> {
 }
 
 fn is_json_name(l: &str) -> bool {
-    (l.ends_with(".json") || l.ends_with(".jsonl") || l.ends_with(".json.zst")) && !l.contains(' ') && !l.starts_with('.')
+    (l.ends_with(".json") || l.ends_with(".jsonl") || l.ends_with(".json.zst"))
+        && !l.contains(' ')
+        && !l.starts_with('.')
 }
 
 pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String> {
@@ -220,7 +318,8 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
             // A write, and the path it writes: a primitive's first
             // argument, or the first argument handed to a local writer.
             let primitive = program::destructive_call(f, c) && !program::spawn_call(c);
-            let writer = !p.target(i, ci).possible && p.target(i, ci).local.iter().any(|g| writes.contains(g));
+            let writer = !p.target(i, ci).possible
+                && p.target(i, ci).local.iter().any(|g| writes.contains(g));
             if !(primitive || writer) || c.method {
                 continue;
             }
@@ -229,7 +328,13 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
             for name in names.iter().filter(|n| is_json_name(n)) {
                 let file = name.rsplit('/').next().unwrap_or(name);
                 let pattern_ok = STORE_CONTROL_PATTERNS.iter().any(|(dir, pat)| {
-                    name.ends_with(pat) && (dir.is_empty() || names.iter().any(|n| n == dir || n.ends_with(&format!("/{dir}")) || n.starts_with(&format!("{dir}/"))))
+                    name.ends_with(pat)
+                        && (dir.is_empty()
+                            || names.iter().any(|n| {
+                                n == dir
+                                    || n.ends_with(&format!("/{dir}"))
+                                    || n.starts_with(&format!("{dir}/"))
+                            }))
                 });
                 if STORE_CONTROL_FILES.contains(&file) || pattern_ok {
                     continue;
@@ -322,20 +427,30 @@ pub(crate) fn unowned_history_writes(p: &Program) -> (Vec<HistoryWrite>, usize) 
             if let Some(name) = lhs.strip_prefix('*')
                 && let Some(b) = f.bindings.iter().rev().find(|b| b.name == name)
             {
-                lhs = b.from.replace(' ', "").trim_start_matches("&mut").trim_start_matches('&').to_string();
+                lhs = b
+                    .from
+                    .replace(' ', "")
+                    .trim_start_matches("&mut")
+                    .trim_start_matches('&')
+                    .to_string();
             }
             let rhs = a.rhs.replace(' ', "");
             let tombstone = lhs.ends_with(".present") && a.op == "=" && falsy(p, &a.rhs);
             let bump = lhs.ends_with(".regrowth_count")
                 && (a.op == "+=" || rhs.contains("regrowth_count+") || {
                     let r = resolve::root_ident(&a.rhs);
-                    f.bindings.iter().any(|b| b.name == r && b.from.replace(' ', "").contains("regrowth_count+"))
+                    f.bindings
+                        .iter()
+                        .any(|b| b.name == r && b.from.replace(' ', "").contains("regrowth_count+"))
                 });
             if !tombstone && !bump {
                 continue;
             }
             seen += 1;
-            let owned = a.conditions.iter().any(|c| ownership_condition(f, c, &methods))
+            let owned = a
+                .conditions
+                .iter()
+                .any(|c| ownership_condition(f, c, &methods))
                 || (bump && a.conditions.iter().any(|c| observed_lookup(f, c)));
             if !owned {
                 out.push(HistoryWrite {
@@ -369,17 +484,36 @@ pub fn history_sweeps_are_owned(root: &Path) -> Result<(), String> {
     // comes from the caller, which states what it covered.
     let methods = ownership_methods(&p);
     for f in p.funs.iter() {
-        let uses_window = f.assigns.iter().any(|a| a.conditions.iter().any(|c| methods.iter().any(|m| c.replace(' ', "").contains(&format!(".{m}(")))));
-        if uses_window && !f.params.iter().any(|(_, t)| contains_token(t, "ObservationOwnership")) && f.self_ty.as_deref() != Some("ObservationOwnership") {
-            problems.push(format!("{} sweeps with an ownership window it was not handed", f.display()));
+        let uses_window = f.assigns.iter().any(|a| {
+            a.conditions.iter().any(|c| {
+                methods
+                    .iter()
+                    .any(|m| c.replace(' ', "").contains(&format!(".{m}(")))
+            })
+        });
+        if uses_window
+            && !f
+                .params
+                .iter()
+                .any(|(_, t)| contains_token(t, "ObservationOwnership"))
+            && f.self_ty.as_deref() != Some("ObservationOwnership")
+        {
+            problems.push(format!(
+                "{} sweeps with an ownership window it was not handed",
+                f.display()
+            ));
         }
         // No wildcard window.
         let b = f.body.replace(' ', "");
         if b.contains("ObservationOwnership::all(")
             || b.contains("ObservationOwnership::wildcard(")
-            || (b.contains("ObservationOwnership::new(") && (b.contains("PathBuf::from(\"/\")") || b.contains("Path::new(\"/\")")))
+            || (b.contains("ObservationOwnership::new(")
+                && (b.contains("PathBuf::from(\"/\")") || b.contains("Path::new(\"/\")")))
         {
-            problems.push(format!("{} constructs a wildcard ObservationOwnership", f.display()));
+            problems.push(format!(
+                "{} constructs a wildcard ObservationOwnership",
+                f.display()
+            ));
         }
     }
     verdict(
@@ -400,7 +534,10 @@ pub fn coverage_changes_are_not_storage_changes(root: &Path) -> Result<(), Strin
             w.who, w.what
         ));
     }
-    let has_field = p.types.iter().any(|t| t.name == "ObservationOwnership" && t.fields.iter().any(|(n, _, _, _)| n == "excluded_subtrees"));
+    let has_field = p.types.iter().any(|t| {
+        t.name == "ObservationOwnership"
+            && t.fields.iter().any(|(n, _, _, _)| n == "excluded_subtrees")
+    });
     if !has_field {
         problems.push("`ObservationOwnership` has no `excluded_subtrees`: a prefix window cannot subtract an excluded nested location (CE4)".into());
     }
@@ -410,7 +547,8 @@ pub fn coverage_changes_are_not_storage_changes(root: &Path) -> Result<(), Strin
     }
     for c in covers {
         if !p.funs[c].fields.iter().any(|x| x == "excluded_subtrees") {
-            problems.push("`ObservationOwnership::covers` does not consult `excluded_subtrees`".into());
+            problems
+                .push("`ObservationOwnership::covers` does not consult `excluded_subtrees`".into());
         }
     }
     verdict("coverage changes are not storage changes", problems)

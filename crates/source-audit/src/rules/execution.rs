@@ -38,7 +38,11 @@ struct Have([bool; 3]);
 
 impl Have {
     fn union(self, o: Have) -> Have {
-        Have([self.0[0] || o.0[0], self.0[1] || o.0[1], self.0[2] || o.0[2]])
+        Have([
+            self.0[0] || o.0[0],
+            self.0[1] || o.0[1],
+            self.0[2] || o.0[2],
+        ])
     }
     fn complete(self) -> bool {
         self.0.iter().all(|b| *b)
@@ -59,7 +63,12 @@ fn honoured(c: &PCall) -> bool {
 }
 
 /// Which rechecks a definition performs, honoured, transitively.
-fn rechecks_of(p: &Program, g: usize, memo: &mut HashMap<usize, Have>, seen: &mut HashSet<usize>) -> Have {
+fn rechecks_of(
+    p: &Program,
+    g: usize,
+    memo: &mut HashMap<usize, Have>,
+    seen: &mut HashSet<usize>,
+) -> Have {
     if let Some(h) = memo.get(&g) {
         return *h;
     }
@@ -132,7 +141,10 @@ pub(crate) fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) ->
             .to_string();
         return self_field_supplied(p, f, &field);
     }
-    if f.params.iter().any(|(pat, _)| resolve::root_ident(pat) == root) {
+    if f.params
+        .iter()
+        .any(|(pat, _)| resolve::root_ident(pat) == root)
+    {
         return true;
     }
     match f.bindings.iter().rev().find(|b| b.name == root) {
@@ -147,9 +159,16 @@ pub(crate) fn caller_supplied(p: &Program, f: &Fun, expr: &str, depth: usize) ->
 /// formatted, given as an extension, or used to select directory entries.
 fn names_a_path(f: &Fun) -> bool {
     let b = &f.body;
-    ["join (\"", "with_extension (\"", "format !", "ends_with (\"", "starts_with (\"", "extension () == Some (\""]
-        .iter()
-        .any(|s| b.contains(s))
+    [
+        "join (\"",
+        "with_extension (\"",
+        "format !",
+        "ends_with (\"",
+        "starts_with (\"",
+        "extension () == Some (\"",
+    ]
+    .iter()
+    .any(|s| b.contains(s))
         || b.contains("== \"") && b.contains("extension")
 }
 
@@ -160,12 +179,18 @@ fn self_field_supplied(p: &Program, f: &Fun, field: &str) -> bool {
     let mut seen = false;
     for g in p.funs.iter() {
         for l in &g.struct_lits {
-            if !resolve::path_ends_with(&l.path, ty) && !(l.path == "Self" && g.self_ty.as_deref() == Some(ty)) {
+            if !resolve::path_ends_with(&l.path, ty)
+                && !(l.path == "Self" && g.self_ty.as_deref() == Some(ty))
+            {
                 continue;
             }
             if let Some((_, init)) = l.fields.iter().find(|(n, _)| n == field) {
                 seen = true;
-                let init = if init.trim().is_empty() { field } else { init.as_str() };
+                let init = if init.trim().is_empty() {
+                    field
+                } else {
+                    init.as_str()
+                };
                 if caller_supplied(p, g, init, 1) {
                     return true;
                 }
@@ -240,9 +265,15 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect();
-            seeds.extend(f.bindings.iter().filter(|b| {
-                all.iter().any(|r| b.from.replace(' ', "").contains(&r.replace(' ', "")))
-            }).map(|b| b.name.clone()));
+            seeds.extend(
+                f.bindings
+                    .iter()
+                    .filter(|b| {
+                        all.iter()
+                            .any(|r| b.from.replace(' ', "").contains(&r.replace(' ', "")))
+                    })
+                    .map(|b| b.name.clone()),
+            );
             let tainted = resolve::derived_from(&f.bindings, &f.name, &seeds);
             if !root_s.is_empty() && !tainted.contains(&root_s) {
                 problems.push(format!(
@@ -266,7 +297,9 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
                 continue;
             }
             let ok = f.calls.iter().enumerate().any(|(ri, r)| {
-                r.stmt <= c.stmt && honoured(r) && p.target(i, ri).local.iter().any(|g| recheck.contains(g))
+                r.stmt <= c.stmt
+                    && honoured(r)
+                    && p.target(i, ri).local.iter().any(|g| recheck.contains(g))
             });
             if !ok {
                 problems.push(format!(
@@ -278,8 +311,13 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
     }
     // The destructive docker subprocess is built in exactly the sink.
     for (i, f) in p.funs.iter().enumerate() {
-        let spawns_docker = f.calls.iter().any(|c| spawn_site(c) && first_literal(&p, c).as_deref() == Some("docker"));
-        let destructive = ["rm", "rmi", "prune"].iter().any(|v| f.literals.iter().any(|l| l == v));
+        let spawns_docker = f
+            .calls
+            .iter()
+            .any(|c| spawn_site(c) && first_literal(&p, c).as_deref() == Some("docker"));
+        let destructive = ["rm", "rmi", "prune"]
+            .iter()
+            .any(|v| f.literals.iter().any(|l| l == v));
         if spawns_docker && destructive && !sinks.contains(&i) {
             problems.push(format!(
                 "{} builds a destructive `docker` subprocess; only `docker::remove` may, so every \
@@ -302,7 +340,10 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
 /// The shapes that turn a protection lookup's error into "nothing is
 /// protected": `Result` combinators that substitute a value.
 fn discards_error(method: &str) -> bool {
-    matches!(method, "unwrap_or_default" | "unwrap_or" | "unwrap_or_else" | "ok")
+    matches!(
+        method,
+        "unwrap_or_default" | "unwrap_or" | "unwrap_or_else" | "ok"
+    )
 }
 
 pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
@@ -323,12 +364,17 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
             .map(|c| {
                 (
                     resolve::root_ident(&c.receiver),
-                    c.args.first().map(|a| resolve::root_ident(a)).unwrap_or_default(),
+                    c.args
+                        .first()
+                        .map(|a| resolve::root_ident(a))
+                        .unwrap_or_default(),
                 )
             })
             .filter(|(r, a)| !r.is_empty() && !a.is_empty())
             .collect();
-        let both = pairs.iter().any(|(r, a)| pairs.iter().any(|(r2, a2)| r2 == a && a2 == r));
+        let both = pairs
+            .iter()
+            .any(|(r, a)| pairs.iter().any(|(r2, a2)| r2 == a && a2 == r));
         if !both {
             problems.push(format!(
                 "{} tests protection in only one direction: protecting `debug/log.txt` must also \
@@ -340,7 +386,10 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
 
     // What returns the protect list, and what persists it (a function
     // taking the list that reaches a write).
-    let list_type: Vec<String> = loaders.iter().map(|i| p.funs[*i].ret.replace(' ', "")).collect();
+    let list_type: Vec<String> = loaders
+        .iter()
+        .map(|i| p.funs[*i].ret.replace(' ', ""))
+        .collect();
     let mutating = p.mutating();
     // A persister: something a function that loads the list calls, in the
     // list's own module, handing it a path list, that writes.
@@ -352,7 +401,9 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
         .filter(|(i, f)| {
             loaders.iter().any(|l| p.funs[*l].rel == f.rel)
                 && load_callers.iter().any(|c| p.callees(*c).contains(i))
-                && f.params.iter().any(|(_, t)| t.replace(' ', "").contains("PathBuf]"))
+                && f.params
+                    .iter()
+                    .any(|(_, t)| t.replace(' ', "").contains("PathBuf]"))
                 && mutating.contains(i)
         })
         .map(|(i, _)| i)
@@ -360,7 +411,10 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
     // 2. Every persister writes through the atomic temp+rename writer.
     for i in &persisters {
         let reaches_writer = !p.reachable(&[*i], &HashSet::new()).is_disjoint(&writer);
-        let bare = p.funs[*i].calls.iter().any(|c| !c.method && (c.is("fs::write") || c.is("File::create")));
+        let bare = p.funs[*i]
+            .calls
+            .iter()
+            .any(|c| !c.method && (c.is("fs::write") || c.is("File::create")));
         if !reaches_writer || bare {
             problems.push(format!(
                 "{} persists the protect list without `write_atomic` (temp file + rename): a crash \
@@ -375,7 +429,11 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
         if loaders.contains(&i) || predicate.contains(&i) {
             continue;
         }
-        let loads = f.calls.iter().enumerate().any(|(ci, _)| p.target(i, ci).local.iter().any(|g| loaders.contains(g)));
+        let loads = f
+            .calls
+            .iter()
+            .enumerate()
+            .any(|(ci, _)| p.target(i, ci).local.iter().any(|g| loaders.contains(g)));
         if !loads {
             continue;
         }
@@ -391,7 +449,16 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
         }
         // 4. No caller turns the lookup's error into an empty list.
         for c in &f.calls {
-            if c.method && discards_error(&c.path) && (c.receiver.contains("load_protect") || c.receiver.contains("protect_list") || f.calls.iter().any(|l| !l.method && l.callee() == resolve::root_ident(&c.receiver) && l.is("agents::load_protect"))) {
+            if c.method
+                && discards_error(&c.path)
+                && (c.receiver.contains("load_protect")
+                    || c.receiver.contains("protect_list")
+                    || f.calls.iter().any(|l| {
+                        !l.method
+                            && l.callee() == resolve::root_ident(&c.receiver)
+                            && l.is("agents::load_protect")
+                    }))
+            {
                 problems.push(format!(
                     "{} discards the protection lookup's error with `.{}()`: unreadable protection \
                      state is unknown, never an empty keep list",
@@ -410,7 +477,10 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
             }
             let spelled = format!("{} (", crate::program::spaced(&c.written));
             for m in &f.calls {
-                if m.method && discards_error(&m.path) && m.receiver.contains(spelled.trim_end_matches(" (")) {
+                if m.method
+                    && discards_error(&m.path)
+                    && m.receiver.contains(spelled.trim_end_matches(" ("))
+                {
                     problems.push(format!(
                         "{} discards the protection lookup's error with `.{}()`",
                         f.display(),
@@ -419,7 +489,10 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
                 }
             }
             if c.honoured == Honoured::Discarded {
-                problems.push(format!("{} loads the protect list and ignores the answer", f.display()));
+                problems.push(format!(
+                    "{} loads the protect list and ignores the answer",
+                    f.display()
+                ));
             }
         }
     }
@@ -427,20 +500,23 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
     //    `execute*`/`propose*` entry point), no second containment
     //    predicate: a verdict-returning function that tests path
     //    containment must be, or delegate to, the one predicate.
-    let decision_files: HashSet<String> = p.family(&p
-        .funs
-        .iter()
-        .filter(|f| f.is_pub && f.self_ty.is_none() && (f.name.starts_with("execute") || f.name.starts_with("propose")))
-        .map(|f| f.rel.clone())
-        .collect());
+    let decision_files: HashSet<String> = p.family(
+        &p.funs
+            .iter()
+            .filter(|f| {
+                f.is_pub
+                    && f.self_ty.is_none()
+                    && (f.name.starts_with("execute") || f.name.starts_with("propose"))
+            })
+            .map(|f| f.rel.clone())
+            .collect(),
+    );
     for (i, f) in p.funs.iter().enumerate() {
         if !decision_files.contains(&f.rel) || predicate.contains(&i) || !f.returns_verdict() {
             continue;
         }
         let contains_test = f.calls.iter().any(|c| {
-            c.method
-                && c.path == "starts_with"
-                && c.args.first().is_some_and(|a| !a.contains('"'))
+            c.method && c.path == "starts_with" && c.args.first().is_some_and(|a| !a.contains('"'))
         });
         let delegates = !p.reachable(&[i], &HashSet::new()).is_disjoint(&predicate);
         if contains_test && !delegates {
@@ -465,9 +541,11 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
 /// unknown into an explicit unknown/unavailable fact.
 fn refuses(body: &str) -> bool {
     let b = body.replace(' ', "");
-    ["bail!", "Err(", "return", "continue", "break", "panic!", "anyhow!"]
-        .iter()
-        .any(|r| b.contains(r))
+    [
+        "bail!", "Err(", "return", "continue", "break", "panic!", "anyhow!",
+    ]
+    .iter()
+    .any(|r| b.contains(r))
         || b.contains("Evidence::unavailable")
         || b.contains("Evidence::unknown")
         || b.to_ascii_lowercase().contains("refus")
@@ -493,7 +571,11 @@ pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
         .funs
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.ret.trim() == "bool" && (contains_token(&f.body, "OccupancyState") || f.calls.iter().any(|c| c.is("occupancy::probe_path"))))
+        .filter(|(_, f)| {
+            f.ret.trim() == "bool"
+                && (contains_token(&f.body, "OccupancyState")
+                    || f.calls.iter().any(|c| c.is("occupancy::probe_path")))
+        })
         .map(|(i, _)| i)
         .collect();
     for (i, f) in p.funs.iter().enumerate() {
@@ -508,25 +590,35 @@ pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
                 ));
             }
             if c.honoured == Honoured::Discarded && t.local.iter().any(|g| tri.contains(g)) {
-                problems.push(format!("{} discards the result of `member_occupancy`", f.display()));
+                problems.push(format!(
+                    "{} discards the result of `member_occupancy`",
+                    f.display()
+                ));
             }
         }
         // Match arms: an `Unknown` arm refuses; a wildcard that covers an
         // unnamed `Unknown` refuses too.
         let mut by_scrutinee: HashMap<&str, Vec<&resolve::MatchArm>> = HashMap::new();
         for a in &f.arms {
-            by_scrutinee.entry(a.scrutinee.as_str()).or_default().push(a);
+            by_scrutinee
+                .entry(a.scrutinee.as_str())
+                .or_default()
+                .push(a);
         }
         for (_, arms) in by_scrutinee {
             let about = arms.iter().any(|a| a.pattern.contains("OccupancyState"))
-                || arms.iter().any(|a| a.scrutinee.contains("member_occupancy") || a.scrutinee.contains("probe_path"));
+                || arms.iter().any(|a| {
+                    a.scrutinee.contains("member_occupancy") || a.scrutinee.contains("probe_path")
+                });
             if !about {
                 continue;
             }
             let names_unknown = arms.iter().any(|a| a.pattern.contains("Unknown"));
             for a in &arms {
                 let covers_unknown = a.pattern.contains("Unknown")
-                    || (!names_unknown && !a.pattern.contains("Free") && !a.pattern.contains("Occupied"));
+                    || (!names_unknown
+                        && !a.pattern.contains("Free")
+                        && !a.pattern.contains("Occupied"));
                 if covers_unknown && !refuses(&a.body) {
                     problems.push(format!(
                         "{}: the arm `{} => {}` lets an unanswerable occupancy probe through",
@@ -557,7 +649,10 @@ pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
             || body.contains("!=OccupancyState::Occupied")
             || body.contains("::OccupancyState::Occupied(_)==")
         {
-            problems.push(format!("{} compares against `Occupied`, collapsing `Unknown` into free", f.display()));
+            problems.push(format!(
+                "{} compares against `Occupied`, collapsing `Unknown` into free",
+                f.display()
+            ));
         }
         let mut rest = body.as_str();
         while let Some(at) = rest.find("iflet") {
@@ -584,7 +679,11 @@ pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------
 
 /// The three functions that mint or change authorization.
-const AUTH_SINKS: &[&str] = &["actions::approve", "actions::add_standing_grant", "actions::revoke_grant"];
+const AUTH_SINKS: &[&str] = &[
+    "actions::approve",
+    "actions::add_standing_grant",
+    "actions::revoke_grant",
+];
 
 /// `(file, function)`: the reviewed call sites. The CLI's own
 /// approve/grant subcommands are factored into these so the list can
@@ -617,7 +716,9 @@ pub fn human_only_authorization(root: &Path) -> Result<(), String> {
         if hits.is_empty() {
             continue;
         }
-        let allowed = AUTH_ALLOWED_CALLERS.iter().any(|(rel, name)| *rel == f.rel && *name == f.name);
+        let allowed = AUTH_ALLOWED_CALLERS
+            .iter()
+            .any(|(rel, name)| *rel == f.rel && *name == f.name);
         if !allowed {
             problems.push(format!(
                 "{} reaches authorization-minting {hits:?} outside the reviewed CLI approve/grant \
@@ -628,7 +729,9 @@ pub fn human_only_authorization(root: &Path) -> Result<(), String> {
     }
     for (rel, name) in AUTH_ALLOWED_CALLERS {
         if !p.funs.iter().any(|f| f.rel == *rel && f.name == *name) {
-            problems.push(format!("the reviewed caller {rel}::{name} no longer exists; remove it from the list"));
+            problems.push(format!(
+                "the reviewed caller {rel}::{name} no longer exists; remove it from the list"
+            ));
         }
     }
     verdict(
@@ -659,7 +762,10 @@ pub fn every_spawn_is_counted(root: &Path) -> Result<(), String> {
     for w in &wrapper {
         let f = &p.funs[*w];
         let record = f.calls.iter().find(|c| c.is("work_counters::record_spawn"));
-        let build = f.calls.iter().find(|c| !c.method && c.is("process::Command::new"));
+        let build = f
+            .calls
+            .iter()
+            .find(|c| !c.method && c.is("process::Command::new"));
         match (record, build) {
             (Some(r), Some(b)) if r.stmt <= b.stmt => {}
             _ => problems.push(format!(

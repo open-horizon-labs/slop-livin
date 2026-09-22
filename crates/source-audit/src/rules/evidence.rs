@@ -37,7 +37,10 @@ const NEGATED_VERDICTS: &[&str] = &[
 fn verdict_in(lit: &str) -> Option<&'static str> {
     // A snake_case identifier (a column or field name) is a name, not
     // prose a person reads.
-    if lit.contains('_') && !lit.contains(' ') && lit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if lit.contains('_')
+        && !lit.contains(' ')
+        && lit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return None;
     }
     let mut l = lit.to_ascii_lowercase();
@@ -58,7 +61,10 @@ pub fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
     for f in p.funs.iter() {
         for lit in &f.literals {
             if let Some(v) = verdict_in(lit) {
-                problems.push(format!("{} emits {lit:?}, which carries the verdict {v:?}", f.display()));
+                problems.push(format!(
+                    "{} emits {lit:?}, which carries the verdict {v:?}",
+                    f.display()
+                ));
             }
         }
         for d in p.consts_reached(f) {
@@ -75,7 +81,9 @@ pub fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
         }
         // A macro this layer cannot see through, in a function that
         // produces strings, is not a pass.
-        if !f.unknown_macros.is_empty() && (f.krate != "swamp_core" || f.module == "render" || f.module == "agent_json") {
+        if !f.unknown_macros.is_empty()
+            && (f.krate != "swamp_core" || f.module == "render" || f.module == "agent_json")
+        {
             problems.push(format!(
                 "{} emits through `{}!`, which the resolver cannot see through",
                 f.display(),
@@ -83,7 +91,10 @@ pub fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
             ));
         }
     }
-    verdict("facts, not verdicts: no user- or agent-facing string asserts a verdict", problems)
+    verdict(
+        "facts, not verdicts: no user- or agent-facing string asserts a verdict",
+        problems,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -93,7 +104,12 @@ pub fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
 pub fn activity_and_consumer_evidence_have_limits(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
-    let status_module: HashSet<String> = p.types.iter().filter(|t| t.name == "FactStatus").map(|t| t.rel.clone()).collect();
+    let status_module: HashSet<String> = p
+        .types
+        .iter()
+        .filter(|t| t.name == "FactStatus")
+        .map(|t| t.rel.clone())
+        .collect();
     if status_module.is_empty() {
         problems.push("`FactStatus` is not defined".into());
     }
@@ -137,7 +153,8 @@ pub fn activity_and_consumer_evidence_have_limits(root: &Path) -> Result<(), Str
             if c.method {
                 continue;
             }
-            let Some((name, pos)) = ctors.iter().find(|(n, _)| c.is(&format!("Evidence::{n}"))) else {
+            let Some((name, pos)) = ctors.iter().find(|(n, _)| c.is(&format!("Evidence::{n}")))
+            else {
                 continue;
             };
             let arg = c.args.get(*pos).cloned().unwrap_or_default();
@@ -154,21 +171,41 @@ pub fn activity_and_consumer_evidence_have_limits(root: &Path) -> Result<(), Str
     // 3. Every activity fact names its source, or delegates to a builder
     //    that does.
     let returns_evidence = |f: &crate::program::Fun| contains_token(&f.ret, "Evidence");
-    let builders: HashSet<usize> = p.funs.iter().enumerate().filter(|(_, f)| (f.module == "activity" || f.module.starts_with("activity::")) && returns_evidence(f)).map(|(i, _)| i).collect();
+    let builders: HashSet<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            (f.module == "activity" || f.module.starts_with("activity::")) && returns_evidence(f)
+        })
+        .map(|(i, _)| i)
+        .collect();
     for i in &builders {
         let f = &p.funs[*i];
         let names_source = f.body.contains("EvidenceSource ::");
-        let delegates = p.callees(*i).iter().any(|g| returns_evidence(&p.funs[*g]) && p.funs[*g].body.contains("EvidenceSource ::"));
+        let delegates = p.callees(*i).iter().any(|g| {
+            returns_evidence(&p.funs[*g]) && p.funs[*g].body.contains("EvidenceSource ::")
+        });
         if !names_source && !delegates {
-            problems.push(format!("{} returns evidence without naming an `EvidenceSource`", f.display()));
+            problems.push(format!(
+                "{} returns evidence without naming an `EvidenceSource`",
+                f.display()
+            ));
         }
     }
     // 4. The renderer prints the reason with the status.
     let render = p.defs("render::render_evidence_lines");
-    if render.is_empty() || !render.iter().any(|i| contains_token(&p.funs[*i].body, "reason")) {
+    if render.is_empty()
+        || !render
+            .iter()
+            .any(|i| contains_token(&p.funs[*i].body, "reason"))
+    {
         problems.push("render::render_evidence_lines does not print the reason: an unknown without its reason reads as \"nothing there\"".into());
     }
-    verdict("every unknown carries its reason and every fact its source", problems)
+    verdict(
+        "every unknown carries its reason and every fact its source",
+        problems,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -180,8 +217,16 @@ fn empty_init(e: &str) -> bool {
     let e = e.replace(' ', "");
     matches!(
         e.as_str(),
-        "Vec::new()" | "vec![]" | "Default::default()" | "Vec::default()" | "None" | "String::new()"
-            | "BTreeMap::new()" | "HashMap::new()" | "BTreeSet::new()" | "HashSet::new()"
+        "Vec::new()"
+            | "vec![]"
+            | "Default::default()"
+            | "Vec::default()"
+            | "None"
+            | "String::new()"
+            | "BTreeMap::new()"
+            | "HashMap::new()"
+            | "BTreeSet::new()"
+            | "HashSet::new()"
     )
 }
 
@@ -202,7 +247,13 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
         .flat_map(|i| idents(&p.funs[i].ret))
         .collect();
     while let Some(n) = queue.pop() {
-        let Some(t) = p.types.iter().find(|t| t.name == n && t.krate == "swamp_core") else { continue };
+        let Some(t) = p
+            .types
+            .iter()
+            .find(|t| t.name == n && t.krate == "swamp_core")
+        else {
+            continue;
+        };
         if !graph.insert(n.clone()) {
             continue;
         }
@@ -214,19 +265,38 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
     let vocab_types: Vec<String> = p
         .types
         .iter()
-        .filter(|t| p.types.iter().any(|e| e.name == "Evidence" && e.rel == t.rel))
+        .filter(|t| {
+            p.types
+                .iter()
+                .any(|e| e.name == "Evidence" && e.rel == t.rel)
+        })
         .map(|t| t.name.clone())
         .collect();
-    let delivery_modules: HashSet<String> = p.family(&p.types.iter().filter(|t| graph.contains(&t.name)).map(|t| t.rel.clone()).collect());
+    let delivery_modules: HashSet<String> = p.family(
+        &p.types
+            .iter()
+            .filter(|t| graph.contains(&t.name))
+            .map(|t| t.rel.clone())
+            .collect(),
+    );
     if delivery_modules.is_empty() {
-        problems.push("the pipeline's report types are not found: nothing to audit as delivered".into());
+        problems.push(
+            "the pipeline's report types are not found: nothing to audit as delivered".into(),
+        );
     }
     let surfaces: Vec<&crate::program::TypeDecl> = p
         .types
         .iter()
         .filter(|t| {
-            let carries_facts = t.fields.iter().any(|(_, ty, _, _)| vocab_types.iter().any(|v| contains_token(ty, v)));
-            t.krate == "swamp_core" && t.kind == TypeKind::Struct && t.is_pub && (t.derives("Serialize") || carries_facts) && delivery_modules.contains(&t.rel)
+            let carries_facts = t
+                .fields
+                .iter()
+                .any(|(_, ty, _, _)| vocab_types.iter().any(|v| contains_token(ty, v)));
+            t.krate == "swamp_core"
+                && t.kind == TypeKind::Struct
+                && t.is_pub
+                && (t.derives("Serialize") || carries_facts)
+                && delivery_modules.contains(&t.rel)
         })
         .collect();
     for t in surfaces {
@@ -237,7 +307,9 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
             let mut inits: Vec<String> = Vec::new();
             for f in p.funs.iter() {
                 for l in &f.struct_lits {
-                    if crate::resolve::path_ends_with(&l.path, &t.name) || (l.path == "Self" && f.self_ty.as_deref() == Some(t.name.as_str())) {
+                    if crate::resolve::path_ends_with(&l.path, &t.name)
+                        || (l.path == "Self" && f.self_ty.as_deref() == Some(t.name.as_str()))
+                    {
                         for (n, init) in &l.fields {
                             if n == field {
                                 inits.push(init.clone());
@@ -247,10 +319,24 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
                 }
             }
             let mutated = p.funs.iter().any(|f| {
-                f.assigns.iter().any(|a| a.lhs.replace(' ', "").ends_with(&format!(".{field}")))
+                f.assigns
+                    .iter()
+                    .any(|a| a.lhs.replace(' ', "").ends_with(&format!(".{field}")))
                     || f.calls.iter().any(|c| {
                         c.method
-                            && ["push", "extend", "insert", "append", "push_str", "get_or_insert_with", "entry", "retain", "sort", "iter_mut"].contains(&c.path.as_str())
+                            && [
+                                "push",
+                                "extend",
+                                "insert",
+                                "append",
+                                "push_str",
+                                "get_or_insert_with",
+                                "entry",
+                                "retain",
+                                "sort",
+                                "iter_mut",
+                            ]
+                            .contains(&c.path.as_str())
                             && c.receiver.replace(' ', "").ends_with(&format!(".{field}"))
                     })
             });
@@ -265,7 +351,9 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
                 continue;
             }
             // A field serde hides when empty has to be read by something.
-            if attrs.contains("skip_serializing_if") && !p.funs.iter().any(|f| f.fields.iter().any(|x| x == field)) {
+            if attrs.contains("skip_serializing_if")
+                && !p.funs.iter().any(|f| f.fields.iter().any(|x| x == field))
+            {
                 problems.push(format!(
                     "{}::{}.{field} is populated but nothing reads it: a field serde hides and no \
                      renderer names is not delivered",
@@ -274,7 +362,10 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
             }
         }
     }
-    verdict("what is computed for a delivered surface is delivered", problems)
+    verdict(
+        "what is computed for a delivered surface is delivered",
+        problems,
+    )
 }
 
 /// The identifiers in a type's token text.
@@ -298,7 +389,11 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
     let vocab: HashSet<String> = p
         .types
         .iter()
-        .filter(|t| p.types.iter().any(|e| e.name == "Evidence" && e.rel == t.rel))
+        .filter(|t| {
+            p.types
+                .iter()
+                .any(|e| e.name == "Evidence" && e.rel == t.rel)
+        })
         .map(|t| t.name.clone())
         .chain(["OccupancyState".to_string()])
         .collect();
@@ -306,7 +401,14 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
     // evidence is a delivery surface, audited by what calls *it*.
     let speaks = |f: &crate::program::Fun| vocab.iter().any(|v| contains_token(&f.ret, v));
     // ... or that build facts: a module whose code constructs `Evidence`.
-    let builds = |f: &crate::program::Fun| f.calls.iter().any(|c| !c.method && ["known", "unknown", "unavailable", "conflicting"].iter().any(|k| c.is(&format!("Evidence::{k}"))));
+    let builds = |f: &crate::program::Fun| {
+        f.calls.iter().any(|c| {
+            !c.method
+                && ["known", "unknown", "unavailable", "conflicting"]
+                    .iter()
+                    .any(|k| c.is(&format!("Evidence::{k}")))
+        })
+    };
     let modules: HashSet<String> = p.family(
         &p.funs
             .iter()
@@ -320,7 +422,11 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
         .funs
         .iter()
         .enumerate()
-        .filter(|(_, f)| (f.name == "main" && f.krate == "swamp") || f.trait_.is_some() || (f.krate == "swamp_tui" && f.is_pub && f.name.starts_with("run")))
+        .filter(|(_, f)| {
+            (f.name == "main" && f.krate == "swamp")
+                || f.trait_.is_some()
+                || (f.krate == "swamp_tui" && f.is_pub && f.name.starts_with("run"))
+        })
         .map(|(i, _)| i)
         .collect();
     let live = p.reachable(&entries, &HashSet::new());
@@ -336,13 +442,26 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
     }
     // Public constants and statics are read, not called.
     for d in &p.items {
-        if !modules.contains(&d.rel) || !d.is_pub || !matches!(d.kind, crate::program::DeclKind::Const | crate::program::DeclKind::Static) {
+        if !modules.contains(&d.rel)
+            || !d.is_pub
+            || !matches!(
+                d.kind,
+                crate::program::DeclKind::Const | crate::program::DeclKind::Static
+            )
+        {
             continue;
         }
-        let read = live.iter().any(|i| contains_token(&p.funs[*i].body, &d.name))
-            || p.items.iter().any(|o| o.name != d.name && contains_token(&o.value, &d.name));
+        let read = live
+            .iter()
+            .any(|i| contains_token(&p.funs[*i].body, &d.name))
+            || p.items
+                .iter()
+                .any(|o| o.name != d.name && contains_token(&o.value, &d.name));
         if !read {
-            problems.push(format!("{}::{} (pub const/static) has no live reader", d.rel, d.name));
+            problems.push(format!(
+                "{}::{} (pub const/static) has no live reader",
+                d.rel, d.name
+            ));
         }
     }
     verdict(

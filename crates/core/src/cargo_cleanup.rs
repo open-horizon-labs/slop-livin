@@ -711,7 +711,10 @@ pub(crate) fn move_reviewed(
     }
     for m in &group.members {
         if !same_safety(&snapshot(&m.path)?, m) {
-            bail!("Cargo member {} changed since review; propose again", m.path.display());
+            bail!(
+                "Cargo member {} changed since review; propose again",
+                m.path.display()
+            );
         }
     }
     // The shared live-state recheck, after the Cargo-specific checks so

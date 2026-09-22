@@ -8,7 +8,10 @@ use crate::resolve::Honoured;
 use std::collections::HashSet;
 use std::path::Path;
 
-const DISCOVERY: &[&str] = &["external::discover_and_measure", "agents::discover_and_measure"];
+const DISCOVERY: &[&str] = &[
+    "external::discover_and_measure",
+    "agents::discover_and_measure",
+];
 
 /// The raw detector-output types: what a discovery pass must not read.
 const RAW_DETECTOR_OUTPUT: &[&str] = &["DetectorSummary", "ProposedLocation", "LocationStatus"];
@@ -21,7 +24,12 @@ fn interpreters(p: &Program) -> HashSet<String> {
         .filter(|t| RAW_DETECTOR_OUTPUT.contains(&t.name.as_str()))
         .map(|t| t.rel.clone())
         // The detectors themselves produce the raw output.
-        .chain(p.impls.iter().filter(|i| i.implements("Detector")).map(|i| i.rel.clone()))
+        .chain(
+            p.impls
+                .iter()
+                .filter(|i| i.implements("Detector"))
+                .map(|i| i.rel.clone()),
+        )
         .collect()
 }
 
@@ -44,7 +52,12 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         // A field holding detector output wholesale -- a collection of
         // summaries or proposed locations. (A single status field inside a
         // proposed location is only reachable through one of these.)
-        .filter(|(_, ty, _, _)| RAW_DETECTOR_OUTPUT[..2].iter().any(|r| contains_token(ty, r)) && ty.contains("Vec"))
+        .filter(|(_, ty, _, _)| {
+            RAW_DETECTOR_OUTPUT[..2]
+                .iter()
+                .any(|r| contains_token(ty, r))
+                && ty.contains("Vec")
+        })
         .map(|(n, _, _, _)| n.clone())
         .collect();
     let variants: Vec<String> = p
@@ -57,7 +70,10 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
     // the interpreters themselves.
     // The adapters are discovery's per-tool code, reached by trait
     // dispatch the exact graph does not follow.
-    let region = p.reachable_exact(&entries.iter().copied().collect::<Vec<_>>(), &HashSet::new());
+    let region = p.reachable_exact(
+        &entries.iter().copied().collect::<Vec<_>>(),
+        &HashSet::new(),
+    );
     let region_files: HashSet<String> = region
         .iter()
         .map(|i| p.funs[*i].rel.clone())
@@ -65,7 +81,11 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         .chain(p.adapter_files())
         .filter(|r| !interp.contains(r))
         .collect();
-    let region_files: HashSet<String> = p.family(&region_files).into_iter().filter(|r| !interp.contains(r)).collect();
+    let region_files: HashSet<String> = p
+        .family(&region_files)
+        .into_iter()
+        .filter(|r| !interp.contains(r))
+        .collect();
     for f in p.funs.iter() {
         if !region_files.contains(&f.rel) {
             continue;
@@ -78,7 +98,10 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
             ));
         }
         if let Some(v) = variants.iter().find(|v| f.body.contains(v.as_str())) {
-            problems.push(format!("{} matches on `{v}`, a raw detector status", f.display()));
+            problems.push(format!(
+                "{} matches on `{v}`, a raw detector status",
+                f.display()
+            ));
         }
     }
     let seam: HashSet<usize> = p
@@ -91,10 +114,16 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
     }
     for e in &entries {
         if p.reachable(&[*e], &HashSet::new()).is_disjoint(&seam) {
-            problems.push(format!("{} never reaches `EffectiveScope::authorized_roots()`", p.funs[*e].display()));
+            problems.push(format!(
+                "{} never reaches `EffectiveScope::authorized_roots()`",
+                p.funs[*e].display()
+            ));
         }
     }
-    verdict("discovery consumes the authorized scope, never raw detector candidates", problems)
+    verdict(
+        "discovery consumes the authorized scope, never raw detector candidates",
+        problems,
+    )
 }
 
 pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String> {
@@ -104,7 +133,10 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
     let config: Vec<String> = p
         .types
         .iter()
-        .filter(|t| t.fields.iter().any(|(n, _, _, _)| n == "enabled_detectors") && t.name.ends_with("Config"))
+        .filter(|t| {
+            t.fields.iter().any(|(n, _, _, _)| n == "enabled_detectors")
+                && t.name.ends_with("Config")
+        })
         .map(|t| t.name.clone())
         .collect();
     if config.is_empty() {
@@ -115,8 +147,13 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
     let predicate: HashSet<usize> = p.named("detectors_permitted").into_iter().collect();
     for i in &predicate {
         let f = &p.funs[*i];
-        if !(f.fields.iter().any(|x| x == "defaults") && f.fields.iter().any(|x| x == "enabled_detectors")) {
-            problems.push(format!("{} does not read both `defaults` and `enabled_detectors`", f.display()));
+        if !(f.fields.iter().any(|x| x == "defaults")
+            && f.fields.iter().any(|x| x == "enabled_detectors"))
+        {
+            problems.push(format!(
+                "{} does not read both `defaults` and `enabled_detectors`",
+                f.display()
+            ));
         }
     }
     // Detector inference: calling a `Detector` implementation.
@@ -132,14 +169,23 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
     // Every function that takes the config and produces roots by
     // inference or by listing the filesystem asks the predicate first.
     for (i, f) in p.funs.iter().enumerate() {
-        let takes_config = f.params.iter().any(|(_, t)| config.iter().any(|c| contains_token(t, c)));
-        if !takes_config || f.ret.is_empty() || predicate.contains(&i) || detector_methods.contains(&i) {
+        let takes_config = f
+            .params
+            .iter()
+            .any(|(_, t)| config.iter().any(|c| contains_token(t, c)));
+        if !takes_config
+            || f.ret.is_empty()
+            || predicate.contains(&i)
+            || detector_methods.contains(&i)
+        {
             continue;
         }
         // A resolver: it produces roots by inference or by listing, or it
         // returns the scope itself.
         let returns_scope = contains_token(&f.ret, "EffectiveScope");
-        let produces = (infers.contains(&i) && !detector_methods.contains(&i)) || walks.contains(&i) || returns_scope;
+        let produces = (infers.contains(&i) && !detector_methods.contains(&i))
+            || walks.contains(&i)
+            || returns_scope;
         let guarded = !p.reachable(&[i], &HashSet::new()).is_disjoint(&predicate);
         if produces && !guarded {
             problems.push(format!(
@@ -150,14 +196,27 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
         }
     }
     // The semantics are pinned by running tests.
-    let scope_file = p.file("crates/core/src/scope.rs").map(|f| super::adapters::running_tests(&f.ast)).unwrap_or_default();
-    if !scope_file.iter().any(|t| t == "defaults_false_without_includes_or_enabled_detectors_is_empty") {
+    let scope_file = p
+        .file("crates/core/src/scope.rs")
+        .map(|f| super::adapters::running_tests(&f.ast))
+        .unwrap_or_default();
+    if !scope_file
+        .iter()
+        .any(|t| t == "defaults_false_without_includes_or_enabled_detectors_is_empty")
+    {
         problems.push("scope.rs lacks the running test `defaults_false_without_includes_or_enabled_detectors_is_empty`".into());
     }
-    if !super::meta::integration_test_exists(root, "crates/core/tests/reviewer_counterexamples.rs", "defaults_false_must_mean_explicit_only") {
+    if !super::meta::integration_test_exists(
+        root,
+        "crates/core/tests/reviewer_counterexamples.rs",
+        "defaults_false_must_mean_explicit_only",
+    ) {
         problems.push("crates/core/tests/reviewer_counterexamples.rs lacks the running test `defaults_false_must_mean_explicit_only`".into());
     }
-    verdict("defaults=false with no includes or enabled detectors means an explicit-only scope", problems)
+    verdict(
+        "defaults=false with no includes or enabled detectors means an explicit-only scope",
+        problems,
+    )
 }
 
 pub fn discovery_owned_by_report_pipeline(root: &Path) -> Result<(), String> {
@@ -165,11 +224,17 @@ pub fn discovery_owned_by_report_pipeline(root: &Path) -> Result<(), String> {
     let mut problems = Vec::new();
     let entries = anchors(&p, DISCOVERY, &mut problems);
     // Every production caller of either pass.
-    let mut owners: Vec<usize> = entries.iter().flat_map(|e| p.callers(*e)).filter(|c| !entries.contains(c)).collect();
+    let mut owners: Vec<usize> = entries
+        .iter()
+        .flat_map(|e| p.callers(*e))
+        .filter(|c| !entries.contains(c))
+        .collect();
     owners.sort();
     owners.dedup();
     match owners.as_slice() {
-        [] => problems.push("nothing runs discovery: the one observation that owns it has to be somewhere".into()),
+        [] => problems.push(
+            "nothing runs discovery: the one observation that owns it has to be somewhere".into(),
+        ),
         [one] => {
             let reaches: HashSet<usize> = p.callees(*one).iter().copied().collect();
             for e in &entries {
@@ -202,17 +267,25 @@ pub fn detector_ids_only_in_registry(root: &Path) -> Result<(), String> {
     // Detector ids, derived: the constants a `Detector` implementation's
     // `id()` returns, with the values they hold.
     let mut ids: Vec<(String, String)> = Vec::new();
-    for f in p.funs.iter().filter(|f| f.trait_.as_deref() == Some("Detector") && f.name == "id") {
+    for f in p
+        .funs
+        .iter()
+        .filter(|f| f.trait_.as_deref() == Some("Detector") && f.name == "id")
+    {
         for d in &p.items {
             if d.kind == crate::program::DeclKind::Const && contains_token(&f.body, &d.name) {
-                ids.push((d.name.clone(), d.literals.first().cloned().unwrap_or_default()));
+                ids.push((
+                    d.name.clone(),
+                    d.literals.first().cloned().unwrap_or_default(),
+                ));
             }
         }
     }
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
-        problems.push("no `Detector::id()` returns a constant: detector ids are not declared".into());
+        problems
+            .push("no `Detector::id()` returns a constant: detector ids are not declared".into());
     }
     // The registry: the detector implementations' own modules and the
     // module that declares the trait.
@@ -221,20 +294,39 @@ pub fn detector_ids_only_in_registry(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|i| i.implements("Detector"))
         .map(|i| i.rel.clone())
-        .chain(p.types.iter().filter(|t| t.name == "Detector" && t.kind == TypeKind::Trait).map(|t| t.rel.clone()))
+        .chain(
+            p.types
+                .iter()
+                .filter(|t| t.name == "Detector" && t.kind == TypeKind::Trait)
+                .map(|t| t.rel.clone()),
+        )
         .collect();
     let interp = interpreters(&p);
-    let inside = |rel: &str| registry.contains(rel) || interp.contains(rel) || rel.contains("/locations/");
+    let inside =
+        |rel: &str| registry.contains(rel) || interp.contains(rel) || rel.contains("/locations/");
     for f in p.funs.iter() {
         if inside(&f.rel) {
             continue;
         }
-        if let Some((n, _)) = ids.iter().find(|(n, _)| contains_token(&f.body, n) || contains_token(&f.sig, n)) {
-            problems.push(format!("{} names the detector id constant `{n}`", f.display()));
+        if let Some((n, _)) = ids
+            .iter()
+            .find(|(n, _)| contains_token(&f.body, n) || contains_token(&f.sig, n))
+        {
+            problems.push(format!(
+                "{} names the detector id constant `{n}`",
+                f.display()
+            ));
         }
         let matched: HashSet<&str> = ids
             .iter()
-            .filter(|(_, v)| !v.is_empty() && (f.arms.iter().any(|a| a.pattern.contains(&format!("\"{v}\""))) || f.body.contains(&format!("== \"{v}\""))))
+            .filter(|(_, v)| {
+                !v.is_empty()
+                    && (f
+                        .arms
+                        .iter()
+                        .any(|a| a.pattern.contains(&format!("\"{v}\"")))
+                        || f.body.contains(&format!("== \"{v}\"")))
+            })
             .map(|(_, v)| v.as_str())
             .collect();
         if matched.len() >= 2 {
@@ -248,12 +340,19 @@ pub fn detector_ids_only_in_registry(root: &Path) -> Result<(), String> {
         }
     }
     for d in &p.items {
-        if !inside(&d.rel) && let Some((n, _)) = ids.iter().find(|(n, _)| contains_token(&d.value, n)) {
-            problems.push(format!("{}::{} names the detector id constant `{n}` at item level", d.rel, d.name));
+        if !inside(&d.rel)
+            && let Some((n, _)) = ids.iter().find(|(n, _)| contains_token(&d.value, n))
+        {
+            problems.push(format!(
+                "{}::{} names the detector id constant `{n}` at item level",
+                d.rel, d.name
+            ));
         }
     }
     if p.named("manager_conventions").is_empty() {
-        problems.push("`Detector` has no `manager_conventions()` capability for wiring to match on".into());
+        problems.push(
+            "`Detector` has no `manager_conventions()` capability for wiring to match on".into(),
+        );
     }
     verdict("detector ids live only in the detector registry", problems)
 }
@@ -284,10 +383,15 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
         let f = &p.funs[g];
         let bare_root = f.params.iter().any(|(_, t)| {
             let t = t.replace(' ', "");
-            (t.ends_with("Path") || t.ends_with("PathBuf")) && !t.contains('[') && !t.contains("Vec<")
+            (t.ends_with("Path") || t.ends_with("PathBuf"))
+                && !t.contains('[')
+                && !t.contains("Vec<")
         });
         let opens = reads.contains(&g) || f.calls.iter().any(|c| c.is("File::open"));
-        let cache_load = f.ret.contains("Report") && opens && !p.destructive().contains(&g) && !p.traversal(&HashSet::new()).contains(&g);
+        let cache_load = f.ret.contains("Report")
+            && opens
+            && !p.destructive().contains(&g)
+            && !p.traversal(&HashSet::new()).contains(&g);
         f.is_pub
             && report_files.contains(&f.rel)
             && bare_root
@@ -305,7 +409,9 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
             }
             // A call into the report module this audit cannot resolve is
             // not a pass.
-            let into_report = report_files.iter().any(|r| t.abs.starts_with(&format!("{}::", Program::file_module(r))));
+            let into_report = report_files
+                .iter()
+                .any(|r| t.abs.starts_with(&format!("{}::", Program::file_module(r))));
             if into_report && t.local.is_empty() {
                 problems.push(format!(
                     "{} calls `{}` in the report module, which resolves to nothing: an entry point \

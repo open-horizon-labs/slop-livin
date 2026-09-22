@@ -26,13 +26,19 @@ fn frontmatter(text: &str) -> Vec<String> {
     if lines.next().map(str::trim) != Some("---") {
         return Vec::new();
     }
-    lines.take_while(|l| l.trim() != "---").map(str::to_string).collect()
+    lines
+        .take_while(|l| l.trim() != "---")
+        .map(str::to_string)
+        .collect()
 }
 
 fn value(front: &[String], key: &str) -> Option<String> {
     front
         .iter()
-        .find_map(|l| l.strip_prefix(&format!("{key}:")).map(|v| v.trim().trim_matches('"').to_string()))
+        .find_map(|l| {
+            l.strip_prefix(&format!("{key}:"))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
         .filter(|v| !v.is_empty())
 }
 
@@ -61,7 +67,11 @@ fn detection(text: &str) -> String {
     let mut on = false;
     for l in text.lines() {
         if l.starts_with("## ") {
-            on = l.trim_start_matches('#').trim().to_ascii_lowercase().starts_with("detection");
+            on = l
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("detection");
             continue;
         }
         if on {
@@ -79,8 +89,20 @@ fn test_fns(file: &syn::File) -> Vec<(String, bool, bool)> {
         fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
             if f.attrs.iter().any(|a| a.path().is_ident("test")) {
                 let body = f.block.to_token_stream().to_string();
-                let asserts = ["assert", "panic !", "unwrap_err", "expect_err", "contract ::"].iter().any(|a| body.contains(a));
-                self.0.push((f.sig.ident.to_string(), f.attrs.iter().any(|a| a.path().is_ident("ignore")), asserts));
+                let asserts = [
+                    "assert",
+                    "panic !",
+                    "unwrap_err",
+                    "expect_err",
+                    "contract ::",
+                ]
+                .iter()
+                .any(|a| body.contains(a));
+                self.0.push((
+                    f.sig.ident.to_string(),
+                    f.attrs.iter().any(|a| a.path().is_ident("ignore")),
+                    asserts,
+                ));
             }
             syn::visit::visit_item_fn(self, f);
         }
@@ -101,8 +123,12 @@ fn all_tests(root: &Path) -> HashSet<String> {
         let name = krate.file_name().to_string_lossy().into_owned();
         for sub in ["src", "tests"] {
             for rel in crate::resolve::rust_files_recursive(root, &format!("crates/{name}/{sub}")) {
-                let Ok(text) = std::fs::read_to_string(root.join(&rel)) else { continue };
-                let Ok(ast) = crate::ast::parse_cached(&rel, &text) else { continue };
+                let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
+                    continue;
+                };
+                let Ok(ast) = crate::ast::parse_cached(&rel, &text) else {
+                    continue;
+                };
                 for (n, ignored, asserts) in test_fns(&ast) {
                     if !ignored && asserts {
                         out.insert(n);
@@ -122,14 +148,18 @@ pub fn integration_test_exists(root: &Path, rel: &str, name: &str) -> bool {
     let Ok(ast) = crate::ast::parse_cached(rel, &text) else {
         return false;
     };
-    test_fns(&ast).iter().any(|(n, ignored, asserts)| n == name && !ignored && *asserts)
+    test_fns(&ast)
+        .iter()
+        .any(|(n, ignored, asserts)| n == name && !ignored && *asserts)
 }
 
 /// Every fixture id (`<audit>/<stem>`) in the mutation corpus.
 fn fixture_ids(root: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     let dir = root.join("crates/source-audit/tests/mutations");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for a in rd.flatten() {
         if !a.path().is_dir() {
             continue;
@@ -147,7 +177,13 @@ fn fixture_ids(root: &Path) -> HashSet<String> {
 
 fn dated(s: &str) -> bool {
     s.as_bytes().windows(10).any(|w| {
-        w.iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() })
+        w.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
     })
 }
 
@@ -158,7 +194,10 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
     let fixtures = fixture_ids(root);
     let gdir = root.join(".oh/guardrails");
     let mut seen = 0;
-    let mut entries: Vec<_> = std::fs::read_dir(&gdir).map_err(|e| format!("read .oh/guardrails: {e}"))?.flatten().collect();
+    let mut entries: Vec<_> = std::fs::read_dir(&gdir)
+        .map_err(|e| format!("read .oh/guardrails: {e}"))?
+        .flatten()
+        .collect();
     entries.sort_by_key(|e| e.path());
     for e in entries {
         if e.path().extension().and_then(|x| x.to_str()) != Some("md") {
@@ -191,15 +230,27 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
                     let (file, name) = match t.split_once(".rs::") {
                         Some((f, n)) => (format!("{f}.rs"), Some(n.to_string())),
                         None if t.ends_with(".rs") => (t.clone(), None),
-                        None => (String::new(), Some(t.rsplit("::").next().unwrap_or(&t).to_string())),
+                        None => (
+                            String::new(),
+                            Some(t.rsplit("::").next().unwrap_or(&t).to_string()),
+                        ),
                     };
                     let ok = match (&file, &name) {
                         (f, Some(n)) if !f.is_empty() => integration_test_exists(root, f, n),
-                        (f, None) => std::fs::read_to_string(root.join(f)).ok().and_then(|text| crate::ast::parse_cached(f, &text).ok()).is_some_and(|ast| test_fns(&ast).iter().any(|(_, ig, asserts)| !ig && *asserts)),
+                        (f, None) => std::fs::read_to_string(root.join(f))
+                            .ok()
+                            .and_then(|text| crate::ast::parse_cached(f, &text).ok())
+                            .is_some_and(|ast| {
+                                test_fns(&ast)
+                                    .iter()
+                                    .any(|(_, ig, asserts)| !ig && *asserts)
+                            }),
                         (_, Some(n)) => tests.contains(n),
                     };
                     if !ok {
-                        problems.push(format!("{rel}: runtime test `{t}` is not a running, asserting #[test]"));
+                        problems.push(format!(
+                            "{rel}: runtime test `{t}` is not a running, asserting #[test]"
+                        ));
                     }
                 }
             }
@@ -208,7 +259,9 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
                     problems.push(format!("{rel}: names audit `{a}`, which is not registered"));
                 } else {
                     let det = detection(&text);
-                    let named = fixtures.iter().any(|id| id.starts_with(&format!("{a}/")) && det.contains(id.as_str()));
+                    let named = fixtures
+                        .iter()
+                        .any(|id| id.starts_with(&format!("{a}/")) && det.contains(id.as_str()));
                     if !named {
                         problems.push(format!(
                             "{rel}: its Detection section names no mutation-corpus fixture of \
@@ -223,7 +276,10 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
         problems.push(".oh/guardrails is empty".into());
     }
     let adr_dir = root.join("docs/ADRs");
-    for e in std::fs::read_dir(&adr_dir).map_err(|e| format!("read docs/ADRs: {e}"))?.flatten() {
+    for e in std::fs::read_dir(&adr_dir)
+        .map_err(|e| format!("read docs/ADRs: {e}"))?
+        .flatten()
+    {
         if e.path().extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
@@ -238,9 +294,14 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
         for t in list(&front, "cargo_tests") {
             let fn_name = t.rsplit("::").next().unwrap_or(&t).to_string();
             if !tests.contains(&fn_name) {
-                problems.push(format!("{rel}: names test `{t}`, which is not a running, asserting #[test]"));
+                problems.push(format!(
+                    "{rel}: names test `{t}`, which is not a running, asserting #[test]"
+                ));
             }
         }
     }
-    verdict("guardrail and ADR metadata resolve to real audits, fixtures and tests", problems)
+    verdict(
+        "guardrail and ADR metadata resolve to real audits, fixtures and tests",
+        problems,
+    )
 }

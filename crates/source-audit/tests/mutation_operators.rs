@@ -100,7 +100,10 @@ fn parse_seed(audit: &str, path: &Path) -> Seed {
                 if files.is_empty() {
                     files.push((
                         header.get("target").cloned().unwrap_or_default(),
-                        header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+                        header
+                            .get("mode")
+                            .cloned()
+                            .unwrap_or_else(|| "append".into()),
                         std::mem::take(&mut body),
                     ));
                 } else {
@@ -122,7 +125,10 @@ fn parse_seed(audit: &str, path: &Path) -> Seed {
     if files.is_empty() {
         files.push((
             header.get("target").cloned().unwrap_or_default(),
-            header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+            header
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "append".into()),
             body,
         ));
     } else {
@@ -131,7 +137,10 @@ fn parse_seed(audit: &str, path: &Path) -> Seed {
     Seed {
         audit: audit.to_string(),
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        expect: header.get("expect").cloned().unwrap_or_else(|| "reject".into()),
+        expect: header
+            .get("expect")
+            .cloned()
+            .unwrap_or_else(|| "reject".into()),
         files,
     }
 }
@@ -164,7 +173,8 @@ fn seeds() -> Vec<Seed> {
 fn dependency_crates() -> Vec<String> {
     let mut out = Vec::new();
     for k in ["core", "cli", "tui"] {
-        let text = std::fs::read_to_string(repo_root().join(format!("crates/{k}/Cargo.toml"))).unwrap_or_default();
+        let text = std::fs::read_to_string(repo_root().join(format!("crates/{k}/Cargo.toml")))
+            .unwrap_or_default();
         let mut on = false;
         for line in text.lines() {
             let t = line.trim();
@@ -235,7 +245,10 @@ impl VisitMut for Retarget {
 /// Applies `edit` to every item list (the file and each inline module's
 /// contents), so an inserted `use` or helper lands in the same scope as
 /// the function it serves.
-fn each_scope(items: &mut Vec<syn::Item>, edit: &mut dyn FnMut(&mut Vec<syn::Item>) -> bool) -> bool {
+fn each_scope(
+    items: &mut Vec<syn::Item>,
+    edit: &mut dyn FnMut(&mut Vec<syn::Item>) -> bool,
+) -> bool {
     let mut changed = edit(items);
     for it in items.iter_mut() {
         if let syn::Item::Mod(m) = it
@@ -309,11 +322,16 @@ fn op_helper(file: &mut syn::File) -> bool {
     each_scope(&mut file.items, &mut |items| {
         let mut added: Vec<syn::Item> = Vec::new();
         for f in fns_in(items) {
-            let simple = f.sig.inputs.iter().all(|a| matches!(a, syn::FnArg::Typed(t) if matches!(&*t.pat, syn::Pat::Ident(_))));
+            let simple = f.sig.inputs.iter().all(
+                |a| matches!(a, syn::FnArg::Typed(t) if matches!(&*t.pat, syn::Pat::Ident(_))),
+            );
             if !simple || f.block.stmts.is_empty() || f.sig.asyncness.is_some() {
                 continue;
             }
-            let helper = syn::Ident::new(&format!("sweep_op_helper_{}", f.sig.ident), f.sig.ident.span());
+            let helper = syn::Ident::new(
+                &format!("sweep_op_helper_{}", f.sig.ident),
+                f.sig.ident.span(),
+            );
             let mut sig = f.sig.clone();
             sig.ident = helper.clone();
             let block = f.block.clone();
@@ -351,9 +369,10 @@ fn op_macro_wrap(file: &mut syn::File) -> bool {
         fn visit_block_mut(&mut self, b: &mut syn::Block) {
             for s in b.stmts.iter_mut() {
                 let replacement: Option<syn::Stmt> = match s {
-                    syn::Stmt::Expr(e @ (syn::Expr::Call(_) | syn::Expr::MethodCall(_) | syn::Expr::Try(_)), Some(_)) => {
-                        Some(syn::parse_quote!(let _ = vec![#e];))
-                    }
+                    syn::Stmt::Expr(
+                        e @ (syn::Expr::Call(_) | syn::Expr::MethodCall(_) | syn::Expr::Try(_)),
+                        Some(_),
+                    ) => Some(syn::parse_quote!(let _ = vec![#e];)),
                     syn::Stmt::Local(l)
                         if matches!(l.pat, syn::Pat::Wild(_))
                             && l.init.as_ref().is_some_and(|i| i.diverge.is_none()) =>
@@ -399,7 +418,10 @@ fn op_via_constant(file: &mut syn::File) -> bool {
     }
     let mut n = 0usize;
     each_scope(&mut file.items, &mut |items| {
-        let mut h = H { n, consts: Vec::new() };
+        let mut h = H {
+            n,
+            consts: Vec::new(),
+        };
         for f in fns_in(items) {
             h.visit_block_mut(&mut f.block);
         }
@@ -424,7 +446,9 @@ fn op_discard(file: &mut syn::File) -> bool {
             for s in b.stmts.iter_mut() {
                 let inner: Option<syn::Expr> = match s {
                     syn::Stmt::Expr(syn::Expr::Try(t), _) => Some((*t.expr).clone()),
-                    syn::Stmt::Expr(syn::Expr::Match(m), _) if matches!(&*m.expr, syn::Expr::Call(_)) => {
+                    syn::Stmt::Expr(syn::Expr::Match(m), _)
+                        if matches!(&*m.expr, syn::Expr::Call(_)) =>
+                    {
                         Some((*m.expr).clone())
                     }
                     syn::Stmt::Local(l) => match l.init.as_ref().map(|i| &*i.expr) {
@@ -475,24 +499,47 @@ fn variant(seed: &Seed, op: &str, root: &Path) -> Option<Seed> {
         } else {
             format!("{dir}/{stem}/sweep_op_moved.rs")
         };
-        out.files[0] = (target.clone(), "append".into(), "pub mod sweep_op_moved;\n".into());
-        out.files.insert(1, (child, "create".into(), format!("#[allow(unused_imports)]\nuse super::*;\n{body}")));
+        out.files[0] = (
+            target.clone(),
+            "append".into(),
+            "pub mod sweep_op_moved;\n".into(),
+        );
+        out.files.insert(
+            1,
+            (
+                child,
+                "create".into(),
+                format!("#[allow(unused_imports)]\nuse super::*;\n{body}"),
+            ),
+        );
         return Some(out);
     }
     if op == "exempt_helper" {
         let (file, anchor) = match seed.audit.as_str() {
-            "agent_adapters_read_bounded_headers_only" => ("crates/core/src/agents/bounded_io.rs", "pub fn read_header("),
+            "agent_adapters_read_bounded_headers_only" => (
+                "crates/core/src/agents/bounded_io.rs",
+                "pub fn read_header(",
+            ),
             "agent_adapters_do_not_traverse" | "no_second_traversal_on_report_path" => {
                 ("crates/core/src/locations/mod.rs", "pub fn shallow_list(")
             }
             _ => return None,
         };
         let mut parsed: syn::File = syn::parse_str(&body).ok()?;
-        let stmts = fns_in(&mut parsed.items).into_iter().next()?.block.stmts.clone();
+        let stmts = fns_in(&mut parsed.items)
+            .into_iter()
+            .next()?
+            .block
+            .stmts
+            .clone();
         let text = std::fs::read_to_string(root.join(file)).ok()?;
         let at = text.find(anchor)?;
         let open = at + text[at..].find('{')? + 1;
-        let injected: String = stmts.iter().map(|s| format!("\n    {};", s.to_token_stream())).collect::<String>().replace(";;", ";");
+        let injected: String = stmts
+            .iter()
+            .map(|s| format!("\n    {};", s.to_token_stream()))
+            .collect::<String>()
+            .replace(";;", ";");
         // The seed's own imports come along, or an aliased primitive would
         // arrive under a name the primitive's file never declared.
         let uses: String = parsed
@@ -610,12 +657,20 @@ fn every_operator_variant_of_every_seed_is_rejected() {
         "the operators generated only {} variants",
         jobs.len()
     );
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 12);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 12);
     let tmp = tempfile::tempdir().unwrap();
     let problems: Vec<String> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let mine: Vec<&(String, Seed)> = jobs.iter().enumerate().filter(|(i, _)| i % workers == w).map(|(_, j)| j).collect();
+                let mine: Vec<&(String, Seed)> = jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % workers == w)
+                    .map(|(_, j)| j)
+                    .collect();
                 let dir = tmp.path().join(format!("w{w}"));
                 let root = root.clone();
                 scope.spawn(move || {
@@ -630,13 +685,21 @@ fn every_operator_variant_of_every_seed_is_rejected() {
                     for (op, v) in mine {
                         let audit = rule(&v.audit).unwrap();
                         let originals = apply(&work, v);
-                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(&work)));
+                        let r =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(&work)));
                         restore(originals);
                         let want_accept = v.expect == "accept" && op.ends_with("(accept)");
                         match r {
-                            Err(_) => out.push(format!("{}/{}: the audit panicked ({op})", v.audit, v.name)),
-                            Ok(Ok(())) if !want_accept => out.push(format!("{}/{}: ACCEPTED the `{op}` variant", v.audit, v.name)),
-                            Ok(Err(e)) if want_accept => out.push(format!("{}/{}: REJECTED the legitimate `{op}` variant: {e}", v.audit, v.name)),
+                            Err(_) => out
+                                .push(format!("{}/{}: the audit panicked ({op})", v.audit, v.name)),
+                            Ok(Ok(())) if !want_accept => out.push(format!(
+                                "{}/{}: ACCEPTED the `{op}` variant",
+                                v.audit, v.name
+                            )),
+                            Ok(Err(e)) if want_accept => out.push(format!(
+                                "{}/{}: REJECTED the legitimate `{op}` variant: {e}",
+                                v.audit, v.name
+                            )),
                             _ => {}
                         }
                     }
@@ -644,7 +707,10 @@ fn every_operator_variant_of_every_seed_is_rejected() {
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     println!("mutation operators: {} variants {per_op:?}", jobs.len());
     let mut problems = problems;

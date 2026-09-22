@@ -865,6 +865,4 @@ mod consumer_sidecar_tests {
             vec!["kept"]
         );
     }
-
-
 }

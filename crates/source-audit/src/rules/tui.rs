@@ -22,8 +22,20 @@ use crate::program::{PCall, spawn_call, traversal_call};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-const REQUIRED_ROOTS: &[&str] = &["event_loop", "handle_terminal_key", "handle_key", "handle_key_mod", "draw"];
-const ROOT_PATTERNS: &[&str] = &["handle_key", "handle_terminal", "on_key", "event_loop", "draw"];
+const REQUIRED_ROOTS: &[&str] = &[
+    "event_loop",
+    "handle_terminal_key",
+    "handle_key",
+    "handle_key_mod",
+    "draw",
+];
+const ROOT_PATTERNS: &[&str] = &[
+    "handle_key",
+    "handle_terminal",
+    "on_key",
+    "event_loop",
+    "draw",
+];
 
 /// Blocking on the calling thread, in the standard library's terms.
 fn blocks(c: &PCall) -> bool {
@@ -47,21 +59,42 @@ pub fn tui_actions_off_event_thread(root: &Path) -> Result<(), String> {
     // transitively.
     // The one-level, capped `locations::shallow_list` is the bounded
     // listing the guardrails sanction everywhere; it is not a scan.
-    let bounded = super::bounded_primitives(&p, &[("locations::shallow_list", "SHALLOW_LIST_CAP")], false, &mut problems);
+    let bounded = super::bounded_primitives(
+        &p,
+        &[("locations::shallow_list", "SHALLOW_LIST_CAP")],
+        false,
+        &mut problems,
+    );
     let core_blocking = p.closure("tui_blocking", &bounded, |_, c| {
-        (spawn_call(c) || c.is("thread::sleep") || traversal_call(c) || (c.method && ["recv", "recv_timeout", "wait_with_output"].contains(&c.path.as_str())))
+        (spawn_call(c)
+            || c.is("thread::sleep")
+            || traversal_call(c)
+            || (c.method
+                && ["recv", "recv_timeout", "wait_with_output"].contains(&c.path.as_str())))
             && !c.in_spawn
     });
-    let tui: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| f.krate == "swamp_tui").map(|(i, _)| i).collect();
+    let tui: Vec<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.krate == "swamp_tui")
+        .map(|(i, _)| i)
+        .collect();
     for r in REQUIRED_ROOTS {
         if !tui.iter().any(|i| p.funs[*i].name == *r) {
-            problems.push(format!("missing UI root `{r}`; update the audit when entry points change"));
+            problems.push(format!(
+                "missing UI root `{r}`; update the audit when entry points change"
+            ));
         }
     }
     let roots: Vec<usize> = tui
         .iter()
         .copied()
-        .filter(|i| ROOT_PATTERNS.iter().any(|pat| p.funs[*i].name.contains(pat)))
+        .filter(|i| {
+            ROOT_PATTERNS
+                .iter()
+                .any(|pat| p.funs[*i].name.contains(pat))
+        })
         .collect();
     let mut prev: HashMap<usize, usize> = HashMap::new();
     let mut seen: HashSet<usize> = roots.iter().copied().collect();
@@ -103,7 +136,9 @@ pub fn tui_actions_off_event_thread(root: &Path) -> Result<(), String> {
                         "blocking action on the UI path: {} -> `{}` ({})",
                         chain(&prev, i),
                         gf.path(),
-                        p.chain(*g, &core_blocking, |h| p.funs[h].calls.iter().any(|c| spawn_call(c) || c.is("thread::sleep") || traversal_call(c)))
+                        p.chain(*g, &core_blocking, |h| p.funs[h].calls.iter().any(
+                            |c| spawn_call(c) || c.is("thread::sleep") || traversal_call(c)
+                        ))
                     ));
                 }
             }
@@ -114,9 +149,16 @@ pub fn tui_actions_off_event_thread(root: &Path) -> Result<(), String> {
                 prev.insert(*g, i);
                 queue.push_back(*g);
             } else if p.funs[*g].krate != "swamp_tui" && core_blocking.contains(g) {
-                problems.push(format!("blocking action on the UI path: {} names `{}`", chain(&prev, i), p.funs[*g].path()));
+                problems.push(format!(
+                    "blocking action on the UI path: {} names `{}`",
+                    chain(&prev, i),
+                    p.funs[*g].path()
+                ));
             }
         }
     }
-    verdict("no blocking scan, review or cleanup on the TUI event or render path", problems)
+    verdict(
+        "no blocking scan, review or cleanup on the TUI event or render path",
+        problems,
+    )
 }

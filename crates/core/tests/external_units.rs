@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 
-use swamp_core::external::{
-    ExternalUnit, discover_and_measure,
-};
+use swamp_core::external::{ExternalUnit, discover_and_measure};
 use swamp_core::locations::{Environment, Platform, Registry, StorageCategory};
 use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 

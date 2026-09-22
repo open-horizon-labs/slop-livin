@@ -327,7 +327,9 @@ fn every_vendored_file_is_cited_by_the_manifest() {
 // cannot close.
 
 fn pinned(c: &Citation) -> bool {
-    c.repo.starts_with("github.com/") && c.commit.len() == 40 && c.commit.chars().all(|x| x.is_ascii_hexdigit())
+    c.repo.starts_with("github.com/")
+        && c.commit.len() == 40
+        && c.commit.chars().all(|x| x.is_ascii_hexdigit())
 }
 
 #[test]
@@ -338,10 +340,16 @@ fn every_pinned_citation_records_its_fetched_upstream_digest() {
         let recorded = &c.upstream_blake3;
         let is_digest = recorded.len() == 64 && recorded.chars().all(|x| x.is_ascii_hexdigit());
         if pinned(c) && !is_digest {
-            problems.push(format!("{} {}: a pinned citation records no upstream digest ({recorded})", c.repo, c.path));
+            problems.push(format!(
+                "{} {}: a pinned citation records no upstream digest ({recorded})",
+                c.repo, c.path
+            ));
         }
         if !pinned(c) && recorded != "doc-page" {
-            problems.push(format!("{} {}: an unpinned citation must say `doc-page`, not {recorded}", c.repo, c.path));
+            problems.push(format!(
+                "{} {}: an unpinned citation must say `doc-page`, not {recorded}",
+                c.repo, c.path
+            ));
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
@@ -355,7 +363,9 @@ fn quoted_lines(excerpt: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter(|l| {
-            let bare = l.trim_start_matches(|c: char| c == '/' || c == '#' || c == '<' || c == '!' || c == '-' || c == ' ');
+            let bare = l.trim_start_matches(|c: char| {
+                c == '/' || c == '#' || c == '<' || c == '!' || c == '-' || c == ' '
+            });
             !(bare.starts_with("repo:")
                 || bare.starts_with("commit:")
                 || bare.starts_with("retrieved:")
@@ -384,7 +394,10 @@ fn a_pinned_citation_re_fetches_to_its_recorded_digest_and_contains_its_excerpt(
     let mut problems = Vec::new();
     for (i, c) in citations.iter().enumerate().filter(|(_, c)| pinned(c)) {
         let repo = c.repo.trim_start_matches("github.com/");
-        let url = format!("https://raw.githubusercontent.com/{repo}/{}/{}", c.commit, c.path);
+        let url = format!(
+            "https://raw.githubusercontent.com/{repo}/{}/{}",
+            c.commit, c.path
+        );
         let out = tmp.path().join(format!("f{i}"));
         let ok = std::process::Command::new("curl")
             .args(["-sfL", "-m", "30", "-o"])
@@ -392,7 +405,10 @@ fn a_pinned_citation_re_fetches_to_its_recorded_digest_and_contains_its_excerpt(
             .arg(&url)
             .status()
             .is_ok_and(|s| s.success());
-        let Ok(bytes) = std::fs::read(&out).map_err(|_| ()).and_then(|b| if ok { Ok(b) } else { Err(()) }) else {
+        let Ok(bytes) = std::fs::read(&out)
+            .map_err(|_| ())
+            .and_then(|b| if ok { Ok(b) } else { Err(()) })
+        else {
             problems.push(format!("{url}: could not be fetched"));
             continue;
         };
@@ -402,13 +418,19 @@ fn a_pinned_citation_re_fetches_to_its_recorded_digest_and_contains_its_excerpt(
             continue;
         }
         if digest != c.upstream_blake3 {
-            problems.push(format!("{url}: upstream digest {digest} is not the recorded {}", c.upstream_blake3));
+            problems.push(format!(
+                "{url}: upstream digest {digest} is not the recorded {}",
+                c.upstream_blake3
+            ));
         }
         let upstream = String::from_utf8_lossy(&bytes);
         let excerpt = std::fs::read_to_string(dir.join(&c.excerpt)).unwrap_or_default();
         for line in quoted_lines(&excerpt) {
             if !upstream.contains(line.as_str()) {
-                problems.push(format!("{}: excerpt line not found upstream at the pinned commit: {line}", c.excerpt));
+                problems.push(format!(
+                    "{}: excerpt line not found upstream at the pinned commit: {line}",
+                    c.excerpt
+                ));
             }
         }
     }

@@ -107,7 +107,9 @@ pub enum Truncation {
     Complete,
     /// The listing stopped at the cap with more entries left; `n` is how
     /// many it kept.
-    Truncated { n: usize },
+    Truncated {
+        n: usize,
+    },
 }
 
 impl Truncation {
@@ -900,7 +902,10 @@ mod tests {
         for i in 1..8 {
             std::fs::remove_file(dir.path().join(format!("e{i:05}"))).unwrap();
         }
-        assert_eq!(super::shallow_list(dir.path()).truncation, super::Truncation::Complete);
+        assert_eq!(
+            super::shallow_list(dir.path()).truncation,
+            super::Truncation::Complete
+        );
     }
 
     use super::*;

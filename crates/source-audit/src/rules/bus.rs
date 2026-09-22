@@ -35,7 +35,8 @@ fn bus(p: &Program) -> Result<Bus, String> {
     if consumers.is_empty() {
         return Err("nothing implements `bus::Consumer`: the pipeline is not on the bus".into());
     }
-    let consumer_files: HashSet<String> = p.family(&consumers.iter().map(|(_, r)| r.clone()).collect());
+    let consumer_files: HashSet<String> =
+        p.family(&consumers.iter().map(|(_, r)| r.clone()).collect());
     let register: HashSet<usize> = p
         .funs
         .iter()
@@ -88,7 +89,8 @@ fn bus(p: &Program) -> Result<Bus, String> {
         .filter(|m| m.starts_with("on_"))
         .collect();
     let sink_names: HashSet<String> = register.iter().map(|i| p.funs[*i].name.clone()).collect();
-    let registrar_names: HashSet<String> = registrars.iter().map(|i| p.funs[*i].name.clone()).collect();
+    let registrar_names: HashSet<String> =
+        registrars.iter().map(|i| p.funs[*i].name.clone()).collect();
     Ok(Bus {
         handlers,
         sink_names,
@@ -145,8 +147,14 @@ pub fn no_consumer_knows_other_consumers(root: &Path) -> Result<(), String> {
         // Registration knowledge by name: a consumer module calling
         // anything spelled like the bus's registrar or its sink.
         for c in &f.calls {
-            if b.registrar_names.contains(c.callee()) || (c.method && b.sink_names.contains(c.callee())) {
-                problems.push(format!("{} calls `{}`, which is registration knowledge a consumer must not have", f.display(), c.written));
+            if b.registrar_names.contains(c.callee())
+                || (c.method && b.sink_names.contains(c.callee()))
+            {
+                problems.push(format!(
+                    "{} calls `{}`, which is registration knowledge a consumer must not have",
+                    f.display(),
+                    c.written
+                ));
             }
         }
     }
@@ -157,7 +165,10 @@ pub fn no_consumer_knows_other_consumers(root: &Path) -> Result<(), String> {
         }
         for (c, rel) in &b.consumers {
             if rel != &d.rel && (contains_token(&d.ty, c) || contains_token(&d.value, c)) {
-                problems.push(format!("{}::{} names consumer `{c}` from {rel}", d.rel, d.name));
+                problems.push(format!(
+                    "{}::{} names consumer `{c}` from {rel}",
+                    d.rel, d.name
+                ));
             }
         }
     }
@@ -172,7 +183,9 @@ pub fn static_registration_only(root: &Path) -> Result<(), String> {
     let b = bus(&p)?;
     let mut problems = Vec::new();
     if b.registrars.is_empty() {
-        problems.push("the bus has no static registrar (an associated constructor that registers)".into());
+        problems.push(
+            "the bus has no static registrar (an associated constructor that registers)".into(),
+        );
     }
     for (i, f) in p.funs.iter().enumerate() {
         if b.registrars.contains(&i) || b.register.contains(&i) {
@@ -199,7 +212,9 @@ pub fn static_registration_only(root: &Path) -> Result<(), String> {
             continue;
         }
         for c in &f.calls {
-            if b.registrar_names.contains(c.callee()) || (c.method && b.sink_names.contains(c.callee())) {
+            if b.registrar_names.contains(c.callee())
+                || (c.method && b.sink_names.contains(c.callee()))
+            {
                 problems.push(format!(
                     "{} registers at event time (`{}`): the registered set is decided before the \
                      first event",
@@ -209,7 +224,10 @@ pub fn static_registration_only(root: &Path) -> Result<(), String> {
             }
         }
     }
-    verdict("consumers are registered statically, once, before any event", problems)
+    verdict(
+        "consumers are registered statically, once, before any event",
+        problems,
+    )
 }
 
 pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
@@ -242,7 +260,11 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
     }
     // Nothing outside the consumers and the registrar reaches into a
     // consumer module: a new source must not need walker changes.
-    let registrar_files: HashSet<String> = b.registrars.iter().map(|i| p.funs[*i].rel.clone()).collect();
+    let registrar_files: HashSet<String> = b
+        .registrars
+        .iter()
+        .map(|i| p.funs[*i].rel.clone())
+        .collect();
     for (i, f) in p.funs.iter().enumerate() {
         // The bus dispatches to consumers by trait object; that is what
         // it is for.
@@ -254,17 +276,34 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
             .flat_map(|ci| p.target(i, ci).local.clone())
             .chain(p.ref_targets(i).iter().copied())
             .collect();
-        let consumer_mods: Vec<String> = b.consumer_files.iter().map(|r| Program::file_module(r)).collect();
+        let consumer_mods: Vec<String> = b
+            .consumer_files
+            .iter()
+            .map(|r| Program::file_module(r))
+            .collect();
         for (ci, c) in f.calls.iter().enumerate() {
             let abs = &p.target(i, ci).abs;
-            if let Some(m) = consumer_mods.iter().find(|m| abs.starts_with(&format!("{m}::"))) {
-                problems.push(format!("{} calls `{}` ({abs}) in consumer module {m}", f.display(), c.written));
+            if let Some(m) = consumer_mods
+                .iter()
+                .find(|m| abs.starts_with(&format!("{m}::")))
+            {
+                problems.push(format!(
+                    "{} calls `{}` ({abs}) in consumer module {m}",
+                    f.display(),
+                    c.written
+                ));
             }
         }
         for path in super::named_paths(&f.body) {
             let (abs, _) = crate::program::absolute(&path, &f.krate, &f.module, None);
-            if let Some(m) = consumer_mods.iter().find(|m| abs.starts_with(&format!("{m}::"))) {
-                problems.push(format!("{} names `{path}` in consumer module {m}: stages never depend on consumers", f.display()));
+            if let Some(m) = consumer_mods
+                .iter()
+                .find(|m| abs.starts_with(&format!("{m}::")))
+            {
+                problems.push(format!(
+                    "{} names `{path}` in consumer module {m}: stages never depend on consumers",
+                    f.display()
+                ));
             }
         }
         for g in exact {
@@ -277,7 +316,10 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
             }
         }
     }
-    verdict("every consumer is registered exactly once and stages never reach consumers", problems)
+    verdict(
+        "every consumer is registered exactly once and stages never reach consumers",
+        problems,
+    )
 }
 
 /// How many times `body` constructs `Box::new(<..>::ty ..)`.
@@ -347,14 +389,21 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
         .into_iter()
         .filter(|g| {
             let gf = &p.funs[*g];
-            !b.consumer_files.contains(&gf.rel) && !gf.module.starts_with("bus") && !report_files.contains(&gf.rel) && heavy.contains(g)
+            !b.consumer_files.contains(&gf.rel)
+                && !gf.module.starts_with("bus")
+                && !report_files.contains(&gf.rel)
+                && heavy.contains(g)
         })
         .collect();
     // ... and the entry points that wrap them in their own modules
     // (`observe_tracked_with_source` over `stage_tracked_with_source`).
     // A stage *entry* is one a handler calls directly; a wrapper is a
     // function beside it that calls it directly.
-    let entries: HashSet<usize> = handlers.iter().flat_map(|h| p.callees(*h).to_vec()).filter(|g| stages.contains(g)).collect();
+    let entries: HashSet<usize> = handlers
+        .iter()
+        .flat_map(|h| p.callees(*h).to_vec())
+        .filter(|g| stages.contains(g))
+        .collect();
     let wrappers: Vec<usize> = entries
         .iter()
         .flat_map(|e| p.callers(*e))
@@ -367,7 +416,13 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
     let stages: HashSet<usize> = stages.into_iter().chain(wrappers).collect();
     // A stage the report module itself defines (a consumer calls it) may
     // call other stages: it *is* the bus's work.
-    let consumer_methods: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| b.consumer_files.contains(&f.rel) && f.trait_.is_some()).map(|(i, _)| i).collect();
+    let consumer_methods: Vec<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| b.consumer_files.contains(&f.rel) && f.trait_.is_some())
+        .map(|(i, _)| i)
+        .collect();
     let bus_work = p.reachable_exact(&consumer_methods, &HashSet::new());
     for (i, f) in p.funs.iter().enumerate() {
         if !report_files.contains(&f.rel) || bus_work.contains(&i) {

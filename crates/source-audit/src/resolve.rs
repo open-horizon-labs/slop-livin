@@ -523,7 +523,12 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
     /// throws `check()`'s answer away exactly as `let _ = check()` does,
     /// and `if matches!(probe(), ..)` honours it.
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
-        let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        let name = m
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
         // A declarative macro body is not a call site.
         if name == "macro_rules" {
             return;

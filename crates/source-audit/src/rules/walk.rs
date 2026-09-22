@@ -26,24 +26,38 @@ pub fn one_byte_formatter(root: &Path) -> Result<(), String> {
     for i in &the_one {
         let f = &p.funs[*i];
         if !contains_token(&f.body, "1000") || contains_token(&f.body, "1024") {
-            problems.push(format!("{} must divide by 1000 under SI labels", f.display()));
+            problems.push(format!(
+                "{} must divide by 1000 under SI labels",
+                f.display()
+            ));
         }
     }
     // Any other definition of the formatter's name is a second formatter.
     for (i, f) in p.funs.iter().enumerate() {
-        if (f.name == "human_bytes" || f.name == "human_signed_bytes") && !the_one.contains(&i) && f.module != "render" {
-            problems.push(format!("{} defines a byte formatter; it must re-export core's", f.display()));
+        if (f.name == "human_bytes" || f.name == "human_signed_bytes")
+            && !the_one.contains(&i)
+            && f.module != "render"
+        {
+            problems.push(format!(
+                "{} defines a byte formatter; it must re-export core's",
+                f.display()
+            ));
         }
     }
     // The TUI re-exports the one formatter.
-    if !p.reexports.iter().any(|r| r.module.starts_with("swamp_tui") && resolve::path_ends_with(&r.target, "render::human_bytes_pub")) {
+    if !p.reexports.iter().any(|r| {
+        r.module.starts_with("swamp_tui")
+            && resolve::path_ends_with(&r.target, "render::human_bytes_pub")
+    }) {
         problems.push("the TUI does not re-export core's byte formatter".into());
     }
     // Anywhere: a function that divides by 1024 and puts a binary unit
     // label into formatted output -- written in the macro, or held in a
     // constant (a unit table) the macro indexes.
     for f in p.funs.iter() {
-        let divides = contains_token(&f.body, "1024") || f.body.contains("1024.0") || f.body.replace(' ', "").contains("1<<10");
+        let divides = contains_token(&f.body, "1024")
+            || f.body.contains("1024.0")
+            || f.body.replace(' ', "").contains("1<<10");
         if !divides {
             continue;
         }
@@ -54,9 +68,25 @@ pub fn one_byte_formatter(root: &Path) -> Result<(), String> {
             .map(|d| d.name.clone())
             .collect();
         let labels = f.macros.iter().any(|m| {
-            ["format", "format_args", "write", "writeln", "print", "println", "eprintln"].contains(&m.name.as_str())
-                && (m.literals.iter().any(|l| binary_label(l)) || consts.iter().any(|c| contains_token(&m.tokens, c)))
-        }) || f.calls.iter().any(|c| c.method && c.path == "push_str" && c.args.iter().any(|a| binary_label(a) || consts.iter().any(|k| contains_token(a, k))));
+            [
+                "format",
+                "format_args",
+                "write",
+                "writeln",
+                "print",
+                "println",
+                "eprintln",
+            ]
+            .contains(&m.name.as_str())
+                && (m.literals.iter().any(|l| binary_label(l))
+                    || consts.iter().any(|c| contains_token(&m.tokens, c)))
+        }) || f.calls.iter().any(|c| {
+            c.method
+                && c.path == "push_str"
+                && c.args
+                    .iter()
+                    .any(|a| binary_label(a) || consts.iter().any(|k| contains_token(a, k)))
+        });
         if labels {
             problems.push(format!(
                 "{} formats bytes with a 1024 divisor and a binary unit label: there is one byte \
@@ -77,10 +107,13 @@ pub fn legacy_invariants(root: &Path) -> Result<(), String> {
     let mut problems = Vec::new();
     let defs = p.named("canonical_roots");
     if defs.is_empty() {
-        problems.push("nothing defines `canonical_roots`: roots are not canonicalized at the boundary".into());
+        problems.push(
+            "nothing defines `canonical_roots`: roots are not canonicalized at the boundary".into(),
+        );
     }
     if !defs.iter().any(|d| !p.callers(*d).is_empty()) {
-        problems.push("nothing calls `canonical_roots`: the boundary is not on the scan path".into());
+        problems
+            .push("nothing calls `canonical_roots`: the boundary is not on the scan path".into());
     }
     // Every definition canonicalizes, honours the answer, and returns it.
     for d in &defs {
@@ -107,12 +140,23 @@ pub fn legacy_invariants(root: &Path) -> Result<(), String> {
         }
     }
     // Grants carry non-index provenance, and it is read.
-    let has = p.types.iter().any(|t| t.name == "Grant" && t.fields.iter().any(|(n, _, _, _)| n == "created_outside_index"));
-    let read = p.funs.iter().any(|f| f.fields.iter().any(|x| x == "created_outside_index"));
+    let has = p.types.iter().any(|t| {
+        t.name == "Grant"
+            && t.fields
+                .iter()
+                .any(|(n, _, _, _)| n == "created_outside_index")
+    });
+    let read = p
+        .funs
+        .iter()
+        .any(|f| f.fields.iter().any(|x| x == "created_outside_index"));
     if !has || !read {
         problems.push("grants need non-index provenance (`Grant::created_outside_index`, read by the grant check)".into());
     }
-    verdict("roots are canonicalized at the boundary; grants carry non-index provenance", problems)
+    verdict(
+        "roots are canonicalized at the boundary; grants carry non-index provenance",
+        problems,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -125,7 +169,9 @@ pub fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
     let stage: HashSet<usize> = p.named("stage_tracked_with_source").into_iter().collect();
     let entry: HashSet<usize> = p.named("observe_tracked_with_source").into_iter().collect();
     if stage.is_empty() || entry.is_empty() {
-        problems.push("`stage_tracked_with_source`/`observe_tracked_with_source` are not defined".into());
+        problems.push(
+            "`stage_tracked_with_source`/`observe_tracked_with_source` are not defined".into(),
+        );
     }
     let walks = p.traversal(&HashSet::new());
     // The entry point delegates planning to the stage and never walks
@@ -133,13 +179,19 @@ pub fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
     let walks_except_stage = p.traversal(&stage);
     for e in &entry {
         let f = &p.funs[*e];
-        let delegates = f.calls.iter().enumerate().any(|(ci, c)| c.honoured != Honoured::Discarded && p.target(*e, ci).local.iter().any(|g| stage.contains(g)));
+        let delegates = f.calls.iter().enumerate().any(|(ci, c)| {
+            c.honoured != Honoured::Discarded
+                && p.target(*e, ci).local.iter().any(|g| stage.contains(g))
+        });
         if !delegates || walks_except_stage.contains(e) {
             problems.push(format!(
                 "{} must delegate replay planning to `stage_tracked_with_source` and must not \
                  walk any other way ({})",
                 f.display(),
-                p.chain(*e, &walks_except_stage, |g| p.funs[g].calls.iter().any(crate::program::traversal_call))
+                p.chain(*e, &walks_except_stage, |g| p.funs[g]
+                    .calls
+                    .iter()
+                    .any(crate::program::traversal_call))
             ));
         }
     }
@@ -147,7 +199,13 @@ pub fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
     // path.
     for s in &stage {
         let f = &p.funs[*s];
-        let Some(replay_at) = f.calls.iter().filter(|c| c.method && c.path.starts_with("replay")).map(|c| c.stmt).min() else {
+        let Some(replay_at) = f
+            .calls
+            .iter()
+            .filter(|c| c.method && c.path.starts_with("replay"))
+            .map(|c| c.stmt)
+            .min()
+        else {
             problems.push(format!("{} never calls the FSEvents replay", f.display()));
             continue;
         };
@@ -156,8 +214,11 @@ pub fn fsevents_before_full_walk(root: &Path) -> Result<(), String> {
                 continue;
             }
             let forced = c.conditions.iter().any(|k| contains_token(k, "force_full"))
-                || f.stmts.get(c.stmt).is_some_and(|t| t.trim_start().starts_with("if") && contains_token(t, "force_full"));
-            let walks_here = crate::program::traversal_call(c) || p.target(*s, ci).local.iter().any(|g| walks.contains(g));
+                || f.stmts.get(c.stmt).is_some_and(|t| {
+                    t.trim_start().starts_with("if") && contains_token(t, "force_full")
+                });
+            let walks_here = crate::program::traversal_call(c)
+                || p.target(*s, ci).local.iter().any(|g| walks.contains(g));
             if walks_here && !forced {
                 problems.push(format!(
                     "{}: statement {} walks (`{}`) before the FSEvents replay without the \
@@ -183,18 +244,34 @@ pub fn incremental_walk_only_changed_subtrees(root: &Path) -> Result<(), String>
     let targeted: HashSet<usize> = p
         .named("attribute_one_worktree")
         .into_iter()
-        .chain(p.funs.iter().enumerate().filter(|(_, f)| f.module == "walk" && f.name.starts_with("resize_artifact")).map(|(i, _)| i))
+        .chain(
+            p.funs
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.module == "walk" && f.name.starts_with("resize_artifact"))
+                .map(|(i, _)| i),
+        )
         .collect();
     if targeted.is_empty() {
-        problems.push("the targeted re-walkers (`attribute_one_worktree`, `resize_artifact*`) are gone".into());
+        problems.push(
+            "the targeted re-walkers (`attribute_one_worktree`, `resize_artifact*`) are gone"
+                .into(),
+        );
     }
     let other_walks = p.traversal(&targeted);
     for d in &defs {
         let f = &p.funs[*d];
         let calls_targeted = |pred: &dyn Fn(&Fun) -> bool| {
-            f.calls.iter().enumerate().any(|(ci, _)| p.target(*d, ci).local.iter().any(|g| targeted.contains(g) && pred(&p.funs[*g])))
+            f.calls.iter().enumerate().any(|(ci, _)| {
+                p.target(*d, ci)
+                    .local
+                    .iter()
+                    .any(|g| targeted.contains(g) && pred(&p.funs[*g]))
+            })
         };
-        if !calls_targeted(&|g| g.name == "attribute_one_worktree") || !calls_targeted(&|g| g.name.starts_with("resize_artifact")) {
+        if !calls_targeted(&|g| g.name == "attribute_one_worktree")
+            || !calls_targeted(&|g| g.name.starts_with("resize_artifact"))
+        {
             problems.push(format!(
                 "{} must re-walk only the implicated worktrees and artifacts \
                  (`attribute_one_worktree`, `resize_artifact*`), by calling them",
@@ -206,14 +283,22 @@ pub fn incremental_walk_only_changed_subtrees(root: &Path) -> Result<(), String>
         let lists: Vec<String> = f
             .params
             .iter()
-            .filter(|(_, t)| t.replace(' ', "").contains("PathBuf]") || t.contains("Vec < std :: path :: PathBuf"))
+            .filter(|(_, t)| {
+                t.replace(' ', "").contains("PathBuf]")
+                    || t.contains("Vec < std :: path :: PathBuf")
+            })
             .map(|(n, _)| resolve::root_ident(n))
             .collect();
         let changed = taint(f, &lists);
         for (ci, c) in f.calls.iter().enumerate() {
-            let walks = crate::program::traversal_call(c) || p.target(*d, ci).local.iter().any(|g| other_walks.contains(g));
+            let walks = crate::program::traversal_call(c)
+                || p.target(*d, ci)
+                    .local
+                    .iter()
+                    .any(|g| other_walks.contains(g));
             let targeted_arg = c.args.iter().any(|a| {
-                a.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|t| changed.contains(t))
+                a.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .any(|t| changed.contains(t))
             });
             if walks && !targeted_arg {
                 problems.push(format!(
@@ -225,7 +310,10 @@ pub fn incremental_walk_only_changed_subtrees(root: &Path) -> Result<(), String>
             }
         }
     }
-    verdict("the incremental walk re-walks only changed subtrees", problems)
+    verdict(
+        "the incremental walk re-walks only changed subtrees",
+        problems,
+    )
 }
 
 /// The local names an expression depends on, followed back through the
@@ -257,7 +345,10 @@ pub(crate) fn taint_back(f: &Fun, expr: &str) -> HashSet<String> {
 /// and through a collection a tainted value is pushed or inserted into.
 pub(crate) fn taint(f: &Fun, seeds: &[String]) -> HashSet<String> {
     let mut t: HashSet<String> = seeds.iter().cloned().collect();
-    let mentions = |s: &str, t: &HashSet<String>| s.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|x| !x.is_empty() && t.contains(x));
+    let mentions = |s: &str, t: &HashSet<String>| {
+        s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|x| !x.is_empty() && t.contains(x))
+    };
     loop {
         let before = t.len();
         for b in &f.bindings {
@@ -267,7 +358,8 @@ pub(crate) fn taint(f: &Fun, seeds: &[String]) -> HashSet<String> {
         }
         for c in &f.calls {
             if c.method
-                && ["push", "insert", "extend", "entry", "push_back", "append"].contains(&c.path.as_str())
+                && ["push", "insert", "extend", "entry", "push_back", "append"]
+                    .contains(&c.path.as_str())
                 && c.args.iter().any(|a| mentions(a, &t))
             {
                 let r = resolve::root_ident(&c.receiver);
@@ -291,14 +383,24 @@ pub fn column_store_parquet_zstd(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
     let mut writers = 0usize;
-    let zstd_fns: HashSet<usize> = p.funs.iter().enumerate().filter(|(_, f)| f.body.contains("Compression :: ZSTD")).map(|(i, _)| i).collect();
+    let zstd_fns: HashSet<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.body.contains("Compression :: ZSTD"))
+        .map(|(i, _)| i)
+        .collect();
     for (i, f) in p.funs.iter().enumerate() {
         for c in &f.calls {
             if c.method || !(c.is("ArrowWriter::try_new") || c.is("ArrowWriter::new")) {
                 continue;
             }
             writers += 1;
-            let props = c.args.get(2).map(|a| a.replace(' ', "")).unwrap_or_default();
+            let props = c
+                .args
+                .get(2)
+                .map(|a| a.replace(' ', ""))
+                .unwrap_or_default();
             let none = props.is_empty() || props == "None" || props.ends_with("::None");
             // The properties must come from a ZSTD declaration: in this
             // body, or from a helper that declares it.
@@ -328,8 +430,16 @@ pub fn dir_mtime_int32_minutes(root: &Path) -> Result<(), String> {
             if c.method || !c.is("Field::new") {
                 continue;
             }
-            let name = c.args.first().and_then(|a| p.eval_literal(a)).unwrap_or_default();
-            let ty = c.args.get(1).map(|a| a.replace(' ', "")).unwrap_or_default();
+            let name = c
+                .args
+                .first()
+                .and_then(|a| p.eval_literal(a))
+                .unwrap_or_default();
+            let ty = c
+                .args
+                .get(1)
+                .map(|a| a.replace(' ', ""))
+                .unwrap_or_default();
             if !name.starts_with("mod_time") {
                 continue;
             }
@@ -352,11 +462,18 @@ pub fn dir_mtime_int32_minutes(root: &Path) -> Result<(), String> {
     if minutes < 2 {
         problems.push(format!("only {minutes} schema(s) declare `mod_time_min` Int32; the dirs and files tables both do"));
     }
-    verdict("directory and file modification times are Int32 minutes", problems)
+    verdict(
+        "directory and file modification times are Int32 minutes",
+        problems,
+    )
 }
 
 /// The current-table and reverse-delta path helpers the guardrail names.
-const CURRENT_PATHS: &[&str] = &["growth::current_path", "growth::dirs_current_path", "growth::files_current_path"];
+const CURRENT_PATHS: &[&str] = &[
+    "growth::current_path",
+    "growth::dirs_current_path",
+    "growth::files_current_path",
+];
 const DELTA_PATHS: &[&str] = &["growth::next_delta_path", "growth::next_seq_path"];
 
 pub fn reverse_delta_current_plus_deltas(root: &Path) -> Result<(), String> {
@@ -370,7 +487,11 @@ pub fn reverse_delta_current_plus_deltas(root: &Path) -> Result<(), String> {
     // on to a write.
     let mut writers = 0usize;
     for (i, f) in p.funs.iter().enumerate() {
-        let calls_current = f.calls.iter().enumerate().any(|(ci, _)| p.target(i, ci).local.iter().any(|g| current.contains(g)));
+        let calls_current = f
+            .calls
+            .iter()
+            .enumerate()
+            .any(|(ci, _)| p.target(i, ci).local.iter().any(|g| current.contains(g)));
         if !calls_current || !writes.contains(&i) || current.contains(&i) || delta.contains(&i) {
             continue;
         }
@@ -391,12 +512,19 @@ pub fn reverse_delta_current_plus_deltas(root: &Path) -> Result<(), String> {
             ));
         }
     }
-    for name in ["observe_and_annotate", "observe_and_annotate_dirs", "observe_and_annotate_files"] {
+    for name in [
+        "observe_and_annotate",
+        "observe_and_annotate_dirs",
+        "observe_and_annotate_files",
+    ] {
         for d in p.named(name) {
             let f = &p.funs[d];
             let reaches: HashSet<usize> = p.reachable(&[d], &HashSet::new());
             if reaches.is_disjoint(&current) || reaches.is_disjoint(&delta) {
-                problems.push(format!("{} must rewrite the current table and append a delta", f.display()));
+                problems.push(format!(
+                    "{} must rewrite the current table and append a delta",
+                    f.display()
+                ));
             }
         }
     }
@@ -413,13 +541,27 @@ pub fn reverse_delta_current_plus_deltas(root: &Path) -> Result<(), String> {
 pub fn scheduled_refresh_launchagent(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
-    if !p.types.iter().any(|t| t.krate == "swamp" && t.name == "Command" && t.variants.iter().any(|v| v == "Schedule")) {
+    if !p.types.iter().any(|t| {
+        t.krate == "swamp" && t.name == "Command" && t.variants.iter().any(|v| v == "Schedule")
+    }) {
         problems.push("cli: `Command::Schedule` subcommand missing".into());
     }
-    let mains: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| f.krate == "swamp" && f.name == "main").map(|(i, _)| i).collect();
+    let mains: Vec<usize> = p
+        .funs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.krate == "swamp" && f.name == "main")
+        .map(|(i, _)| i)
+        .collect();
     let live = p.reachable(&mains, &HashSet::new());
     // The scheduler is the module that writes the LaunchAgent plist.
-    let sched_files: HashSet<String> = p.family(&p.funs.iter().filter(|f| f.literals.iter().any(|l| l.contains("LaunchAgents"))).map(|f| f.rel.clone()).collect());
+    let sched_files: HashSet<String> = p.family(
+        &p.funs
+            .iter()
+            .filter(|f| f.literals.iter().any(|l| l.contains("LaunchAgents")))
+            .map(|f| f.rel.clone())
+            .collect(),
+    );
     if sched_files.is_empty() {
         problems.push("nothing writes a LaunchAgent plist".into());
     }
@@ -432,7 +574,8 @@ pub fn scheduled_refresh_launchagent(root: &Path) -> Result<(), String> {
             if !super::execution::spawn_site(c) {
                 continue;
             }
-            let prog = super::execution::first_literal(&p, c).unwrap_or_else(|| c.args.first().cloned().unwrap_or_default());
+            let prog = super::execution::first_literal(&p, c)
+                .unwrap_or_else(|| c.args.first().cloned().unwrap_or_default());
             if !live.contains(&i) {
                 problems.push(format!(
                     "{} spawns `{prog}` from the scheduler but nothing the CLI runs reaches it: \
@@ -445,9 +588,15 @@ pub fn scheduled_refresh_launchagent(root: &Path) -> Result<(), String> {
         }
     }
     if !launchctl {
-        problems.push("nothing the CLI runs spawns `launchctl`: the scheduled refresh is not a LaunchAgent".into());
+        problems.push(
+            "nothing the CLI runs spawns `launchctl`: the scheduled refresh is not a LaunchAgent"
+                .into(),
+        );
     }
-    verdict("the scheduled refresh is a LaunchAgent installed with launchctl", problems)
+    verdict(
+        "the scheduled refresh is a LaunchAgent installed with launchctl",
+        problems,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -466,10 +615,18 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
     let mut problems = Vec::new();
     let entries = anchors(&p, FOLDING_ENTRY_POINTS, &mut problems);
     // Each is the walker's own: defined beside the job type it builds.
-    let job_modules: HashSet<String> = p.types.iter().filter(|t| t.name == "AttrJob").map(|t| format!("{}::{}", t.krate, t.module)).collect();
+    let job_modules: HashSet<String> = p
+        .types
+        .iter()
+        .filter(|t| t.name == "AttrJob")
+        .map(|t| format!("{}::{}", t.krate, t.module))
+        .collect();
     for e in &entries {
         if !job_modules.contains(&Program::module_of(&p.funs[*e])) {
-            problems.push(format!("{} is exempt as a folding entry point but is not the walker's own", p.funs[*e].display()));
+            problems.push(format!(
+                "{} is exempt as a folding entry point but is not the walker's own",
+                p.funs[*e].display()
+            ));
         }
     }
     let mut folds = 0usize;
@@ -477,8 +634,13 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
     for file in &p.files {
         for s in ast::guarded_sites(&file.ast, "AttrJob::Size") {
             folds += 1;
-            let guarded = s.enclosing_if_let_inits.iter().any(|i| i.contains("classify_at"));
-            let exempt = entries.iter().any(|e| p.funs[*e].rel == file.rel && p.funs[*e].name == s.func);
+            let guarded = s
+                .enclosing_if_let_inits
+                .iter()
+                .any(|i| i.contains("classify_at"));
+            let exempt = entries
+                .iter()
+                .any(|e| p.funs[*e].rel == file.rel && p.funs[*e].name == s.func);
             if !guarded && !exempt {
                 problems.push(format!(
                     "{}::{} folds (`AttrJob::Size`) outside an `if let Some(kind) = classify_at(..)`",
@@ -491,18 +653,30 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
                 continue;
             }
             records += 1;
-            if !s.enclosing_if_let_inits.iter().any(|i| i.contains("classify_at")) {
-                problems.push(format!("{}::{}: record_artifact outside a classify_at guard", file.rel, s.func));
+            if !s
+                .enclosing_if_let_inits
+                .iter()
+                .any(|i| i.contains("classify_at"))
+            {
+                problems.push(format!(
+                    "{}::{}: record_artifact outside a classify_at guard",
+                    file.rel, s.func
+                ));
             }
         }
     }
     // A fold or a record written inside a macro's arguments has no guard
     // this layer can see: not a pass.
     for f in p.funs.iter() {
-        let exempt = entries.iter().any(|e| p.funs[*e].rel == f.rel && p.funs[*e].name == f.name);
+        let exempt = entries
+            .iter()
+            .any(|e| p.funs[*e].rel == f.rel && p.funs[*e].name == f.name);
         for m in &f.macros {
             let t = m.tokens.replace(' ', "");
-            if !exempt && (t.contains("AttrJob::Size") || (t.contains("record_artifact(") && f.name != "record_artifact")) {
+            if !exempt
+                && (t.contains("AttrJob::Size")
+                    || (t.contains("record_artifact(") && f.name != "record_artifact"))
+            {
                 problems.push(format!("{} folds or records an artifact inside `{}!`, where no classify_at guard can be seen", f.display(), m.name));
             }
         }
@@ -515,15 +689,32 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
         let f = &p.funs[d];
         let tail = f.stmts.last().cloned().unwrap_or_default();
         let table = tail.trim() == "None"
-            || ["ARTIFACT_KINDS", "MARKED_ARTIFACT_KINDS", "classify_gated", "classify ("].iter().any(|t| tail.contains(t));
-        if !table || tail.contains("Some (ArtifactKind") || tail.contains("or (") || f.body.contains("Some (ArtifactKind") {
-            problems.push(format!("{} must end in a table lookup or `None`; tail is `{tail}`", f.display()));
+            || [
+                "ARTIFACT_KINDS",
+                "MARKED_ARTIFACT_KINDS",
+                "classify_gated",
+                "classify (",
+            ]
+            .iter()
+            .any(|t| tail.contains(t));
+        if !table
+            || tail.contains("Some (ArtifactKind")
+            || tail.contains("or (")
+            || f.body.contains("Some (ArtifactKind")
+        {
+            problems.push(format!(
+                "{} must end in a table lookup or `None`; tail is `{tail}`",
+                f.display()
+            ));
         }
     }
     for name in ["classify", "classify_marked"] {
         for d in p.named(name) {
             if p.funs[d].module == "attribution" && p.funs[d].body.contains("Some (ArtifactKind") {
-                problems.push(format!("{} invents a kind instead of consulting the tables", p.funs[d].display()));
+                problems.push(format!(
+                    "{} invents a kind instead of consulting the tables",
+                    p.funs[d].display()
+                ));
             }
         }
     }
@@ -534,10 +725,16 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
         }
         let guard = f.body.split("Some (ArtifactKind").next().unwrap_or("");
         let ok = p.funs.iter().any(|g| {
-            g.rel == f.rel && g.name != f.name && guard.contains(&format!("{} (", g.name)) && (g.body.contains("marker_present") || g.body.contains("manifest"))
+            g.rel == f.rel
+                && g.name != f.name
+                && guard.contains(&format!("{} (", g.name))
+                && (g.body.contains("marker_present") || g.body.contains("manifest"))
         });
         if !ok {
-            problems.push(format!("{} invents a kind without a marker-file convention predicate", f.display()));
+            problems.push(format!(
+                "{} invents a kind without a marker-file convention predicate",
+                f.display()
+            ));
         }
     }
     verdict("only classified artifacts are folded", problems)
@@ -556,7 +753,11 @@ pub fn symlinks_never_followed(root: &Path) -> Result<(), String> {
         let listings: Vec<String> = f
             .bindings
             .iter()
-            .filter(|b| b.from.contains("read_dir") || b.from.contains("WalkDir") || b.from.contains("shallow_list"))
+            .filter(|b| {
+                b.from.contains("read_dir")
+                    || b.from.contains("WalkDir")
+                    || b.from.contains("shallow_list")
+            })
             .map(|b| b.name.clone())
             .collect();
         let entries = resolve::derived_from(&f.bindings, &f.name, &listings);
@@ -568,7 +769,9 @@ pub fn symlinks_never_followed(root: &Path) -> Result<(), String> {
                 let sized = size_after(&f.body, "fs :: metadata (");
                 // In a walk, a following stat of an entry.
                 let of_entry = walks_here
-                    && c.args.first().is_some_and(|a| entries.contains(&resolve::root_ident(a)));
+                    && c.args
+                        .first()
+                        .is_some_and(|a| entries.contains(&resolve::root_ident(a)));
                 if sized || of_entry {
                     problems.push(format!(
                         "{} stats through `{}`, which follows symlinks: a measurement or a walk \
@@ -579,19 +782,33 @@ pub fn symlinks_never_followed(root: &Path) -> Result<(), String> {
                 }
             }
             // Canonicalizing a child dereferences whatever it points at.
-            if c.callee() == "canonicalize" && c.args.first().is_some_and(|a| a.contains(". join (")) {
-                problems.push(format!("{} canonicalizes a child path, following its link", f.display()));
+            if c.callee() == "canonicalize"
+                && c.args.first().is_some_and(|a| a.contains(". join ("))
+            {
+                problems.push(format!(
+                    "{} canonicalizes a child path, following its link",
+                    f.display()
+                ));
             }
             // In a walk, a type question on a *path* follows the link.
-            if walks_here && c.method && ["is_dir", "is_file", "exists"].contains(&c.path.as_str()) {
+            if walks_here && c.method && ["is_dir", "is_file", "exists"].contains(&c.path.as_str())
+            {
                 let r = c.receiver.replace(' ', "");
                 if r.ends_with(".path()") || r.contains(".join(") {
-                    problems.push(format!("{}: `{}.{}()` asks about a path, which follows symlinks", f.display(), r, c.path));
+                    problems.push(format!(
+                        "{}: `{}.{}()` asks about a path, which follows symlinks",
+                        f.display(),
+                        r,
+                        c.path
+                    ));
                 }
             }
         }
     }
-    verdict("symlinks are never followed by a walk or a measurement", problems)
+    verdict(
+        "symlinks are never followed by a walk or a measurement",
+        problems,
+    )
 }
 
 /// Whether a size (`.len()`, `.blocks()`) is taken from the result of the
@@ -622,15 +839,23 @@ pub fn walk_optimized_parallel_pool(root: &Path) -> Result<(), String> {
         .funs
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.calls.iter().any(|c| c.is("Pool::new")) && f.calls.iter().any(|c| c.method && c.path == "drain"))
+        .filter(|(_, f)| {
+            f.calls.iter().any(|c| c.is("Pool::new"))
+                && f.calls.iter().any(|c| c.method && c.path == "drain")
+        })
         .map(|(i, _)| i)
         .collect();
     if parallel.is_empty() {
         problems.push("nothing drains a worker pool: the parallel walk is gone".into());
     }
     for e in &entry {
-        if p.reachable_exact(&[*e], &HashSet::new()).is_disjoint(&parallel) {
-            problems.push(format!("{} does not use the parallel walk", p.funs[*e].display()));
+        if p.reachable_exact(&[*e], &HashSet::new())
+            .is_disjoint(&parallel)
+        {
+            problems.push(format!(
+                "{} does not use the parallel walk",
+                p.funs[*e].display()
+            ));
         }
     }
     // The serial walk is test-only: no production caller at all.
@@ -645,7 +870,10 @@ pub fn walk_optimized_parallel_pool(root: &Path) -> Result<(), String> {
             }
         }
     }
-    verdict("production walks use the parallel pool; the serial walk is test-only", problems)
+    verdict(
+        "production walks use the parallel pool; the serial walk is test-only",
+        problems,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -661,7 +889,13 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
     // only peeks (one entry, to tell "empty" from "unreadable").
     let mut stop: HashSet<usize> = super::bounded_primitives(
         &p,
-        &[("locations::shallow_list", "SHALLOW_LIST_CAP"), ("folded_measurement::folded_bytes_bounded_stamped", "max_entries")],
+        &[
+            ("locations::shallow_list", "SHALLOW_LIST_CAP"),
+            (
+                "folded_measurement::folded_bytes_bounded_stamped",
+                "max_entries",
+            ),
+        ],
         false,
         &mut problems,
     );
@@ -672,14 +906,22 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
             .calls
             .iter()
             .enumerate()
-            .filter(|(ci, c)| crate::program::traversal_call(c) || p.target(m, *ci).local.iter().any(|g| walks_raw.contains(g)))
+            .filter(|(ci, c)| {
+                crate::program::traversal_call(c)
+                    || p.target(m, *ci).local.iter().any(|g| walks_raw.contains(g))
+            })
             .map(|(_, c)| c.stmt)
             .min();
         let gate = first_walk.is_some_and(|w| {
             f.stmts.iter().take(w).any(|s| {
-                s.trim_start().starts_with("if") && contains_token(s, "return") && f.calls.iter().enumerate().any(|(ci, c)| {
-                    c.stmt < w && !c.method && s.contains(&crate::program::spaced(&c.written)) && p.target(m, ci).local.iter().any(|g| !walks_raw.contains(g))
-                })
+                s.trim_start().starts_with("if")
+                    && contains_token(s, "return")
+                    && f.calls.iter().enumerate().any(|(ci, c)| {
+                        c.stmt < w
+                            && !c.method
+                            && s.contains(&crate::program::spaced(&c.written))
+                            && p.target(m, ci).local.iter().any(|g| !walks_raw.contains(g))
+                    })
             })
         });
         if first_walk.is_some() && !gate {
@@ -693,17 +935,32 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
             stop.insert(m);
         }
     }
-    stop.extend(p.funs.iter().enumerate().filter(|(_, f)| contains_token(&f.ret, "ProjectLinkState")).map(|(i, _)| i));
+    stop.extend(
+        p.funs
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| contains_token(&f.ret, "ProjectLinkState"))
+            .map(|(i, _)| i),
+    );
     // A listing whose answer is only "can it be opened" (or its first
     // entry) is a readability probe, not a traversal.
     let probe = |f: &Fun, c: &crate::program::PCall| -> bool {
         let call = format!("{} (", crate::program::spaced(&c.written));
-        let tested = f.calls.iter().any(|m| m.method && ["is_err", "is_ok"].contains(&m.path.as_str()) && m.receiver.contains(&call));
+        let tested = f.calls.iter().any(|m| {
+            m.method && ["is_err", "is_ok"].contains(&m.path.as_str()) && m.receiver.contains(&call)
+        });
         let matched_only = f.arms.iter().any(|a| a.scrutinee.contains(&call))
-            && f.arms.iter().filter(|a| a.scrutinee.contains(&call)).all(|a| {
-                let pat = a.pattern.replace(' ', "");
-                pat.starts_with("Err") || pat == "Ok(_)" || (a.body.contains(". next ()") && !a.body.contains(" for ") && !a.body.contains(". flatten ()"))
-            });
+            && f.arms
+                .iter()
+                .filter(|a| a.scrutinee.contains(&call))
+                .all(|a| {
+                    let pat = a.pattern.replace(' ', "");
+                    pat.starts_with("Err")
+                        || pat == "Ok(_)"
+                        || (a.body.contains(". next ()")
+                            && !a.body.contains(" for ")
+                            && !a.body.contains(". flatten ()"))
+                });
         tested || matched_only
     };
     // What walks the user's tree: a listing of a path the function was
@@ -719,7 +976,9 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
                 && f.calls.iter().any(|c| {
                     crate::program::traversal_call(c)
                         && !probe(f, c)
-                        && c.args.first().is_none_or(|a| super::execution::caller_supplied(&p, f, a, 0))
+                        && c.args
+                            .first()
+                            .is_none_or(|a| super::execution::caller_supplied(&p, f, a, 0))
                 })
         })
         .map(|(i, _)| i)
@@ -734,7 +993,9 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
                 let t = p.target(i, ci);
                 !t.possible
                     && t.local.iter().any(|g| walks.contains(g))
-                    && c.args.first().is_none_or(|a| super::execution::caller_supplied(&p, f, a, 0))
+                    && c.args
+                        .first()
+                        .is_none_or(|a| super::execution::caller_supplied(&p, f, a, 0))
             });
             if joins {
                 walks.insert(i);
@@ -754,12 +1015,20 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
         .map(|(i, _)| i)
         .collect();
     // ... and the folded walk itself, wherever it is entered from.
-    let walker: Vec<usize> = p.defs("walk::discover_and_attribute").into_iter().chain(p.named("stage_tracked_with_source")).collect();
+    let walker: Vec<usize> = p
+        .defs("walk::discover_and_attribute")
+        .into_iter()
+        .chain(p.named("stage_tracked_with_source"))
+        .collect();
     let mut sanctioned = p.reachable_exact(&consumer_methods, &stop);
     sanctioned.extend(p.reachable_exact(&walker, &stop));
     let mut stop_all = stop.clone();
     stop_all.extend(consumer_methods.iter().copied());
-    let entries: Vec<usize> = p.defs("report::observe_scope").into_iter().chain(p.defs("bus::run_report")).collect();
+    let entries: Vec<usize> = p
+        .defs("report::observe_scope")
+        .into_iter()
+        .chain(p.defs("bus::run_report"))
+        .collect();
     if entries.is_empty() {
         problems.push("neither `report::observe_scope` nor `bus::run_report` is defined".into());
     }
@@ -779,10 +1048,18 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
     let walker_set: HashSet<usize> = walker.iter().copied().collect();
     let only_via_walker = |i: usize| -> bool {
         let reach = p.reachable_exact(&[i], &walker_set);
-        !reach.iter().any(|g| !walker_set.contains(g) && !sanctioned.contains(g) && p.funs[*g].calls.iter().any(crate::program::traversal_call))
+        !reach.iter().any(|g| {
+            !walker_set.contains(g)
+                && !sanctioned.contains(g)
+                && p.funs[*g].calls.iter().any(crate::program::traversal_call)
+        })
     };
     for (i, f) in p.funs.iter().enumerate() {
-        if !path_files.contains(&f.rel) || sanctioned.contains(&i) || stop.contains(&i) || !walks.contains(&i) {
+        if !path_files.contains(&f.rel)
+            || sanctioned.contains(&i)
+            || stop.contains(&i)
+            || !walks.contains(&i)
+        {
             continue;
         }
         if walker_files.contains(&f.rel) && only_via_walker(i) {
@@ -792,7 +1069,10 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
             "{} traverses ({}): the ordinary report path traverses only in the folded walk; use \
              folded rows, cached identification or a bounded primitive",
             f.display(),
-            p.chain(i, &walks, |g| p.funs[g].calls.iter().any(crate::program::traversal_call))
+            p.chain(i, &walks, |g| p.funs[g]
+                .calls
+                .iter()
+                .any(crate::program::traversal_call))
         ));
     }
     let _ = split_top_level;
