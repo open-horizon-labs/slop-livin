@@ -508,6 +508,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
         let status = PCommand::new("git")
             .args(args)
             .current_dir(dir)
@@ -642,6 +643,7 @@ mod tests {
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-q", "-m", "init"]);
 
+        crate::work_counters::record_spawn();
         let out = PCommand::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())

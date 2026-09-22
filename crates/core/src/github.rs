@@ -204,6 +204,7 @@ pub trait GithubResponder: Sync {
 pub struct GhCliResponder;
 
 fn bounded_gh(args: &[String]) -> Result<String, String> {
+    crate::work_counters::record_spawn();
     let mut child = Command::new("gh")
         .args(args)
         .stdin(Stdio::null())

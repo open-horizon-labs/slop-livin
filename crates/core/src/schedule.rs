@@ -90,6 +90,7 @@ fn run_launchctl(args: &[&str]) -> Result<bool> {
         println!("[test-mode] launchctl {}", args.join(" "));
         return Ok(true);
     }
+    crate::work_counters::record_spawn();
     let status = std::process::Command::new("launchctl")
         .args(args)
         .stdout(std::process::Stdio::null())
@@ -101,6 +102,7 @@ fn run_launchctl(args: &[&str]) -> Result<bool> {
 
 fn domain() -> String {
     let uid = std::env::var("SWAMP_UID").ok().unwrap_or_else(|| {
+        crate::work_counters::record_spawn();
         std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -531,6 +533,7 @@ fn lock_path(store_dir: &Path) -> PathBuf {
 }
 
 fn pid_alive(pid: u32) -> bool {
+    crate::work_counters::record_spawn();
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())

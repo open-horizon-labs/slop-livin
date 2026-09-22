@@ -246,6 +246,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn run_git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -414,6 +415,7 @@ mod tests {
         run_git(&sub_source, &["add", "README.md"]);
         run_git(&sub_source, &["commit", "-q", "-m", "init"]);
 
+        crate::work_counters::record_spawn();
         let out = Command::new("git")
             .arg("-C")
             .arg(&parent)

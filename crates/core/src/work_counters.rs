@@ -52,6 +52,7 @@ pub struct Counters {
     cache_misses: AtomicU64,
     containers_reused: AtomicU64,
     containers_identified: AtomicU64,
+    spawns: AtomicU64,
 }
 
 impl Counters {
@@ -64,6 +65,7 @@ impl Counters {
             identification_cache_misses: self.cache_misses.load(Ordering::Relaxed),
             containers_reused: self.containers_reused.load(Ordering::Relaxed),
             containers_identified: self.containers_identified.load(Ordering::Relaxed),
+            subprocess_spawns: self.spawns.load(Ordering::Relaxed),
         }
     }
 }
@@ -76,6 +78,7 @@ static GLOBAL: Counters = Counters {
     cache_misses: AtomicU64::new(0),
     containers_reused: AtomicU64::new(0),
     containers_identified: AtomicU64::new(0),
+    spawns: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -122,6 +125,17 @@ pub struct WorkCounters {
     pub containers_reused: u64,
     /// Container directories identified file by file this pass.
     pub containers_identified: u64,
+    /// Child processes this crate spawned.
+    ///
+    /// The 2026-09-21 review's CE6 -- a disabled `docker-desktop`
+    /// detector still asking the daemon to enumerate the user's images,
+    /// five spawns per observation, forever -- was caught with
+    /// process-wide `PATH` shims, which cannot run under the default
+    /// test harness: one test's shimmed `PATH` and shared counter file
+    /// are every concurrent test's too. Counting the spawn where it
+    /// happens makes the same assertion, through the scoped sink
+    /// [`measured`] installs, with no process-wide state at all.
+    pub subprocess_spawns: u64,
 }
 
 pub fn record_dir_listed() {
@@ -150,6 +164,14 @@ pub fn record_container_reused() {
 
 pub fn record_container_identified() {
     add(|c| &c.containers_identified, 1);
+}
+
+/// One child process, recorded at the call that spawns it. Every
+/// `std::process::Command` in this crate goes through a site that calls
+/// this, so "this observation spawned nothing" is a measurement rather
+/// than an inference from a `PATH` shim.
+pub fn record_spawn() {
+    add(|c| &c.spawns, 1);
 }
 
 /// The process-global counters. Sees every thread; a caller that wants
@@ -182,6 +204,7 @@ pub fn reset() {
         &GLOBAL.cache_misses,
         &GLOBAL.containers_reused,
         &GLOBAL.containers_identified,
+        &GLOBAL.spawns,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -208,6 +231,9 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         containers_identified: now
             .containers_identified
             .saturating_sub(before.containers_identified),
+        subprocess_spawns: now
+            .subprocess_spawns
+            .saturating_sub(before.subprocess_spawns),
     }
 }
 

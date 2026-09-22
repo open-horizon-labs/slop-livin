@@ -295,6 +295,7 @@ impl CommandRunner for SystemCommandRunner {
                 "refusing to run non-allow-listed command: {program} {args:?}"
             ));
         }
+        crate::work_counters::record_spawn();
         let mut child = Command::new(program)
             .args(args)
             .stdout(std::process::Stdio::piped())

@@ -53,6 +53,7 @@ fn html_unescape(s: &str) -> String {
 /// `Err`, never a silent `None` indistinguishable from "no workspace
 /// recorded".
 pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, String> {
+    crate::work_counters::record_spawn();
     let output = std::process::Command::new("plutil")
         .args(["-convert", "xml1", "-o", "-"])
         .arg(info_plist_path)

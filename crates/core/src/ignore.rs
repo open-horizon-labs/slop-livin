@@ -320,6 +320,7 @@ mod tests {
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
         let ok = Command::new("git")
             .arg("-C")
             .arg(dir)

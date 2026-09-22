@@ -531,6 +531,7 @@ pub fn remove(target: &Removal, timeout: Duration) -> Result<(), String> {
         Removal::Volume { name } => vec!["volume", "rm", name.as_str()],
         Removal::Refused(why) => return Err((*why).to_string()),
     };
+    crate::work_counters::record_spawn();
     let out = Command::new("docker")
         .args(&args)
         .stdin(Stdio::null())
@@ -560,6 +561,7 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
         Removal::Volume { name } => ("volume", name.as_str()),
         Removal::Refused(why) => return Err((*why).to_string()),
     };
+    crate::work_counters::record_spawn();
     let out = Command::new("docker")
         .args([kind, "inspect", id])
         .stdin(Stdio::null())
@@ -575,6 +577,7 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
 }
 
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
+    crate::work_counters::record_spawn();
     let mut child = Command::new("docker")
         .args(args)
         .stdout(Stdio::piped())

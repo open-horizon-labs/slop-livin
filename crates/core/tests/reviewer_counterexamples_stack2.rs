@@ -388,25 +388,19 @@ fn a_disabled_detector_must_not_probe_its_tool() {
     fs::write(src.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
     let store = tempfile::tempdir().unwrap();
 
-    // A PATH shim that records every spawn instead of running the tool.
-    let shims = root.join("shims");
-    let log = root.join("spawns.log");
-    fs::create_dir_all(&shims).unwrap();
-    fs::write(&log, b"").unwrap();
-    for name in ["docker", "lsof", "plutil", "xcrun", "du"] {
-        let p = shims.join(name);
-        fs::write(
-            &p,
-            format!("#!/bin/sh\necho {name} >> {}\nexit 1\n", log.display()),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&p).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        fs::set_permissions(&p, perms).unwrap();
-    }
-    let previous = std::env::var("PATH").unwrap_or_default();
-    unsafe { std::env::set_var("PATH", format!("{}:{previous}", shims.display())) };
-
+    // No PATH shim. The previous version of this test put a directory of
+    // fake `docker`/`lsof`/... scripts at the front of the process-wide
+    // `PATH` and counted lines in a shared log file, which made it
+    // unrunnable under the default test harness: a sibling test in the
+    // same binary that legitimately probes occupancy appended to the
+    // same log, and the failure read as a real regression
+    // (`["lsof", "lsof"]`). `scripts/check.sh` carried
+    // `--test-threads=1` for that reason alone.
+    //
+    // Every `std::process::Command` in `swamp-core` now records itself
+    // through `work_counters::record_spawn`, and `measured` installs a
+    // sink scoped to this thread and the pools it starts. Same
+    // assertion, no process-wide state, thread-safe.
     let registry = Registry::with_builtins();
     let cfg = ScanConfig {
         defaults: false,
@@ -421,33 +415,53 @@ fn a_disabled_detector_must_not_probe_its_tool() {
     };
     let env = Environment::fixture(root.clone(), HashMap::new(), Platform::MacOS);
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);
-    for _ in 0..2 {
-        let _ = swamp_core::report::observe_scope(
-            &scope,
-            swamp_core::report::ObservationParts::ALL,
-            None,
-            None,
-            false,
-            Some(store.path()),
-            None,
-            true,
-            true,
-            false,
-            false,
-            swamp_core::fs_events::platform_source().as_ref(),
-            30,
-            24 * 3600,
-        );
-    }
-    unsafe { std::env::set_var("PATH", previous) };
-    let spawned: Vec<String> = fs::read_to_string(&log)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert!(
-        spawned.is_empty(),
-        "two observations with every detector disabled spawned {} subprocesses: {spawned:?}",
-        spawned.len()
+    let (_, counted) = swamp_core::work_counters::measured(|| {
+        for _ in 0..2 {
+            let _ = swamp_core::report::observe_scope(
+                &scope,
+                swamp_core::report::ObservationParts::ALL,
+                None,
+                None,
+                false,
+                Some(store.path()),
+                None,
+                true,
+                true,
+                false,
+                false,
+                swamp_core::fs_events::platform_source().as_ref(),
+                30,
+                24 * 3600,
+            );
+        }
+    });
+    assert_eq!(
+        counted.subprocess_spawns, 0,
+        "two observations with every detector disabled spawned {} subprocesses",
+        counted.subprocess_spawns
+    );
+}
+
+/// The instrument the test above rests on, checked rather than assumed.
+///
+/// A spawn counter that nothing increments would make
+/// `a_disabled_detector_must_not_probe_its_tool` pass vacuously -- which
+/// is precisely the failure mode the 2026-09-22 re-review found in the
+/// work counters themselves ("a 20,000-file traversal reporting 2 dirs
+/// listed"). So: a command that really does spawn must be counted, and
+/// it must be counted in the scoped sink, not only globally.
+#[test]
+fn the_spawn_counter_counts_a_real_spawn() {
+    use swamp_core::locations::{CommandRunner, SystemCommandRunner};
+    let (_, counted) = swamp_core::work_counters::measured(|| {
+        // Allow-listed, read-only, and harmless if absent: a failure to
+        // spawn is still a spawn attempt for every purpose this counter
+        // has, and `brew --prefix` is the query the detector registry
+        // itself makes.
+        let _ = SystemCommandRunner.run("brew", &["--prefix"], std::time::Duration::from_secs(5));
+    });
+    assert_eq!(
+        counted.subprocess_spawns, 1,
+        "the spawn counter must count an allow-listed command runner spawn"
     );
 }

@@ -12,7 +12,6 @@ cargo test -p swamp-core \
   --test reviewer_counterexamples \
   --test reviewer_counterexamples_123 \
   --test reviewer_counterexamples_stack2 \
-  --test reviewer_cost_measurement_stack2 \
   --test coverage_changes_are_not_storage_changes \
   --test explicit_root_scope_exclusions \
   --test nested_artifact_evidence_is_delivered \
@@ -22,7 +21,20 @@ cargo test -p swamp-core \
   --test store_contents_are_allowlisted \
   --test incremental_external_and_agent_measurement \
   --test agent_matrix_matches_docs \
-  --test agent_storage_validation \
+  --test agent_storage_validation
+
+# `--test-threads=1` here and nowhere else. This test measures through
+# the *process-global* work counters (`work_counters::reset` +
+# `snapshot`, which is what a whole-observation cost report needs) and
+# installs PATH shims to count subprocess spawns, so a sibling test
+# running beside it would be measured as its work. Every other test that
+# counts work uses `work_counters::measured`, whose sink is scoped to the
+# calling thread and the pools it starts, and therefore needs nothing
+# here -- including `reviewer_counterexamples_stack2`, which used to be
+# in this list because its spawn count came from a process-wide PATH
+# shim and a shared log file.
+cargo test -p swamp-core \
+  --test reviewer_cost_measurement_stack2 \
   -- --test-threads=1
 cargo test -p swamp-tui --test scope_preserving_refresh \
   --test reviewer_counterexamples_stack2_tui
@@ -86,6 +98,30 @@ json_violations=$(
 if [ -n "$json_violations" ]; then
   echo "$json_violations" >&2
   echo 'source audit: JSON serialization outside the allow-listed writers' >&2
+  exit 1
+fi
+
+# The spawn counter cannot be allowed to rot: a `Command::new` added
+# without its `record_spawn()` would make
+# `a_disabled_detector_must_not_probe_its_tool` pass while the spawn it
+# guards against happens. The AST audit's resolver does not follow
+# `Command` builders, so this is the check.
+missing_spawn_counts=$(
+  grep -rn 'Command::new(' crates/core/src |
+    awk '{ code = $0; sub(/^[^:]*:[0-9]+:/, "", code); if (code !~ /^[[:space:]]*\/\//) print }' |
+    while IFS= read -r hit; do
+      file=${hit%%:*}
+      rest=${hit#*:}
+      line=${rest%%:*}
+      prev=$((line - 1))
+      if ! sed -n "${prev}p" "$file" | grep -q 'record_spawn()'; then
+        echo "$hit"
+      fi
+    done
+) || true
+if [ -n "$missing_spawn_counts" ]; then
+  echo "$missing_spawn_counts" >&2
+  echo 'source audit: every Command::new in swamp-core must be preceded by work_counters::record_spawn()' >&2
   exit 1
 fi
 
