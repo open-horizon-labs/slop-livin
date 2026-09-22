@@ -303,6 +303,59 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
         ));
     }
 
+    // ONE predicate, everywhere.
+    //
+    // The integration owner's own mutation check found the hole this
+    // closes: removing one `starts_with` direction from
+    // `protection_conflict` was caught, but the same mutation applied
+    // through `agents::is_human_protected` -- a `bool` wrapper that
+    // delegated here -- passed this audit *and* every runtime test,
+    // because the audit inspected `protection_conflict` while
+    // `actions::propose_checking_protection` called the wrapper. A
+    // second spelling of the same question is a second thing to inspect,
+    // and the audit will always be looking at the other one.
+    //
+    // So: no other function in the crate may answer "is this protected"
+    // unless it delegates to `protection_conflict`. `is_human_protected`
+    // is deleted rather than fixed.
+    for rel in workspace_src_files(root) {
+        let Some(f) = maybe_parse(root, &rel) else {
+            continue;
+        };
+        for item in &f.ast.items {
+            let syn::Item::Fn(func) = item else { continue };
+            let name = func.sig.ident.to_string();
+            if name == "protection_conflict" || !name.contains("protect") {
+                continue;
+            }
+            let returns_verdict = match &func.sig.output {
+                syn::ReturnType::Default => false,
+                syn::ReturnType::Type(_, ty) => {
+                    let rendered = quote::quote!(#ty).to_string();
+                    rendered == "bool" || rendered.starts_with("Option <")
+                }
+            };
+            if !returns_verdict {
+                continue;
+            }
+            let body = ast::functions(&f.ast)
+                .into_iter()
+                .find(|x| x.name == name)
+                .map(|x| x.body)
+                .unwrap_or_default();
+            if !body.contains("protection_conflict (") {
+                return Err(format!(
+                    "{rel}::{name} answers a protection question without delegating to \
+                     `agents::protection_conflict`. One predicate, everywhere: a second spelling \
+                     is a second thing to inspect, and a mutation that removes one containment \
+                     direction survives in whichever one the audit is not reading (the \
+                     integration owner's 2026-09-21 mutation check found exactly this through \
+                     the deleted `is_human_protected`)"
+                ));
+            }
+        }
+    }
+
     // Atomic writes.
     for name in ["protect_add", "protect_remove"] {
         let f = ast::function(&funcs, name)?;
@@ -590,10 +643,30 @@ const TRAVERSAL_CALLS: &[&str] = &[
     "resize_artifact",
 ];
 
+/// `(file, fn)`: the *one* bounded, single-level, capped, symlink-refusing
+/// listing the guardrail spec itself carves out -- "detector modules that
+/// genuinely need one shallow listing must go through a bounded helper
+/// `locations::shallow_list` which is itself allow-listed and capped".
+///
+/// It is a `(file, fn)` pair rather than a whole-file entry on purpose: a
+/// second traversal added elsewhere in `locations/mod.rs` still fails.
+/// The cap is `locations::SHALLOW_LIST_CAP` and the audit below checks it
+/// is still there, so the exemption cannot outlive the bound that earns
+/// it.
+const BOUNDED_LISTERS: &[(&str, &str)] = &[("crates/core/src/locations/mod.rs", "shallow_list")];
+
 pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
     let mut files: Vec<String> = TRAVERSAL_FORBIDDEN.iter().map(|s| s.to_string()).collect();
     files.extend(ast::rust_files_under(root, "crates/core/src/agents"));
     files.extend(ast::rust_files_under(root, "crates/core/src/locations"));
+    let loc = parse(root, "crates/core/src/locations/mod.rs")?;
+    if !loc.text.contains("SHALLOW_LIST_CAP") {
+        return Err(
+            "locations/mod.rs has no `SHALLOW_LIST_CAP`: the one allowed listing is allowed \
+             *because* it is capped"
+                .into(),
+        );
+    }
     for rel in files {
         if TRAVERSAL_ALLOWED.contains(&rel.as_str()) {
             continue;
@@ -602,6 +675,12 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
             continue;
         };
         for func in ast::functions(&f.ast) {
+            if BOUNDED_LISTERS
+                .iter()
+                .any(|(file, name)| *file == rel && *name == func.name)
+            {
+                continue;
+            }
             if let Some((_, call)) = find_first(&func.body, TRAVERSAL_CALLS) {
                 return Err(format!(
                     "{rel}::{} traverses with `{}`: the ordinary report path traverses only in \
@@ -1089,8 +1168,26 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
                 "agents/registry.rs does not register adapter module `{name}`"
             ));
         }
-        let count = registry.text.matches(&format!("{name}::Adapter")).count();
-        if count > 1 {
+        // Count whole path segments, not substrings: `pi :: Adapter`
+        // occurs inside `oh_my_pi :: Adapter`, and counting naively
+        // reported `pi` as registered twice. A registration is a match
+        // whose preceding character is not part of an identifier.
+        let count: usize = [format!("{name}::Adapter"), format!("{name} :: Adapter")]
+            .iter()
+            .map(|needle| {
+                registry
+                    .text
+                    .match_indices(needle.as_str())
+                    .filter(|(at, _)| {
+                        registry.text[..*at]
+                            .chars()
+                            .next_back()
+                            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                    })
+                    .count()
+            })
+            .sum();
+        if count != 1 {
             return Err(format!(
                 "agents/registry.rs registers `{name}` {count} times; exactly once"
             ));
@@ -1391,51 +1488,105 @@ pub fn detector_ids_only_in_registry(root: &Path) -> Result<(), String> {
 // discovery_owned_by_report_pipeline
 // ---------------------------------------------------------------------
 
+/// The single non-test function allowed to run a discovery pass.
+/// `report.rs::observe_scope` is the one observation that owns the walk,
+/// the external pass and the agent pass together -- which is what makes
+/// each one's `growth::ObservationOwnership` window meaningful, and what
+/// stopped the ordering between them mattering.
+const DISCOVERY_OWNER: (&str, &str) = ("crates/core/src/report.rs", "observe_scope");
+
+const DISCOVERY_CALLS: &[&str] = &[
+    "external :: discover_and_measure (",
+    "agents :: discover_and_measure (",
+];
+
+/// Statement: one observation owns discovery.
+///
+/// **This audit checks call sites rather than visibility, and that is a
+/// correction, not a relaxation.** As first written it required both
+/// `discover_and_measure` functions to be `pub(crate)`. That is directly
+/// incompatible with the reviewers' own mandatory
+/// `crates/core/tests/reviewer_counterexamples.rs`, which calls both from
+/// an integration test -- from outside the crate. Those files are copied
+/// in byte-for-byte and may never be edited, so `pub(crate)` would stop
+/// the required evidence compiling. The rule and the evidence cannot both
+/// be satisfied, and the evidence wins.
+///
+/// Visibility was never the property the review falsified. What it found
+/// was two *passes* over one shared history table in an order nobody
+/// declared. So the rule is now exactly that: outside test code, nothing
+/// in `crates/cli/src` or `crates/tui/src` may run a discovery pass, and
+/// inside `crates/core/src` only `report.rs::observe_scope` may -- which
+/// must call *both*, so their ownership windows are decided together.
+/// Integration tests may still call either directly, which is how the
+/// counterexamples exercise them in isolation.
+///
+/// Inside the crate this is strictly stronger than the visibility check
+/// it replaces: `pub(crate)` permitted any number of core-internal
+/// passes, and this permits one.
 pub fn discovery_owned_by_report_pipeline(root: &Path) -> Result<(), String> {
     for (rel, name) in [
         ("crates/core/src/external.rs", "discover_and_measure"),
         ("crates/core/src/agents/mod.rs", "discover_and_measure"),
     ] {
         let f = parse(root, rel)?;
-        let mut found = false;
-        for item in &f.ast.items {
-            if let syn::Item::Fn(func) = item
-                && func.sig.ident == name
-            {
-                found = true;
-                let is_crate_visible = matches!(
-                    &func.vis,
-                    syn::Visibility::Restricted(r) if r.path.is_ident("crate")
-                );
-                if !is_crate_visible {
-                    return Err(format!(
-                        "{rel}::{name} is not `pub(crate)`: one observation owns discovery, and \
-                         CLI/TUI take units from the report rather than running their own pass"
-                    ));
-                }
-            }
-        }
-        if !found {
+        if !f
+            .ast
+            .items
+            .iter()
+            .any(|item| matches!(item, syn::Item::Fn(func) if func.sig.ident == name))
+        {
             return Err(format!("{rel} no longer defines `{name}`"));
         }
     }
+
+    let owner = parse(root, DISCOVERY_OWNER.0)?;
+    let owner_fn = ast::functions(&owner.ast)
+        .into_iter()
+        .find(|f| f.name == DISCOVERY_OWNER.1)
+        .ok_or_else(|| {
+            format!(
+                "{}::{} does not exist: the one observation that owns discovery has to be \
+                 somewhere",
+                DISCOVERY_OWNER.0, DISCOVERY_OWNER.1
+            )
+        })?;
+    for call in DISCOVERY_CALLS {
+        if !owner_fn.body.contains(call) {
+            return Err(format!(
+                "{}::{} does not call `{}`: one observation owns *both* passes, or their \
+                 ownership windows can disagree again",
+                DISCOVERY_OWNER.0,
+                DISCOVERY_OWNER.1,
+                call.trim()
+            ));
+        }
+    }
+
     let mut callers = ast::rust_files_under(root, "crates/cli/src");
     callers.extend(ast::rust_files_under(root, "crates/tui/src"));
+    callers.extend(
+        workspace_src_files(root)
+            .into_iter()
+            .filter(|rel| rel.starts_with("crates/core/src") && rel != DISCOVERY_OWNER.0),
+    );
+    callers.sort();
+    callers.dedup();
     for rel in callers {
         let Some(f) = maybe_parse(root, &rel) else {
             continue;
         };
         for func in ast::functions(&f.ast) {
-            for call in [
-                "external :: discover_and_measure (",
-                "agents :: discover_and_measure (",
-            ] {
+            for call in DISCOVERY_CALLS {
                 if func.body.contains(call) {
                     return Err(format!(
-                        "{rel}::{} runs its own discovery pass (`{}`): a second pass over the same \
-                         shared history table is how ordering started mattering",
+                        "{rel}::{} runs its own discovery pass (`{}`): a second pass over the \
+                         same shared history table is how ordering started mattering. Take the \
+                         units from `{}::{}`'s observation instead",
                         func.name,
-                        call.trim()
+                        call.trim(),
+                        DISCOVERY_OWNER.0,
+                        DISCOVERY_OWNER.1
                     ));
                 }
             }
@@ -1696,6 +1847,41 @@ mod mutation_tests {
         assert!(err.contains("write_atomic"), "{err}");
     }
 
+    #[test]
+    fn a_second_protection_predicate_is_rejected() {
+        // The integration owner's 2026-09-21 mutation check: a `bool`
+        // wrapper (`is_human_protected`) that *looked* like a delegation
+        // let a one-directional mutation of the real predicate pass this
+        // audit and every runtime test, because the audit read
+        // `protection_conflict` and the proposal path called the
+        // wrapper. This fixture reintroduces the wrapper with its own
+        // inlined, one-directional logic.
+        let with_wrapper = format!(
+            "{GOOD_PROTECT}\n\
+             pub fn is_human_protected(protected: &[PathBuf], candidate: &Path) -> bool {{\n\
+                 protected.iter().any(|p| candidate.starts_with(p))\n\
+             }}\n"
+        );
+        let tmp = workspace(&[("crates/core/src/agents/mod.rs", &with_wrapper)]);
+        let err = protection_fails_closed(tmp.path()).unwrap_err();
+        assert!(err.contains("One predicate, everywhere"), "{err}");
+        assert!(err.contains("is_human_protected"), "{err}");
+    }
+
+    #[test]
+    fn a_protection_helper_that_does_delegate_is_accepted() {
+        // Precision, not prohibition: a helper is fine when it really is
+        // one.
+        let delegating = format!(
+            "{GOOD_PROTECT}\n\
+             pub fn member_protection(protected: &[PathBuf], ms: &[PathBuf]) -> Option<String> {{\n\
+                 ms.iter().find_map(|m| protection_conflict(protected, m))\n\
+             }}\n"
+        );
+        let tmp = workspace(&[("crates/core/src/agents/mod.rs", &delegating)]);
+        assert_eq!(protection_fails_closed(tmp.path()), Ok(()));
+    }
+
     // -- 3 --------------------------------------------------------------
 
     #[test]
@@ -1778,23 +1964,66 @@ mod mutation_tests {
 
     // -- 6 --------------------------------------------------------------
 
+    /// The one bounded lister every traversal fixture needs, since the
+    /// audit checks that the exemption still comes with its cap.
+    const BOUNDED_LISTER_FILE: (&str, &str) = (
+        "crates/core/src/locations/mod.rs",
+        "pub const SHALLOW_LIST_CAP: usize = 4096;\n\
+         pub fn shallow_list(dir: &Path) -> Vec<ShallowEntry> { fs::read_dir(dir); vec![] }\n",
+    );
+
     #[test]
     fn an_adapter_calling_read_dir_is_rejected() {
-        let tmp = workspace(&[(
-            "crates/core/src/agents/x.rs",
-            "fn identify() { for e in fs::read_dir(home).unwrap() {} }",
-        )]);
+        let tmp = workspace(&[
+            (
+                "crates/core/src/agents/x.rs",
+                "fn identify() { for e in fs::read_dir(home).unwrap() {} }",
+            ),
+            BOUNDED_LISTER_FILE,
+        ]);
         let err = no_second_traversal_on_report_path(tmp.path()).unwrap_err();
         assert!(err.contains("agents/x.rs"), "{err}");
     }
 
     #[test]
     fn an_adapter_using_shallow_list_passes() {
-        let tmp = workspace(&[(
-            "crates/core/src/agents/x.rs",
-            "fn identify() { for e in locations::shallow_list(home) {} }",
-        )]);
+        let tmp = workspace(&[
+            (
+                "crates/core/src/agents/x.rs",
+                "fn identify() { for e in locations::shallow_list(home) {} }",
+            ),
+            BOUNDED_LISTER_FILE,
+        ]);
         assert_eq!(no_second_traversal_on_report_path(tmp.path()), Ok(()));
+    }
+
+    #[test]
+    fn the_one_bounded_lister_is_exempt_but_a_sibling_in_the_same_file_is_not() {
+        // The exemption is a `(file, fn)` pair, so a second traversal
+        // added beside it still fails -- otherwise exempting
+        // `shallow_list` would have exempted the whole detector
+        // registry.
+        let tmp = workspace(&[(
+            BOUNDED_LISTER_FILE.0,
+            &format!(
+                "{}fn enumerate_everything(d: &Path) {{ for e in fs::read_dir(d).unwrap() {{}} }}\n",
+                BOUNDED_LISTER_FILE.1
+            ),
+        )]);
+        let err = no_second_traversal_on_report_path(tmp.path()).unwrap_err();
+        assert!(err.contains("enumerate_everything"), "{err}");
+    }
+
+    #[test]
+    fn a_bounded_lister_that_lost_its_cap_is_rejected() {
+        // The exemption exists because the listing is capped. Remove the
+        // cap and the exemption has to go with it.
+        let tmp = workspace(&[(
+            BOUNDED_LISTER_FILE.0,
+            "pub fn shallow_list(dir: &Path) -> Vec<ShallowEntry> { fs::read_dir(dir); vec![] }\n",
+        )]);
+        let err = no_second_traversal_on_report_path(tmp.path()).unwrap_err();
+        assert!(err.contains("SHALLOW_LIST_CAP"), "{err}");
     }
 
     // -- 7 --------------------------------------------------------------
@@ -2141,28 +2370,75 @@ mod mutation_tests {
         assert_eq!(detector_ids_only_in_registry(tmp.path()), Ok(()));
     }
 
-    #[test]
-    fn a_cli_discovery_call_is_rejected() {
-        let tmp = workspace(&[
+    /// The three files every `discovery_owned_by_report_pipeline`
+    /// fixture needs: the two discovery functions and the one owner that
+    /// calls both.
+    fn discovery_fixture(extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let mut files: Vec<(&str, &str)> = vec![
             (
                 "crates/core/src/external.rs",
-                "pub(crate) fn discover_and_measure() {}",
+                "pub fn discover_and_measure() {}",
             ),
             (
                 "crates/core/src/agents/mod.rs",
-                "pub(crate) fn discover_and_measure() {}",
+                "pub fn discover_and_measure() {}",
             ),
             (
-                "crates/cli/src/main.rs",
-                "fn cmd() { let u = external::discover_and_measure(&scope); }",
+                "crates/core/src/report.rs",
+                "pub fn observe_scope() { external::discover_and_measure(); \
+                 agents::discover_and_measure(); }",
             ),
-        ]);
+        ];
+        files.extend_from_slice(extra);
+        workspace(&files)
+    }
+
+    #[test]
+    fn one_owner_calling_both_passes_is_accepted() {
+        assert_eq!(
+            discovery_owned_by_report_pipeline(discovery_fixture(&[]).path()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_cli_discovery_call_is_rejected() {
+        let tmp = discovery_fixture(&[(
+            "crates/cli/src/main.rs",
+            "fn cmd() { let u = external::discover_and_measure(&scope); }",
+        )]);
+        let err = discovery_owned_by_report_pipeline(tmp.path()).unwrap_err();
+        assert!(err.contains("own discovery pass"), "{err}");
+        assert!(err.contains("crates/cli/src/main.rs"), "{err}");
+    }
+
+    #[test]
+    fn a_tui_discovery_call_is_rejected() {
+        let tmp = discovery_fixture(&[(
+            "crates/tui/src/app.rs",
+            "fn refresh() { let u = agents::discover_and_measure(&scope); }",
+        )]);
         let err = discovery_owned_by_report_pipeline(tmp.path()).unwrap_err();
         assert!(err.contains("own discovery pass"), "{err}");
     }
 
     #[test]
-    fn public_discovery_is_rejected() {
+    fn a_second_pass_inside_the_core_crate_is_rejected() {
+        // The case the old `pub(crate)` rule allowed and this one does
+        // not: a core-internal caller other than the owner.
+        let tmp = discovery_fixture(&[(
+            "crates/core/src/schedule.rs",
+            "fn refresh() { let u = external::discover_and_measure(&scope); }",
+        )]);
+        let err = discovery_owned_by_report_pipeline(tmp.path()).unwrap_err();
+        assert!(err.contains("own discovery pass"), "{err}");
+        assert!(err.contains("schedule.rs"), "{err}");
+    }
+
+    #[test]
+    fn an_owner_that_runs_only_one_of_the_two_passes_is_rejected() {
+        // Splitting them back apart is how their ownership windows could
+        // disagree again.
         let tmp = workspace(&[
             (
                 "crates/core/src/external.rs",
@@ -2170,11 +2446,32 @@ mod mutation_tests {
             ),
             (
                 "crates/core/src/agents/mod.rs",
-                "pub(crate) fn discover_and_measure() {}",
+                "pub fn discover_and_measure() {}",
+            ),
+            (
+                "crates/core/src/report.rs",
+                "pub fn observe_scope() { external::discover_and_measure(); }",
             ),
         ]);
         let err = discovery_owned_by_report_pipeline(tmp.path()).unwrap_err();
-        assert!(err.contains("pub(crate)"), "{err}");
+        assert!(err.contains("owns *both* passes"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_owner_is_rejected() {
+        let tmp = workspace(&[
+            (
+                "crates/core/src/external.rs",
+                "pub fn discover_and_measure() {}",
+            ),
+            (
+                "crates/core/src/agents/mod.rs",
+                "pub fn discover_and_measure() {}",
+            ),
+            ("crates/core/src/report.rs", "pub fn something_else() {}"),
+        ]);
+        let err = discovery_owned_by_report_pipeline(tmp.path()).unwrap_err();
+        assert!(err.contains("has to be somewhere"), "{err}");
     }
 
     #[test]

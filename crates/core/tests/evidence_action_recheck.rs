@@ -214,3 +214,88 @@ fn human_protected_ordinary_artifact_is_refused_at_proposal_not_silently_dropped
     );
     assert!(!plan.units.iter().any(|u| u.path == fx.target_dir));
 }
+
+/// The integration owner's 2026-09-21 mutation check, as a runtime test.
+///
+/// Mutating protection to one direction only -- `candidate.starts_with(p)`,
+/// dropping `p.starts_with(candidate)` -- passed the
+/// `protection_fails_closed` audit *and* every runtime test at the time.
+/// The audit inspected `agents::protection_conflict`, while this path,
+/// `actions::propose_checking_protection` for **ordinary** filesystem
+/// rows, went through a second predicate (`agents::is_human_protected`,
+/// since deleted). Nothing proposed an ordinary directory that
+/// *contained* a protected descendant, so the surviving direction was
+/// never exercised here.
+///
+/// This test is that exact case. Protecting one file inside an artifact
+/// directory must make the directory itself unproposable: removing
+/// `target/` destroys `target/keep-this.txt`, which is precisely what
+/// the human asked to keep.
+#[test]
+fn ordinary_unit_containing_protected_descendant_is_refused_at_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+
+    // A file the human protects, *inside* the artifact directory.
+    let keep = fx.target_dir.join("keep-this.txt");
+    fs::write(&keep, b"work I asked you to keep").unwrap();
+    let r = report_for(&fx.root, store.path());
+    let protected = vec![keep.clone()];
+
+    // Naming the containing directory explicitly must fail.
+    let err = actions::propose_checking_protection(
+        &r,
+        None,
+        std::slice::from_ref(&fx.target_dir),
+        "test",
+        &protected,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("human-protected"),
+        "removing a directory that contains a protected file must be refused: {err}"
+    );
+
+    // And a broad proposal must refuse it by name rather than quietly
+    // including it.
+    let plan = actions::propose_checking_protection(&r, None, &[], "test", &protected)
+        .expect("other units remain plannable");
+    assert!(
+        plan.refused
+            .iter()
+            .any(|x| x.path == fx.target_dir && x.cause.contains("human-protected")),
+        "the containing directory must appear in `refused` with a named cause: {:?}",
+        plan.refused
+    );
+    assert!(
+        !plan.units.iter().any(|u| u.path == fx.target_dir),
+        "the containing directory must not be plannable"
+    );
+    assert!(keep.exists(), "nothing may have been touched at proposal");
+}
+
+/// The other direction, in the same place, so a future one-directional
+/// mutation fails whichever half it drops.
+#[test]
+fn ordinary_unit_beneath_a_protected_ancestor_is_refused_at_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let r = report_for(&fx.root, store.path());
+
+    // Protect an ancestor of the artifact row.
+    let protected = vec![fx.checkout.clone()];
+    let err = actions::propose_checking_protection(
+        &r,
+        None,
+        std::slice::from_ref(&fx.target_dir),
+        "test",
+        &protected,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("human-protected"),
+        "a unit beneath a protected path must be refused: {err}"
+    );
+}

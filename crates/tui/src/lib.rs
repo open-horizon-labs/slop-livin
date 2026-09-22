@@ -238,6 +238,8 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                 // too or the first report shows `source` with no children.
                 let res = swamp_core::report::observe_scope(
                     &scope2,
+                    swamp_core::report::ObservationParts::ALL,
+                    None,
                     None,
                     false,
                     Some(&store2),
@@ -266,6 +268,8 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             })?;
             let observation = swamp_core::report::observe_scope(
                 &scope_now,
+                swamp_core::report::ObservationParts::ALL,
+                None,
                 None,
                 false,
                 Some(&store),
@@ -341,6 +345,8 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
     );
     let observation = swamp_core::report::observe_scope(
         scope,
+        swamp_core::report::ObservationParts::ALL,
+        None,
         None,
         false,
         Some(&store),

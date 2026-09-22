@@ -904,32 +904,49 @@ fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option
 fn discover_agent_units_for_propose(
     store_dir: &Path,
 ) -> Result<Vec<swamp_core::agents::AgentUnit>> {
-    let detector_scope = resolve_scope(&[])?;
-    let (r, _coverage) = swamp_core::report::report_scope(
-        &detector_scope,
+    // Through the one observation that owns discovery, never a second
+    // pass of the CLI's own
+    // (`.oh/guardrails/discovery-owned-by-report-pipeline.md`). It walks
+    // for the worktree roots Aider's per-repo units need and runs the
+    // agent pass with the same ownership window, so nothing here can
+    // tombstone a row the walk did not cover.
+    Ok(observe_for_cli(
+        &resolve_scope(&[])?,
+        swamp_core::report::ObservationParts::AGENTS,
         None,
-        false,
-        Some(store_dir),
-        None,
+        store_dir,
         true,
-        false,
-        false,
-        false,
-    )?;
-    let project_worktrees: Vec<PathBuf> = r
-        .projects
-        .iter()
-        .flat_map(|p| p.worktrees.iter())
-        .map(|wt| wt.path.clone())
-        .collect();
-    swamp_core::agents::discover_and_measure(
-        &detector_scope,
-        &project_worktrees,
-        Some(store_dir),
-        true,
-        r.observed_at,
-        swamp_core::growth::load_config(store_dir).retention_days,
         3600,
+    )?
+    .agent_units)
+}
+
+/// The CLI's one route into `report::observe_scope`, with this binary's
+/// fixed arguments (no Docker facts, no `du` verification, no directory
+/// rows, no enrichment) filled in.
+fn observe_for_cli(
+    scope: &swamp_core::scope::EffectiveScope,
+    want: swamp_core::report::ObservationParts,
+    base: Option<swamp_core::report::Report>,
+    store_dir: &Path,
+    observe: bool,
+    since_secs: u64,
+) -> Result<swamp_core::report::ScopeObservation> {
+    swamp_core::report::observe_scope(
+        scope,
+        want,
+        base,
+        None,
+        false,
+        Some(store_dir),
+        None,
+        observe,
+        false,
+        false,
+        false,
+        swamp_core::fs_events::platform_source().as_ref(),
+        swamp_core::growth::load_config(store_dir).retention_days,
+        since_secs,
     )
 }
 
@@ -943,34 +960,19 @@ fn discover_agent_units_for_propose(
 fn discover_external_units_for_propose(
     store_dir: &Path,
 ) -> Result<Vec<swamp_core::external::ExternalUnit>> {
-    let detector_scope = resolve_scope(&[])?;
-    let observed_at = swamp_core::entities::now();
-    let mut units = swamp_core::external::discover_and_measure(
-        &detector_scope,
-        Some(store_dir),
+    // One observation, which also attaches the live tool-version and
+    // dependency associations (#56/#57) -- so a proposed external unit's
+    // evidence carries the same consumer facts `report --view external`
+    // shows, rather than a narrower answer for taking a different route.
+    Ok(observe_for_cli(
+        &resolve_scope(&[])?,
+        swamp_core::report::ObservationParts::EXTERNAL,
+        None,
+        store_dir,
         true,
-        observed_at,
-        swamp_core::growth::load_config(store_dir).retention_days,
         24 * 3600,
-    )?;
-    // Same real report walk `discover_agent_units_for_propose` already
-    // runs for Aider's per-repo units: not an extra walk beyond what
-    // that sibling function costs, and `propose` without a `root` is
-    // already documented as not a hot path.
-    let mut r = swamp_core::report::report_scope(
-        &detector_scope,
-        None,
-        false,
-        Some(store_dir),
-        None,
-        true,
-        false,
-        false,
-        false,
-    )
-    .map(|(r, _coverage)| r)?;
-    swamp_core::consumer_wiring::attach_associations(&mut r, &mut units, Some(store_dir));
-    Ok(units)
+    )?
+    .external_units)
 }
 
 /// Saves `plan` and prints it (JSON envelope or the plain-text form),
@@ -1361,78 +1363,60 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|e| (Err(e), Vec::new()))
             };
             progress.stop();
-            let mut r = r?;
+            let r = r?;
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
             }
-            // External units (#43) are detector-resolved, not derived
-            // from the walked root(s): resolved independently so
-            // `--view external` works the same whether `report` is
-            // scoped to the configured catalog or an explicit root.
-            let mut external_units = if view == Some(View::External) {
-                let detector_scope = resolve_scope(&[])?;
-                swamp_core::external::discover_and_measure(
-                    &detector_scope,
-                    Some(&store_dir),
-                    !no_observe,
-                    r.observed_at,
-                    swamp_core::growth::load_config(&store_dir).retention_days,
-                    since
-                        .as_deref()
-                        .and_then(swamp_core::growth::parse_duration_secs)
-                        .unwrap_or(24 * 3600),
-                )?
-            } else {
-                Vec::new()
-            };
-            // Live tool-version/dependency association wiring (#56/#57):
-            // both `r` and `external_units` are computed above, exactly
-            // the shape `attach_associations` needs -- see its own
-            // module doc for why this cannot run inside the bus.
-            if !external_units.is_empty() {
-                swamp_core::consumer_wiring::attach_associations(
-                    &mut r,
-                    &mut external_units,
-                    Some(&store_dir),
-                );
-            }
-            // Agent-tool storage (#91/#92/#100): same "detector-resolved,
-            // independent of the walked root(s)" contract as external
-            // units above -- a tool home is found regardless of whether
-            // `report` is scoped to the configured catalog or an
-            // explicit root. Also computed for a project-scoped query
-            // (`--project NAME`, with or without `--view agents`) so the
-            // project tree's collapsed "Agent storage (linked)" row and
+            // External units (#43) and agent-tool storage (#91/#92/#100)
+            // are detector-resolved, not derived from the walked
+            // root(s): resolved against the configured scope so both
+            // views work the same whether `report` was scoped to the
+            // catalog or to an explicit root.
+            //
+            // They come from `report::observe_scope`, the one
+            // observation that owns discovery, with `r` handed in as its
+            // base so no second walk happens
+            // (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
+            // Before this the CLI ran each pass itself, against a scope
+            // it re-resolved locally, in an order nobody declared --
+            // which is exactly what let the two tombstone each other's
+            // rows in the shared history table.
+            //
+            // Which parts are asked for is unchanged: external units for
+            // `--view external`; agent units for `--view agents` *and*
+            // for any project-scoped query, so the project tree's
+            // collapsed "Agent storage (linked)" row and
             // `--project NAME --json`'s linked units are never silently
             // missing just because `--view agents` was not also passed
-            // (#100's project-linkage acceptance).
-            let agent_units = if view == Some(View::Agents) || project.is_some() {
-                let detector_scope = resolve_scope(&[])?;
-                // Aider's per-repo units (#96) need every known worktree
-                // root; `r` (this report) is already computed above, so
-                // no extra walk is needed to supply them.
-                let project_worktrees: Vec<std::path::PathBuf> = r
-                    .projects
-                    .iter()
-                    .flat_map(|p| p.worktrees.iter())
-                    .map(|wt| wt.path.clone())
-                    .collect();
-                swamp_core::agents::discover_and_measure(
-                    &detector_scope,
-                    &project_worktrees,
-                    Some(&store_dir),
-                    !no_observe,
-                    r.observed_at,
-                    swamp_core::growth::load_config(&store_dir).retention_days,
-                    since
-                        .as_deref()
-                        .and_then(swamp_core::growth::parse_duration_secs)
-                        .unwrap_or(24 * 3600),
-                )?
-            } else {
-                Vec::new()
+            // (#100's project-linkage acceptance). Aider's per-repo
+            // units (#96) need every known worktree root, which `r`
+            // already carries.
+            let want = swamp_core::report::ObservationParts {
+                external: view == Some(View::External),
+                agents: view == Some(View::Agents) || project.is_some(),
             };
+            let (r, external_units, agent_units) =
+                if want == swamp_core::report::ObservationParts::WALK_ONLY {
+                    (r, Vec::new(), Vec::new())
+                } else {
+                    let observation = observe_for_cli(
+                        &resolve_scope(&[])?,
+                        want,
+                        Some(r),
+                        &store_dir,
+                        !no_observe,
+                        since
+                            .as_deref()
+                            .and_then(swamp_core::growth::parse_duration_secs)
+                            .unwrap_or(24 * 3600),
+                    )?;
+                    (
+                        observation.merged,
+                        observation.external_units,
+                        observation.agent_units,
+                    )
+                };
             if !json
                 && r.projects
                     .iter()

@@ -1136,6 +1136,44 @@ impl App {
         if self.marked.remove(&unit_id.0).is_some() {
             return; // toggle off
         }
+        // Human keep/protect intent, checked for **every** markable row
+        // before anything else.
+        //
+        // This used to be reached only for the two row kinds that
+        // happen to propose through core (`nested_artifacts` and agent
+        // units), so an ordinary artifact or unowned row containing a
+        // protected file marked cleanly and was refused much later, at
+        // execution. The integration owner's 2026-09-21 mutation check
+        // is why this is a gate rather than a side effect of proposing:
+        // a one-directional protection predicate survived every test
+        // precisely because no path exercised "ordinary row *contains* a
+        // protected descendant".
+        //
+        // Both directions, from the one predicate
+        // (`.oh/guardrails/protection-fails-closed.md`); protection
+        // state that cannot be read is *unknown*, so it refuses too.
+        if let Some(store) = self.store_dir.clone() {
+            let candidate = PathBuf::from(&unit_id.0);
+            match swamp_core::agents::load_protect(&store) {
+                Ok(protected) => {
+                    if let Some(reason) =
+                        swamp_core::agents::protection_conflict(&protected, &candidate)
+                    {
+                        self.set_refusal(&format!(
+                            "human-protected path (swamp protect): {reason}; remove protection \
+                             first if this unit should be actionable"
+                        ));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.set_refusal(&format!(
+                        "protection state could not be read, so nothing may be marked: {e}"
+                    ));
+                    return;
+                }
+            }
+        }
         let mut warnings: Vec<String> = Vec::new();
         let worktree = row.worktree.clone().map(|wt| {
             let whole_checkout = !wt.linked;
@@ -1207,11 +1245,25 @@ impl App {
             .iter()
             .any(|u| u.path == unit_path)
         {
-            match swamp_core::actions::propose(
+            // `propose_checking_protection`, not `propose`: human
+            // keep/protect intent has to refuse here, at the moment the
+            // human marks the row, not silently at execution.
+            //
+            // The integration owner's 2026-09-21 mutation check is why
+            // this is spelled out: a one-directional protection check
+            // survived every test because nothing exercised an
+            // *ordinary* row that contained a protected descendant, and
+            // this was the path that would have caught it. The live
+            // protect list is reloaded from `self.report.store_dir`
+            // inside that function (one small control file, the same
+            // cost as the `stat`s `propose` already does here), so a
+            // protection added since startup is honoured.
+            match swamp_core::actions::propose_checking_protection(
                 &self.report,
                 None,
                 std::slice::from_ref(&unit_path),
                 "human:tui",
+                &[],
             ) {
                 Ok(plan) => {
                     warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
@@ -1828,6 +1880,8 @@ impl App {
             let source = swamp_core::fs_events::testing::CannedSource(plan);
             let res = swamp_core::report::observe_scope(
                 &scope,
+                swamp_core::report::ObservationParts::ALL,
+                None,
                 None,
                 false,
                 Some(&store),
@@ -1881,6 +1935,8 @@ impl App {
             // cannot drift out of date behind a "live" header.
             let res = swamp_core::report::observe_scope(
                 &scope,
+                swamp_core::report::ObservationParts::ALL,
+                None,
                 None,
                 false,
                 Some(&store),

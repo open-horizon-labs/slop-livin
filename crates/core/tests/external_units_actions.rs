@@ -31,8 +31,11 @@ fn external_units_are_inspection_only_and_execution_refuses() {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: vec!["rustup".into(), "homebrew".into()],
-        enabled_detectors: Vec::new(),
+        // Allow-list, so no detector proposing an absolute system path
+        // (e.g. core_simulator's /Library/Developer/CoreSimulator/Volumes)
+        // can reach the developer's real storage from a fixture.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["cargo-home".into()],
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -81,8 +84,8 @@ fn propose_external_with_no_matching_path_is_a_visible_error() {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: vec!["rustup".into(), "homebrew".into()],
-        enabled_detectors: Vec::new(),
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["cargo-home".into()],
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

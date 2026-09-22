@@ -56,6 +56,8 @@ fn scope_for(home: &Path, include: &[&Path], exclude: &[&Path]) -> EffectiveScop
 fn observe(scope: &EffectiveScope, store: &Path) -> swamp_core::report::ScopeObservation {
     swamp_core::report::observe_scope(
         scope,
+        swamp_core::report::ObservationParts::ALL,
+        None,
         None,
         false,
         Some(store),
@@ -282,4 +284,81 @@ fn external_unit(path: &Path) -> swamp_core::external::ExternalUnit {
         note: None,
         evidence: Vec::new(),
     }
+}
+
+/// The TUI half of the integration owner's 2026-09-21 mutation-check
+/// finding: an ordinary filesystem row that *contains* a human-protected
+/// descendant must be refused when the human marks it, with the reason,
+/// not silently at execution.
+///
+/// One-directional protection (`candidate.starts_with(p)` only) survived
+/// every test at the time, because no test marked an ordinary row with a
+/// protected file inside it. This is that case on the TUI path;
+/// `crates/core/tests/evidence_action_recheck.rs::ordinary_unit_containing_protected_descendant_is_refused_at_proposal`
+/// is the same case on the CLI/core path.
+#[test]
+fn marking_an_ordinary_row_that_contains_a_protected_file_is_refused_with_the_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap();
+    let project = git_project(&home, "proj");
+    // The file the human asked to keep, inside a measurable directory.
+    let keep = project.join("target/debug/keep-this.txt");
+    fs::write(&keep, b"work I asked you to keep").unwrap();
+
+    let store = tempfile::tempdir().unwrap();
+    swamp_core::agents::protect_add(store.path(), &keep).unwrap();
+
+    let scope = scope_for(&home, &[&project], &[]);
+    let observation = observe(&scope, store.path());
+    let mut app = App::new(observation.merged, project.clone());
+    app.store_dir = Some(store.path().to_path_buf());
+    app.scope = Some(scope);
+    // A fixture with no git checkout produces unowned rows, so that is
+    // the view holding the markable row here. `mark_row`'s ordinary
+    // branch is the same code in every view.
+    app.set_view(swamp_tui::app::ViewKind::Unowned);
+
+    // Open every level until a markable row naming a directory that
+    // contains the protected file appears.
+    let contains_keep = |row: &swamp_tui::model::Row| {
+        row.unit.as_ref().is_some_and(|u| {
+            let p = PathBuf::from(&u.0);
+            keep.starts_with(&p) && p != keep
+        })
+    };
+    for _ in 0..6 {
+        if app.rows().iter().any(contains_keep) {
+            break;
+        }
+        for i in 0..app.rows().len() {
+            app.selected = i;
+            app.toggle_expand();
+        }
+    }
+    let row = app
+        .rows()
+        .into_iter()
+        .find(|r| contains_keep(r))
+        .unwrap_or_else(|| {
+            panic!(
+                "precondition: some markable row must contain {}; rows were {:?}",
+                keep.display(),
+                app.rows()
+                    .iter()
+                    .map(|r| (r.label.clone(), r.unit.clone()))
+                    .collect::<Vec<_>>()
+            )
+        });
+    app.mark_row(&row);
+
+    assert!(
+        app.marked.is_empty(),
+        "a row containing a human-protected file must never be marked"
+    );
+    let refusal = app.refusal_active().unwrap_or_default();
+    assert!(
+        refusal.contains("human-protected"),
+        "the refusal must name the cause, not be a generic message: {refusal:?}"
+    );
+    assert!(keep.exists(), "nothing may be touched at mark time");
 }

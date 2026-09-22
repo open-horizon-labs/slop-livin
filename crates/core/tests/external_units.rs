@@ -19,13 +19,28 @@ fn fixture_env(home: &std::path::Path, extra: &[(&str, &str)]) -> Environment {
     Environment::fixture(home.to_path_buf(), env, Platform::MacOS)
 }
 
+/// An **allow-list**, not a deny-list.
+///
+/// This used to disable `rustup` and `homebrew` and leave every other
+/// detector running, on the assumption that a fixture `Environment`'s
+/// injected `home` confines them. It does not: `core_simulator` proposes
+/// the absolute system path `/Library/Developer/CoreSimulator/Volumes`,
+/// independent of `env.home`, so these tests measured the developer's
+/// real simulator runtimes -- 42 GB and ninety seconds of it on the
+/// machine where this was found, which is both a wrong assertion and a
+/// straight violation of "tests use disposable fixtures, never real user
+/// data".
+///
+/// `enabled_detectors` is the strict reading of explicit-only scope (see
+/// `docs/usage.md`), and it is what a fixture wants: exactly the
+/// detector under test, nothing inferred.
 fn only_cargo_home_config() -> ScanConfig {
     ScanConfig {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: vec!["rustup".into(), "homebrew".into()],
-        enabled_detectors: Vec::new(),
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["cargo-home".into()],
     }
 }
 
@@ -237,8 +252,8 @@ fn tool_executable_removed_but_storage_remains_still_measures_it() {
         defaults: false,
         include: Vec::new(),
         exclude: Vec::new(),
-        disabled_detectors: vec!["cargo-home".into(), "rustup".into()],
-        enabled_detectors: Vec::new(),
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec!["homebrew".into()],
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -309,5 +324,111 @@ fn incomplete_coverage_preserves_unknown_not_absent() {
     assert_eq!(
         unit_after.regrowth_count, 0,
         "losing and regaining read access to an external unit must never count as regrowth"
+    );
+}
+
+/// No fixture may ever measure a path outside its own fixture tree.
+///
+/// This is the guard for a bug that cost ninety seconds a run and read
+/// 42 GB of the developer's real simulator runtimes: `core_simulator`
+/// proposes the **absolute** system path
+/// `/Library/Developer/CoreSimulator/Volumes`, which no injected
+/// `Environment::home` can confine. Every fixture in this file and its
+/// siblings used a *deny-list* of two or three detector ids and left the
+/// rest of the catalog running, so that path was in scope.
+///
+/// The test is deliberately not "core_simulator specifically": it walks
+/// the whole registry, asks each detector what it would propose from a
+/// fixture home, and fails on any resolved path that escapes it. A new
+/// detector with a hardcoded system path fails here rather than in
+/// whichever unrelated assertion happens to sum bytes.
+#[test]
+fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_byte_total() {
+    use swamp_core::locations::LocationStatus;
+
+    let home = tempfile::tempdir().unwrap();
+    let env = fixture_env(home.path(), &[]);
+    let registry = Registry::with_builtins();
+    let mut escaping: Vec<(String, String)> = Vec::new();
+    for (id, proposals) in registry.resolve(&env, &[]) {
+        for p in proposals {
+            if p.status != LocationStatus::Resolved {
+                continue;
+            }
+            let Some(path) = p.path else { continue };
+            if !path.starts_with(home.path()) {
+                escaping.push((id.clone(), path.display().to_string()));
+            }
+        }
+    }
+
+    // Three detectors genuinely do this, and all three are correct to:
+    // Homebrew's prefixes, ruby-install's `/opt/rubies` and
+    // CoreSimulator's system-wide runtime volumes are machine-wide
+    // conventions, not per-user paths, so no `HOME` can relocate them.
+    // They are listed here by name so the *number* of detectors that can
+    // reach outside a fixture stays a reviewed decision instead of
+    // something a byte total discovers by accident.
+    //
+    // The consequence for tests: a fixture scope naming any of these --
+    // or, worse, using a deny-list that does not -- reads the
+    // developer's real storage.
+    let known: &[(&str, &str)] = &[
+        ("core-simulator", "/Library/Developer/CoreSimulator/Volumes"),
+        ("homebrew", "/opt/homebrew"),
+        ("homebrew", "/usr/local"),
+        ("homebrew", "/opt/homebrew/Cellar"),
+        ("homebrew", "/opt/homebrew/Caskroom"),
+        ("homebrew", "/usr/local/Cellar"),
+        ("homebrew", "/usr/local/Caskroom"),
+        ("ruby-install", "/opt/rubies"),
+    ];
+    let unexpected: Vec<&(String, String)> = escaping
+        .iter()
+        .filter(|(id, path)| !known.iter().any(|(k, p)| k == id && p == path))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these detectors resolve a path outside the fixture home, so any test that does not \
+         name them in `enabled_detectors` measures real user data: {unexpected:?}"
+    );
+
+    // And the consequence, stated: a fixture scope must be an
+    // allow-list. A deny-list of a few ids leaves the escaping detector
+    // in scope.
+    let deny_list_scope = resolve_effective_scope(
+        &env,
+        &ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: vec!["rustup".into(), "homebrew".into()],
+            enabled_detectors: Vec::new(),
+        },
+        &[],
+        &registry,
+        1,
+    );
+    let (authorized, _) = deny_list_scope.authorized_roots();
+    assert!(
+        authorized
+            .iter()
+            .any(|r| r.detector_id.as_deref() == Some("core-simulator")),
+        "if this ever stops being true, the allow-list fixtures in this file can be relaxed -- \
+         until then they must stay allow-lists"
+    );
+
+    let allow_list_scope =
+        resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
+    let (authorized, _) = allow_list_scope.authorized_roots();
+    assert!(
+        authorized
+            .iter()
+            .all(|r| r.detector_id.as_deref() == Some("cargo-home")),
+        "an allow-list scope must authorize nothing but the detector it names: {:?}",
+        authorized
+            .iter()
+            .map(|r| r.detector_id.clone())
+            .collect::<Vec<_>>()
     );
 }
