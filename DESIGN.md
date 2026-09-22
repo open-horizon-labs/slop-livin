@@ -97,7 +97,15 @@ chunk; all three now ship:
   (`Row.unit: None`) rather than markable-then-refused: the action
   layer (`actions::execute`) already refuses every
   `PlanUnit::external_category` unit unconditionally, so there is no
-  delete affordance to offer in the first place.
+  delete affordance to offer in the first place. A unit that is a
+  machine-wide build store (a Maven repository, Go's module cache,
+  DerivedData, the Android SDK, ...) is expandable: `Enter`/`→` opens it
+  onto the **same** family groups a project container shows (closed
+  until opened, guidance first, every row `blocked`, no `UnitId`), from
+  `ScopeObservation::store_interiors` of the same pass. The Docker view
+  gains one row per BuildKit builder that opens the same way; its member
+  rows say "created (daemon)" rather than "modified", because the time
+  is the daemon's record, not a file's.
 - **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
   "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
   same way: tool/category/relative-path/project-link facts. Every row

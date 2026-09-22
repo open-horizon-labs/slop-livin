@@ -899,7 +899,62 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
     }
 }
 
+/// Every read-only query the observation path may send the Docker CLI,
+/// by argument prefix (a builder name or object ids follow some of them).
+/// A query not on this list is refused before a process is spawned --
+/// the same belt-and-braces `locations::ALLOWED_COMMANDS` is for the
+/// detectors. Removal (`image rm`, `volume rm`) is not an observation
+/// and goes through [`remove`], behind the action layer's rechecks.
+pub const OBSERVATION_QUERIES: &[&[&str]] = &[
+    &["system", "df", "-v", "--format", "json"],
+    &["image", "inspect"],
+    &["volume", "inspect"],
+    &["ps", "-a", "--format", "json"],
+    &["inspect"],
+    &["version", "--format", "json"],
+    &["buildx", "ls", "--format", "json"],
+    &["buildx", "du", "--verbose", "--builder"],
+];
+
+/// Whether `args` is an allow-listed observation query.
+pub fn is_observation_query(args: &[&str]) -> bool {
+    OBSERVATION_QUERIES
+        .iter()
+        .any(|q| args.len() >= q.len() && args[..q.len()] == **q)
+}
+
+/// How many buildx builders besides the daemon's own get a `du` query.
+/// Each is one bounded spawn, cached with the rest of the facts.
+const MAX_BUILDX_BUILDERS: usize = 4;
+
+/// A shorter bound for the buildx queries: an unresponsive builder is a
+/// stated limit, and must not hold the whole observation.
+const BUILDX_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
+    let stdout = run_docker(args, timeout)?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        return Ok(v);
+    }
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if !lines.is_empty() {
+        return Ok(serde_json::Value::Array(lines));
+    }
+    Err("docker: unavailable (bad output)".to_string())
+}
+
+/// One bounded, allow-listed Docker CLI query, its stdout as text.
+fn run_docker(args: &[&str], timeout: Duration) -> Result<String, String> {
+    if !is_observation_query(args) {
+        return Err(format!(
+            "docker: refused (`docker {}` is not an allow-listed observation query)",
+            args.join(" ")
+        ));
+    }
     crate::work_counters::record_spawn();
     let mut child = Command::new("docker")
         .args(args)
@@ -939,19 +994,59 @@ fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value
     if !status.success() {
         return Err("docker: unavailable (daemon not responding)".to_string());
     }
-    let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        return Ok(v);
+    Ok(rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default())
+}
+
+/// The daemon's API version and the buildx builders' records, after
+/// `docker system df` answered. Each failure is a stated capability
+/// limit on the facts, never an error: an old daemon, a missing buildx,
+/// or one builder that does not answer leaves everything else intact.
+fn load_buildkit_detail(facts: &mut DockerFacts) {
+    match run_docker_json(&["version", "--format", "json"], DOCKER_TIMEOUT) {
+        Ok(v) => facts.capabilities.api_version = api_version_of(&v),
+        Err(e) => facts
+            .capabilities
+            .buildx_limits
+            .push(format!("the daemon's API version is unknown ({e})")),
     }
-    let lines: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+    let builders = match run_docker_json(&["buildx", "ls", "--format", "json"], BUILDX_TIMEOUT) {
+        Ok(serde_json::Value::Array(rows)) => rows.iter().filter_map(parse_builder).collect(),
+        Ok(row) => parse_builder(&row).into_iter().collect(),
+        Err(e) => {
+            facts.capabilities.buildx_limits.push(format!(
+                "buildx builders are not listed ({e}); only the daemon's own build cache is shown"
+            ));
+            Vec::new()
+        }
+    };
+    facts.builders = builders;
+    let others: Vec<String> = facts
+        .builders
+        .iter()
+        .filter(|b| b.driver.as_deref() != Some("docker"))
+        .map(|b| b.name.clone())
         .collect();
-    if !lines.is_empty() {
-        return Ok(serde_json::Value::Array(lines));
+    if others.len() > MAX_BUILDX_BUILDERS {
+        facts.capabilities.buildx_limits.push(format!(
+            "{} builders listed; the records of only the first {MAX_BUILDX_BUILDERS} are asked for",
+            others.len()
+        ));
     }
-    Err("docker: unavailable (bad output)".to_string())
+    for name in others.into_iter().take(MAX_BUILDX_BUILDERS) {
+        match run_docker(
+            &["buildx", "du", "--verbose", "--builder", &name],
+            BUILDX_TIMEOUT,
+        ) {
+            Ok(text) => {
+                let records = parse_buildx_du_verbose(&text);
+                merge_builder_records(facts, &name, records);
+            }
+            Err(e) => facts
+                .capabilities
+                .buildx_limits
+                .push(format!("builder `{name}`: records not listed ({e})")),
+        }
+    }
 }
 
 /// Loads Docker facts either from a mocked facts file (tests, or the
@@ -1072,6 +1167,8 @@ fn load_live() -> DockerFacts {
             }
         };
     let mut facts = parse_value(&df_value);
+    facts.captured_at = Some(crate::entities::now());
+    load_buildkit_detail(&mut facts);
 
     let ids: Vec<&str> = facts
         .images
@@ -1225,5 +1322,107 @@ mod tests {
         });
         let facts = parse_value(&value);
         assert_eq!(facts.images[0].containers[0].finished_at, None);
+    }
+
+    /// A facts file in the documented shapes: `docker system df -v
+    /// --format json`'s `BuildCache`, `docker version --format json`,
+    /// `docker buildx ls --format json`, and `docker buildx du --verbose`
+    /// text per builder. Synthetic ids and descriptions.
+    const BUILDKIT_FACTS: &str = r#"{
+      "BuildCache": [
+        {"ID": "r1", "CacheType": "regular", "Description": "[build 2/5] RUN apt-get update",
+         "Size": "120MB", "CreatedAt": "2024-01-15T10:32:00Z", "LastUsedAt": "2024-02-01T08:00:00Z",
+         "UsageCount": 4, "InUse": false, "Shared": true},
+        {"ID": "r2", "CacheType": "exec.cachemount", "Description": "mount / from exec /bin/sh -c pip install",
+         "Size": "300MB", "Parent": "r1", "InUse": true, "Shared": false}
+      ],
+      "Version": {"Client": {"ApiVersion": "1.45"}, "Server": {"ApiVersion": "1.45", "Version": "26.1.0"}},
+      "Builders": [
+        {"Name": "default", "Driver": "docker", "Nodes": [{"Status": "running"}]},
+        {"Name": "ci", "Driver": "docker-container", "Nodes": [{"Status": "running"}]},
+        {"Name": "cold", "Driver": "docker-container", "Nodes": [{"Status": "inactive"}]}
+      ],
+      "BuildxDu": [
+        {"Builder": "ci", "Verbose": "ID:\t\tc1\nParents:\tc0\nCreated at:\t2024-03-01 09:00:00 +0000 UTC\nMutable:\tfalse\nReclaimable:\ttrue\nShared:\t\tfalse\nSize:\t\t50MB\nDescription:\t[stage-1 1/3] COPY . .\nUsage count:\t1\nLast used:\t2024-03-01 09:05:00 +0000 UTC\nType:\t\tregular\n\nID:\t\tc0\nCreated at:\t2024-03-01 08:59:00 +0000 UTC\nReclaimable:\ttrue\nShared:\t\ttrue\nSize:\t\t10MB\nType:\t\tsource.local\n\nShared:\t\t10MB\nPrivate:\t50MB\nReclaimable:\t60MB\nTotal:\t\t60MB\n"},
+        {"Builder": "cold", "Unavailable": "timed out"}
+      ]
+    }"#;
+
+    #[test]
+    fn buildkit_records_keep_every_daemon_field_per_builder() {
+        let v: serde_json::Value = serde_json::from_str(BUILDKIT_FACTS).unwrap();
+        let f = parse_value(&v);
+        assert_eq!(f.capabilities.api_version.as_deref(), Some("1.45"));
+        assert!(!f.capabilities.build_cache_api_unsupported());
+        assert_eq!(f.builder_names(), vec!["default", "ci", "cold"]);
+        let r2 = f.build_cache.iter().find(|r| r.id == "r2").unwrap();
+        assert_eq!(
+            r2.parents,
+            vec!["r1".to_string()],
+            "the deprecated `Parent` is read"
+        );
+        assert!(r2.in_use);
+        assert_eq!(r2.cache_type.as_deref(), Some("exec.cachemount"));
+        let ci = f.records_of("ci");
+        assert_eq!(
+            ci.len(),
+            2,
+            "the verbose text's summary block is not a record"
+        );
+        let c1 = ci.iter().find(|r| r.id == "c1").unwrap();
+        assert_eq!(c1.bytes, 50_000_000);
+        assert_eq!(c1.reclaimable, Some(true));
+        assert_eq!(c1.parents, vec!["c0".to_string()]);
+        assert_eq!(
+            c1.last_used.as_deref(),
+            Some("2024-03-01 09:05:00 +0000 UTC")
+        );
+        assert!(f.records_of("cold").is_empty());
+        assert!(
+            f.capabilities
+                .buildx_limits
+                .iter()
+                .any(|l| l.contains("`cold`") && l.contains("timed out")),
+            "a builder that did not answer is a stated limit: {:?}",
+            f.capabilities.buildx_limits
+        );
+        assert_eq!(f.records_of("default").len(), 2);
+    }
+
+    #[test]
+    fn an_old_daemon_api_is_stated_and_an_unknown_one_is_not_assumed_old() {
+        let old = DockerCapabilities {
+            api_version: Some("1.38".into()),
+            ..Default::default()
+        };
+        assert!(old.build_cache_api_unsupported());
+        assert!(!DockerCapabilities::default().build_cache_api_unsupported());
+    }
+
+    #[test]
+    fn only_allow_listed_observation_queries_may_run() {
+        assert!(is_observation_query(&[
+            "buildx",
+            "du",
+            "--verbose",
+            "--builder",
+            "ci"
+        ]));
+        assert!(is_observation_query(&[
+            "system", "df", "-v", "--format", "json"
+        ]));
+        assert!(!is_observation_query(&["builder", "prune", "-f"]));
+        assert!(!is_observation_query(&[
+            "buildx", "prune", "--filter", "id=x"
+        ]));
+        assert!(!is_observation_query(&["image", "rm", "x"]));
+        let (r, counted) = crate::work_counters::measured(|| {
+            run_docker(&["builder", "prune", "-f"], DOCKER_TIMEOUT)
+        });
+        assert!(r.unwrap_err().contains("not an allow-listed"));
+        assert_eq!(
+            counted.subprocess_spawns, 0,
+            "refused before any process is spawned"
+        );
     }
 }

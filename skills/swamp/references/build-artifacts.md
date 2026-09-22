@@ -1,7 +1,11 @@
 # Build artifacts (reference)
 
-What is *inside* a `target/`, a `node_modules/`, a Gradle `build/` or a
-Maven `target/`, and what removing a piece of it would cost.
+What is *inside* a `target/`, a `node_modules/`, a Gradle or Android
+`build/`, a Maven `target/`, a `.venv`, a `dist/`, a Go `vendor/`, a
+SwiftPM `.build` -- and inside the machine-wide stores beside them (a
+Maven repository, a Gradle home, npm/pnpm stores, Go's module and build
+caches, pip/uv caches, DerivedData, CoreSimulator, the Android SDK,
+BuildKit's cache) -- and what removing a piece of it would cost.
 
 **This layer never removes anything.** No build adapter implements an
 action. Every unit is inspection only; say so rather than implying a
@@ -21,11 +25,19 @@ cleanup swamp supports, and they are separate from this.
 - `swamp report <root> --view rust` -- the Cargo drill-down.
 - TUI: opening a project expands an identified container into its
   families; a `node_modules` that is mostly pnpm store shows that.
+- `swamp report --view external` -- each machine-wide store's family rows
+  under its unit; `--json` carries them as `interiors`, keyed by the
+  unit's path, in the same shape as `interior` above. TUI External view:
+  a store row opens onto the same family groups.
+- `swamp report <root> --view docker` -- BuildKit records per builder,
+  in the daemon's terms; `--json` adds a `buildkit` array.
 
 ## Role families
 
 `outputs`, `tests`, `intermediates`, `dependencies`, `shared-store`,
-`metadata`, `residual`, `unknown`. Cargo's older roles (`profile`,
+`installations` (SDKs, runtimes, interpreters, toolchain downloads --
+never build output), `state` (archives, simulator devices, AVDs --
+nothing regenerates them), `metadata`, `residual`, `unknown`. Cargo's older roles (`profile`,
 `dependency`, `test-executable`, `example`, `build-script-output`,
 `incremental`, `final-output`, `companion-metadata`) map into the same
 families, so a summary never has a Rust column and an everything-else
@@ -74,13 +86,25 @@ project's copy is never added to the store's own total. Which projects
 link a given entry is not derivable from the entry, and no action is
 offered on one.
 
-These stores are identified but **not yet joined into the report pass**
-(they are detector-resolved external locations). Do not claim a report
-shows a machine's whole pnpm store.
+These stores are joined into the external observation's pass: the
+detector declares which location is which store kind, the adapter
+declares which kinds it identifies, and the interior's history lives on
+its own key family. Only stores in the scope (enabled, not excluded,
+readable) appear; say which ones a report actually covered.
 
 ## Coverage
 
-Implemented interiors: Cargo, Node, Gradle, Maven. Measured as whole
-rows with no interior identification: Python, Go, Xcode/Swift, Android,
-Docker/BuildKit. `docs/build-artifacts.md` in the repository is the
+Implemented interiors: Cargo, Node, Gradle, Maven, Python, Go,
+Xcode/Swift, Android, Docker/BuildKit.
+
+- **Go build cache (GOCACHE)**: bucket names are opaque hashes. Never say
+  an entry is a test binary, belongs to a package, or will not be read
+  again.
+- **Docker/BuildKit**: sizes, times and in-use/shared/reclaimable are the
+  daemon's facts; a record's size never includes its parents'. The host
+  disk image is a separate number -- never add them. Native prune removes
+  a record with its dependents; swamp offers no action.
+- **Archives, simulator devices, AVDs** (`state`) and **SDKs/runtimes**
+  (`installations`) are never "build output"; do not describe them as
+  rebuildable. `docs/build-artifacts.md` in the repository is the
 checked matrix, including per-ecosystem layouts and attribution limits.

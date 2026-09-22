@@ -230,6 +230,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                         per_root: Vec::new(),
                         external_units: None,
                         agent_units: None,
+                        store_interiors: None,
                     }));
                     return;
                 };
@@ -256,6 +257,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                     per_root: o.per_root.into_iter().collect(),
                     external_units: Some(o.external_units),
                     agent_units: Some(o.agent_units),
+                    store_interiors: Some(o.store_interiors),
                 });
                 let _ = tx.send(res);
             });
@@ -285,6 +287,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             let mut a = App::new(observation.merged, root.clone());
             a.reports_by_root = observation.per_root;
             a.set_external_units(observation.external_units);
+            a.set_store_interiors(observation.store_interiors);
             a.set_agent_units(observation.agent_units);
             a
         }
@@ -363,6 +366,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
     let mut app = App::new_multi_root(observation.merged, present_roots);
     app.reports_by_root = observation.per_root;
     app.set_external_units(observation.external_units);
+    app.set_store_interiors(observation.store_interiors);
     app.set_agent_units(observation.agent_units);
     app.scope = Some(scope.clone());
     app.observed_label = "just now".into();
@@ -496,6 +500,9 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     // so the agent view is never older than the header.
                     if let Some(units) = fresh.external_units {
                         app.set_external_units(units);
+                    }
+                    if let Some(units) = fresh.store_interiors {
+                        app.set_store_interiors(units);
                     }
                     if let Some(units) = fresh.agent_units {
                         app.set_agent_units(units);

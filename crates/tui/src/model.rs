@@ -909,9 +909,29 @@ fn family_tree_children(
     prefix: &str,
     collapsed: &std::collections::HashSet<String>,
 ) -> Vec<Row> {
+    family_tree_children_of(
+        &report.nested_artifacts,
+        report.observed_at,
+        container,
+        depth,
+        prefix,
+        collapsed,
+    )
+}
+
+/// [`family_tree_children`] over any set of units: a project container's,
+/// a machine-wide store's (`ViewKind::External`) or a BuildKit builder's
+/// (`ViewKind::Docker`). One presentation for every interior.
+fn family_tree_children_of(
+    all: &[swamp_core::artifact::NestedArtifact],
+    observed_at: u64,
+    container: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
     use swamp_core::build_adapters::{family_members, summarize_container};
-    let units: Vec<swamp_core::artifact::NestedArtifact> = report
-        .nested_artifacts
+    let units: Vec<swamp_core::artifact::NestedArtifact> = all
         .iter()
         .filter(|u| u.present && u.path.starts_with(container))
         .cloned()
@@ -920,7 +940,6 @@ fn family_tree_children(
     let residual = summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
     let show_residual = summary.unsupported_count > 0 || residual > 0;
     let group_count = summary.families.len() + usize::from(show_residual);
-    let observed_at = report.observed_at;
     let mut rows = Vec::new();
     for (i, f) in summary.families.iter().enumerate() {
         let last = i + 1 == group_count;
@@ -1059,10 +1078,16 @@ fn family_member_row(
     let age = (u.time_source != swamp_core::artifact::TimeSource::Unknown && u.mtime_max > 0)
         .then(|| observed_at.saturating_sub(u.mtime_max));
     row.cleanup_summary = Some(format!(
-        "{} · modified {}",
+        "{} · {} {}",
         u.consequence
             .clone()
             .unwrap_or_else(|| "consequence not established".into()),
+        // A daemon's record time is the daemon's, never a file's.
+        if u.reported_by.is_some() {
+            "created (daemon)"
+        } else {
+            "modified"
+        },
         match age {
             Some(a) => age_label(Some(a)),
             None => "unknown".into(),
@@ -1604,6 +1629,61 @@ pub fn docker_unowned_bytes(report: &Report) -> u64 {
 
 /// Docker view: unowned docker rows plus a per-project docker rollup.
 pub fn docker_rows(report: &Report) -> Vec<Row> {
+    docker_rows_with(report, &std::collections::HashSet::new())
+}
+
+/// [`docker_rows`], plus one row per BuildKit builder with its records
+/// in family groups -- sizes the daemon's logical figures, times the
+/// daemon's records, nothing selectable.
+pub fn docker_rows_with(
+    report: &Report,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut out = docker_object_rows(report);
+    let mut builders: Vec<&swamp_core::artifact::NestedArtifact> = report
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.reported_by.is_some() && Some(u.id.as_str()) == u.container_id.as_deref())
+        .collect();
+    builders.sort_by(|a, b| a.path.cmp(&b.path));
+    for b in builders {
+        let name = b
+            .path
+            .to_string_lossy()
+            .strip_prefix(swamp_core::build_adapters::DAEMON_STORE_SCHEME)
+            .unwrap_or_default()
+            .to_string();
+        let mut row = Row::leaf(
+            0,
+            format!("buildkit · builder {name} (daemon-reported, logical)"),
+            b.bytes,
+            None,
+        );
+        let key = format!("store-open:{}", b.path.display());
+        let open = collapsed.contains(&key);
+        let children = family_tree_children_of(
+            &report.nested_artifacts,
+            report.observed_at,
+            &b.path,
+            1,
+            "",
+            collapsed,
+        );
+        row.expandable = !children.is_empty();
+        row.expansion_key = Some(key);
+        row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+        row.collapsed_children = (!open).then_some(children.len());
+        row.signals = b.coverage.limits.clone();
+        row.signals.push("blocked".into());
+        out.push(row);
+        if open {
+            out.extend(children);
+        }
+    }
+    out
+}
+
+fn docker_object_rows(report: &Report) -> Vec<Row> {
     let mut out = Vec::new();
     for p in &report.projects {
         for wt in &p.worktrees {
@@ -2005,30 +2085,61 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
 /// the action layer would refuse anyway, rather than inventing a
 /// confirm flow only to refuse it.
 pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
-    let mut rows: Vec<Row> = units
-        .iter()
-        .map(|u| {
-            let consumers = if u.consumers.is_empty() {
-                "no declared consumers".to_string()
-            } else {
-                format!("{} consumer(s)", u.consumers.len())
-            };
-            let mut row = Row::leaf(
-                0,
-                format!(
-                    "{:?} · {} ({}) · {consumers}",
-                    u.category,
-                    u.path.display(),
-                    u.detector_id
-                ),
-                u.bytes,
-                u.growth_bytes,
-            );
-            row.evidence = u.evidence.clone();
-            row
-        })
-        .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    external_rows_with(units, &[], &std::collections::HashSet::new(), 0)
+}
+
+/// [`external_rows`], with each machine-wide build store's identified
+/// interior under it: closed until opened (`Enter`), then the same
+/// family groups a project container shows. Every interior row is
+/// inspection only (`blocked`, no `UnitId`), exactly as there.
+pub fn external_rows_with(
+    units: &[swamp_core::external::ExternalUnit],
+    interiors: &[swamp_core::artifact::NestedArtifact],
+    collapsed: &std::collections::HashSet<String>,
+    observed_at: u64,
+) -> Vec<Row> {
+    let mut sorted: Vec<&swamp_core::external::ExternalUnit> = units.iter().collect();
+    sorted.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    let mut rows = Vec::new();
+    for u in sorted {
+        let consumers = if u.consumers.is_empty() {
+            "no declared consumers".to_string()
+        } else {
+            format!("{} consumer(s)", u.consumers.len())
+        };
+        let mut row = Row::leaf(
+            0,
+            format!(
+                "{:?} · {} ({}) · {consumers}",
+                u.category,
+                u.path.display(),
+                u.detector_id
+            ),
+            u.bytes,
+            u.growth_bytes,
+        );
+        row.evidence = u.evidence.clone();
+        let has_interior = interiors
+            .iter()
+            .any(|i| i.path != u.path && i.path.starts_with(&u.path));
+        if has_interior {
+            let key = format!("store-open:{}", u.path.display());
+            let open = collapsed.contains(&key);
+            let children =
+                family_tree_children_of(interiors, observed_at, &u.path, 1, "", collapsed);
+            row.expandable = !children.is_empty();
+            row.expansion_key = Some(key);
+            row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+            row.collapsed_children = (!open).then_some(children.len());
+            row.signals = vec!["store interior below · inspection only".into()];
+            rows.push(row);
+            if open {
+                rows.extend(children);
+            }
+        } else {
+            rows.push(row);
+        }
+    }
     rows
 }
 

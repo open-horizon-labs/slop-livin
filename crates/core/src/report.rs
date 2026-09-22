@@ -2563,7 +2563,16 @@ pub fn merge_root_report_into(merged: &mut Report, r: Report) {
         }
         _ => {}
     }
-    merged.nested_artifacts.extend(r.nested_artifacts);
+    // The daemon answers once for the whole machine, and every root's
+    // pass carries the same BuildKit records: one copy each, by the
+    // record's stable id. Filesystem units belong to exactly one root and
+    // are kept as they are.
+    for u in r.nested_artifacts {
+        if u.reported_by.is_some() && merged.nested_artifacts.iter().any(|m| m.id == u.id) {
+            continue;
+        }
+        merged.nested_artifacts.push(u);
+    }
 }
 
 /// Rebuilds one merged multi-root [`Report`] from scratch given every

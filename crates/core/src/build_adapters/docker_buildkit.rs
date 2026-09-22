@@ -25,7 +25,7 @@
 //! Every unit is inspection only. The native operations are coarser
 //! than a row: `docker buildx prune --filter id=<id>` removes a record
 //! *and* records that depend on it, and `docker builder prune` removes
-//! every unused record matching its filters. Neither is offered here, and
+//! every record not in use that matches its filters. Neither is offered here, and
 //! nothing here touches Docker's files.
 
 use super::layout::rfc3339_secs;

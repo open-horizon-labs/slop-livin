@@ -30,11 +30,16 @@ cargo test -p swamp-core \
 # capability table matches the registry, and that no identified unit
 # renders a verdict; `build_adapter_history` drives the real report
 # pipeline for Node and Gradle (full vs incremental, reclassification,
-# unreadable members, the JSON interior, and the refresh cost).
+# unreadable members, the JSON interior, and the refresh cost) and for
+# Python, Go, SwiftPM and Android checkouts; `build_store_join` drives
+# the machine-wide store join and the BuildKit records through
+# `report::observe_scope` (capability join, the store family's owned
+# sweep in both orders, disabled/excluded/unreadable stores, replay cost).
 cargo test -p swamp-core \
   --test build_adapter_contract \
   --test build_adapter_cost \
-  --test build_adapter_history
+  --test build_adapter_history \
+  --test build_store_join
 
 # `--test-threads=1` here and nowhere else. This test measures through
 # the *process-global* work counters (`work_counters::reset` +

@@ -923,7 +923,6 @@ pub fn render_view_builds(report: &Report, only_project: Option<&str>) -> String
 /// containers prints nothing here, and a family with no members prints
 /// no line.
 fn render_build_containers(report: &Report, only_project: Option<&str>) -> String {
-    use crate::build_adapters::summarize_container;
     let mut out = String::new();
     if report.nested_artifacts.is_empty() {
         return out;
@@ -936,6 +935,11 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
         let Some(id) = u.container_id.as_deref() else {
             continue;
         };
+        // A daemon's records are `--view docker`'s, not a build
+        // directory's interior.
+        if u.reported_by.is_some() {
+            continue;
+        }
         let project = report
             .projects
             .iter()
@@ -956,107 +960,220 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
     );
     let mut sections: Vec<(u64, String)> = Vec::new();
     for units in containers.values() {
-        // The container's own row is the one whose id equals the
-        // container id; everything else hangs off it.
-        let Some(root) = units
-            .iter()
-            .find(|u| Some(u.id.as_str()) == u.container_id.as_deref())
-        else {
-            continue;
-        };
         let owned: Vec<crate::artifact::NestedArtifact> =
             units.iter().map(|u| (*u).clone()).collect();
-        let summary = summarize_container(&root.path, &owned);
-        let residual =
-            summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
-        if summary.families.is_empty() && summary.unsupported_count == 0 && residual == 0 {
-            continue;
+        if let Some(section) = render_container_section(&owned, report.observed_at, "") {
+            sections.push(section);
         }
-        let mut section = String::new();
-        let _ = writeln!(
-            section,
-            "\n{} ({}, {} {})",
-            root.path.display(),
-            root.adapter.clone().unwrap_or_else(|| "unknown".into()),
-            human_bytes(root.bytes),
-            root.basis.label()
-        );
-        for limit in &root.coverage.limits {
-            let _ = writeln!(section, "  limit: {limit}");
-        }
-        for f in &summary.families {
-            // Guidance and consequence first: that is the question. The
-            // numbers follow on their own line.
-            let consequence = match (&f.consequence, f.other_consequences) {
-                (Some(c), 0) => c.clone(),
-                (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
-                (None, _) => "consequence not established".to_string(),
-            };
-            let size = match f.basis {
-                crate::artifact::AccountingBasis::Unknown => {
-                    "size mixed-basis (not summed)".to_string()
-                }
-                basis => format!("{} {}", human_bytes(f.bytes), basis.label()),
-            };
-            let oldest = match f.oldest_modified {
-                Some(t) => format!("oldest modified {}", age_label(t, report.observed_at)),
-                None => "no known modification time".to_string(),
-            };
-            let unknowns = if f.unknown_age > 0 {
-                format!(", {} of unknown age", f.unknown_age)
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                section,
-                "  {:<24} {} -- {consequence}",
-                f.family.title(),
-                f.recommendation
-            );
-            let _ = writeln!(
-                section,
-                "  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; inspection only",
-                "",
-                f.count,
-                if f.complete {
-                    ""
-                } else {
-                    " (measurement incomplete)"
-                }
-            );
-        }
-        if summary.unsupported_count > 0 || residual > 0 {
-            let _ = writeln!(
-                section,
-                "  {:<24} {} -- {} unrecognised entr{}, {}",
-                crate::artifact::RoleFamily::Residual.title(),
-                crate::build_adapters::family_guidance(crate::artifact::RoleFamily::Residual),
-                summary.unsupported_count,
-                if summary.unsupported_count == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                match summary.unaccounted_bytes {
-                    Some(b) => format!(
-                        "{} {} in total, {} of it claimed by no unit",
-                        human_bytes(residual),
-                        root.basis.label(),
-                        human_bytes(b)
-                    ),
-                    None => format!(
-                        "{} {} unrecognised; the remainder of the container was not reconciled",
-                        human_bytes(residual),
-                        root.basis.label()
-                    ),
-                }
-            );
-        }
-        sections.push((root.bytes, section));
     }
     sections.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, s) in sections {
         out.push_str(&s);
+    }
+    out
+}
+
+/// One container's interior as text: the container line, its limits,
+/// one guidance + numbers pair per family, and the residual. The one
+/// renderer `--view builds`, `--view external` and `--view docker`
+/// share, so a Maven repository's interior reads exactly like a
+/// `node_modules`'s. `None` when there is nothing to show. Returns the
+/// container's bytes for ordering.
+fn render_container_section(
+    units: &[crate::artifact::NestedArtifact],
+    observed_at: u64,
+    indent: &str,
+) -> Option<(u64, String)> {
+    use crate::build_adapters::summarize_container;
+    // The container's own row is the one whose id equals the container
+    // id; everything else hangs off it.
+    let root = units
+        .iter()
+        .find(|u| Some(u.id.as_str()) == u.container_id.as_deref())?;
+    let summary = summarize_container(&root.path, units);
+    let residual = summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
+    if summary.families.is_empty() && summary.unsupported_count == 0 && residual == 0 {
+        return None;
+    }
+    let mut section = String::new();
+    let _ = writeln!(
+        section,
+        "\n{indent}{} ({}, {} {})",
+        root.path.display(),
+        root.adapter.clone().unwrap_or_else(|| "unknown".into()),
+        human_bytes(root.bytes),
+        root.basis.label()
+    );
+    for limit in &root.coverage.limits {
+        let _ = writeln!(section, "{indent}  limit: {limit}");
+    }
+    for f in &summary.families {
+        // Guidance and consequence first: that is the question. The
+        // numbers follow on their own line.
+        let consequence = match (&f.consequence, f.other_consequences) {
+            (Some(c), 0) => c.clone(),
+            (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
+            (None, _) => "consequence not established".to_string(),
+        };
+        let size = match f.basis {
+            crate::artifact::AccountingBasis::Unknown => {
+                "size mixed-basis (not summed)".to_string()
+            }
+            basis => format!("{} {}", human_bytes(f.bytes), basis.label()),
+        };
+        let time_word = if root.reported_by.is_some() {
+            "oldest created (daemon record)"
+        } else {
+            "oldest modified"
+        };
+        let oldest = match f.oldest_modified {
+            Some(t) => format!("{time_word} {}", age_label(t, observed_at)),
+            None => "no known modification time".to_string(),
+        };
+        let unknowns = if f.unknown_age > 0 {
+            format!(", {} of unknown age", f.unknown_age)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            section,
+            "{indent}  {:<24} {} -- {consequence}",
+            f.family.title(),
+            f.recommendation
+        );
+        let _ = writeln!(
+            section,
+            "{indent}  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; inspection only",
+            "",
+            f.count,
+            if f.complete {
+                ""
+            } else {
+                " (measurement incomplete)"
+            }
+        );
+    }
+    if summary.unsupported_count > 0 || residual > 0 {
+        let _ = writeln!(
+            section,
+            "{indent}  {:<24} {} -- {} unrecognised entr{}, {}",
+            crate::artifact::RoleFamily::Residual.title(),
+            crate::build_adapters::family_guidance(crate::artifact::RoleFamily::Residual),
+            summary.unsupported_count,
+            if summary.unsupported_count == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            match summary.unaccounted_bytes {
+                Some(b) => format!(
+                    "{} {} in total, {} of it claimed by no unit",
+                    human_bytes(residual),
+                    root.basis.label(),
+                    human_bytes(b)
+                ),
+                None => format!(
+                    "{} {} unrecognised; the remainder of the container was not reconciled",
+                    human_bytes(residual),
+                    root.basis.label()
+                ),
+            }
+        );
+    }
+    Some((root.bytes, section))
+}
+
+/// `--view docker`'s BuildKit section: each builder's records, in the
+/// daemon's own terms. The family rows say what the records are and
+/// cost; the record lines say which record, with the daemon's flags --
+/// shared, in use, reclaimable -- and its parents, because a native
+/// prune removes a record with its dependents. The host disk image that
+/// holds these is `--view external`'s, never added here.
+fn render_buildkit_records(report: &Report) -> String {
+    let mut out = String::new();
+    let mut builders: std::collections::BTreeMap<&str, Vec<crate::artifact::NestedArtifact>> =
+        std::collections::BTreeMap::new();
+    for u in report
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.reported_by.is_some())
+    {
+        if let Some(c) = u.container_id.as_deref() {
+            builders.entry(c).or_default().push(u.clone());
+        }
+    }
+    if builders.is_empty() {
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "\nBuildKit build cache, as the daemon reports it (logical sizes, each record's own; \
+         inspection only):"
+    );
+    for units in builders.values() {
+        if let Some((_, section)) = render_container_section(units, report.observed_at, "") {
+            out.push_str(&section);
+        }
+        let mut records: Vec<&crate::artifact::NestedArtifact> = units
+            .iter()
+            .filter(|u| Some(u.id.as_str()) != u.container_id.as_deref())
+            .collect();
+        records.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        for r in records.iter().take(25) {
+            let flags: Vec<&str> = r
+                .coverage
+                .limits
+                .iter()
+                .filter_map(|l| {
+                    if l.contains("in use") {
+                        Some("in use")
+                    } else if l.contains("reports this record shared") {
+                        Some("shared")
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let parents = r
+                .producer_evidence
+                .iter()
+                .filter(|e| e.source == "buildkit-parent")
+                .count();
+            let description = r
+                .producer_evidence
+                .iter()
+                .find(|e| e.source == "buildkit-description")
+                .map(|e| e.detail.as_str())
+                .unwrap_or("");
+            let last_used = r
+                .producer_evidence
+                .iter()
+                .find(|e| e.source == crate::build_adapters::LAST_USED_EVIDENCE)
+                .map(|e| format!(" · last used {} (daemon)", e.detail))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "    {:<14} {:<18} {:>10}  created {}{last_used}{}{} {}",
+                r.relative_path.chars().take(14).collect::<String>(),
+                r.variant.configuration.as_deref().unwrap_or("unknown type"),
+                human_bytes(r.bytes),
+                age_label(r.mtime_max, report.observed_at),
+                if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", flags.join(", "))
+                },
+                if parents > 0 {
+                    format!(" · {parents} parent(s)")
+                } else {
+                    String::new()
+                },
+                description
+            );
+        }
+        if records.len() > 25 {
+            let _ = writeln!(out, "    ... and {} more records", records.len() - 25);
+        }
     }
     out
 }
@@ -1383,6 +1500,9 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
             row.detail,
         );
     }
+    if only_project.is_none() {
+        out.push_str(&render_buildkit_records(report));
+    }
     out
 }
 
@@ -1462,6 +1582,16 @@ pub fn render_view_unowned(report: &Report) -> String {
 /// nothing (they never overlap) but would also conflate two different
 /// bases; kept visibly separate instead.
 pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
+    render_view_external_with(units, &[], crate::entities::now())
+}
+
+/// `--view external`, with each machine-wide build store's identified
+/// interior (`ScopeObservation::store_interiors`) under its unit.
+pub fn render_view_external_with(
+    units: &[crate::external::ExternalUnit],
+    interiors: &[crate::artifact::NestedArtifact],
+    observed_at: u64,
+) -> String {
     let mut out = String::new();
     if units.is_empty() {
         let _ = writeln!(out, "no external storage units detected");
@@ -1505,6 +1635,17 @@ pub fn render_view_external(units: &[crate::external::ExternalUnit]) -> String {
         );
         for line in render_evidence_lines(&u.evidence) {
             let _ = writeln!(out, "    {line}");
+        }
+        let inside: Vec<crate::artifact::NestedArtifact> = interiors
+            .iter()
+            .filter(|i| i.present && i.path.starts_with(&u.path))
+            .cloned()
+            .collect();
+        if let Some((_, section)) = render_container_section(&inside, observed_at, "    ") {
+            let _ = write!(
+                out,
+                "    inside (identification only -- no cleanup is offered here):{section}"
+            );
         }
     }
     let _ = writeln!(
