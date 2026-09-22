@@ -193,6 +193,8 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
     for _ in 0..2 {
         let observation = swamp_core::report::observe_scope(
             &scope,
+            swamp_core::report::ObservationParts::ALL,
+            None,
             None,
             false,
             Some(&fx.store),
@@ -217,6 +219,8 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
     // propose -> approve -> execute one agent cache unit.
     let observation = swamp_core::report::observe_scope(
         &scope,
+        swamp_core::report::ObservationParts::ALL,
+        None,
         None,
         false,
         Some(&fx.store),
@@ -251,6 +255,8 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
     // One more report after the action.
     let _ = swamp_core::report::observe_scope(
         &scope,
+        swamp_core::report::ObservationParts::ALL,
+        None,
         None,
         false,
         Some(&fx.store),

@@ -418,29 +418,6 @@ pub fn project_declarations(
     out
 }
 
-/// Detects conflicting declarations for the *same tool* at the *same
-/// scope* (e.g. a project with both `.python-version` and
-/// `.tool-versions` naming different Python versions): returns the
-/// tool names for which more than one distinct version_spec was
-/// declared. Never silently picks one file's answer over another's.
-pub fn conflicting_tools(declarations: &[ToolVersionDeclaration]) -> Vec<String> {
-    let mut by_tool: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
-        std::collections::HashMap::new();
-    for d in declarations {
-        by_tool
-            .entry(d.tool.as_str())
-            .or_default()
-            .insert(d.version_spec.as_str());
-    }
-    let mut out: Vec<String> = by_tool
-        .into_iter()
-        .filter(|(_, versions)| versions.len() > 1)
-        .map(|(tool, _)| tool.to_string())
-        .collect();
-    out.sort();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,27 +562,6 @@ mod tests {
         };
         assert_ne!(a.scope, b.scope);
         assert_eq!(a.version_spec, b.version_spec);
-    }
-
-    #[test]
-    fn conflicting_declarations_within_one_project_are_named() {
-        let decls = vec![
-            ToolVersionDeclaration {
-                manager: "pyenv".into(),
-                tool: "python".into(),
-                version_spec: "3.12.4".into(),
-                source_path: PathBuf::from("/proj/.python-version"),
-                scope: DeclarationScope::Project(PathBuf::from("/proj")),
-            },
-            ToolVersionDeclaration {
-                manager: "asdf-or-mise".into(),
-                tool: "python".into(),
-                version_spec: "3.11.0".into(),
-                source_path: PathBuf::from("/proj/.tool-versions"),
-                scope: DeclarationScope::Project(PathBuf::from("/proj")),
-            },
-        ];
-        assert_eq!(conflicting_tools(&decls), vec!["python".to_string()]);
     }
 
     #[test]

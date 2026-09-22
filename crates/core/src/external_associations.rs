@@ -288,34 +288,29 @@ pub fn parse_go_sum(text: &str) -> Vec<DependencyIdentity> {
 /// `pom.xml`'s `<dependencies><dependency>` entries (direct
 /// dependencies only -- `<dependencyManagement>` entries are BOM/version
 /// declarations, not necessarily actually depended on, so they are
-/// deliberately excluded rather than counted as used). Parsed with
-/// `roxmltree` (a real, read-only, non-validating XML parser -- see
-/// `Cargo.toml`; MIT/Apache-2.0, actively maintained), never a
-/// hand-rolled tag scan the way `xcode_derived_data_association`'s
-/// plist reader gets away with for one fixed tag. A version containing
-/// an unresolved Maven property placeholder (`${...}`, e.g. a
-/// multi-module build's `${revision}`) cannot be joined without full
-/// Maven property resolution, which this module does not implement --
-/// that entry is skipped (never fabricated), not treated as a parse
-/// error. `name` is `"group:artifact"`, matching
+/// deliberately excluded rather than counted as used), *plus* the
+/// dependencies whose identity could not be established at all.
+///
+/// Parsed with `roxmltree` (a real, read-only, non-validating XML
+/// parser -- see `Cargo.toml`; MIT/Apache-2.0, actively maintained),
+/// never a hand-rolled tag scan the way
+/// `xcode_derived_data_association`'s plist reader gets away with for
+/// one fixed tag. `name` is `"group:artifact"`, matching
 /// [`parse_gradle_lockfile`]'s own coordinate convention so both
 /// ecosystems' identities compare the same way.
-pub fn parse_pom_xml(text: &str) -> Result<Vec<DependencyIdentity>, String> {
-    parse_pom_xml_with_gaps(text).map(|(ids, _gaps)| ids)
-}
-
-/// `parse_pom_xml`, also returning the dependencies whose *identity*
-/// could not be established: a `${property}` version this parser does
-/// not evaluate, or a version inherited from a parent POM that is not
-/// on disk here.
 ///
-/// These used to be skipped silently, so a Maven project with a
-/// property-driven version read as declaring nothing and its local
+/// A version that is an unresolved Maven property (`${revision}` in a
+/// multi-module build) or inherited from a parent POM that is not on
+/// disk here cannot be joined without full Maven property and
+/// inheritance resolution, which this module does not implement. Such
+/// an entry comes back in the second return value, never guessed and
+/// never silently dropped: dropping them made a Maven project with a
+/// property-driven version read as declaring nothing, and its local
 /// repository read as having no consumer -- the PR #123 review's
 /// `a_pom_whose_versions_cannot_be_resolved_must_state_the_gap`
-/// counterexample. Swamp does not implement Maven's property and
-/// inheritance resolution, and guessing a version would be worse; what
-/// it can do is say which dependency it could not resolve and why.
+/// counterexample. Swamp cannot say which cache entry the dependency
+/// points at; what it can do is say which one it could not resolve and
+/// why.
 pub fn parse_pom_xml_with_gaps(
     text: &str,
 ) -> Result<(Vec<DependencyIdentity>, Vec<String>), String> {
@@ -476,7 +471,7 @@ pub fn gradle_cache_entry_exists(
 
 /// Maven local repository `<group/path>/<artifact>/<version>` under the
 /// already-resolved repository root. `group_artifact` is
-/// `"group:artifact"` ([`parse_pom_xml`]'s own `name` shape).
+/// `"group:artifact"` ([`parse_pom_xml_with_gaps`]'s own `name` shape).
 pub fn maven_repo_entry_exists(repo_root: &Path, group_artifact: &str, version: &str) -> bool {
     let Some((group, artifact)) = group_artifact.split_once(':') else {
         return false;
@@ -486,63 +481,6 @@ pub fn maven_repo_entry_exists(repo_root: &Path, group_artifact: &str, version: 
         .join(artifact)
         .join(version)
         .exists()
-}
-
-// ---------------------------------------------------------------------
-// Joining a cache entry's identity to the projects whose lockfiles
-// declare it.
-// ---------------------------------------------------------------------
-
-/// One project's already-parsed lockfile identities, kept with the
-/// project's own label so a join result can name exactly which
-/// projects declared a given entry.
-pub struct ProjectDependencies<'a> {
-    pub project_label: &'a str,
-    pub identities: &'a [DependencyIdentity],
-}
-
-/// Joins one shared cache entry's identity to every project that
-/// declares it. Distinguishes a similar name at a different version
-/// (not a match) from a genuine shared reference (an exact
-/// name+version match in more than one project). Never forces a single
-/// owner and never mutates/duplicates the underlying cache entry.
-pub fn join_cache_entry(
-    entry: &DependencyIdentity,
-    projects: &[ProjectDependencies<'_>],
-) -> Evidence {
-    let consumers: Vec<String> = projects
-        .iter()
-        .filter(|p| p.identities.contains(entry))
-        .map(|p| p.project_label.to_string())
-        .collect();
-    let source = EvidenceSource::Lockfile {
-        ecosystem: entry.ecosystem.to_string(),
-        path: format!("{}@{}", entry.name, entry.version),
-    };
-    match consumers.len() {
-        0 => Evidence::unknown(
-            FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
-            source,
-            now(),
-            "no scanned project's lockfile declares this exact name+version",
-        ),
-        1 => Evidence::known(
-            FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
-            FactValue::Text(consumers[0].clone()),
-            source,
-            now(),
-        ),
-        _ => Evidence::known(
-            FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
-            FactValue::List(consumers),
-            source,
-            now(),
-        )
-        .with_note("declared by more than one project; this is a shared reference, not an error"),
-    }
 }
 
 /// An unparseable lockfile is a named evidence gap, never a silent
@@ -659,83 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn cargo_lock_two_projects_share_one_entry() {
-        let text = r#"
-[[package]]
-name = "serde"
-version = "1.0.203"
-
-[[package]]
-name = "libc"
-version = "0.2.155"
-"#;
-        let entries = parse_cargo_lock(text).unwrap();
-        let serde = entries.iter().find(|e| e.name == "serde").unwrap();
-        let project_a = ProjectDependencies {
-            project_label: "project-a",
-            identities: &entries,
-        };
-        let project_b = ProjectDependencies {
-            project_label: "project-b",
-            identities: &entries,
-        };
-        let ev = join_cache_entry(serde, &[project_a, project_b]);
-        match ev.status {
-            crate::evidence::FactStatus::Known(FactValue::List(labels)) => {
-                assert_eq!(labels.len(), 2);
-            }
-            other => panic!("expected known list of two consumers, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn similar_name_different_version_is_not_a_match() {
-        let a = vec![DependencyIdentity {
-            ecosystem: "cargo",
-            name: "serde".into(),
-            version: "1.0.203".into(),
-        }];
-        let b = vec![DependencyIdentity {
-            ecosystem: "cargo",
-            name: "serde".into(),
-            version: "1.0.150".into(),
-        }];
-        let entry = DependencyIdentity {
-            ecosystem: "cargo",
-            name: "serde".into(),
-            version: "1.0.203".into(),
-        };
-        let projects = vec![
-            ProjectDependencies {
-                project_label: "uses-newer",
-                identities: &a,
-            },
-            ProjectDependencies {
-                project_label: "uses-older",
-                identities: &b,
-            },
-        ];
-        let ev = join_cache_entry(&entry, &projects);
-        match ev.status {
-            crate::evidence::FactStatus::Known(FactValue::Text(label)) => {
-                assert_eq!(label, "uses-newer");
-            }
-            other => panic!("expected exactly one match, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn moved_or_missing_project_leaves_entry_orphaned_not_owned() {
-        let entry = DependencyIdentity {
-            ecosystem: "cargo",
-            name: "orphan-crate".into(),
-            version: "1.0.0".into(),
-        };
-        let ev = join_cache_entry(&entry, &[]);
-        assert!(!ev.is_known());
-    }
-
-    #[test]
     fn invalid_cargo_lock_is_a_named_gap_not_a_silent_empty_list() {
         let err = parse_cargo_lock("not valid toml [[[").unwrap_err();
         let ev = invalid_lockfile_evidence("cargo", Path::new("/proj/Cargo.lock"), &err);
@@ -827,7 +688,7 @@ version = "0.2.155"
     </dependency>
   </dependencies>
 </project>"#;
-        let entries = parse_pom_xml(text).unwrap();
+        let (entries, gaps) = parse_pom_xml_with_gaps(text).unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -835,11 +696,17 @@ version = "0.2.155"
         );
         assert_eq!(entries[0].name, "org.apache.commons:commons-lang3");
         assert_eq!(entries[0].version, "3.14.0");
+        // Excluded from the identity list is not the same as dropped:
+        // the unresolved-property entry comes back as a named gap. The
+        // BOM entry is not a gap -- it was never claimed as a
+        // dependency in the first place.
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("${revision}"), "{gaps:?}");
     }
 
     #[test]
     fn pom_xml_invalid_xml_is_a_named_gap() {
-        let err = parse_pom_xml("<project><unterminated>").unwrap_err();
+        let err = parse_pom_xml_with_gaps("<project><unterminated>").unwrap_err();
         assert!(err.contains("invalid pom.xml"));
     }
 

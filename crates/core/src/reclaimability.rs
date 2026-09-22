@@ -260,7 +260,7 @@ pub struct SelectionMember {
 
 /// The result of reconciling a selection set's allocated bytes against
 /// shared inode membership.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SelectionEstimate {
     /// Sum of every member's `allocated_bytes`, exactly what a naive
     /// "just add up the rows" implementation would report.

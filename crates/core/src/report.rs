@@ -493,6 +493,43 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
     report_with(root, docker_facts, false, None, None)
 }
 
+/// Whether `path` sits on a filesystem whose extents can be shared with
+/// a clone or a snapshot *outside* the unit being measured (APFS). On
+/// such a volume, removing a unit does not necessarily free its
+/// allocated blocks: a cloned copy elsewhere, or a Time Machine local
+/// snapshot, can retain every extent. This pass does not query that
+/// sharing (there is no bounded way to), so the honest answer is a bound
+/// -- see `reclaimability::apfs_clone_or_snapshot_bound`.
+///
+/// One `statfs` per row, the same bounded per-unit read
+/// `activity::access_time_evidence` already makes; never a per-file
+/// pass. A failed `statfs` answers `false`, which keeps the existing
+/// exact figure rather than inventing uncertainty.
+#[cfg(target_os = "macos")]
+fn copy_on_write_volume(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe {
+        let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return false;
+        }
+        let sf = buf.assume_init();
+        std::ffi::CStr::from_ptr(sf.f_fstypename.as_ptr())
+            .to_bytes()
+            .eq_ignore_ascii_case(b"apfs")
+    }
+}
+
+/// No copy-on-write extent sharing is claimed on a platform where this
+/// pass has no bounded way to establish it; the exact figure stands.
+#[cfg(not(target_os = "macos"))]
+fn copy_on_write_volume(_path: &Path) -> bool {
+    false
+}
+
 /// Populates every `ArtifactRow.evidence` (#53) from facts this report
 /// pass already has in hand -- `mtime_max`, `hardlinked`/`dedup_stale`,
 /// the row's own kind and its worktree's path -- never a new per-file
@@ -507,6 +544,20 @@ pub fn attach_decision_evidence(report: &mut Report) {
         for wt in &mut project.worktrees {
             let wt_path = wt.path.clone();
             for a in &mut wt.artifacts {
+                // A Docker row's "path" is a repo tag, image id or volume
+                // name: an object the daemon owns, not a filesystem path.
+                // Nothing here that stats a path may run for it -- that is
+                // the provenance discipline
+                // `reviewer_counterexamples_123`'s
+                // `docker_reclaimability_must_not_claim_filesystem_provenance`
+                // pins.
+                let is_docker_object = matches!(
+                    a.kind,
+                    ArtifactKind::DockerImage
+                        | ArtifactKind::DockerVolume
+                        | ArtifactKind::DockerBuildCache
+                );
+
                 // Activity (#54): the folded walk's own newest-child-mtime
                 // stat, already recorded on every row.
                 a.evidence.push(crate::activity::modification_evidence(
@@ -514,28 +565,44 @@ pub fn attach_decision_evidence(report: &mut Report) {
                     observed_at,
                 ));
 
+                // Activity (#54), the second filesystem source: this
+                // unit's own anchor path's access time. One extra `stat`
+                // plus one `statfs` for this row, never a per-file pass.
+                // On a `noatime`/`relatime` mount the fact *is* that
+                // atime cannot support a recent-access claim, which
+                // `access_time_evidence` reports as `Unavailable` with
+                // the mount option named -- omitting the row instead
+                // would leave "was this opened" looking unasked rather
+                // than unanswerable.
+                if !is_docker_object {
+                    a.evidence
+                        .push(crate::activity::access_time_evidence(&a.path, observed_at));
+                }
+
                 // Reclaimability (#59): allocated bytes are already
                 // known; whether they are uniquely this row's is bounded,
-                // not asserted, when the row is flagged hardlinked or its
-                // dedup is stale.
+                // not asserted, when the row is flagged hardlinked, its
+                // dedup is stale, or the volume itself can share extents
+                // with a clone or snapshot outside this unit.
                 // A Docker object's bytes came from the daemon
                 // (`docker system df -v`): a layer-shared, logical
                 // number that no directory walk measured. Giving it
                 // filesystem provenance and an exact reclaimable equal
                 // to its allocation was the PR #123 review's
                 // docker_reclaimability counterexample.
-                if matches!(
-                    a.kind,
-                    ArtifactKind::DockerImage
-                        | ArtifactKind::DockerVolume
-                        | ArtifactKind::DockerBuildCache
-                ) {
+                if is_docker_object {
                     a.evidence.extend(
                         crate::reclaimability::DockerByteAccounting::for_object(a.bytes).evidence(),
                     );
                 } else {
                     let acc = if a.hardlinked || a.dedup_stale {
                         crate::reclaimability::hardlink_unresolved_bound(a.bytes)
+                    } else if copy_on_write_volume(&a.path) {
+                        // On APFS an extent can be retained by a clone or
+                        // a (Time Machine local) snapshot this pass never
+                        // queried, so the allocated bytes are a ceiling on
+                        // what removal frees, not the amount.
+                        crate::reclaimability::apfs_clone_or_snapshot_bound(a.bytes)
                     } else {
                         crate::reclaimability::exclusive_allocation(a.bytes)
                     };
@@ -1147,6 +1214,15 @@ struct JoinCandidate {
     containers: Vec<String>,
     shared_with: Vec<String>,
     dangling: bool,
+    /// Daemon-sourced decision evidence built where the raw
+    /// `docker::DockerFacts` are still in hand (#54's tool-reported use,
+    /// #55's running-container occupancy). Collected here because the
+    /// `ArtifactRow`/`UnownedRow` this candidate becomes keeps only
+    /// pre-formatted `Vec<String>` container labels -- by then the
+    /// `ContainerRef` states and the build cache's own `last_used`
+    /// string are gone. Every fact here names the Docker daemon as its
+    /// source and rides only on Docker rows, never on a filesystem row.
+    docker_evidence: Vec<crate::evidence::Evidence>,
 }
 
 enum JoinOutcome {
@@ -1377,6 +1453,8 @@ pub(crate) fn join_docker_facts(
         }
     }
 
+    let observed_at = crate::entities::now();
+
     let mut candidates: Vec<JoinCandidate> = Vec::new();
     for image in &facts.images {
         candidates.push(JoinCandidate {
@@ -1393,6 +1471,15 @@ pub(crate) fn join_docker_facts(
             containers: image.containers.iter().map(format_container).collect(),
             shared_with: image.shared_with.clone(),
             dangling: image.dangling,
+            // Current use (#55): a *running* container is a live
+            // consumer of this image. No running container is not proof
+            // of no consumer, and no container reference at all is
+            // `Unknown` rather than a known "nothing uses this" --
+            // `docker_running_container_evidence` draws both
+            // distinctions.
+            docker_evidence: vec![crate::occupancy::docker_running_container_evidence(
+                &image.containers,
+            )],
         });
     }
     for cache in &facts.build_cache {
@@ -1415,6 +1502,17 @@ pub(crate) fn join_docker_facts(
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            // Activity (#54): the daemon's own `last_used` for this
+            // cache entry, kept as a `ToolReportedUse` fact with Docker
+            // named as the source -- never flattened into the
+            // filesystem-mtime `Modified` fact
+            // `attach_decision_evidence` attaches separately. A build
+            // cache entry with no `last_used` is `Unknown`, never a
+            // fabricated timestamp.
+            docker_evidence: vec![crate::activity::docker_last_used_evidence(
+                cache.last_used.as_deref(),
+                observed_at,
+            )],
         });
         // Build-cache detail has no per-object join label to carry it on,
         // so it rides along as a note on the candidate's eventual row
@@ -1433,10 +1531,15 @@ pub(crate) fn join_docker_facts(
             containers: volume.containers.iter().map(format_container).collect(),
             shared_with: Vec::new(),
             dangling: false,
+            // Current use (#55), same question as an image: a volume a
+            // running container has mounted is being written to right
+            // now.
+            docker_evidence: vec![crate::occupancy::docker_running_container_evidence(
+                &volume.containers,
+            )],
         });
     }
 
-    let observed_at = crate::entities::now();
     for candidate in candidates {
         match join_one(
             &candidate,
@@ -1467,10 +1570,11 @@ pub(crate) fn join_docker_facts(
                 // Docker join into the shared contract rather than
                 // re-deriving it -- see
                 // `external_associations::docker_join_evidence`.
-                let evidence = vec![crate::external_associations::docker_join_evidence(
+                let mut evidence = vec![crate::external_associations::docker_join_evidence(
                     Some(&worktree_id),
                     rule,
                 )];
+                evidence.extend(candidate.docker_evidence);
                 result
                     .rows_by_worktree
                     .entry(worktree_id)
@@ -1533,6 +1637,12 @@ pub(crate) fn join_docker_facts(
                     Some(check) => recovery.evidence.with_note(format!("check: {check}")),
                     None => recovery.evidence,
                 };
+                // An unjoined object's activity/current-use facts are as
+                // real as a joined one's: "no project claims it" is a
+                // consumer fact, not a reason to drop the daemon's own
+                // running-container and last-used evidence.
+                let mut evidence = vec![recovery_evidence];
+                evidence.extend(candidate.docker_evidence);
                 result.unowned.push(UnownedRow {
                     path_or_object: candidate.reference,
                     bytes: candidate.unique_bytes,
@@ -1544,7 +1654,7 @@ pub(crate) fn join_docker_facts(
                     containers: candidate.containers,
                     shared_with: candidate.shared_with,
                     dangling: candidate.dangling,
-                    evidence: vec![recovery_evidence],
+                    evidence,
                 });
             }
         }
@@ -1891,6 +2001,40 @@ pub struct ScopeObservation {
     pub agent_units: Vec<crate::agents::AgentUnit>,
 }
 
+/// Which parts of a scope this observation covers.
+///
+/// A part left out is a part not *observed*, which also means not swept:
+/// `growth::ObservationOwnership` only tombstones inside the region an
+/// observation actually covered, so asking for fewer parts can never
+/// invent a disappearance. That is what makes this a cost decision
+/// rather than a correctness one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationParts {
+    pub external: bool,
+    pub agents: bool,
+}
+
+impl ObservationParts {
+    /// Everything: the walk plus both unit families.
+    pub const ALL: Self = Self {
+        external: true,
+        agents: true,
+    };
+    /// The walk only.
+    pub const WALK_ONLY: Self = Self {
+        external: false,
+        agents: false,
+    };
+    pub const EXTERNAL: Self = Self {
+        external: true,
+        agents: false,
+    };
+    pub const AGENTS: Self = Self {
+        external: false,
+        agents: true,
+    };
+}
+
 /// The one entry point that observes a scope completely: walk, external
 /// units and agent units, in a single pass with a single ownership.
 ///
@@ -1908,9 +2052,21 @@ pub struct ScopeObservation {
 /// could be arbitrarily stale while the header said the report was
 /// live. A refresh that returns all three together cannot update one
 /// without the others.
+///
+/// `want` says which parts this observation covers. A caller that will
+/// not show external or agent units does not pay for them -- and,
+/// because a part not observed is a part not swept, skipping one can
+/// never tombstone anything either. `base` lets a caller that already
+/// has a report (the CLI's explicit-root path, which walks one root
+/// rather than the configured scope) hand it in instead of walking
+/// again: that is the whole point of this function owning discovery, so
+/// there is nowhere else to run a second pass from
+/// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
 #[allow(clippy::too_many_arguments)]
 pub fn observe_scope(
     scope: &crate::scope::EffectiveScope,
+    want: ObservationParts,
+    base: Option<Report>,
     docker_facts: Option<&Path>,
     verify_du: bool,
     store_dir: Option<&Path>,
@@ -1923,30 +2079,43 @@ pub fn observe_scope(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<ScopeObservation> {
-    let (merged, coverage, per_root) = report_scope_with_parts(
-        scope,
-        docker_facts,
-        verify_du,
-        store_dir,
-        since_override,
-        observe,
-        include_dirs,
-        enrich,
-        force_full,
-        fs_events_source,
-    )?;
+    // A caller that already walked (the CLI's explicit-root path) hands
+    // its report in rather than walking a second time. It has no
+    // per-root coverage to contribute, which is honest: coverage
+    // describes the scope this function walked, and it did not walk one.
+    let (merged, coverage, per_root) = match base {
+        Some(r) => (r, Vec::new(), std::collections::HashMap::new()),
+        None => report_scope_with_parts(
+            scope,
+            docker_facts,
+            verify_du,
+            store_dir,
+            since_override,
+            observe,
+            include_dirs,
+            enrich,
+            force_full,
+            fs_events_source,
+        )?,
+    };
     let observed_at = merged.observed_at;
-    let mut external_units = crate::external::discover_and_measure(
-        scope,
-        store_dir,
-        observe,
-        observed_at,
-        retention_days,
-        since_secs,
-    )
-    .unwrap_or_default();
     let mut merged = merged;
-    crate::consumer_wiring::attach_associations(&mut merged, &mut external_units, store_dir);
+    let mut external_units = if want.external {
+        let mut units = crate::external::discover_and_measure(
+            scope,
+            store_dir,
+            observe,
+            observed_at,
+            retention_days,
+            since_secs,
+        )
+        .unwrap_or_default();
+        crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
+        units
+    } else {
+        Vec::new()
+    };
+    let _ = &mut external_units;
     // Aider's per-repository units need every known worktree root; the
     // walk above already produced them, so this costs no extra walk.
     let project_worktrees: Vec<PathBuf> = merged
@@ -1955,16 +2124,20 @@ pub fn observe_scope(
         .flat_map(|p| p.worktrees.iter())
         .map(|wt| wt.path.clone())
         .collect();
-    let agent_units = crate::agents::discover_and_measure(
-        scope,
-        &project_worktrees,
-        store_dir,
-        observe,
-        observed_at,
-        retention_days,
-        since_secs,
-    )
-    .unwrap_or_default();
+    let agent_units = if want.agents {
+        crate::agents::discover_and_measure(
+            scope,
+            &project_worktrees,
+            store_dir,
+            observe,
+            observed_at,
+            retention_days,
+            since_secs,
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(ScopeObservation {
         merged,
         coverage,

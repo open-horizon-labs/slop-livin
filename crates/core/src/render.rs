@@ -1419,9 +1419,42 @@ pub fn evidence_subtype_label(subtype: crate::evidence::FactSubtype) -> &'static
     }
 }
 
+/// The order the five evidence domains are printed in, so a reader
+/// always finds the same question in the same place: what happened to
+/// it, who refers to it, whether anything holds it right now, how it
+/// comes back, and what removing it would actually free. A row's
+/// evidence arrives in whatever order the sources that filled it ran
+/// (`report::attach_decision_evidence`, then the Docker join, then
+/// `consumer_wiring`, then a fresh current-use reading at proposal
+/// time), so without this the same facts render in a different order
+/// depending on which pass touched the row.
+const EVIDENCE_KIND_ORDER: &[crate::evidence::FactKind] = &[
+    crate::evidence::FactKind::Activity,
+    crate::evidence::FactKind::Consumer,
+    crate::evidence::FactKind::CurrentUse,
+    crate::evidence::FactKind::Recovery,
+    crate::evidence::FactKind::Reclaimability,
+];
+
 pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<String> {
     use crate::evidence::{FactKind, FactStatus, FactValue};
-    evidence
+    // Grouped by domain through the shared accessor rather than by
+    // re-filtering here, so "which facts belong to this question" has
+    // exactly one definition (`evidence::of_kind`) across the renderer,
+    // the agent-facing JSON shaper and the action sinks.
+    let mut grouped: Vec<&crate::evidence::Evidence> = EVIDENCE_KIND_ORDER
+        .iter()
+        .flat_map(|kind| crate::evidence::of_kind(evidence, *kind))
+        .collect();
+    // A fact whose kind this order does not name is appended rather than
+    // dropped: adding a sixth `FactKind` must never silently delete a
+    // line from what a human reads.
+    grouped.extend(
+        evidence
+            .iter()
+            .filter(|e| !EVIDENCE_KIND_ORDER.contains(&e.kind)),
+    );
+    grouped
         .iter()
         .map(|e| {
             let kind = match e.kind {
@@ -1534,6 +1567,22 @@ pub fn evidence_warnings(evidence: &[crate::evidence::Evidence]) -> Vec<String> 
             }
             _ => {}
         }
+    }
+    // A short-lived fact (a process/lock/container/booted reading) that
+    // is already past its own recheck window must not read like a
+    // current one. `evidence::stale` is the single definition of "past
+    // its stated expiry" -- the same one the action sinks recheck
+    // against -- so the confirmation line and the sink cannot disagree
+    // about which readings still stand.
+    let now = crate::entities::now();
+    for e in crate::evidence::stale(evidence, now) {
+        let window = e.freshness.expires_after_secs.unwrap_or_default();
+        out.push(format!(
+            "this {} reading was taken {}s ago, past its {window}s recheck window; it is re-taken \
+             fresh before any action rather than trusted from here",
+            evidence_subtype_label(e.subtype),
+            now.saturating_sub(e.observed_at),
+        ));
     }
     out
 }

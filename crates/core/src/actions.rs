@@ -158,6 +158,17 @@ pub struct Plan {
     /// refused them. Kept on the plan so the human sees what was *not*
     /// proposed and why.
     pub refused: Vec<Refused>,
+    /// Selection-set byte accounting (#59): this plan's naive per-unit
+    /// sum next to the figure with storage already charged to an
+    /// earlier-counted inode removed, plus whether any selected unit
+    /// might share inodes whose membership was never enumerated. Carried
+    /// on the plan (and so in the plan JSON a human or agent reads)
+    /// because `planned_bytes` is deliberately the naive sum -- the
+    /// number a grant budget is spent against -- and #59's whole point is
+    /// that the same physical storage must not silently count twice in
+    /// what a selection claims it would free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::reclaimability::SelectionEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +513,7 @@ pub fn propose(
         expires_at: created_at + PLAN_TTL_SECS,
         proposed_by: proposed_by.to_string(),
         status: PlanStatus::Proposed,
+        selection: Some(selection_estimate(&units)),
         units,
         refused,
     })
@@ -546,7 +558,7 @@ pub fn propose_checking_protection(
     for u in plan.units {
         // Both directions, as everywhere else: a unit beneath a
         // protected path, and a unit that *contains* one.
-        if crate::agents::is_human_protected(&protected, &u.path) {
+        if crate::agents::protection_conflict(&protected, &u.path).is_some() {
             plan.refused.push(Refused {
                 path: u.path.clone(),
                 cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
@@ -623,6 +635,7 @@ pub fn propose_external(
         expires_at: created_at + PLAN_TTL_SECS,
         proposed_by: proposed_by.to_string(),
         status: PlanStatus::Proposed,
+        selection: Some(selection_estimate(&plan_units)),
         units: plan_units,
         refused,
     })
@@ -643,6 +656,317 @@ fn plan_unit_evidence(
     let mut evidence = existing.to_vec();
     evidence.push(crate::occupancy::open_file_evidence(path));
     evidence
+}
+
+/// Turns this plan's units into selection members for
+/// `reclaimability::estimate_selection` (#59), supplying the physical
+/// inode identities the plan *already reviewed* where it has them.
+///
+/// An ordinary filesystem artifact row records
+/// `ReviewedMembership::Anchor`: one `stat` of the directory, no member
+/// listing (enumerating a `target/` tree per matched row at proposal
+/// time is exactly the cost `recheck::capture_anchor` exists to avoid).
+/// A directory's own inode says nothing about which inodes hold its
+/// bytes, so that unit contributes `inodes: None` -- summed as if
+/// exclusive and flagged through `SelectionEstimate::unknown_sharing`
+/// when the unit might hardlink, never quietly deduplicated against an
+/// inode set nobody looked at. Agent and external units, whose member
+/// sets are bounded by construction and recorded exactly, contribute
+/// their real inodes and so are genuinely deduplicated.
+fn selection_estimate(units: &[PlanUnit]) -> crate::reclaimability::SelectionEstimate {
+    use crate::recheck::ReviewedMembership as M;
+    let members: Vec<crate::reclaimability::SelectionMember> = units
+        .iter()
+        .map(|u| {
+            let inodes = u.reviewed.as_ref().and_then(|r| match &r.membership {
+                M::Exact { members } => Some(members.iter().map(|m| (r.device, m.inode)).collect()),
+                // A single file's own inode *is* where its bytes live.
+                M::File { .. } => Some(vec![(r.device, r.inode)]),
+                // A directory anchor's inode is not; a bounded summary
+                // deliberately did not record members.
+                M::Anchor { .. } | M::Summary(_) => None,
+            });
+            crate::reclaimability::SelectionMember {
+                label: u.rel_path.clone(),
+                allocated_bytes: u.bytes,
+                hardlinked: u.dedup_stale
+                    || u.cargo_group.as_ref().is_some_and(|g| g.shared_storage),
+                inodes,
+            }
+        })
+        .collect();
+    crate::reclaimability::estimate_selection(&members)
+}
+
+// ---------------------------------------------------------------------
+// External-unit evidence at the proposal sink (#55, #58, #59)
+//
+// An external unit is identification-only until a human names it in a
+// `propose`. That is deliberately where the live, per-unit checks below
+// run: an occupancy/lock/device-state probe on every detected unit of
+// every ordinary report would spawn processes during identification,
+// which the occupancy discipline (and the TUI's non-blocking event path)
+// forbid. Everything here is bounded -- fixed candidate filenames, one
+// single-level `locations::shallow_list`, allow-listed read-only
+// queries -- and none of it traverses.
+// ---------------------------------------------------------------------
+
+/// Lock-file names package and version managers conventionally create
+/// *while they are working*, checked only as direct children of a
+/// unit's own directory: Cargo's `$CARGO_HOME/.package-cache`, a generic
+/// manager `.lock`, Gradle's cache journal and daemon registry locks,
+/// and pnpm's store lock. This is a list of *conventions*, not a
+/// detector table: a unit gets whichever of them actually exists in its
+/// own directory, so a new detector for a tool that uses one of these
+/// needs no change here.
+const MANAGER_LOCK_FILENAMES: &[&str] = &[
+    ".package-cache",
+    ".lock",
+    "journal-1.lock",
+    "registry.bin.lock",
+    "store.lock",
+];
+
+/// How many simulator devices one proposal probes. Each probe is one
+/// bounded, allow-listed, read-only `xcrun simctl list devices -j`
+/// (`locations::ALLOWED_COMMANDS`), run only because a human named this
+/// unit; the cap keeps a store with an unusual number of devices from
+/// turning one proposal into an unbounded number of subprocesses, and
+/// the remainder is stated rather than dropped.
+const SIMULATOR_DEVICE_PROBE_CAP: usize = 8;
+
+/// Manager-lock current use (#55) for one external unit. Every existing
+/// candidate lock is probed; when none of them exists the single
+/// `Unknown` names what was looked for, so "no lock file" never reads as
+/// "nothing is using this".
+fn manager_lock_facts(unit: &crate::external::ExternalUnit) -> Vec<crate::evidence::Evidence> {
+    let mut present = Vec::new();
+    let mut absent = None;
+    for name in MANAGER_LOCK_FILENAMES {
+        let ev =
+            crate::occupancy::manager_lock_evidence(&unit.detector_name, &unit.path.join(name));
+        if matches!(ev.status, crate::evidence::FactStatus::Unknown { .. }) {
+            absent = absent.or(Some(ev));
+        } else {
+            present.push(ev);
+        }
+    }
+    if !present.is_empty() {
+        return present;
+    }
+    absent
+        .map(|ev| {
+            vec![ev.with_note(format!(
+                "no manager lock file present in this unit's own directory; looked for {}. A \
+                 manager that only creates its lock while working leaves none here between \
+                 operations, so this is not evidence that nothing is using the store",
+                MANAGER_LOCK_FILENAMES.join(", ")
+            ))]
+        })
+        .unwrap_or_default()
+}
+
+/// CoreSimulator names each device's data directory by its device UDID
+/// (`8-4-4-4-12` hex). Recognizing the *shape* is what keeps an Android
+/// AVD directory (`Pixel_5_API_31.avd`) out of a `simctl` query: both
+/// are `Environments` units, and asking `simctl` about an AVD name would
+/// return an answer about nothing.
+fn is_simulator_device_udid(name: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = name.split('-').collect();
+    parts.len() == GROUPS.len()
+        && parts
+            .iter()
+            .zip(GROUPS)
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Booted-device current use (#55) for a simulator device store: one
+/// `simctl` reading per device directory the store holds, capped.
+fn simulator_booted_facts(unit: &crate::external::ExternalUnit) -> Vec<crate::evidence::Evidence> {
+    if unit.category != crate::locations::StorageCategory::Environments {
+        return Vec::new();
+    }
+    let udids: Vec<String> = crate::locations::shallow_dir_names(&unit.path)
+        .into_iter()
+        .filter(|n| is_simulator_device_udid(n))
+        .collect();
+    if udids.is_empty() {
+        return Vec::new();
+    }
+    let env = crate::locations::Environment::from_process();
+    let mut out: Vec<crate::evidence::Evidence> = udids
+        .iter()
+        .take(SIMULATOR_DEVICE_PROBE_CAP)
+        .map(|udid| {
+            crate::occupancy::simulator_booted_evidence(udid, &env)
+                .with_note(format!("device {udid}"))
+        })
+        .collect();
+    if udids.len() > SIMULATOR_DEVICE_PROBE_CAP {
+        out.push(crate::evidence::Evidence::unknown(
+            crate::evidence::FactKind::CurrentUse,
+            crate::evidence::FactSubtype::Booted,
+            crate::evidence::EvidenceSource::ProcessQuery {
+                tool: "xcrun simctl list devices -j".into(),
+            },
+            crate::entities::now(),
+            format!(
+                "{} device directories in this store; the first {SIMULATOR_DEVICE_PROBE_CAP} were \
+                 read this pass and the rest were not asked about",
+                udids.len()
+            ),
+        ));
+    }
+    out
+}
+
+/// Whether this unit's detector declares a Maven-layout dependency
+/// store (`locations::StoreEntryLookup::MavenLayout`), read from the
+/// registry rather than matched against a detector id -- so a second
+/// Maven-layout store (a mirror, a `<localRepository>` override) is
+/// recognized without editing anything here.
+///
+/// The fallback is the layout Maven itself documents and the detector
+/// hard-codes (`~/.m2/repository`), used while the detector-declared
+/// capability is still being filled in; see the session note.
+fn is_maven_layout_store(unit: &crate::external::ExternalUnit) -> bool {
+    use crate::locations::{ConventionRole, StoreEntryLookup};
+    let registry = crate::locations::Registry::with_builtins();
+    if let Some(d) = registry
+        .detectors()
+        .iter()
+        .find(|d| d.id() == unit.detector_id)
+        && d.manager_conventions().iter().any(|c| {
+            matches!(
+                c.role,
+                ConventionRole::DependencyStore {
+                    lookup: StoreEntryLookup::MavenLayout,
+                    ..
+                }
+            )
+        })
+    {
+        return true;
+    }
+    // No path-shape fallback. An earlier revision also matched
+    // `.m2/repository` directly, because the Maven detector did not yet
+    // declare its convention; it does now
+    // (`locations::maven::MavenDetector::manager_conventions`), and a
+    // path literal here would be exactly the wiring table
+    // `.oh/guardrails/detector-ids-only-in-registry.md` exists to
+    // prevent -- one that keeps working while the capability it
+    // duplicates silently stops being declared.
+    false
+}
+
+/// Recovery evidence (#58) for one external unit, selected by the unit's
+/// own storage category plus the capabilities its detector declares --
+/// never by a detector-id match.
+fn external_recovery_facts(unit: &crate::external::ExternalUnit) -> Vec<crate::evidence::Evidence> {
+    use crate::locations::{ConventionRole, StorageCategory};
+    let carry = |r: crate::recovery::RecoveryAssessment| match &r.follow_up_check {
+        Some(check) => r.evidence.clone().with_note(format!("check: {check}")),
+        None => r.evidence,
+    };
+    let mut out = Vec::new();
+
+    // Maven's local repository mixes downloaded and locally-`mvn
+    // install`ed artifacts in one tree. At store granularity there is no
+    // `_remote.repositories` marker to read, so the honest fact is the
+    // stated limit, not a blanket `network_fetch` label for the whole
+    // repository.
+    if is_maven_layout_store(unit) {
+        out.push(carry(crate::recovery::maven_artifact_recovery(false)));
+    }
+
+    // An installation store holds versions a manager can reinstall by
+    // name. The manager is the one whose detector declares the
+    // installed-versions convention; the versions are the store's own
+    // single-level directory names, never a traversal.
+    if unit.category == StorageCategory::Installation {
+        let registry = crate::locations::Registry::with_builtins();
+        let declares_versions = registry
+            .detectors()
+            .iter()
+            .find(|d| d.id() == unit.detector_id)
+            .is_some_and(|d| {
+                d.manager_conventions()
+                    .iter()
+                    .any(|c| matches!(c.role, ConventionRole::DeclaredVersions { .. }))
+            });
+        if declares_versions {
+            let installed = crate::locations::shallow_dir_names(&unit.path);
+            if installed.is_empty() {
+                out.push(carry(crate::recovery::toolchain_installation_recovery(
+                    &unit.detector_name,
+                    None,
+                )));
+            } else {
+                for version in installed.iter().take(SIMULATOR_DEVICE_PROBE_CAP) {
+                    out.push(carry(crate::recovery::toolchain_installation_recovery(
+                        &unit.detector_name,
+                        Some(version),
+                    )));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Byte accounting (#59) for one external unit whose storage is sparse:
+/// a file's *apparent* length can be far larger than the blocks actually
+/// charged on disk (a VM disk image is the canonical case). Removing it
+/// only ever frees the allocated blocks -- the gap was never occupying
+/// space -- so `sparse_file_accounting` keeps the two numbers separate
+/// and never counts the apparent size as reclaimable.
+///
+/// One `symlink_metadata` for a file-backed unit, or one single-level
+/// `locations::shallow_list` plus one `stat` per direct file child for a
+/// directory-backed one. Never a traversal, and only for a unit a human
+/// named.
+fn sparse_byte_accounting_facts(
+    unit: &crate::external::ExternalUnit,
+) -> Vec<crate::evidence::Evidence> {
+    use std::os::unix::fs::MetadataExt;
+    let mut logical = 0u64;
+    let mut allocated = 0u64;
+    let mut add = |meta: &fs::Metadata| {
+        if meta.is_file() {
+            logical = logical.saturating_add(meta.len());
+            allocated = allocated.saturating_add(meta.blocks().saturating_mul(512));
+        }
+    };
+    match fs::symlink_metadata(&unit.path) {
+        Ok(meta) if meta.is_file() => add(&meta),
+        Ok(meta) if meta.is_dir() => {
+            for entry in crate::locations::shallow_list(&unit.path) {
+                if entry.is_dir {
+                    continue;
+                }
+                if let Ok(m) = fs::symlink_metadata(unit.path.join(&entry.name)) {
+                    add(&m);
+                }
+            }
+        }
+        _ => return Vec::new(),
+    }
+    if logical <= allocated {
+        // Nothing sparse to report: an ordinary dense file's apparent
+        // length and its allocated blocks agree (up to block rounding,
+        // which rounds allocation *up*).
+        return Vec::new();
+    }
+    let acc = crate::reclaimability::sparse_file_accounting(logical, allocated);
+    crate::reclaimability::accounting_evidence(
+        &acc,
+        crate::evidence::EvidenceSource::FilesystemMetadata {
+            detail: "apparent length versus allocated blocks of this unit's own files (sparse \
+                     storage; the unallocated gap was never occupying disk)"
+                .into(),
+        },
+    )
 }
 
 fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> PlanUnit {
@@ -690,6 +1014,14 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
 /// plan is legible if a human inspects its JSON.
 pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
     let category = format!("{:?}", unit.category);
+    // Live per-unit evidence, taken now because a human named this unit
+    // (#55/#58/#59) -- see the module section above for why none of it
+    // runs during identification.
+    let mut evidence = unit.evidence.clone();
+    evidence.extend(manager_lock_facts(unit));
+    evidence.extend(simulator_booted_facts(unit));
+    evidence.extend(external_recovery_facts(unit));
+    evidence.extend(sparse_byte_accounting_facts(unit));
     PlanUnit {
         cargo_group: None,
         path: unit.path.clone(),
@@ -713,7 +1045,7 @@ pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
         warnings: vec![format!(
             "external unit ({category}): identification only, never authorization"
         )],
-        evidence: unit.evidence.clone(),
+        evidence,
         external_category: Some(category),
         agent_meta: None,
         // An external unit is refused unconditionally at execution, but
@@ -883,6 +1215,7 @@ pub fn propose_agents(
         expires_at: created_at + PLAN_TTL_SECS,
         proposed_by: proposed_by.to_string(),
         status: PlanStatus::Proposed,
+        selection: Some(selection_estimate(&plan_units)),
         units: plan_units,
         refused,
     })
@@ -1085,49 +1418,22 @@ fn execute_agent_session_removal(
     trash: &Path,
     at: u64,
 ) -> Result<(PathBuf, u64)> {
-    let fresh = match meta.tool_id.as_str() {
-        crate::agents::claude_code::CLAUDE_CODE_TOOL_ID => {
-            crate::agents::claude_code::identify(&meta.tool_home, at)
-        }
-        crate::agents::codex::CODEX_TOOL_ID => crate::agents::codex::identify(&meta.tool_home, at),
-        crate::agents::codex_desktop::CODEX_DESKTOP_TOOL_ID => {
-            crate::agents::codex_desktop::identify(&meta.tool_home, at)
-        }
-        crate::agents::oh_my_pi::OH_MY_PI_TOOL_ID => {
-            crate::agents::oh_my_pi::identify(&meta.tool_home, at)
-        }
-        crate::agents::opencode::OPENCODE_TOOL_ID => {
-            crate::agents::opencode::identify(&meta.tool_home, at)
-        }
-        crate::agents::gemini_cli::GEMINI_CLI_TOOL_ID => {
-            crate::agents::gemini_cli::identify(&meta.tool_home, at)
-        }
-        crate::agents::pi::PI_TOOL_ID => crate::agents::pi::identify(&meta.tool_home, at),
-        // Aider's per-repo units (#96): `tool_home` was set to the
-        // worktree root itself at proposal time (see
-        // `crate::agents::discover_and_measure`'s Aider handling), so
-        // re-identification calls the exact same function against it.
-        crate::agents::aider::AIDER_TOOL_ID => {
-            crate::agents::aider::identify_repo_units(&meta.tool_home, at)
-        }
-        crate::agents::copilot_cli::COPILOT_CLI_TOOL_ID => {
-            crate::agents::copilot_cli::identify(&meta.tool_home, at)
-        }
-        crate::agents::cursor::CURSOR_TOOL_ID => {
-            crate::agents::cursor::identify(&meta.tool_home, at)
-        }
-        crate::agents::windsurf::WINDSURF_TOOL_ID => {
-            crate::agents::windsurf::identify(&meta.tool_home, at)
-        }
-        crate::agents::cline::CLINE_TOOL_ID => crate::agents::cline::identify(&meta.tool_home, at),
-        crate::agents::roo_code::ROO_CODE_TOOL_ID => {
-            crate::agents::roo_code::identify(&meta.tool_home, at)
-        }
-        crate::agents::continue_dev::CONTINUE_TOOL_ID => {
-            crate::agents::continue_dev::identify(&meta.tool_home, at)
-        }
-        other => bail!("no session-removal re-identification implemented for tool {other}"),
-    };
+    // One registry dispatch, never a second fourteen-arm tool-id match:
+    // this used to be its own copy of `agents::identify_for_tool`'s
+    // table, and a tool added to one and not the other identified fine
+    // and then refused to re-verify here
+    // (`.oh/guardrails/agent-adapters-are-pluggable.md`).
+    //
+    // The registry's recheck path runs with the identification cache
+    // disabled, so this is live state rather than a cached derivation.
+    let fresh = crate::agents::reidentify_for_tool(&meta.tool_id, &meta.tool_home, at).ok_or_else(
+        || {
+            anyhow!(
+                "no session-removal re-identification implemented for tool {}",
+                meta.tool_id
+            )
+        },
+    )?;
     let current = fresh
         .iter()
         .find(|c| c.path == session_path)
@@ -1587,6 +1893,19 @@ pub struct ExecuteResult {
     /// volume, so this is expected to be ~0 until Trash is emptied; it is
     /// reported so nobody mistakes "trashed" for "freed".
     pub freed_measured: Option<i64>,
+    /// Outcome evidence (#59): the one *measured* reclaimability number
+    /// in this pipeline -- a real `statvfs`/`df` reading taken before
+    /// and after this execution, carrying its own limits (a move to
+    /// Trash on the same volume, an open file another process still
+    /// holds, a filesystem snapshot or a concurrent writer can each
+    /// suppress the change). Deliberately a separate fact from the
+    /// plan's `EstimatedReclaimable`: an estimate and an observation are
+    /// different things, and collapsing them is how a scan comes to
+    /// promise exact reclaimed bytes. Empty when nothing was executed --
+    /// an expired, already-executed or unauthorized plan measures
+    /// nothing rather than reporting a fabricated zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
     pub actor: String,
 }
 
@@ -1791,6 +2110,7 @@ pub fn execute_with_trash_opts(
         free_before: None,
         free_after: None,
         freed_measured: None,
+        evidence: Vec::new(),
         actor: actor.to_string(),
     };
     if plan.status == PlanStatus::Executed {
@@ -2239,6 +2559,15 @@ pub fn execute_with_trash_opts(
             (Some(b), Some(a)) => Some(a as i64 - b as i64),
             _ => None,
         },
+        // The observed free-space change as a sourced fact, not just a
+        // bare signed integer: `Statvfs` provenance, an explicit
+        // `Unknown` when either reading was unavailable (never a
+        // fabricated zero), and the note that names why the number can
+        // legitimately differ from what was planned.
+        evidence: vec![crate::reclaimability::observed_free_space_change(
+            free_before,
+            free_after,
+        )],
         actor: actor.to_string(),
     })
 }
@@ -2309,7 +2638,8 @@ mod agent_partial_removal_tests {
         session_id: &str,
         at: u64,
     ) -> (PathBuf, Vec<PathBuf>) {
-        let candidates = identify(home, at);
+        let cache = crate::agents::IdentificationCache::disabled();
+        let candidates = identify(home, &crate::agents::IdentifyCtx::new(at, &cache));
         let current = candidates
             .iter()
             .find(|c| c.path == session_path)

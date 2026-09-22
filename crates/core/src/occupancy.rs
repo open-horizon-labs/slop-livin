@@ -265,7 +265,17 @@ pub fn docker_running_container_evidence(containers: &[crate::docker::ContainerR
         },
         observed_at,
     )
-    .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS))
+    // Coverage, not just expiry: the daemon reports the containers *it*
+    // knows about. A consumer that is not a container (a `docker build`
+    // in flight, another daemon, a `docker cp` reading a volume) is
+    // outside what this question can see, so the fact carries that limit
+    // alongside its recheck window rather than reading as "nothing at
+    // all uses this".
+    .with_freshness(Freshness::expires_after_with_coverage(
+        CURRENT_USE_EXPIRY_SECS,
+        "only container references this daemon reported this pass; a non-container consumer \
+         (an in-flight build, another daemon, a running `docker cp`) would not appear here",
+    ))
     .with_note(if has_running {
         format!("running: {}", running.join(", "))
     } else {
@@ -357,7 +367,16 @@ pub fn simulator_booted_evidence(udid: &str, env: &crate::locations::Environment
                 observed_at,
             )
             .with_note(format!("simctl state: {state}"))
-            .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS)),
+            // `simctl list devices` answers for the devices *this user's*
+            // CoreSimulator store holds. A device in another user's store,
+            // or one backed by a system-wide runtime volume this user
+            // cannot read, is outside the query's reach -- a coverage
+            // limit, separate from the recheck window.
+            .with_freshness(Freshness::expires_after_with_coverage(
+                CURRENT_USE_EXPIRY_SECS,
+                "only devices `simctl list devices` reports for this user; a device in another \
+                 user's CoreSimulator store or on an unreadable runtime volume would not appear",
+            )),
             None => Evidence::unknown(
                 FactKind::CurrentUse,
                 FactSubtype::Booted,
