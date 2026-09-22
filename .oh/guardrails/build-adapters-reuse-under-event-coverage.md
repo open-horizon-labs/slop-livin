@@ -21,15 +21,34 @@ wrong, aging answer rather than an honest "not observed".
 
 ## Detection
 
-`build_adapters/mod.rs` must consult `EventCoverage`. Any function in it
-that decides reuse or replay from `mtime`/`mod_time` must have a coverage
-term in the same function, so the gate is part of the decision rather
-than present elsewhere in the file.
+All eight build-adapter rules range over **derived** sets
+(`crates/source-audit/src/build_audits.rs`, module doc): the governed
+modules are every file under `crates/core/src/build_adapters/` --
+`mod.rs`, `registry.rs`, `matrix.rs`, `jvm_common.rs` and `bounded_io.rs`
+included, no file exempt by name -- plus any workspace file holding an
+`impl BuildAdapter for ..`; adapters, their types and their ids are read
+from those impls. Re-review 3 (`review/REVIEW-STACK-3.md` section 1)
+found 31 of 43 audit slips were a hand-written list that did not contain
+the thing; these rules keep no such list except the four bounded
+primitives, each of which is itself checked to name its cap.
 
-**Limits.** Function-scoped: the audit proves the coverage term is in the
-deciding function, not that it is the controlling condition. The runtime
-complement is the pair of cost tests below, which assert zero listings on
-an unchanged container *and* a re-identification when coverage is absent.
+Replay sites are derived: every governed function outside
+`impl ContainerCache` that reads the cache's storage (`.cache.entries`)
+or calls one of the cache type's non-constructor methods. Each must
+reach, within its file, an `unchanged_since` call whose result is not
+discarded. Separately, a governed function whose reachable surface
+mentions reuse/replay and reads an `mtime`/`mod_time` with no honoured
+coverage call fails. With no replay site at all the rule fails (reuse
+is required, not optional). The runtime half: replay also requires the
+stored units to have been written by the adapter claiming the container
+this pass (`rows_written_by_another_adapter_are_never_replayed`), and
+`build_adapter_history::an_unchanged_node_checkout_replays_its_units_without_reading_a_manifest`
+measures zero manifest bytes on an unchanged pass.
+
+**Limits.** "Honoured" is the resolver's `Honoured` classification: a
+result bound to a variable that is later read counts as honoured even if
+the read does not gate the replay. The runtime tests cover the gate's
+behaviour.
 
 ## Runtime tests that complete it
 

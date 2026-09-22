@@ -1,6 +1,28 @@
 //! target: crates/core/src/build_adapters/swift_build.rs
-//! why: a required test whose body asserts nothing is a name, not a proof
+//! why: discarded-result variant -- a required test whose body computes and throws away is a name, not a proof
 pub struct Adapter;
+impl super::BuildAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        "swift-build"
+    }
+    fn name(&self) -> &'static str {
+        "Swift"
+    }
+    fn containers(
+        &self,
+        _root: &std::path::Path,
+        _candidates: &[std::path::PathBuf],
+    ) -> Vec<super::BuildContainer> {
+        Vec::new()
+    }
+    fn identify(
+        &self,
+        _c: &super::BuildContainer,
+        _ctx: &super::BuildCtx,
+    ) -> Vec<crate::artifact::NestedArtifact> {
+        Vec::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]

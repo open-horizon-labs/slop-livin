@@ -25,16 +25,35 @@ of that belongs in a serde error message.
 
 ## Detection
 
-Adapter modules may not use `fs::read_to_string`, `fs::read`,
-`read_to_end`, `serde_json::from_reader`, `BufReader::new` or
-`.lines()`; resolved calls catch the aliased forms. `bounded_io.rs` must
-define a `MAX_MANIFEST_BYTES` cap constant (256 KiB).
+All eight build-adapter rules range over **derived** sets
+(`crates/source-audit/src/build_audits.rs`, module doc): the governed
+modules are every file under `crates/core/src/build_adapters/` --
+`mod.rs`, `registry.rs`, `matrix.rs`, `jvm_common.rs` and `bounded_io.rs`
+included, no file exempt by name -- plus any workspace file holding an
+`impl BuildAdapter for ..`; adapters, their types and their ids are read
+from those impls. Re-review 3 (`review/REVIEW-STACK-3.md` section 1)
+found 31 of 43 audit slips were a hand-written list that did not contain
+the thing; these rules keep no such list except the four bounded
+primitives, each of which is itself checked to name its cap.
 
-**Limits.** The rule bounds one read, not the number of reads. An adapter
-that calls `read_manifest` once per file in a large tree is within this
-guardrail and outside the cost budget; that is what the per-adapter
-manifest-cap test and the benchmark in
-`.oh/sessions/2026-09-21-build-adapters-node-jvm.md` are for.
+`bounded_io.rs` must define `MAX_MANIFEST_BYTES`; the bounded
+primitives (`bounded_io::{read_manifest, read_whole_manifest}`,
+`locations::{shallow_list, shallow_dir_names}`) must name their cap or
+delegate to one that does, and are the graph's cut points. Every other
+governed function fails if it reaches `fs::read_to_string`, `fs::read`,
+`std::io::read_to_string`, `File::open`, anything in `OpenOptions`,
+`BufReader::new`, `serde_json::from_reader`, or the methods
+`read_to_end`/`read_to_string`/`read_line` -- including through a helper
+elsewhere (`report::load_last_report`) and in `bounded_io.rs` itself
+outside the two primitives.
+
+**Limits.** The call graph is lexical: trait-object dispatch
+(`adapter.identify(..)` through `dyn BuildAdapter`), function pointers
+stored in a struct and closures passed across modules are not followed,
+and a method call resolves only to the `impl`s of types the calling
+function names in its signature or body. A primitive *named* anywhere in
+a governed function (a function pointer, a type) is flagged even when it
+is not called. Unknown macros in a governed module fail the rule.
 
 ## Runtime tests that complete it
 

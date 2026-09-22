@@ -28,14 +28,29 @@ The five names are not a checklist; each one is a specific way the
 
 ## Detection
 
-Each adapter module must define all five, each not `#[ignore]`d and each
-containing at least one `assert!`/`assert_eq!`/`assert_ne!`/`contract::`
-call. Section 17 item 4: an existence-only check is satisfied by a name.
+All eight build-adapter rules range over **derived** sets
+(`crates/source-audit/src/build_audits.rs`, module doc): the governed
+modules are every file under `crates/core/src/build_adapters/` --
+`mod.rs`, `registry.rs`, `matrix.rs`, `jvm_common.rs` and `bounded_io.rs`
+included, no file exempt by name -- plus any workspace file holding an
+`impl BuildAdapter for ..`; adapters, their types and their ids are read
+from those impls. Re-review 3 (`review/REVIEW-STACK-3.md` section 1)
+found 31 of 43 audit slips were a hand-written list that did not contain
+the thing; these rules keep no such list except the four bounded
+primitives, each of which is itself checked to name its cap.
 
-**Limits.** The audit cannot tell a strong assertion from
-`assert!(true)`. It guarantees the test runs and asserts *something*;
-review and the shared contract tests in
-`crates/core/tests/build_adapter_contract.rs` cover the rest.
+For every derived adapter (anywhere in the workspace), the file defines
+the five functions `unknown_layout_is_explicit_not_empty`,
+`identification_reads_no_more_than_manifest_cap`,
+`no_project_or_build_code_is_executed`,
+`variants_never_collapse_by_basename` and `age_is_not_obsolescence` as
+real `fn` items (a name in a comment does not count), inside a
+`#[cfg(test)]` module, with `#[test]`, not `#[ignore]`d, and containing
+an `assert!`/`assert_eq!`/`assert_ne!` or a `contract::` call.
+
+**Limits.** "Contains an assertion" is structural: an assertion of a
+tautology passes. The assertions' substance is reviewed, and the shared
+runtime contract is `crates/core/tests/build_adapter_contract.rs`.
 
 ## Runtime tests that complete it
 

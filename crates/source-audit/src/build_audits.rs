@@ -1,96 +1,975 @@
 //! The build-artifact adapter guardrails (`GUARDRAILS_SPEC.md` section
-//! 18): the mirror of the agent-adapter set in `repair_audits.rs`, for
-//! `crates/core/src/build_adapters/`.
+//! 18), written against the structural causes re-review 3 found rather
+//! than against the shapes their author had in mind
+//! (`review/REVIEW-STACK-3.md` section 1: 43 of 45 audits accepted a
+//! compiling, harmful mutation, and 31 of the 43 slips were "a list that
+//! does not contain the thing").
 //!
-//! Why a mirror and not a shared rule set: the two families forbid
-//! nearly the same shapes for different reasons, and the *reasons* are
-//! what the failure messages have to say. An agent adapter must not read
-//! a whole file because a transcript is private; a build adapter must
-//! not read a whole file because a `node_modules` tree has half a
-//! million of them and a manifest read is the per-project cost. An agent
-//! adapter must not spawn a process because it would be running someone
-//! else's tool over their sessions; a build adapter must not spawn one
-//! because `npm`, `gradle` and `cargo` all *execute project code* when
-//! asked a question, and identification is an observation, never a
-//! build.
+//! Every set these rules range over is **derived**, never written down:
 //!
-//! Every rule here resolves references through `crate::resolve` (section
-//! 17), so `use std::fs::read_dir as list` is reported as
-//! `std::fs::read_dir`, and every rule has at least three rejection
-//! fixtures in the mutation corpus including one alias/rename.
+//! * **Governed modules**: every `.rs` file under
+//!   `crates/core/src/build_adapters/` -- including the shared model
+//!   (`mod.rs`), the registry, the matrix, the neutral helper
+//!   (`jvm_common.rs`) and the bounded reader (`bounded_io.rs`) -- plus
+//!   *any file anywhere in the workspace* that contains an
+//!   `impl BuildAdapter for ..`. No module is exempt by name. Exempting
+//!   the shared helpers is how re-review 3 got a `$HOME` read into
+//!   `vscode_family.rs` and a recursive walk into `bounded_io.rs`.
+//! * **Adapters**: the files holding `impl BuildAdapter for T`, with `T`
+//!   read from the impl, so an adapter cannot escape by living outside
+//!   the directory or by naming its type something other than `Adapter`.
+//! * **Adapter ids**: the string literal each adapter's `fn id` returns.
+//! * **The registry**: the governed file that defines `with_builtins`.
+//! * **The builder**: `NestedUnitBuilder`; its own inherent `impl` block
+//!   is the one place a unit's fields are written.
+//! * **Unit fields**: the field names of `NestedArtifact` (and of its
+//!   `ArtifactCoverage`), parsed from `crates/core/src/artifact.rs`, so a
+//!   field added tomorrow is governed tomorrow.
+//! * **Reachability**: the whole-workspace call graph -- free functions,
+//!   calls inside known macros' arguments, and method calls resolved to
+//!   the `impl` methods of the types the calling function names. A
+//!   governed function fails if it *reaches* a forbidden primitive
+//!   through any number of calls in any file.
+//!
+//! The primitive sets are still lists -- there is no way to avoid naming
+//! `std::fs::remove_dir_all` -- but they are lists of resolved targets
+//! reached transitively, and where a whole namespace is the hazard
+//! (`Command`, `OpenOptions`, `crate::actions`, `walkdir`) the rule
+//! matches the namespace, not one of its members. Where a list must be
+//! an allow-list (the methods a governed function may call on a unit's
+//! field), it fails closed: an unlisted method is a violation.
+//!
+//! Limits (also in each guardrail's Limits section): the graph is
+//! lexical. Trait-object dispatch (`adapter.identify(..)` through
+//! `dyn BuildAdapter`), function pointers and closures stored in a struct
+//! are not followed; a method call is resolved only to the `impl`s of
+//! types the calling function names in its signature or body. The
+//! runtime complements are the per-adapter contract tests and
+//! `crates/core/tests/build_adapter_{contract,cost,history}.rs`.
 
-use crate::ast::{self, SourceFile};
-use std::collections::BTreeSet;
+use crate::ast;
+use quote::ToTokens;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
+use syn::visit::Visit;
 
-/// Modules under `crates/core/src/build_adapters/` that are *not*
-/// adapters: the shared model, the capability matrix, the static
-/// registry, the one bounded reader, and the neutral cross-adapter
-/// helper the spec allow-lists by name.
-///
-/// `jvm_common.rs` is the allow-listed neutral helper: Gradle and Maven
-/// genuinely share coordinate parsing (`group/artifact/version` from a
-/// repository path), and the alternative to a neutral module is Maven's
-/// adapter calling Gradle's -- exactly the Pi/Oh-My-Pi coupling section
-/// 13 had to remove.
-const BUILD_NON_ADAPTERS: &[&str] = &[
-    "mod.rs",
-    "matrix.rs",
-    "registry.rs",
-    "bounded_io.rs",
-    "jvm_common.rs",
+const BUILD_ADAPTERS_DIR: &str = "crates/core/src/build_adapters";
+const ARTIFACT_RS: &str = "crates/core/src/artifact.rs";
+const BUILDER: &str = "NestedUnitBuilder";
+const CACHE_TYPE: &str = "ContainerCache";
+
+/// `(file, function, cap constant)`: the functions allowed to do the
+/// bounded thing, because they *are* the bound. Each is checked to still
+/// name its cap in its body, so "exempt" cannot quietly become "exempt
+/// and unbounded", and each is a cut point of the call graph. The one
+/// hand-written list in this module, and a list of exemptions that are
+/// themselves audited.
+const BOUNDED_PRIMITIVES: &[(&str, &str, &str)] = &[
+    (
+        "crates/core/src/build_adapters/bounded_io.rs",
+        "read_manifest",
+        "MAX_MANIFEST_BYTES",
+    ),
+    (
+        "crates/core/src/build_adapters/bounded_io.rs",
+        "read_whole_manifest",
+        "MAX_MANIFEST_BYTES",
+    ),
+    (
+        "crates/core/src/locations/mod.rs",
+        "shallow_list",
+        "SHALLOW_LIST_CAP",
+    ),
+    (
+        "crates/core/src/locations/mod.rs",
+        "shallow_dir_names",
+        "SHALLOW_LIST_CAP",
+    ),
 ];
 
-pub(crate) fn build_adapter_files(root: &Path) -> Vec<String> {
-    ast::rust_files_under(root, "crates/core/src/build_adapters")
-        .into_iter()
-        .filter(|rel| {
-            let name = rel.rsplit('/').next().unwrap_or(rel);
-            !BUILD_NON_ADAPTERS.contains(&name)
-        })
-        .collect()
+// ---------------------------------------------------------------------
+// Parsing, cached by exact text
+// ---------------------------------------------------------------------
+
+/// A parsed file. The cache is keyed on the file's exact text, so a
+/// mutated copy is a miss and a verdict never comes from stale
+/// structure; it exists because the mutation corpus re-runs these rules
+/// over a whole workspace once per fixture.
+struct Parsed {
+    text: String,
+    ast: syn::File,
+}
+
+thread_local! {
+    static PARSED: std::cell::RefCell<HashMap<(String, String), Rc<Parsed>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn load(root: &Path, rel: &str) -> Option<Rc<Parsed>> {
+    let text = std::fs::read_to_string(root.join(rel)).ok()?;
+    let key = (rel.to_string(), text.clone());
+    if let Some(hit) = PARSED.with(|c| c.borrow().get(&key).cloned()) {
+        return Some(hit);
+    }
+    let ast = syn::parse_file(&text).ok()?;
+    let parsed = Rc::new(Parsed { text, ast });
+    PARSED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 4096 {
+            c.clear();
+        }
+        c.insert(key, Rc::clone(&parsed));
+    });
+    Some(parsed)
+}
+
+fn load_or_err(root: &Path, rel: &str) -> Result<Rc<Parsed>, String> {
+    load(root, rel).ok_or_else(|| format!("{rel}: missing or not valid Rust"))
+}
+
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test"))
+}
+
+// ---------------------------------------------------------------------
+// Derived sets
+// ---------------------------------------------------------------------
+
+struct Adapter {
+    rel: String,
+    module: String,
+    ty: String,
+    id: Option<String>,
+}
+
+struct Derived {
+    governed: Vec<String>,
+    adapters: Vec<Adapter>,
+    registry: Option<String>,
 }
 
 fn module_name(rel: &str) -> String {
-    rel.rsplit('/')
-        .next()
-        .unwrap_or(rel)
-        .trim_end_matches(".rs")
-        .to_string()
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    if file == "mod.rs" {
+        rel.trim_end_matches("/mod.rs")
+            .rsplit('/')
+            .next()
+            .unwrap_or(file)
+            .to_string()
+    } else {
+        file.trim_end_matches(".rs").to_string()
+    }
 }
 
-fn parse(root: &Path, rel: &str) -> Result<SourceFile, String> {
-    ast::parse(root, rel)
+/// The literal a `fn id(&self) -> &'static str { "x" }` returns.
+fn adapter_id(file: &syn::File, ty: &str) -> Option<String> {
+    for item in &file.items {
+        let syn::Item::Impl(i) = item else { continue };
+        let syn::Type::Path(tp) = &*i.self_ty else {
+            continue;
+        };
+        if tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .as_deref()
+            != Some(ty)
+        {
+            continue;
+        }
+        for it in &i.items {
+            if let syn::ImplItem::Fn(f) = it
+                && f.sig.ident == "id"
+            {
+                let text = f.block.to_token_stream().to_string();
+                let start = text.find('"')?;
+                let rest = &text[start + 1..];
+                let end = rest.find('"')?;
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
 }
 
-fn maybe_parse(root: &Path, rel: &str) -> Option<SourceFile> {
-    ast::parse(root, rel).ok()
-}
-
-/// Token-stream text search, in `syn`'s spaced form (`fs :: rename`).
-fn find_first(haystack: &str, needles: &[&str]) -> Option<(usize, String)> {
-    needles
+fn derive(root: &Path) -> Derived {
+    let mut governed: BTreeSet<String> =
+        crate::resolve::rust_files_recursive(root, BUILD_ADAPTERS_DIR)
+            .into_iter()
+            .collect();
+    let mut adapters = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(f) = load(root, &rel) else { continue };
+        let impls = ast::impls_of(&f.ast, "BuildAdapter");
+        if impls.is_empty() {
+            continue;
+        }
+        governed.insert(rel.clone());
+        for ty in impls {
+            adapters.push(Adapter {
+                rel: rel.clone(),
+                module: module_name(&rel),
+                id: adapter_id(&f.ast, &ty),
+                ty,
+            });
+        }
+    }
+    let registry = governed
         .iter()
-        .filter_map(|n| haystack.find(n).map(|i| (i, (*n).to_string())))
-        .min_by_key(|(i, _)| *i)
+        .find(|rel| {
+            load(root, rel).is_some_and(|f| {
+                ast::functions(&f.ast)
+                    .iter()
+                    .any(|func| func.name == "with_builtins")
+            })
+        })
+        .cloned();
+    Derived {
+        governed: governed.into_iter().collect(),
+        adapters,
+        registry,
+    }
 }
 
-/// The directory must exist and hold adapters before any of these rules
-/// mean anything. Landing the audits first (spec section 18: "Land
-/// FIRST, failing, then implement") means this is the *first* failure
-/// the repo-level run reports, and it names what is missing rather than
-/// passing vacuously over an empty directory.
-fn adapters_or_err(root: &Path) -> Result<Vec<String>, String> {
-    let files = build_adapter_files(root);
-    if files.is_empty() {
+/// Adapters must exist before any rule means anything; saying so is the
+/// first failure rather than a vacuous pass over an empty set.
+fn derived_or_err(root: &Path) -> Result<Derived, String> {
+    let d = derive(root);
+    if d.adapters.is_empty() {
         return Err(
-            "crates/core/src/build_adapters/ has no adapter modules: section 18 requires a \
+            "no `impl BuildAdapter` anywhere in the workspace: section 18 requires a \
              `BuildAdapter` trait with a static registry and one module per ecosystem family \
              (Cargo ported onto the trait, then Node, Gradle and Maven)"
                 .into(),
         );
     }
-    Ok(files)
+    Ok(d)
+}
+
+/// Field names of `NestedArtifact`, plus those of its `ArtifactCoverage`
+/// (whose `supported`/`complete` overstate when written), parsed from
+/// `artifact.rs`. `ArtifactVariant`'s fields are deliberately not
+/// included: an adapter assembles a variant field by field and then
+/// hands it to the builder, and a variant is identity evidence, not a
+/// claim about bytes, support or action.
+fn unit_fields(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(f) = load(root, ARTIFACT_RS) else {
+        return out;
+    };
+    let structs: HashMap<String, &syn::ItemStruct> = f
+        .ast
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            syn::Item::Struct(s) => Some((s.ident.to_string(), s)),
+            _ => None,
+        })
+        .collect();
+    let Some(unit) = structs.get("NestedArtifact") else {
+        return out;
+    };
+    for field in &unit.fields {
+        let Some(name) = &field.ident else { continue };
+        out.insert(name.to_string());
+        if field.ty.to_token_stream().to_string() == "ArtifactCoverage"
+            && let Some(s) = structs.get("ArtifactCoverage")
+        {
+            for sub in &s.fields {
+                if let Some(n) = &sub.ident {
+                    out.insert(n.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn bounded_primitives_still_bounded(root: &Path) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for (rel, func, cap) in BOUNDED_PRIMITIVES {
+        let Some(f) = load(root, rel) else {
+            problems.push(format!(
+                "{rel} is missing, but its `{func}` is exempted as a bounded primitive"
+            ));
+            continue;
+        };
+        let Some(body) = ast::functions(&f.ast).into_iter().find(|x| &x.name == func) else {
+            problems.push(format!(
+                "{rel} no longer defines the bounded primitive `{func}`"
+            ));
+            continue;
+        };
+        // The cap is named in the body, or the body delegates to
+        // another bounded primitive that does (`read_whole_manifest`
+        // wraps `read_manifest`).
+        let delegates = BOUNDED_PRIMITIVES.iter().any(|(r, other, _)| {
+            r == rel && other != func && body.body.contains(&format!("{other} ("))
+        });
+        if !body.body.contains(cap) && !delegates {
+            problems.push(format!(
+                "{rel}::{func} is exempted as a bounded primitive but its body does not name its \
+                 cap `{cap}`"
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n  "))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-file facts for the whole-workspace graph
+// ---------------------------------------------------------------------
+
+type Node = (String, String);
+
+/// One call edge's raw material.
+#[derive(Clone)]
+struct Call {
+    func: String,
+    path: String,
+    written: String,
+    method: bool,
+}
+
+#[derive(Default)]
+struct FileFacts {
+    calls: Vec<Call>,
+    /// Functions defined here: name, the self type of their `impl` (if
+    /// any), and the type-like identifiers their signature and body name.
+    defs: Vec<(String, Option<String>, BTreeSet<String>)>,
+}
+
+type FactCache = Mutex<HashMap<(String, u64), Arc<FileFacts>>>;
+static FACTS: OnceLock<FactCache> = OnceLock::new();
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Macro arguments parsed as comma-separated expressions, when they
+/// are (`vec![..]`, `format!(..)`'s arguments, `assert!(..)`).
+fn macro_exprs(tokens: &proc_macro2::TokenStream) -> Vec<syn::Expr> {
+    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    syn::parse::Parser::parse2(parser, tokens.clone())
+        .map(|p| p.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Calls written inside macro arguments, which `syn::visit` does not
+/// descend into (`vec![std::fs::read_dir(p)]`).
+fn macro_calls(file: &syn::File, res: &crate::resolve::Resolver) -> Vec<Call> {
+    struct Outer<'a> {
+        func: String,
+        in_test: usize,
+        res: &'a crate::resolve::Resolver,
+        out: Vec<Call>,
+    }
+    struct Inner<'a, 'b> {
+        outer: &'b mut Outer<'a>,
+    }
+    impl<'ast> Visit<'ast> for Inner<'_, '_> {
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func {
+                let written = p.path.to_token_stream().to_string().replace(' ', "");
+                self.outer.out.push(Call {
+                    func: self.outer.func.clone(),
+                    path: self.outer.res.resolve(&written),
+                    written,
+                    method: false,
+                });
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            self.outer.out.push(Call {
+                func: self.outer.func.clone(),
+                path: m.method.to_string(),
+                written: m.method.to_string(),
+                method: true,
+            });
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for e in macro_exprs(&m.tokens) {
+                self.visit_expr(&e);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Outer<'_> {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_test -= usize::from(test);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if self.in_test > 0 {
+                return;
+            }
+            let exprs = macro_exprs(&m.tokens);
+            let mut inner = Inner { outer: self };
+            for e in &exprs {
+                inner.visit_expr(e);
+            }
+        }
+    }
+    let mut v = Outer {
+        func: String::new(),
+        in_test: 0,
+        res,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+fn type_idents(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn facts_of(root: &Path, rel: &str) -> Option<Arc<FileFacts>> {
+    let f = load(root, rel)?;
+    let key = (rel.to_string(), text_hash(&f.text));
+    let cache = FACTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key).cloned() {
+        return Some(hit);
+    }
+    let res = crate::resolve::resolver(&f.ast);
+    let mut facts = FileFacts::default();
+    for c in crate::resolve::production_calls(&f.ast) {
+        facts.calls.push(Call {
+            func: c.func,
+            path: c.path,
+            written: c.written,
+            method: c.method,
+        });
+    }
+    facts.calls.extend(macro_calls(&f.ast, &res));
+    let mut impl_of: HashMap<String, String> = HashMap::new();
+    for item in &f.ast.items {
+        if let syn::Item::Impl(i) = item
+            && let syn::Type::Path(tp) = &*i.self_ty
+            && let Some(last) = tp.path.segments.last()
+        {
+            for it in &i.items {
+                if let syn::ImplItem::Fn(m) = it {
+                    impl_of.insert(m.sig.ident.to_string(), last.ident.to_string());
+                }
+            }
+        }
+    }
+    for func in ast::functions(&f.ast) {
+        let types = type_idents(&format!("{} {}", func.sig, func.body));
+        facts
+            .defs
+            .push((func.name.clone(), impl_of.get(&func.name).cloned(), types));
+    }
+    let facts = Arc::new(facts);
+    let mut c = cache.lock().unwrap();
+    if c.len() > 8192 {
+        c.clear();
+    }
+    c.insert(key, Arc::clone(&facts));
+    Some(facts)
+}
+
+/// A forbidden target: a resolved path suffix, a whole namespace, or a
+/// method name for primitives only ever reached as methods.
+#[derive(Clone, Copy)]
+enum Target {
+    /// `fs::read_dir` matches `std::fs::read_dir`, segment-wise.
+    Path(&'static str),
+    /// Any path with this segment sequence before its last segment:
+    /// `Command` matches `std::process::Command::new`; `actions` matches
+    /// `crate::actions::anything`.
+    Namespace(&'static str),
+    Method(&'static str),
+}
+
+fn target_matches(t: Target, call: &Call) -> bool {
+    match t {
+        Target::Path(p) => !call.method && crate::resolve::path_ends_with(&call.path, p),
+        Target::Method(m) => call.method && call.path == m,
+        Target::Namespace(ns) => {
+            if call.method {
+                return false;
+            }
+            let segs: Vec<&str> = call.path.split("::").filter(|s| !s.is_empty()).collect();
+            let want: Vec<&str> = ns.split("::").collect();
+            if segs.len() <= want.len() {
+                return false;
+            }
+            segs[..segs.len() - 1]
+                .windows(want.len())
+                .any(|w| w == want.as_slice())
+        }
+    }
+}
+
+fn target_label(t: Target) -> &'static str {
+    match t {
+        Target::Path(p) | Target::Namespace(p) | Target::Method(p) => p,
+    }
+}
+
+/// Which functions reach a forbidden call (or a seeded function), over
+/// the whole workspace.
+struct Reachability {
+    tainted: HashMap<Node, String>,
+}
+
+impl Reachability {
+    fn build(root: &Path, forbidden: &[(Target, &str)], seeds: &[(Node, String)]) -> Self {
+        let files = crate::resolve::workspace_files(root);
+        let facts: Vec<(String, Arc<FileFacts>)> = files
+            .iter()
+            .filter_map(|rel| facts_of(root, rel).map(|f| (rel.clone(), f)))
+            .collect();
+        let cut: HashSet<Node> = BOUNDED_PRIMITIVES
+            .iter()
+            .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+            .collect();
+        type Def<'a> = (Node, Option<&'a str>);
+        let mut by_name: HashMap<&str, Vec<Def>> = HashMap::new();
+        let mut types_of: HashMap<Node, BTreeSet<String>> = HashMap::new();
+        for (rel, f) in &facts {
+            for (name, self_ty, types) in &f.defs {
+                let node = (rel.clone(), name.clone());
+                by_name
+                    .entry(name.as_str())
+                    .or_default()
+                    .push((node.clone(), self_ty.as_deref()));
+                types_of
+                    .entry(node)
+                    .or_default()
+                    .extend(types.iter().cloned());
+            }
+        }
+        let mut tainted: HashMap<Node, String> = seeds.iter().cloned().collect();
+        let mut edges: HashMap<Node, BTreeSet<Node>> = HashMap::new();
+        for (rel, f) in &facts {
+            for c in &f.calls {
+                let node = (rel.clone(), c.func.clone());
+                if cut.contains(&node) {
+                    continue;
+                }
+                if let Some((t, why)) = forbidden.iter().find(|(t, _)| target_matches(*t, c)) {
+                    tainted.entry(node.clone()).or_insert_with(|| {
+                        format!("{} (resolved {}, which {why})", c.written, target_label(*t))
+                    });
+                    continue;
+                }
+                let segments: Vec<&str> = c.path.split("::").collect();
+                let callee = segments.last().copied().unwrap_or_default();
+                let module = (segments.len() >= 2).then(|| segments[segments.len() - 2]);
+                let caller_types = types_of.get(&node);
+                for (target, self_ty) in by_name.get(callee).into_iter().flatten() {
+                    if cut.contains(target) || target == &node {
+                        continue;
+                    }
+                    let reachable = if c.method {
+                        // A method resolves to the impls of the types the
+                        // caller names (`ctx: &BuildCtx` -> BuildCtx::list).
+                        self_ty.is_some_and(|t| caller_types.is_some_and(|ts| ts.contains(t)))
+                    } else {
+                        let same_file = target.0 == *rel;
+                        let in_module = module.is_some_and(|m| {
+                            target.0.ends_with(&format!("/{m}.rs"))
+                                || target.0.ends_with(&format!("/{m}/mod.rs"))
+                                || self_ty.is_some_and(|t| t == m)
+                        });
+                        same_file || in_module
+                    };
+                    if reachable {
+                        edges
+                            .entry(node.clone())
+                            .or_default()
+                            .insert(target.clone());
+                    }
+                }
+            }
+        }
+        loop {
+            let mut grew = false;
+            for (caller, callees) in &edges {
+                if tainted.contains_key(caller) {
+                    continue;
+                }
+                if let Some(c) = callees.iter().find(|c| tainted.contains_key(*c)) {
+                    let why = tainted[c].clone();
+                    tainted.insert(caller.clone(), format!("{}::{} -> {why}", c.0, c.1));
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        Self { tainted }
+    }
+
+    fn why(&self, rel: &str, func: &str) -> Option<&String> {
+        self.tainted.get(&(rel.to_string(), func.to_string()))
+    }
+}
+
+/// Forbidden targets written as text inside a macro's tokens that did
+/// not parse as expressions (the parsed ones are already call edges).
+fn macro_token_hits(f: &syn::File, forbidden: &[(Target, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for site in crate::resolve::macro_sites(f) {
+        if site.in_test {
+            continue;
+        }
+        for (t, why) in forbidden {
+            let needle = match t {
+                Target::Path(p) | Target::Namespace(p) => p.replace("::", " :: "),
+                Target::Method(m) => format!(". {m} ("),
+            };
+            if site.tokens.contains(&needle) {
+                out.push(format!(
+                    "{}: the `{}!` macro's tokens reach `{}`, which {why}",
+                    site.func,
+                    site.name,
+                    target_label(*t)
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn unknown_macro_problems(rel: &str, f: &syn::File) -> Vec<String> {
+    crate::resolve::unknown_macros(f)
+        .into_iter()
+        .map(|(func, name)| {
+            format!(
+                "{rel}::{func} uses the macro `{name}!`, which this layer cannot see through: a \
+                 governed module may not hide a call inside a macro no rule can read"
+            )
+        })
+        .collect()
+}
+
+fn finish(mut problems: Vec<String>) -> Result<(), String> {
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        problems.sort();
+        problems.dedup();
+        Err(problems.join("\n  "))
+    }
+}
+
+/// The shared shape of the three primitive rules.
+fn primitive_rule(root: &Path, forbidden: &[(Target, &str)], advice: &str) -> Result<(), String> {
+    let d = derived_or_err(root)?;
+    bounded_primitives_still_bounded(root)?;
+    let reach = Reachability::build(root, forbidden, &[]);
+    let cut: HashSet<Node> = BOUNDED_PRIMITIVES
+        .iter()
+        .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    let mut problems: Vec<String> = Vec::new();
+    for rel in &d.governed {
+        let f = load_or_err(root, rel)?;
+        for func in ast::functions(&f.ast) {
+            if cut.contains(&(rel.clone(), func.name.clone())) {
+                continue;
+            }
+            if let Some(why) = reach.why(rel, &func.name) {
+                problems.push(format!("{rel}::{} reaches `{why}`: {advice}", func.name));
+            }
+        }
+        for hit in macro_token_hits(&f.ast, forbidden) {
+            problems.push(format!("{rel}::{hit}: {advice}"));
+        }
+        // Referenced at all, not only called: a primitive taken as a
+        // function pointer (`let list = std::fs::read_dir; list(p)`) or
+        // named in a type is never a call edge.
+        for (func, path) in referenced_paths_by_fn(rel, &f.ast) {
+            if cut.contains(&(rel.clone(), func.clone())) {
+                continue;
+            }
+            let as_call = Call {
+                func: func.clone(),
+                path: path.clone(),
+                written: path.clone(),
+                method: false,
+            };
+            if let Some((t, why)) = forbidden
+                .iter()
+                .find(|(t, _)| !matches!(t, Target::Method(_)) && target_matches(*t, &as_call))
+            {
+                problems.push(format!(
+                    "{rel}::{} names `{path}` (matching `{}`, which {why}): {advice}",
+                    if func.is_empty() { "<item>" } else { &func },
+                    target_label(*t)
+                ));
+            }
+        }
+        problems.extend(unknown_macro_problems(rel, &f.ast));
+    }
+    finish(problems)
+}
+
+// ---------------------------------------------------------------------
+// The primitive sets
+// ---------------------------------------------------------------------
+
+/// Anything that changes the filesystem, runs someone else's code, or
+/// reaches the plan/authorization/execution layer.
+const DESTRUCTIVE: &[(Target, &str)] = &[
+    (Target::Path("fs::rename"), "renames"),
+    (Target::Path("fs::remove_file"), "deletes"),
+    (Target::Path("fs::remove_dir"), "deletes"),
+    (Target::Path("fs::remove_dir_all"), "deletes a whole tree"),
+    (Target::Path("fs::write"), "overwrites"),
+    (Target::Path("fs::create_dir"), "creates"),
+    (Target::Path("fs::create_dir_all"), "creates"),
+    (Target::Path("fs::set_permissions"), "changes permissions"),
+    (Target::Path("fs::copy"), "writes"),
+    (Target::Path("fs::hard_link"), "writes"),
+    (Target::Path("fs::soft_link"), "writes"),
+    (Target::Path("fs::symlink"), "writes"),
+    (Target::Path("File::create"), "truncates and writes"),
+    (Target::Path("File::create_new"), "writes"),
+    (Target::Namespace("OpenOptions"), "opens a file for writing"),
+    (Target::Namespace("Command"), "runs another program"),
+    (
+        Target::Namespace("process"),
+        "runs or controls another process",
+    ),
+    (Target::Namespace("trash"), "moves to Trash"),
+    (
+        Target::Namespace("actions"),
+        "reaches the plan/execution layer",
+    ),
+    (Target::Namespace("grants"), "mints authorization"),
+    (Target::Namespace("ledger"), "records an execution"),
+    (
+        Target::Namespace("execution"),
+        "reaches the execution layer",
+    ),
+    (
+        Target::Namespace("cargo_cleanup"),
+        "reaches a cleanup planner",
+    ),
+];
+
+/// Anything that reads a file without a cap.
+const UNBOUNDED_READS: &[(Target, &str)] = &[
+    (Target::Path("fs::read_to_string"), "reads a whole file"),
+    (Target::Path("fs::read"), "reads a whole file"),
+    (Target::Path("io::read_to_string"), "reads a whole reader"),
+    (Target::Path("File::open"), "opens an uncapped handle"),
+    (Target::Namespace("OpenOptions"), "opens an uncapped handle"),
+    (Target::Path("BufReader::new"), "wraps an uncapped reader"),
+    (
+        Target::Path("serde_json::from_reader"),
+        "reads a whole reader",
+    ),
+    (Target::Method("read_to_end"), "reads to the end"),
+    (Target::Method("read_to_string"), "reads to the end"),
+    (Target::Method("read_line"), "reads without a cap"),
+];
+
+/// Anything that enumerates a directory or starts a walk -- the report
+/// path's own walkers included, by namespace.
+const TRAVERSALS: &[(Target, &str)] = &[
+    (Target::Path("fs::read_dir"), "enumerates a directory"),
+    (Target::Namespace("walkdir"), "walks a tree"),
+    (Target::Namespace("WalkDir"), "walks a tree"),
+    (Target::Namespace("jwalk"), "walks a tree"),
+    (Target::Namespace("glob"), "enumerates by pattern"),
+    (Target::Namespace("walk"), "starts the report walk"),
+    (
+        Target::Namespace("attribution"),
+        "starts an attribution pass",
+    ),
+    (
+        Target::Namespace("folded_measurement"),
+        "re-measures a tree",
+    ),
+];
+
+// ---------------------------------------------------------------------
+// Paths a file references, resolved
+// ---------------------------------------------------------------------
+
+/// Every path a file's production items reference -- `use` trees
+/// (including `as` renames and `{..}` groups), expression and type
+/// paths, item-level consts and statics, and `a::b` paths inside macro
+/// tokens -- resolved through the file's symbol table, with `super::` and
+/// `self::` made absolute for files in the core crate. Test modules
+/// excluded.
+fn referenced_paths(rel: &str, file: &syn::File) -> Vec<String> {
+    referenced_paths_by_fn(rel, file)
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// [`referenced_paths`], with the enclosing function (`""` at item level).
+fn referenced_paths_by_fn(rel: &str, file: &syn::File) -> Vec<(String, String)> {
+    struct V<'a> {
+        res: &'a crate::resolve::Resolver,
+        in_test: usize,
+        func: String,
+        out: Vec<(String, String)>,
+    }
+    fn use_paths(tree: &syn::UseTree, prefix: &str, out: &mut Vec<String>) {
+        let join = |p: &str, s: &str| {
+            if p.is_empty() {
+                s.to_string()
+            } else {
+                format!("{p}::{s}")
+            }
+        };
+        match tree {
+            syn::UseTree::Path(p) => use_paths(&p.tree, &join(prefix, &p.ident.to_string()), out),
+            syn::UseTree::Name(n) => out.push(join(prefix, &n.ident.to_string())),
+            syn::UseTree::Rename(r) => out.push(join(prefix, &r.ident.to_string())),
+            syn::UseTree::Glob(_) => out.push(join(prefix, "*")),
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    use_paths(t, prefix, out);
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_test -= usize::from(test);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+            if self.in_test == 0 {
+                let mut paths = Vec::new();
+                use_paths(&u.tree, "", &mut paths);
+                let func = self.func.clone();
+                self.out
+                    .extend(paths.into_iter().map(|p| (func.clone(), p)));
+            }
+        }
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if self.in_test == 0 {
+                let written = p.to_token_stream().to_string().replace(' ', "");
+                self.out
+                    .push((self.func.clone(), self.res.resolve(&written)));
+            }
+            syn::visit::visit_path(self, p);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if self.in_test == 0 {
+                let compact = m.tokens.to_string().replace(" :: ", "::");
+                for piece in compact.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                {
+                    if piece.contains("::") {
+                        self.out.push((self.func.clone(), self.res.resolve(piece)));
+                    }
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+        // Attributes (doc comments included) are metadata.
+        fn visit_attribute(&mut self, _a: &'ast syn::Attribute) {}
+    }
+    let res = crate::resolve::resolver(file);
+    let mut v = V {
+        res: &res,
+        in_test: 0,
+        func: String::new(),
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    let module_path: Vec<String> = rel
+        .strip_prefix("crates/core/src/")
+        .map(|r| {
+            let mut parts: Vec<String> = r
+                .trim_end_matches(".rs")
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            if parts.last().is_some_and(|p| p == "mod") {
+                parts.pop();
+            }
+            parts
+        })
+        .unwrap_or_default();
+    v.out
+        .into_iter()
+        .map(|(func, p)| {
+            let mut segs: Vec<&str> = p.split("::").collect();
+            let mut base = module_path.clone();
+            let mut rewritten = false;
+            while segs.first() == Some(&"super") {
+                segs.remove(0);
+                base.pop();
+                rewritten = true;
+            }
+            if segs.first() == Some(&"self") {
+                segs.remove(0);
+                rewritten = true;
+            }
+            let path = if rewritten {
+                let mut out = vec!["crate".to_string()];
+                out.extend(base);
+                out.extend(segs.iter().map(|s| s.to_string()));
+                out.join("::")
+            } else {
+                p.replace("swamp_core::", "crate::")
+            };
+            (func, path)
+        })
+        .collect()
+}
+
+/// Whether a resolved path names adapter module `m`: under
+/// `build_adapters`, or (for an adapter defined elsewhere) as a
+/// top-level core module.
+fn names_module(path: &str, m: &str) -> bool {
+    let segs: Vec<&str> = path.split("::").collect();
+    segs.windows(2)
+        .any(|w| w[0] == "build_adapters" && w[1] == m)
+        || (segs.len() >= 3 && segs[0] == "crate" && segs[1] == m)
 }
 
 // ---------------------------------------------------------------------
@@ -98,409 +977,720 @@ fn adapters_or_err(root: &Path) -> Result<Vec<String>, String> {
 // ---------------------------------------------------------------------
 
 /// Statement: a build adapter is one line in a static registry, names no
-/// other adapter, and nothing dispatches to it by matching an ecosystem
-/// id.
-///
-/// The precedent is exact. `agents/mod.rs` grew a fourteen-arm
-/// `match tool_id` and a second copy of it in `actions.rs`, and adding a
-/// tool meant editing four places. The Cargo build code is at the same
-/// fork today: `consumers/cargo.rs` calls `cargo_artifacts::folded_units`
-/// by name, and the obvious way to add Node is a second named call, then
-/// a `match ecosystem` once there are four. So the rule lands before the
-/// second adapter exists, not after.
+/// other adapter, and nothing dispatches on an adapter's identity -- no
+/// `match` over `*_ADAPTER_ID`, and no comparison of an adapter field
+/// against an adapter id literal -- anywhere in the source. The registry
+/// is the one file that may name adapter modules; the matrix is the one
+/// table that may list their ids.
 pub fn build_adapters_are_pluggable(root: &Path) -> Result<(), String> {
-    let adapters = adapters_or_err(root)?;
-    let names: Vec<String> = adapters.iter().map(|r| module_name(r)).collect();
-
-    // (1) No adapter names another adapter. One ecosystem's layout
-    // change must never be able to move another's identification.
-    for rel in &adapters {
-        let me = module_name(rel);
-        let f = parse(root, rel)?;
-        for other in &names {
-            if other == &me {
-                continue;
-            }
-            for form in [
-                format!("super :: {other} ::"),
-                format!("crate :: build_adapters :: {other} ::"),
-            ] {
-                for func in ast::functions(&f.ast) {
-                    if func.body.contains(&form) || func.sig.contains(&form) {
-                        return Err(format!(
-                            "{rel}::{} reaches into adapter `{other}`: an adapter names no other \
-                             adapter. Genuinely shared parsing goes in a neutral helper \
-                             (`jvm_common.rs`) that neither adapter reaches the other through",
-                            func.name
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // (2) No central `match` over adapter ids outside the registry.
-    let mut dispatch_files = vec![
-        "crates/core/src/build_adapters/mod.rs".to_string(),
-        "crates/core/src/actions.rs".to_string(),
-        "crates/core/src/render.rs".to_string(),
-        "crates/core/src/consumers/cargo.rs".to_string(),
-    ];
-    dispatch_files.extend(ast::rust_files_under(root, "crates/tui/src"));
-    dispatch_files.extend(ast::rust_files_under(root, "crates/cli/src"));
-    for rel in dispatch_files {
-        let Some(f) = maybe_parse(root, &rel) else {
-            continue;
-        };
-        for func in ast::functions(&f.ast) {
-            if !func.body.contains("match ") {
-                continue;
-            }
-            for other in &names {
-                let upper = format!("{}_ADAPTER_ID", other.to_ascii_uppercase());
-                if func.body.contains(&upper) {
-                    return Err(format!(
-                        "{rel}::{} matches on `{upper}`: build-adapter dispatch goes through \
-                         `build_adapters::Registry`, never a central ecosystem match",
-                        func.name
-                    ));
-                }
-            }
-        }
-    }
-
-    // (3) Registry <-> module set equality, exactly once each.
-    let registry = parse(root, "crates/core/src/build_adapters/registry.rs").map_err(|e| {
-        format!("{e}; section 18 requires a static `build_adapters::Registry::with_builtins()`")
-    })?;
-    for name in &names {
-        let count: usize = [format!("{name}::Adapter"), format!("{name} :: Adapter")]
-            .iter()
-            .map(|needle| {
-                registry
-                    .text
-                    .match_indices(needle.as_str())
-                    .filter(|(at, _)| {
-                        registry.text[..*at]
-                            .chars()
-                            .next_back()
-                            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-                    })
-                    .count()
-            })
-            .sum();
-        if count != 1 {
-            return Err(format!(
-                "build_adapters/registry.rs registers `{name}` {count} times; exactly once (an \
-                 unregistered adapter identifies nothing and no test notices)"
-            ));
-        }
-    }
-
-    // (4) Registry ids == matrix ids == docs table rows. The matrix is
-    // the published support claim; the registry is what runs.
-    let matrix = parse(root, "crates/core/src/build_adapters/matrix.rs")?;
-    let matrix_ids: BTreeSet<String> = ast::string_literals(&matrix.ast)
-        .into_iter()
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
-        .collect();
-    if matrix_ids.is_empty() {
-        return Err(
-            "build_adapters/matrix.rs exposes no adapter ids to compare with the registry".into(),
-        );
-    }
-    for name in &names {
-        let id = name.replace('_', "-");
-        if !matrix_ids.contains(&id) && !matrix_ids.contains(name) {
-            return Err(format!(
-                "build_adapters/matrix.rs has no row for adapter `{name}`: an adapter with no \
-                 capability row is an undocumented support claim"
-            ));
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------
-// build_adapters_are_inspection_only
-// ---------------------------------------------------------------------
-
-const BUILD_ACTION_REFERENCES: &[&str] = &["actions ::", "trash ::", "Plan {", "Grant {", "Ledger"];
-
-/// Resolved paths a build adapter may never call.
-///
-/// `Command::new` is the one that matters most here and is the one an
-/// author will reach for first: `npm ls --json`, `gradle
-/// dependencies`, `mvn help:evaluate` and `cargo metadata` all answer
-/// exactly the questions an adapter wants, and all four *evaluate the
-/// project's own build definition* to do it. Running an untrusted
-/// build script during observation is the handoff's own hard
-/// constraint, so it is a call-level rule, not a review note.
-const BUILD_FORBIDDEN_CALLS: &[&str] = &[
-    "fs::rename",
-    "fs::remove_file",
-    "fs::remove_dir",
-    "fs::remove_dir_all",
-    "fs::write",
-    "fs::create_dir",
-    "fs::create_dir_all",
-    "fs::set_permissions",
-    "fs::copy",
-    "fs::hard_link",
-    "Command::new",
-    "Command::output",
-    "Command::status",
-    "Command::spawn",
-    "process::Command",
-];
-
-pub fn build_adapters_are_inspection_only(root: &Path) -> Result<(), String> {
+    let d = derived_or_err(root)?;
     let mut problems: Vec<String> = Vec::new();
-    for rel in adapters_or_err(root)? {
-        let f = parse(root, &rel)?;
-        for func in ast::functions(&f.ast) {
-            if let Some((_, call)) = find_first(&func.body, BUILD_ACTION_REFERENCES) {
+    let ids: BTreeSet<String> = d.adapters.iter().filter_map(|a| a.id.clone()).collect();
+
+    // (1) No governed file other than the registry names an adapter
+    // module: adapters naming each other, and a "neutral" helper
+    // reaching into an adapter (a back door between two adapters).
+    for rel in &d.governed {
+        if Some(rel) == d.registry.as_ref() {
+            continue;
+        }
+        let me = module_name(rel);
+        let f = load_or_err(root, rel)?;
+        let paths = referenced_paths(rel, &f.ast);
+        for a in &d.adapters {
+            if a.module == me {
+                continue;
+            }
+            if let Some(p) = paths.iter().find(|p| names_module(p, &a.module)) {
                 problems.push(format!(
-                    "{rel}::{} references `{}`: identification never acts. An adapter declares an \
-                     action capability on the unit; only the shared sink executes anything, after \
-                     its own live rechecks",
-                    func.name,
-                    call.trim()
+                    "{rel} reaches into adapter module `{}` (resolved `{p}`): an adapter names no \
+                     other adapter, and a shared helper names none at all -- shared parsing goes \
+                     in a neutral module no adapter's code passes through",
+                    a.module
                 ));
             }
         }
-        for c in crate::resolve::production_calls(&f.ast) {
-            if c.method && !c.path.starts_with("Command") {
-                continue;
+    }
+
+    // (2) No dispatch on adapter identity, anywhere in the workspace.
+    for rel in crate::resolve::workspace_files(root) {
+        if Some(&rel) == d.registry.as_ref() || rel == format!("{BUILD_ADAPTERS_DIR}/matrix.rs") {
+            continue;
+        }
+        let Some(f) = load(root, &rel) else { continue };
+        for arm in crate::resolve::match_arms(&f.ast) {
+            for a in &d.adapters {
+                let upper = format!("{}_ADAPTER_ID", a.module.to_ascii_uppercase());
+                if arm.pattern.contains(&upper) || arm.scrutinee.contains(&upper) {
+                    problems.push(format!(
+                        "{rel}::{} matches on `{upper}`: dispatch goes through \
+                         `build_adapters::Registry`, never a central ecosystem match",
+                        arm.func
+                    ));
+                }
             }
-            if let Some(bad) = BUILD_FORBIDDEN_CALLS
-                .iter()
-                .find(|p| crate::resolve::path_ends_with(&c.path, p))
+            if arm.scrutinee.contains("adapter")
+                && let Some(id) = ids
+                    .iter()
+                    .find(|id| arm.pattern.contains(&format!("\"{id}\"")))
             {
                 problems.push(format!(
-                    "{rel}::{} calls `{}` (resolved: {bad}): a build adapter identifies from \
-                     read-only metadata. It never writes, never deletes, and never runs `npm`, \
-                     `gradle`, `mvn` or `cargo` -- each of those evaluates the project's own build \
-                     definition to answer",
-                    c.func, c.written
+                    "{rel}::{} matches an adapter field against the id \"{id}\": presentation and \
+                     behaviour follow the unit's roles and the registry's capabilities, never one \
+                     adapter's id",
+                    arm.func
                 ));
             }
         }
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
-    }
-}
-
-// ---------------------------------------------------------------------
-// build_adapters_read_bounded_manifests_only
-// ---------------------------------------------------------------------
-
-const UNBOUNDED_READS: &[&str] = &[
-    "fs :: read_to_string (",
-    "fs :: read (",
-    ". read_to_end (",
-    ". read_to_string (",
-    "serde_json :: from_reader (",
-    "BufReader :: new (",
-    ". lines ( )",
-];
-
-/// Statement: a build adapter's only content access is the shared
-/// capped `build_adapters::bounded_io::read_manifest(path, cap)`, for
-/// named manifest/lockfile/fingerprint files.
-///
-/// The cost argument and the safety argument point the same way. A
-/// `pnpm-lock.yaml` in a large monorepo is tens of megabytes and a
-/// `node_modules` tree holds one `package.json` per package; an adapter
-/// that reads whole files reads gigabytes to answer "which packages are
-/// installed". And an unbounded read of an arbitrary path under a
-/// build directory is an unbounded read of whatever a build happened to
-/// put there.
-pub fn build_adapters_read_bounded_manifests_only(root: &Path) -> Result<(), String> {
-    let mut problems: Vec<String> = Vec::new();
-    for rel in adapters_or_err(root)? {
-        let f = parse(root, &rel)?;
-        for func in ast::functions(&f.ast) {
-            if let Some((_, call)) = find_first(&func.body, UNBOUNDED_READS) {
-                problems.push(format!(
-                    "{rel}::{} reads file contents with `{}`: an adapter's only content access is \
-                     `build_adapters::bounded_io::read_manifest(path, cap)`, capped, for named \
-                     manifest and fingerprint files",
-                    func.name,
-                    call.trim()
-                ));
-            }
-        }
-        // Resolved, so `use std::fs::read_to_string as slurp` is caught.
-        for c in crate::resolve::production_calls(&f.ast) {
-            if c.method {
-                continue;
-            }
-            for bad in ["fs::read_to_string", "fs::read", "io::read_to_string"] {
-                if crate::resolve::path_ends_with(&c.path, bad) {
-                    problems.push(format!(
-                        "{rel}::{} calls `{}` (resolved: {bad}): content reads go through the \
-                         capped `bounded_io::read_manifest`",
-                        c.func, c.written
-                    ));
+        // A const holding an adapter id is the id by another name.
+        let aliases: Vec<(String, String)> = f
+            .ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Const(c) => {
+                    let v = c.expr.to_token_stream().to_string();
+                    ids.iter()
+                        .find(|id| v == format!("\"{id}\""))
+                        .map(|id| (c.ident.to_string(), id.clone()))
                 }
+                _ => None,
+            })
+            .collect();
+        for (func, stmt) in adapter_comparisons(&f.ast) {
+            let by_alias = aliases.iter().find(|(name, _)| {
+                stmt.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|t| t == name)
+            });
+            if let Some((_, id)) = by_alias {
+                problems.push(format!(
+                    "{rel}::{func} compares an adapter against a const holding the id \"{id}\": \
+                     the id by another name is still a dispatch on one adapter"
+                ));
+            }
+            if let Some(id) = ids.iter().find(|id| stmt.contains(&format!("\"{id}\""))) {
+                problems.push(format!(
+                    "{rel}::{func} compares an adapter against the id \"{id}\": special-casing one \
+                     adapter by id outside the registry is the central dispatch section 13 \
+                     removed from the agent side"
+                ));
             }
         }
     }
-    let bounded = parse(root, "crates/core/src/build_adapters/bounded_io.rs").map_err(|e| {
-        format!(
-            "{e}; build adapters need one shared capped manifest reader \
-             (`bounded_io::read_manifest`)"
-        )
-    })?;
-    if !bounded.text.contains("MAX_MANIFEST_BYTES") {
-        problems.push(
-            "build_adapters/bounded_io.rs has no `MAX_MANIFEST_BYTES` cap constant".to_string(),
+
+    // (3) Registry <-> adapter set, exactly once each.
+    let Some(registry_rel) = d.registry.clone() else {
+        return Err(
+            "no governed file defines `with_builtins`: section 18 requires a static \
+             `build_adapters::Registry::with_builtins()`"
+                .into(),
         );
+    };
+    let registry = load_or_err(root, &registry_rel)?;
+    let body = ast::functions(&registry.ast)
+        .into_iter()
+        .find(|f| f.name == "with_builtins")
+        .map(|f| f.body)
+        .unwrap_or_default();
+    for a in &d.adapters {
+        let needle = format!("{} :: {}", a.module, a.ty);
+        let count = body
+            .match_indices(&needle)
+            .filter(|(at, _)| {
+                body[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+            .count();
+        if count != 1 {
+            problems.push(format!(
+                "{registry_rel}::with_builtins registers `{}::{}` {count} times; exactly once (an \
+                 unregistered adapter identifies nothing and no test notices, and a duplicate \
+                 identifies twice)",
+                a.module, a.ty
+            ));
+        }
+        if a.id.is_none() {
+            problems.push(format!(
+                "{}: `impl BuildAdapter for {}` has no literal `fn id`; the id is how the matrix \
+                 and the docs are joined to the code",
+                a.rel, a.ty
+            ));
+        }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
+
+    // (4) Adapter ids == the matrix's implemented ids.
+    let implemented = matrix_implemented_ids(root)?;
+    for id in ids.difference(&implemented) {
+        problems.push(format!(
+            "build_adapters/matrix.rs has no implemented entry for adapter `{id}`: an adapter with \
+             no capability row is an undocumented support claim"
+        ));
     }
+    for id in implemented.difference(&ids) {
+        problems.push(format!(
+            "build_adapters/matrix.rs marks `{id}` implemented and no adapter has that id: a \
+             documented family with no code behind it"
+        ));
+    }
+    finish(problems)
+}
+
+/// Comparisons that could be a dispatch on an adapter's identity: an
+/// `==`/`!=` whose own operands, or the receiver of a method chain it
+/// sits inside (`u.adapter.as_deref().filter(|a| *a != "x")`), mention
+/// `adapter`; an `if let <pattern> = <expr mentioning adapter>`; and a
+/// macro (`matches!`) whose tokens mention `adapter`. Returned as the
+/// token text to search for an adapter id literal.
+fn adapter_comparisons(file: &syn::File) -> Vec<(String, String)> {
+    struct V {
+        func: String,
+        in_test: usize,
+        receivers: Vec<String>,
+        out: Vec<(String, String)>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_test -= usize::from(test);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            self.visit_expr(&m.receiver);
+            self.receivers
+                .push(m.receiver.to_token_stream().to_string());
+            for a in &m.args {
+                self.visit_expr(a);
+            }
+            self.receivers.pop();
+        }
+        fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+            if self.in_test == 0 && matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+                let own = b.to_token_stream().to_string();
+                if own.contains("adapter") || self.receivers.iter().any(|r| r.contains("adapter")) {
+                    self.out.push((self.func.clone(), own));
+                }
+            }
+            syn::visit::visit_expr_binary(self, b);
+        }
+        fn visit_expr_let(&mut self, l: &'ast syn::ExprLet) {
+            if self.in_test == 0 && l.expr.to_token_stream().to_string().contains("adapter") {
+                self.out
+                    .push((self.func.clone(), l.pat.to_token_stream().to_string()));
+            }
+            syn::visit::visit_expr_let(self, l);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            let t = m.tokens.to_string();
+            if self.in_test == 0 && t.contains("adapter") {
+                self.out.push((self.func.clone(), t));
+            }
+        }
+    }
+    let mut v = V {
+        func: String::new(),
+        in_test: 0,
+        receivers: Vec::new(),
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+/// `MatrixEntry { id: "x", status: Status::Implemented, .. }` ids, read
+/// from the struct literals in the matrix file.
+fn matrix_implemented_ids(root: &Path) -> Result<BTreeSet<String>, String> {
+    let f = load_or_err(root, &format!("{BUILD_ADAPTERS_DIR}/matrix.rs"))?;
+    struct V {
+        out: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+            let mut id = None;
+            let mut implemented = false;
+            for field in &s.fields {
+                let name = field.member.to_token_stream().to_string();
+                let value = field.expr.to_token_stream().to_string();
+                if name == "id" {
+                    id = Some(value.trim_matches('"').to_string());
+                }
+                if name == "status" && value.contains("Implemented") {
+                    implemented = true;
+                }
+            }
+            if implemented && let Some(id) = id {
+                self.out.insert(id);
+            }
+            syn::visit::visit_expr_struct(self, s);
+        }
+    }
+    let mut v = V {
+        out: BTreeSet::new(),
+    };
+    v.visit_file(&f.ast);
+    Ok(v.out)
 }
 
 // ---------------------------------------------------------------------
-// build_adapters_do_not_traverse
+// The three primitive rules
 // ---------------------------------------------------------------------
 
-const BUILD_TRAVERSAL_CALLS: &[&str] = &[":: read_dir (", "read_dir (", "walkdir", "jwalk"];
+pub fn build_adapters_are_inspection_only(root: &Path) -> Result<(), String> {
+    primitive_rule(
+        root,
+        DESTRUCTIVE,
+        "build identification reads metadata and nothing else. It never writes, never deletes, \
+         never runs `npm`, `gradle`, `mvn` or `cargo` -- each of those evaluates the project's own \
+         build definition -- and never reaches the plan, grant or execution layer. An adapter \
+         declares an action capability; only the shared sink executes anything",
+    )
+}
 
-/// Statement: directory structure reaches a build adapter through the
-/// folded walk rows in its context, or through the capped
-/// `locations::shallow_list`.
-///
-/// This is the adapter-scoped half of
-/// `no-second-traversal-on-report-path`. A `node_modules` tree and a
-/// `~/.m2/repository` are the two largest directory trees on a typical
-/// developer machine; an adapter that walks either one turns an ordinary
-/// refresh into a second full scan of the thing the folded walk just
-/// measured.
+pub fn build_adapters_read_bounded_manifests_only(root: &Path) -> Result<(), String> {
+    let mut problems = Vec::new();
+    match load(root, &format!("{BUILD_ADAPTERS_DIR}/bounded_io.rs")) {
+        None => problems.push(
+            "build_adapters/bounded_io.rs is missing: build adapters need one shared capped \
+             manifest reader (`bounded_io::read_manifest`)"
+                .to_string(),
+        ),
+        Some(b) if !b.text.contains("MAX_MANIFEST_BYTES") => problems.push(
+            "build_adapters/bounded_io.rs has no `MAX_MANIFEST_BYTES` cap constant".to_string(),
+        ),
+        Some(_) => {}
+    }
+    if let Err(e) = primitive_rule(
+        root,
+        UNBOUNDED_READS,
+        "the only content access in build identification is \
+         `build_adapters::bounded_io::read_manifest(path, cap)`: capped at 256 KiB, counted, and \
+         for named manifest and metadata files",
+    ) {
+        problems.push(e);
+    }
+    finish(problems)
+}
+
 pub fn build_adapters_do_not_traverse(root: &Path) -> Result<(), String> {
-    let mut problems: Vec<String> = Vec::new();
-    for rel in adapters_or_err(root)? {
-        let f = parse(root, &rel)?;
-        for func in ast::functions(&f.ast) {
-            if let Some((_, call)) = find_first(&func.body, BUILD_TRAVERSAL_CALLS) {
-                problems.push(format!(
-                    "{rel}::{} traverses with `{}`: directory structure reaches an adapter through \
-                     the folded walk rows in its context, or the capped `locations::shallow_list`",
-                    func.name,
-                    call.trim()
-                ));
-            }
-        }
-        for c in crate::resolve::production_calls(&f.ast) {
-            if c.method {
-                continue;
-            }
-            for bad in ["fs::read_dir", "WalkDir::new"] {
-                if crate::resolve::path_ends_with(&c.path, bad) {
-                    problems.push(format!(
-                        "{rel}::{} calls `{}` (resolved: {bad}): listings go through \
-                         `locations::shallow_list`, which is capped, counted and refuses symlinks",
-                        c.func, c.written
-                    ));
-                }
-            }
-        }
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
-    }
+    primitive_rule(
+        root,
+        TRAVERSALS,
+        "directory structure reaches build identification through the folded walk rows in its \
+         context, or through the capped `locations::shallow_list`",
+    )
 }
 
 // ---------------------------------------------------------------------
 // build_units_built_through_builder
 // ---------------------------------------------------------------------
 
-/// Statement: adapters build nested units with `NestedUnitBuilder`,
-/// never a `NestedArtifact { .. }` literal.
-///
-/// A literal has to spell out `coverage`, `membership`,
-/// `physical_bytes`, `physical_total` and the action capability. Every
-/// one of those has a *safe* default that a literal can silently get
-/// wrong: coverage `supported: true` on a layout nobody tested,
-/// `Membership::Exclusive` on a hardlinked store entry (which
-/// double-counts), a nonzero `physical_total` on an aggregate (which
-/// double-counts again), and an action capability other than
-/// `InspectionOnly` on an adapter with no action support at all.
-/// The constructor applies the honest defaults; overriding one is a
-/// named method call, visible in the diff.
+/// Methods a governed function may call on a unit's field. An
+/// allow-list that fails closed: a method not named here, called on a
+/// unit field, is a violation, because it may take `&mut self` (`push`,
+/// `retain`, `clear`, `get_or_insert_with`, `iter_mut`, ...).
+const READ_ONLY_FIELD_METHODS: &[&str] = &[
+    "clone",
+    "as_deref",
+    "as_ref",
+    "as_str",
+    "as_path",
+    "iter",
+    "len",
+    "is_empty",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "file_name",
+    "file_stem",
+    "parent",
+    "join",
+    "display",
+    "to_path_buf",
+    "to_str",
+    "to_string",
+    "to_string_lossy",
+    "to_owned",
+    "ancestors",
+    "components",
+    "extension",
+    "exists",
+    "is_dir",
+    "is_file",
+    "strip_prefix",
+    "label",
+    "family",
+    "title",
+    "is_some",
+    "is_none",
+    "is_some_and",
+    "is_none_or",
+    "unwrap_or",
+    "unwrap_or_default",
+    "get",
+    "first",
+    "last",
+    "eq",
+    "ne",
+    "cmp",
+    "partial_cmp",
+    "max",
+    "min",
+    "saturating_sub",
+    "checked_sub",
+    "split",
+    "rsplit_once",
+    "split_once",
+    "chars",
+    "trim",
+    "borrow",
+    "cloned",
+    "copied",
+];
+
+/// Every way a function in `file` writes a unit's field: assignment,
+/// compound assignment, `&mut` borrow (so `mem::replace`/`mem::take`),
+/// a non-read-only method on the field, a `ref mut` binding -- including
+/// inside macro arguments -- outside the builder's own inherent `impl`
+/// and outside tests.
+fn field_writes(file: &syn::File, fields: &HashSet<String>) -> Vec<(String, String)> {
+    struct V<'a> {
+        fields: &'a HashSet<String>,
+        func: String,
+        in_test: usize,
+        in_builder: usize,
+        /// The self type of the enclosing `impl`: inside `impl BuildCtx`,
+        /// `self.coverage` is the context's own field, not a unit's.
+        self_ty: Vec<String>,
+        out: Vec<(String, String)>,
+    }
+    /// The unit field a place expression writes through, if any: the
+    /// members of a field chain, minus the first one when the chain
+    /// starts at `self` inside an `impl` of some other type.
+    fn unit_field(
+        e: &syn::Expr,
+        fields: &HashSet<String>,
+        self_ty: Option<&str>,
+    ) -> Option<String> {
+        let mut members: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match cur {
+                syn::Expr::Field(f) => {
+                    members.push(f.member.to_token_stream().to_string());
+                    cur = &f.base;
+                }
+                syn::Expr::Paren(p) => cur = &p.expr,
+                syn::Expr::Index(i) => cur = &i.expr,
+                _ => break,
+            }
+        }
+        members.reverse();
+        let on_self = matches!(cur, syn::Expr::Path(p) if p.path.is_ident("self"));
+        if on_self && self_ty.is_some_and(|t| t != "NestedArtifact") && !members.is_empty() {
+            members.remove(0);
+        }
+        members.into_iter().find(|m| fields.contains(m))
+    }
+    impl V<'_> {
+        fn unit_field(&self, e: &syn::Expr) -> Option<String> {
+            unit_field(e, self.fields, self.self_ty.last().map(String::as_str))
+        }
+        fn flag(&mut self, what: String) {
+            if self.in_test == 0 && self.in_builder == 0 {
+                self.out.push((self.func.clone(), what));
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_test -= usize::from(test);
+        }
+        fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+            let ty = i.self_ty.to_token_stream().to_string();
+            let builder = i.trait_.is_none() && ty == BUILDER;
+            self.in_builder += usize::from(builder);
+            self.self_ty.push(ty);
+            syn::visit::visit_item_impl(self, i);
+            self.self_ty.pop();
+            self.in_builder -= usize::from(builder);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, f);
+            self.func = prev;
+        }
+        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+            if let Some(field) = self.unit_field(&a.left) {
+                self.flag(format!(
+                    "assigns `{}` (the unit field `{field}`)",
+                    a.left.to_token_stream()
+                ));
+            }
+            syn::visit::visit_expr_assign(self, a);
+        }
+        fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+            let compound = matches!(
+                b.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+                    | syn::BinOp::BitAndAssign(_)
+                    | syn::BinOp::BitOrAssign(_)
+                    | syn::BinOp::BitXorAssign(_)
+                    | syn::BinOp::ShlAssign(_)
+                    | syn::BinOp::ShrAssign(_)
+            );
+            if compound && let Some(field) = self.unit_field(&b.left) {
+                self.flag(format!(
+                    "compound-assigns `{}` (the unit field `{field}`)",
+                    b.left.to_token_stream()
+                ));
+            }
+            syn::visit::visit_expr_binary(self, b);
+        }
+        fn visit_expr_reference(&mut self, r: &'ast syn::ExprReference) {
+            if r.mutability.is_some()
+                && let Some(field) = self.unit_field(&r.expr)
+            {
+                self.flag(format!(
+                    "takes `&mut {}` (the unit field `{field}`)",
+                    r.expr.to_token_stream()
+                ));
+            }
+            syn::visit::visit_expr_reference(self, r);
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            let method = m.method.to_string();
+            if let Some(field) = self.unit_field(&m.receiver)
+                && !READ_ONLY_FIELD_METHODS.contains(&method.as_str())
+            {
+                self.flag(format!(
+                    "calls `.{method}(..)` on `{}` (the unit field `{field}`), which may mutate it",
+                    m.receiver.to_token_stream()
+                ));
+            }
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+            if p.by_ref.is_some()
+                && p.mutability.is_some()
+                && self.fields.contains(&p.ident.to_string())
+            {
+                self.flag(format!("binds `ref mut {}` to a unit field", p.ident));
+            }
+            syn::visit::visit_pat_ident(self, p);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for e in macro_exprs(&m.tokens) {
+                self.visit_expr(&e);
+            }
+        }
+    }
+    let mut v = V {
+        fields,
+        func: String::new(),
+        in_test: 0,
+        in_builder: 0,
+        self_ty: Vec::new(),
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
+
+/// Statement: build units come from `NestedUnitBuilder` and only from
+/// it -- no `NestedArtifact { .. }`, `ArtifactCoverage { .. }` or
+/// `NestedActionCapability::Unsupported { .. }` literal outside the
+/// builder's own `impl`, and no write to a unit's field after `build()`
+/// in any governed function or any function a governed function reaches.
+/// Enrichment re-opens the unit with `NestedUnitBuilder::amend(unit)` and
+/// goes through named methods.
 pub fn build_units_built_through_builder(root: &Path) -> Result<(), String> {
+    let d = derived_or_err(root)?;
+    let fields = unit_fields(root);
+    if fields.is_empty() {
+        return Err(format!(
+            "{ARTIFACT_RS} defines no `NestedArtifact` fields to govern; the rule cannot speak \
+             about a type it cannot read"
+        ));
+    }
     let mut problems: Vec<String> = Vec::new();
-    for rel in adapters_or_err(root)? {
-        let f = parse(root, &rel)?;
+    let mut builder_defined = false;
+    for rel in &d.governed {
+        let f = load_or_err(root, rel)?;
+        builder_defined |= f
+            .ast
+            .items
+            .iter()
+            .any(|i| matches!(i, syn::Item::Struct(s) if s.ident == BUILDER));
         let res = crate::resolve::resolver(&f.ast);
+        let builder_fns: HashSet<String> = f
+            .ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Impl(imp)
+                    if imp.trait_.is_none()
+                        && imp.self_ty.to_token_stream().to_string() == BUILDER =>
+                {
+                    Some(imp.items.iter().filter_map(|it| match it {
+                        syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
         for (func, path) in ast::struct_literal_sites(&f.ast) {
+            if builder_fns.contains(&func) {
+                continue;
+            }
             let resolved = res.resolve(&path);
-            for what in ["NestedArtifact", "CandidateNestedUnit"] {
+            for what in [
+                "NestedArtifact",
+                "ArtifactCoverage",
+                "NestedActionCapability::Unsupported",
+                "CandidateNestedUnit",
+            ] {
                 if crate::resolve::path_ends_with(&resolved, what) {
                     problems.push(format!(
-                        "{rel}::{func} builds a `{what} {{ .. }}` struct literal (written \
-                         `{path}`): units are built with `NestedUnitBuilder::new(adapter, role, \
-                         path)`, whose constructor applies the role vocabulary, the accounting \
-                         basis, the timestamp provenance and `InspectionOnly` -- every one of \
-                         which a literal can silently get wrong in the direction that inflates a \
-                         total or promises an action"
+                        "{rel}::{func} builds a `{what} {{ .. }}` literal (written `{path}`): units \
+                         are built with `NestedUnitBuilder::new(container, role, path)`, whose \
+                         defaults understate -- a literal can get every one of them wrong in the \
+                         direction that inflates a total or promises an action"
                     ));
                 }
             }
         }
-        // Declaring support is the same reviewed act as lifting a
-        // protection: an empty reason is an unreviewed claim.
+        for (func, what) in field_writes(&f.ast, &fields) {
+            problems.push(format!(
+                "{rel}::{func} {what} after the unit was built: re-open it with \
+                 `NestedUnitBuilder::amend(unit)` and change it through a named builder method, so \
+                 the change is visible in the diff"
+            ));
+        }
         for c in crate::resolve::production_calls(&f.ast) {
-            if (c.path == "supported_with_reason" || c.path == "acts_with_reason")
-                && c.args
-                    .iter()
-                    .all(|a| a.replace(' ', "").is_empty() || a.replace(' ', "") == "\"\"")
-            {
+            if matches!(
+                c.path.as_str(),
+                "supported_with_reason" | "acts_with_reason" | "no_action_because"
+            ) && c.args.iter().all(|x| {
+                let x = x.replace(' ', "");
+                x.is_empty() || x == "\"\""
+            }) {
                 problems.push(format!(
-                    "{rel}::{} lifts an inspection-only/unsupported default with no stated reason",
-                    c.func
+                    "{rel}::{} calls `{}` with no stated reason",
+                    c.func, c.path
                 ));
             }
         }
     }
-    let modrs = parse(root, "crates/core/src/build_adapters/mod.rs")?;
-    if !modrs.text.contains("NestedUnitBuilder") {
-        problems.push("build_adapters/mod.rs does not define `NestedUnitBuilder`".to_string());
+    if !builder_defined {
+        problems.push(format!("no governed module defines `struct {BUILDER}`"));
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
+
+    // Writes one call away: a function anywhere else in the workspace
+    // whose signature takes a unit mutably (`&mut NestedArtifact`, `&mut
+    // [NestedArtifact]`, `&mut self` on `impl NestedArtifact`) and which
+    // writes a unit field is a seed, and every governed function that
+    // reaches it fails.
+    let mut seeds: Vec<(Node, String)> = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        if d.governed.contains(&rel) {
+            continue;
+        }
+        let Some(f) = load(root, &rel) else { continue };
+        if !f.text.contains("NestedArtifact") {
+            continue;
+        }
+        let res = crate::resolve::resolver(&f.ast);
+        for (func, path) in ast::struct_literal_sites(&f.ast) {
+            if crate::resolve::path_ends_with(&res.resolve(&path), "NestedArtifact") {
+                seeds.push((
+                    (rel.clone(), func.clone()),
+                    format!("{rel}::{func} builds a `NestedArtifact {{ .. }}` literal"),
+                ));
+            }
+        }
+        let writes = field_writes(&f.ast, &fields);
+        if writes.is_empty() {
+            continue;
+        }
+        let unit_methods: HashSet<String> = f
+            .ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Impl(imp)
+                    if imp.self_ty.to_token_stream().to_string() == "NestedArtifact" =>
+                {
+                    Some(imp.items.iter().filter_map(|it| match it {
+                        syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for func in ast::functions(&f.ast) {
+            let takes_unit_mutably = (func.sig.contains("mut")
+                && func.sig.contains("NestedArtifact"))
+                || (unit_methods.contains(&func.name) && func.sig.contains("mut self"));
+            if takes_unit_mutably
+                && let Some((_, what)) = writes.iter().find(|(n, _)| *n == func.name)
+            {
+                seeds.push((
+                    (rel.clone(), func.name.clone()),
+                    format!("{rel}::{} {what}", func.name),
+                ));
+            }
+        }
     }
+    if !seeds.is_empty() {
+        let reach = Reachability::build(root, &[], &seeds);
+        for rel in &d.governed {
+            let f = load_or_err(root, rel)?;
+            for func in ast::functions(&f.ast) {
+                if let Some(why) = reach.why(rel, &func.name) {
+                    problems.push(format!(
+                        "{rel}::{} reaches a function that writes a unit's field ({why}): the \
+                         builder bypass one call away is still a builder bypass",
+                        func.name
+                    ));
+                }
+            }
+        }
+    }
+    finish(problems)
 }
 
 // ---------------------------------------------------------------------
 // build_adapter_test_contract
 // ---------------------------------------------------------------------
 
-/// The five things every build adapter proves about *itself*, chosen
-/// because each one is a specific way the epic's issues say this work
-/// fails: an unsupported layout reported as "nothing here"; a manifest
-/// read that grows with the tree; identification that runs the project's
-/// build; variants collapsed by basename (`dist` in two workspaces,
-/// `debug` for two target triples); and age read as obsolescence.
 const REQUIRED_BUILD_TESTS: &[&str] = &[
     "unknown_layout_is_explicit_not_empty",
     "identification_reads_no_more_than_manifest_cap",
@@ -509,50 +1699,84 @@ const REQUIRED_BUILD_TESTS: &[&str] = &[
     "age_is_not_obsolescence",
 ];
 
-/// Whether `text` defines a test named `name` that is not `#[ignore]`d
-/// and contains at least one assertion. Section 17 item 4: a rule that
-/// "the test exists" must also assert the test is not ignored and is not
-/// an empty stub, or the audit is satisfied by a name.
-fn defines_real_test(f: &SourceFile, name: &str) -> Result<(), String> {
-    let needle = format!("fn {name}(");
-    let Some(at) = f.text.find(&needle) else {
-        return Err("missing".into());
+/// One test function as `syn` sees it: a real `fn` item (a name in a
+/// comment does not count), inside a `#[cfg(test)]` module, carrying
+/// `#[test]`, not `#[ignore]`d, and asserting something.
+struct TestFn {
+    name: String,
+    in_cfg_test: bool,
+    is_test: bool,
+    ignored: bool,
+    asserts: bool,
+}
+
+fn test_fns(file: &syn::File) -> Vec<TestFn> {
+    struct V {
+        in_cfg_test: usize,
+        out: Vec<TestFn>,
+    }
+    fn attr(attrs: &[syn::Attribute], name: &str) -> bool {
+        attrs.iter().any(|a| a.path().is_ident(name))
+    }
+    fn asserts(block: &syn::Block) -> bool {
+        let t = block.to_token_stream().to_string();
+        ["assert !", "assert_eq !", "assert_ne !", "contract ::"]
+            .iter()
+            .any(|n| t.contains(n))
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            let test = is_cfg_test(&m.attrs);
+            self.in_cfg_test += usize::from(test);
+            syn::visit::visit_item_mod(self, m);
+            self.in_cfg_test -= usize::from(test);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            self.out.push(TestFn {
+                name: f.sig.ident.to_string(),
+                in_cfg_test: self.in_cfg_test > 0,
+                is_test: attr(&f.attrs, "test"),
+                ignored: attr(&f.attrs, "ignore"),
+                asserts: asserts(&f.block),
+            });
+            syn::visit::visit_item_fn(self, f);
+        }
+    }
+    let mut v = V {
+        in_cfg_test: 0,
+        out: Vec::new(),
     };
-    let start = at.saturating_sub(200);
-    if f.text[start..at].contains("#[ignore") {
-        return Err("`#[ignore]`d".into());
-    }
-    // The body: from the name to the next test fn, or the end.
-    let rest = &f.text[at..];
-    let end = rest[needle.len()..]
-        .find("\n    fn ")
-        .map(|i| i + needle.len())
-        .unwrap_or(rest.len());
-    let body = &rest[..end];
-    let asserts = body.contains("assert!")
-        || body.contains("assert_eq!")
-        || body.contains("assert_ne!")
-        || body.contains("contract::");
-    if !asserts {
-        return Err("has no assertion".into());
-    }
-    Ok(())
+    v.visit_file(file);
+    v.out
 }
 
 pub fn build_adapter_test_contract(root: &Path) -> Result<(), String> {
+    let d = derived_or_err(root)?;
     let mut missing: Vec<String> = Vec::new();
-    for rel in adapters_or_err(root)? {
-        let f = parse(root, &rel)?;
+    let mut seen: HashSet<&str> = HashSet::new();
+    for a in &d.adapters {
+        if !seen.insert(a.rel.as_str()) {
+            continue;
+        }
+        let f = load_or_err(root, &a.rel)?;
+        let defined = test_fns(&f.ast);
         let absent: Vec<String> = REQUIRED_BUILD_TESTS
             .iter()
-            .filter_map(|t| {
-                defines_real_test(&f, t)
-                    .err()
-                    .map(|why| format!("{t} ({why})"))
+            .filter_map(|want| match defined.iter().find(|t| t.name == *want) {
+                None => Some(format!(
+                    "{want} (no such function -- a name in a comment is not a test)"
+                )),
+                Some(t) if !t.in_cfg_test => {
+                    Some(format!("{want} (not inside a `#[cfg(test)]` module)"))
+                }
+                Some(t) if !t.is_test => Some(format!("{want} (no `#[test]` attribute)")),
+                Some(t) if t.ignored => Some(format!("{want} (`#[ignore]`d)")),
+                Some(t) if !t.asserts => Some(format!("{want} (asserts nothing)")),
+                Some(_) => None,
             })
             .collect();
         if !absent.is_empty() {
-            missing.push(format!("{rel}: {}", absent.join(", ")));
+            missing.push(format!("{}: {}", a.rel, absent.join(", ")));
         }
     }
     if missing.is_empty() {
@@ -569,133 +1793,240 @@ pub fn build_adapter_test_contract(root: &Path) -> Result<(), String> {
 // build_adapter_matrix_matches_docs
 // ---------------------------------------------------------------------
 
-/// Statement: the support-matrix table in `docs/build-artifacts.md` has
-/// exactly one row per registered adapter family, and every row's
-/// "actions" column says inspection-only for as long as no adapter
-/// implements an action.
-///
-/// The agent-side version of this rule caught a published table
-/// promising actions the code refused. Here the same failure would be
-/// worse: the whole point of this chunk is identification *without*
-/// cleanup, so a docs row reading anything but "inspection only" is a
-/// promise nothing in the codebase can keep.
+/// Statement: `docs/build-artifacts.md`'s support table, the code's
+/// matrix and the registered adapters describe the same set of
+/// implemented adapters, in both directions, and no row in either table
+/// claims an action. The executable column-by-column equality check is
+/// `crates/core/tests/build_adapter_contract.rs::docs_table_equals_the_capability_matrix`;
+/// this rule is its structural half.
 pub fn build_adapter_matrix_matches_docs(root: &Path) -> Result<(), String> {
-    let adapters = adapters_or_err(root)?;
-    let doc_path = root.join("docs/build-artifacts.md");
-    let doc = std::fs::read_to_string(&doc_path).map_err(|e| {
+    let d = derived_or_err(root)?;
+    let doc = std::fs::read_to_string(root.join("docs/build-artifacts.md")).map_err(|e| {
         format!(
             "docs/build-artifacts.md: {e}; section 18 requires a published capability matrix the \
              code is checked against"
         )
     })?;
-    let matrix = parse(root, "crates/core/src/build_adapters/matrix.rs")?;
+    let ids: BTreeSet<String> = d.adapters.iter().filter_map(|a| a.id.clone()).collect();
+    let implemented = matrix_implemented_ids(root)?;
     let mut problems = Vec::new();
-    for rel in &adapters {
-        let id = module_name(rel).replace('_', "-");
-        if !doc.contains(&format!("`{id}`")) {
-            problems.push(format!(
-                "docs/build-artifacts.md has no matrix row naming `{id}`"
-            ));
-        }
-        if !matrix.text.contains(&format!("\"{id}\"")) {
-            problems.push(format!("build_adapters/matrix.rs has no entry for `{id}`"));
-        }
-    }
-    // Every table row that names an action capability must say the same
-    // thing the code says. Until an adapter implements an action, that
-    // is "inspection only" everywhere.
+    let mut doc_implemented: BTreeSet<String> = BTreeSet::new();
     for line in doc.lines() {
+        if !line.starts_with('|') {
+            continue;
+        }
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        if cells.len() < 3 || !line.starts_with('|') {
+        if cells.len() < 4 {
             continue;
         }
-        // The row's *first cell* must name the adapter, backticked and
-        // whole. A substring match read `maven-metadata-local.xml` in
-        // the origin-evidence table as a Maven support row and demanded
-        // an actions column of it.
-        let names_adapter = adapters
-            .iter()
-            .any(|rel| cells[1].starts_with(&format!("`{}`", module_name(rel).replace('_', "-"))));
-        if !names_adapter {
+        let Some(first) = cells[1].strip_prefix('`') else {
+            continue;
+        };
+        let Some(id) = first.split('`').next() else {
+            continue;
+        };
+        let status = cells[2].to_ascii_lowercase();
+        if status != "implemented" && status != "planned" {
             continue;
         }
-        let lowered = line.to_ascii_lowercase();
-        if !lowered.contains("inspection only") && !lowered.contains("inspection-only") {
+        if status == "implemented" {
+            doc_implemented.insert(id.to_string());
+        }
+        let actions = cells[cells.len() - 2].to_ascii_lowercase();
+        if actions != "inspection only" {
             problems.push(format!(
-                "docs/build-artifacts.md row `{}` does not state inspection only: no build \
-                 adapter implements an action, so any other claim is unkept",
-                cells[1]
+                "docs/build-artifacts.md row `{id}` claims `{actions}`: no build adapter \
+                 implements an action, so any claim but `inspection only` is unkept"
             ));
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
+    for id in ids.difference(&doc_implemented) {
+        problems.push(format!(
+            "docs/build-artifacts.md has no implemented support row for adapter `{id}`"
+        ));
     }
+    for id in doc_implemented.difference(&ids) {
+        problems.push(format!(
+            "docs/build-artifacts.md marks `{id}` implemented and no adapter has that id"
+        ));
+    }
+    for id in ids.difference(&implemented) {
+        problems.push(format!(
+            "build_adapters/matrix.rs has no implemented entry for `{id}`"
+        ));
+    }
+    for id in implemented.difference(&ids) {
+        problems.push(format!(
+            "build_adapters/matrix.rs marks `{id}` implemented and no adapter has that id"
+        ));
+    }
+    let matrix = load_or_err(root, &format!("{BUILD_ADAPTERS_DIR}/matrix.rs"))?;
+    struct V {
+        out: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+            for field in &s.fields {
+                if field.member.to_token_stream().to_string() == "actions" {
+                    let v = field.expr.to_token_stream().to_string();
+                    if v != "INSPECTION_ONLY" && v != "\"inspection only\"" {
+                        self.out.push(v);
+                    }
+                }
+            }
+            syn::visit::visit_expr_struct(self, s);
+        }
+    }
+    let mut v = V { out: Vec::new() };
+    v.visit_file(&matrix.ast);
+    for claim in v.out {
+        problems.push(format!(
+            "build_adapters/matrix.rs claims `{claim}`: no build adapter implements an action"
+        ));
+    }
+    let defines_inspection_only = matrix.ast.items.iter().any(|i| {
+        matches!(i, syn::Item::Const(c)
+            if c.ident == "INSPECTION_ONLY"
+                && c.expr.to_token_stream().to_string() == "\"inspection only\"")
+    });
+    if !defines_inspection_only {
+        problems.push(
+            "build_adapters/matrix.rs no longer defines `INSPECTION_ONLY` as \"inspection only\"; \
+             a redefined constant is a claimed action by another name"
+                .into(),
+        );
+    }
+    finish(problems)
 }
 
 // ---------------------------------------------------------------------
 // build_adapters_reuse_under_event_coverage
 // ---------------------------------------------------------------------
 
-/// Statement: an unchanged build container is replayed through the same
-/// `EventCoverage`-gated container seam the agent adapters use, never
-/// through a directory mtime stamp alone.
+/// Statement: stored build units are replayed only when this pass's
+/// `EventCoverage` vouches for the container, and that answer is
+/// honoured; no governed function decides reuse from a stamp.
 ///
-/// stack/13 landed that gate because a directory's own stamp does not
-/// move when a file *inside a subdirectory* changes, so "the stamp is
-/// the same" is not "nothing changed". The build side is where that
-/// matters most: a `target/` or `node_modules` whose top-level stamp
-/// never moves would be replayed forever.
+/// Derived: the *replay sites* are the governed functions outside the
+/// cache type's own `impl` that read the cache's storage
+/// (`<..>.cache.entries`). Every one of them must reach, within its file,
+/// a call to `unchanged_since` whose result is not discarded -- a
+/// `let _ = coverage.unchanged_since(..)` is a removed gate. Separately,
+/// a governed function that mentions reuse or replay and reads an
+/// `mtime` with no honoured coverage call anywhere it reaches fails.
 pub fn build_adapters_reuse_under_event_coverage(root: &Path) -> Result<(), String> {
-    let modrs = parse(root, "crates/core/src/build_adapters/mod.rs").map_err(|e| {
-        format!("{e}; section 18 requires the build adapters' shared model and container seam")
-    })?;
+    let d = derived_or_err(root)?;
     let mut problems = Vec::new();
-    if !modrs.text.contains("EventCoverage") && !modrs.text.contains("event_coverage") {
-        problems.push(
-            "build_adapters/mod.rs does not consult `EventCoverage`: container reuse is gated on \
-             trusted event coverage, exactly as the agent containers are, never on a directory \
-             stamp alone"
-                .to_string(),
-        );
-    }
-    // A stamp-only reuse decision is the specific shortcut. If the
-    // module compares modification times to decide reuse, the coverage
-    // gate must be a condition of that decision, not merely present in
-    // the file.
-    for func in ast::functions(&modrs.ast) {
-        // Name, signature and body together. The sweep's own shape was a
-        // function *called* `reuse_container` whose body said only
-        // `previous_mtime == current_mtime`: a body-only rule cannot see
-        // that the comparison is a reuse decision, and a name-only rule
-        // cannot see that it is a stamp.
-        let surface = format!("{} {} {}", func.name, func.sig, func.body);
-        let decides_reuse = surface.contains("reuse") || surface.contains("replay");
-        let uses_stamp = surface.contains("mtime") || surface.contains("mod_time");
-        if decides_reuse
-            && uses_stamp
-            && !surface.contains("coverage")
-            && !surface.contains("Coverage")
-        {
-            problems.push(format!(
-                "build_adapters/mod.rs::{} decides reuse from a modification stamp with no \
-                 coverage gate in the same function: a directory's own stamp does not move when a \
-                 file inside a subdirectory changes",
-                func.name
-            ));
+    let mut replay_sites = 0usize;
+    // Accessors on the cache type: every inherent method that does not
+    // construct one. Reading stored units through one of them is a
+    // replay site exactly as reading its storage field is.
+    let mut cache_readers: Vec<String> = Vec::new();
+    for rel in &d.governed {
+        let f = load_or_err(root, rel)?;
+        for item in &f.ast.items {
+            if let syn::Item::Impl(imp) = item
+                && imp.self_ty.to_token_stream().to_string() == CACHE_TYPE
+            {
+                for it in &imp.items {
+                    if let syn::ImplItem::Fn(m) = it {
+                        let ret = m.sig.output.to_token_stream().to_string();
+                        if !ret.contains("Self") && !ret.contains(CACHE_TYPE) {
+                            cache_readers.push(m.sig.ident.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        problems.sort();
-        problems.dedup();
-        Err(problems.join("\n  "))
+    for rel in &d.governed {
+        let f = load_or_err(root, rel)?;
+        let funcs = ast::functions(&f.ast);
+        let calls = crate::resolve::production_calls(&f.ast);
+        let by_name: HashMap<&str, &ast::Func> =
+            funcs.iter().map(|x| (x.name.as_str(), x)).collect();
+        let cache_impl: HashSet<String> = f
+            .ast
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                syn::Item::Impl(imp) if imp.self_ty.to_token_stream().to_string() == CACHE_TYPE => {
+                    Some(imp.items.iter().filter_map(|it| match it {
+                        syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let reach = |start: &str| -> HashSet<String> {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut stack = vec![start.to_string()];
+            while let Some(n) = stack.pop() {
+                if !seen.insert(n.clone()) {
+                    continue;
+                }
+                for c in calls.iter().filter(|c| c.func == n) {
+                    let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
+                    if by_name.contains_key(callee.as_str()) {
+                        stack.push(callee);
+                    }
+                }
+            }
+            seen
+        };
+        let gated_in = |n: &str| {
+            calls.iter().any(|c| {
+                c.func == n
+                    && c.path.rsplit("::").next() == Some("unchanged_since")
+                    && c.honoured != crate::resolve::Honoured::Discarded
+            })
+        };
+        for func in &funcs {
+            let reachable = reach(&func.name);
+            let gated = reachable.iter().any(|n| gated_in(n));
+            let reads_cache = func.body.contains("cache . entries")
+                || cache_readers
+                    .iter()
+                    .any(|m| func.body.contains(&format!(". {m} (")));
+            if reads_cache && !cache_impl.contains(&func.name) {
+                replay_sites += 1;
+                if !gated {
+                    problems.push(format!(
+                        "{rel}::{} reads stored build units and nothing it reaches honours \
+                         `EventCoverage::unchanged_since`: replay is gated on trusted event \
+                         coverage, and a discarded answer is no gate",
+                        func.name
+                    ));
+                }
+            }
+            let surface: String = reachable
+                .iter()
+                .filter_map(|n| by_name.get(n.as_str()))
+                .map(|x| format!("{} {} {}", x.name, x.sig, x.body))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let decides_reuse = surface.contains("reuse") || surface.contains("replay");
+            let uses_stamp = surface.contains("mtime") || surface.contains("mod_time");
+            if decides_reuse && uses_stamp && !gated {
+                problems.push(format!(
+                    "{rel}::{} decides reuse from a modification stamp with no coverage gate \
+                     anywhere it reaches: a directory's own stamp does not move when a file inside \
+                     a subdirectory changes",
+                    func.name
+                ));
+            }
+        }
     }
+    if replay_sites == 0 {
+        problems.push(
+            "no governed function reads the container cache: section 18 requires unchanged \
+             containers to be replayed (zero listings), gated on EventCoverage"
+                .into(),
+        );
+    }
+    finish(problems)
 }
 
 #[cfg(test)]
@@ -712,91 +2043,130 @@ mod tests {
         tmp
     }
 
-    const REGISTRY: &str = r#"
-        pub struct Registry;
-        impl Registry {
-            pub fn with_builtins() -> Self { let _ = super::cargo::Adapter; Self }
-        }
-    "#;
-    const MATRIX: &str = r#"pub const IDS: &[&str] = &["cargo"];"#;
-    const BOUNDED: &str = r#"pub const MAX_MANIFEST_BYTES: usize = 262144;"#;
-    const MODRS: &str = r#"pub struct NestedUnitBuilder; pub fn gate(c: &EventCoverage) {}"#;
-
-    fn base() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("crates/core/src/build_adapters/registry.rs", REGISTRY),
-            ("crates/core/src/build_adapters/matrix.rs", MATRIX),
-            ("crates/core/src/build_adapters/bounded_io.rs", BOUNDED),
-            ("crates/core/src/build_adapters/mod.rs", MODRS),
-        ]
-    }
-
     #[test]
-    fn an_absent_build_adapters_directory_is_the_first_failure() {
+    fn an_absent_adapter_set_is_the_first_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let err = build_adapters_are_pluggable(tmp.path()).unwrap_err();
-        assert!(err.contains("has no adapter modules"), "{err}");
+        assert!(err.contains("no `impl BuildAdapter`"), "{err}");
     }
 
     #[test]
-    fn an_adapter_naming_another_adapter_is_rejected() {
-        let mut files = base();
-        files.push((
-            "crates/core/src/build_adapters/cargo.rs",
-            "pub fn f() { super::node::helper(); }",
-        ));
-        files.push((
-            "crates/core/src/build_adapters/node.rs",
-            "pub fn helper() {}",
-        ));
-        let tmp = tree(&files);
-        let err = build_adapters_are_pluggable(tmp.path()).unwrap_err();
-        assert!(err.contains("reaches into adapter `node`"), "{err}");
+    fn the_adapter_set_is_derived_from_the_trait_impl_anywhere() {
+        let tmp = tree(&[
+            (
+                "crates/core/src/build_adapters/anything.rs",
+                "pub struct A;\nimpl BuildAdapter for A { fn id(&self) -> &'static str { \
+                 \"anything\" } }",
+            ),
+            (
+                "crates/core/src/build_adapters/helper.rs",
+                "pub fn shared() -> u8 { 1 }",
+            ),
+            (
+                "crates/core/src/elsewhere.rs",
+                "pub struct B;\nimpl BuildAdapter for B { fn id(&self) -> &'static str { \"b\" } }",
+            ),
+        ]);
+        let d = derive(tmp.path());
+        let ids: Vec<Option<String>> = d.adapters.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids, vec![Some("anything".into()), Some("b".into())]);
+        assert!(
+            d.governed.iter().any(|g| g.ends_with("elsewhere.rs")),
+            "an adapter outside build_adapters/ is governed"
+        );
+        assert!(
+            d.governed.iter().any(|g| g.ends_with("helper.rs")),
+            "a helper is not an adapter and is still governed"
+        );
     }
 
     #[test]
-    fn spawning_a_build_tool_during_identification_is_rejected() {
-        let mut files = base();
-        files.push((
-            "crates/core/src/build_adapters/node.rs",
-            "use std::process::Command as Runner;\npub fn f() { let _ = Runner::new(\"npm\"); }",
-        ));
-        let tmp = tree(&files);
-        let err = build_adapters_are_inspection_only(tmp.path()).unwrap_err();
-        assert!(err.contains("Command"), "{err}");
+    fn no_module_is_exempt_by_name() {
+        let tmp = tree(&[
+            (
+                "crates/core/src/build_adapters/a.rs",
+                "pub struct A;\nimpl BuildAdapter for A { fn id(&self) -> &'static str { \"a\" } }",
+            ),
+            ("crates/core/src/build_adapters/mod.rs", "pub fn m() {}"),
+            (
+                "crates/core/src/build_adapters/registry.rs",
+                "pub fn r() {}",
+            ),
+            ("crates/core/src/build_adapters/matrix.rs", "pub fn x() {}"),
+            (
+                "crates/core/src/build_adapters/bounded_io.rs",
+                "pub fn b() {}",
+            ),
+        ]);
+        assert_eq!(derive(tmp.path()).governed.len(), 5);
     }
 
     #[test]
-    fn an_aliased_whole_file_read_is_rejected() {
-        let mut files = base();
-        files.push((
-            "crates/core/src/build_adapters/node.rs",
-            "use std::fs::read_to_string as slurp;\npub fn f(p: &std::path::Path) { let _ = \
-             slurp(p); }",
-        ));
-        let tmp = tree(&files);
-        let err = build_adapters_read_bounded_manifests_only(tmp.path()).unwrap_err();
-        assert!(err.contains("read_to_string"), "{err}");
+    fn a_bounded_primitive_that_lost_its_cap_is_rejected() {
+        let tmp = tree(&[
+            (
+                "crates/core/src/build_adapters/bounded_io.rs",
+                "pub const MAX_MANIFEST_BYTES: usize = 1;\npub fn read_manifest(p: \
+                 &std::path::Path, cap: usize) -> Option<String> { let _ = (p, cap); None }\npub \
+                 fn read_whole_manifest() {}",
+            ),
+            (
+                "crates/core/src/locations/mod.rs",
+                "pub const SHALLOW_LIST_CAP: usize = 8;\npub fn shallow_list() { let _ = \
+                 SHALLOW_LIST_CAP; }\npub fn shallow_dir_names() { let _ = SHALLOW_LIST_CAP; }",
+            ),
+        ]);
+        let err = bounded_primitives_still_bounded(tmp.path()).unwrap_err();
+        assert!(err.contains("read_manifest"), "{err}");
     }
 
     #[test]
-    fn an_ignored_required_test_does_not_satisfy_the_contract() {
-        let mut files = base();
-        let body = REQUIRED_BUILD_TESTS
+    fn a_namespace_target_matches_any_member() {
+        let call = |path: &str| Call {
+            func: "f".into(),
+            path: path.into(),
+            written: path.into(),
+            method: false,
+        };
+        assert!(target_matches(
+            Target::Namespace("Command"),
+            &call("std::process::Command::new")
+        ));
+        assert!(target_matches(
+            Target::Namespace("actions"),
+            &call("crate::actions::propose_for_path")
+        ));
+        assert!(!target_matches(
+            Target::Namespace("actions"),
+            &call("crate::build_adapters::actions_label")
+        ));
+        assert!(!target_matches(Target::Namespace("walk"), &call("walk")));
+    }
+
+    #[test]
+    fn a_field_write_is_seen_in_every_form() {
+        let fields: HashSet<String> = ["action", "coverage", "supported", "bytes", "limits"]
             .iter()
-            .map(|t| {
-                if *t == "age_is_not_obsolescence" {
-                    format!("#[ignore]\n    fn {t}() {{ assert!(true); }}\n")
-                } else {
-                    format!("    fn {t}() {{ assert!(true); }}\n")
-                }
-            })
-            .collect::<String>();
-        let src = format!("#[cfg(test)]\nmod tests {{\n{body}}}\n");
-        let leaked: &'static str = Box::leak(src.into_boxed_str());
-        files.push(("crates/core/src/build_adapters/node.rs", leaked));
-        let tmp = tree(&files);
-        let err = build_adapter_test_contract(tmp.path()).unwrap_err();
-        assert!(err.contains("age_is_not_obsolescence"), "{err}");
+            .map(|s| s.to_string())
+            .collect();
+        let f: syn::File = syn::parse_str(
+            "fn a(u: &mut U) { u.coverage.supported = true; }
+             fn b(u: &mut U) { u.bytes += 1; }
+             fn c(u: &mut U) { u.coverage.limits.clear(); }
+             fn d(u: &mut U) { std::mem::take(&mut u.action); }
+             fn e(u: &U) -> bool { u.coverage.limits.iter().any(|l| l.is_empty()) }
+             fn g(u: &mut U) { let _ = vec![u.coverage.limits.pop()]; }
+             impl NestedUnitBuilder { fn ok(mut self) -> Self { self.unit.bytes = 1; self } }",
+        )
+        .unwrap();
+        let writes: Vec<String> = field_writes(&f, &fields)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["a", "b", "c", "d", "g"],
+            "e is a read; the builder's own impl is exempt; g is inside a macro"
+        );
     }
 }

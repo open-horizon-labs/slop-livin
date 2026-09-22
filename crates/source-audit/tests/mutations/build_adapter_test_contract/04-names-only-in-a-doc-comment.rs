@@ -1,12 +1,15 @@
-//! target: crates/core/src/build_adapters/bun.rs
-//! why: an adapter module absent from the static registry identifies nothing and no test notices
+//! target: crates/core/src/build_adapters/zig_build.rs
+//! why: re-review 3's agent-side slip -- the five names written in a doc comment satisfied a text search for `fn <name>(`
+/// fn unknown_layout_is_explicit_not_empty() fn identification_reads_no_more_than_manifest_cap()
+/// fn no_project_or_build_code_is_executed() fn variants_never_collapse_by_basename()
+/// fn age_is_not_obsolescence()
 pub struct Adapter;
 impl super::BuildAdapter for Adapter {
     fn id(&self) -> &'static str {
-        "bun"
+        "zig-build"
     }
     fn name(&self) -> &'static str {
-        "Bun"
+        "Zig"
     }
     fn containers(
         &self,

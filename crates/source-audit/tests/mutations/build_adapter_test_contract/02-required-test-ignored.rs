@@ -1,6 +1,28 @@
 //! target: crates/core/src/build_adapters/deno_build.rs
 //! why: a named test resolves by name whether or not it ever runs; `#[ignore]` satisfied the old existence check
 pub struct Adapter;
+impl super::BuildAdapter for Adapter {
+    fn id(&self) -> &'static str {
+        "deno-build"
+    }
+    fn name(&self) -> &'static str {
+        "Deno"
+    }
+    fn containers(
+        &self,
+        _root: &std::path::Path,
+        _candidates: &[std::path::PathBuf],
+    ) -> Vec<super::BuildContainer> {
+        Vec::new()
+    }
+    fn identify(
+        &self,
+        _c: &super::BuildContainer,
+        _ctx: &super::BuildCtx,
+    ) -> Vec<crate::artifact::NestedArtifact> {
+        Vec::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]

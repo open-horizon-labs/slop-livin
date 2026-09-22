@@ -22,14 +22,30 @@ directions.
 
 ## Detection
 
-For every registered adapter: `docs/build-artifacts.md` contains a row
-naming its id in backticks, and `matrix.rs` contains an entry for it.
-Every table row naming an adapter must contain "inspection only".
+All eight build-adapter rules range over **derived** sets
+(`crates/source-audit/src/build_audits.rs`, module doc): the governed
+modules are every file under `crates/core/src/build_adapters/` --
+`mod.rs`, `registry.rs`, `matrix.rs`, `jvm_common.rs` and `bounded_io.rs`
+included, no file exempt by name -- plus any workspace file holding an
+`impl BuildAdapter for ..`; adapters, their types and their ids are read
+from those impls. Re-review 3 (`review/REVIEW-STACK-3.md` section 1)
+found 31 of 43 audit slips were a hand-written list that did not contain
+the thing; these rules keep no such list except the four bounded
+primitives, each of which is itself checked to name its cap.
 
-**Limits.** The audit matches rows by adapter id and checks the action
-column's wording. Role and layout columns are compared against the code
-by the executable test below, which parses the table rather than
-grepping it.
+`docs/build-artifacts.md`'s support rows (first cell a backticked id,
+second `implemented`/`planned`), the matrix's `Status::Implemented`
+struct literals and the derived adapter ids are the same implemented
+set in all three directions; every docs row's Actions cell is exactly
+`inspection only`; every matrix entry's `actions` is `INSPECTION_ONLY`,
+which must still be defined as `"inspection only"`. The executable
+column-by-column half is
+`build_adapter_contract::docs_table_equals_the_capability_matrix`
+(status, families, operation granularity and actions per row, and the
+set of rows).
+
+**Limits.** The known-layouts and attribution-limits columns are prose
+and are compared by review, not by equality.
 
 ## Runtime tests that complete it
 

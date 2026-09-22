@@ -1,12 +1,13 @@
-//! target: crates/core/src/build_adapters/bun.rs
-//! why: an adapter module absent from the static registry identifies nothing and no test notices
-pub struct Adapter;
-impl super::BuildAdapter for Adapter {
+//! target: crates/core/src/build_adapters/bazel_build.rs
+//! why: alias/rename variant -- `use super::BuildAdapter as Identify; impl Identify for ..` is an adapter with no proofs, and a derivation matching the trait's spelling would not count it
+use super::BuildAdapter as Identify;
+pub struct Bazel;
+impl Identify for Bazel {
     fn id(&self) -> &'static str {
-        "bun"
+        "bazel-build"
     }
     fn name(&self) -> &'static str {
-        "Bun"
+        "Bazel"
     }
     fn containers(
         &self,

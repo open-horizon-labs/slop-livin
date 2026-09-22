@@ -1,12 +1,12 @@
-//! target: crates/core/src/build_adapters/bun.rs
-//! why: an adapter with no published matrix row or docs row is an undocumented support claim
+//! target: crates/core/src/build_adapters/elm_build.rs
+//! why: the five functions exist but are plain fns outside `#[cfg(test)]` with no `#[test]` -- nothing ever runs them
 pub struct Adapter;
 impl super::BuildAdapter for Adapter {
     fn id(&self) -> &'static str {
-        "bun"
+        "elm-build"
     }
     fn name(&self) -> &'static str {
-        "Bun"
+        "Elm"
     }
     fn containers(
         &self,
@@ -23,25 +23,19 @@ impl super::BuildAdapter for Adapter {
         Vec::new()
     }
 }
-#[cfg(test)]
 mod tests {
-    #[test]
     fn unknown_layout_is_explicit_not_empty() {
         assert!(true);
     }
-    #[test]
     fn identification_reads_no_more_than_manifest_cap() {
         assert!(true);
     }
-    #[test]
     fn no_project_or_build_code_is_executed() {
         assert!(true);
     }
-    #[test]
     fn variants_never_collapse_by_basename() {
         assert!(true);
     }
-    #[test]
     fn age_is_not_obsolescence() {
         assert!(true);
     }

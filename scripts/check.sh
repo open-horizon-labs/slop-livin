@@ -28,10 +28,13 @@ cargo test -p swamp-core \
 # of the code, and only these prove that an unchanged container really
 # reads nothing, that a shared store is charged once, that the published
 # capability table matches the registry, and that no identified unit
-# renders a verdict.
+# renders a verdict; `build_adapter_history` drives the real report
+# pipeline for Node and Gradle (full vs incremental, reclassification,
+# unreadable members, the JSON interior, and the refresh cost).
 cargo test -p swamp-core \
   --test build_adapter_contract \
-  --test build_adapter_cost
+  --test build_adapter_cost \
+  --test build_adapter_history
 
 # `--test-threads=1` here and nowhere else. This test measures through
 # the *process-global* work counters (`work_counters::reset` +
