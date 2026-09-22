@@ -230,24 +230,55 @@ fn the_unmutated_workspace_copy_reproduces_the_real_audit_result() {
 /// Section 17, item 6: an audit with no rejection fixture is an audit
 /// nobody has shown rejects anything. The sweep's own result is the
 /// argument -- all 42 passed their own tests and all 42 slipped.
+///
+/// Porting every audit is not one session's work, so this is a
+/// **ratchet**, not a wish: `NOT_YET_IN_THE_CORPUS` lists the audits
+/// still to port, and the test fails in both directions. An audit
+/// removed from the list without fixtures fails; an audit that gains
+/// fixtures while still listed also fails, so the list can only shrink.
+/// It is checked in beside the fixtures rather than described in a
+/// session note, because a gap nothing executes is a gap nobody closes.
 #[test]
-fn every_audit_has_rejection_fixtures() {
+fn every_audit_has_rejection_fixtures_or_is_on_the_shrinking_list() {
     let fixtures = fixtures();
-    let mut missing: Vec<String> = Vec::new();
+    let uncovered_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mutations/NOT_YET_IN_THE_CORPUS");
+    let listed: Vec<String> = std::fs::read_to_string(&uncovered_path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+
+    let mut problems: Vec<String> = Vec::new();
+    for name in &listed {
+        if !AUDITS.iter().any(|(n, _)| n == name) {
+            problems.push(format!(
+                "{name} is on the to-port list but is not a registered audit"
+            ));
+        }
+    }
     for (name, _) in AUDITS {
         let n = fixtures
             .iter()
             .filter(|f| f.audit == *name && f.expect == "reject")
             .count();
-        if n < 3 {
-            missing.push(format!("{name} ({n}/3)"));
+        let on_list = listed.iter().any(|l| l == name);
+        if n >= 3 && on_list {
+            problems.push(format!(
+                "{name} now has {n} rejection fixtures: remove it from \
+                 tests/mutations/NOT_YET_IN_THE_CORPUS"
+            ));
+        }
+        if n < 3 && !on_list {
+            problems.push(format!(
+                "{name} has {n}/3 rejection fixtures and is not on the to-port list: add three \
+                 (one alias/rename, one discarded-result, one audit-specific) or add the audit to \
+                 tests/mutations/NOT_YET_IN_THE_CORPUS with a reason"
+            ));
         }
     }
-    assert!(
-        missing.is_empty(),
-        "these audits have fewer than three rejection fixtures under \
-         crates/source-audit/tests/mutations/, including one alias/rename and one \
-         discarded-result variant:\n  {}",
-        missing.join("\n  ")
-    );
+    problems.sort();
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

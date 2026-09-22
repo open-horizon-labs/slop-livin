@@ -27,6 +27,13 @@ cargo test -p swamp-core \
 cargo test -p swamp-tui --test scope_preserving_refresh \
   --test reviewer_counterexamples_stack2_tui
 
+# The audit machinery's own mutation corpus: every slip the 2026-09-22
+# background sweep found, applied to a copy of the real workspace, with
+# the audit that let it through required to reject it
+# (GUARDRAILS_SPEC.md section 17). Named explicitly because an audit
+# nobody has shown rejects anything is the state all 42 were in.
+cargo test -p swamp-source-audit --test mutation_corpus
+
 # These checks intentionally fail obvious safety regressions in source
 # review: a raw recursive delete, and verdict vocabulary the tool never
 # applies to a path ("safe", "unused", "stale" are for the human to
