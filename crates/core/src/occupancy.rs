@@ -100,15 +100,50 @@ pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
         crate::platform::OccupancyProbe::Procfs => {
             // SAFETY: getpid cannot fail and reads no memory.
             let pid = unsafe { libc::getpid() as u32 };
-            procfs_probe(
+            let procfs = procfs_probe(
                 Path::new("/proc"),
                 paths,
                 &Creds::of_self(),
                 pid,
                 OCCUPANCY_TIMEOUT,
-            )
+            );
+            // procfs is the answer; `lsof`, where one is installed, is a
+            // second reader of the same kernel state and can only make
+            // the answer stricter: Occupied or Unknown from either wins,
+            // Free needs both. With no `lsof` on PATH, procfs stands on
+            // its own -- a minimal install has none, and needs none.
+            if procfs != OccupancyState::Free || !lsof_on_path() {
+                return procfs;
+            }
+            for p in paths {
+                match lsof_probe(p) {
+                    OccupancyState::Free => {}
+                    other => return other,
+                }
+            }
+            OccupancyState::Free
         }
     }
+}
+
+/// Whether an `lsof` is on `PATH` at all -- present, not necessarily
+/// runnable. A present `lsof` that cannot be run is a second reader
+/// that could not answer, which is `Unknown`, exactly as on macOS.
+///
+/// A `PATH` entry that cannot be examined counts as "maybe": the second
+/// reader is then tried, and if it cannot run the answer is `Unknown`.
+fn lsof_on_path() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        match std::fs::symlink_metadata(dir.join("lsof")) {
+            Ok(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// The name a current-use fact gives for where its answer came from.

@@ -35,10 +35,12 @@ Target gating of `Os::current` and the `CAPABILITIES` table are not text checks:
 
 Runtime halves, because an audit does not prove a refusal refuses:
 
-- `schedule::tests::install_refuses_and_writes_nothing_where_there_is_no_scheduler` — no plist, no agents entry, no log directory.
-- `schedule::tests::install_refuses_before_it_validates_the_interval`.
-- `schedule::tests::uninstall_and_status_report_the_capability_not_an_empty_installation`.
-- `platform::tests::linux_scheduling_refuses_with_a_reason_and_an_issue`.
+- `schedule::tests::install_without_a_user_manager_refuses_and_writes_nothing` (Linux) — no unit, no unit directory, no log directory, never a LaunchAgent.
+- `schedule::tests::install_and_off_through_the_real_entry_points_use_systemd_units_only` (Linux) and `schedule::tests::macos_refuses_a_collector`.
+- `systemd_user::tests::*` — the whole systemd lifecycle against an injected backend, on both platforms: refusal with no manager, owned units only, duplicate install/update, a failed start rolled back, uninstall.
+- `platform::tests::each_platform_has_its_own_scheduler_and_neither_the_others`.
+
+Since #83 Linux has a scheduler, so "refuse and write nothing" is now the answer to a *missing user manager* (a runtime fact) rather than to the platform; the static `Scheduling::Unavailable` refusal remains for a target with no backend at all.
 - `fs_events::tests::a_kernel_without_persisted_history_says_so_rather_than_unsupported`.
 - `platform::tests::a_live_watch_epoch_does_not_cover_time_before_the_watch_opened`.
 

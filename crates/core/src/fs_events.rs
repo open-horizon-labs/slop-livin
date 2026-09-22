@@ -295,10 +295,19 @@ impl FsEventsPlan {
     }
 
     /// A refusal a live consumer builds itself: the watch lost coverage,
-    /// or the stored observation predates the watch's epoch. The walk is
-    /// full, and `reason` is what the coverage note names.
+    /// the collector stopped, or the stored observation predates the
+    /// watch's epoch. The walk is full, and `reason` is what the coverage
+    /// note names.
+    ///
+    /// Marked `live`: the replay-lag floor ([`RefreshRefusal::TooSoon`])
+    /// protects a replay of a *persisted* log that may lag a write, and
+    /// no persisted log was consulted here, so it must not replace the
+    /// actual reason with `too_soon`.
     pub fn refused(reason: RefreshRefusal, device: Option<u64>) -> Self {
-        Self::refuse(reason, 0, device)
+        Self {
+            live: true,
+            ..Self::refuse(reason, 0, device)
+        }
     }
 
     fn refuse(reason: RefreshRefusal, current_event_id: u64, device: Option<u64>) -> Self {

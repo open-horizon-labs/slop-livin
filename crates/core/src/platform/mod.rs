@@ -330,7 +330,8 @@ pub enum OccupancyProbe {
     /// Linux: procfs, read directly and unprivileged (#86) -- `cwd`,
     /// `root`, `exe`, every fd and every mapped file of each process
     /// running as this user. No `lsof` dependency, which a minimal
-    /// Ubuntu install does not have.
+    /// Ubuntu install does not have; where one is installed it is a
+    /// second reader that can only make the answer stricter.
     Procfs,
 }
 

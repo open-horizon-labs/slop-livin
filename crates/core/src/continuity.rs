@@ -536,6 +536,8 @@ fn collect_one(
     let mut last_flush = Instant::now() - Duration::from_secs(60);
     let mut last_event = Instant::now();
     let mut dirty_since_flush = true;
+    // An unrecoverable loss is written once, not on every pass.
+    let mut loss_flushed = false;
     log(&format!(
         "watching {} ({} watches, epoch {epoch} opened at {})",
         root.display(),
@@ -579,7 +581,7 @@ fn collect_one(
             Coverage::Complete => None,
         };
         let due = pending_sync
-            || lost.is_some()
+            || (lost.is_some() && !loss_flushed)
             || stopping
             || (dirty_since_flush
                 && (last_event.elapsed() >= Duration::from_millis(400)
@@ -666,9 +668,10 @@ fn collect_one(
                     dirty_since_flush = true;
                     log(&format!("{}: new epoch {epoch}", root.display()));
                 } else {
-                    // Unrecoverable (watch limit, permissions): keep
-                    // saying so, and keep answering sync requests so an
-                    // observation hears it rather than timing out.
+                    // Unrecoverable (watch limit, permissions): said once,
+                    // and every sync request is still answered with it, so
+                    // an observation hears it rather than timing out.
+                    loss_flushed = true;
                 }
             }
         }

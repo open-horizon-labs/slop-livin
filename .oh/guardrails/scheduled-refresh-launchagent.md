@@ -10,7 +10,7 @@ audit: scheduled_refresh_launchagent
 Growth needs a baseline. Without a schedule the first question a user asks has no history behind it.
 
 ## Detection
-The CLI exposes a `Schedule` subcommand and `core::schedule` drives `launchctl` where launchd exists. AST audit `scheduled_refresh_launchagent`. The platform-neutral half -- every `install` consults the scheduling capability, honours the answer, and does so before any write -- is audit `platform_capabilities_gate_their_backends`, with the runtime half in `schedule::tests::install_refuses_and_writes_nothing_where_there_is_no_scheduler`.
+The CLI exposes a `Schedule` subcommand and `core::schedule` drives `launchctl` where launchd exists. AST audit `scheduled_refresh_launchagent`. The platform-neutral half -- every `install` consults the scheduling capability, honours the answer, and does so before any write -- is audit `platform_capabilities_gate_their_backends`, with the runtime half in `schedule::tests::install_without_a_user_manager_refuses_and_writes_nothing` (Linux: the systemd backend refuses and writes nothing where no user manager is reachable) and the injected-backend lifecycle tests in `systemd_user::tests`.
 
 ## Limits
 Linux has no scheduler here at all (#86). The guardrail holds by refusal, which is the outcome it is for: a baseline nobody has is visible, and a job that silently never runs is not.
