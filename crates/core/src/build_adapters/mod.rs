@@ -631,7 +631,15 @@ pub struct FamilySummary {
     pub complete: bool,
 }
 
-/// Collapses a container's units into one row per role family.
+/// Collapses the units *inside* `container` into one row per role
+/// family.
+///
+/// `container` is taken explicitly and excluded, rather than inferred.
+/// A container's own row usually does not carry the `Container` role --
+/// a `node_modules` is `InstalledDependencies`, a Gradle `build/` is
+/// `Output` -- so inferring it from the role meant the container looked
+/// like an ordinary unit, every real member looked like its descendant,
+/// and the summary collapsed to one row holding the container itself.
 ///
 /// Two rules, both from #65:
 ///
@@ -643,10 +651,11 @@ pub struct FamilySummary {
 ///   accounting basis; a family holding both allocated and logical
 ///   numbers reports [`AccountingBasis::Unknown`] and no total, because
 ///   a mixed number is worse than no number.
-pub fn summarize_families(units: &[NestedArtifact]) -> Vec<FamilySummary> {
+pub fn summarize_families(container: &Path, units: &[NestedArtifact]) -> Vec<FamilySummary> {
+    let units: Vec<&NestedArtifact> = units.iter().filter(|u| u.path != container).collect();
     let paths: std::collections::HashSet<&Path> = units.iter().map(|u| u.path.as_path()).collect();
     let mut by_family: HashMap<RoleFamily, Vec<&NestedArtifact>> = HashMap::new();
-    for u in units {
+    for u in units.iter().copied() {
         if u.role == ArtifactRole::Container {
             continue;
         }
@@ -798,7 +807,7 @@ mod tests {
                 .is_dir(true)
                 .bytes_on_basis(400, AccountingBasis::Allocated)
                 .build();
-        let s = summarize_families(&[outer, inner]);
+        let s = summarize_families(tmp.path(), &[outer, inner]);
         let outputs = s.iter().find(|f| f.family == RoleFamily::Outputs).unwrap();
         assert_eq!(outputs.count, 1);
         assert_eq!(
@@ -817,7 +826,7 @@ mod tests {
         let b = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("b"))
             .bytes_on_basis(100, AccountingBasis::Logical)
             .build();
-        let s = summarize_families(&[a, b]);
+        let s = summarize_families(tmp.path(), &[a, b]);
         let outputs = s.iter().find(|f| f.family == RoleFamily::Outputs).unwrap();
         assert_eq!(outputs.basis, AccountingBasis::Unknown);
         assert_eq!(
@@ -837,7 +846,7 @@ mod tests {
         let undated = NestedUnitBuilder::new(&c, ArtifactRole::Output, tmp.path().join("b"))
             .bytes_on_basis(1, AccountingBasis::Allocated)
             .build();
-        let s = summarize_families(&[dated, undated]);
+        let s = summarize_families(tmp.path(), &[dated, undated]);
         let outputs = s.iter().find(|f| f.family == RoleFamily::Outputs).unwrap();
         assert_eq!(outputs.oldest_modified, Some(5_000));
         assert_eq!(

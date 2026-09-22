@@ -65,6 +65,17 @@ recovery, reclaimability facts with source and freshness) -- read
 `references/evidence.md` before summarizing what keeping or removing
 something would actually mean.
 
+A build container (`target/`, `node_modules/`, a Gradle or Maven
+`build/`) also carries identified units explaining what is inside it.
+Those are **inspection only** -- no build adapter implements an action
+-- and each one states its accounting basis, where its timestamp came
+from, and what removing it would cost in that ecosystem's own words.
+Read `references/build-artifacts.md` before answering "what is in my
+node_modules" or "can I delete this"; several things that look
+inferable there (a build generation, a package's identity from its
+directory name, whether a Maven artifact can be downloaded again) are
+deliberately not inferred.
+
 ## Why this isn't a security boundary
 
 Nothing stops a shell-capable agent from typing `swamp approve` itself.
@@ -88,6 +99,7 @@ enough for read-only investigation.
 | `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 6.8 KB |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
 | `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect`, `swamp propose --path` | 3.4 KB |
+| `references/build-artifacts.md` | What is inside a build container (Cargo, Node, Gradle, Maven): role families, accounting basis, timestamp source, removal consequences, shared stores, and what is never inferred | 3.6 KB |
 | `references/evidence.md` | The activity/consumer/current-use/recovery/reclaimability evidence contract: what each fact's `status`/`source`/`freshness` actually establishes, and what it does not | 5.2 KB |
 
 This file is 5.8 KB (roughly 1,400 tokens at ~4 bytes/token). Each

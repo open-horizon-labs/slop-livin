@@ -39,6 +39,17 @@ back newly added marks, preserving earlier selections. No virtual group is a
 directory deletion target. Age ordering applies within groups; individual members
 can be selected instead of the whole group.
 
+A build container an adapter other than Cargo identified (a `node_modules`,
+a `dist`, a Gradle `build/`, a Maven `target/`) expands the same way, into one
+row per role family. Each row leads with the family and what removing it would
+cost in that ecosystem's own words, then the count, the size with its accounting
+basis, and the oldest known modification. That order is the point: a narrow
+terminal truncates the numbers, never the consequence. These rows are never
+selectable -- no adapter has an action, so none of them reaches the confirmation
+path -- and they say `inspection only`, or name the reason an action is
+unavailable (a shared store entry other projects may link to). A `node_modules`
+that is mostly pnpm store shows that before it shows a total.
+
 The physical tree remains under a collapsed Inspect directories row; it is a
 second view of the same bytes, not additional storage. Physical category rows
 are navigation, not selective cleanup units. The selected-row detail area shows recommendations

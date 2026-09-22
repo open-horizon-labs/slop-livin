@@ -1,0 +1,80 @@
+# Build artifacts (reference)
+
+What is *inside* a `target/`, a `node_modules/`, a Gradle `build/` or a
+Maven `target/`, and what removing a piece of it would cost.
+
+**This layer never removes anything.** No build adapter implements an
+action. Every unit is inspection only; say so rather than implying a
+cleanup path exists. Cargo's own purpose groups
+(`references/cleanup-and-recovery.md`) are the only build-artifact
+cleanup swamp supports, and they are separate from this.
+
+## Where it appears
+
+- `swamp report <root> --view builds` -- artifact rows, then one
+  collapsed row per role family for each identified container.
+- `swamp report <root> --view builds --json` -- each unit's `adapter`,
+  `role`, `basis`, `time_source`, `action`, `consequence`,
+  `coverage.limits` and `variant`.
+- `swamp report <root> --view deps` -- the same breakdown under an
+  installed dependency tree.
+- `swamp report <root> --view rust` -- the Cargo drill-down.
+- TUI: opening a project expands an identified container into its
+  families; a `node_modules` that is mostly pnpm store shows that.
+
+## Role families
+
+`outputs`, `tests`, `intermediates`, `dependencies`, `shared-store`,
+`metadata`, `residual`, `unknown`. Cargo's older roles (`profile`,
+`dependency`, `test-executable`, `example`, `build-script-output`,
+`incremental`, `final-output`, `companion-metadata`) map into the same
+families, so a summary never has a Rust column and an everything-else
+column.
+
+## Reading a unit honestly
+
+| Field | What it establishes | What it does not |
+|---|---|---|
+| `mtime_max` + `time_source` | when something under this unit was last **written** | not when it was last used, read or executed |
+| `bytes` + `basis` | a size on one stated basis | not reclaimable space, and never addable across bases |
+| `role` / family | what kind of thing this is | not that it is obsolete or removable |
+| `consequence` | what happens if the bytes go | not a recommendation to remove them |
+| `action` | inspection only, or unavailable-with-a-reason | never an available action |
+| `coverage.limits` | exactly what swamp could not establish | |
+| `variant.unknowns` | fields with no evidence behind them | |
+
+Summaries carry `unknown_age` separately from `oldest_modified`: a unit
+with no known time is counted, not folded in as epoch zero.
+
+## What is never inferred
+
+- **A build generation.** npm, pnpm, Gradle and Maven record none. A
+  newer similarly-named output does not supersede an older one.
+- **A package's identity from its directory name.** It comes from the
+  package's own `package.json`; unreadable means unknown.
+- **That a Maven artifact can be downloaded again.** Origin is
+  `downloaded`, `locally-installed` or `unknown-origin`, from the marker
+  files beside it. `unknown-origin` is a real answer; never upgrade it
+  to "downloaded".
+- **Anything from running a build tool.** No `npm`/`gradle`/`mvn`/
+  `cargo`, no JS config, no Gradle script, no Maven plugin.
+
+## Shared stores
+
+A pnpm object store, an npm `_cacache`, a Gradle user home and a Maven
+local repository are shared by every project on the machine. Their
+entries carry `shared-hardlink` membership and no physical charge, so a
+project's copy is never added to the store's own total. Which projects
+link a given entry is not derivable from the entry, and no action is
+offered on one.
+
+These stores are identified but **not yet joined into the report pass**
+(they are detector-resolved external locations). Do not claim a report
+shows a machine's whole pnpm store.
+
+## Coverage
+
+Implemented interiors: Cargo, Node, Gradle, Maven. Measured as whole
+rows with no interior identification: Python, Go, Xcode/Swift, Android,
+Docker/BuildKit. `docs/build-artifacts.md` in the repository is the
+checked matrix, including per-ecosystem layouts and attribution limits.

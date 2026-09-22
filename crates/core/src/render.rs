@@ -904,6 +904,124 @@ pub fn render_view_builds(report: &Report, only_project: Option<&str>) -> String
         only_project,
         &[ArtifactKind::BuildOutput, ArtifactKind::Cache],
     ));
+    out.push_str(&render_build_containers(report, only_project));
+    out
+}
+
+/// The build-adapter drill-down under `--view builds`: for each
+/// identified container, one collapsed row per role family.
+///
+/// The ordering is what the row is *for*. A person looking at a 24 GiB
+/// `target/` wants to know which kind of thing it is made of before they
+/// want the numbers, so the family and its consequence come first and
+/// the count/size/oldest follow. Every row states its accounting basis,
+/// because #65 forbids adding an allocated number to a logical one and
+/// the only way to honour that outside this function is to print which
+/// is which.
+///
+/// Absence is never rendered as a zero row: a report with no identified
+/// containers prints nothing here, and a family with no members prints
+/// no line.
+fn render_build_containers(report: &Report, only_project: Option<&str>) -> String {
+    use crate::build_adapters::summarize_families;
+    let mut out = String::new();
+    if report.nested_artifacts.is_empty() {
+        return out;
+    }
+    // Group by container, keeping the container's own row aside: it is
+    // the total the families sit inside, not one of them.
+    let mut containers: std::collections::BTreeMap<&str, Vec<&crate::artifact::NestedArtifact>> =
+        std::collections::BTreeMap::new();
+    for u in &report.nested_artifacts {
+        let Some(id) = u.container_id.as_deref() else {
+            continue;
+        };
+        let project = report
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| u.path.starts_with(&w.path)));
+        if let Some(wanted) = only_project
+            && project.map(|p| p.name.as_str()) != Some(wanted)
+        {
+            continue;
+        }
+        containers.entry(id).or_default().push(u);
+    }
+    if containers.is_empty() {
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "\nInside these build containers (identification only -- no cleanup is offered here):"
+    );
+    let mut sections: Vec<(u64, String)> = Vec::new();
+    for units in containers.values() {
+        // The container's own row is the one whose id equals the
+        // container id; everything else hangs off it.
+        let Some(root) = units
+            .iter()
+            .find(|u| Some(u.id.as_str()) == u.container_id.as_deref())
+        else {
+            continue;
+        };
+        let owned: Vec<crate::artifact::NestedArtifact> =
+            units.iter().map(|u| (*u).clone()).collect();
+        let families = summarize_families(&root.path, &owned);
+        if families.is_empty() {
+            continue;
+        }
+        let mut section = String::new();
+        let _ = writeln!(
+            section,
+            "\n{} ({}, {} {})",
+            root.path.display(),
+            root.adapter.clone().unwrap_or_else(|| "unknown".into()),
+            human_bytes(root.bytes),
+            root.basis.label()
+        );
+        for limit in &root.coverage.limits {
+            let _ = writeln!(section, "  limit: {limit}");
+        }
+        for f in families {
+            let consequence = owned
+                .iter()
+                .find(|u| u.role.family() == f.family && u.consequence.is_some())
+                .and_then(|u| u.consequence.clone())
+                .unwrap_or_else(|| "consequence not established".to_string());
+            let size = match f.basis {
+                crate::artifact::AccountingBasis::Unknown => {
+                    "size mixed-basis (not summed)".to_string()
+                }
+                basis => format!("{} {}", human_bytes(f.bytes), basis.label()),
+            };
+            let oldest = match f.oldest_modified {
+                Some(t) => format!("oldest modified {}", age_label(t, report.observed_at)),
+                None => "no known modification time".to_string(),
+            };
+            let unknowns = if f.unknown_age > 0 {
+                format!(", {} of unknown age", f.unknown_age)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(section, "  {:<14} {consequence}", f.family.label());
+            let _ = writeln!(
+                section,
+                "  {:<14} {} item(s), {size}, {oldest}{unknowns}{}",
+                "",
+                f.count,
+                if f.complete {
+                    ""
+                } else {
+                    " (measurement incomplete)"
+                }
+            );
+        }
+        sections.push((root.bytes, section));
+    }
+    sections.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, s) in sections {
+        out.push_str(&s);
+    }
     out
 }
 

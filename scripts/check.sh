@@ -23,6 +23,16 @@ cargo test -p swamp-core \
   --test agent_matrix_matches_docs \
   --test agent_storage_validation
 
+# The runtime halves of the section 18 build-adapter guardrails. Named
+# for the same reason as the list above: the AST audits check the shape
+# of the code, and only these prove that an unchanged container really
+# reads nothing, that a shared store is charged once, that the published
+# capability table matches the registry, and that no identified unit
+# renders a verdict.
+cargo test -p swamp-core \
+  --test build_adapter_contract \
+  --test build_adapter_cost
+
 # `--test-threads=1` here and nowhere else. This test measures through
 # the *process-global* work counters (`work_counters::reset` +
 # `snapshot`, which is what a whole-observation cost report needs) and

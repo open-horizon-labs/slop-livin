@@ -758,7 +758,16 @@ pub fn tree_rows_with_agents(
                     out_row.evidence = a.evidence.clone();
                 }
             }
+            // Any row an adapter identified the interior of expands,
+            // not only `BuildOutput`. An installed dependency tree is a
+            // `DependencyTree` row, and `node_modules` is the row a
+            // person most often wants to open.
+            let identified_interior = report
+                .nested_artifacts
+                .iter()
+                .any(|u| u.path.starts_with(&abs) && u.path != abs && u.adapter.is_some());
             let cargo_children = if row.kind == Some(ArtifactKind::BuildOutput)
+                || identified_interior
                 || (row.folded_count == 1
                     && report.nested_artifacts.iter().any(|u| {
                         u.path == abs && u.role == swamp_core::artifact::ArtifactRole::Container
@@ -932,6 +941,30 @@ fn cargo_children_from_index(
         let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
         row.signals = vec![guidance.recommendation, guidance.consequence.into()];
         row.allocated = true;
+        // A unit an adapter other than Cargo identified answers for
+        // itself. `cargo_cleanup`'s guidance is Cargo's vocabulary --
+        // "rebuild before rerunning" is not what removing a
+        // `coverage/` or a `~/.m2` artifact costs -- and the adapter
+        // already stated the consequence in its own ecosystem's words.
+        if let Some(adapter) = unit.adapter.as_deref().filter(|a| *a != "cargo") {
+            let action = match &unit.action {
+                swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
+                    format!("selective cleanup unsupported: {reason}")
+                }
+                swamp_core::artifact::NestedActionCapability::InspectionOnly => {
+                    "inspection only".to_string()
+                }
+            };
+            row.signals = vec![
+                unit.role.family().label().to_string(),
+                unit.consequence
+                    .clone()
+                    .unwrap_or_else(|| "consequence not established".into()),
+                action,
+                format!("{} bytes ({adapter})", unit.basis.label()),
+            ];
+            row.signals.extend(unit.coverage.limits.iter().cloned());
+        }
         let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
         let advice = match unit.role {
             swamp_core::artifact::ArtifactRole::Incremental => "Start here: slower next build",
@@ -946,6 +979,21 @@ fn cargo_children_from_index(
         };
         row.cleanup_summary = Some(if unit.bytes == 0 {
             "Empty".into()
+        } else if let Some(consequence) = unit
+            .adapter
+            .as_deref()
+            .filter(|a| *a != "cargo")
+            .and(unit.consequence.clone())
+        {
+            // Consequence first, numbers second: the numbers are what a
+            // narrow terminal should give up.
+            format!(
+                "{consequence} · modified {}",
+                age_label(swamp_core::cargo_cleanup::modified_age_secs(
+                    unit,
+                    observed_at
+                ))
+            )
         } else if swamp_core::cargo_cleanup::candidate(unit) {
             format!(
                 "{advice} · modified {}",
@@ -1423,13 +1471,20 @@ pub fn builds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         filter,
     );
     append_cargo_breakdowns(report, filter, &mut rows);
+    append_build_family_breakdowns(report, filter, &mut rows);
     rows
 }
 
 /// Deps view: every `DependencyTree` row across the whole root, same as
 /// the CLI's `--view deps`.
 pub fn deps_rows(report: &Report, filter: &Filter) -> Vec<Row> {
-    kind_filtered_rows(report, &[ArtifactKind::DependencyTree], filter)
+    let mut rows = kind_filtered_rows(report, &[ArtifactKind::DependencyTree], filter);
+    // An installed dependency tree is a `DependencyTree` row, not a
+    // build row, so its family breakdown belongs here as well as in
+    // Builds -- a `node_modules` that is 70% pnpm store is the question
+    // this view exists to answer.
+    append_build_family_breakdowns(report, filter, &mut rows);
+    rows
 }
 
 fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) -> Vec<Row> {
@@ -1477,6 +1532,121 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
         }
     }
     out
+}
+
+/// Adds one collapsed row per role family below a build row an adapter
+/// other than Cargo identified (#68 Node, #67 Gradle/Maven).
+///
+/// The ordering inside a row is deliberate and is the same one the
+/// Cargo purpose groups use: **what this is and what losing it costs**
+/// comes first, because that is the question, and the count, size and
+/// oldest modification follow when the width allows. A row that has to
+/// be truncated loses the numbers, not the consequence.
+///
+/// These rows are not selectable. Cargo's groups carry a `unit` because
+/// `cargo_cleanup` can check and plan them; no other adapter has an
+/// action yet (#73), so these rows say "inspection only" and offer no
+/// `UnitId` -- which is what stops the confirmation path ever being
+/// reached for a unit with no executor behind it.
+fn append_build_family_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>) {
+    use swamp_core::build_adapters::summarize_families;
+    let mut additions: Vec<(usize, Vec<Row>)> = Vec::new();
+    for p in &report.projects {
+        if !filter::type_passes(filter, p) {
+            continue;
+        }
+        if let Some(name) = filter::project_name(filter)
+            && !swamp_core::filter::name_matches(name, &p.name)
+        {
+            continue;
+        }
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if !matches!(
+                    a.kind,
+                    ArtifactKind::BuildOutput | ArtifactKind::Cache | ArtifactKind::DependencyTree
+                ) {
+                    continue;
+                }
+                let units: Vec<&swamp_core::artifact::NestedArtifact> = report
+                    .nested_artifacts
+                    .iter()
+                    .filter(|u| u.path.starts_with(&a.path))
+                    .filter(|u| u.adapter.as_deref().is_some_and(|id| id != "cargo"))
+                    .collect();
+                if units.is_empty() {
+                    continue;
+                }
+                let Some(parent_index) = rows
+                    .iter()
+                    .position(|r| r.unit == Some(UnitId::for_artifact(&a.path)))
+                else {
+                    continue;
+                };
+                let adapter = units
+                    .iter()
+                    .find_map(|u| u.adapter.clone())
+                    .unwrap_or_default();
+                let owned: Vec<swamp_core::artifact::NestedArtifact> =
+                    units.iter().map(|u| (*u).clone()).collect();
+                let families = summarize_families(&a.path, &owned);
+                let last = families.len().saturating_sub(1);
+                let children: Vec<Row> = families
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let consequence = owned
+                            .iter()
+                            .find(|u| u.role.family() == f.family && u.consequence.is_some())
+                            .and_then(|u| u.consequence.clone())
+                            .unwrap_or_else(|| "consequence not established".to_string());
+                        let mut row = Row::leaf(
+                            1,
+                            format!("{} · {consequence}", f.family.label()),
+                            f.bytes,
+                            None,
+                        );
+                        row.rail = if i == last {
+                            "└─ ".to_string()
+                        } else {
+                            "├─ ".to_string()
+                        };
+                        row.allocated = true;
+                        row.mtime_max = f.oldest_modified.unwrap_or(0);
+                        let age = f
+                            .oldest_modified
+                            .map(|t| report.observed_at.saturating_sub(t));
+                        row.cleanup_summary = Some(format!(
+                            "{adapter} · {} item(s) · oldest modified {}",
+                            f.count,
+                            match f.oldest_modified {
+                                Some(_) => age_label(age),
+                                None => "unknown".to_string(),
+                            }
+                        ));
+                        let mut signals = vec![
+                            "inspection only".to_string(),
+                            format!("{} bytes", f.basis.label()),
+                        ];
+                        if f.unknown_age > 0 {
+                            signals.push(format!("{} of unknown age", f.unknown_age));
+                        }
+                        if !f.complete {
+                            signals.push("measurement incomplete".into());
+                        }
+                        row.signals = signals;
+                        row
+                    })
+                    .collect();
+                if !children.is_empty() {
+                    additions.push((parent_index + 1, children));
+                }
+            }
+        }
+    }
+    for (index, mut children) in additions.into_iter().rev() {
+        rows.splice(index..index, children.drain(..));
+    }
 }
 
 /// Adds a compact, non-actionable Cargo breakdown below build rows.  The

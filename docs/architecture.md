@@ -41,9 +41,68 @@ An image's source label or Compose metadata can associate it with a project even
 
 Filesystem reconciliation separates attributed and unowned bytes. Docker has separate attributed and unowned totals, because daemon storage and shared layers do not map directly to the walked tree. The optional `--verify-du` result is an independent comparison; it does not establish that an entire volume, snapshots, or inaccessible paths have been accounted for.
 
-## Cross-ecosystem decision contract (planned extension)
+### Build adapters are pluggable
 
-The reusable decision aid is **age + size + removal consequences**. Cargo currently supplies this guidance; the other ecosystem adapters remain planned under [#74](https://github.com/open-horizon-labs/swamp/issues/74). This is not a claim of implemented cross-ecosystem parity.
+Cargo was the only ecosystem whose build directory had an interior, and
+the report pipeline called its identification by name. That is the shape
+the agent side reached fourteen adapters with before anyone noticed it
+was a fourteen-arm `match`, so the build side was given a trait and a
+static registry before the second adapter existed rather than after the
+fourth.
+
+[`build_adapters`](../crates/core/src/build_adapters/) holds a
+`BuildAdapter` trait, a static `Registry::with_builtins()`, a shared
+`NestedUnitBuilder`, one capped manifest reader, and a checked
+capability matrix. `consumers/cargo.rs` builds one identification
+context and hands it to the registry; adding an ecosystem is one line
+there and nothing else. An adapter references no other adapter (Gradle
+and Maven share coordinate parsing through a neutral `jvm_common.rs`),
+never traverses (structure comes from the folded walk's own rows or the
+capped `locations::shallow_list`), never reads a whole file (only
+`bounded_io::read_manifest`, capped at 256 KiB and counted), and never
+spawns a process -- `npm ls`, `gradle dependencies`, `mvn
+help:evaluate` and `cargo metadata` all evaluate the project's own build
+definition to answer, and observation never runs the user's build.
+Eight audits enforce those rules
+(`.oh/guardrails/build-adapters-*.md`), each with rejection fixtures in
+the mutation corpus.
+
+The unit model is ecosystem-neutral. Cargo's roles (`profile`,
+`incremental`, `build-script-output`) stay, and generic roles sit beside
+them (`output`, `test-output`, `intermediate`,
+`installed-dependencies`, `shared-store-entry`, `metadata`); both sets
+map onto one small set of **role families** that aggregation and the
+views group by. Every unit carries its accounting basis (allocated /
+logical / unique-allocated / unknown -- never mixed in one total), the
+source of its timestamp (a file's own `mtime`, a folded directory's
+rolled-up newest entry, a time the tool recorded, or unknown), an action
+capability, and a removal consequence in the ecosystem's own words.
+Identity stays the unit's path inside its container, so a
+reclassification changes no bytes and reaches no history as a delta.
+
+Reuse is gated on `fs_events::EventCoverage`, the same gate the agent
+containers use. An unchanged container is replayed with zero listings
+and zero manifest reads; a replay window that cannot say when it opened
+is not evidence that nothing changed, and buys no reuse.
+
+Shared stores (a pnpm object store, an npm `_cacache`, a Gradle user
+home, a Maven local repository) are identified by the adapters and are
+**not yet joined into the report pass**: they are detector-resolved
+locations whose measurement and history window `external` already owns,
+and a second pass over them from the build consumer would be a double
+observation. The gap is stated in `consumers/cargo.rs` rather than
+closed by a second traversal.
+
+`docs/build-artifacts.md` is the published capability matrix, checked
+against the code in both directions.
+
+## Cross-ecosystem decision contract
+
+The reusable decision aid is **age + size + removal consequences**.
+Cargo, Node, Gradle and Maven supply it through the adapter registry;
+Python, Go, Xcode/Swift, Android and Docker/BuildKit are measured as
+whole artifact rows with no interior identification, and the capability
+matrix says so per family rather than implying parity.
 
 Modification age is enough to recommend reviewing a supported generated-output or cache unit. It is not proof of obsolescence, and access time is not a prerequisite. Recent units remain reviewable; unknown or future timestamps must not look ancient. Unique data and active writers still require their specific protections. A recommendation never supplies deletion authority.
 
