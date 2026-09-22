@@ -348,6 +348,30 @@ pub fn check(
     Ok(results)
 }
 
+/// Whether this module's guidance and cleanup groups speak for a unit
+/// in `role` -- the Cargo layout vocabulary this module was written
+/// against (`Profile`, `Incremental`, `TestExecutable`, ...).
+///
+/// Views decide how to present a container by the *roles* its units
+/// carry, never by comparing an adapter id: a container whose units use
+/// the ecosystem-neutral roles (`Output`, `InstalledDependencies`,
+/// `SharedStoreEntry`, ...) is presented as neutral family groups, and
+/// this module's vocabulary ("rebuild before rerunning") is not applied
+/// to it.
+pub fn speaks_for(role: &ArtifactRole) -> bool {
+    matches!(
+        role,
+        ArtifactRole::Profile
+            | ArtifactRole::Dependency
+            | ArtifactRole::TestExecutable
+            | ArtifactRole::Example
+            | ArtifactRole::BuildScriptOutput
+            | ArtifactRole::Incremental
+            | ArtifactRole::FinalOutput
+            | ArtifactRole::CompanionMetadata
+    )
+}
+
 pub fn candidate(unit: &NestedArtifact) -> bool {
     if !unit.coverage.complete || !unit.coverage.supported {
         return false;

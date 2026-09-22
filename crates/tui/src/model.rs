@@ -766,12 +766,29 @@ pub fn tree_rows_with_agents(
                 .nested_artifacts
                 .iter()
                 .any(|u| u.path.starts_with(&abs) && u.path != abs && u.adapter.is_some());
-            let cargo_children = if row.kind == Some(ArtifactKind::BuildOutput)
+            // How the interior is presented follows the roles its units
+            // carry, never an adapter id: a container in the neutral
+            // vocabulary gets family groups, one whose units the Cargo
+            // cleanup module speaks for keeps its purpose groups.
+            let neutral_interior = identified_interior
+                && !report.nested_artifacts.iter().any(|u| {
+                    u.path.starts_with(&abs) && swamp_core::cargo_cleanup::speaks_for(&u.role)
+                });
+            let cargo_children = if neutral_interior {
+                family_tree_children(
+                    report,
+                    &abs,
+                    3,
+                    &format!("{child_prefix}{}", if r_last { "   " } else { "│  " }),
+                    collapsed,
+                )
+            } else if row.kind == Some(ArtifactKind::BuildOutput)
                 || identified_interior
                 || (row.folded_count == 1
                     && report.nested_artifacts.iter().any(|u| {
                         u.path == abs && u.role == swamp_core::artifact::ArtifactRole::Container
-                    })) {
+                    }))
+            {
                 cargo_tree_children(
                     report,
                     &abs,
@@ -863,6 +880,216 @@ pub fn tree_rows_with_agents(
 
 pub use swamp_core::render::project_display_name;
 
+/// How many members an expanded family group lists before summarizing
+/// the rest in one "… and N more" row. A `node_modules` with thousands of
+/// packages is one group, not thousands of rows.
+const FAMILY_MEMBERS_SHOWN: usize = 25;
+
+/// The interior of a container identified in the ecosystem-neutral role
+/// vocabulary (Node, Gradle, Maven, ...): one collapsed row per role
+/// family, then one "Not identified" row for what no supported unit
+/// accounts for.
+///
+/// Each group row leads with **review guidance and what removing it
+/// costs** (`family_guidance`), then the count and oldest modification,
+/// so a narrow terminal gives up the numbers before the meaning -- the
+/// same ordering as Cargo's purpose groups. The adapter's own
+/// consequence, the accounting basis and the action capability are the
+/// row's signals. Groups open on demand (they start closed): a family is
+/// the answer to "what is this made of", and its members are the
+/// follow-up question.
+///
+/// Nothing here is selectable. No neutral-vocabulary adapter has an
+/// executor yet (#73), so every row carries the `blocked` signal and no
+/// `UnitId`, which is what keeps the confirmation path unreachable.
+fn family_tree_children(
+    report: &Report,
+    container: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    use swamp_core::build_adapters::{family_members, summarize_container};
+    let units: Vec<swamp_core::artifact::NestedArtifact> = report
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.present && u.path.starts_with(container))
+        .cloned()
+        .collect();
+    let summary = summarize_container(container, &units);
+    let residual = summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
+    let show_residual = summary.unsupported_count > 0 || residual > 0;
+    let group_count = summary.families.len() + usize::from(show_residual);
+    let observed_at = report.observed_at;
+    let mut rows = Vec::new();
+    for (i, f) in summary.families.iter().enumerate() {
+        let last = i + 1 == group_count;
+        let key = format!("family-open:{}:{}", container.display(), f.family.label());
+        let open = collapsed.contains(&key);
+        let members = family_members(container, &units, f.family);
+        let mut row = Row::leaf(depth, f.family.title().to_string(), f.bytes, None);
+        row.rail = format!(
+            "{prefix}{}{}",
+            if last { "└─ " } else { "├─ " },
+            if open { "▾ " } else { "▸ " }
+        );
+        row.expandable = true;
+        row.expansion_key = Some(key);
+        row.collapsed_children = (!open).then_some(members.len());
+        row.allocated = true;
+        row.mtime_max = f.oldest_modified.unwrap_or(0);
+        row.cleanup_summary = Some(format!(
+            "{} · {} {} · oldest {}{}",
+            f.recommendation,
+            f.count,
+            if f.count == 1 { "item" } else { "items" },
+            match f.oldest_modified {
+                Some(t) => age_label(Some(observed_at.saturating_sub(t))),
+                None => "unknown".into(),
+            },
+            if f.unknown_age > 0 {
+                format!(" · {} of unknown age", f.unknown_age)
+            } else {
+                String::new()
+            }
+        ));
+        let mut signals = vec![match (&f.consequence, f.other_consequences) {
+            (Some(c), 0) => c.clone(),
+            (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
+            (None, _) => "consequence not established".into(),
+        }];
+        signals.push("inspection only: selective cleanup unsupported here".into());
+        signals.push(match f.basis {
+            swamp_core::artifact::AccountingBasis::Unknown => {
+                "mixed accounting bases: not summed".to_string()
+            }
+            basis => format!("{} bytes", basis.label()),
+        });
+        if !f.complete {
+            signals.push("measurement incomplete".into());
+        }
+        signals.push("blocked".into());
+        row.signals = signals;
+        rows.push(row);
+        if open {
+            let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+            let shown = members.len().min(FAMILY_MEMBERS_SHOWN);
+            for (j, u) in members.iter().take(shown).enumerate() {
+                let m_last = j + 1 == shown && members.len() <= shown;
+                rows.push(family_member_row(
+                    u,
+                    depth + 1,
+                    &child_prefix,
+                    m_last,
+                    observed_at,
+                ));
+            }
+            if members.len() > shown {
+                let rest: u64 = members.iter().skip(shown).map(|u| u.bytes).sum();
+                let mut more = Row::leaf(
+                    depth + 1,
+                    format!("… and {} more", members.len() - shown),
+                    rest,
+                    None,
+                );
+                more.rail = format!("{child_prefix}└─ ");
+                more.allocated = true;
+                more.signals = vec!["blocked".into()];
+                rows.push(more);
+            }
+        }
+    }
+    if show_residual {
+        let mut row = Row::leaf(
+            depth,
+            swamp_core::artifact::RoleFamily::Residual
+                .title()
+                .to_string(),
+            residual,
+            None,
+        );
+        row.rail = format!("{prefix}└─ ");
+        row.allocated = true;
+        row.cleanup_summary = Some(format!(
+            "{}{}{}",
+            swamp_core::build_adapters::family_guidance(swamp_core::artifact::RoleFamily::Residual),
+            match summary.unsupported_count {
+                0 => String::new(),
+                1 => " · 1 unrecognised entry".to_string(),
+                n => format!(" · {n} unrecognised entries"),
+            },
+            match summary.unaccounted_bytes {
+                Some(b) if b > 0 => format!(" · {} no unit claims", human_bytes(b)),
+                Some(_) => String::new(),
+                None => " · remainder not reconciled".into(),
+            }
+        ));
+        row.signals = vec![
+            "not identified: an unsupported layout or bytes no unit accounts for".into(),
+            "blocked".into(),
+        ];
+        rows.push(row);
+    }
+    rows
+}
+
+fn family_member_row(
+    u: &swamp_core::artifact::NestedArtifact,
+    depth: usize,
+    prefix: &str,
+    last: bool,
+    observed_at: u64,
+) -> Row {
+    let name = u
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let label = match (&u.variant.package, &u.variant.version) {
+        (Some(p), Some(v)) if *p != name => format!("{name} ({p}@{v})"),
+        (Some(p), None) if *p != name => format!("{name} ({p})"),
+        (Some(_), Some(v)) => format!("{name}@{v}"),
+        _ => name,
+    };
+    let mut row = Row::leaf(depth, label, u.bytes, u.growth_bytes);
+    row.rail = format!("{prefix}{}", if last { "└─ " } else { "├─ " });
+    row.allocated = true;
+    row.mtime_max = u.mtime_max;
+    let age = (u.time_source != swamp_core::artifact::TimeSource::Unknown && u.mtime_max > 0)
+        .then(|| observed_at.saturating_sub(u.mtime_max));
+    row.cleanup_summary = Some(format!(
+        "{} · modified {}",
+        u.consequence
+            .clone()
+            .unwrap_or_else(|| "consequence not established".into()),
+        match age {
+            Some(a) => age_label(Some(a)),
+            None => "unknown".into(),
+        }
+    ));
+    let action = match &u.action {
+        swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
+            format!("selective cleanup unsupported: {reason}")
+        }
+        swamp_core::artifact::NestedActionCapability::InspectionOnly => "inspection only".into(),
+    };
+    row.signals = vec![
+        u.role.label().to_string(),
+        action,
+        format!(
+            "{} bytes ({})",
+            u.basis.label(),
+            u.adapter
+                .clone()
+                .unwrap_or_else(|| "unknown adapter".into())
+        ),
+    ];
+    row.signals.extend(u.coverage.limits.iter().cloned());
+    row.signals.push("blocked".into());
+    row
+}
+
 fn cargo_tree_children(
     report: &Report,
     parent: &std::path::Path,
@@ -941,30 +1168,6 @@ fn cargo_children_from_index(
         let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
         row.signals = vec![guidance.recommendation, guidance.consequence.into()];
         row.allocated = true;
-        // A unit an adapter other than Cargo identified answers for
-        // itself. `cargo_cleanup`'s guidance is Cargo's vocabulary --
-        // "rebuild before rerunning" is not what removing a
-        // `coverage/` or a `~/.m2` artifact costs -- and the adapter
-        // already stated the consequence in its own ecosystem's words.
-        if let Some(adapter) = unit.adapter.as_deref().filter(|a| *a != "cargo") {
-            let action = match &unit.action {
-                swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
-                    format!("selective cleanup unsupported: {reason}")
-                }
-                swamp_core::artifact::NestedActionCapability::InspectionOnly => {
-                    "inspection only".to_string()
-                }
-            };
-            row.signals = vec![
-                unit.role.family().label().to_string(),
-                unit.consequence
-                    .clone()
-                    .unwrap_or_else(|| "consequence not established".into()),
-                action,
-                format!("{} bytes ({adapter})", unit.basis.label()),
-            ];
-            row.signals.extend(unit.coverage.limits.iter().cloned());
-        }
         let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
         let advice = match unit.role {
             swamp_core::artifact::ArtifactRole::Incremental => "Start here: slower next build",
@@ -979,21 +1182,6 @@ fn cargo_children_from_index(
         };
         row.cleanup_summary = Some(if unit.bytes == 0 {
             "Empty".into()
-        } else if let Some(consequence) = unit
-            .adapter
-            .as_deref()
-            .filter(|a| *a != "cargo")
-            .and(unit.consequence.clone())
-        {
-            // Consequence first, numbers second: the numbers are what a
-            // narrow terminal should give up.
-            format!(
-                "{consequence} · modified {}",
-                age_label(swamp_core::cargo_cleanup::modified_age_secs(
-                    unit,
-                    observed_at
-                ))
-            )
         } else if swamp_core::cargo_cleanup::candidate(unit) {
             format!(
                 "{advice} · modified {}",
@@ -1534,8 +1722,9 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
     out
 }
 
-/// Adds one collapsed row per role family below a build row an adapter
-/// other than Cargo identified (#68 Node, #67 Gradle/Maven).
+/// Adds one collapsed row per role family below a build row whose
+/// interior an adapter identified in the neutral role vocabulary (#68
+/// Node, #67 Gradle/Maven).
 ///
 /// The ordering inside a row is deliberate and is the same one the
 /// Cargo purpose groups use: **what this is and what losing it costs**
@@ -1549,8 +1738,8 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
 /// `UnitId` -- which is what stops the confirmation path ever being
 /// reached for a unit with no executor behind it.
 fn append_build_family_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>) {
-    use swamp_core::build_adapters::summarize_families;
     let mut additions: Vec<(usize, Vec<Row>)> = Vec::new();
+    let none = std::collections::HashSet::new();
     for p in &report.projects {
         if !filter::type_passes(filter, p) {
             continue;
@@ -1568,13 +1757,21 @@ fn append_build_family_breakdowns(report: &Report, filter: &Filter, rows: &mut V
                 ) {
                     continue;
                 }
-                let units: Vec<&swamp_core::artifact::NestedArtifact> = report
+                // Neutral-vocabulary interiors only; a container whose
+                // units the Cargo cleanup module speaks for has its own
+                // breakdown (`append_cargo_breakdowns`). Decided by the
+                // roles present, never by an adapter id.
+                let mut inside = report
                     .nested_artifacts
                     .iter()
-                    .filter(|u| u.path.starts_with(&a.path))
-                    .filter(|u| u.adapter.as_deref().is_some_and(|id| id != "cargo"))
-                    .collect();
-                if units.is_empty() {
+                    .filter(|u| u.present && u.path.starts_with(&a.path) && u.path != a.path);
+                let mut any = false;
+                let mut cargo_vocabulary = false;
+                for u in inside.by_ref() {
+                    any |= u.adapter.is_some();
+                    cargo_vocabulary |= swamp_core::cargo_cleanup::speaks_for(&u.role);
+                }
+                if !any || cargo_vocabulary {
                     continue;
                 }
                 let Some(parent_index) = rows
@@ -1583,61 +1780,16 @@ fn append_build_family_breakdowns(report: &Report, filter: &Filter, rows: &mut V
                 else {
                     continue;
                 };
-                let adapter = units
-                    .iter()
-                    .find_map(|u| u.adapter.clone())
-                    .unwrap_or_default();
-                let owned: Vec<swamp_core::artifact::NestedArtifact> =
-                    units.iter().map(|u| (*u).clone()).collect();
-                let families = summarize_families(&a.path, &owned);
-                let last = families.len().saturating_sub(1);
-                let children: Vec<Row> = families
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| {
-                        let consequence = owned
-                            .iter()
-                            .find(|u| u.role.family() == f.family && u.consequence.is_some())
-                            .and_then(|u| u.consequence.clone())
-                            .unwrap_or_else(|| "consequence not established".to_string());
-                        let mut row = Row::leaf(
-                            1,
-                            format!("{} · {consequence}", f.family.label()),
-                            f.bytes,
-                            None,
-                        );
-                        row.rail = if i == last {
-                            "└─ ".to_string()
-                        } else {
-                            "├─ ".to_string()
-                        };
-                        row.allocated = true;
-                        row.mtime_max = f.oldest_modified.unwrap_or(0);
-                        let age = f
-                            .oldest_modified
-                            .map(|t| report.observed_at.saturating_sub(t));
-                        row.cleanup_summary = Some(format!(
-                            "{adapter} · {} item(s) · oldest modified {}",
-                            f.count,
-                            match f.oldest_modified {
-                                Some(_) => age_label(age),
-                                None => "unknown".to_string(),
-                            }
-                        ));
-                        let mut signals = vec![
-                            "inspection only".to_string(),
-                            format!("{} bytes", f.basis.label()),
-                        ];
-                        if f.unknown_age > 0 {
-                            signals.push(format!("{} of unknown age", f.unknown_age));
-                        }
-                        if !f.complete {
-                            signals.push("measurement incomplete".into());
-                        }
-                        row.signals = signals;
-                        row
-                    })
-                    .collect();
+                // The same group rows as the project tree, flattened: the
+                // Builds view is a list, so the rows neither expand nor
+                // carry an expansion glyph.
+                let mut children = family_tree_children(report, &a.path, 1, "", &none);
+                for row in &mut children {
+                    row.rail = row.rail.replace("▸ ", "").replace("▾ ", "");
+                    row.expandable = false;
+                    row.expansion_key = None;
+                    row.collapsed_children = None;
+                }
                 if !children.is_empty() {
                     additions.push((parent_index + 1, children));
                 }

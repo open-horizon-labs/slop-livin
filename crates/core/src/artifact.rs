@@ -103,6 +103,21 @@ impl RoleFamily {
         }
     }
 
+    /// The heading a view shows for a collapsed family row.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Container => "Containers",
+            Self::Outputs => "Build outputs",
+            Self::Tests => "Test & coverage output",
+            Self::Intermediates => "Caches & intermediates",
+            Self::Dependencies => "Installed dependencies",
+            Self::SharedStore => "Shared store entries",
+            Self::Metadata => "Tool metadata",
+            Self::Residual => "Not identified",
+            Self::Unknown => "Unknown role",
+        }
+    }
+
     /// Every family, in the order the views show them: what a build
     /// produced, then what it produced for tests, then what it kept to
     /// go faster, then what it downloaded, then what is shared, then the
