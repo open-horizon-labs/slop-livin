@@ -299,6 +299,75 @@ pub fn observe_unit(
     }
 }
 
+/// [`observe_unit`] for a unit a build adapter will identify the
+/// interior of: a machine-wide store.
+///
+/// With `allow_reuse`, exactly [`observe_unit`] -- a stored measurement
+/// the event window vouches for is replayed, and the caller replays the
+/// store's identified units under the same window, so an unchanged store
+/// costs no listing and no read. Without it (the stored units cannot be
+/// replayed), or when the stored measurement is not good, the store is
+/// measured by the one folded walk, which this time also returns its
+/// per-directory rows: the structure the adapter identifies from. That
+/// is the same walk a miss would have done anyway, handing over rows it
+/// already produced -- never a second traversal.
+///
+/// The directory rows are relative to `path`, with each directory's own
+/// bytes in `own_allocated`; `report::aggregate_dir_totals` rolls them
+/// up.
+pub fn observe_unit_with_dirs(
+    store: Option<&Path>,
+    path: &Path,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
+    allow_reuse: bool,
+) -> (UnitObservation, Option<Vec<crate::report::DirRollup>>) {
+    if allow_reuse && let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage)
+    {
+        crate::work_counters::record_cache_hit();
+        return (UnitObservation::Unit(folded), None);
+    }
+    match access(path) {
+        UnitAccess::Absent => (UnitObservation::Absent, None),
+        UnitAccess::Unreadable(why) => (UnitObservation::Unreadable(why), None),
+        UnitAccess::Measurable => {
+            let (row, dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
+                path,
+                ArtifactKind::Unknown,
+                observed_at,
+                Some((STORE_WORKTREE_ID, path)),
+                exclusions,
+                store.is_some(),
+            );
+            crate::work_counters::record_cache_miss();
+            let folded = FoldedUnit {
+                reused: false,
+                bytes: row.bytes,
+                hardlinked: row.hardlinked,
+                mtime_max: row.mtime_max,
+                complete,
+            };
+            // Same rule as `measure`: an incomplete fold is never stored
+            // (it would overwrite a good prior measurement with a
+            // partial one), but the store's own directory rows are
+            // still handed back so the adapter can identify whatever
+            // *was* read -- best-effort, same as any other unreadable
+            // subdirectory.
+            if let Some(dir) = store
+                && complete
+            {
+                record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
+            }
+            (UnitObservation::Unit(folded), Some(dirs))
+        }
+    }
+}
+
+/// The pseudo-worktree id a store's own directory rows are recorded
+/// under: they are relative to the store, never to a checkout.
+pub const STORE_WORKTREE_ID: &str = "build-store";
+
 /// Bounded, stat-only folded byte total for `path` (file or directory),
 /// returning `(bytes, mtime_max, truncated)`.
 ///

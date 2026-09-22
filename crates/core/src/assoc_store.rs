@@ -283,6 +283,23 @@ pub struct IdentificationTable(KeyedTable);
 /// identification cache still keeping its header reads at zero.
 pub struct ContainerTable(KeyedTable);
 
+/// `store container -> the units a build adapter identified inside one
+/// machine-wide build store`: the store family's container-level reuse,
+/// the same bargain [`ContainerTable`] strikes for agent homes.
+///
+/// A store's interior is identified from the folded walk's directory
+/// rows, which are only produced when the store is actually measured. An
+/// unchanged store is not measured -- its folded total is replayed under
+/// the event window -- so its units have to be replayed too, from here,
+/// under the same window. One row per *(unit, field)*, never per file
+/// inside the store: the unit set is already the adapter's own bounded
+/// grouping (a module version, a DerivedData project, a cache category),
+/// and the columns stay columns rather than a serialized blob
+/// (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`). The
+/// fingerprint is the swamp version: a new adapter's identification is
+/// never answered by an old one's rows.
+pub struct BuildStoreTable(KeyedTable);
+
 /// `external unit key -> (consumer label, note)`: the declared-consumer
 /// sidecar. Human intent rather than derived data, so it is *not*
 /// fingerprint-invalidated -- the fingerprint column is a constant --
@@ -379,6 +396,23 @@ impl ContainerTable {
     pub fn open(swamp_dir: &Path) -> Self {
         Self(KeyedTable {
             path: dir(swamp_dir).join("agent_containers.parquet"),
+            value_columns: Self::COLUMNS,
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl BuildStoreTable {
+    pub const COLUMNS: &'static [&'static str] = &["unit", "field", "value"];
+
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("build_stores.parquet"),
             value_columns: Self::COLUMNS,
         })
     }

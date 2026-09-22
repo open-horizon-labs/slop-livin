@@ -572,6 +572,9 @@ fn anchored_units(units: &[ExternalUnit], detector_id: &str, anchor: StoreAnchor
         StoreAnchor::Categorized { category, suffix } => {
             of_detector(category, &|u| path_ends_with(&u.path, suffix))
         }
+        StoreAnchor::CategorizedExcept { category, except } => of_detector(category, &|u| {
+            !except.iter().any(|s| path_ends_with(&u.path, s))
+        }),
         StoreAnchor::AncestorOfSibling {
             sibling,
             up,

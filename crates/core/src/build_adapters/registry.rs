@@ -11,7 +11,7 @@
 //! is the whole repair.
 
 use super::BuildAdapter;
-use super::{cargo, gradle, maven, node};
+use super::{android, cargo, docker_buildkit, go, gradle, maven, node, python, xcode_swift};
 
 pub struct Registry {
     adapters: Vec<Box<dyn BuildAdapter>>,
@@ -28,8 +28,16 @@ impl Registry {
             adapters: vec![
                 Box::new(cargo::Adapter),
                 Box::new(node::Adapter),
+                // Before Gradle: an Android module's `build/` is a Gradle
+                // build directory with the Android plugin's layout in it,
+                // and the module manifest decides which adapter claims it.
+                Box::new(android::Adapter),
                 Box::new(gradle::Adapter),
                 Box::new(maven::Adapter),
+                Box::new(python::Adapter),
+                Box::new(go::Adapter),
+                Box::new(xcode_swift::Adapter),
+                Box::new(docker_buildkit::Adapter),
             ],
         }
     }

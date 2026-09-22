@@ -29,7 +29,8 @@
 //! there beyond the ordinary directory walk.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const DOCKER_DESKTOP_DETECTOR_ID: &str = "docker-desktop";
@@ -52,6 +53,13 @@ impl Detector for DockerDesktopDetector {
     fn version_note(&self) -> &'static str {
         "Docker Desktop Mac FAQ, current stable default disk-image location \
          (a relocated disk image is not read; see this module's doc comment)"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::BuildKitCache,
+            anchor: StoreAnchor::SoleLocation,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

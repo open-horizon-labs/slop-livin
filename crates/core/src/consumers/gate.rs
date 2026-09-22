@@ -37,6 +37,7 @@ struct Pending {
     ecosystems: Option<Arc<HashMap<String, Vec<String>>>>,
     github: Option<GithubFactsBundle>,
     docker: Option<DockerBundle>,
+    docker_facts: Option<Arc<crate::docker::DockerFacts>>,
     emitted: bool,
 }
 
@@ -98,6 +99,7 @@ impl Consumer for AssemblyGate {
                 attributed_bytes,
                 unowned_bytes,
                 notes,
+                facts,
             } => {
                 p.docker = Some((
                     rows_by_worktree.clone(),
@@ -105,7 +107,8 @@ impl Consumer for AssemblyGate {
                     *attributed_bytes,
                     *unowned_bytes,
                     notes.clone(),
-                ))
+                ));
+                p.docker_facts = facts.clone();
             }
             _ => {}
         }
@@ -194,6 +197,7 @@ impl Consumer for AssemblyGate {
             github_enrichment: gh_summary,
             schedule_line: None,
             nested_artifacts: Arc::new(Vec::new()),
+            docker_facts: p.docker_facts.clone(),
             protected_worktree_ids: p.protected_worktree_ids.clone(),
         }))])
     }

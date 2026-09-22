@@ -63,6 +63,22 @@ pub enum ArtifactRole {
     /// than a companion of one: a `tsconfig.tsbuildinfo`, a
     /// `maven-metadata-local.xml`, a `.gradle/` task-history file.
     Metadata,
+    /// An installed toolchain, SDK, runtime or interpreter: an Android
+    /// platform, a simulator runtime, a uv-managed Python, iOS
+    /// DeviceSupport symbols. Never build output (#70: "Keep archives,
+    /// SDKs, simulator/runtime installations and mutable device state
+    /// distinct from rebuildable build output"): getting it back is a
+    /// reinstall, usually a download, not a rebuild.
+    Installation,
+    /// A retained release artifact a person produced on purpose: an Xcode
+    /// `.xcarchive`, whose dSYMs may be the only symbols for a shipped
+    /// build. Not rebuildable from source in general -- a rebuild makes a
+    /// *different* binary.
+    Archive,
+    /// Mutable state of a device or environment: a simulator's `data/`,
+    /// an Android Virtual Device. Holds whatever was installed and
+    /// written there; nothing regenerates it.
+    DeviceState,
 }
 
 /// The small set of families every adapter's roles collapse into, for
@@ -84,6 +100,11 @@ pub enum RoleFamily {
     Dependencies,
     SharedStore,
     Metadata,
+    /// Installed toolchains, SDKs and runtimes.
+    Installations,
+    /// Retained archives and mutable device state: bytes nothing
+    /// regenerates.
+    State,
     Residual,
     Unknown,
 }
@@ -98,6 +119,8 @@ impl RoleFamily {
             Self::Dependencies => "dependencies",
             Self::SharedStore => "shared-store",
             Self::Metadata => "metadata",
+            Self::Installations => "installations",
+            Self::State => "state",
             Self::Residual => "residual",
             Self::Unknown => "unknown",
         }
@@ -113,6 +136,8 @@ impl RoleFamily {
             Self::Dependencies => "Installed dependencies",
             Self::SharedStore => "Shared store entries",
             Self::Metadata => "Tool metadata",
+            Self::Installations => "Installed SDKs & runtimes",
+            Self::State => "Archives & device state",
             Self::Residual => "Not identified",
             Self::Unknown => "Unknown role",
         }
@@ -129,6 +154,8 @@ impl RoleFamily {
         Self::Intermediates,
         Self::Dependencies,
         Self::SharedStore,
+        Self::Installations,
+        Self::State,
         Self::Metadata,
         Self::Residual,
         Self::Unknown,
@@ -155,6 +182,9 @@ impl ArtifactRole {
             Self::InstalledDependencies => "installed-dependencies",
             Self::SharedStoreEntry => "shared-store-entry",
             Self::Metadata => "metadata",
+            Self::Installation => "installation",
+            Self::Archive => "archive",
+            Self::DeviceState => "device-state",
         }
     }
 
@@ -183,6 +213,9 @@ impl ArtifactRole {
         Self::InstalledDependencies,
         Self::SharedStoreEntry,
         Self::Metadata,
+        Self::Installation,
+        Self::Archive,
+        Self::DeviceState,
     ];
 
     /// Which family this role aggregates into.
@@ -204,6 +237,8 @@ impl ArtifactRole {
             Self::Dependency | Self::InstalledDependencies => RoleFamily::Dependencies,
             Self::SharedStoreEntry => RoleFamily::SharedStore,
             Self::CompanionMetadata | Self::Metadata => RoleFamily::Metadata,
+            Self::Installation => RoleFamily::Installations,
+            Self::Archive | Self::DeviceState => RoleFamily::State,
             Self::Residual => RoleFamily::Residual,
             Self::Unknown => RoleFamily::Unknown,
         }
@@ -429,6 +464,21 @@ pub struct NestedArtifact {
     /// what happens if the bytes go, never whether they should.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consequence: Option<String>,
+    /// The manager that reported this unit's bytes and times, when swamp
+    /// did not measure them itself: `Some("docker")` for a BuildKit cache
+    /// record the daemon described. `None` is swamp's own folded walk or
+    /// `stat`. A reported unit's size is the manager's logical figure and
+    /// its times are the manager's records, never a filesystem age
+    /// (#71: "do not manufacture filesystem-equivalent build
+    /// generations").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
+    /// A lock file a build tool holds while it writes here, found
+    /// present this pass (SwiftPM's `.build/.lock`, Gradle's
+    /// `*.lock`). Evidence that a writer may be active now, never proof
+    /// either way: a crashed build leaves one behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_lock: Option<PathBuf>,
 }
 
 impl NestedArtifact {

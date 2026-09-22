@@ -17,9 +17,9 @@
 //! fabricating a whole-directory download/local split it cannot support.
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    BuildStoreDecl, BuildStoreKind, ConventionRole, Detector, Environment, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 
 pub const MAVEN_DETECTOR_ID: &str = "maven";
@@ -74,6 +74,13 @@ impl Detector for MavenDetector {
             command: "mvn dependency:go-offline",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::MavenRepository,
+            anchor: StoreAnchor::SoleLocation,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

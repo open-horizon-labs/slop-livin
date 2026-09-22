@@ -9,7 +9,8 @@
 //! `crate::locations::gradle`'s job, not this detector's.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 use std::path::PathBuf;
 
@@ -44,6 +45,25 @@ impl Detector for AndroidDetector {
 
     fn version_note(&self) -> &'static str {
         "Android tools environment variables reference, current stable"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::AndroidSdkPackages,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::AndroidVirtualDevices,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Environments,
+                    suffix: &[],
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

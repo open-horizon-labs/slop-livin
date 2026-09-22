@@ -525,6 +525,8 @@ fn node(
         time_source: crate::artifact::TimeSource::FileModification,
         action: crate::artifact::NestedActionCapability::InspectionOnly,
         consequence: None,
+        reported_by: None,
+        writer_lock: None,
     }
 }
 

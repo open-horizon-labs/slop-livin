@@ -4,9 +4,8 @@
 //! `report::observe_scope` (the gate audit pins that call site).
 
 /// The right to run one observation's unit discovery. Minted only by
-/// `report::observe_scope`, and required by
-/// `external::discover_and_measure_in` and
-/// `agents::discover_and_measure_in`: the report pipeline owns discovery,
+/// `report::observe_scope`, and required by `external::observe_external`
+/// and `agents::discover_and_measure_in`: the report pipeline owns discovery,
 /// and nothing else can run a second pass over the shared history table
 /// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
 #[derive(Debug)]

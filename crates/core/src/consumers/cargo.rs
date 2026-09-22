@@ -91,9 +91,13 @@ impl Consumer for CargoConsumer {
         };
 
         let folded = folded_index(&draft);
-        let build_ctx = BuildCtx::new(ctx.observed_at, &folded, &coverage, &cache);
+        let facts = draft.docker_facts.clone();
+        let mut build_ctx = BuildCtx::new(ctx.observed_at, &folded, &coverage, &cache);
+        if let Some(f) = facts.as_deref() {
+            build_ctx = build_ctx.with_daemon(f);
+        }
         let projects = project_candidates(&draft);
-        let shared = shared_containers(ctx);
+        let shared = shared_containers(&self.adapters, facts.as_deref());
         let nested =
             crate::build_adapters::identify_all(&self.adapters, &projects, &shared, &build_ctx);
 
@@ -152,23 +156,35 @@ fn project_candidates(draft: &Draft) -> Vec<(PathBuf, Vec<PathBuf>)> {
     out
 }
 
-/// Stores shared across every project: an npm/pnpm cache, a Gradle user
-/// home, a Maven local repository.
+/// The stores this *per-root* pass hands an adapter: the Docker
+/// daemon's BuildKit caches, one per builder, when the daemon was asked
+/// and answered.
 ///
-/// Empty in this chunk, deliberately. These are detector-resolved
-/// locations (`crate::locations`, #47) rather than artifact rows beneath
-/// a checkout, and `external::discover_and_measure` already owns their
-/// measurement and their history window. Joining them in from here would
-/// be a second observation of the same bytes in the same pass, which is
-/// the shape `.oh/guardrails/history-sweeps-are-owned.md` exists to
-/// stop, and it would need an ownership decision this chunk has no
-/// mandate to make.
+/// Until 2026-09-22 this returned an empty list for every machine-wide
+/// store, deliberately, because the npm/pnpm stores, Gradle homes, Maven
+/// repositories, Go/Python caches, DerivedData, CoreSimulator and the
+/// Android SDK are detector-resolved external locations whose
+/// measurement and history window `external::observe_external` owns --
+/// joining them from here would observe the same bytes twice in one pass.
+/// They are now joined *there*, from the folded rows that observation
+/// already produces (`crate::build_stores::containers_for`), and reach
+/// the report as `ScopeObservation::store_interiors`.
 ///
-/// The adapters' shared-store identification is written and tested
-/// (`BuildContainer::shared_store`, and the store tests in
-/// `build_adapters::{node,gradle,maven}`); what is missing is the join.
-/// Saying so here is more honest than wiring a second traversal to make
-/// a column non-empty.
-fn shared_containers(_ctx: &Ctx<'_>) -> Vec<BuildContainer> {
-    Vec::new()
+/// A BuildKit cache is the one store that belongs here: it is not on
+/// disk for anything to walk, the daemon answered for it in this very
+/// pass (`consumers::docker`), and its records have no filesystem
+/// history to own. Matched by the same two declared capabilities
+/// (`.oh/guardrails/build-stores-join-by-capability.md`).
+fn shared_containers(
+    adapters: &crate::build_adapters::registry::Registry,
+    facts: Option<&crate::docker::DockerFacts>,
+) -> Vec<BuildContainer> {
+    let Some(facts) = facts else {
+        return Vec::new();
+    };
+    crate::build_stores::daemon_containers(
+        adapters,
+        &crate::locations::Registry::with_builtins(),
+        facts,
+    )
 }

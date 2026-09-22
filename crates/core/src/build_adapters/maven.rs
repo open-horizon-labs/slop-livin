@@ -192,6 +192,11 @@ impl BuildAdapter for Adapter {
         }
     }
 
+    fn store_kinds(&self) -> &'static [crate::locations::BuildStoreKind] {
+        use crate::locations::BuildStoreKind;
+        &[BuildStoreKind::MavenRepository]
+    }
+
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
         if !project_root.join("pom.xml").is_file() {
             return Vec::new();

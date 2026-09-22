@@ -41,7 +41,8 @@ impl Consumer for DockerConsumer {
         // observation, forever, when the daemon is installed and
         // stopped (the 2026-09-22 re-review's CE6). A mocked facts file
         // is a test/CLI input, not a probe, so it is still honoured.
-        let facts = if ctx.docker_in_scope || ctx.docker_facts.is_some() {
+        let asked = ctx.docker_in_scope || ctx.docker_facts.is_some();
+        let facts = if asked {
             crate::docker::load_cached(
                 ctx.docker_facts.as_deref(),
                 ctx.store_dir.as_deref(),
@@ -84,6 +85,7 @@ impl Consumer for DockerConsumer {
             attributed_bytes: join.attributed_bytes,
             unowned_bytes: join.unowned_bytes,
             notes,
+            facts: asked.then(|| Arc::new(facts)),
         }])
     }
 }

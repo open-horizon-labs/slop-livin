@@ -123,6 +123,11 @@ pub struct Draft {
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
     pub nested_artifacts: Arc<Vec<crate::artifact::NestedArtifact>>,
+    /// The Docker daemon's answers this pass, when it was asked and
+    /// answered: what the build consumer hands the BuildKit adapter
+    /// (`crate::build_stores::daemon_containers`). `None` when Docker
+    /// was out of scope.
+    pub docker_facts: Option<Arc<crate::docker::DockerFacts>>,
     /// Worktree ids the walk could not confirm gone-vs-inaccessible this
     /// pass (#42) -- see `growth::compute_unconfirmed_worktrees`. The
     /// growth store must never tombstone rows for these ids from this
@@ -201,6 +206,9 @@ pub enum Event {
         attributed_bytes: u64,
         unowned_bytes: u64,
         notes: Vec<String>,
+        /// The facts the rows came from, for the BuildKit record
+        /// identification; `None` when the daemon was not asked.
+        facts: Option<Arc<crate::docker::DockerFacts>>,
     },
     RowsAssembled(Arc<Draft>),
     CargoAnnotated(Arc<Draft>),

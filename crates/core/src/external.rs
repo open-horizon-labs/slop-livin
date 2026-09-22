@@ -260,7 +260,7 @@ pub fn discover_and_measure(
     since_secs: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> Result<Vec<ExternalUnit>> {
-    discover_and_measure_in(
+    observe_external(
         &crate::report::DiscoveryPass::for_tests(),
         scope,
         swamp_dir,
@@ -270,14 +270,29 @@ pub fn discover_and_measure(
         since_secs,
         coverage,
     )
+    .map(|o| o.units)
 }
 
-/// External-unit discovery for one observation. Takes the
+/// Everything one external observation produces: the external units, and
+/// the identified interior of every machine-wide build store among them
+/// (`crate::build_stores`), in the same pass and under the same
+/// ownership.
+#[derive(Debug, Default)]
+pub struct ExternalObservation {
+    pub units: Vec<ExternalUnit>,
+    /// Units inside the stores, each with `container_id` naming its
+    /// store; a unit's store is the external unit whose `path` its own
+    /// path lies under.
+    pub interiors: Vec<crate::artifact::NestedArtifact>,
+}
+
+/// [`discover_and_measure`], plus the store interiors. Takes the
 /// [`crate::report::DiscoveryPass`] only `report::observe_scope` mints
 /// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`); the
-/// `testing`-feature `discover_and_measure` is the fixture spelling.
+/// `testing`-feature `discover_and_measure` is the fixture spelling, and
+/// drops the interiors for callers that only want units.
 #[allow(clippy::too_many_arguments)]
-pub fn discover_and_measure_in(
+pub fn observe_external(
     _pass: &crate::report::DiscoveryPass,
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
@@ -286,7 +301,7 @@ pub fn discover_and_measure_in(
     retention_days: u64,
     since_secs: u64,
     coverage: &crate::fs_events::EventCoverage,
-) -> Result<Vec<ExternalUnit>> {
+) -> Result<ExternalObservation> {
     // Authorized scope only -- never raw detector candidates. The
     // review's `excluded_agent_home_must_not_be_scanned` counterexample
     // was exactly this loop reading `scope.detectors` and so never
@@ -320,6 +335,43 @@ pub fn discover_and_measure_in(
             canon_candidates.push((c, canonical));
         }
     }
+
+    // Which of these locations are machine-wide build stores, and which
+    // adapter identifies each: the detector's declaration against the
+    // adapter's, nothing else (`crate::build_stores::containers_for`).
+    let adapters = crate::build_adapters::registry::Registry::with_builtins();
+    let detectors = crate::locations::Registry::with_builtins();
+    let store_containers: HashMap<usize, crate::build_adapters::BuildContainer> = {
+        let located: Vec<crate::build_stores::Located> = canon_candidates
+            .iter()
+            .map(|(c, canonical)| crate::build_stores::Located {
+                detector_id: &c.detector_id,
+                category: c.category,
+                path: canonical,
+            })
+            .collect();
+        crate::build_stores::containers_for(&adapters, &detectors, &located)
+            .into_iter()
+            .collect()
+    };
+    // The stores' previously identified units, and the question whether
+    // this pass's window vouches for each -- asked before measuring, so
+    // a store whose units cannot be replayed is measured with its
+    // directory rows kept rather than twice.
+    let previous_units = match swamp_dir {
+        Some(dir) if !store_containers.is_empty() => crate::build_stores::load_units(dir),
+        _ => HashMap::new(),
+    };
+    let stored_cache = crate::build_adapters::ContainerCache::from_containers(
+        previous_units.values().cloned().collect(),
+    );
+    let no_rows = crate::build_adapters::FoldedIndex::default();
+    let probe =
+        crate::build_adapters::BuildCtx::new(observed_at, &no_rows, coverage, &stored_cache);
+    let mut store_dirs: Vec<crate::build_adapters::FoldedDir> = Vec::new();
+    // Stores measured this pass (identified or replayed), and which of
+    // them were *not* re-walked, so their stored units may be replayed.
+    let mut measured_stores: Vec<(usize, bool)> = Vec::new();
 
     let mut units: Vec<ExternalUnit> = Vec::new();
     let mut observed: Vec<crate::growth::ObservedExternal> = Vec::new();
@@ -384,13 +436,33 @@ pub fn discover_and_measure_in(
         // `observe_unit` tries the stored folded rows first, so a unit
         // this pass's event window vouches for costs no listing, no
         // `stat` and not even the readability probe.
-        let row = match crate::folded_measurement::observe_unit(
-            swamp_dir,
-            &canonical,
-            &nested_exclusions,
-            observed_at,
-            coverage,
-        ) {
+        let observation = match store_containers.get(&idx) {
+            Some(container) => {
+                let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
+                    swamp_dir,
+                    &canonical,
+                    &nested_exclusions,
+                    observed_at,
+                    coverage,
+                    probe.can_reuse(container),
+                );
+                if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
+                    measured_stores.push((idx, dirs.is_none()));
+                }
+                if let Some(dirs) = dirs {
+                    store_dirs.extend(crate::build_stores::folded_dirs(&canonical, dirs));
+                }
+                obs
+            }
+            None => crate::folded_measurement::observe_unit(
+                swamp_dir,
+                &canonical,
+                &nested_exclusions,
+                observed_at,
+                coverage,
+            ),
+        };
+        let row = match observation {
             // Genuinely absent: no candidate this pass. If it was
             // measured before, this observation's own owned sweep
             // tombstones it correctly (a real removal, e.g. the tool was
@@ -492,6 +564,77 @@ pub fn discover_and_measure_in(
         .transpose()?
         .unwrap_or_default();
 
+    // The stores' interiors. A store that was not re-walked replays its
+    // stored units under the same window its folded total was replayed
+    // under; one that was re-walked is identified from the directory rows
+    // that walk produced, never from stored units that predate it.
+    let containers: Vec<crate::build_adapters::BuildContainer> = measured_stores
+        .iter()
+        .filter_map(|(i, _)| store_containers.get(i).cloned())
+        .collect();
+    let replayable: HashSet<String> = measured_stores
+        .iter()
+        .filter(|(_, reused)| *reused)
+        .filter_map(|(i, _)| store_containers.get(i).map(|c| c.scope()))
+        .collect();
+    let replay_cache = crate::build_adapters::ContainerCache::from_containers(
+        previous_units
+            .iter()
+            .filter(|(k, _)| replayable.contains(*k))
+            .map(|(_, v)| v.clone())
+            .collect(),
+    );
+    let folded_rows = crate::build_adapters::FoldedIndex::from_dirs(store_dirs);
+    let build_ctx =
+        crate::build_adapters::BuildCtx::new(observed_at, &folded_rows, coverage, &replay_cache);
+    let mut interiors =
+        crate::build_adapters::identify_all(&adapters, &[], &containers, &build_ctx);
+    crate::report::nested_decision_evidence(&mut interiors, observed_at, true);
+    let identified: Vec<crate::build_stores::IdentifiedStore> = measured_stores
+        .iter()
+        .filter_map(|(i, _)| {
+            let (c, canonical) = canon_candidates.get(*i)?;
+            Some(crate::build_stores::IdentifiedStore {
+                detector_id: c.detector_id.clone(),
+                device: device_of(canonical),
+                path: canonical.clone(),
+            })
+        })
+        .collect();
+    crate::build_stores::record_history(
+        swamp_dir,
+        observe,
+        &identified,
+        &mut interiors,
+        &out_of_scope,
+        observed_at,
+        retention_days,
+        since_secs,
+    )?;
+    if let Some(dir) = swamp_dir
+        && observe
+        && !containers.is_empty()
+    {
+        let mut this_pass: HashMap<String, Vec<crate::artifact::NestedArtifact>> = HashMap::new();
+        for c in &containers {
+            this_pass.entry(c.scope()).or_default();
+        }
+        for u in &interiors {
+            if let Some(scope) = &u.container_id
+                && let Some(v) = this_pass.get_mut(scope)
+            {
+                v.push(u.clone());
+            }
+        }
+        let carried: HashMap<String, (u64, Vec<crate::artifact::NestedArtifact>)> = previous_units
+            .into_iter()
+            .filter(|(k, _)| !this_pass.contains_key(k))
+            .collect();
+        let this_pass: Vec<(String, Vec<crate::artifact::NestedArtifact>)> =
+            this_pass.into_iter().collect();
+        crate::build_stores::save_units(dir, &this_pass, carried, observed_at);
+    }
+
     for (
         key,
         MeasuredUnit {
@@ -571,7 +714,17 @@ pub fn discover_and_measure_in(
         }
     }
 
-    Ok(units)
+    // A store's own row is the external unit, and its history is the
+    // external unit's: the same bytes on the same observation, never a
+    // second key.
+    for u in interiors.iter_mut() {
+        if let Some(e) = units.iter().find(|e| e.path == u.path) {
+            *u = crate::build_adapters::NestedUnitBuilder::amend(u.clone())
+                .history(e.growth_bytes, e.regrowth_count)
+                .build();
+        }
+    }
+    Ok(ExternalObservation { units, interiors })
 }
 
 fn category_from_str(s: &str) -> Option<StorageCategory> {

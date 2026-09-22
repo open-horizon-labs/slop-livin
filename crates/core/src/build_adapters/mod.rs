@@ -44,14 +44,20 @@
 //! `crates/core/tests/build_adapter_cost.rs` assertions rather than
 //! claims.
 
+pub mod android;
 pub mod bounded_io;
 pub mod cargo;
+pub mod docker_buildkit;
+pub mod go;
 pub mod gradle;
 pub mod jvm_common;
+pub mod layout;
 pub mod matrix;
 pub mod maven;
 pub mod node;
+pub mod python;
 pub mod registry;
+pub mod xcode_swift;
 
 use crate::artifact::{
     AccountingBasis, ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant, Membership,
@@ -59,6 +65,7 @@ use crate::artifact::{
 };
 use crate::entities::Confidence;
 use crate::fs_events::EventCoverage;
+use crate::locations::BuildStoreKind;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +95,11 @@ pub struct BuildContainer {
     /// linked from (#68: "Account for linked/shared store entries
     /// without duplicated measurement").
     pub shared: bool,
+    /// Which kind of machine-wide store this is, when the detector that
+    /// resolved it declared one (`locations::Detector::build_stores`).
+    /// `None` for a project-local container, and for a shared store a
+    /// caller built without a declaration (the adapters' own fixtures).
+    pub store_kind: Option<BuildStoreKind>,
 }
 
 impl BuildContainer {
@@ -97,6 +109,7 @@ impl BuildContainer {
             path,
             project_root: Some(project_root),
             shared: false,
+            store_kind: None,
         }
     }
 
@@ -106,7 +119,41 @@ impl BuildContainer {
             path,
             project_root: None,
             shared: true,
+            store_kind: None,
         }
+    }
+
+    /// A machine-wide store the detector declared as `kind`. What the
+    /// external observation hands an adapter
+    /// (`.oh/guardrails/build-stores-join-by-capability.md`).
+    pub fn shared_store_of(adapter_id: &'static str, path: PathBuf, kind: BuildStoreKind) -> Self {
+        Self {
+            adapter_id,
+            path,
+            project_root: None,
+            shared: true,
+            store_kind: Some(kind),
+        }
+    }
+
+    /// A store a daemon answers for rather than a directory swamp walks:
+    /// one BuildKit builder's cache. The path is a stable name, never a
+    /// filesystem location -- nothing inside it is statted, listed or
+    /// read, and no unit under it carries filesystem provenance.
+    pub fn daemon_store(adapter_id: &'static str, name: &str, kind: BuildStoreKind) -> Self {
+        Self {
+            adapter_id,
+            path: PathBuf::from(format!("{DAEMON_STORE_SCHEME}{name}")),
+            project_root: None,
+            shared: true,
+            store_kind: Some(kind),
+        }
+    }
+
+    /// Whether this container is answered by a daemon rather than
+    /// measured on disk.
+    pub fn is_daemon_store(&self) -> bool {
+        self.path.to_string_lossy().starts_with(DAEMON_STORE_SCHEME)
     }
 
     /// The container's own storage id, the prefix every unit inside it
@@ -116,6 +163,17 @@ impl BuildContainer {
         NestedArtifact::storage_id(&self.path, "")
     }
 }
+
+/// The `producer_evidence` source under which an adapter records a
+/// manager's own last-use timestamp for a unit (a BuildKit record's
+/// `LastUsedAt`), verbatim, so the decision-evidence layer can normalize
+/// it without the adapter ever converting it into a filesystem age.
+pub const LAST_USED_EVIDENCE: &str = "manager-last-used";
+
+/// The path prefix of a [`BuildContainer::daemon_store`]. Not a
+/// filesystem path on any platform, so nothing can mistake one for a
+/// directory to stat.
+pub const DAEMON_STORE_SCHEME: &str = "daemon-store://";
 
 // ---------------------------------------------------------------------
 // Folded rows: the structure an adapter is allowed to see
@@ -215,6 +273,26 @@ impl ContainerCache {
         }
     }
 
+    /// Seeds the cache from stored containers, each with the observation
+    /// that last verified it -- a machine-wide store's units carry their
+    /// own verification time, not one stamp for the whole table.
+    pub fn from_containers(containers: Vec<(u64, Vec<NestedArtifact>)>) -> Self {
+        let mut entries: HashMap<String, (u64, Vec<NestedArtifact>)> = HashMap::new();
+        for (stored_at, units) in containers {
+            let Some(key) = units
+                .first()
+                .map(|u| u.container_id.clone().unwrap_or_else(|| u.id.clone()))
+            else {
+                continue;
+            };
+            entries.insert(key, (stored_at, units));
+        }
+        Self {
+            entries: RefCell::new(entries),
+            enabled: true,
+        }
+    }
+
     /// Seeds the cache from a previous report's nested units, grouped by
     /// the container each one belongs to.
     pub fn from_previous(units: Vec<NestedArtifact>, stored_at: u64) -> Self {
@@ -241,6 +319,7 @@ pub struct BuildCtx<'a> {
     folded: &'a FoldedIndex,
     coverage: &'a EventCoverage,
     cache: &'a ContainerCache,
+    daemon: Option<&'a crate::docker::DockerFacts>,
 }
 
 impl<'a> BuildCtx<'a> {
@@ -255,7 +334,20 @@ impl<'a> BuildCtx<'a> {
             folded,
             coverage,
             cache,
+            daemon: None,
         }
+    }
+
+    /// The Docker daemon's answers this pass (already fetched, cached and
+    /// bounded by `crate::docker`), for an adapter that identifies a
+    /// daemon store. An adapter never asks the daemon itself.
+    pub fn with_daemon(mut self, facts: &'a crate::docker::DockerFacts) -> Self {
+        self.daemon = Some(facts);
+        self
+    }
+
+    pub fn daemon(&self) -> Option<&crate::docker::DockerFacts> {
+        self.daemon
     }
 
     pub fn folded(&self) -> &FoldedIndex {
@@ -409,6 +501,14 @@ pub trait BuildAdapter: Send + Sync {
         BuildCapabilities::default()
     }
 
+    /// Which kinds of machine-wide store this adapter identifies the
+    /// interior of. The external observation hands a measured store to
+    /// the adapter claiming its declared kind; an adapter claiming none
+    /// is only ever given project containers.
+    fn store_kinds(&self) -> &'static [BuildStoreKind] {
+        &[]
+    }
+
     /// Which containers under `project_root` this adapter claims, given
     /// the artifact directories the walk found there.
     ///
@@ -491,7 +591,52 @@ impl NestedUnitBuilder {
                 time_source: TimeSource::Unknown,
                 action: NestedActionCapability::InspectionOnly,
                 consequence: None,
+                reported_by: None,
+                writer_lock: None,
             },
+        }
+    }
+
+    /// A directory the folded walk measured, identified: `role`, the
+    /// layout claim that makes it reviewable, the tool that produced it,
+    /// and what removing it costs. The shape nearly every adapter unit
+    /// has, in one constructor so the claim and the measurement are
+    /// never separated.
+    pub fn known_dir(
+        container: &BuildContainer,
+        role: ArtifactRole,
+        dir: &FoldedDir,
+        reason: impl Into<String>,
+        consequence: impl Into<String>,
+    ) -> Self {
+        let reason = reason.into();
+        let source = format!("{}-layout", container.adapter_id);
+        Self::new(container, role, dir.path.clone())
+            .folded(dir)
+            .supported_with_reason(reason.clone())
+            .evidence(&source, reason, Confidence::Medium)
+            .consequence(consequence)
+    }
+
+    /// A directory the folded walk measured and this adapter does not
+    /// identify: a residual, named, never dropped.
+    pub fn unknown_dir(
+        container: &BuildContainer,
+        dir: &FoldedDir,
+        limit: impl Into<String>,
+    ) -> Self {
+        Self::new(container, ArtifactRole::Residual, dir.path.clone())
+            .folded(dir)
+            .unsupported_layout(limit)
+    }
+
+    /// The container's own row, measured from the folded rows when the
+    /// walk measured it, and saying so when it did not.
+    pub fn container_root(container: &BuildContainer, ctx: &BuildCtx, role: ArtifactRole) -> Self {
+        let b = Self::new(container, role, container.path.clone()).is_dir(true);
+        match ctx.folded().get(&container.path) {
+            Some(d) => b.folded(d),
+            None => b.limit("this directory was not measured by the walk this pass"),
         }
     }
 
@@ -686,6 +831,59 @@ impl NestedUnitBuilder {
         self
     }
 
+    /// Bytes and a time a manager reported rather than swamp measured:
+    /// the daemon's logical size, on the logical basis, and the record's
+    /// own creation time as a tool-recorded fact. The two things that
+    /// make a reported number interpretable travel with it, and nothing
+    /// here can be mistaken for a filesystem measurement.
+    pub fn reported_by_manager(
+        mut self,
+        manager: impl Into<String>,
+        logical_bytes: u64,
+        recorded_at: Option<u64>,
+    ) -> Self {
+        self.unit.reported_by = Some(manager.into());
+        self.unit.bytes = logical_bytes;
+        self.unit.logical_bytes = logical_bytes;
+        self.unit.basis = AccountingBasis::Logical;
+        match recorded_at {
+            Some(t) => {
+                self.unit.mtime_max = t;
+                self.unit.time_source = TimeSource::ToolRecorded;
+            }
+            None => {
+                self.unit.mtime_max = 0;
+                self.unit.time_source = TimeSource::Unknown;
+            }
+        }
+        self.unit.coverage.complete = true;
+        self
+    }
+
+    /// Records a writer's lock file found present this pass, and
+    /// withholds any action while it is there.
+    pub fn writer_lock(mut self, lock: PathBuf, tool: &str) -> Self {
+        self.unit.coverage.limits.push(format!(
+            "`{}` is present: {tool} may be writing here now (a crashed build also leaves one)",
+            lock.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        self.unit.writer_lock = Some(lock);
+        self.unit.action = NestedActionCapability::Unsupported {
+            reason: format!("{tool} may be writing here now"),
+        };
+        self
+    }
+
+    /// This pass's history for the unit, from the current + reverse-delta
+    /// store. History is annotation, never identity.
+    pub fn history(mut self, growth_bytes: Option<i64>, regrowth_count: u32) -> Self {
+        self.unit.growth_bytes = growth_bytes;
+        self.unit.regrowth_count = regrowth_count;
+        self
+    }
+
     /// An action group by its already-computed storage id.
     pub fn action_group_id(mut self, id: String) -> Self {
         self.unit.action_group = Some(id);
@@ -780,6 +978,8 @@ pub fn family_guidance(family: RoleFamily) -> &'static str {
         RoleFamily::Dependencies => "Review: reinstall from registry",
         RoleFamily::SharedStore => "Shared: other projects may link",
         RoleFamily::Metadata => "Lower priority: tool bookkeeping",
+        RoleFamily::Installations => "Review: reinstall is a download",
+        RoleFamily::State => "Keep in mind: may be unique",
         RoleFamily::Container => "Container: see groups inside",
         RoleFamily::Residual | RoleFamily::Unknown => "Inspect: not identified",
     }

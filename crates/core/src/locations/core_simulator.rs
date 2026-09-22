@@ -14,7 +14,8 @@
 //! Unreadable`), never silently treated as "not present".
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const CORE_SIMULATOR_DETECTOR_ID: &str = "core-simulator";
@@ -36,6 +37,32 @@ impl Detector for CoreSimulatorDetector {
 
     fn version_note(&self) -> &'static str {
         "CoreSimulator layout, current stable (system-wide runtime volumes may be permission-gated)"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::SimulatorDevices,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Environments,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::SimulatorCaches,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &[],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::SimulatorRuntimes,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &[],
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

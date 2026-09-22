@@ -687,9 +687,59 @@ pub fn attach_decision_evidence(report: &mut Report) {
 /// `coverage`. No new traversal, no new `stat`: a nested unit's facts
 /// are a projection of the Cargo inspection that produced it.
 fn attach_nested_decision_evidence(report: &mut Report) {
-    use crate::artifact::{ArtifactRole, Membership};
     let observed_at = report.observed_at;
-    for unit in &mut report.nested_artifacts {
+    nested_decision_evidence(&mut report.nested_artifacts, observed_at, false);
+}
+
+/// The evidence projection for nested units, wherever they were
+/// identified: inside a project container (`in_shared_store: false`) or
+/// inside a machine-wide store the external observation measured
+/// (`true`, `crate::build_stores`).
+///
+/// A unit a manager reported (`reported_by`, a BuildKit record) gets the
+/// manager's provenance throughout -- its times are the daemon's, its
+/// bytes are the daemon's logical figure, and nothing here names
+/// `FilesystemMetadata` for them (PR #123's test 10, for nested units).
+pub(crate) fn nested_decision_evidence(
+    units: &mut [crate::artifact::NestedArtifact],
+    observed_at: u64,
+    in_shared_store: bool,
+) {
+    use crate::artifact::{ArtifactRole, Membership, RoleFamily};
+    for unit in units.iter_mut() {
+        if let Some(manager) = unit.reported_by.clone() {
+            // Activity: the record's creation time is the manager's own
+            // record, never a filesystem age; its last use is a separate
+            // manager fact, carried as the adapter recorded it.
+            unit.decision_evidence
+                .push(crate::activity::tool_reported_use_evidence(
+                    manager.clone(),
+                    "the daemon's record of when this entry was created",
+                    (unit.mtime_max > 0).then_some(unit.mtime_max),
+                    observed_at,
+                ));
+            let last_used = unit
+                .producer_evidence
+                .iter()
+                .find(|e| e.source == crate::build_adapters::LAST_USED_EVIDENCE)
+                .map(|e| e.detail.clone());
+            unit.decision_evidence
+                .push(crate::activity::docker_last_used_evidence(
+                    last_used.as_deref(),
+                    observed_at,
+                ));
+            unit.decision_evidence.extend(
+                crate::reclaimability::DockerByteAccounting::for_object(unit.bytes).evidence(),
+            );
+            let recovery = crate::recovery::docker_build_cache_recovery(false);
+            let ev = match &recovery.follow_up_check {
+                Some(check) => recovery.evidence.with_note(format!("check: {check}")),
+                None => recovery.evidence,
+            };
+            unit.decision_evidence.push(ev);
+            continue;
+        }
+
         // Activity (#54): the newest recorded modification among this
         // unit's measured children. Labelled modification, never "last
         // used".
@@ -703,12 +753,6 @@ fn attach_nested_decision_evidence(report: &mut Report) {
         // mtime is Cargo's record of when it last built that unit --
         // a *tool-reported build time*, not a filesystem age, and kept
         // as a separate fact beside the modification one.
-        //
-        // `docs/usage.md` and `activity::ACTIVITY_EVIDENCE_INVENTORY`
-        // both claimed this fact; until 2026-09-22
-        // `tool_reported_use_evidence`'s only non-test caller was
-        // `docker_last_used_evidence`, so the Cargo half of the claim
-        // was Docker-only in practice.
         if unit.relative_path.contains(".fingerprint") {
             unit.decision_evidence
                 .push(crate::activity::tool_reported_use_evidence(
@@ -717,6 +761,16 @@ fn attach_nested_decision_evidence(report: &mut Report) {
                      build for it, which is not the same as when a human last used the output",
                     (unit.mtime_max > 0).then_some(unit.mtime_max),
                     observed_at,
+                ));
+        }
+
+        // Current use (#55): a writer's lock file the adapter found
+        // present this pass. Probed read-only; absence is never "idle".
+        if let Some(lock) = unit.writer_lock.clone() {
+            unit.decision_evidence
+                .push(crate::occupancy::manager_lock_evidence(
+                    unit.adapter.clone().unwrap_or_default(),
+                    &lock,
                 ));
         }
 
@@ -744,13 +798,37 @@ fn attach_nested_decision_evidence(report: &mut Report) {
                 },
             ));
 
-        // Recovery (#58): a nested unit inside a `target/` tree is build
-        // output whose source is present in this report by construction.
-        // Anything the inspection could not classify says so rather than
-        // guessing at a rebuild command.
-        let recovery = match unit.role {
-            ArtifactRole::Unknown => crate::recovery::cache_without_signal_recovery(
+        // Recovery (#58), by what the unit *is*. A unit inside a project
+        // container is build output whose source is present in this
+        // report by construction. An installation is a reinstall; an
+        // archive or a device's state is not regenerated by anything; a
+        // shared store entry is a re-download from wherever it came
+        // from, which the entry itself does not record. Anything the
+        // inspection could not classify says so.
+        let recovery = match (unit.role.family(), &unit.role) {
+            (_, ArtifactRole::Unknown) => crate::recovery::cache_without_signal_recovery(
                 "the nested unit's role was not established by this pass",
+            ),
+            (RoleFamily::Installations, _) => crate::recovery::toolchain_installation_recovery(
+                unit.adapter.as_deref().unwrap_or("its manager"),
+                unit.variant
+                    .version
+                    .as_deref()
+                    .or(unit.variant.toolchain.as_deref()),
+            ),
+            (RoleFamily::State, _) => crate::recovery::mutable_environment_recovery(
+                unit.role.label(),
+                &unit.path.display().to_string(),
+            ),
+            (RoleFamily::SharedStore, _) | (RoleFamily::Dependencies, _) if in_shared_store => {
+                crate::recovery::cache_without_signal_recovery(
+                    "an entry in a shared store: whether it can be fetched again depends on the \
+                     registry or source it came from, which the entry does not record",
+                )
+            }
+            _ if in_shared_store => crate::recovery::cache_without_signal_recovery(
+                "a machine-wide cache entry: which project's build would regenerate it is not \
+                 recorded in the store",
             ),
             _ => crate::recovery::build_output_recovery(true, &unit.path),
         };
@@ -2200,6 +2278,13 @@ pub struct ScopeObservation {
     /// FSEvents replay covered it (so its units could be replayed) or
     /// why it could not. Empty when no detector resolved a root.
     pub unit_root_coverage: Vec<crate::coverage::UnitRootCoverage>,
+    /// The identified interiors of the machine-wide build stores among
+    /// `external_units` -- a Maven repository's artifact versions, a Go
+    /// module cache's modules, a DerivedData project folder's products
+    /// (`crate::build_stores`). Each unit's `container_id` names its
+    /// store; a unit belongs to the external unit whose path it lies
+    /// under. Empty when external units were not observed.
+    pub store_interiors: Vec<crate::artifact::NestedArtifact>,
 }
 
 /// Which parts of a scope this observation covers.
@@ -2336,8 +2421,8 @@ pub fn observe_scope(
     let mut merged = merged;
     let pass = pass::DiscoveryPass::begin();
     let mut external_ok = true;
-    let mut external_units = if want.external {
-        let measured = crate::external::discover_and_measure_in(
+    let (mut external_units, store_interiors) = if want.external {
+        let measured = crate::external::observe_external(
             &pass,
             scope,
             store_dir,
@@ -2348,11 +2433,12 @@ pub fn observe_scope(
             &events,
         );
         external_ok = measured.is_ok();
-        let mut units = measured.unwrap_or_default();
+        let observation = measured.unwrap_or_default();
+        let mut units = observation.units;
         crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
-        units
+        (units, observation.interiors)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let _ = &mut external_units;
     // Aider's per-repository units need every known worktree root; the
@@ -2442,6 +2528,7 @@ pub fn observe_scope(
         external_units,
         agent_units,
         unit_root_coverage,
+        store_interiors,
     })
 }
 
