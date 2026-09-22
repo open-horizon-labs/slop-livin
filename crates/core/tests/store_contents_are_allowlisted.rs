@@ -1,0 +1,328 @@
+//! What swamp is allowed to leave in its store
+//! (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`,
+//! `.oh/guardrails/json-persistence-is-allowlisted.md`).
+//!
+//! The AST audits check the *code*. This checks the disk: it runs a full
+//! observe -> report -> propose -> approve -> execute cycle over a
+//! multi-ecosystem fixture and then walks the store, asserting every
+//! file matches exactly one allow-listed pattern. A new JSON data cache
+//! fails here even if it is assembled from fragments the audits cannot
+//! see, and a growing JSON file fails on size alone -- a control file
+//! that keeps growing is a data store in disguise.
+//!
+//! Disposable `tempfile` fixtures throughout. The Trash root is a
+//! fixture directory, never the user's real Trash.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use swamp_core::locations::{Environment, Platform, Registry};
+use swamp_core::scope::{ScanConfig, resolve_effective_scope};
+
+/// A control file may be JSON; above this it is a data store wearing a
+/// control file's name.
+const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
+
+/// Exact basenames allowed anywhere under the store.
+const ALLOWED_NAMES: &[&str] = &[
+    "config.toml",
+    "grants.json",
+    "ledger.jsonl",
+    "last_run.json",
+    "fsevents.json",
+    "topology.json",
+    "docker_facts.json",
+    "unowned.json",
+    "ui_state.json",
+    "scope.json",
+    "agent_protect.json",
+    "restore.json",
+    "last_report.json",
+    "last_report.json.zst",
+];
+
+fn allowed(rel: &Path) -> bool {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if ALLOWED_NAMES.contains(&name.as_str()) {
+        return true;
+    }
+    // Columnar tables, wherever the store puts them.
+    if name.ends_with(".parquet") {
+        return true;
+    }
+    // One plan per file, named by its id.
+    if rel.components().any(|c| c.as_os_str() == "plans") && name.ends_with(".json") {
+        return true;
+    }
+    // The per-root/per-scope report cache is one compressed file named
+    // from a hash of what it covers.
+    if name.starts_with("last_report-") && name.ends_with(".json.zst") {
+        return true;
+    }
+    // Lock files and the store's own bookkeeping markers.
+    if name.ends_with(".lock") || name == "VERSION" {
+        return true;
+    }
+    false
+}
+
+fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            walk(&p, base, out);
+        } else {
+            out.push(p.strip_prefix(base).unwrap_or(&p).to_path_buf());
+        }
+    }
+}
+
+/// Projects in three ecosystems, an external cache root, and a synthetic
+/// agent home: enough that every persistence path in the pipeline runs.
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    src: PathBuf,
+    cargo_home: PathBuf,
+    claude_home: PathBuf,
+    store: PathBuf,
+    trash: PathBuf,
+}
+
+fn build() -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let src = root.join("src");
+
+    // Rust
+    let rust = src.join("rust-app");
+    fs::create_dir_all(rust.join("target/debug/incremental")).unwrap();
+    fs::write(rust.join("Cargo.toml"), b"[package]\nname=\"a\"\n").unwrap();
+    fs::write(
+        rust.join("Cargo.lock"),
+        b"[[package]]\nname = \"serde\"\nversion = \"1.0.203\"\n",
+    )
+    .unwrap();
+    fs::write(rust.join("target/debug/blob"), vec![b'r'; 8192]).unwrap();
+
+    // Node
+    let node = src.join("node-app");
+    fs::create_dir_all(node.join("node_modules/lodash")).unwrap();
+    fs::write(node.join("package.json"), b"{\"name\":\"n\"}").unwrap();
+    fs::write(node.join("node_modules/lodash/index.js"), vec![b'n'; 4096]).unwrap();
+
+    // Maven, with an unresolvable version so the gap path runs too
+    let maven = src.join("maven-app");
+    fs::create_dir_all(&maven).unwrap();
+    fs::write(
+        maven.join("pom.xml"),
+        br#"<project><properties><v>1.0</v></properties><dependencies>
+        <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency>
+        </dependencies></project>"#,
+    )
+    .unwrap();
+
+    // An external cache root and a synthetic agent home.
+    let cargo_home = root.join("cargo-home");
+    fs::create_dir_all(cargo_home.join("registry/src/index.crates.io-abc/serde-1.0.203")).unwrap();
+    fs::write(
+        cargo_home.join("registry/src/index.crates.io-abc/serde-1.0.203/lib.rs"),
+        vec![b'c'; 2048],
+    )
+    .unwrap();
+
+    let claude_home = root.join("claude");
+    fs::create_dir_all(claude_home.join("debug")).unwrap();
+    fs::write(claude_home.join("debug/log.txt"), vec![b'l'; 1024]).unwrap();
+
+    Fixture {
+        src,
+        cargo_home,
+        claude_home,
+        store: root.join("store"),
+        trash: root.join("trash"),
+        _tmp: tmp,
+    }
+}
+
+#[test]
+fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
+    let fx = build();
+    fs::create_dir_all(&fx.store).unwrap();
+    fs::create_dir_all(&fx.trash).unwrap();
+
+    let registry = Registry::with_builtins();
+    let env = Environment::fixture(
+        fx.claude_home
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_path_buf(),
+        HashMap::from([
+            (
+                "CARGO_HOME".to_string(),
+                fx.cargo_home.display().to_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                fx.claude_home.display().to_string(),
+            ),
+        ]),
+        Platform::MacOS,
+    );
+    let cfg = ScanConfig {
+        defaults: false,
+        include: vec![fx.src.display().to_string()],
+        disabled_detectors: registry
+            .detectors()
+            .iter()
+            .map(|d| d.id().to_string())
+            .filter(|id| id != "cargo-home" && id != "claude-code")
+            .collect(),
+        ..Default::default()
+    };
+    let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1_000);
+
+    // observe -> report, twice, so the incremental/cached paths persist
+    // whatever they persist.
+    for _ in 0..2 {
+        let observation = swamp_core::report::observe_scope(
+            &scope,
+            None,
+            false,
+            Some(&fx.store),
+            None,
+            true,
+            true,
+            false,
+            false,
+            swamp_core::fs_events::platform_source().as_ref(),
+            30,
+            24 * 3600,
+        )
+        .expect("scope observation");
+        // Every JSON/text rendering path, so anything that writes as a
+        // side effect of rendering shows up here too.
+        let _ = swamp_core::report::to_json(&observation.merged);
+        let _ = swamp_core::agent_json::view_payload(&observation.merged, "projects", None);
+        let _ = swamp_core::agent_json::what_grew_payload(&observation.merged, None);
+        swamp_core::scope::persist_effective_scope(&fx.store, &scope).unwrap();
+    }
+
+    // propose -> approve -> execute one agent cache unit.
+    let observation = swamp_core::report::observe_scope(
+        &scope,
+        None,
+        false,
+        Some(&fx.store),
+        None,
+        true,
+        true,
+        false,
+        false,
+        swamp_core::fs_events::platform_source().as_ref(),
+        30,
+        24 * 3600,
+    )
+    .expect("scope observation");
+    let cache = fx.claude_home.join("debug");
+    let plan = swamp_core::actions::propose_agents(
+        &observation.agent_units,
+        std::slice::from_ref(&cache),
+        "test:store-contents",
+    )
+    .expect("the fixture's agent cache unit must be proposable");
+    swamp_core::actions::save_plan(&fx.store, &plan).unwrap();
+    swamp_core::actions::approve(&fx.store, &plan.id, "human:test").unwrap();
+    let result =
+        swamp_core::actions::execute_with_trash(&fx.store, &plan.id, "human:test", &fx.trash)
+            .expect("execute");
+    assert_eq!(
+        result.outcomes[0].status, "completed",
+        "the fixture must actually execute so the Trash envelope exists: {:?}",
+        result.outcomes[0].cause
+    );
+
+    // One more report after the action.
+    let _ = swamp_core::report::observe_scope(
+        &scope,
+        None,
+        false,
+        Some(&fx.store),
+        None,
+        true,
+        true,
+        false,
+        false,
+        swamp_core::fs_events::platform_source().as_ref(),
+        30,
+        24 * 3600,
+    )
+    .expect("scope observation");
+
+    // --- the assertions ---
+    let mut files = Vec::new();
+    walk(&fx.store, &fx.store, &mut files);
+    assert!(!files.is_empty(), "the cycle must have written *something*");
+
+    let unexpected: Vec<String> = files
+        .iter()
+        .filter(|rel| !allowed(rel))
+        .map(|rel| rel.display().to_string())
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "the store may hold only Parquet tables and the named small control files; found: \
+         {unexpected:?}"
+    );
+
+    for rel in &files {
+        let name = rel.file_name().unwrap_or_default().to_string_lossy();
+        if !(name.ends_with(".json") || name.ends_with(".jsonl")) {
+            continue;
+        }
+        let size = fs::metadata(fx.store.join(rel))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            size <= MAX_CONTROL_JSON_BYTES,
+            "{} is {size} bytes: a control file that keeps growing is a data store in disguise",
+            rel.display()
+        );
+    }
+
+    // The Trash envelope holds its manifest plus the moved members, and
+    // nothing else.
+    let envelope = fs::read_dir(&fx.trash)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .or_else(|| {
+            fs::read_dir(&fx.trash)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .next()
+        })
+        .expect("the execution moved something into the fixture Trash");
+    if envelope.is_dir() {
+        let names: Vec<String> = fs::read_dir(&envelope)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        for n in &names {
+            assert!(
+                n == "restore.json" || !n.ends_with(".json") || n.starts_with(char::is_numeric),
+                "a Trash envelope holds restore.json plus the moved members, nothing else: \
+                 {names:?}"
+            );
+        }
+    }
+}

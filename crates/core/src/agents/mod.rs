@@ -39,6 +39,7 @@
 //! `Debug`, or JSON-serialized output.
 
 pub mod aider;
+pub mod bounded_io;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;

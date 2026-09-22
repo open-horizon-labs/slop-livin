@@ -46,7 +46,6 @@ use super::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const CLAUDE_CODE_TOOL_ID: &str = crate::locations::claude_code::CLAUDE_CODE_DETECTOR_ID;
@@ -296,13 +295,11 @@ fn resolve_project_link(jsonl: &Path) -> ProjectLinkState {
 }
 
 fn read_header_cwd(jsonl: &Path) -> Option<String> {
-    let mut f = fs::File::open(jsonl).ok()?;
-    let mut buf = vec![0u8; HEADER_READ_BYTES];
-    let n = f.read(&mut buf).ok()?;
-    buf.truncate(n);
-    let text = String::from_utf8_lossy(&buf);
-    let first_line = text.lines().next()?;
-    let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    // Through the shared capped reader, so the privacy bound is one
+    // reviewed function rather than fifteen open-coded reads, and the
+    // cost is counted (`.oh/guardrails/agent-adapters-read-bounded-headers-only.md`).
+    let first_line = super::bounded_io::read_header_line(jsonl, HEADER_READ_BYTES)?;
+    let value: serde_json::Value = serde_json::from_str(&first_line).ok()?;
     value
         .get("cwd")
         .and_then(|v| v.as_str())
