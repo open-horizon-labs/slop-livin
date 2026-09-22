@@ -503,31 +503,49 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 ///
 /// One `statfs` per row, the same bounded per-unit read
 /// `activity::access_time_evidence` already makes; never a per-file
-/// pass. A failed `statfs` answers `false`, which keeps the existing
+/// pass. A failed `statfs` answers `None`, which keeps the existing
 /// exact figure rather than inventing uncertainty.
 #[cfg(target_os = "macos")]
-fn copy_on_write_volume(path: &Path) -> bool {
+fn shared_extent_filesystem(path: &Path) -> Option<&'static str> {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     unsafe {
         let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
         if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
-            return false;
+            return None;
         }
         let sf = buf.assume_init();
         std::ffi::CStr::from_ptr(sf.f_fstypename.as_ptr())
             .to_bytes()
             .eq_ignore_ascii_case(b"apfs")
+            .then_some("APFS")
     }
 }
 
-/// No copy-on-write extent sharing is claimed on a platform where this
-/// pass has no bounded way to establish it; the exact figure stands.
-#[cfg(not(target_os = "macos"))]
-fn copy_on_write_volume(_path: &Path) -> bool {
-    false
+/// Linux: the filesystems whose allocated blocks are not the space
+/// removing a file returns (owner decision (c), 2026-09-22). Btrfs,
+/// bcachefs and XFS share extents through reflinks and snapshots; Btrfs,
+/// bcachefs and ZFS compress and deduplicate below the file; overlayfs
+/// reports a merged view over layers the unit does not own. On each, a
+/// sum of `st_blocks * 512` is an **upper bound** on what a removal
+/// frees, and is labelled as one. ext4 and tmpfs share nothing and keep
+/// the exact figure.
+///
+/// `statfs(2)`'s `f_type` magic numbers are from `linux/magic.h` (ZFS's
+/// from OpenZFS, which is out of tree). A failed `statfs` answers
+/// `None`, as on macOS.
+#[cfg(target_os = "linux")]
+fn shared_extent_filesystem(path: &Path) -> Option<&'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let f_type = unsafe {
+        let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init().f_type as u64
+    };
+    crate::reclaimability::shared_extent_filesystem_for_magic(f_type)
 }
 
 /// Populates every `ArtifactRow.evidence` (#53) from facts this report
@@ -597,12 +615,13 @@ pub fn attach_decision_evidence(report: &mut Report) {
                 } else {
                     let acc = if a.hardlinked || a.dedup_stale {
                         crate::reclaimability::hardlink_unresolved_bound(a.bytes)
-                    } else if copy_on_write_volume(&a.path) {
-                        // On APFS an extent can be retained by a clone or
-                        // a (Time Machine local) snapshot this pass never
-                        // queried, so the allocated bytes are a ceiling on
-                        // what removal frees, not the amount.
-                        crate::reclaimability::apfs_clone_or_snapshot_bound(a.bytes)
+                    } else if let Some(fs) = shared_extent_filesystem(&a.path) {
+                        // On APFS (and Btrfs, ZFS, XFS, bcachefs,
+                        // overlayfs) an extent can be retained by a clone,
+                        // a snapshot, a reflink or a lower layer this pass
+                        // never queried, so the allocated bytes are a
+                        // ceiling on what removal frees, not the amount.
+                        crate::reclaimability::shared_extent_bound(a.bytes, fs)
                     } else {
                         crate::reclaimability::exclusive_allocation(a.bytes)
                     };

@@ -156,11 +156,16 @@ impl Platform {
         Platform::Linux
     }
 
+    /// No convention table exists for any other target, and answering
+    /// `Linux` here -- what this used to do -- handed a BSD build Linux's
+    /// default roots and paths while `platform::Os::current` refused to
+    /// compile at all. The two must agree, so this refuses too.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn current() -> Self {
-        // No built-in table exists for this target; detectors that gate
-        // on a specific platform simply propose nothing.
-        Platform::Linux
+        compile_error!(
+            "swamp's location conventions exist for macOS and Linux only; \
+             see docs/platform.md before adding a target"
+        )
     }
 }
 
