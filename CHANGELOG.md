@@ -24,13 +24,17 @@ What is inside a build container, for four ecosystems instead of one.
   said otherwise would fail the build's own audit. Cargo's existing
   purpose groups are unchanged and remain the only build-artifact
   cleanup swamp supports.
-- **A Maven artifact with no origin evidence is reported as unknown
-  origin, not as re-downloadable.** `_remote.repositories` or a
-  `*.lastUpdated` marker means downloaded; `maven-metadata-local.xml`
-  means installed from a local build and *not* recoverable from a
-  repository; neither means swamp does not know and says so. Where both
-  are present the local claim wins, because guessing the other way costs
-  someone an artifact they cannot rebuild.
+- **Maven origin is read, not guessed.** `_remote.repositories` is
+  parsed (bounded): an entry with a repository id (`lib-2.0.jar>central=`)
+  means downloaded from that repository; an entry with an **empty** id
+  (`app-1.0.jar>=`) is how Maven's Resolver records `mvn install`, so the
+  file's presence alone proves nothing. `maven-metadata-local.xml` beside
+  a version, or an artifact-level one listing it, means installed
+  locally. A `*.lastUpdated` file records a resolution *attempt* and on
+  its own leaves the origin unknown. Local evidence wins over remote for
+  the same version, and with no usable evidence swamp says unknown origin
+  and never promises a re-download. An unresolved `${property}` version
+  directory is an explicit residual unit, not a missing row.
 - **A package is named by its own manifest, never by its directory.**
   An unreadable or oversized `package.json` leaves the identity unknown
   rather than guessing from the folder name. No build generation is
@@ -53,6 +57,25 @@ What is inside a build container, for four ecosystems instead of one.
   be empty, which is not the same claim as "nothing changed since your
   rows were written" when the window cannot say when it opened; that
   case now re-identifies.
+- **Family rows count what they claim to.** A family's count, bytes and
+  oldest modification are over nonempty supported candidates only; units
+  in an unrecognised layout and bytes no unit accounts for (a
+  container's loose files) are one explicit "Not identified" row, and a
+  family's members never double-count a nested unit. In the TUI, Node,
+  Gradle and Maven containers open into these family groups (closed
+  until opened, members oldest first, unknown ages last); `--view
+  builds|deps --json` now carries the same summary and every unit as an
+  `interior` object.
+- **A marker change is never replayed away.** When a `settings.gradle`
+  appears beside a Node project's `build/`, the Gradle adapter now
+  identifies it on the next refresh; stored units are replayed only when
+  the adapter that wrote them is the one claiming the container.
+- **An unreadable directory inside a build container is incomplete
+  coverage, not a smaller tree.** The walk used to skip it silently and
+  mark every ancestor complete; it now records it and the container says
+  "the walk could not read all of this directory".
+- Gradle: `daemon/<version>` directories and `modules-2/metadata-*` are
+  identified; an unrecognised `modules-2` entry is a named residual.
 - Docs: `docs/build-artifacts.md` (new -- the checked capability matrix,
   per-ecosystem layouts, attribution limits and origin evidence),
   `docs/architecture.md`, `docs/usage.md`, and a new

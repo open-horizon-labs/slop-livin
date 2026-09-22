@@ -53,9 +53,15 @@ with no known time is counted, not folded in as epoch zero.
 - **A package's identity from its directory name.** It comes from the
   package's own `package.json`; unreadable means unknown.
 - **That a Maven artifact can be downloaded again.** Origin is
-  `downloaded`, `locally-installed` or `unknown-origin`, from the marker
-  files beside it. `unknown-origin` is a real answer; never upgrade it
-  to "downloaded".
+  `downloaded` (a repository id in `_remote.repositories`),
+  `locally-installed` (an empty id there, or `maven-metadata-local.xml`)
+  or `unknown-origin` (no usable evidence; a `*.lastUpdated` file alone is
+  an attempt record, not a download). `unknown-origin` is a real answer;
+  never upgrade it to "downloaded".
+- **That a family's oldest member is its last use**, or that the family
+  total is the whole container: summaries count nonempty supported units
+  only, and `unsupported_*`/`unaccounted_bytes` in the `--json`
+  `interior` are the rest.
 - **Anything from running a build tool.** No `npm`/`gradle`/`mvn`/
   `cargo`, no JS config, no Gradle script, no Maven plugin.
 

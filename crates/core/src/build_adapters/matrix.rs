@@ -97,7 +97,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         name: "Node.js",
         status: Status::Implemented,
         families: &[
-            RoleFamily::Container,
             RoleFamily::Outputs,
             RoleFamily::Tests,
             RoleFamily::Intermediates,
@@ -132,7 +131,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         name: "Gradle",
         status: Status::Implemented,
         families: &[
-            RoleFamily::Container,
             RoleFamily::Outputs,
             RoleFamily::Tests,
             RoleFamily::Intermediates,
@@ -147,6 +145,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "<gradle-user-home>/caches/{modules-2,jars-*,transforms-*,build-cache-*}",
             "<gradle-user-home>/wrapper/dists/<dist>-<hash>",
             "<gradle-user-home>/daemon/<version>",
+            "<gradle-user-home>/caches/modules-2/metadata-*",
         ],
         attribution_limits: &[
             "build scripts and plugins are never evaluated, so a custom buildDir or a plugin's \
@@ -162,10 +161,8 @@ pub const MATRIX: &[MatrixEntry] = &[
         name: "Maven",
         status: Status::Implemented,
         families: &[
-            RoleFamily::Container,
             RoleFamily::Outputs,
             RoleFamily::Tests,
-            RoleFamily::Intermediates,
             RoleFamily::SharedStore,
             RoleFamily::Metadata,
             RoleFamily::Residual,
@@ -178,8 +175,10 @@ pub const MATRIX: &[MatrixEntry] = &[
             "_remote.repositories, *.lastUpdated, maven-metadata-local.xml origin evidence",
         ],
         attribution_limits: &[
-            "a repository artifact with no _remote.repositories and no maven-metadata-local.xml \
-             has unknown origin: swamp never promises it can be downloaded again",
+            "origin comes from _remote.repositories entries (a repository id means downloaded, an \
+             empty id means installed by `mvn install`) or maven-metadata-local.xml; with neither, \
+             or with only a *.lastUpdated attempt record, the origin is unknown and swamp never \
+             promises a re-download",
             "POM property and parent-inherited versions are not resolved; an unresolved \
              ${property} is an explicit identity gap",
             "plugins are never evaluated, so a plugin's own output directory under target/ is an \
