@@ -928,9 +928,17 @@ The initial observation discovers repositories and measures allocated filesystem
 
 Folding an artifact means grouping its bytes under one report row. The walker still traverses that directory to measure it. During the walk it also records interior directory rows for later updates.
 
+### Platform contracts
+
+Which questions a build can answer at all is [`platform`](../crates/core/src/platform/mod.rs): a capability table, the change-observation source and its cursor shape, the scheduling service, the trash location strategy, and free space. It is data rather than `cfg` attributes, so a test on either machine can ask what the other platform promises, and `platform_matrix_matches_docs` checks the table against [the platform guide](platform.md) in both directions.
+
+The one contract worth restating here is continuity. An FSEvents event id is a cursor into a log the kernel wrote whether or not swamp was running, so a replay from it accounts for the gap. An inotify watch descriptor is a handle on a watch that is running now; it says nothing about what happened before it opened. `ContinuityCursor` keeps the two apart -- `FsEventsEventId` covers all prior time by construction, `LiveWatchEpoch` covers only time after `opened_at` -- because storing the second where the first belongs would turn "swamp was not watching" into "nothing changed", which is the one thing the growth store must never record. A build whose source cannot replay refuses with `no_persisted_change_history` and walks fully.
+
+Shared portable code stays shared: allocated bytes, device and inode identity, and the walk itself are POSIX and have one implementation. Target gating is for genuinely different kernels -- FSEvents and launchd on one side, `/proc` and the XDG conventions on the other -- not for filing code by operating system. [Platforms](platform.md#where-each-platforms-code-lives) has the full map.
+
 ### Ask macOS where to look next
 
-Subsequent observations use the stored FSEvents ID and device to request changes under the root. Events identify areas to remeasure; they do not supply byte deltas or the process that caused a change.
+On macOS, subsequent observations use the stored FSEvents ID and device to request changes under the root. Events identify areas to remeasure; they do not supply byte deltas or the process that caused a change.
 
 An observation with usable event history reconstructs the previous topology and attribution, applies changes, and carries untouched rows forward. The work depends on the change:
 

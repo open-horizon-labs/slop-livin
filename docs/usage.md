@@ -1,6 +1,10 @@
 # Usage
 
-For the product overview, start with the [README](../README.md).
+For the product overview, start with the [README](../README.md). For which
+platform can do what, and where swamp keeps its files on each, see the
+[platform guide](platform.md) -- three capabilities named below
+(scheduled observation, the live watcher, and the small-update path) are
+macOS-only today, and swamp says so rather than pretending.
 
 ## Installing a release
 
@@ -27,12 +31,14 @@ You can also [build from source](../README.md#build-from-source).
 swamp report ~/src --since 24h
 swamp report ~/src --since 7d --sort size --reverse
 swamp observe ~/src
-swamp schedule --every 15m ~/src
+swamp schedule --every 15m ~/src   # macOS only; see below
 swamp schedule
 swamp schedule --off
 ```
 
 `report` measures and persists by default. `observe` records data without rendering and permits GitHub enrichment. Scheduling runs that observation command; it does not delete anything.
+
+`swamp schedule` installs a per-user LaunchAgent, which exists only on macOS. On Linux the command refuses, names [#86](https://github.com/open-horizon-labs/swamp/issues/86) as what would change it, and writes nothing -- installing a job that cannot run and reporting success would leave you believing you had a baseline you do not have. Until then, run `swamp observe` from your own timer.
 
 History starts when swamp observes a root. `--since` selects a comparison window, defaulting to the `since` config value. Use seconds, minutes, hours, or days here: `30m`, `24h`, `7d`. The filter language also accepts weeks, but the CLI/config history-duration parser does not; use `7d` rather than `1w` for `--since`.
 
@@ -55,8 +61,12 @@ swamp scope --json
 
 The effective scope is built from four sources, in this order:
 
-1. **Built-in default roots** on macOS: `~/src`, `~/Library/Developer`,
-   `~/Library/Caches`. (Linux has no built-in defaults yet.)
+1. **Built-in default roots**, per platform. macOS: `~/src`,
+   `~/Library/Developer`, `~/Library/Caches`. Linux: `~/src` and
+   `$XDG_CACHE_HOME` (default `~/.cache`). Neither platform's
+   conventions appear in the other's build; see
+   [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are)
+   for why Linux has two rather than three.
 2. **Detector results.** A built-in catalog of read-only detectors
    proposes locations for developer tools: language version managers
    (mise, asdf, pyenv, uv, Conda, rbenv, RVM, ruby-install, nvm,
@@ -801,7 +811,11 @@ and `config init` both refuse (nonzero exit, message on stderr) on a
 `config.toml` with a malformed `[scan]` table, rather than silently
 falling back to the all-defaults scope.
 
-The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. The schedule log defaults to `~/Library/Logs/swamp/observe.log`. The observation timeout applies to `observe`, not every interactive operation.
+The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. On Linux `$XDG_DATA_HOME` moves the store if it is set to an absolute path, and the schedule log defaults to `$XDG_STATE_HOME/swamp/observe.log` (`~/.local/state/swamp/observe.log`); on macOS the log defaults to `~/Library/Logs/swamp/observe.log`. `SWAMP_LOG_DIR` overrides the log directory on both. If `HOME` is unset and `SWAMP_DIR` is not given, swamp fails with a message rather than writing the store into the current directory. The observation timeout applies to `observe`, not every interactive operation.
+
+`swamp scope` (text and `--json`) reports which platform's conventions
+produced its roots, so a scope read on the other machine is not just a
+list of missing paths.
 
 For a trace of stage timings:
 

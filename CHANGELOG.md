@@ -4,6 +4,46 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Linux x86_64
+
+- **Swamp builds, runs and is tested on Linux x86_64.** CI runs the whole
+  workspace suite natively on Ubuntu 24.04 and on macOS arm64 on every push,
+  and checks on each that the build carries only its own platform's backend --
+  once through the resolved dependency graph and once through the built
+  binary's linkage and symbol table. There is no Linux release artifact yet
+  (#88); build from source.
+- **A capability a platform does not have is refused and named, never
+  approximated.** `swamp schedule` on Linux refuses, says why, names #86, and
+  writes nothing -- it previously wrote a LaunchAgent plist into a
+  `~/Library/LaunchAgents` no daemon reads and reported success. An
+  observation on Linux reports `mode=full reason=no_persisted_change_history`
+  rather than `unsupported_platform`: the first says this kernel keeps no
+  change history to replay, which #81's watcher narrows and cannot remove; the
+  second would have said someone forgot to write a backend.
+- **Linux-native locations.** Default scan roots are `~/src` and
+  `$XDG_CACHE_HOME` (`~/.cache`); the growth store honours `$XDG_DATA_HOME`;
+  the scheduled-run log goes to `$XDG_STATE_HOME/swamp`; the trash directory
+  follows the freedesktop specification, including the rule that an item on
+  another mount belongs in that mount's own `.Trash-$uid` rather than a
+  cross-device copy into the home trash. macOS paths are unchanged, including
+  the growth store's, so no existing install's history moves. `swamp scope`
+  now reports which platform's conventions produced its roots.
+- **A missing `HOME` is an error, not the current directory.** With no `HOME`
+  and no `SWAMP_DIR`, swamp used to write its growth store into whatever
+  directory it was run from -- where the next run from somewhere else would
+  not find it, and every project would look like it had vanished.
+- **Free space is read from the kernel, not parsed out of `df`.** The old code
+  read `df -k`'s fourth whitespace-separated field, which is a macOS column
+  layout: GNU coreutils prints a different header and wraps a long device row,
+  so that field can be the capacity percentage. macOS now uses `statfs` and
+  Linux `statvfs`; macOS's POSIX `statvfs` has 32-bit block counts, which
+  overflow on a volume above 16 TB. One fewer subprocess per call, too.
+- **Documented**: [docs/platform.md](docs/platform.md) carries the supported
+  targets, the capability table (checked against the code in both directions),
+  where each platform's files live, the traversal limits on overlay, network,
+  Btrfs and ZFS filesystems, and the reuse assessment behind `trash`, `notify`,
+  `walkdir`, `jwalk` and clean-dev-dirs.
+
 ### Repairs after review 2, part 4
 
 What "unchanged" is allowed to mean.

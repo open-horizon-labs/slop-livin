@@ -392,3 +392,57 @@ fn volume_identity_depends_on_the_device_and_a_changed_device_starts_a_new_histo
          filesystem's history speak for another's bytes"
     );
 }
+
+/// The block-size multiplier is the one thing a unit mistake hides
+/// inside a plausible-looking number, and it differs by backend
+/// (`f_bsize` on Darwin's `statfs`, `f_frsize` on Linux's
+/// `statvfs`). `df -k` is the independent oracle: it asks the same
+/// kernel through a different program, and it is what the old
+/// implementation parsed, so agreeing with it is also the evidence
+/// that replacing it changed no answer.
+///
+/// A 5% band, because a busy machine genuinely moves blocks between
+/// the two calls. A factor-of-512 or factor-of-1024 mistake -- the
+/// ones actually on offer here -- is nowhere near it.
+#[test]
+fn the_figure_agrees_with_df() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ours =
+        swamp_core::platform::fs_space::available_bytes(tmp.path()).expect("space for a temp dir");
+
+    let Ok(out) = std::process::Command::new("df")
+        .arg("-k")
+        .arg(tmp.path())
+        .output()
+    else {
+        eprintln!("SKIPPED: no `df` on this machine to cross-check against");
+        return;
+    };
+    if !out.status.success() {
+        eprintln!("SKIPPED: `df -k` failed on this machine");
+        return;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Not by field index: GNU df wraps a long device name onto a
+    // second line, which is the bug this module exists to remove.
+    // The available figure is the third number on the row, whichever
+    // line it landed on.
+    let numbers: Vec<u64> = text
+        .lines()
+        .skip(1)
+        .flat_map(|l| l.split_whitespace())
+        .filter_map(|f| f.parse::<u64>().ok())
+        .collect();
+    let Some(&avail_kib) = numbers.get(2) else {
+        eprintln!("SKIPPED: could not read an available figure out of `df -k`:\n{text}");
+        return;
+    };
+    let theirs = avail_kib * 1024;
+
+    let (hi, lo) = (ours.max(theirs), ours.min(theirs).max(1));
+    assert!(
+        (hi - lo) * 20 <= hi,
+        "statvfs/statfs says {ours} bytes available, `df -k` says {theirs}; \
+         that is not measurement drift, it is a different unit"
+    );
+}
