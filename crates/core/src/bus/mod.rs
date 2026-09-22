@@ -92,7 +92,7 @@ pub struct Ctx<'a> {
     /// unfiltered one, because a subtree this walk pruned is still a
     /// subtree the window must be able to speak about -- and the
     /// observation time it replays from.
-    pub event_window: std::sync::Arc<std::sync::Mutex<Option<(Vec<PathBuf>, u64)>>>,
+    pub event_window: crate::fs_events::EventWindowSlot,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.

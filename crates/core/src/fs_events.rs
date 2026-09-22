@@ -191,6 +191,15 @@ pub trait FsEventsSource: Send + Sync {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan;
 }
 
+/// One root's trusted replay window, as `growth` hands it up to the
+/// report pipeline: the replay's own (unfiltered) change list, and the
+/// observation time the window opens from.
+pub type TrustedWindow = (Vec<PathBuf>, u64);
+
+/// Where `consumers::walk` leaves one root's [`TrustedWindow`] for the
+/// caller that built the bus context.
+pub type EventWindowSlot = std::sync::Arc<std::sync::Mutex<Option<TrustedWindow>>>;
+
 /// One root this observation replayed successfully, and everything the
 /// replay said changed underneath it.
 #[derive(Debug, Clone)]

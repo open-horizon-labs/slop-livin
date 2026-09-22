@@ -56,7 +56,7 @@
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
-    mtime_secs, resolve_declared_path,
+    mtime_secs,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -65,6 +65,17 @@ use std::path::{Path, PathBuf};
 pub const CODEX_TOOL_ID: &str = crate::locations::codex::CODEX_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
+/// Rollout files one session-tree **container** will identify. Per
+/// container, never shared: a bound a day directory shares with its
+/// siblings would make its stored rows mean something different from a
+/// live identification of the same directory (see [`collect_sessions`]).
+const MAX_CONTAINER_ENTRIES: usize = 20_000;
+/// Session-tree containers one pass will identify. Caps the whole pass
+/// without making any one container's contents depend on another's.
+const MAX_CONTAINERS: usize = 20_000;
+/// Depth below a session root at which a directory becomes a container:
+/// `sessions/<yyyy>/<mm>/<dd>/`, upstream's documented layout.
+const CONTAINER_DEPTH: usize = 3;
 /// Bound on how many bytes of a rollout file's first line this adapter
 /// will ever read looking for a `cwd` field -- never whole transcripts.
 const HEADER_READ_BYTES: usize = 8192;
@@ -94,8 +105,23 @@ impl AgentAdapter for Adapter {
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let mut units = Vec::new();
-    identify_sessions(home, "sessions", false, ctx, &mut units);
-    identify_sessions(home, "archived_sessions", true, ctx, &mut units);
+    let mut containers_used = 0usize;
+    identify_sessions(
+        home,
+        "sessions",
+        false,
+        ctx,
+        &mut units,
+        &mut containers_used,
+    );
+    identify_sessions(
+        home,
+        "archived_sessions",
+        true,
+        ctx,
+        &mut units,
+        &mut containers_used,
+    );
     identify_sqlite_stores(home, &mut units);
     identify_static_categories(home, ctx, &mut units);
     units
@@ -113,65 +139,126 @@ fn identify_sessions(
     archived: bool,
     ctx: &IdentifyCtx,
     out: &mut Vec<CandidateAgentUnit>,
+    containers_used: &mut usize,
 ) {
     let base = home.join(subdir);
-    let mut files = Vec::new();
-    collect_jsonl_files(&base, 0, out.len(), ctx, &mut files);
-    for jsonl in files {
-        let Ok(meta) = fs::symlink_metadata(&jsonl) else {
-            continue;
-        };
-        let bytes = meta.len();
-        let mtime = mtime_secs(&meta);
-        let project_link = resolve_declared_path(
-            read_header_cwd(&jsonl, ctx),
-            "no cwd field found in the session's first line",
-        );
-        let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
-            .relative_to(home)
-            .members(vec![AgentMember {
-                path: jsonl,
-                bytes,
-                kind: AgentMemberKind::Transcript,
-            }])
-            .mtime_max(mtime)
-            .project_link(project_link)
-            .action(AgentActionCapability::SessionRemoval);
-        if archived {
-            unit = unit.note(
-                "archived: hidden from the default thread list, but still unique conversation \
-                 history -- archiving is not evidence this session is unused",
-            );
-        }
-        out.push(unit.build());
-    }
+    collect_sessions(&base, 0, home, archived, ctx, out, containers_used);
 }
 
-/// Bounded recursive `*.jsonl` collection under `dir`, one explicit
-/// level at a time through the shared capped listing (`IdentifyCtx::list`
-/// never follows a symlink and never recurses on its own), depth- and
-/// entry-count-bounded like `IdentifyCtx::folded_bytes`. `already_seen`
-/// is the running count from earlier calls in the same `identify()` pass
-/// so `sessions/` and `archived_sessions/` share one overall bound rather
-/// than each independently allowing the full `MAX_FOLD_ENTRIES`.
-fn collect_jsonl_files(
+/// One rollout file's unit. Factored out so the same code produces it
+/// whether it was found inside a container or directly under a session
+/// root.
+fn session_unit(
+    home: &Path,
+    jsonl: PathBuf,
+    archived: bool,
+    ctx: &IdentifyCtx,
+) -> Option<CandidateAgentUnit> {
+    let meta = fs::symlink_metadata(&jsonl).ok()?;
+    let bytes = meta.len();
+    let mtime = mtime_secs(&meta);
+    // `project_link_declared`, not `project_link`: the declared path is
+    // what a replayed container re-resolves live, so a worktree deleted
+    // between two passes is never reported as still linked
+    // (`crate::agents::LinkBasis`). A unit whose link is `Fixed` makes
+    // its whole container unstorable.
+    let declared = read_header_cwd(&jsonl, ctx);
+    let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
+        .relative_to(home)
+        .members(vec![AgentMember {
+            path: jsonl,
+            bytes,
+            kind: AgentMemberKind::Transcript,
+        }])
+        .mtime_max(mtime)
+        .project_link_declared(declared, "no cwd field found in the session's first line")
+        .action(AgentActionCapability::SessionRemoval);
+    if archived {
+        unit = unit.note(
+            "archived: hidden from the default thread list, but still unique conversation \
+             history -- archiving is not evidence this session is unused",
+        );
+    }
+    Some(unit.build())
+}
+
+/// Walks a session root, wrapping every **day directory**
+/// (`sessions/<yyyy>/<mm>/<dd>/`) in [`IdentifyCtx::container`] so a day
+/// nothing touched is replayed from the store instead of re-listed and
+/// re-`stat`ed.
+///
+/// The bound is the reason this could not be done before. It used to be
+/// one budget shared across `sessions/` and `archived_sessions/`
+/// (`already_seen + out.len()`), which made a day's output depend on how
+/// many files the days before it had produced -- so a day replayed from
+/// the store would have meant something different from the same day
+/// identified live, and the stored rows could not be trusted. The budget
+/// is now **per container** ([`MAX_CONTAINER_ENTRIES`]), which each day
+/// owns outright, plus a pass-level cap on how many containers are
+/// identified at all ([`MAX_CONTAINERS`]). Both are deterministic from
+/// the tree alone; neither depends on what a sibling produced.
+fn collect_sessions(
     dir: &Path,
     depth: usize,
-    already_seen: usize,
+    home: &Path,
+    archived: bool,
     ctx: &IdentifyCtx,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<CandidateAgentUnit>,
+    containers_used: &mut usize,
 ) {
-    if depth > MAX_WALK_DEPTH || already_seen + out.len() > MAX_FOLD_ENTRIES {
+    if depth > MAX_WALK_DEPTH {
         return;
     }
     for entry in ctx.list(dir) {
-        if already_seen + out.len() > MAX_FOLD_ENTRIES {
+        let path = dir.join(&entry.name);
+        if entry.is_dir {
+            if depth + 1 == CONTAINER_DEPTH {
+                if *containers_used >= MAX_CONTAINERS {
+                    return;
+                }
+                *containers_used += 1;
+                let units = ctx.container(CODEX_TOOL_ID, &path, &|| {
+                    let mut files = Vec::new();
+                    collect_jsonl_files(&path, depth + 1, ctx, &mut files);
+                    files
+                        .into_iter()
+                        .filter_map(|jsonl| session_unit(home, jsonl, archived, ctx))
+                        .collect()
+                });
+                out.extend(units);
+            } else {
+                collect_sessions(&path, depth + 1, home, archived, ctx, out, containers_used);
+            }
+        } else if is_rollout(&entry.name) {
+            // A rollout file sitting above the day level (an older or
+            // hand-moved layout) is identified inline: it belongs to no
+            // container, so it is never replayed.
+            out.extend(session_unit(home, path, archived, ctx));
+        }
+    }
+}
+
+fn is_rollout(name: &str) -> bool {
+    name.ends_with(".jsonl") && name.starts_with("rollout-")
+}
+
+/// Bounded recursive `*.jsonl` collection under one container, one
+/// explicit level at a time through the shared capped listing
+/// (`IdentifyCtx::list` never follows a symlink and never recurses on
+/// its own). The entry budget is this container's own: see
+/// [`collect_sessions`].
+fn collect_jsonl_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
+    if depth > MAX_WALK_DEPTH || out.len() >= MAX_CONTAINER_ENTRIES {
+        return;
+    }
+    for entry in ctx.list(dir) {
+        if out.len() >= MAX_CONTAINER_ENTRIES {
             return;
         }
         let path = dir.join(&entry.name);
         if entry.is_dir {
-            collect_jsonl_files(&path, depth + 1, already_seen, ctx, out);
-        } else if entry.name.ends_with(".jsonl") && entry.name.starts_with("rollout-") {
+            collect_jsonl_files(&path, depth + 1, ctx, out);
+        } else if is_rollout(&entry.name) {
             out.push(path);
         }
     }

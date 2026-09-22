@@ -1087,7 +1087,7 @@ pub(crate) fn report_full_mode_scoped_tracked(
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
     pruned_subtrees: &[PathBuf],
     docker_in_scope: bool,
-) -> Result<(Report, Option<(Vec<PathBuf>, u64)>)> {
+) -> Result<(Report, Option<crate::fs_events::TrustedWindow>)> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
     // alias and the next uses its canonical spelling: FSEvents is canonical,
@@ -2021,6 +2021,15 @@ pub fn report_scope_with_parts(
     .map(|(r, c, p, _)| (r, c, p))
 }
 
+/// The merged report, per-root coverage, each root's own report, and the
+/// event coverage this pass's replays earned.
+pub type ScopeWalk = (
+    Report,
+    Vec<crate::coverage::RootCoverage>,
+    std::collections::HashMap<PathBuf, Report>,
+    crate::fs_events::EventCoverage,
+);
+
 /// [`report_scope_with_parts`] plus the [`crate::fs_events::EventCoverage`]
 /// this pass's replays earned, one window per root that went
 /// incremental. `observe_scope` hands it to the unit families; nothing
@@ -2038,12 +2047,7 @@ pub fn report_scope_with_parts_covered(
     enrich: bool,
     force_full: bool,
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
-) -> Result<(
-    Report,
-    Vec<crate::coverage::RootCoverage>,
-    std::collections::HashMap<PathBuf, Report>,
-    crate::fs_events::EventCoverage,
-)> {
+) -> Result<ScopeWalk> {
     use crate::coverage::{RegionStatus, RootCoverage};
     use crate::scope::RootStatus;
 

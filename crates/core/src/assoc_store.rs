@@ -49,6 +49,10 @@ pub fn fingerprint_string(parts: &[(String, u64)]) -> String {
     parts.join("\u{1}")
 }
 
+/// One stored row: key, fingerprint, the observation that wrote it, and
+/// the value columns.
+type StoredRow = (String, String, u64, Vec<String>);
+
 /// One `(key, fingerprint) -> values` table. Three columns, so a reader
 /// can scan one without materializing the others, and one row per cached
 /// value rather than one blob per key.
@@ -71,7 +75,7 @@ impl KeyedTable {
     }
 
     /// Every row as `(key, fingerprint, observed_at, values)`.
-    fn read(&self) -> Result<Vec<(String, String, u64, Vec<String>)>> {
+    fn read(&self) -> Result<Vec<StoredRow>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -120,7 +124,7 @@ impl KeyedTable {
         Ok(out)
     }
 
-    fn write(&self, rows: &[(String, String, u64, Vec<String>)]) -> Result<()> {
+    fn write(&self, rows: &[StoredRow]) -> Result<()> {
         let schema = self.schema();
         let keys: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         let fps: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
@@ -198,7 +202,7 @@ fn load(table: &KeyedTable) -> HashMap<String, CachedRows> {
 }
 
 fn store(table: &KeyedTable, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
-    let mut rows: Vec<(String, String, u64, Vec<String>)> = Vec::new();
+    let mut rows: Vec<StoredRow> = Vec::new();
     let mut keys: Vec<&String> = cache.keys().collect();
     keys.sort();
     for key in keys {

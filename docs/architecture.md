@@ -533,40 +533,77 @@ artifact row:
   and walking it as an ordinary scan root would either find nothing
   useful or (worse) misclassify its contents.
 - **And, since 2026-09-22, not even that on an unchanged pass.** The
-  measuring walk records one stamp per directory it listed --
-  `(relative path, mtime_ns, ctime_ns)`, taken from the `stat` the
-  sizing job already performs -- into `${SWAMP_DIR}/external/folded.parquet`
-  beside a root row carrying the folded bytes, `hardlinked`,
-  `mtime_max` and a digest of the exclusion list the measurement was
-  taken under. The next pass stats those directories and, if every
-  stamp matches, returns the stored measurement without listing a
-  single directory: a 20,000-file Cargo registry cache costs four stats
-  instead of 20,004 stats and six listings (73 ms to 1.9 ms, measured
-  in `crates/core/tests/incremental_external_and_agent_measurement.rs`).
-  This is a *measurement cache*, per directory and never per file: it
-  feeds no growth, no tombstone and no regrowth, and deleting it costs
-  one full re-measurement. Its stated blind spot is on
-  `folded_measurement::reuse_folded_measurement` -- a file rewritten in
-  place does not move its directory's stamp, so a rewrite that also
-  changes the file's allocation leaves the reused total stale until
-  something else in that directory changes.
+  measuring walk records one row per directory it listed into
+  `${SWAMP_DIR}/external/folded.parquet`, beside a root row carrying the
+  folded bytes, `hardlinked`, `mtime_max`, the observation that took the
+  measurement, and a digest of the exclusion list it was taken under.
+  The next pass returns that stored measurement **without listing or
+  `stat`ing anything at all** -- but only when this pass's trusted event
+  coverage vouches for the unit (below). A changed exclusion set is
+  always a miss: a measurement taken while a nested location was
+  excluded describes different bytes. This is a *measurement cache*,
+  per directory and never per file: it feeds no growth, no tombstone and
+  no regrowth, and deleting it costs one full re-measurement.
+- **Reuse is gated on trusted event coverage, not on directory stamps.**
+  Until 2026-09-22 both unit families decided "unchanged" from the
+  recorded directories' own `mtime`/`ctime`. A directory stamp moves
+  when an entry is created, deleted, renamed or replaced, and **not**
+  when a file inside it is appended to or rewritten in place -- which is
+  exactly how a running agent writes its session transcript. A growth
+  tool that cannot see the file that is growing is not answering its own
+  question, so stamp-only reuse was removed as a sufficient condition.
+  `fs_events::EventCoverage` replaces it, and it is the rule the Cargo
+  adapter has always followed: a unit is replayed only when
+  - some root this pass replayed successfully is the unit's path or an
+    ancestor of it,
+  - that replay reports no event at the path or under it, and
+  - the stored rows are no older than the observation the window opens
+    from (a pass that skipped a unit family leaves exactly that gap, and
+    a window alone cannot see into it).
+
+  With no window -- a full walk, any `fs_events::RefreshRefusal`, a
+  first observation, a store-less caller -- there is no reuse, and the
+  unit is re-measured or re-identified. That is slower and always
+  correct; the per-file identification cache still keeps header reads at
+  zero for the files that did not move. **The window comes from the
+  walk**, so reuse applies to a tool home or external cache root that
+  lies under a walked scope root, and not to one outside every scan
+  root. A default install whose scope is a projects directory therefore
+  re-measures `~/.claude` and `~/.cargo` every pass; giving each unit
+  root its own FSEvents cursor is recorded as the open follow-up in
+  `.oh/sessions/2026-09-22-event-gated-reuse.md`.
 - **The agent family has the same reuse, keyed per container.** The
   identification cache (`${SWAMP_DIR}/associations/agent_identifications.parquet`)
   removed the header *reads* from an unchanged pass, but its validity
   key is each session file's own `(len, mtime_ns, ctime_ns, inode)`, so
   knowing a session is unchanged costs a `stat` per session -- work that
-  scales with files, which the handoff forbids. Since 2026-09-22 an
-  adapter wraps the identification of one **container directory**
-  (`projects/<encoded-cwd>/`, a tool's session parent) in
+  scales with files, which the handoff forbids. An adapter wraps the
+  identification of one **container directory** in
   `agents::IdentifyCtx::container`. Every directory that identification
-  lists or folds is recorded; the container's fingerprint is those
-  directories' own `mtime`/`ctime`; and an unchanged container is
+  lists, folds or declares with `IdentifyCtx::watch` is recorded, and a
+  container every one of whose directories the window vouches for is
   replayed from `${SWAMP_DIR}/associations/agent_containers.parquet` --
-  one row per directory and one per unit, never one per file. A
-  5,000-session home in 5 project directories costs 11 listings and
-  5,031 stats on the first pass and **5 listings / 31 stats** on an
-  unchanged second; one appended session re-identifies exactly one
-  container.
+  one row per directory and one per unit, never one per file, and no
+  syscall on the replay path. Measured on a 5,000-session home in five
+  project directories: 11 listings and 5,006 stats on the first pass,
+  and on a vouched-for second pass **5 listings / 6 stats**, none of
+  them per container -- that residual is the tool home's own structure
+  scan, and it does not grow with either containers or sessions
+  (`replaying_containers_costs_nothing_per_container`).
+  - Every adapter whose session storage is a directory tree uses the
+    seam: Claude Code (`projects/<encoded-cwd>/`), Codex
+    (`sessions/<yyyy>/<mm>/<dd>/` and the archived tree), OpenCode
+    (`storage/session/<project-id>/`) and Pi (`sessions/<dir>/`). Each
+    container owns its **own** entry budget. A budget shared across
+    containers -- which is what Codex's session walk used to carry --
+    would make a container's contents depend on how many files the
+    containers before it produced, so its stored rows would mean
+    something different from a live identification of the same
+    directory. Oh My Pi has a session tree and deliberately does not use
+    the seam: its session bodies feed a home-wide shared-blob reference
+    count, and a partially replayed pass would report a count that is
+    wrong rather than unknown. That is recorded in
+    `oh_my_pi_declares_why_it_does_not_use_the_container_seam`.
   - Project linkage is *not* replayed. It is resolved against a declared
     path somewhere else on the disk entirely, so a unit records the
     declared path (`agents::LinkBasis::Declared`) and a replayed
@@ -574,16 +611,12 @@ artifact row:
     one resolution per project rather than one per session. A unit whose
     link can neither be recomputed nor go stale makes its whole container
     unpersistable rather than replaying a stale answer.
-  - Same blind spot as the external reuse, and it matters more here: a
-    session transcript **appended to in place** does not move its
-    container's stamp, so its stored byte total stands until the
-    container's shape changes. Reporting lag, bounded by that next shape
-    change, never an authorization hole -- every execution sink
-    re-derives from the live filesystem with both caches disabled
-    (`agents::reidentify_for_tool`). Recorded on
-    `agents::ContainerCache` and in
-    `.oh/guardrails/no-second-traversal-on-report-path.md`, and measured
-    by `a_session_rewritten_in_place_is_not_seen_until_its_container_moves`.
+  - The reuse is therefore as fresh as the observation that stored it,
+    and never fresher. A replay can report a stale fact only if the pass
+    that wrote it did, and the window refuses to vouch for rows older
+    than itself. The safety boundary for *acting* is elsewhere and
+    unchanged: every execution sink re-derives from the live filesystem
+    with both caches disabled (`agents::reidentify_for_tool`).
 - **A new key family in the existing store, not a second store.**
   `growth::observe_and_annotate_external`/`annotate_readonly_external`
   reuse the same current+reverse-delta Parquet design as artifact rows,

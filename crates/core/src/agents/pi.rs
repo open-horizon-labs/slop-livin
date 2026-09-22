@@ -40,7 +40,6 @@
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs, pi_family,
-    resolve_declared_path,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,6 +47,11 @@ use std::path::{Path, PathBuf};
 pub const PI_TOOL_ID: &str = crate::locations::pi::PI_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
+/// Session files one `sessions/<dir>/` container will identify. Per
+/// container, never shared: see [`collect_files`].
+const MAX_CONTAINER_ENTRIES: usize = 20_000;
+/// Session containers one pass will identify.
+const MAX_CONTAINERS: usize = 20_000;
 const MAX_WALK_DEPTH: usize = 4;
 /// Per-session header read cap. Pi's header is one JSON line at byte
 /// offset 0, so the read never needs a title-slot allowance.
@@ -121,10 +125,37 @@ fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgent
     ]
 }
 
+/// Each immediate subdirectory of `sessions/` is a container: Pi's
+/// layout is a directory tree, and nothing in a session's unit is
+/// derived from outside its own subtree, so a subtree nothing touched is
+/// replayed rather than re-listed. Session files sitting directly in
+/// `sessions/` belong to no container and are identified every pass.
 fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("sessions");
-    let mut files = Vec::new();
-    collect_files(&base, 0, ctx, &mut files);
+    let mut loose = Vec::new();
+    let mut containers = 0usize;
+    for entry in ctx.list(&base) {
+        let path = base.join(&entry.name);
+        if entry.is_dir {
+            if containers >= MAX_CONTAINERS {
+                break;
+            }
+            containers += 1;
+            let units = ctx.container(PI_TOOL_ID, &path, &|| {
+                let mut files = Vec::new();
+                collect_files(&path, 1, ctx, &mut files);
+                session_units(home, files, ctx)
+            });
+            out.extend(units);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            loose.push(path);
+        }
+    }
+    out.extend(session_units(home, loose, ctx));
+}
+
+fn session_units(home: &Path, files: Vec<PathBuf>, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+    let mut out = Vec::new();
     for jsonl in files {
         let Ok(meta) = fs::symlink_metadata(&jsonl) else {
             continue;
@@ -140,10 +171,10 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
             ACCEPTED_LAYOUTS,
         );
         let unknown_format = header.is_empty();
-        let project_link = resolve_declared_path(
-            header.cwd,
-            &pi_family::no_layout_matched_reason(ACCEPTED_LAYOUTS),
-        );
+        // `project_link_declared`, not `project_link`: a replayed
+        // container re-resolves the declared path live rather than
+        // replaying a resolution that may have gone stale
+        // (`crate::agents::LinkBasis`).
         let mut unit = AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
             .relative_to(home)
             .members(vec![AgentMember {
@@ -152,7 +183,10 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
                 kind: AgentMemberKind::Transcript,
             }])
             .mtime_max(mtime)
-            .project_link(project_link)
+            .project_link_declared(
+                header.cwd,
+                &pi_family::no_layout_matched_reason(ACCEPTED_LAYOUTS),
+            )
             .action(AgentActionCapability::SessionRemoval);
         if unknown_format {
             // Explicit, not silent: this session's header is not in the
@@ -166,14 +200,20 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
         }
         out.push(unit.build());
     }
+    out
 }
 
+/// Bounded collection under **one** container. The entry budget belongs
+/// to that container alone: a budget shared across containers would make
+/// a replayed subtree mean something different from a live
+/// identification of the same subtree, which is what kept this adapter
+/// off the container seam until 2026-09-22.
 fn collect_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
-    if depth > MAX_WALK_DEPTH || out.len() > MAX_FOLD_ENTRIES {
+    if depth > MAX_WALK_DEPTH || out.len() >= MAX_CONTAINER_ENTRIES {
         return;
     }
     for entry in ctx.list(dir) {
-        if out.len() > MAX_FOLD_ENTRIES {
+        if out.len() >= MAX_CONTAINER_ENTRIES {
             return;
         }
         let path = dir.join(&entry.name);

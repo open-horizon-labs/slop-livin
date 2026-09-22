@@ -275,7 +275,37 @@ fn identify_file_tree_sessions(
     for project_id in ctx.dir_names(&base) {
         let project_dir = base.join(&project_id);
         let project_link = project_link_for(projects, &project_id);
-        for file_name in ctx.file_names(&project_dir) {
+        // One container per `storage/session/<project-id>/`. Its units'
+        // members reach outside it -- `storage/message/<session-id>/`
+        // and `storage/session_diff/<session-id>.json` -- so those paths
+        // are declared with `ctx.watch` inside the closure, and an event
+        // at any of them re-identifies the whole project directory.
+        let units = ctx.container(OPENCODE_TOOL_ID, &project_dir, &|| {
+            identify_one_project_dir(home, &project_dir, &project_link, ctx)
+        });
+        for unit in &units {
+            if let Some(stem) = unit.path.file_stem().and_then(|s| s.to_str()) {
+                // Derived from the replayed units, not from a variable
+                // the closure mutated: a container that is replayed must
+                // claim exactly what it claimed when it was identified,
+                // or `identify_storage_auxiliary` would report its
+                // session diffs as orphans on every reused pass.
+                claimed.insert(stem.to_string());
+            }
+        }
+        out.extend(units);
+    }
+}
+
+fn identify_one_project_dir(
+    home: &Path,
+    project_dir: &Path,
+    project_link: &ProjectLinkState,
+    ctx: &IdentifyCtx,
+) -> Vec<CandidateAgentUnit> {
+    let mut out: Vec<CandidateAgentUnit> = Vec::new();
+    {
+        for file_name in ctx.file_names(project_dir) {
             let path = project_dir.join(&file_name);
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
@@ -312,6 +342,11 @@ fn identify_file_tree_sessions(
             // one, a directory of the same name is folded if some
             // version writes one, and neither is assumed.
             let message_dir = home.join("storage").join("message").join(&session_id);
+            // Consulted with `is_dir`/`symlink_metadata` rather than
+            // through `ctx`, so the container would not otherwise record
+            // it. A session acquiring its first message directory has to
+            // be a change to this container.
+            ctx.watch(&message_dir);
             if message_dir.is_dir() {
                 let (b, m, _t) = ctx.folded_bytes(&message_dir, MAX_FOLD_ENTRIES);
                 bytes += b;
@@ -327,6 +362,7 @@ fn identify_file_tree_sessions(
                 diff_base.join(format!("{session_id}.json")),
                 diff_base.join(&session_id),
             ] {
+                ctx.watch(&diff);
                 let Ok(meta) = fs::symlink_metadata(&diff) else {
                     continue;
                 };
@@ -346,7 +382,6 @@ fn identify_file_tree_sessions(
                     kind: AgentMemberKind::SessionData,
                 });
             }
-            claimed.insert(session_id);
             let relative_path = relative_to(home, &path);
             out.push(
                 AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Sessions, path)
@@ -360,6 +395,7 @@ fn identify_file_tree_sessions(
             );
         }
     }
+    out
 }
 
 /// `storage/message/` and `storage/session_diff/` entries no session

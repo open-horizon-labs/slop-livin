@@ -1985,7 +1985,7 @@ pub struct TrackedWalk {
     /// a scan root is pruned from it precisely so it can be measured
     /// once, as its own unit -- so narrowing the list for them would
     /// hand out a window that cannot see a change it was asked about.
-    pub event_window: Option<(Vec<PathBuf>, u64)>,
+    pub event_window: Option<crate::fs_events::TrustedWindow>,
     pub discovered: Vec<DiscoveredWorktree>,
     pub attribution: crate::attribution::AttributionResult,
     /// `"incremental"` or `"full"`.
