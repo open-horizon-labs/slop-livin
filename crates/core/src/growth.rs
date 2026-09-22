@@ -1821,9 +1821,34 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
         .unwrap_or_default()
 }
 
+/// Publishes the walk's half of this dir's replay anchor, carrying the
+/// unit-root half through untouched.
+///
+/// A path can be both a scan root and an authorized unit root (a tool
+/// home the user put in scope), in which case the walk and
+/// [`replay_unit_roots`] both own an anchor in this one file. Writing
+/// `state` wholesale would let whichever finished last erase the
+/// other's, and the visible symptom would be a unit that re-measures
+/// every pass for no stated reason.
 fn write_fsevents_state(dir: &Path, state: &FsEventsState) -> Result<()> {
     fs::create_dir_all(dir)?;
-    fs::write(fsevents_state_path(dir), serde_json::to_string(state)?)
+    let merged = FsEventsState {
+        unit_root: read_fsevents_state(dir).unit_root,
+        ..state.clone()
+    };
+    fs::write(fsevents_state_path(dir), serde_json::to_string(&merged)?)
+        .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+}
+
+/// The mirror of [`write_fsevents_state`]: publishes one unit root's
+/// anchor, carrying the walk's scalars through untouched.
+fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let merged = FsEventsState {
+        unit_root: Some(cursor.clone()),
+        ..read_fsevents_state(dir)
+    };
+    fs::write(fsevents_state_path(dir), serde_json::to_string(&merged)?)
         .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
 }
 
@@ -2104,6 +2129,218 @@ pub fn observe_tracked_with_source(
     Ok(walk)
 }
 
+/// What one pass's unit-root replays earned: the event coverage the
+/// authorized external/agent roots contributed, one reason code per root
+/// for the report, and the cursors this pass may publish **if it
+/// completes**.
+///
+/// # Why the cursors are staged rather than written
+///
+/// Advancing a cursor is a promise: it says the next pass's window may
+/// start here, which is only true if this pass actually refreshed the
+/// rows the next pass will want to reuse. A pass that measured and then
+/// failed to persist has not earned that, so [`Self::commit`] is called
+/// only on the success path -- the same `ReportCached`-gated ordering
+/// [`ObservationCheckpoint`] uses for the walk's anchor. Dropping this
+/// value leaves the previous cursor in place, which makes the next
+/// window *wider* than necessary: the outcome of a failed pass is a
+/// re-measurement, never a reuse that rests on it.
+///
+/// Not advancing is always the safe direction, which is why a pass that
+/// covers only one unit family does not advance either (see
+/// `report::observe_scope`).
+#[derive(Default)]
+pub struct UnitRootReplay {
+    /// The windows the unit roots earned, to be merged into the walk's.
+    pub coverage: crate::fs_events::EventCoverage,
+    /// `(root, reason)` per root asked about: `incremental` when the
+    /// root earned a window, otherwise the refusal that explains why the
+    /// units under it are being measured from scratch.
+    pub outcomes: Vec<(PathBuf, String)>,
+    staged: Vec<(PathBuf, crate::fs_events::UnitRootCursor)>,
+}
+
+impl UnitRootReplay {
+    /// Publishes every staged cursor. Called only by a pass that
+    /// observed and persisted both unit families.
+    pub fn commit(self) -> Result<()> {
+        for (dir, cursor) in self.staged {
+            write_unit_root_cursor(&dir, &cursor)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this root earned a window this pass -- the "event-covered
+    /// / replayed" fact the report renders.
+    pub fn covered(&self, root: &Path) -> bool {
+        self.outcomes
+            .iter()
+            .any(|(p, reason)| p == root && reason == "incremental")
+    }
+}
+
+/// Replays one FSEvents cursor per authorized unit root (external cache
+/// or agent tool home), so a default install -- where no tool home is
+/// under any scan root -- can reuse stored measurements at all.
+///
+/// Each root's anchor lives in its own volume dir's `fsevents.json`,
+/// under `unit_root`, beside (never instead of) the walk's anchor for
+/// the same path. Roots on one device are replayed through a single
+/// FSEvents stream and the result split per root
+/// (`fs_events::FsEventsSource::replay_roots`).
+///
+/// Three things make the result safe to reuse a measurement on, and all
+/// three are here rather than in the caller:
+///
+/// * `force_full` never touches the source at all, exactly as the walk's
+///   own path does not -- a forced full pass has promised not to pay for
+///   a replay, and "call it and discard the answer" is not that promise.
+/// * The `TooSoon` floor applies unchanged: FSEvents' persisted log can
+///   lag a write by longer than a whole second, so two passes in quick
+///   succession get no window and honestly re-measure.
+/// * A root whose device differs from the one its cursor was recorded
+///   against gets no window and a `root_mismatch` reason, decided here
+///   rather than left to the platform source, so it holds for every
+///   source including the injected ones.
+///
+/// On a platform with no FSEvents the source refuses
+/// (`unsupported_platform`), no root earns a window, and every unit is
+/// re-measured -- the "continuity unavailable" contract from stack/09.
+pub fn replay_unit_roots(
+    swamp_dir: Option<&Path>,
+    roots: &[PathBuf],
+    observed_at: u64,
+    force_full: bool,
+    source: &dyn crate::fs_events::FsEventsSource,
+) -> UnitRootReplay {
+    use crate::fs_events::{FsEventsRequest, FsEventsState, UnitRootCursor};
+
+    let mut out = UnitRootReplay::default();
+    let Some(swamp_dir) = swamp_dir else {
+        for r in roots {
+            out.outcomes.push((r.clone(), "no_store".to_string()));
+        }
+        return out;
+    };
+    if force_full {
+        for r in roots {
+            out.outcomes.push((r.clone(), "full_forced".to_string()));
+        }
+        return out;
+    }
+
+    struct Staged {
+        root: PathBuf,
+        canonical: PathBuf,
+        dir: PathBuf,
+        device: Option<u64>,
+        since: Option<u64>,
+        too_soon: bool,
+        device_mismatch: bool,
+    }
+
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut requests: Vec<FsEventsRequest> = Vec::new();
+    for root in roots {
+        let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let dir = volume_dir(swamp_dir, root_scoped_volume_id(&canonical));
+        let prev = read_fsevents_state(&dir).unit_root.unwrap_or_default();
+        // A root that is not on disk has no units, nothing to replay and
+        // nothing worth anchoring. It gets no row at all rather than a
+        // refusal row, for the same reason a `SkippedAsNested` scan root
+        // gets no coverage row: a report should not list a reason for
+        // something that was never a candidate this pass. The authorized
+        // scope legitimately contains such paths -- a Cargo home
+        // contributes `registry/index` and `git/db` whether or not they
+        // have ever been populated.
+        let Some(device) = fs::metadata(&canonical).map(|m| m.dev()).ok() else {
+            continue;
+        };
+        let device_mismatch = prev.device.is_some_and(|stored| stored != device);
+        let too_soon = prev
+            .observed_at
+            .is_some_and(|t| observed_at.saturating_sub(t) < min_interval_secs());
+        requests.push(FsEventsRequest {
+            root: canonical.clone(),
+            since: FsEventsState {
+                event_id: prev.event_id,
+                device: prev.device,
+                last_observed_at: prev.observed_at,
+                rules_version: crate::ecosystem::RULES_VERSION,
+                unit_root: None,
+            },
+        });
+        staged.push(Staged {
+            root: root.clone(),
+            canonical,
+            dir,
+            device: Some(device),
+            since: prev.observed_at,
+            too_soon,
+            device_mismatch,
+        });
+    }
+
+    let plans = source.replay_roots(&requests);
+    for (s, plan) in staged.into_iter().zip(plans) {
+        let reason = if s.device_mismatch {
+            crate::fs_events::RefreshRefusal::RootMismatch
+                .as_str()
+                .to_string()
+        } else if s.too_soon && !plan.live {
+            crate::fs_events::RefreshRefusal::TooSoon
+                .as_str()
+                .to_string()
+        } else if plan.incremental && s.since.is_none() {
+            // A replay with nothing to replay *from* answers about a
+            // window whose start is unknown; a stored row cannot be
+            // shown to predate it.
+            crate::fs_events::RefreshRefusal::NoStoredEventId
+                .as_str()
+                .to_string()
+        } else {
+            plan.reason_str().to_string()
+        };
+        if reason == "incremental"
+            && let Some(since) = s.since
+        {
+            // Two spellings, because the two unit families address their
+            // units differently: `external::discover_and_measure`
+            // canonicalizes every candidate, while
+            // `agents::authorized_tool_homes` keeps the scope's own
+            // spelling. Registering only one of them would silently
+            // cover only one family whenever a root's canonical form
+            // differs (`/var` vs `/private/var`, a symlinked home).
+            out.coverage.trust_alias(
+                s.root.clone(),
+                s.canonical.clone(),
+                plan.changed_dirs.clone(),
+                since,
+            );
+            if s.canonical != s.root {
+                out.coverage
+                    .trust(s.canonical.clone(), plan.changed_dirs.clone(), since);
+            }
+        }
+        out.outcomes.push((s.root.clone(), reason));
+        // Nothing was learned about where to replay from next time (no
+        // FSEvents on this platform at all), so there is no anchor worth
+        // storing.
+        if plan.current_event_id == 0 && plan.device.is_none() {
+            continue;
+        }
+        out.staged.push((
+            s.dir,
+            UnitRootCursor {
+                event_id: Some(plan.current_event_id),
+                device: s.device.or(plan.device),
+                observed_at: Some(observed_at),
+            },
+        ));
+    }
+    out
+}
+
 /// Replay state is staged until all observation consumers have persisted their
 /// facts. Dropping this value on any later failure leaves the old replay anchor.
 pub struct ObservationCheckpoint {
@@ -2313,6 +2550,11 @@ pub fn stage_tracked_with_source(
             device: plan.device,
             last_observed_at: Some(observed_at),
             rules_version: crate::ecosystem::RULES_VERSION,
+            // The unit-root half of this file belongs to
+            // `replay_unit_roots`; `write_fsevents_state` carries
+            // whatever is on disk through rather than taking it from
+            // here.
+            unit_root: None,
         }),
         topology: to_stored_worktrees(&result.discovered),
         unowned: result.attribution.unowned.clone(),

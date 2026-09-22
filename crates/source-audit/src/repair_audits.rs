@@ -1429,6 +1429,12 @@ pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/core/src/growth.rs",
+        "write_unit_root_cursor",
+        "the unit-root half of the same FSEvents cursor file: one event id, device and \
+         timestamp per authorized external/agent root",
+    ),
+    (
+        "crates/core/src/growth.rs",
         "write_topology",
         "the worktree topology snapshot an incremental replay diffs against",
     ),

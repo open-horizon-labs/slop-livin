@@ -2230,6 +2230,10 @@ pub struct ScopeObservation {
     pub per_root: std::collections::HashMap<PathBuf, Report>,
     pub external_units: Vec<crate::external::ExternalUnit>,
     pub agent_units: Vec<crate::agents::AgentUnit>,
+    /// One row per authorized unit root: whether this pass's own
+    /// FSEvents replay covered it (so its units could be replayed) or
+    /// why it could not. Empty when no detector resolved a root.
+    pub unit_root_coverage: Vec<crate::coverage::UnitRootCoverage>,
 }
 
 /// Which parts of a scope this observation covers.
@@ -2310,14 +2314,37 @@ pub fn observe_scope(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<ScopeObservation> {
+    // Every authorized external/agent root's own replay window, taken
+    // **before** the walk so each cursor is read at its previous pass's
+    // value rather than one this pass has just written -- a root that is
+    // also a scan root would otherwise be asked about a window it opened
+    // itself.
+    //
+    // This is what makes the event gate do anything at all in a default
+    // install: scan roots are project directories, and `~/.claude`,
+    // `~/.cargo` and `~/Library/Caches/...` are not under them, so
+    // before this the only windows in existence could never reach the
+    // units they were supposed to vouch for
+    // (`.oh/sessions/2026-09-22-event-gated-reuse.md` §3).
+    let unit_roots = scope.authorized_unit_roots();
+    let unit_replay = crate::growth::replay_unit_roots(
+        store_dir,
+        &unit_roots,
+        crate::entities::now(),
+        force_full,
+        fs_events_source,
+    );
+
     // A caller that already walked (the CLI's explicit-root path) hands
     // its report in rather than walking a second time. It has no
     // per-root coverage to contribute, which is honest: coverage
     // describes the scope this function walked, and it did not walk one.
     let (merged, coverage, per_root, events) = match base {
-        // A handed-in report brings no replay window with it, so this
-        // observation has no evidence that any unit is unchanged and
-        // reuses nothing. Honest and slower, never wrong.
+        // A handed-in report brings no *walk* window with it. The unit
+        // roots' own cursors are independent evidence -- they were
+        // replayed above, not derived from the walk -- so they still
+        // apply; the report this caller handed in simply contributes
+        // none of its own.
         Some(r) => (
             r,
             Vec::new(),
@@ -2337,10 +2364,13 @@ pub fn observe_scope(
             fs_events_source,
         )?,
     };
+    let mut events = events;
+    events.merge(unit_replay.coverage.clone());
     let observed_at = merged.observed_at;
     let mut merged = merged;
+    let mut external_ok = true;
     let mut external_units = if want.external {
-        let mut units = crate::external::discover_and_measure(
+        let measured = crate::external::discover_and_measure(
             scope,
             store_dir,
             observe,
@@ -2348,8 +2378,9 @@ pub fn observe_scope(
             retention_days,
             since_secs,
             &events,
-        )
-        .unwrap_or_default();
+        );
+        external_ok = measured.is_ok();
+        let mut units = measured.unwrap_or_default();
         crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
         units
     } else {
@@ -2364,8 +2395,9 @@ pub fn observe_scope(
         .flat_map(|p| p.worktrees.iter())
         .map(|wt| wt.path.clone())
         .collect();
+    let mut agents_ok = true;
     let agent_units = if want.agents {
-        crate::agents::discover_and_measure(
+        let measured = crate::agents::discover_and_measure(
             scope,
             &project_worktrees,
             store_dir,
@@ -2374,17 +2406,47 @@ pub fn observe_scope(
             retention_days,
             since_secs,
             &events,
-        )
-        .unwrap_or_default()
+        );
+        agents_ok = measured.is_ok();
+        measured.unwrap_or_default()
     } else {
         Vec::new()
     };
+
+    // The cursors advance only for a pass that observed **both** unit
+    // families and persisted them. Three refusals in one condition:
+    //
+    // * `observe` false: this pass wrote no rows, so the next pass must
+    //   keep comparing against the rows the last observing pass wrote.
+    // * a family this pass did not cover: its rows are still the
+    //   previous pass's. Advancing would move the window past changes
+    //   that family never measured; the `observed_at` guard would then
+    //   refuse to reuse those rows, so the cost of advancing is a
+    //   guaranteed re-measurement and the cost of not advancing is a
+    //   slightly wider replay. Wider wins.
+    // * a family that erred after measuring: same reasoning, and this is
+    //   the `ReportCached` gate the walk's own checkpoint has -- a pass
+    //   that failed to persist never gets to vouch for what it measured.
+    let unit_root_coverage: Vec<crate::coverage::UnitRootCoverage> = unit_replay
+        .outcomes
+        .iter()
+        .map(|(path, reason)| crate::coverage::UnitRootCoverage {
+            path: path.clone(),
+            event_covered: reason == "incremental",
+            reason: reason.clone(),
+        })
+        .collect();
+    if observe && want.external && want.agents && external_ok && agents_ok {
+        unit_replay.commit()?;
+    }
+
     Ok(ScopeObservation {
         merged,
         coverage,
         per_root,
         external_units,
         agent_units,
+        unit_root_coverage,
     })
 }
 

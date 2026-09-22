@@ -547,6 +547,45 @@ impl EffectiveScope {
             .any(|r| r.detector_id.as_deref() == Some(id))
     }
 
+    /// Every authorized detector-resolved root the external and agent
+    /// unit families measure under, de-duplicated and in scope order.
+    ///
+    /// This is the set that gets its own FSEvents cursor
+    /// (`crate::growth::replay_unit_roots`). Without one, a default
+    /// install's event window comes only from the walked project roots,
+    /// which never contain `~/.claude` or `~/.cargo`, so no stored
+    /// measurement of either is ever reusable and the event gate does
+    /// nothing outside a scope that happens to contain a tool home.
+    ///
+    /// Derived from the same authorized seam the two families derive
+    /// their own candidate lists from, so a disabled detector, an
+    /// exclusion or an explicit-root replacement removes a root's cursor
+    /// exactly as it removes its units
+    /// (`.oh/guardrails/discovery-consumes-effective-scope.md`). The
+    /// builtin-defaults pseudo-detector is dropped: it proposes the
+    /// configured scan roots themselves, which the walk already anchors.
+    pub fn authorized_unit_roots(&self) -> Vec<PathBuf> {
+        let roots = if self.explicit {
+            self.authorized_detector_paths_in_explicit_roots()
+        } else {
+            self.authorized_roots().0
+        };
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for root in roots {
+            let Some(detector_id) = root.detector_id.as_deref() else {
+                continue;
+            };
+            if detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
+                continue;
+            }
+            if seen.insert(root.path.clone()) {
+                out.push(root.path);
+            }
+        }
+        out
+    }
+
     /// Whether this scope lets a detector contribute at all.
     ///
     /// Distinct from "did it resolve a present home": a detector can be

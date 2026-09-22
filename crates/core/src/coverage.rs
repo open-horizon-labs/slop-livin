@@ -81,6 +81,44 @@ pub struct RootCoverage {
     pub mode: String,
 }
 
+/// One authorized unit root's event-coverage outcome for a pass: whether
+/// this observation's own FSEvents replay can vouch for what did *not*
+/// change under it, and, when it cannot, why not.
+///
+/// Distinct from [`RootCoverage`], which describes a walked scan root. A
+/// unit root (`~/.claude`, `~/.cargo`, a model store) is not walked by
+/// the report path at all -- it is measured as its own unit -- so this
+/// row is what lets a surface say *why* a unit was replayed rather than
+/// re-measured: "event-covered" versus a named refusal.
+///
+/// It is a coverage fact, never a storage fact: a root that loses its
+/// window re-measures, which changes cost and nothing else
+/// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRootCoverage {
+    pub path: PathBuf,
+    /// `true` exactly when this pass replayed the root successfully and
+    /// earned a usable window, so stored measurements under it may be
+    /// replayed rather than re-taken.
+    pub event_covered: bool,
+    /// `"incremental"` when covered; otherwise the reason code --
+    /// `no_stored_event_id`, `too_soon`, `root_mismatch`,
+    /// `unsupported_platform`, `helper_inconclusive`, `full_forced`,
+    /// `no_store`.
+    pub reason: String,
+}
+
+impl UnitRootCoverage {
+    /// How a surface says it: the fact, not a verdict.
+    pub fn label(&self) -> String {
+        if self.event_covered {
+            "event-covered (replayed)".to_string()
+        } else {
+            format!("re-measured ({})", self.reason)
+        }
+    }
+}
+
 impl RootCoverage {
     pub fn excluded(path: PathBuf) -> Self {
         Self {

@@ -98,6 +98,39 @@ pub struct FsEventsState {
     /// A different current version forces a full walk (missing = 0).
     #[serde(default)]
     pub rules_version: u32,
+    /// This path's anchor as a *measured unit root* -- an authorized
+    /// detector-resolved external cache or agent tool home
+    /// (`crate::growth::replay_unit_roots`).
+    ///
+    /// It is a separate anchor from the three scalars above, in the same
+    /// control file, because the two are advanced by different things at
+    /// different times: the scalars by the folded walk of a scan root,
+    /// this by the pass that measured the unit family. A path can be
+    /// both (a tool home inside the configured scope), which is exactly
+    /// why neither writer may rewrite the whole file -- both do a
+    /// read-modify-write of their own half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_root: Option<UnitRootCursor>,
+}
+
+/// One authorized unit root's replay anchor.
+///
+/// Deliberately not just a second [`FsEventsState`]: a unit root has no
+/// `rules_version` of its own (nothing about it is classified by the
+/// ecosystem rules) and reusing the same struct would invite a writer to
+/// copy the walk's scalars into it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnitRootCursor {
+    /// The `current_event_id` from the replay that accompanied the last
+    /// measurement of this root.
+    pub event_id: Option<u64>,
+    /// The device the root lived on then. A root that now resolves to a
+    /// different device makes the stored id meaningless.
+    pub device: Option<u64>,
+    /// `now()` (whole seconds) as of the pass that recorded `event_id`.
+    /// This is the instant the next window opens from, and the floor
+    /// [`EventCoverage::unchanged_since`] compares stored rows against.
+    pub observed_at: Option<u64>,
 }
 
 /// One replay request: a canonical root and the state persisted from the
@@ -189,6 +222,20 @@ impl FsEventsPlan {
 /// event batches so no test depends on the live `fseventsd`.
 pub trait FsEventsSource: Send + Sync {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan;
+
+    /// Replays several roots in one go, returning one plan per request
+    /// in the same order.
+    ///
+    /// An implementation is free to answer them with a single stream --
+    /// the macOS one opens one stream per *device*, since that is the
+    /// granularity FSEvents' retained log actually has, and splits the
+    /// result with [`partition_changes`] so no root ever sees another
+    /// root's events. The default implementation replays them one at a
+    /// time, which is what every canned test source wants and what the
+    /// non-macOS stub needs.
+    fn replay_roots(&self, requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
+        requests.iter().map(|r| self.replay(r)).collect()
+    }
 }
 
 /// One root's trusted replay window, as `growth` hands it up to the
@@ -204,10 +251,15 @@ pub type EventWindowSlot = std::sync::Arc<std::sync::Mutex<Option<TrustedWindow>
 /// replay said changed underneath it.
 #[derive(Debug, Clone)]
 struct EventWindow {
-    /// Canonical, as FSEvents answers.
+    /// The spelling the *units* under this root are addressed in -- the
+    /// one a caller passes to [`EventCoverage::unchanged_since`].
     root: PathBuf,
+    /// The same root canonicalized, which is the namespace `changed` is
+    /// expressed in because that is the only namespace FSEvents answers
+    /// in. Equal to `root` for every root that was already canonical.
+    canonical_root: PathBuf,
     /// Every path the replay implicated (each reported path plus its
-    /// parent), unfiltered.
+    /// parent), unfiltered, in the canonical namespace.
     changed: Vec<PathBuf>,
     /// The observation time the window replays *from*. Stored rows older
     /// than this were written before the window opened, so the window
@@ -272,11 +324,44 @@ impl EventCoverage {
     /// this walk chose not to descend into is still a path the window
     /// has to be able to say "changed" about.
     pub fn trust(&mut self, root: PathBuf, changed: Vec<PathBuf>, since_observed_at: u64) {
+        let canonical_root = root.clone();
+        self.trust_alias(root, canonical_root, changed, since_observed_at);
+    }
+
+    /// [`Self::trust`] for a root whose units are addressed by a
+    /// non-canonical spelling (a symlinked tool home, a `/var` alias of
+    /// `/private/var`).
+    ///
+    /// Both spellings are needed and neither substitutes for the other.
+    /// Matching a queried path against the canonical root alone would
+    /// never cover a unit reached through the alias; matching the
+    /// alias-form path against `changed` (which FSEvents always answers
+    /// in canonical form) would find no event under it and report the
+    /// unit quiet *because* the spellings differ -- silently wrong in
+    /// the direction that matters. So the query is matched against
+    /// `root` and then rewritten into the canonical namespace before it
+    /// is tested against `changed`.
+    pub fn trust_alias(
+        &mut self,
+        root: PathBuf,
+        canonical_root: PathBuf,
+        changed: Vec<PathBuf>,
+        since_observed_at: u64,
+    ) {
         self.windows.push(EventWindow {
             root,
+            canonical_root,
             changed,
             since_observed_at,
         });
+    }
+
+    /// Folds another pass-scoped coverage into this one. Windows are
+    /// independent evidence, so this is a concatenation: the unit-root
+    /// cursors' windows and the walk's windows both vouch for whatever
+    /// they each cover.
+    pub fn merge(&mut self, other: EventCoverage) {
+        self.windows.extend(other.windows);
     }
 
     /// A single-window coverage, for tests and for callers that replay
@@ -311,11 +396,38 @@ impl EventCoverage {
     ///   `path`, and is not treated as one.
     pub fn unchanged_since(&self, path: &Path, stored_at: u64) -> bool {
         self.windows.iter().any(|w| {
-            path.starts_with(&w.root)
-                && stored_at >= w.since_observed_at
-                && !w.changed.iter().any(|c| c.starts_with(path))
+            if stored_at < w.since_observed_at {
+                return false;
+            }
+            let Ok(rel) = path.strip_prefix(&w.root) else {
+                return false;
+            };
+            let in_window = w.canonical_root.join(rel);
+            !w.changed.iter().any(|c| c.starts_with(&in_window))
         })
     }
+}
+
+/// Splits one shared stream's change list into one list per root: each
+/// root gets exactly the reported paths at or under it.
+///
+/// Several roots on one device are replayed through a single FSEvents
+/// stream (see [`FsEventsSource::replay_roots`]), which means one
+/// callback sees every root's events. Handing that combined list to
+/// every root would make a write under `~/.cargo` read as a change under
+/// `~/.claude` -- the cross-talk this function exists to prevent. Roots
+/// are compared as canonical paths, the namespace FSEvents reports in.
+fn partition_changes(roots: &[PathBuf], changes: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+    roots
+        .iter()
+        .map(|root| {
+            changes
+                .iter()
+                .filter(|c| c.starts_with(root))
+                .cloned()
+                .collect()
+        })
+        .collect()
 }
 
 /// Returns the platform's real source on macOS, and the always-refusing
@@ -379,8 +491,7 @@ impl PendingWatch {
                 thread: self.thread.take(),
             }),
             _ => {
-                self.stop
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(t) = self.thread.take() {
                     let _ = t.join();
                 }
@@ -392,9 +503,13 @@ impl PendingWatch {
 
 impl Drop for PendingWatch {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Only a stream still owned by this pending handle is stopped.
+        // `ready` hands the join handle to the `Watcher` it returns and
+        // leaves `thread` empty; setting the shared stop flag here
+        // regardless would end the stream the caller just took
+        // ownership of, on the same line it took it.
         if let Some(t) = self.thread.take() {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = t.join();
         }
     }
@@ -554,7 +669,10 @@ mod macos {
     }
 
     struct Collector {
-        root: PathBuf,
+        /// Every root this stream is watching. One stream can carry
+        /// several roots on the same device; the collector keeps their
+        /// union and `replay_many` splits it per root afterwards.
+        roots: Vec<PathBuf>,
         changes: std::collections::HashSet<PathBuf>,
         history_done: bool,
         hard_fail: Option<RefreshRefusal>,
@@ -619,7 +737,10 @@ mod macos {
             // SAFETY: FSEvents paths are NUL-terminated C strings.
             let cstr = unsafe { CStr::from_ptr(cpath) };
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes()));
-            add_with_parent(&mut collector.changes, &collector.root, &path);
+            for i in 0..collector.roots.len() {
+                let root = collector.roots[i].clone();
+                add_with_parent(&mut collector.changes, &root, &path);
+            }
         }
     }
 
@@ -768,70 +889,179 @@ mod macos {
 
     impl FsEventsSource for MacOsFsEventsSource {
         fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan {
-            replay(&request.root, &request.since)
+            self.replay_roots(std::slice::from_ref(request))
+                .pop()
+                .unwrap_or_else(|| {
+                    FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, 0, None)
+                })
+        }
+
+        fn replay_roots(&self, requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
+            replay_many(requests)
         }
     }
 
-    fn replay(root: &Path, since: &FsEventsState) -> FsEventsPlan {
+    /// Every root whose pre-checks passed, grouped by the device its
+    /// FSEvents history lives on.
+    struct Group {
+        dev: u64,
+        /// Index into the caller's request slice, so each plan goes back
+        /// to the root that asked for it.
+        members: Vec<usize>,
+        /// The earliest anchor among the members. A member whose own
+        /// anchor is later simply sees some events it already knew
+        /// about, which can only make it re-measure something that did
+        /// not need it -- never the other way round.
+        since_id: u64,
+    }
+
+    fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
         // SAFETY: no arguments; a pure query of the FSEvents subsystem.
         let current = unsafe { fs::FSEventsGetCurrentEventId() };
         if current == 0 {
-            return FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, 0, None);
+            return requests
+                .iter()
+                .map(|_| FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, 0, None))
+                .collect();
         }
 
-        let dev = match std::fs::metadata(root) {
-            Ok(meta) => meta.dev(),
-            Err(_) => {
-                return FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, current, None);
+        let mut plans: Vec<Option<FsEventsPlan>> = vec![None; requests.len()];
+        let mut groups: Vec<Group> = Vec::new();
+
+        for (i, request) in requests.iter().enumerate() {
+            let root = &request.root;
+            let since = &request.since;
+            let dev = match std::fs::metadata(root) {
+                Ok(meta) => meta.dev(),
+                Err(_) => {
+                    plans[i] = Some(FsEventsPlan::refuse(
+                        RefreshRefusal::FseventsdUnavailable,
+                        current,
+                        None,
+                    ));
+                    continue;
+                }
+            };
+
+            // Sanity check named in the issue: ask FSEvents for the last
+            // event id it can vouch for on this device as of "now". This
+            // is read-only and its only use here is to catch a device
+            // whose FSEvents history log cannot possibly reach back to
+            // `since` (the id looks plausible but predates everything
+            // retained).
+            // SAFETY: `dev` came from a real `stat`;
+            // `CFAbsoluteTimeGetCurrent` takes no arguments.
+            let last_known = unsafe {
+                fs::FSEventsGetLastEventIdForDeviceBeforeTime(
+                    dev,
+                    core_foundation_sys::date::CFAbsoluteTimeGetCurrent(),
+                )
+            };
+
+            if let Some(stored_device) = since.device
+                && stored_device != dev
+            {
+                plans[i] = Some(FsEventsPlan::refuse(
+                    RefreshRefusal::RootMismatch,
+                    current,
+                    Some(dev),
+                ));
+                continue;
             }
-        };
+            let Some(since_id) = since.event_id else {
+                plans[i] = Some(FsEventsPlan::refuse(
+                    RefreshRefusal::NoStoredEventId,
+                    current,
+                    Some(dev),
+                ));
+                continue;
+            };
+            if since_id > current {
+                plans[i] = Some(FsEventsPlan::refuse(
+                    RefreshRefusal::EventIdFromFuture,
+                    current,
+                    Some(dev),
+                ));
+                continue;
+            }
+            // `last_known` being 0 means FSEvents could not answer at all
+            // for this device (no history yet observed); that is not by
+            // itself a reason to refuse a replay FSEvents is about to
+            // attempt, so it only gates the case where FSEvents can
+            // positively vouch for a *later* floor than our stored id,
+            // meaning `since_id` is stale history that has already
+            // rotated out.
+            if last_known != 0 && since_id != 0 && since_id < last_known {
+                plans[i] = Some(FsEventsPlan::refuse(
+                    RefreshRefusal::HelperInconclusive,
+                    current,
+                    Some(dev),
+                ));
+                continue;
+            }
 
-        // Sanity check named in the issue: ask FSEvents for the last
-        // event id it can vouch for on this device as of "now". This is
-        // read-only and its only use here is to catch a device whose
-        // FSEvents history log cannot possibly reach back to `since`
-        // (the id looks plausible but predates everything retained).
-        // SAFETY: `dev` came from a real `stat`; `CFAbsoluteTimeGetCurrent`
-        // takes no arguments.
-        let last_known = unsafe {
-            fs::FSEventsGetLastEventIdForDeviceBeforeTime(
-                dev,
-                core_foundation_sys::date::CFAbsoluteTimeGetCurrent(),
-            )
-        };
-
-        if let Some(stored_device) = since.device
-            && stored_device != dev
-        {
-            return FsEventsPlan::refuse(RefreshRefusal::RootMismatch, current, Some(dev));
+            match groups.iter_mut().find(|g| g.dev == dev) {
+                Some(g) => {
+                    g.members.push(i);
+                    g.since_id = g.since_id.min(since_id);
+                }
+                None => groups.push(Group {
+                    dev,
+                    members: vec![i],
+                    since_id,
+                }),
+            }
         }
 
-        let Some(since_id) = since.event_id else {
-            return FsEventsPlan::refuse(RefreshRefusal::NoStoredEventId, current, Some(dev));
-        };
-        if since_id > current {
-            return FsEventsPlan::refuse(RefreshRefusal::EventIdFromFuture, current, Some(dev));
-        }
-        // `last_known` being 0 means FSEvents could not answer at all for
-        // this device (no history yet observed); that is not by itself a
-        // reason to refuse a replay FSEvents is about to attempt, so it
-        // only gates the case where FSEvents can positively vouch for a
-        // *later* floor than our stored id, meaning `since_id` is stale
-        // history that has already rotated out.
-        if last_known != 0 && since_id != 0 && since_id < last_known {
-            return FsEventsPlan::refuse(RefreshRefusal::HelperInconclusive, current, Some(dev));
+        for group in groups {
+            let roots: Vec<PathBuf> = group
+                .members
+                .iter()
+                .map(|&i| requests[i].root.clone())
+                .collect();
+            match run_stream(&roots, group.since_id) {
+                Err(reason) => {
+                    for &i in &group.members {
+                        plans[i] = Some(FsEventsPlan::refuse(reason, current, Some(group.dev)));
+                    }
+                }
+                Ok(changes) => {
+                    let per_root = super::partition_changes(&roots, &changes);
+                    for (&i, changed) in group.members.iter().zip(per_root) {
+                        plans[i] = Some(FsEventsPlan::ok(changed, current, Some(group.dev)));
+                    }
+                }
+            }
         }
 
+        plans
+            .into_iter()
+            .map(|p| {
+                p.unwrap_or_else(|| {
+                    FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, current, None)
+                })
+            })
+            .collect()
+    }
+
+    /// One FSEvents stream over `roots` (all on one device), replayed
+    /// from `since_id`. `Ok` is the complete union of implicated paths;
+    /// `Err` is the one refusal every root in the group shares, because
+    /// an inconclusive replay is inconclusive for all of them.
+    fn run_stream(roots: &[PathBuf], since_id: u64) -> Result<Vec<PathBuf>, RefreshRefusal> {
         let mut collector = Box::new(Collector {
-            root: root.to_path_buf(),
+            roots: roots.to_vec(),
             changes: std::collections::HashSet::new(),
             history_done: false,
             hard_fail: None,
         });
         let info_ptr = collector.as_mut() as *mut Collector as *mut c_void;
 
-        let cf_path = CFString::new(&root.to_string_lossy());
-        let paths_array: CFArray<CFString> = CFArray::from_CFTypes(&[cf_path]);
+        let cf_paths: Vec<CFString> = roots
+            .iter()
+            .map(|r| CFString::new(&r.to_string_lossy()))
+            .collect();
+        let paths_array: CFArray<CFString> = CFArray::from_CFTypes(&cf_paths);
         let context = fs::FSEventStreamContext {
             version: 0,
             info: info_ptr,
@@ -861,7 +1091,7 @@ mod macos {
             )
         };
         if stream.is_null() {
-            return FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, current, Some(dev));
+            return Err(RefreshRefusal::FseventsdUnavailable);
         }
 
         // SAFETY: `stream` was just created and is released below on
@@ -875,11 +1105,7 @@ mod macos {
             if fs::FSEventStreamStart(stream) == 0 {
                 fs::FSEventStreamInvalidate(stream);
                 fs::FSEventStreamRelease(stream);
-                return FsEventsPlan::refuse(
-                    RefreshRefusal::FseventsdUnavailable,
-                    current,
-                    Some(dev),
-                );
+                return Err(RefreshRefusal::FseventsdUnavailable);
             }
         }
 
@@ -906,17 +1132,17 @@ mod macos {
         }
 
         if let Some(reason) = collector.hard_fail {
-            return FsEventsPlan::refuse(reason, current, Some(dev));
+            return Err(reason);
         }
         if !collector.history_done {
             // The run loop stopped (budget exhausted) without FSEvents
             // ever reporting the replay complete. Whatever was collected
             // may be a prefix of what changed, and a prefix is exactly
             // the silent partial this design refuses to report.
-            return FsEventsPlan::refuse(RefreshRefusal::HelperInconclusive, current, Some(dev));
+            return Err(RefreshRefusal::HelperInconclusive);
         }
 
-        FsEventsPlan::ok(collector.changes.drain().collect(), current, Some(dev))
+        Ok(collector.changes.drain().collect())
     }
 }
 
@@ -1006,6 +1232,7 @@ mod tests {
                 device: Some(1),
                 last_observed_at: Some(1),
                 rules_version: 0,
+                unit_root: None,
             },
         });
         assert!(!plan.incremental);
@@ -1024,6 +1251,85 @@ mod tests {
         let mut changes = std::collections::HashSet::new();
         add_with_parent(&mut changes, root, Path::new("/elsewhere/x"));
         assert!(changes.is_empty(), "a path outside root must not be added");
+    }
+
+    /// Two roots on one device share one FSEvents stream, so the
+    /// callback sees both roots' events. Splitting that union is the
+    /// only thing standing between "a write under the Cargo home" and
+    /// "the Claude Code home changed"; assert the split directly, since
+    /// the stream itself cannot be reproduced deterministically.
+    #[test]
+    fn a_shared_stream_gives_each_root_only_its_own_changes() {
+        let cargo = PathBuf::from("/Users/x/.cargo");
+        let claude = PathBuf::from("/Users/x/.claude");
+        let changes = vec![
+            cargo.join("registry/cache"),
+            cargo.join("registry"),
+            PathBuf::from("/Users/x/elsewhere"),
+        ];
+        let split = partition_changes(&[cargo.clone(), claude.clone()], &changes);
+        assert_eq!(split[0].len(), 2, "the Cargo home keeps its own two paths");
+        assert!(
+            split[1].is_empty(),
+            "the Claude Code home saw nothing: {:?}",
+            split[1]
+        );
+        // And the consequence the split exists for.
+        let mut coverage = EventCoverage::untrusted();
+        coverage.trust(cargo.clone(), split[0].clone(), 1_000);
+        coverage.trust(claude.clone(), split[1].clone(), 1_000);
+        assert!(
+            !coverage.unchanged_since(&cargo, 1_000),
+            "the root that changed must not be reported unchanged"
+        );
+        assert!(
+            coverage.unchanged_since(&claude, 1_000),
+            "the quiet root on the same stream is still reusable"
+        );
+    }
+
+    /// A window whose root is reached through an alias spelling
+    /// (`/var/folders/...` for `/private/var/folders/...`) must translate
+    /// the queried path into the canonical namespace before testing it
+    /// against the change list. Skipping the translation reports the unit
+    /// quiet because the spellings differ, which is the wrong answer in
+    /// the only direction that matters.
+    #[test]
+    fn an_aliased_root_still_sees_its_own_changes() {
+        let alias = PathBuf::from("/var/home/.claude");
+        let canonical = PathBuf::from("/private/var/home/.claude");
+        let mut coverage = EventCoverage::untrusted();
+        coverage.trust_alias(
+            alias.clone(),
+            canonical.clone(),
+            vec![canonical.join("projects/a")],
+            1_000,
+        );
+        assert!(
+            !coverage.unchanged_since(&alias.join("projects/a"), 1_000),
+            "the change is under the queried path, however it is spelled"
+        );
+        assert!(
+            coverage.unchanged_since(&alias.join("projects/b"), 1_000),
+            "a sibling that did not change is still reusable"
+        );
+        assert!(
+            !coverage.unchanged_since(&PathBuf::from("/somewhere/else"), 1_000),
+            "a path outside the root is not covered at all"
+        );
+    }
+
+    /// Merging is concatenation: the unit-root cursors' windows and the
+    /// walk's windows are independent evidence and neither overrides the
+    /// other.
+    #[test]
+    fn merging_coverage_keeps_both_sets_of_windows() {
+        let mut walk = EventCoverage::trusted(PathBuf::from("/src"), Vec::new(), 1_000);
+        let units = EventCoverage::trusted(PathBuf::from("/home/.cargo"), Vec::new(), 1_000);
+        walk.merge(units);
+        assert!(walk.unchanged_since(Path::new("/src/proj"), 1_000));
+        assert!(walk.unchanged_since(Path::new("/home/.cargo/registry"), 1_000));
+        assert!(!walk.unchanged_since(Path::new("/home/.claude"), 1_000));
     }
 
     #[test]
