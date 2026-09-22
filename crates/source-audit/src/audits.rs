@@ -796,11 +796,39 @@ fn no_consumer_knows_other_consumers(root: &Path) -> Result<(), String> {
         .collect();
     for f in &files {
         let idents = ast::referenced_idents(&f.ast);
-        if idents
-            .iter()
-            .any(|i| i == "EventBus" || i == "with_builtins")
-        {
+        if idents.iter().any(|i| i == "EventBus") {
             return Err(format!("{}: a consumer names the bus", f.rel));
+        }
+        // `with_builtins` is a constructor name three static registries
+        // share (`bus::EventBus`, `agents::Registry`,
+        // `locations::Registry`, and now `build_adapters::Registry`), so
+        // matching the bare identifier reported a consumer using its own
+        // domain's registry as if it were assembling the bus.
+        //
+        // The property this rule is about is *whose* builtin set: a
+        // consumer must not assemble the set of consumers. So the call is
+        // rejected when it is unqualified (the shape the mutation corpus
+        // uses) or qualified by the bus, and allowed when it names some
+        // other module's registry explicitly -- which is visible in the
+        // diff and cannot be the consumer set.
+        for c in crate::resolve::calls(&f.ast) {
+            if !crate::resolve::path_ends_with(&c.path, "with_builtins") {
+                continue;
+            }
+            let qualifier = c
+                .path
+                .trim_end_matches("with_builtins")
+                .trim_end_matches("::");
+            let assembles_the_bus = qualifier.is_empty()
+                || qualifier == "Self"
+                || qualifier.contains("bus")
+                || qualifier.contains("EventBus");
+            if assembles_the_bus {
+                return Err(format!(
+                    "{}: `{}` assembles a builtin set with no module qualifying it; a consumer                      never builds the consumer set, and an unqualified `with_builtins` cannot be                      shown not to",
+                    f.rel, c.written
+                ));
+            }
         }
         for (other_rel, structs) in &all {
             if other_rel == &f.rel {

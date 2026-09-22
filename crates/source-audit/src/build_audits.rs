@@ -609,9 +609,13 @@ pub fn build_adapter_matrix_matches_docs(root: &Path) -> Result<(), String> {
         if cells.len() < 3 || !line.starts_with('|') {
             continue;
         }
+        // The row's *first cell* must name the adapter, backticked and
+        // whole. A substring match read `maven-metadata-local.xml` in
+        // the origin-evidence table as a Maven support row and demanded
+        // an actions column of it.
         let names_adapter = adapters
             .iter()
-            .any(|rel| cells[1].contains(&module_name(rel).replace('_', "-")));
+            .any(|rel| cells[1].starts_with(&format!("`{}`", module_name(rel).replace('_', "-"))));
         if !names_adapter {
             continue;
         }
@@ -664,12 +668,18 @@ pub fn build_adapters_reuse_under_event_coverage(root: &Path) -> Result<(), Stri
     // gate must be a condition of that decision, not merely present in
     // the file.
     for func in ast::functions(&modrs.ast) {
-        let decides_reuse = func.body.contains("reuse") || func.body.contains("replay");
-        let uses_stamp = func.body.contains("mtime") || func.body.contains("mod_time");
+        // Name, signature and body together. The sweep's own shape was a
+        // function *called* `reuse_container` whose body said only
+        // `previous_mtime == current_mtime`: a body-only rule cannot see
+        // that the comparison is a reuse decision, and a name-only rule
+        // cannot see that it is a stamp.
+        let surface = format!("{} {} {}", func.name, func.sig, func.body);
+        let decides_reuse = surface.contains("reuse") || surface.contains("replay");
+        let uses_stamp = surface.contains("mtime") || surface.contains("mod_time");
         if decides_reuse
             && uses_stamp
-            && !func.body.contains("coverage")
-            && !func.body.contains("Coverage")
+            && !surface.contains("coverage")
+            && !surface.contains("Coverage")
         {
             problems.push(format!(
                 "build_adapters/mod.rs::{} decides reuse from a modification stamp with no \

@@ -790,7 +790,44 @@ fn trusted_unchanged_container_reuses_units_without_reading_fingerprints() {
     }
     let (_tmp, root, target) = fixture();
     let store = tempfile::tempdir().unwrap();
-    let first = report(&root, store.path());
+    // Two warm-up observations before the baseline, because a trusted
+    // window needs a *recorded start* and the store only gains one on
+    // the second pass:
+    //
+    //   pass 1 -- the classification rules differ from the empty store's,
+    //             so this is a full walk whose checkpoint stamps the
+    //             rules version and deliberately leaves the FSEvents
+    //             anchor (`last_observed_at`) alone;
+    //   pass 2 -- incremental, and its checkpoint records
+    //             `last_observed_at` for the first time;
+    //   pass 3 -- the first pass whose replay window has a start, and so
+    //             the first pass that may reuse anything.
+    //
+    // Until the build adapters moved onto the `EventCoverage` gate
+    // (GUARDRAILS_SPEC.md section 18) the Cargo consumer reused from
+    // pass 2, keying off the replay's `changed_paths` list being empty.
+    // That list says "this replay reported nothing", not "nothing
+    // changed since your rows were written", and with no window start
+    // the two are not the same claim. The sibling test below pins the
+    // stricter behaviour; this one establishes a real window, which is
+    // what it always meant to test.
+    let observe = || {
+        swamp_core::report::report_full_mode_with_source(
+            &root,
+            None,
+            false,
+            Some(store.path()),
+            Some("1h"),
+            true,
+            false,
+            false,
+            false,
+            &Unchanged,
+        )
+        .unwrap()
+    };
+    observe();
+    let first = observe();
     let fingerprints = target.join("debug/.fingerprint/fixture-aaa");
     fs::set_permissions(&fingerprints, fs::Permissions::from_mode(0o000)).unwrap();
     // Deliberately supply trusted no-change coverage: this tests the consumer's
@@ -809,6 +846,10 @@ fn trusted_unchanged_container_reuses_units_without_reading_fingerprints() {
     );
     fs::set_permissions(&fingerprints, fs::Permissions::from_mode(0o755)).unwrap();
     let next = next.unwrap();
+    assert!(
+        !first.nested_artifacts.is_empty(),
+        "the baseline identified nothing, so replaying it would prove nothing"
+    );
     assert_eq!(first.nested_artifacts.len(), next.nested_artifacts.len());
     for (old, new) in first.nested_artifacts.iter().zip(&next.nested_artifacts) {
         assert_eq!(
@@ -816,4 +857,53 @@ fn trusted_unchanged_container_reuses_units_without_reading_fingerprints() {
             (&new.id, new.bytes, &new.role)
         );
     }
+}
+
+/// The other half of the gate: without a recorded window start there is
+/// no evidence, so the container is identified again -- and the
+/// unreadable fingerprint directory shows it really was re-read rather
+/// than replayed.
+///
+/// This is the case the pre-adapter consumer got wrong. A forced full
+/// walk stores no `last_observed_at`, so the next pass's replay window
+/// has no start; the old code still reused, because the replay's change
+/// list happened to be empty. An empty change list from a window that
+/// cannot say when it opened is not proof that nothing changed.
+#[test]
+fn without_a_recorded_window_start_the_container_is_identified_again() {
+    use swamp_core::fs_events::{FsEventsPlan, FsEventsRequest, FsEventsSource};
+    struct Unchanged;
+    impl FsEventsSource for Unchanged {
+        fn replay(&self, _: &FsEventsRequest) -> FsEventsPlan {
+            FsEventsPlan::from_live(vec![], 1000, None)
+        }
+    }
+    let (_tmp, root, target) = fixture();
+    let store = tempfile::tempdir().unwrap();
+    // `report()` passes `force_full: true`, which is what leaves the
+    // anchor unset.
+    let first = report(&root, store.path());
+    let fingerprints = target.join("debug/.fingerprint/fixture-aaa");
+    fs::set_permissions(&fingerprints, fs::Permissions::from_mode(0o000)).unwrap();
+    let next = swamp_core::report::report_full_mode_with_source(
+        &root,
+        None,
+        false,
+        Some(store.path()),
+        Some("1h"),
+        true,
+        false,
+        false,
+        false,
+        &Unchanged,
+    );
+    fs::set_permissions(&fingerprints, fs::Permissions::from_mode(0o755)).unwrap();
+    let next = next.unwrap();
+    assert!(
+        next.nested_artifacts.len() < first.nested_artifacts.len(),
+        "with no window start the container must be re-identified, and the unreadable \
+         fingerprint directory then costs it the test-executable row: first={} next={}",
+        first.nested_artifacts.len(),
+        next.nested_artifacts.len()
+    );
 }
