@@ -2111,6 +2111,14 @@ pub struct ObservationCheckpoint {
     state: Option<FsEventsState>,
     topology: Vec<StoredWorktree>,
     unowned: Vec<crate::report::UnownedRow>,
+    /// Linux collector: the dirty-list entries this observation's walk
+    /// covered, consumed only once everything above is written.
+    consume: Option<crate::continuity::Consumption>,
+    /// Held from before the previous state was read until the commit (or
+    /// drop): two observations of one root -- TUI, CLI, a scheduled run
+    /// -- cannot interleave, so neither overwrites the other's rows with
+    /// an older walk or consumes changes the other has not written.
+    _lock: Option<crate::continuity::FileLock>,
 }
 
 impl ObservationCheckpoint {
@@ -2122,9 +2130,27 @@ impl ObservationCheckpoint {
         if let Some(state) = self.state {
             write_fsevents_state(&self.dir, &state)?;
         }
+        // And only after that, forget the collector's entries this walk
+        // covered. A crash before this line leaves them, and the next
+        // observation re-walks them: redundant, never wrong.
+        if let Some(c) = &self.consume {
+            crate::continuity::consume(c)?;
+        }
         Ok(())
     }
+
+    /// Test hook: the crash between the history write and the
+    /// consumption -- everything is written except the consumption.
+    #[doc(hidden)]
+    pub fn commit_without_consuming_for_test(mut self) -> Result<()> {
+        self.consume = None;
+        self.commit()
+    }
 }
+
+/// How long an observation waits for another observation of the same
+/// root to finish before giving up.
+const OBSERVATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[allow(clippy::too_many_arguments)]
 pub fn stage_tracked_with_source(
@@ -2143,6 +2169,18 @@ pub fn stage_tracked_with_source(
     let volume_id = root_scoped_volume_id(&root);
     let dir = volume_dir(swamp_dir, volume_id);
     fs::create_dir_all(&dir)?;
+    // One writer per root, from reading the previous state to committing
+    // the next (see `ObservationCheckpoint::_lock`). A read-only pass
+    // (`observe == false`) writes nothing and takes nothing.
+    let lock = if observe {
+        Some(crate::continuity::lock_wait(
+            &dir.join("observation.lock"),
+            true,
+            OBSERVATION_LOCK_WAIT,
+        )?)
+    } else {
+        None
+    };
 
     // FSEvents and persisted topology use the canonical root namespace.
     let prev_state = read_fsevents_state(&dir);
@@ -2177,6 +2215,8 @@ pub fn stage_tracked_with_source(
             compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
         let checkpoint = observe.then(|| ObservationCheckpoint {
             dir,
+            consume: None,
+            _lock: lock,
             topology: to_stored_worktrees(&result.discovered),
             unowned: result.attribution.unowned.clone(),
             // The stored FSEvents id/device is deliberately left as-is: a
@@ -2216,6 +2256,8 @@ pub fn stage_tracked_with_source(
     let plan = source.replay(&FsEventsRequest {
         root: root.clone(),
         since: prev_state,
+        swamp_dir: Some(swamp_dir.to_path_buf()),
+        excluded: excluded.to_vec(),
     });
     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
         eprintln!(
@@ -2306,7 +2348,10 @@ pub fn stage_tracked_with_source(
         _ => None,
     };
 
+    let consume = plan.consume.clone();
     let checkpoint = observe.then(|| ObservationCheckpoint {
+        consume,
+        _lock: lock,
         // Re-anchor for the next call regardless of which path was taken.
         state: Some(FsEventsState {
             event_id: Some(plan.current_event_id),

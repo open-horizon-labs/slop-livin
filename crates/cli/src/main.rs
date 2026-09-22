@@ -1,3 +1,4 @@
+mod collect;
 mod schedule;
 
 use anyhow::Result;
@@ -268,6 +269,21 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Linux: watch the scope's roots with inotify until stopped and keep
+    /// a bounded change list, so a later `observe`/`report` can walk only
+    /// what changed (#82). Opt-in, user-owned, foreground; refuses on
+    /// macOS, where FSEvents already keeps the history.
+    Collect {
+        /// Defaults to every present root in the configured scope.
+        roots: Vec<PathBuf>,
+        /// Print each root's checkpoint and whether its collector is
+        /// running, then exit. Reads only.
+        #[arg(long)]
+        status: bool,
+        /// With --status: the CLI's JSON contract instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install, report on, or remove the opt-in per-user LaunchAgent that
     /// runs `observe` on a fixed interval (#31).
     Schedule {
@@ -278,6 +294,11 @@ enum Command {
         /// Remove the schedule.
         #[arg(long)]
         off: bool,
+        /// Linux: also install the optional `swamp collect` user service,
+        /// which keeps a live change list between scheduled runs so they
+        /// can walk only what changed. Refused on macOS (not needed).
+        #[arg(long)]
+        collector: bool,
         roots: Vec<PathBuf>,
     },
     /// Propose cleanup: the one entry point for artifact/Cargo-group/
@@ -2038,7 +2059,40 @@ fn main() -> Result<()> {
             note_and_persist_scope(&store_dir, &scope);
             schedule::cmd_observe(store_dir, resolved, full)?;
         }
-        Command::Schedule { every, off, roots } => {
+        Command::Collect {
+            roots,
+            status,
+            json,
+        } => {
+            let store_dir = swamp_dir()?;
+            let scope = resolve_scope(&roots)?;
+            let (authorized, _) = scope.authorized_roots();
+            let present: Vec<collect::Root> = authorized
+                .into_iter()
+                .filter(|r| r.nested_in.is_none() && r.path.is_dir())
+                .map(|r| collect::Root {
+                    excluded: r.pruned_subtrees.clone(),
+                    path: std::fs::canonicalize(&r.path).unwrap_or(r.path),
+                })
+                .collect();
+            if present.is_empty() {
+                anyhow::bail!(
+                    "no present root to collect for -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            if status {
+                let roots = present.into_iter().map(|r| r.path).collect();
+                collect::cmd_collect_status(store_dir, roots, json)?;
+            } else {
+                collect::cmd_collect(store_dir, present)?;
+            }
+        }
+        Command::Schedule {
+            every,
+            off,
+            collector,
+            roots,
+        } => {
             let store_dir = swamp_dir()?;
             // No explicit roots: install `observe` with none baked into
             // the plist's argv at all (#42/#50), so every scheduled fire
@@ -2061,7 +2115,7 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            schedule::cmd_schedule(store_dir, every, off, roots)?;
+            schedule::cmd_schedule(store_dir, every, off, collector, roots)?;
         }
     }
     Ok(())

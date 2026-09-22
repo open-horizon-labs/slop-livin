@@ -677,6 +677,23 @@ pub mod inotify {
         }
     }
 
+    impl Inotify {
+        /// A watch for swamp's own control files (a collector's sync
+        /// requests): created or renamed-in files only. Same instance as
+        /// the tree, so its events are ordered with the tree's.
+        pub fn add_control(&mut self, dir: &Path) -> std::io::Result<i32> {
+            let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let m = libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_ONLYDIR;
+            // SAFETY: valid fd and NUL-terminated path.
+            let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), m) };
+            if wd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(wd)
+        }
+    }
+
     impl Kernel for Inotify {
         fn add(&mut self, dir: &Path) -> std::io::Result<i32> {
             let c = std::ffi::CString::new(dir.as_os_str().as_bytes())

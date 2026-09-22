@@ -96,6 +96,21 @@ fn find_first(haystack: &str, needles: &[&str]) -> Option<(usize, String)> {
 /// concrete members of it.
 const STORE_BOOKKEEPING_FNS: &[(&str, &str, &str)] = &[
     (
+        "crates/core/src/continuity.rs",
+        "write_checkpoint",
+        "publishes a Linux collector's bounded checkpoint into the store by temp + rename",
+    ),
+    (
+        "crates/core/src/systemd_user.rs",
+        "write_unit",
+        "publishes a swamp-owned (marker-checked) systemd user unit by temp + rename",
+    ),
+    (
+        "crates/core/src/continuity.rs",
+        "sync",
+        "publishes an observation's sync-request token for the collector by temp + rename",
+    ),
+    (
         "crates/core/src/actions.rs",
         "save_plan",
         "publishes an unapproved plan file into the store by temp + rename",
@@ -1431,6 +1446,11 @@ fn string_literals_in(body: &str) -> Vec<String> {
 /// artifact; none names per-row data. The audit fails when an entry no
 /// longer resolves, so the list cannot rot.
 pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        "crates/core/src/continuity.rs",
+        "write_checkpoint",
+        "a Linux collector's checkpoint: epoch, coverage and a dirty list bounded by live_watch::DIRTY_BOUND",
+    ),
     (
         "crates/core/src/actions.rs",
         "save_plan",

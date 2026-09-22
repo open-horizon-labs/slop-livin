@@ -149,6 +149,7 @@ pub fn cmd_schedule(
     store_dir: PathBuf,
     every: Option<String>,
     off: bool,
+    collector: bool,
     roots: Vec<PathBuf>,
 ) -> Result<()> {
     // Each call is bound before it is printed rather than written inside
@@ -162,7 +163,7 @@ pub fn cmd_schedule(
         return Ok(());
     }
     if let Some(interval) = every {
-        let message = schedule::install(&interval, &roots)?;
+        let message = schedule::install(&interval, &roots, collector)?;
         print!("{message}");
         return Ok(());
     }

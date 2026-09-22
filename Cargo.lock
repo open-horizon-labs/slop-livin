@@ -2656,6 +2656,7 @@ version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde_json",
  "swamp-core",
  "swamp-tui",

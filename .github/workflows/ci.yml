@@ -64,6 +64,22 @@ jobs:
           for t in lsof docker gh du; do
             printf '%s: %s\n' "$t" "$(command -v "$t" || echo '(absent)')"
           done
+          # #86: which of this user's processes procfs will not show their
+          # open files to this user, and why (credentials, capabilities,
+          # cgroup) -- the evidence the occupancy scope is decided on.
+          me="$(id -u)"
+          for d in /proc/[0-9]*; do
+            pid="${d#/proc/}"
+            uid="$(awk '/^Uid:/{print $3}' "$d/status" 2>/dev/null || true)"
+            [ "$uid" = "$me" ] || continue
+            if ! readlink "$d/cwd" >/dev/null 2>&1; then
+              echo "opaque same-user process $pid ($(cat "$d/comm" 2>/dev/null)):"
+              grep -E '^(Uid|Gid|CapPrm|CapEff|CapAmb|NoNewPrivs|Seccomp):' "$d/status" 2>/dev/null | sed 's/^/    /'
+              sed 's/^/    cgroup: /' "$d/cgroup" 2>/dev/null || true
+            fi
+          done
+          echo "user manager: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}; $(systemctl --user show-environment >/dev/null 2>&1 && echo reachable || echo unreachable)"
+          echo "loginctl linger: $(loginctl show-user "$me" --property=Linger --value 2>/dev/null || echo unknown)"
 
       - name: Format
         run: cargo fmt --all --check

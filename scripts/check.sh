@@ -89,7 +89,7 @@ fi
 # data store (.oh/guardrails/json-persistence-is-allowlisted.md). Belt
 # and braces over the AST audit: a serializer call in a file that is not
 # an allow-listed writer, and is not printing, fails here.
-json_writer_files='actions.rs|grants.rs|ledger.rs|schedule.rs|scope.rs|agents/mod.rs|cargo_cleanup.rs|growth.rs|report.rs|assoc_store.rs|agent_json.rs|app.rs|main.rs|render.rs|docker.rs|github.rs|store.rs|recovery.rs|evidence.rs|entities.rs'
+json_writer_files='actions.rs|continuity.rs|collect.rs|grants.rs|ledger.rs|schedule.rs|scope.rs|agents/mod.rs|cargo_cleanup.rs|growth.rs|report.rs|assoc_store.rs|agent_json.rs|app.rs|main.rs|render.rs|docker.rs|github.rs|store.rs|recovery.rs|evidence.rs|entities.rs'
 json_violations=$(
   grep -rnE 'serde_json::to_(vec|string|writer)' crates/core/src crates/cli/src crates/tui/src |
     grep -vE "/($json_writer_files):" |

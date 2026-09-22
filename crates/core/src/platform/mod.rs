@@ -271,9 +271,16 @@ pub enum Scheduling {
     /// macOS: a per-user LaunchAgent plist driven by `launchctl`. Opt-in,
     /// no resident process.
     LaunchdUserAgent,
-    /// Linux: nothing is installed. Naming the reason and the issue is
-    /// the whole contract -- an unavailable scheduler must refuse, not
-    /// write a plist into a directory no daemon reads.
+    /// Linux (#83): a `systemd --user` timer + oneshot service, opt-in,
+    /// and an optional collector service. Whether a user manager is
+    /// actually reachable is a *runtime* question, answered by
+    /// `systemd_user::user_manager` before anything is written; this
+    /// variant only says which backend the build has.
+    SystemdUser,
+    /// No backend. Naming the reason and the issue is the whole contract
+    /// -- an unavailable scheduler must refuse, not write a job file into
+    /// a directory no daemon reads. No supported build constructs it
+    /// today; it stays so a new target starts from a refusal.
     Unavailable {
         reason: &'static str,
         planned: &'static str,
@@ -284,25 +291,20 @@ impl Scheduling {
     pub fn for_os(os: Os) -> Self {
         match os {
             Os::MacOs => Scheduling::LaunchdUserAgent,
-            Os::Linux => Scheduling::Unavailable {
-                reason: "no scheduling backend is implemented for Linux: launchd does not exist \
-                         here, and swamp does not assume systemd, a running user session bus, or \
-                         permission to install a unit",
-                planned: "#86 (systemd --user timer, opt-in, with an explicit refusal where the \
-                          user manager is unavailable)",
-            },
+            Os::Linux => Scheduling::SystemdUser,
         }
     }
 
     pub fn is_available(self) -> bool {
-        matches!(self, Scheduling::LaunchdUserAgent)
+        matches!(self, Scheduling::LaunchdUserAgent | Scheduling::SystemdUser)
     }
 
     /// The message a scheduling command prints when it cannot proceed.
-    /// `None` where scheduling works.
+    /// `None` where the build has a backend (which may still refuse at
+    /// runtime, with its own diagnostics).
     pub fn refusal(self) -> Option<String> {
         match self {
-            Scheduling::LaunchdUserAgent => None,
+            Scheduling::LaunchdUserAgent | Scheduling::SystemdUser => None,
             Scheduling::Unavailable { reason, planned } => Some(format!(
                 "scheduled observation is not available on this platform: {reason}. Planned in \
                  {planned}. Run `swamp observe` from your own timer until then; nothing has been \
@@ -414,36 +416,48 @@ pub const CAPABILITIES: &[Capability] = &[
         macos: Support::Supported,
         linux: Support::Unavailable,
         note: "macOS replays the fseventsd log from a stored event id. Linux has no persisted \
-               kernel change history; an observation there walks fully and says so.",
+               kernel change history; an observation there walks fully and says so, unless a \
+               running collector can vouch for the gap.",
     },
     Capability {
         id: "live-watch",
         macos: Support::Supported,
-        linux: Support::Planned,
-        note: "macOS opens an FSEvents stream for the TUI. A Linux inotify watcher is #81; \
-               until then the TUI refreshes on demand.",
+        linux: Support::Supported,
+        note: "macOS opens an FSEvents stream for the TUI. Linux registers unprivileged inotify \
+               watches per directory and names every loss (queue overflow, watch limit, \
+               permissions, unmount); a loss makes the next refresh a full walk.",
+    },
+    Capability {
+        id: "background-collection",
+        macos: Support::Unavailable,
+        linux: Support::Supported,
+        note: "Linux: opt-in swamp collect keeps a bounded change list that later observations \
+               reuse only while it runs, in the same boot, with coverage intact. macOS needs \
+               none: FSEvents keeps the history.",
     },
     Capability {
         id: "scheduled-observation",
         macos: Support::Supported,
-        linux: Support::Planned,
-        note: "macOS installs an opt-in per-user LaunchAgent. Linux refuses and names #86 \
-               (systemd --user); nothing is written.",
+        linux: Support::Supported,
+        note: "macOS installs an opt-in per-user LaunchAgent. Linux installs systemd --user \
+               units (timer, optional collector); where no user manager is reachable it \
+               refuses and writes nothing, and it never enables lingering.",
     },
     Capability {
         id: "trash",
         macos: Support::Supported,
-        linux: Support::Planned,
-        note: "macOS moves to ~/.Trash. Linux path resolution follows the freedesktop Trash \
-               spec ($XDG_DATA_HOME/Trash, or .Trash-$uid on another mount); the .trashinfo \
-               records and cross-device move are #85.",
+        linux: Support::Supported,
+        note: "macOS renames into ~/.Trash. Linux follows the freedesktop Trash spec (home \
+               trash, or the mount's own .Trash-$uid) with a .trashinfo record; a rename or a \
+               refusal, never a copy or a permanent fallback.",
     },
     Capability {
         id: "occupancy",
         macos: Support::Supported,
         linux: Support::Supported,
-        note: "Bounded lsof probe on both. A missing or timed-out lsof is Unknown, which every \
-               destructive sink refuses on -- it is never read as 'nothing is open'.",
+        note: "macOS runs a bounded lsof; Linux reads procfs (fds, cwd, exe, maps) of this \
+               user's processes. Anything that cannot be read is Unknown, which every \
+               destructive sink refuses on -- never 'nothing is open'.",
     },
     Capability {
         id: "atime-reliability",
@@ -512,18 +526,18 @@ mod tests {
     }
 
     #[test]
-    fn linux_scheduling_refuses_with_a_reason_and_an_issue() {
-        let s = Scheduling::for_os(Os::Linux);
-        assert!(!s.is_available());
-        let refusal = s
+    fn each_platform_has_its_own_scheduler_and_neither_the_others() {
+        assert_eq!(Scheduling::for_os(Os::Linux), Scheduling::SystemdUser);
+        assert_eq!(Scheduling::for_os(Os::MacOs), Scheduling::LaunchdUserAgent);
+        assert!(Scheduling::for_os(Os::Linux).refusal().is_none());
+        let none = Scheduling::Unavailable {
+            reason: "no backend",
+            planned: "#0",
+        };
+        let refusal = none
             .refusal()
-            .expect("an unavailable scheduler must explain itself");
-        assert!(refusal.contains("#86"), "{refusal}");
-        assert!(
-            refusal.contains("nothing has been installed"),
-            "the refusal must say no state was left behind: {refusal}"
-        );
-        assert!(Scheduling::for_os(Os::MacOs).refusal().is_none());
+            .expect("an unavailable scheduler explains itself");
+        assert!(refusal.contains("nothing has been installed"), "{refusal}");
     }
 
     #[test]

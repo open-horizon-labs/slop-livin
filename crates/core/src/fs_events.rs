@@ -236,6 +236,12 @@ pub struct FsEventsRequest {
     /// it asked about.
     pub root: PathBuf,
     pub since: FsEventsState,
+    /// The store this observation writes to. A live-watch source finds a
+    /// collector's checkpoint there; FSEvents ignores it.
+    pub swamp_dir: Option<PathBuf>,
+    /// What this observation excludes under `root`. A live-watch source
+    /// refuses when its own watch excludes something this walks.
+    pub excluded: Vec<PathBuf>,
 }
 
 /// The verdict: either a complete, incremental account of what changed,
@@ -264,6 +270,10 @@ pub struct FsEventsPlan {
     /// persisted log, so the replay-lag floor (`TooSoon`) does not apply:
     /// a live event is the change, not a query that might predate it.
     pub live: bool,
+    /// Linux collector: which dirty-list entries this plan's walk covers.
+    /// Applied only after the observation's history is written
+    /// (`growth::ObservationCheckpoint::commit`). `None` everywhere else.
+    pub consume: Option<crate::continuity::Consumption>,
 }
 
 impl FsEventsPlan {
@@ -280,6 +290,7 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: true,
+            consume: None,
         }
     }
 
@@ -298,6 +309,7 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: false,
+            consume: None,
         }
     }
 
@@ -316,6 +328,7 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: false,
+            consume: None,
         }
     }
 
@@ -465,9 +478,12 @@ pub fn platform_source() -> Box<dyn FsEventsSource> {
     {
         Box::new(macos::MacOsFsEventsSource)
     }
+    // Linux: a running collector's checkpoint when there is one and it
+    // can vouch for the gap; the platform's own refusal otherwise
+    // (`crate::continuity`).
     #[cfg(not(target_os = "macos"))]
     {
-        Box::new(UnsupportedPlatformSource)
+        Box::new(crate::continuity::CollectorSource)
     }
 }
 
@@ -1106,6 +1122,8 @@ mod tests {
                 last_observed_at: Some(1),
                 rules_version: 0,
             },
+            swamp_dir: None,
+            excluded: Vec::new(),
         });
         assert!(!plan.incremental);
         assert!(

@@ -23,11 +23,12 @@ This table is generated from `crates/core/src/platform/CAPABILITIES`, and `crate
 |---|---|---|---|
 | `walk-and-accounting` | supported | supported | Allocated bytes from st_blocks*512, hardlink dedup by (dev, ino), same-filesystem boundary by st_dev, symlinks never followed. Shared POSIX code. |
 | `free-space` | supported | supported | A syscall through libc, replacing df output parsing whose columns differ between the two: statfs(2) on macOS, whose statvfs has 32-bit block counts, and statvfs(3) on Linux. |
-| `history-replay` | supported | unavailable | macOS replays the fseventsd log from a stored event id. Linux has no persisted kernel change history; an observation there walks fully and says so. |
-| `live-watch` | supported | planned | macOS opens an FSEvents stream for the TUI. A Linux inotify watcher is #81; until then the TUI refreshes on demand. |
-| `scheduled-observation` | supported | planned | macOS installs an opt-in per-user LaunchAgent. Linux refuses and names #86 (systemd --user); nothing is written. |
-| `trash` | supported | planned | macOS moves to ~/.Trash. Linux path resolution follows the freedesktop Trash spec ($XDG_DATA_HOME/Trash, or .Trash-$uid on another mount); the .trashinfo records and cross-device move are #85. |
-| `occupancy` | supported | supported | Bounded lsof probe on both. A missing or timed-out lsof is Unknown, which every destructive sink refuses on -- it is never read as 'nothing is open'. |
+| `history-replay` | supported | unavailable | macOS replays the fseventsd log from a stored event id. Linux has no persisted kernel change history; an observation there walks fully and says so, unless a running collector can vouch for the gap. |
+| `live-watch` | supported | supported | macOS opens an FSEvents stream for the TUI. Linux registers unprivileged inotify watches per directory and names every loss (queue overflow, watch limit, permissions, unmount); a loss makes the next refresh a full walk. |
+| `background-collection` | unavailable | supported | Linux: opt-in swamp collect keeps a bounded change list that later observations reuse only while it runs, in the same boot, with coverage intact. macOS needs none: FSEvents keeps the history. |
+| `scheduled-observation` | supported | supported | macOS installs an opt-in per-user LaunchAgent. Linux installs systemd --user units (timer, optional collector); where no user manager is reachable it refuses and writes nothing, and it never enables lingering. |
+| `trash` | supported | supported | macOS renames into ~/.Trash. Linux follows the freedesktop Trash spec (home trash, or the mount's own .Trash-$uid) with a .trashinfo record; a rename or a refusal, never a copy or a permanent fallback. |
+| `occupancy` | supported | supported | macOS runs a bounded lsof; Linux reads procfs (fds, cwd, exe, maps) of this user's processes. Anything that cannot be read is Unknown, which every destructive sink refuses on -- never 'nothing is open'. |
 | `atime-reliability` | supported | supported | macOS reads statfs mount flags; Linux reads /proc/mounts. Either failing is Undetermined, not 'atime is fine'. |
 | `release-artifact` | supported | planned | macOS arm64 tarballs ship today. Linux x86_64 packaging is #88; CI builds and tests Linux but publishes nothing. |
 
