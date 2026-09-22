@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -531,8 +531,7 @@ pub fn remove(target: &Removal, timeout: Duration) -> Result<(), String> {
         Removal::Volume { name } => vec!["volume", "rm", name.as_str()],
         Removal::Refused(why) => return Err((*why).to_string()),
     };
-    crate::work_counters::record_spawn();
-    let out = Command::new("docker")
+    let out = crate::spawn::command("docker")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -561,8 +560,7 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
         Removal::Volume { name } => ("volume", name.as_str()),
         Removal::Refused(why) => return Err((*why).to_string()),
     };
-    crate::work_counters::record_spawn();
-    let out = Command::new("docker")
+    let out = crate::spawn::command("docker")
         .args([kind, "inspect", id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -577,8 +575,7 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
 }
 
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
-    crate::work_counters::record_spawn();
-    let mut child = Command::new("docker")
+    let mut child = crate::spawn::command("docker")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

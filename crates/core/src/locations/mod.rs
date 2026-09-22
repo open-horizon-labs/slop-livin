@@ -65,7 +65,6 @@ pub mod xcode;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -295,8 +294,7 @@ impl CommandRunner for SystemCommandRunner {
                 "refusing to run non-allow-listed command: {program} {args:?}"
             ));
         }
-        crate::work_counters::record_spawn();
-        let mut child = Command::new(program)
+        let mut child = crate::spawn::command(program)
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -204,8 +204,7 @@ pub trait GithubResponder: Sync {
 pub struct GhCliResponder;
 
 fn bounded_gh(args: &[String]) -> Result<String, String> {
-    crate::work_counters::record_spawn();
-    let mut child = Command::new("gh")
+    let mut child = crate::spawn::command("gh")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

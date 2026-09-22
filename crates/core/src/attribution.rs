@@ -549,8 +549,7 @@ pub fn apply_to_worktree(row: &mut WorktreeRow, result: &mut AttributionResult) 
 /// Runs `du -skPx <root>` and returns bytes (KiB * 1024), or `None` if
 /// the command is unavailable or fails.
 pub fn du_total(root: &Path) -> Option<u64> {
-    crate::work_counters::record_spawn();
-    let out = std::process::Command::new("du")
+    let out = crate::spawn::command("du")
         .arg("-skPx")
         .arg(root)
         .output()

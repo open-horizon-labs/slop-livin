@@ -451,7 +451,7 @@ fn remove_worktree(
         })),
     )?;
     if let Some(c) = common {
-        let _ = std::process::Command::new("git")
+        let _ = swamp_core::spawn::command("git")
             .arg("-C")
             .arg(c.parent().unwrap_or(&c))
             .args(["worktree", "prune"])
@@ -546,7 +546,7 @@ pub fn trash_root() -> PathBuf {
 /// Returns `None` if `df` cannot be read (kept read-only/advisory: a
 /// missing measurement never blocks or fakes the reported result).
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
+    let out = swamp_core::spawn::command("df")
         .arg("-k")
         .arg(path)
         .output()

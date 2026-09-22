@@ -51,6 +51,7 @@ pub mod toolchain_declarations;
 pub mod tree;
 pub mod volume;
 pub mod walk;
+pub mod spawn;
 pub mod work_counters;
 
 pub use entities::*;

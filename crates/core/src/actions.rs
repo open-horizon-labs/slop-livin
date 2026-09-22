@@ -1947,8 +1947,7 @@ pub fn trash_root() -> PathBuf {
 }
 
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    crate::work_counters::record_spawn();
-    let out = std::process::Command::new("df")
+    let out = crate::spawn::command("df")
         .arg("-k")
         .arg(path)
         .output()
@@ -2490,8 +2489,7 @@ pub fn execute_with_trash_opts(
                 trashed += unit.bytes;
                 spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
                 if let Some(c) = &linked_common {
-                    crate::work_counters::record_spawn();
-                    let _ = std::process::Command::new("git")
+                    let _ = crate::spawn::command("git")
                         .arg("-C")
                         .arg(c.parent().unwrap_or(c))
                         .args(["worktree", "prune"])

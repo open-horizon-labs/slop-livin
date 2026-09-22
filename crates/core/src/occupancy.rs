@@ -15,7 +15,6 @@
 use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue, Freshness};
 use std::{
     path::Path,
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -91,8 +90,7 @@ pub fn probe_path(path: &Path) -> OccupancyState {
         Err(e) => return OccupancyState::Unknown(format!("cannot stat {}: {e}", path.display())),
     };
 
-    crate::work_counters::record_spawn();
-    let mut cmd = Command::new("lsof");
+    let mut cmd = crate::spawn::command("lsof");
     if is_dir {
         cmd.arg("+D").arg(path);
     } else {
