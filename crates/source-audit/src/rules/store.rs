@@ -78,10 +78,17 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
     }
     // Names bound from a serializer: `let x = serde_json::to_*(..)`, and
     // `if let Ok(x) = serde_json::to_*(..)`.
+    // However the serializer was spelled (`use serde_json::to_vec_pretty
+    // as dump`), its call text is what a binding was made from.
+    let spellings: Vec<String> = ser
+        .iter()
+        .map(|c| format!("{} (", crate::program::spaced(&c.written)))
+        .chain(["serde_json :: to_".to_string(), "json !".to_string()])
+        .collect();
     let mut seeds: Vec<String> = f
         .bindings
         .iter()
-        .filter(|b| b.from.contains("serde_json :: to_") || b.from.contains("json !"))
+        .filter(|b| spellings.iter().any(|s| b.from.contains(s.as_str())))
         .map(|b| b.name.clone())
         .collect();
     let body = &f.body;
@@ -90,7 +97,7 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
         let tail = &rest[at + "if let Ok (".len()..];
         let name: String = tail.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
         let init = tail.split('{').next().unwrap_or("");
-        if !name.is_empty() && (init.contains("serde_json :: to_") || init.contains("json !")) {
+        if !name.is_empty() && spellings.iter().any(|s| init.contains(s.as_str())) {
             seeds.push(name);
         }
         rest = tail;
@@ -103,8 +110,7 @@ fn json_reaches_write(p: &Program, i: usize) -> bool {
             continue;
         }
         let args = c.args.join(" , ");
-        if args.contains("serde_json :: to_")
-            || args.contains("json !")
+        if spellings.iter().any(|s| args.contains(s.as_str()))
             || args.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|t| tainted.contains(t))
         {
             return true;

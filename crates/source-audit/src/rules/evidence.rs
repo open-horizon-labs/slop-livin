@@ -3,7 +3,7 @@
 //! promised is left undelivered; no public evidence API is dead.
 
 use super::{empty_text, load, verdict};
-use crate::program::{Program, TypeKind, contains_token};
+use crate::program::{TypeKind, contains_token};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -154,7 +154,7 @@ pub fn activity_and_consumer_evidence_have_limits(root: &Path) -> Result<(), Str
     // 3. Every activity fact names its source, or delegates to a builder
     //    that does.
     let returns_evidence = |f: &crate::program::Fun| contains_token(&f.ret, "Evidence");
-    let builders: HashSet<usize> = p.funs.iter().enumerate().filter(|(_, f)| f.module == "activity" && returns_evidence(f)).map(|(i, _)| i).collect();
+    let builders: HashSet<usize> = p.funs.iter().enumerate().filter(|(_, f)| (f.module == "activity" || f.module.starts_with("activity::")) && returns_evidence(f)).map(|(i, _)| i).collect();
     for i in &builders {
         let f = &p.funs[*i];
         let names_source = f.body.contains("EvidenceSource ::");
@@ -217,7 +217,7 @@ pub fn computed_but_not_delivered(root: &Path) -> Result<(), String> {
         .filter(|t| p.types.iter().any(|e| e.name == "Evidence" && e.rel == t.rel))
         .map(|t| t.name.clone())
         .collect();
-    let delivery_modules: HashSet<String> = p.types.iter().filter(|t| graph.contains(&t.name)).map(|t| t.rel.clone()).collect();
+    let delivery_modules: HashSet<String> = p.family(&p.types.iter().filter(|t| graph.contains(&t.name)).map(|t| t.rel.clone()).collect());
     if delivery_modules.is_empty() {
         problems.push("the pipeline's report types are not found: nothing to audit as delivered".into());
     }
@@ -307,12 +307,13 @@ pub fn no_dead_public_evidence_api(root: &Path) -> Result<(), String> {
     let speaks = |f: &crate::program::Fun| vocab.iter().any(|v| contains_token(&f.ret, v));
     // ... or that build facts: a module whose code constructs `Evidence`.
     let builds = |f: &crate::program::Fun| f.calls.iter().any(|c| !c.method && ["known", "unknown", "unavailable", "conflicting"].iter().any(|k| c.is(&format!("Evidence::{k}"))));
-    let modules: HashSet<String> = p
-        .funs
-        .iter()
-        .filter(|f| f.krate == "swamp_core" && ((f.is_pub && speaks(f)) || builds(f)))
-        .map(|f| f.rel.clone())
-        .collect();
+    let modules: HashSet<String> = p.family(
+        &p.funs
+            .iter()
+            .filter(|f| f.krate == "swamp_core" && ((f.is_pub && speaks(f)) || builds(f)))
+            .map(|f| f.rel.clone())
+            .collect(),
+    );
     // Entries: every binary's `main`, every trait method (dispatched by
     // the bus, serde or the runtime), and the TUI's public run functions.
     let entries: Vec<usize> = p

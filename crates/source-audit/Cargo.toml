@@ -12,7 +12,7 @@ name = "swamp-source-audit"
 path = "src/main.rs"
 
 [dependencies]
-syn.workspace = true
+syn = { workspace = true, features = ["visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
 

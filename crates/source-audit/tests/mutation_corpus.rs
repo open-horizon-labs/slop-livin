@@ -28,7 +28,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use swamp_source_audit::audits::AUDITS;
+use swamp_source_audit::audits::{AUDITS, Audit, TEST_ONLY_RULES};
+
+/// Every rule the corpus exercises: the registered audits, and the rules
+/// that run as tests (see `audits::TEST_ONLY_RULES`).
+fn rules() -> impl Iterator<Item = &'static (&'static str, Audit)> {
+    AUDITS.iter().chain(TEST_ONLY_RULES.iter())
+}
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,46 +68,110 @@ fn copy_tree(from: &Path, to: &Path) {
 struct Fixture {
     audit: String,
     name: String,
-    target: String,
-    mode: String,
     expect: String,
     why: String,
-    body: String,
+    /// `(target, mode, body)`: one entry per file the mutation touches.
+    /// The first comes from the header; each `//! file: <path>` line in
+    /// the body starts another (with an optional `//! mode:` after it),
+    /// which is how a mutation that needs two files -- a verdict constant
+    /// in one and the renderer that prints it in another -- is one
+    /// fixture.
+    files: Vec<(String, String, String)>,
+}
+
+impl Fixture {
+    fn target(&self) -> &str {
+        &self.files[0].0
+    }
 }
 
 fn parse_fixture(audit: &str, path: &Path) -> Fixture {
     let text = std::fs::read_to_string(path).unwrap();
     let mut header: BTreeMap<String, String> = BTreeMap::new();
+    let mut files: Vec<(String, String, String)> = Vec::new();
     let mut body = String::new();
+    let mut in_header = true;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("//! ")
             && let Some((k, v)) = rest.split_once(':')
-            && ["target", "mode", "expect", "why"].contains(&k.trim())
-            && body.is_empty()
         {
-            header.insert(k.trim().to_string(), v.trim().to_string());
-            continue;
+            let (k, v) = (k.trim(), v.trim());
+            if in_header && ["target", "mode", "expect", "why"].contains(&k) {
+                header.insert(k.to_string(), v.to_string());
+                continue;
+            }
+            if k == "file" {
+                if files.is_empty() {
+                    files.push((
+                        header.get("target").cloned().unwrap_or_default(),
+                        header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+                        std::mem::take(&mut body),
+                    ));
+                } else {
+                    files.last_mut().unwrap().2 = std::mem::take(&mut body);
+                }
+                files.push((v.to_string(), "append".into(), String::new()));
+                in_header = false;
+                continue;
+            }
+            if k == "mode" && !in_header && body.is_empty() {
+                files.last_mut().unwrap().1 = v.to_string();
+                continue;
+            }
         }
+        in_header = false;
         body.push_str(line);
         body.push('\n');
+    }
+    if files.is_empty() {
+        files.push((
+            header
+                .get("target")
+                .unwrap_or_else(|| panic!("{} has no `//! target:` header", path.display()))
+                .clone(),
+            header.get("mode").cloned().unwrap_or_else(|| "append".into()),
+            body,
+        ));
+    } else {
+        files.last_mut().unwrap().2 = body;
     }
     Fixture {
         audit: audit.to_string(),
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        target: header
-            .get("target")
-            .unwrap_or_else(|| panic!("{} has no `//! target:` header", path.display()))
-            .clone(),
-        mode: header
-            .get("mode")
-            .cloned()
-            .unwrap_or_else(|| "append".to_string()),
         expect: header
             .get("expect")
             .cloned()
             .unwrap_or_else(|| "reject".to_string()),
         why: header.get("why").cloned().unwrap_or_default(),
-        body,
+        files,
+    }
+}
+
+/// Writes every file of `f` into `work`; returns what to restore.
+fn apply(work: &Path, f: &Fixture) -> Vec<(PathBuf, Option<String>)> {
+    let mut originals = Vec::new();
+    for (target, mode, body) in &f.files {
+        let path = work.join(target);
+        let original = std::fs::read_to_string(&path).ok();
+        let mutated = match mode.as_str() {
+            "replace" | "create" => body.clone(),
+            _ => format!("{}\n{body}", original.clone().unwrap_or_default()),
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &mutated).unwrap();
+        originals.push((path, original));
+    }
+    originals
+}
+
+fn restore(originals: Vec<(PathBuf, Option<String>)>) {
+    for (path, original) in originals.into_iter().rev() {
+        match original {
+            Some(text) => std::fs::write(&path, text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 }
 
@@ -151,28 +221,15 @@ fn fresh_copy(tmp: &Path) -> PathBuf {
 /// and it is also why a worker owns its copy outright: two fixtures
 /// whose targets overlap would otherwise see each other's mutation.
 fn check_fixture(work: &Path, f: &Fixture) -> Option<String> {
-    let Some((_, audit)) = AUDITS.iter().find(|(n, _)| *n == f.audit) else {
+    let Some((_, audit)) = rules().find(|(n, _)| *n == f.audit) else {
         return Some(format!(
             "{}/{}: no audit named `{}` is registered",
             f.audit, f.name, f.audit
         ));
     };
-    let target = work.join(&f.target);
-    let original = std::fs::read_to_string(&target).unwrap_or_default();
-    let mutated = match f.mode.as_str() {
-        "replace" => f.body.clone(),
-        _ => format!("{original}\n{}", f.body),
-    };
-    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-    std::fs::write(&target, &mutated).unwrap();
-
+    let originals = apply(work, f);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(work)));
-
-    if original.is_empty() {
-        let _ = std::fs::remove_file(&target);
-    } else {
-        std::fs::write(&target, &original).unwrap();
-    }
+    restore(originals);
 
     match outcome {
         Err(_) => Some(format!(
@@ -181,7 +238,10 @@ fn check_fixture(work: &Path, f: &Fixture) -> Option<String> {
         )),
         Ok(Ok(())) if f.expect == "reject" => Some(format!(
             "{}/{}: ACCEPTED a mutation it must reject -- {}\n    (applied to {})",
-            f.audit, f.name, f.why, f.target
+            f.audit,
+            f.name,
+            f.why,
+            f.target()
         )),
         Ok(Err(e)) if f.expect == "accept" => Some(format!(
             "{}/{}: REJECTED a legitimate shape -- {}\n    audit said: {e}",
@@ -295,32 +355,25 @@ fn the_parse_cache_never_changes_an_audit_verdict() {
 /// One fixture's cold/warm comparison, on a workspace copy of its own.
 fn check_cache_is_invisible(dir: &Path, f: &Fixture) {
     {
-        let Some((_, audit)) = AUDITS.iter().find(|(n, _)| *n == f.audit) else {
+        let Some((_, audit)) = rules().find(|(n, _)| *n == f.audit) else {
             return;
         };
         std::fs::create_dir_all(dir).unwrap();
         let work = fresh_copy(dir);
-        let target = work.join(&f.target);
-        let original = std::fs::read_to_string(&target).unwrap_or_default();
-        let mutated = match f.mode.as_str() {
-            "replace" => f.body.clone(),
-            _ => format!("{original}\n{}", f.body),
-        };
-
         swamp_source_audit::ast::clear_parse_cache();
-        std::fs::write(&target, &mutated).unwrap();
+        let originals = apply(&work, f);
         let cold = audit(&work).is_ok();
 
-        // Warm the cache with the *unmutated* file, then re-run the
-        // mutated one: if the cache were keyed on anything weaker than
+        // Warm the cache with the *unmutated* files, then re-run the
+        // mutated ones: if the cache were keyed on anything weaker than
         // the contents -- a path, a length, a stamp -- this is where it
         // would answer for the wrong text.
-        std::fs::write(&target, &original).unwrap();
+        restore(originals);
         let _ = audit(&work);
-        std::fs::write(&target, &mutated).unwrap();
+        let originals = apply(&work, f);
         let warm = audit(&work).is_ok();
 
-        std::fs::write(&target, &original).unwrap();
+        restore(originals);
         let restored = audit(&work).is_ok();
 
         assert_eq!(
@@ -354,8 +407,7 @@ fn the_unmutated_workspace_copy_reproduces_the_real_audit_result() {
     // so no worker needs a copy of its own.
     let real = repo_root();
     let problems: Vec<String> = std::thread::scope(|scope| {
-        let handles: Vec<_> = AUDITS
-            .iter()
+        let handles: Vec<_> = rules()
             .map(|(name, audit)| {
                 let work = work.clone();
                 let real = real.clone();
@@ -405,13 +457,13 @@ fn every_audit_has_rejection_fixtures_or_is_on_the_shrinking_list() {
 
     let mut problems: Vec<String> = Vec::new();
     for name in &listed {
-        if !AUDITS.iter().any(|(n, _)| n == name) {
+        if !rules().any(|(n, _)| n == name) {
             problems.push(format!(
                 "{name} is on the to-port list but is not a registered audit"
             ));
         }
     }
-    for (name, _) in AUDITS {
+    for (name, _) in rules() {
         let n = fixtures
             .iter()
             .filter(|f| f.audit == *name && f.expect == "reject")
@@ -433,4 +485,16 @@ fn every_audit_has_rejection_fixtures_or_is_on_the_shrinking_list() {
     }
     problems.sort();
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The rules that run as tests rather than registered audits hold on the
+/// real tree (a registered audit is checked by `swamp-source-audit`
+/// itself).
+#[test]
+fn test_only_rules_hold_on_the_real_tree() {
+    for (name, rule) in TEST_ONLY_RULES {
+        if let Err(e) = rule(&repo_root()) {
+            panic!("{name}: {e}");
+        }
+    }
 }

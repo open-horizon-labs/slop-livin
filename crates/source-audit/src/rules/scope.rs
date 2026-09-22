@@ -29,7 +29,7 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
     let entries = anchors(&p, DISCOVERY, &mut problems);
-    let interp = interpreters(&p);
+    let interp = p.family(&interpreters(&p));
     for t in RAW_DETECTOR_OUTPUT {
         if !p.types.iter().any(|d| d.name == *t) {
             problems.push(format!("the raw detector-output type `{t}` is gone"));
@@ -65,6 +65,7 @@ pub fn discovery_consumes_effective_scope(root: &Path) -> Result<(), String> {
         .chain(p.adapter_files())
         .filter(|r| !interp.contains(r))
         .collect();
+    let region_files: HashSet<String> = p.family(&region_files).into_iter().filter(|r| !interp.contains(r)).collect();
     for f in p.funs.iter() {
         if !region_files.contains(&f.rel) {
             continue;
@@ -271,6 +272,7 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
     if report_files.is_empty() {
         problems.push("nothing runs the bus: there is no report module to audit calls into".into());
     }
+    let report_files = p.family(&report_files);
     // A scopeless report entry: a public function of the report module
     // that takes a bare path and no scope.
     // A scopeless entry: a public function of the report module that
@@ -296,7 +298,7 @@ pub fn tui_refresh_preserves_scope(root: &Path) -> Result<(), String> {
         if f.krate != "swamp_tui" {
             continue;
         }
-        for (ci, c) in f.calls.iter().enumerate() {
+        for (ci, _c) in f.calls.iter().enumerate() {
             let t = p.target(i, ci);
             if t.possible && !t.abs.contains("::report::") {
                 continue;

@@ -419,7 +419,7 @@ pub fn scheduled_refresh_launchagent(root: &Path) -> Result<(), String> {
     let mains: Vec<usize> = p.funs.iter().enumerate().filter(|(_, f)| f.krate == "swamp" && f.name == "main").map(|(i, _)| i).collect();
     let live = p.reachable(&mains, &HashSet::new());
     // The scheduler is the module that writes the LaunchAgent plist.
-    let sched_files: HashSet<String> = p.funs.iter().filter(|f| f.literals.iter().any(|l| l.contains("LaunchAgents"))).map(|f| f.rel.clone()).collect();
+    let sched_files: HashSet<String> = p.family(&p.funs.iter().filter(|f| f.literals.iter().any(|l| l.contains("LaunchAgents"))).map(|f| f.rel.clone()).collect());
     if sched_files.is_empty() {
         problems.push("nothing writes a LaunchAgent plist".into());
     }
@@ -493,6 +493,17 @@ pub fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
             records += 1;
             if !s.enclosing_if_let_inits.iter().any(|i| i.contains("classify_at")) {
                 problems.push(format!("{}::{}: record_artifact outside a classify_at guard", file.rel, s.func));
+            }
+        }
+    }
+    // A fold or a record written inside a macro's arguments has no guard
+    // this layer can see: not a pass.
+    for f in p.funs.iter() {
+        let exempt = entries.iter().any(|e| p.funs[*e].rel == f.rel && p.funs[*e].name == f.name);
+        for m in &f.macros {
+            let t = m.tokens.replace(' ', "");
+            if !exempt && (t.contains("AttrJob::Size") || (t.contains("record_artifact(") && f.name != "record_artifact")) {
+                problems.push(format!("{} folds or records an artifact inside `{}!`, where no classify_at guard can be seen", f.display(), m.name));
             }
         }
     }
@@ -648,16 +659,12 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
     // (only while it consults the persisted rows first), the
     // declared-project handoff (see `rules::adapters`), and a listing that
     // only peeks (one entry, to tell "empty" from "unreadable").
-    let mut stop: HashSet<usize> = HashSet::new();
-    for (path, cap) in [("locations::shallow_list", "SHALLOW_LIST_CAP"), ("folded_measurement::folded_bytes_bounded_stamped", "max_entries")] {
-        for i in anchors(&p, &[path], &mut problems) {
-            if super::is_bounded_by(&p.funs[i], cap) {
-                stop.insert(i);
-            } else {
-                problems.push(format!("{} lost its bound `{cap}`", p.funs[i].display()));
-            }
-        }
-    }
+    let mut stop: HashSet<usize> = super::bounded_primitives(
+        &p,
+        &[("locations::shallow_list", "SHALLOW_LIST_CAP"), ("folded_measurement::folded_bytes_bounded_stamped", "max_entries")],
+        false,
+        &mut problems,
+    );
     let walks_raw = p.traversal(&HashSet::new());
     for m in anchors(&p, &["folded_measurement::measure"], &mut problems) {
         let f = &p.funs[m];
@@ -765,6 +772,7 @@ pub fn no_second_traversal_on_report_path(root: &Path) -> Result<(), String> {
         .map(|i| p.funs[*i].rel.clone())
         .chain(p.adapter_files())
         .collect();
+    let path_files = p.family(&path_files);
     // A wrapper in the walk's own modules that reaches the walk only by
     // entering it is the walk, not a second traversal.
     let walker_files: HashSet<String> = walker.iter().map(|i| p.funs[*i].rel.clone()).collect();

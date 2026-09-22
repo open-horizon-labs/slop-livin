@@ -427,12 +427,12 @@ pub fn protection_fails_closed(root: &Path) -> Result<(), String> {
     //    `execute*`/`propose*` entry point), no second containment
     //    predicate: a verdict-returning function that tests path
     //    containment must be, or delegate to, the one predicate.
-    let decision_files: HashSet<String> = p
+    let decision_files: HashSet<String> = p.family(&p
         .funs
         .iter()
         .filter(|f| f.is_pub && f.self_ty.is_none() && (f.name.starts_with("execute") || f.name.starts_with("propose")))
         .map(|f| f.rel.clone())
-        .collect();
+        .collect());
     for (i, f) in p.funs.iter().enumerate() {
         if !decision_files.contains(&f.rel) || predicate.contains(&i) || !f.returns_verdict() {
             continue;

@@ -35,7 +35,7 @@ fn bus(p: &Program) -> Result<Bus, String> {
     if consumers.is_empty() {
         return Err("nothing implements `bus::Consumer`: the pipeline is not on the bus".into());
     }
-    let consumer_files: HashSet<String> = consumers.iter().map(|(_, r)| r.clone()).collect();
+    let consumer_files: HashSet<String> = p.family(&consumers.iter().map(|(_, r)| r.clone()).collect());
     let register: HashSet<usize> = p
         .funs
         .iter()
@@ -255,6 +255,12 @@ pub fn extractors_are_pluggable(root: &Path) -> Result<(), String> {
             .chain(p.ref_targets(i).iter().copied())
             .collect();
         let consumer_mods: Vec<String> = b.consumer_files.iter().map(|r| Program::file_module(r)).collect();
+        for (ci, c) in f.calls.iter().enumerate() {
+            let abs = &p.target(i, ci).abs;
+            if let Some(m) = consumer_mods.iter().find(|m| abs.starts_with(&format!("{m}::"))) {
+                problems.push(format!("{} calls `{}` ({abs}) in consumer module {m}", f.display(), c.written));
+            }
+        }
         for path in super::named_paths(&f.body) {
             let (abs, _) = crate::program::absolute(&path, &f.krate, &f.module, None);
             if let Some(m) = consumer_mods.iter().find(|m| abs.starts_with(&format!("{m}::"))) {
@@ -315,6 +321,7 @@ pub fn all_report_paths_through_bus(root: &Path) -> Result<(), String> {
     if report_files.is_empty() {
         problems.push("nothing runs the bus (`bus::run_report`)".into());
     }
+    let report_files = p.family(&report_files);
     // Stages: what the consumers call, outside the bus and the consumers,
     // that does observation work -- walks, reads a store, writes history
     // or runs a process. `entities::now()` is a consumer's helper, not a

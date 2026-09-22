@@ -73,6 +73,52 @@ pub(crate) fn anchors(p: &Program, paths: &[&str], problems: &mut Vec<String>) -
     out
 }
 
+/// The bounded primitives of one kind, checked: each exists, names its
+/// cap and stops on it, and does nothing beyond its one bounded operation
+/// (a reader that also lists, or a lister that also reads files or
+/// enters another walk, has left what earned the exemption).
+pub(crate) fn bounded_primitives(
+    p: &Program,
+    table: &[(&str, &str)],
+    reader: bool,
+    problems: &mut Vec<String>,
+) -> HashSet<usize> {
+    let set = anchors(p, &table.iter().map(|(a, _)| *a).collect::<Vec<_>>(), problems);
+    let walks_anywhere = p.traversal(&HashSet::new());
+    let reads_anywhere = p.unbounded_reads(&HashSet::new());
+    for (path, cap) in table {
+        for i in p.defs(path) {
+            let f = &p.funs[i];
+            let reads = f.calls.iter().any(crate::program::unbounded_read)
+                || p.callees(i).iter().any(|g| *g != i && reads_anywhere.contains(g));
+            let listings = f.calls.iter().filter(|c| crate::program::traversal_call(c)).count();
+            let other_walk = p.callees(i).iter().any(|g| *g != i && walks_anywhere.contains(g)) || p.callees(i).contains(&i);
+            let one_level = path.contains("shallow_list");
+            let excess = if reader {
+                reads || listings > 0 || other_walk
+            } else {
+                reads || other_walk || (one_level && listings != 1)
+            };
+            if excess {
+                problems.push(format!(
+                    "{} is exempt as a bounded primitive but does more than its one bounded \
+                     operation (reads a whole file: {reads}, listings: {listings}, enters another \
+                     walk: {other_walk})",
+                    f.display()
+                ));
+            }
+            if !is_bounded_by(f, cap) {
+                problems.push(format!(
+                    "{} is exempt as a bounded primitive but no longer names and stops on `{cap}`: \
+                     the exemption is earned by the bound",
+                    f.display()
+                ));
+            }
+        }
+    }
+    set
+}
+
 /// Whether a definition's body names the constant `cap` and stops on it
 /// (`break`, a `truncated`/`Truncated` signal, or `.min(`/`.take(`):
 /// what earns a bounded primitive its exemption.

@@ -316,6 +316,8 @@ pub struct CallSite {
     /// Written inside a closure handed to `thread::spawn`: it runs on
     /// another thread, not the caller's.
     pub in_spawn: bool,
+    /// Written inside a macro's arguments.
+    pub via_macro: bool,
 }
 
 struct CallVisitor<'a> {
@@ -383,6 +385,7 @@ impl CallVisitor<'_> {
             args: Vec::new(),
             receiver: String::new(),
             in_spawn: self.spawned > 0,
+            via_macro: false,
         });
     }
 
@@ -512,6 +515,24 @@ impl<'ast> Visit<'ast> for CallVisitor<'_> {
         self.with(h, |v| v.visit_expr(&m.receiver));
         for a in &m.args {
             self.with(Honoured::Propagated, |v| v.visit_expr(a));
+        }
+    }
+
+    /// Calls written inside a macro's arguments are calls, in the honour
+    /// context of the macro expression itself: `let _ = vec![check()]`
+    /// throws `check()`'s answer away exactly as `let _ = check()` does,
+    /// and `if matches!(probe(), ..)` honours it.
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        // A declarative macro body is not a call site.
+        if name == "macro_rules" {
+            return;
+        }
+        for (written, method, args, receiver) in crate::program::calls_in_tokens(&m.tokens) {
+            self.record_full(written, method, args, receiver);
+            if let Some(last) = self.out.last_mut() {
+                last.via_macro = true;
+            }
         }
     }
 

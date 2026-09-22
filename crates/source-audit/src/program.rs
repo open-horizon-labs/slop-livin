@@ -329,9 +329,12 @@ pub struct ImplDecl {
 
 impl ImplDecl {
     pub fn implements(&self, trait_name: &str) -> bool {
-        self.trait_
-            .as_deref()
-            .is_some_and(|t| resolve::path_ends_with(t, trait_name))
+        let last = trait_name.rsplit("::").next().unwrap_or(trait_name);
+        self.trait_.as_deref().is_some_and(|t| {
+            // A trait named through a glob import resolves to its bare
+            // name: possibly the one this rule means.
+            resolve::path_ends_with(t, trait_name) || (!t.contains("::") && t == last)
+        })
     }
 }
 
@@ -550,6 +553,29 @@ impl Program {
             ref_targets.push(rs);
             edges.push(e);
         }
+        // A call reached through a local re-export of a standard-library or
+        // dependency function (`mod shim { pub use std::fs::read_dir as
+        // g; }`, then `shim::g(p)`) is that function: every capability
+        // predicate reads `PCall::path`, so the path is rewritten to the
+        // re-export's target.
+        for (fi, ts) in targets.iter().enumerate() {
+            let rewrites: Vec<(usize, String)> = ts
+                .iter()
+                .enumerate()
+                .filter(|(ci, t)| {
+                    let c = &p.funs[fi].calls[*ci];
+                    !c.method && t.local.is_empty() && t.abs != c.path && !t.abs.starts_with("swamp")
+                        && p.reexports.iter().any(|r| resolve::path_ends_with(&t.abs, &r.target) || t.abs == r.target)
+                })
+                .map(|(ci, t)| (ci, t.abs.clone()))
+                .collect();
+            if !rewrites.is_empty() {
+                let f = Rc::make_mut(&mut p.funs[fi]);
+                for (ci, abs) in rewrites {
+                    f.calls[ci].path = abs;
+                }
+            }
+        }
         p.targets = targets;
         p.ref_targets = ref_targets;
         p.edges = edges;
@@ -758,7 +784,7 @@ impl Collector<'_> {
             syn::ReturnType::Default => String::new(),
             syn::ReturnType::Type(_, t) => ast::resolve_body(res, &t.to_token_stream().to_string()),
         };
-        let mut calls: Vec<PCall> = resolve::calls_in_fn(item, res)
+        let calls: Vec<PCall> = resolve::calls_in_fn(item, res)
             .into_iter()
             .map(|c| PCall {
                 path: c.path,
@@ -769,36 +795,15 @@ impl Collector<'_> {
                 honoured: c.honoured,
                 stmt: c.stmt,
                 conditions: c.conditions,
-                via_macro: false,
+                via_macro: c.via_macro,
                 in_spawn: c.in_spawn,
             })
             .collect();
         let mut macros = Vec::new();
         let mut unknown_macros = Vec::new();
+        let mut extra_lits: Vec<StructLit> = Vec::new();
         let mut literals = resolve::plain_literals_in_fn(item);
         for m in macro_sites {
-            let ts = syn::parse_str::<proc_macro2::TokenStream>(&m.tokens).unwrap_or_default();
-            for (written, method, args, receiver) in calls_in_tokens(&ts) {
-                let path = if method {
-                    written.clone()
-                } else {
-                    res.resolve(&written)
-                };
-                calls.push(PCall {
-                    path,
-                    written,
-                    method,
-                    args,
-                    receiver,
-                    // An argument is a propagated value: the macro decides
-                    // what to do with it.
-                    honoured: Honoured::Propagated,
-                    stmt: 0,
-                    conditions: Vec::new(),
-                    via_macro: true,
-                    in_spawn: false,
-                });
-            }
             if !resolve::KNOWN_MACROS.contains(&m.name.as_str()) {
                 unknown_macros.push(m.name.clone());
             }
@@ -807,6 +812,12 @@ impl Collector<'_> {
             // pieces; a `vec![..]` of names does not.
             if m.literals.len() > 1 && STRING_MACROS.contains(&m.name.as_str()) {
                 literals.push(m.literals.concat());
+            }
+            // A struct literal written inside a macro (`vec![Unit { .. }]`)
+            // is a struct literal.
+            // (`matches!` takes a pattern, not an expression.)
+            if m.name != "matches" {
+                macro_struct_lits(&m.tokens, res, &mut extra_lits);
             }
             macros.push(MacroUse {
                 path: res.resolve(&m.path),
@@ -847,7 +858,7 @@ impl Collector<'_> {
             assigns: resolve::assignments_in_fn(item),
             arms: resolve::match_arms_in_fn(item),
             bindings: resolve::bindings_in_fn(item),
-            struct_lits: rv.lits,
+            struct_lits: rv.lits.into_iter().chain(extra_lits).collect(),
             unknown_macros,
             local_types: rv.locals,
             globs: res
@@ -1291,6 +1302,42 @@ fn file_facts(rel: &str, file: &CachedAst) -> FileFacts {
     }
 }
 
+/// Every `Path { field: .., .. }` written in macro tokens.
+fn macro_struct_lits(tokens: &str, res: &resolve::Resolver, out: &mut Vec<StructLit>) {
+    let Ok(ts) = syn::parse_str::<proc_macro2::TokenStream>(tokens) else {
+        return;
+    };
+    fn walk(ts: proc_macro2::TokenStream, res: &resolve::Resolver, out: &mut Vec<StructLit>) {
+        let toks: Vec<proc_macro2::TokenTree> = ts.into_iter().collect();
+        for (i, t) in toks.iter().enumerate() {
+            if let proc_macro2::TokenTree::Group(g) = t {
+                if g.delimiter() == proc_macro2::Delimiter::Brace {
+                    let (path, method, _) = path_before(&toks[..i]);
+                    let last = path.rsplit("::").next().unwrap_or("");
+                    if !method && last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                        let fields = split_top_level(&g.stream().to_string())
+                            .into_iter()
+                            .filter_map(|f| {
+                                let (n, v) = f.split_once(':').unwrap_or((f.as_str(), f.as_str()));
+                                let n = n.trim();
+                                (!n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                                    .then(|| (n.to_string(), v.trim().to_string()))
+                            })
+                            .collect();
+                        out.push(StructLit {
+                            path: res.resolve(&path),
+                            fields,
+                            rest: g.stream().to_string().contains(".."),
+                        });
+                    }
+                }
+                walk(g.stream(), res, out);
+            }
+        }
+    }
+    walk(ts, res, out);
+}
+
 /// Splits a parameter/argument list on top-level commas (ignoring those
 /// inside `<>`, `()`, `[]`, `{}`).
 pub fn split_top_level(s: &str) -> Vec<String> {
@@ -1446,6 +1493,7 @@ impl Program {
     /// Where a path, written in `f`, can land.
     pub fn resolve_path(&self, f: &Fun, path: &str) -> Target {
         let written = path.replace(' ', "");
+        let mut followed: Option<String> = None;
         for cand in self.candidates(f, &written) {
             if let Some(ix) = self.free_by_path.get(&cand) {
                 return Target {
@@ -1473,9 +1521,20 @@ impl Program {
                     };
                 }
             }
+            // A local re-export of something this model does not define:
+            // resolve what it names, not the local spelling.
+            if c != cand {
+                followed = Some(c);
+                break;
+            }
         }
-        let (abs, _) = absolute(&written, &f.krate, &f.module, f.self_ty.as_deref());
-        let abs = self.follow(&abs);
+        let abs = match followed {
+            Some(c) => c,
+            None => {
+                let (abs, _) = absolute(&written, &f.krate, &f.module, f.self_ty.as_deref());
+                self.follow(&abs)
+            }
+        };
         let segs: Vec<&str> = abs.split("::").collect();
         // A bare name no module path reaches: it can only come from a glob
         // import (`use super::*`). Anything else is a local binding, a
@@ -1841,6 +1900,24 @@ impl Program {
     pub fn file_module(rel: &str) -> String {
         let (k, m) = crate_and_module(rel);
         qualify(&k, &m)
+    }
+
+    /// `rels` and every file whose module is a descendant of one of
+    /// theirs: a child module file (`report/extra.rs`) is part of the
+    /// module that declares it, so a rule scoped to a module cannot be
+    /// escaped by moving code one file down.
+    pub fn family(&self, rels: &HashSet<String>) -> HashSet<String> {
+        let mods: Vec<String> = rels.iter().map(|r| Program::file_module(r)).collect();
+        self.files
+            .iter()
+            .map(|f| f.rel.clone())
+            .filter(|r| {
+                rels.contains(r) || {
+                    let m = Program::file_module(r);
+                    mods.iter().any(|p| m.starts_with(&format!("{p}::")))
+                }
+            })
+            .collect()
     }
 
     pub fn module_name(rel: &str) -> String {

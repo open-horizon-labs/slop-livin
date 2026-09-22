@@ -23,7 +23,7 @@
 //!   guardrails govern. A handoff function in the adapter tree may still
 //!   not use the capability itself.
 
-use super::{anchors, is_bounded_by, load, verdict};
+use super::{load, verdict};
 use crate::program::{self, DeclKind, Program, TypeKind, contains_token};
 use std::collections::HashSet;
 use std::path::Path;
@@ -41,22 +41,9 @@ const BOUNDED_LISTERS: &[(&str, &str)] = &[
 /// The type an adapter's declared-project resolution returns.
 const PROJECT_LINK_TYPE: &str = "ProjectLinkState";
 
-/// The bounded primitives of one kind, checked: each exists, names its
-/// cap and stops on it.
 fn bounded(p: &Program, table: &[(&str, &str)], problems: &mut Vec<String>) -> HashSet<usize> {
-    let set = anchors(p, &table.iter().map(|(a, _)| *a).collect::<Vec<_>>(), problems);
-    for (path, cap) in table {
-        for i in p.defs(path) {
-            if !is_bounded_by(&p.funs[i], cap) {
-                problems.push(format!(
-                    "{} is exempt as a bounded primitive but no longer names and stops on `{cap}`: \
-                     the exemption is earned by the bound",
-                    p.funs[i].display()
-                ));
-            }
-        }
-    }
-    set
+    let reader = table.iter().any(|(a, _)| a.contains("read_header"));
+    super::bounded_primitives(p, table, reader, problems)
 }
 
 /// Functions that hand a declared project path to the walker's identity
@@ -358,6 +345,15 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
     let p = load(root);
     let mut problems = Vec::new();
     let tools = p.tool_modules();
+    // A tool module's children are that tool's code.
+    let tool_family = |rel: &str| -> Option<String> {
+        tools.iter().find(|t| {
+            *t == rel || {
+                let m = Program::file_module(t);
+                Program::file_module(rel).starts_with(&format!("{m}::"))
+            }
+        }).cloned()
+    };
     if tools.is_empty() {
         problems.push("no module under agents/ declares a tool".into());
     }
@@ -374,13 +370,17 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
     // (1) No tool module reaches into another: by resolved call, by value
     // reference, or by a path in its body, signature or items.
     for (i, f) in p.funs.iter().enumerate() {
-        if !tools.contains(&f.rel) {
+        let Some(me) = tool_family(&f.rel) else {
             continue;
-        }
+        };
         let mut reached: Vec<String> = Vec::new();
         for (ci, _) in f.calls.iter().enumerate() {
-            for g in &p.target(i, ci).local {
+            let t = p.target(i, ci);
+            for g in &t.local {
                 reached.push(p.funs[*g].rel.clone());
+            }
+            if let Some(rel) = module_of(&t.abs) {
+                reached.push(rel.clone());
             }
         }
         for g in p.ref_targets(i) {
@@ -392,12 +392,21 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
                 reached.push(rel.clone());
             }
         }
-        if let Some(other) = reached.iter().find(|r| **r != f.rel && tools.contains(r)) {
+        if let Some(other) = reached.iter().filter_map(|r| tool_family(r)).find(|t| *t != me) {
             problems.push(format!(
                 "{} reaches into adapter {other}: one tool's format change must never change \
                  another tool's identification",
                 f.display()
             ));
+        }
+    }
+    // A re-export written in a tool module is a reach too.
+    for r in &p.reexports {
+        if let Some(me) = tool_family(&r.rel)
+            && let Some(other) = module_of(&r.target).and_then(|rel| tool_family(rel))
+            && other != me
+        {
+            problems.push(format!("{} re-exports `{}` from adapter {other}", r.rel, r.target));
         }
     }
     for d in &p.items {
@@ -457,7 +466,8 @@ pub fn agent_adapters_are_pluggable(root: &Path) -> Result<(), String> {
         }
     }
     // (3) The registry registers each tool module exactly once.
-    let registry: Vec<&program::Fun> = p.funs.iter().filter(|f| f.rel.ends_with("agents/registry.rs")).map(|f| &**f).collect();
+    let registry_files = p.family(&p.files.iter().filter(|f| f.rel.ends_with("agents/registry.rs")).map(|f| f.rel.clone()).collect());
+    let registry: Vec<&program::Fun> = p.funs.iter().filter(|f| registry_files.contains(&f.rel)).map(|f| &**f).collect();
     if registry.is_empty() {
         problems.push("agents/registry.rs defines no function: section 13 requires a static `Registry::with_builtins()`".into());
     }
