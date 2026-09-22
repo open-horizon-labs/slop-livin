@@ -50,6 +50,7 @@ fn only_detector(id: &str) -> ScanConfig {
             .chain(ALL_TOOL_DETECTORS.iter().copied().filter(|d| *d != id))
             .map(str::to_string)
             .collect(),
+        enabled_detectors: Vec::new(),
     }
 }
 
@@ -256,6 +257,7 @@ fn aider_disabled_detector_turns_off_both_home_and_repo_units() {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["aider".to_string()],
+        enabled_detectors: Vec::new(),
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

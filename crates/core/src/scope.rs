@@ -34,16 +34,24 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
-    /// Whether the built-in default roots (`~/src`, `~/Library/Developer`,
-    /// `~/Library/Caches` on macOS) are in scope. This flag controls
-    /// *only* the `builtin-defaults` detector (see
-    /// `crate::locations::builtin`); every other detector is controlled
-    /// independently by `disabled_detectors`. `defaults = false` gives
-    /// "explicit-only scope": `include` entries plus whatever detectors
-    /// remain enabled (i.e. not separately named in `disabled_detectors`).
-    /// This is a documented decision, not the only defensible reading of
-    /// the issue text -- see the session note for the alternative
-    /// considered and why it was rejected.
+    /// Whether swamp may infer scope at all.
+    ///
+    /// `true` (the default): the built-in default roots (`~/src`,
+    /// `~/Library/Developer`, `~/Library/Caches` on macOS) plus every
+    /// detector that is not named in `disabled_detectors`.
+    ///
+    /// `false` means **explicit-only scope**: swamp infers nothing. Only
+    /// `include` entries, explicit command roots, and detectors the
+    /// config names are in scope. With `defaults = false` and neither
+    /// `enabled_detectors` nor `disabled_detectors` set, the scope is
+    /// genuinely empty and every command says so.
+    ///
+    /// An earlier revision of this file read `defaults = false` as
+    /// "drop the builtin-defaults detector only, keep inferring from
+    /// every other detector", recorded as a judgment call. The user
+    /// rejected that reading (see the dated correction in
+    /// `.oh/sessions/2026-09-21-scope-and-detector-registry.md`); the
+    /// explicit-only contract above is the one in force.
     pub defaults: bool,
     /// Additional roots, always in scope regardless of `defaults`.
     /// `~` and relative-to-home paths are resolved against the
@@ -58,6 +66,13 @@ pub struct ScanConfig {
     /// `detect()` is still called by the registry only to be labelled
     /// `Disabled` for transparency -- see `crate::locations::Registry::resolve`).
     pub disabled_detectors: Vec<String>,
+    /// Detector IDs explicitly turned **on** under `defaults = false`
+    /// (explicit-only scope). Ignored when `defaults = true`, where the
+    /// deny-list `disabled_detectors` is the control. This is the
+    /// documented way to say "explicit-only scope, but do still look at
+    /// my Hugging Face cache".
+    #[serde(default)]
+    pub enabled_detectors: Vec<String>,
 }
 
 impl Default for ScanConfig {
@@ -67,8 +82,31 @@ impl Default for ScanConfig {
             include: Vec::new(),
             exclude: Vec::new(),
             disabled_detectors: Vec::new(),
+            enabled_detectors: Vec::new(),
         }
     }
+}
+
+/// Whether detector-inferred roots may enter the scope at all
+/// (`.oh/guardrails/explicit-only-scope-when-defaults-false.md`).
+///
+/// With `defaults = true` this is always `true` -- the deny-list
+/// `disabled_detectors` decides which detectors run.
+///
+/// With `defaults = false` the scope is explicit-only, so swamp infers
+/// nothing unless the config *speaks about detectors*: either an
+/// `enabled_detectors` allow-list (the documented mechanism) or a
+/// non-empty `disabled_detectors` deny-list, which is an equally
+/// explicit curation of the detector set ("run everything except
+/// these"). Neither present means no detector runs and the scope is
+/// exactly `include` plus any explicit command roots -- empty when there
+/// are none, which every command reports rather than falling back to cwd
+/// or home.
+pub fn detectors_permitted(config: &ScanConfig) -> bool {
+    if config.defaults {
+        return true;
+    }
+    !(config.enabled_detectors.is_empty() && config.disabled_detectors.is_empty())
 }
 
 impl ScanConfig {
@@ -78,6 +116,7 @@ impl ScanConfig {
         let include = toml_string_array(&self.include);
         let exclude = toml_string_array(&self.exclude);
         let disabled = toml_string_array(&self.disabled_detectors);
+        let enabled = toml_string_array(&self.enabled_detectors);
         format!(
             "\n[scan]\n\
 # Built-in default roots (~/src, ~/Library/Developer, ~/Library/Caches on\n\
@@ -91,8 +130,12 @@ include = {}\n\
 exclude = {}\n\
 # Detector IDs to turn off without excluding a path another enabled\n\
 # root already reaches, e.g. [\"homebrew\"]. `swamp scope --json` lists ids.\n\
-disabled_detectors = {}\n",
-            self.defaults, include, exclude, disabled
+disabled_detectors = {}\n\
+# Detector IDs explicitly turned on under `defaults = false`. Ignored\n\
+# when defaults = true. With defaults = false and neither list set, no\n\
+# detector runs at all and the scope is `include` plus explicit roots.\n\
+enabled_detectors = {}\n",
+            self.defaults, include, exclude, disabled, enabled
         )
     }
 }
@@ -241,7 +284,253 @@ pub struct ExternalPruneNote {
     pub detector_id: String,
 }
 
+/// One root the effective scope authorizes a discovery/observation pass
+/// to look at, with everything that pass needs to decide *how*.
+/// [`EffectiveScope::authorized_roots`] is the only supported way to get
+/// these: nothing outside `scope.rs` may reinterpret raw detector
+/// candidates (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+#[derive(Debug, Clone)]
+pub struct AuthorizedRoot {
+    pub path: PathBuf,
+    /// The detector that proposed this root, when one did. `None` for a
+    /// configured `include` or an explicit command root.
+    pub detector_id: Option<String>,
+    /// The detector's display name, and how it classified this
+    /// location. Carried here so a discovery pass never has to read
+    /// `scope.detectors` back for a label -- the whole point of the
+    /// authorized seam is that scope decides and discovery is told.
+    pub detector_name: Option<String>,
+    pub category: StorageCategory,
+    pub provenance: Provenance,
+    /// `true` when this root is folded into a larger walked root and is
+    /// measured separately as its own unit (see [`ExternalPruneNote`]).
+    pub nested_in: Option<PathBuf>,
+    /// Exclusion patterns that fall inside this root; a discovery pass
+    /// must not descend into them.
+    pub pruned_subtrees: Vec<PathBuf>,
+}
+
+/// Why a root the scope *considered* is not available to this
+/// observation. Never silently dropped: a caller turns these into
+/// coverage notes so "nothing found" and "not looked at" stay distinct
+/// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+#[derive(Debug, Clone)]
+pub struct UnauthorizedRoot {
+    pub path: PathBuf,
+    /// `true` when the root is deliberately out of scope (excluded, a
+    /// disabled detector, outside the explicit command roots) and
+    /// `false` when it is in scope but could not be observed (missing,
+    /// unreadable). Only the latter is a coverage gap.
+    pub out_of_scope: bool,
+    pub reason: String,
+}
+
 impl EffectiveScope {
+    /// Every root this scope authorizes a discovery or measurement pass
+    /// to look at, and every root it considered but did not, with the
+    /// reason.
+    ///
+    /// This is the single seam between "what the user authorized" and
+    /// "what swamp looks at". `external::discover_and_measure` and
+    /// `agents::discover_and_measure` consume *this*, never
+    /// `self.detectors`' raw `Resolved` candidates: the review's
+    /// `excluded_agent_home_must_not_be_scanned` counterexample was
+    /// exactly a discovery pass that read detector output directly and
+    /// so never saw the exclusion.
+    ///
+    /// Explicit command roots replace inferred ones: when `self.explicit`
+    /// is set, a detector-proposed path is authorized only if it lies
+    /// inside an explicit, present root.
+    pub fn authorized_roots(&self) -> (Vec<AuthorizedRoot>, Vec<UnauthorizedRoot>) {
+        let mut authorized = Vec::new();
+        let mut unauthorized = Vec::new();
+        let excluded_prefixes: Vec<&PathBuf> = self
+            .roots
+            .iter()
+            .filter(|r| matches!(r.status, RootStatus::Excluded { .. }))
+            .map(|r| &r.path)
+            .collect();
+
+        for root in &self.roots {
+            let detector_id = root.reasons.iter().find_map(|r| match r {
+                RootReason::Detector { detector_id, .. } => Some(detector_id.clone()),
+                _ => None,
+            });
+            let pruned: Vec<PathBuf> = self
+                .pruned_subtrees
+                .iter()
+                .filter(|p| p.root == root.path)
+                .map(|p| PathBuf::from(&p.pattern))
+                .collect();
+            match &root.status {
+                RootStatus::Excluded { pattern } => unauthorized.push(UnauthorizedRoot {
+                    path: root.path.clone(),
+                    out_of_scope: true,
+                    reason: format!("excluded by {pattern}"),
+                }),
+                RootStatus::Missing => unauthorized.push(UnauthorizedRoot {
+                    path: root.path.clone(),
+                    out_of_scope: false,
+                    reason: "not present on disk".to_string(),
+                }),
+                RootStatus::Unreadable { reason } => unauthorized.push(UnauthorizedRoot {
+                    path: root.path.clone(),
+                    out_of_scope: false,
+                    reason: format!("could not be read ({reason})"),
+                }),
+                RootStatus::Present | RootStatus::SkippedAsNested { .. } => {
+                    // Defence in depth: a root whose ancestor is excluded
+                    // is out of scope even if resolution recorded it as
+                    // present.
+                    if let Some(ex) = excluded_prefixes
+                        .iter()
+                        .find(|ex| root.path.starts_with(ex.as_path()))
+                    {
+                        unauthorized.push(UnauthorizedRoot {
+                            path: root.path.clone(),
+                            out_of_scope: true,
+                            reason: format!("beneath the excluded root {}", ex.display()),
+                        });
+                        continue;
+                    }
+                    if self.explicit && detector_id.is_some() && !self.inside_explicit(&root.path) {
+                        unauthorized.push(UnauthorizedRoot {
+                            path: root.path.clone(),
+                            out_of_scope: true,
+                            reason:
+                                "outside the explicit command roots, which replace inferred roots"
+                                    .to_string(),
+                        });
+                        continue;
+                    }
+                    let nested_in = match &root.status {
+                        RootStatus::SkippedAsNested { parent } => Some(parent.clone()),
+                        _ => None,
+                    };
+                    let (detector_name, category, provenance) = detector_id
+                        .as_deref()
+                        .and_then(|id| self.detector_label(id, &root.path))
+                        .unwrap_or((
+                            None,
+                            StorageCategory::Unclassified,
+                            Provenance::BuiltinConvention,
+                        ));
+                    authorized.push(AuthorizedRoot {
+                        path: root.path.clone(),
+                        detector_id,
+                        detector_name,
+                        category,
+                        provenance,
+                        nested_in,
+                        pruned_subtrees: pruned,
+                    });
+                }
+            }
+        }
+        (authorized, unauthorized)
+    }
+
+    /// How the detector that proposed `path` labels it. Only `scope.rs`
+    /// reads the detector summaries; callers receive the label on their
+    /// [`AuthorizedRoot`].
+    fn detector_label(
+        &self,
+        detector_id: &str,
+        path: &Path,
+    ) -> Option<(Option<String>, StorageCategory, Provenance)> {
+        let summary = self
+            .detectors
+            .iter()
+            .find(|d| d.detector_id == detector_id)?;
+        let loc = summary
+            .locations
+            .iter()
+            .find(|l| l.path.as_deref() == Some(path))
+            .or_else(|| summary.locations.first())?;
+        Some((
+            Some(summary.name.clone()),
+            loc.category,
+            loc.provenance.clone(),
+        ))
+    }
+
+    /// The same scope narrowed to exactly one of its roots, keeping that
+    /// root's exclusions and external pruning.
+    ///
+    /// A live TUI refresh re-observes the one root whose files changed.
+    /// Doing that through a single-root report function is what dropped
+    /// the scope contract on refresh -- excluded subtrees and pruned
+    /// external locations reappeared. Narrowing the *scope* instead
+    /// keeps every exclusion and prune note attached to the root being
+    /// re-walked (`.oh/guardrails/tui-refresh-preserves-scope.md`).
+    pub fn restricted_to(&self, root: &Path) -> EffectiveScope {
+        let mut narrowed = self.clone();
+        narrowed.roots.retain(|r| r.path == root);
+        narrowed.pruned_subtrees.retain(|p| p.root == root);
+        narrowed.external_pruned_subtrees.retain(|p| p.root == root);
+        narrowed
+    }
+
+    /// Whether this scope lets a detector contribute at all.
+    ///
+    /// Distinct from "did it resolve a present home": a detector can be
+    /// enabled and simply find nothing. Project-local storage that a
+    /// detector *governs* without proposing a home for it (Aider's
+    /// per-repository files) is in scope exactly when the detector is,
+    /// so disabling the detector still turns off everything it governs.
+    pub fn detector_enabled(&self, detector_id: &str) -> bool {
+        !self.disabled_detectors.iter().any(|d| d == detector_id)
+    }
+
+    /// Whether a detector-proposed path lies inside one of the explicit
+    /// command roots this invocation was given.
+    fn inside_explicit(&self, path: &Path) -> bool {
+        self.roots.iter().any(|r| {
+            matches!(r.status, RootStatus::Present)
+                && r.reasons
+                    .iter()
+                    .any(|x| matches!(x, RootReason::ExplicitCommand))
+                && path.starts_with(&r.path)
+        })
+    }
+
+    /// Detector-proposed paths inside the explicit command roots, for a
+    /// discovery pass running under `--root`: the detector catalog still
+    /// applies, but only within what the user named. Returns the
+    /// authorized subset plus the detector locations that were dropped
+    /// because they sit outside every explicit root.
+    pub fn authorized_detector_paths_in_explicit_roots(&self) -> Vec<AuthorizedRoot> {
+        if !self.explicit {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for summary in &self.detectors {
+            for loc in &summary.locations {
+                if loc.status != LocationStatus::Resolved {
+                    continue;
+                }
+                let Some(path) = &loc.path else { continue };
+                let path = lexically_normalize(path);
+                if self.inside_explicit(&path)
+                    && !self.roots.iter().any(|r| {
+                        matches!(r.status, RootStatus::Excluded { .. }) && path.starts_with(&r.path)
+                    })
+                {
+                    out.push(AuthorizedRoot {
+                        detector_id: Some(summary.detector_id.clone()),
+                        detector_name: Some(summary.name.clone()),
+                        category: loc.category,
+                        provenance: loc.provenance.clone(),
+                        nested_in: None,
+                        pruned_subtrees: Vec::new(),
+                        path,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Paths an observation should actually walk: present, in-scope,
     /// not folded into a parent, not excluded.
     pub fn scan_paths(&self) -> Vec<PathBuf> {
@@ -347,10 +636,23 @@ pub fn resolve_effective_scope(
     registry: &Registry,
     generated_at: u64,
 ) -> EffectiveScope {
+    let permitted = detectors_permitted(config);
     let mut effective_disabled = config.disabled_detectors.clone();
     if !config.defaults {
+        // Explicit-only scope: the builtin-defaults detector never runs,
+        // and -- unless the config names detectors -- neither does any
+        // other one. When an allow-list *is* present, everything outside
+        // it is disabled.
         effective_disabled
             .push(crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID.to_string());
+        for d in registry.detectors() {
+            let id = d.id().to_string();
+            if !permitted
+                || (!config.enabled_detectors.is_empty() && !config.enabled_detectors.contains(&id))
+            {
+                effective_disabled.push(id);
+            }
+        }
     }
     effective_disabled.sort();
     effective_disabled.dedup();
@@ -694,6 +996,7 @@ mod tests {
         let home = tmp.path();
         mk(home, "src");
         mk(home, "code");
+        mk(home, ".cargo");
         let env = env_at(home);
         let registry = Registry::with_builtins();
         let mut cfg = ScanConfig {
@@ -707,10 +1010,125 @@ mod tests {
         assert!(!scope.roots.iter().any(|r| r.path == home.join("src")));
         // ~/code came from `include`, so it survives defaults=false.
         assert!(scope.scan_paths().contains(&home.join("code")));
-        // Cargo/rustup/homebrew detectors are untouched by defaults=false
-        // (only disabled_detectors controls them) -- explicit-only scope
-        // still includes every *enabled* detector.
-        assert!(scope.roots.iter().any(|r| r.path == home.join(".cargo")));
+        // The rejected earlier reading kept inferring from every
+        // still-enabled detector here. Explicit-only means explicit:
+        // ~/.cargo exists on disk and is *not* in scope, because nothing
+        // in the config asked for it.
+        assert!(
+            !scope.roots.iter().any(|r| r.path == home.join(".cargo")),
+            "defaults=false must not infer detector roots"
+        );
+    }
+
+    /// The other half of the explicit-only contract, named because
+    /// `.oh/guardrails/explicit-only-scope-when-defaults-false.md`'s
+    /// audit checks for this exact function by name: nothing at all is
+    /// in scope, and that is reported rather than replaced by a cwd or
+    /// home fallback.
+    #[test]
+    fn defaults_false_without_includes_or_enabled_detectors_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        mk(home, "src");
+        mk(home, ".cargo");
+        let env = env_at(home);
+        let registry = Registry::with_builtins();
+        let scope = resolve_effective_scope(
+            &env,
+            &ScanConfig {
+                defaults: false,
+                ..ScanConfig::default()
+            },
+            &[],
+            &registry,
+            1000,
+        );
+        assert!(
+            scope.roots.is_empty(),
+            "defaults=false with no include and no enabled detectors still inferred {} roots",
+            scope.roots.len()
+        );
+        assert!(scope.is_empty_scope());
+        assert!(!detectors_permitted(&ScanConfig {
+            defaults: false,
+            ..ScanConfig::default()
+        }));
+    }
+
+    #[test]
+    fn defaults_false_with_an_enabled_detector_allow_list_runs_only_that_detector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        mk(home, ".cargo");
+        mk(home, ".rustup");
+        let env = env_at(home);
+        let registry = Registry::with_builtins();
+        let cfg = ScanConfig {
+            defaults: false,
+            enabled_detectors: vec!["cargo-home".to_string()],
+            ..ScanConfig::default()
+        };
+        let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);
+        assert!(scope.scan_paths().contains(&home.join(".cargo")));
+        assert!(
+            !scope.roots.iter().any(|r| r.path == home.join(".rustup")),
+            "a detector outside the allow-list must not run"
+        );
+    }
+
+    #[test]
+    fn authorized_roots_drops_excluded_and_explains_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        mk(home, "src");
+        let env = env_at(home);
+        let registry = Registry::with_builtins();
+        let cfg = ScanConfig {
+            exclude: vec!["~/src".to_string()],
+            ..ScanConfig::default()
+        };
+        let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);
+        let (authorized, unauthorized) = scope.authorized_roots();
+        assert!(!authorized.iter().any(|r| r.path == home.join("src")));
+        let note = unauthorized
+            .iter()
+            .find(|r| r.path == home.join("src"))
+            .expect("an excluded root is reported, never silently dropped");
+        assert!(note.out_of_scope);
+        assert!(note.reason.contains("excluded"));
+        // A candidate that simply is not on disk is a coverage note, not
+        // an out-of-scope decision.
+        let missing = unauthorized
+            .iter()
+            .find(|r| r.path == home.join(".cargo"))
+            .expect("missing candidates stay visible");
+        assert!(!missing.out_of_scope);
+    }
+
+    #[test]
+    fn explicit_roots_do_not_authorize_detector_paths_outside_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        mk(home, "proj");
+        mk(home, ".cargo");
+        let env = env_at(home);
+        let registry = Registry::with_builtins();
+        let scope = resolve_effective_scope(
+            &env,
+            &ScanConfig::default(),
+            &[home.join("proj")],
+            &registry,
+            1000,
+        );
+        let (authorized, _) = scope.authorized_roots();
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(authorized[0].path, home.join("proj"));
+        assert!(
+            scope
+                .authorized_detector_paths_in_explicit_roots()
+                .is_empty(),
+            "~/.cargo is outside the explicit root and must not be discovered"
+        );
     }
 
     #[test]

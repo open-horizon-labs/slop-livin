@@ -3546,6 +3546,84 @@ fn read_external_rows(path: &Path) -> Result<Vec<StoredExternalRow>> {
     Ok(rows)
 }
 
+/// Which family of rows in the shared external current table an
+/// observation speaks for. External/detector-level units and agent-tool
+/// units share one table and one key scheme (`agent:`-prefixed
+/// categories distinguish them), which is deliberate -- one store, one
+/// key family, two granularities -- but it means neither observation may
+/// assume a key it did not see has disappeared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFamily {
+    /// Detector-level external storage units (`crate::external`).
+    External,
+    /// Units *inside* a tool home (`crate::agents`).
+    Agent,
+}
+
+impl KeyFamily {
+    fn matches(self, category: &str) -> bool {
+        let is_agent = category.starts_with("agent:");
+        match self {
+            Self::Agent => is_agent,
+            Self::External => !is_agent,
+        }
+    }
+}
+
+/// What one observation pass is entitled to tombstone
+/// (`.oh/guardrails/history-sweeps-are-owned.md`).
+///
+/// The 2026-09-21 review's `unchanged_combined_observation_must_not_invent_regrowth`
+/// counterexample: external and agent discovery both swept the shared
+/// current table for keys they had not seen, so each tombstoned the
+/// other's rows and the next pass recorded the resurrection as regrowth
+/// -- pure fiction, on an unchanged filesystem.
+///
+/// A row may only be marked absent when **both** hold:
+///
+/// * it belongs to this observation's [`KeyFamily`], and
+/// * its path lies inside a root this observation actually covered
+///   completely this pass.
+///
+/// A root that was excluded, whose detector was disabled, that was
+/// missing, unreadable, or simply not part of this pass contributes no
+/// covered root, so nothing under it can be tombstoned. Coverage changes
+/// are not storage changes.
+#[derive(Debug, Clone)]
+pub struct ObservationOwnership {
+    pub family: KeyFamily,
+    pub covered_roots: Vec<PathBuf>,
+}
+
+impl ObservationOwnership {
+    pub fn new(family: KeyFamily, covered_roots: Vec<PathBuf>) -> Self {
+        Self {
+            family,
+            covered_roots,
+        }
+    }
+
+    /// Whether `path` lies inside a region this observation covered.
+    pub fn covers(&self, path: &str) -> bool {
+        let p = Path::new(path);
+        self.covered_roots
+            .iter()
+            .any(|r| p == r.as_path() || p.starts_with(r))
+    }
+
+    /// Whether this observation owns the stored row `key` (family +
+    /// coverage). The tombstone loop is guarded by this and nothing else.
+    fn owns(&self, key: &str) -> bool {
+        let mut parts = key.split('\u{1}');
+        let (_detector, Some(category), _device, Some(path)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        self.family.matches(category) && self.covers(path)
+    }
+}
+
 /// One external unit's observed facts for this pass, before growth
 /// annotation. Mirrors [`Observed`] for artifact rows.
 pub struct ObservedExternal {
@@ -3606,6 +3684,7 @@ pub fn observe_and_annotate_external(
     swamp_dir: &Path,
     observed: &[ObservedExternal],
     protected_keys: &HashSet<String>,
+    ownership: &ObservationOwnership,
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
@@ -3671,8 +3750,16 @@ pub fn observe_and_annotate_external(
         }
     }
 
+    // The owned sweep. `ownership.owns` is the whole guard: a key from
+    // the other family, or one outside the regions this pass actually
+    // covered, is left exactly as it is -- never tombstoned, so never
+    // resurrected as invented regrowth on the next pass.
     for (key, row) in current.iter_mut() {
-        if row.present && !seen_keys.contains(key) && !protected_keys.contains(key) {
+        if row.present
+            && !seen_keys.contains(key)
+            && !protected_keys.contains(key)
+            && ownership.owns(key)
+        {
             delta_rows.push(row.clone());
             row.present = false;
             row.bytes = 0;

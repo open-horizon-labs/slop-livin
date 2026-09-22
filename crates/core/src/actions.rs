@@ -110,6 +110,20 @@ pub struct PlanUnit {
     /// immediately before every rename/removal below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<crate::evidence::Evidence>,
+    /// What a human actually reviewed about this unit's storage: the
+    /// anchor's `(device, inode)` plus its membership -- exactly for a
+    /// bounded member set, a bounded summary plus a metadata fingerprint
+    /// for a large cache. `execute` recomputes it and refuses on any
+    /// drift, so an approval buys the *reviewed* bytes rather than
+    /// whatever now occupies that path
+    /// (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
+    ///
+    /// `None` on a unit whose kind is never actionable (an external unit
+    /// named for inspection). A `None` here on an actionable unit is
+    /// itself a refusal at execution: a plan with no reviewed identity
+    /// was never reviewed against live state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<crate::recheck::ReviewedIdentity>,
 }
 
 /// See `PlanUnit::agent_meta`.
@@ -379,6 +393,10 @@ pub fn propose(
                             .unwrap();
                         let mut unit = unit_from_row(project, wt, row);
                         unit.path = p.clone();
+                        // `unit_from_row` anchored the reviewed identity
+                        // on the container (`target/`); the selection is
+                        // this exact group path.
+                        unit.reviewed = crate::recheck::capture_anchor(p).ok();
                         unit.rel_path = p.strip_prefix(&wt.path).unwrap_or(p).display().to_string();
                         unit.bytes = group.members.iter().map(|m| m.bytes).sum();
                         unit.dedup_stale = false; // selected members were freshly measured
@@ -641,6 +659,7 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         evidence: plan_unit_evidence(&a.evidence, &a.path),
         external_category: None,
         agent_meta: None,
+        reviewed: crate::recheck::capture_anchor(&a.path).ok(),
     }
 }
 
@@ -681,6 +700,11 @@ pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
         evidence: unit.evidence.clone(),
         external_category: Some(category),
         agent_meta: None,
+        // An external unit is refused unconditionally at execution, but
+        // it still records what was reviewed: a later chunk that adds a
+        // supported external action inherits the identity contract
+        // rather than having to remember to add it.
+        reviewed: crate::recheck::capture(&unit.path).ok(),
     }
 }
 
@@ -739,10 +763,16 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
             "touches a database-like (SQLite/WAL/SHM) file; never deleted individually".into(),
         );
     }
-    if crate::agents::is_active(&u.path) {
-        return Some(
-            "refused: an active process holds this path open (session may be running)".into(),
-        );
+    // Proposal-time occupancy uses the same tri-state, descendant-aware
+    // probe the sink uses, not a boolean on the anchor: a session whose
+    // transcript is open *inside* a directory unit must not reach a plan
+    // in the first place, and a probe that could not run must not read
+    // as "nothing open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`).
+    let mut paths: Vec<PathBuf> = vec![u.path.clone()];
+    paths.extend(u.members.iter().map(|m| m.path.clone()));
+    match crate::recheck::member_occupancy(&paths) {
+        crate::occupancy::OccupancyState::Free => {}
+        other => return other.refusal(),
     }
     None
 }
@@ -916,16 +946,41 @@ fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
             category,
             session_members,
         }),
+        reviewed: crate::recheck::capture(&u.path).ok(),
     }
 }
 
-/// A single-path Trash move of a cache/log category directory. Re-stats
-/// the path fresh (never trusts the plan's byte count as proof the path
-/// still exists or is still a directory).
-fn execute_agent_cache_trash(path: &Path, trash: &Path, at: u64) -> Result<(PathBuf, u64)> {
-    let meta = fs::symlink_metadata(path).context("path no longer exists")?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
+/// A single-path Trash move of a cache/log category directory.
+///
+/// Before the move it runs the full live-state recheck
+/// (`.oh/guardrails/execution-sinks-recheck-live-state.md`): the
+/// directory must still be the one that was reviewed, with the exact
+/// membership that was reviewed (`reviewed_snapshot`); no human
+/// keep/protect entry may cover it or anything under it, loaded fresh
+/// (`live_protection`); and nothing may hold any member open, where an
+/// unanswerable probe refuses (`member_occupancy`). `is_dir()` alone was
+/// what let a replaced directory spend an old approval.
+fn execute_agent_cache_trash(
+    store_dir: &Path,
+    path: &Path,
+    reviewed: Option<&crate::recheck::ReviewedIdentity>,
+    trash: &Path,
+    at: u64,
+) -> Result<(PathBuf, u64)> {
+    let fresh = crate::recheck::reviewed_snapshot(path, reviewed)?;
+    if !fresh.is_dir {
         bail!("path is no longer a directory (or is a symlink)");
+    }
+    let covered = crate::recheck::covered_paths(&fresh);
+    crate::recheck::live_protection(store_dir, &covered)?;
+    match crate::recheck::member_occupancy(&covered) {
+        crate::occupancy::OccupancyState::Free => {}
+        other => bail!(
+            "{}",
+            other
+                .refusal()
+                .unwrap_or_else(|| "occupancy refused this unit".to_string())
+        ),
     }
     let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
     let basename = path
@@ -1006,9 +1061,11 @@ impl std::error::Error for PartialAgentRemoval {}
 /// that no longer matches at all (the session was already removed,
 /// re-created, or reclassified since the plan was proposed).
 fn execute_agent_session_removal(
+    store_dir: &Path,
     meta: &AgentPlanMeta,
     session_path: &Path,
     planned_members: &[PathBuf],
+    reviewed: Option<&crate::recheck::ReviewedIdentity>,
     trash: &Path,
     at: u64,
 ) -> Result<(PathBuf, u64)> {
@@ -1070,6 +1127,26 @@ fn execute_agent_session_removal(
              propose again"
         );
     }
+    // The shared live-state recheck, over the session's anchor *and*
+    // every member (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
+    // The membership comparison above catches references drifting; this
+    // catches the anchor being replaced, a protect entry added after
+    // approval in either direction, and anything holding a member open
+    // -- including an unanswerable occupancy probe, which refuses.
+    let fresh_identity = crate::recheck::reviewed_snapshot(session_path, reviewed)?;
+    let mut covered = crate::recheck::covered_paths(&fresh_identity);
+    covered.extend(current_members.iter().cloned());
+    crate::recheck::live_protection(store_dir, &covered)?;
+    match crate::recheck::member_occupancy(&covered) {
+        crate::occupancy::OccupancyState::Free => {}
+        other => bail!(
+            "{}",
+            other
+                .refusal()
+                .unwrap_or_else(|| "occupancy refused this unit".to_string())
+        ),
+    }
+
     // Pre-flight: stat every member *before* moving any of them, so the
     // common failure (a member vanished between proposal and execution)
     // is caught before this session is left half-moved. This does not
@@ -1789,19 +1866,19 @@ pub fn execute_with_trash_opts(
         // Agent-storage action (#101): occupancy, reference and identity
         // are all rechecked fresh here, never trusted from the plan.
         if let Some(meta) = &unit.agent_meta {
-            if crate::agents::is_active(&unit.path) {
-                outcome.cause = Some(
-                    "refused: an active process holds this path open (session may be running)"
-                        .into(),
-                );
-                outcomes.push(outcome);
-                continue;
-            }
             let agent_result = match &meta.session_members {
-                Some(planned_members) => {
-                    execute_agent_session_removal(meta, &unit.path, planned_members, trash, at)
+                Some(planned_members) => execute_agent_session_removal(
+                    dir,
+                    meta,
+                    &unit.path,
+                    planned_members,
+                    unit.reviewed.as_ref(),
+                    trash,
+                    at,
+                ),
+                None => {
+                    execute_agent_cache_trash(dir, &unit.path, unit.reviewed.as_ref(), trash, at)
                 }
-                None => execute_agent_cache_trash(&unit.path, trash, at),
             };
             match agent_result {
                 Ok((dest, moved_bytes)) => {
@@ -1903,6 +1980,15 @@ pub fn execute_with_trash_opts(
                 outcomes.push(outcome);
                 continue;
             }
+            // The Cargo group's own recheck lives in
+            // `cargo_cleanup::move_reviewed`, next to the rename it
+            // guards: role, fingerprint, membership, identity and member
+            // *contents* under a held Cargo build lock -- a stronger
+            // identity check than the shared one, affordable because
+            // these are small build outputs with no privacy constraint.
+            // The two thirds it was missing (protection loaded fresh in
+            // both directions, tri-state occupancy) moved in there too,
+            // so one function owns the whole gate.
             ledger.append(&ActionRecord {
                 id: crate::entities::new_id(),
                 verb: crate::grants::Verb::Delete,
@@ -1916,7 +2002,7 @@ pub fn execute_with_trash_opts(
                 observed_path_state: Some("preflight".into()),
                 recorded_at: at,
             })?;
-            match crate::cargo_cleanup::move_reviewed(group, trash) {
+            match crate::cargo_cleanup::move_reviewed(dir, group, unit.reviewed.as_ref(), trash) {
                 Ok(dest) => {
                     outcome.status = "completed".into();
                     outcome.recovery_location = Some(dest);
@@ -1989,18 +2075,38 @@ pub fn execute_with_trash_opts(
             }
             Some(_) => {}
         }
-        // Current-use recheck (#55, #61): the plan's own evidence
-        // snapshot is never trusted here -- a fresh occupancy reading is
-        // taken immediately before acting, so something that opened this
-        // path *after* proposal (changed occupancy facts between
-        // propose and execute) is still caught, not silently missed.
-        if let crate::evidence::FactStatus::Known(crate::evidence::FactValue::Bool(true)) =
-            crate::occupancy::open_file_evidence(&unit.path).status
-        {
-            outcome.cause =
-                Some("refused: an open file handle was found on this path just now — propose again once it is closed".into());
+        // The shared live-state recheck, on the ordinary filesystem path
+        // too (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
+        //
+        // Two findings from the PR #123 review are fixed here together.
+        // The recheck this replaces refused only on `Known(Bool(true))`,
+        // so a permission-denied or unavailable occupancy answer fell
+        // through and *authorized* the removal -- a fail-open gate
+        // replacing a fail-closed one. And human keep/protect intent was
+        // enforced at proposal only, so `swamp protect` added after
+        // approval did not stop an ordinary artifact row being moved.
+        let reviewed_now =
+            match crate::recheck::reviewed_snapshot(&unit.path, unit.reviewed.as_ref()) {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    outcome.cause = Some(e.to_string());
+                    outcomes.push(outcome);
+                    continue;
+                }
+            };
+        let covered = crate::recheck::covered_paths(&reviewed_now);
+        if let Err(e) = crate::recheck::live_protection(dir, &covered) {
+            outcome.cause = Some(e.to_string());
             outcomes.push(outcome);
             continue;
+        }
+        match crate::recheck::member_occupancy(&covered) {
+            crate::occupancy::OccupancyState::Free => {}
+            other => {
+                outcome.cause = other.refusal();
+                outcomes.push(outcome);
+                continue;
+            }
         }
         if keep_executables && unit.verb == "delete" {
             match preserve_executables(&unit.path, &unit.worktree_path) {
@@ -2238,8 +2344,18 @@ mod agent_partial_removal_tests {
             category: "sessions".to_string(),
             session_members: Some(members.clone()),
         };
-        let err = execute_agent_session_removal(&meta, &session_path, &members, trash.path(), at)
-            .expect_err("the last member's rename was deliberately blocked");
+        let store = tempfile::tempdir().unwrap();
+        let reviewed = crate::recheck::capture(&session_path).ok();
+        let err = execute_agent_session_removal(
+            store.path(),
+            &meta,
+            &session_path,
+            &members,
+            reviewed.as_ref(),
+            trash.path(),
+            at,
+        )
+        .expect_err("the last member's rename was deliberately blocked");
         let partial = err
             .downcast_ref::<PartialAgentRemoval>()
             .unwrap_or_else(|| panic!("expected PartialAgentRemoval, got: {err:#}"));

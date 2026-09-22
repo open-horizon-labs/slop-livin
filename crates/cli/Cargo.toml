@@ -12,3 +12,6 @@ swamp-tui = { path = "../tui" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

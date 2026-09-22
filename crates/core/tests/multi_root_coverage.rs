@@ -70,6 +70,7 @@ fn explicit_only_config() -> ScanConfig {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: Vec::new(),
+        enabled_detectors: Vec::new(),
     }
 }
 

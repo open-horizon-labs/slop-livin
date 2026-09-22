@@ -82,6 +82,7 @@ fn only(keep: &[&str]) -> ScanConfig {
             )
             .map(str::to_string)
             .collect(),
+        enabled_detectors: Vec::new(),
     }
 }
 

@@ -671,7 +671,12 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
 /// Execute only behind the caller's existing explicit authorization. All group
 /// members are checked before the first move. Failure rolls back completed
 /// moves where possible, with the recovery envelope retained on disk.
-pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf> {
+pub(crate) fn move_reviewed(
+    store_dir: &Path,
+    group: &CargoGroup,
+    reviewed: Option<&crate::recheck::ReviewedIdentity>,
+    trash: &Path,
+) -> Result<PathBuf> {
     if locks(&group.profile)? != group.lock_paths {
         bail!("Cargo lock set changed; propose again");
     }
@@ -708,9 +713,27 @@ pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf>
         if !same_safety(&snapshot(&m.path)?, m) {
             bail!("stale Cargo member {}; propose again", m.path.display());
         }
-        if occupied(&m.path) {
-            bail!("occupied or occupancy unavailable: {}", m.path.display());
-        }
+    }
+    // The shared live-state recheck, after the Cargo-specific checks so
+    // their more precise messages come first
+    // (`.oh/guardrails/execution-sinks-recheck-live-state.md`). The
+    // selected path's own identity is re-confirmed against what was
+    // reviewed; human keep/protect intent is loaded *fresh* here, in
+    // both directions, which it never was before; and occupancy is
+    // tri-state over every member, so a probe that could not run refuses
+    // instead of reading as "nothing open".
+    let mut covered: Vec<PathBuf> = group.members.iter().map(|m| m.path.clone()).collect();
+    let fresh = crate::recheck::reviewed_snapshot(&group.selected, reviewed)?;
+    covered.extend(crate::recheck::covered_paths(&fresh));
+    crate::recheck::live_protection(store_dir, &covered)?;
+    match crate::recheck::member_occupancy(&covered) {
+        crate::occupancy::OccupancyState::Free => {}
+        other => bail!(
+            "{}",
+            other
+                .refusal()
+                .unwrap_or_else(|| "occupancy refused this group".to_string())
+        ),
     }
     fs::create_dir_all(trash)?;
     if fs::metadata(trash)?.dev() != group.members[0].device {
@@ -744,41 +767,4 @@ pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf>
         moved.push((member.path.clone(), to));
     }
     Ok(dest)
-}
-
-fn occupied(path: &Path) -> bool {
-    let mut cmd = std::process::Command::new("lsof");
-    if path.is_dir() {
-        cmd.arg("+D").arg(path);
-    } else {
-        cmd.arg("--").arg(path);
-    }
-    // Bound the occupancy probe and avoid pipe backpressure. Any diagnostic,
-    // timeout, or launch failure refuses cleanup.
-    let Ok(output) = tempfile::tempfile() else {
-        return true;
-    };
-    let (Ok(stdout), Ok(stderr)) = (output.try_clone(), output.try_clone()) else {
-        return true;
-    };
-    let Ok(mut child) = cmd.stdout(stdout).stderr(stderr).spawn() else {
-        return true;
-    };
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return !(status.code() == Some(1)
-                    && output.metadata().map(|m| m.len() == 0).unwrap_or(false));
-            }
-            Ok(None) if started.elapsed() < std::time::Duration::from_secs(10) => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return true;
-            }
-        }
-    }
 }

@@ -1040,7 +1040,11 @@ fn propose_unified(
             }
             None => None,
         };
-        let protected = swamp_core::agents::protect_list(&store_dir).unwrap_or_default();
+        // Fail closed: unreadable or malformed protection state is
+        // *unknown*, and proposing against an empty keep list would
+        // silently unprotect every artifact row
+        // (`.oh/guardrails/protection-fails-closed.md`).
+        let protected = swamp_core::agents::protect_list(&store_dir)?;
         let plan = swamp_core::actions::propose_checking_protection(
             &r,
             parsed.as_ref(),

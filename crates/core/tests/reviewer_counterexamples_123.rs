@@ -145,10 +145,7 @@ fn current_use_evidence_for_a_unit_must_cover_the_contents_it_would_remove() {
     // Precondition: lsof works here and does see the open member.
     let member_fact = swamp_core::occupancy::open_file_evidence(&member);
     assert!(
-        matches!(
-            member_fact.status,
-            FactStatus::Known(FactValue::Bool(true))
-        ),
+        matches!(member_fact.status, FactStatus::Known(FactValue::Bool(true))),
         "precondition: lsof must see the open member itself, got {:?}",
         member_fact.status
     );
@@ -330,12 +327,10 @@ fn a_second_unchanged_pass_must_not_respawn_plutil_for_every_derived_data_folder
     );
     let previous = shadow_path_with(shim_dir.path());
 
-    swamp_core::consumer_wiring::attach_associations(
-        &mut report,
-        &mut units,
-        Some(store.path()),
-    );
-    let after_first = fs::read_to_string(&counter).map(|t| t.lines().count()).unwrap_or(0);
+    swamp_core::consumer_wiring::attach_associations(&mut report, &mut units, Some(store.path()));
+    let after_first = fs::read_to_string(&counter)
+        .map(|t| t.lines().count())
+        .unwrap_or(0);
 
     // Nothing changed: same tree, same units, same store (so any
     // persisted cache is in place).
@@ -344,12 +339,10 @@ fn a_second_unchanged_pass_must_not_respawn_plutil_for_every_derived_data_folder
         swamp_core::locations::StorageCategory::BuildOutput,
         &derived,
     )];
-    swamp_core::consumer_wiring::attach_associations(
-        &mut report,
-        &mut units2,
-        Some(store.path()),
-    );
-    let after_second = fs::read_to_string(&counter).map(|t| t.lines().count()).unwrap_or(0);
+    swamp_core::consumer_wiring::attach_associations(&mut report, &mut units2, Some(store.path()));
+    let after_second = fs::read_to_string(&counter)
+        .map(|t| t.lines().count())
+        .unwrap_or(0);
     restore_path(previous);
 
     assert!(
@@ -389,7 +382,11 @@ fn rendered_reclaimability_must_distinguish_allocated_from_estimated_reclaimable
         },
     );
     let lines = swamp_core::render::render_evidence_lines(&facts);
-    assert_eq!(lines.len(), 2, "allocated + estimated reclaimable: {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "allocated + estimated reclaimable: {lines:?}"
+    );
     assert_ne!(
         lines[0], lines[1],
         "a reader must be able to tell allocated bytes from estimated reclaimable bytes; \

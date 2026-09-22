@@ -90,6 +90,7 @@ fn real_units_with_canary_content() -> (Report, PathBuf, Vec<swamp_core::agents:
         .into_iter()
         .map(str::to_string)
         .collect(),
+        enabled_detectors: Vec::new(),
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1_000);
     let store = tempfile::tempdir().unwrap();

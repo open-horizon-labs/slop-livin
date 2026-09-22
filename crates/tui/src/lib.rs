@@ -164,6 +164,31 @@ fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> 
     swamp_core::growth::history_span_secs(&dir, now)
 }
 
+/// The authorized scope for this invocation, resolved once from the
+/// stored config plus whatever explicit roots the command named.
+///
+/// `explicit_roots` is passed through rather than dropped: re-resolving
+/// with an empty explicit-root list is how `swamp ui <one-project>`
+/// quietly widened itself back out to the whole configured catalog for
+/// external/agent discovery (the review's scope finding). `None` when
+/// there is no readable config, which every caller treats as "cannot
+/// observe" rather than "observe everything".
+fn resolved_scope(
+    store: &Path,
+    explicit_roots: &[PathBuf],
+) -> Option<swamp_core::scope::EffectiveScope> {
+    let cfg = swamp_core::growth::load_config_checked(store).ok()?;
+    let env = swamp_core::locations::Environment::from_process();
+    let registry = swamp_core::locations::Registry::with_builtins();
+    Some(swamp_core::scope::resolve_effective_scope(
+        &env,
+        &cfg.scan,
+        explicit_roots,
+        &registry,
+        swamp_core::entities::now(),
+    ))
+}
+
 fn store_dir() -> PathBuf {
     if let Ok(d) = std::env::var("SWAMP_DIR") {
         return PathBuf::from(d);
@@ -175,6 +200,13 @@ fn store_dir() -> PathBuf {
 pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     let store = store_dir();
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // The authorized scope for this invocation, resolved once with the
+    // explicit root the user named. Every observation below -- the
+    // startup walk, the background refresh, later live refreshes --
+    // goes through it, so an exclusion applies to all of them and not
+    // just to whichever one happened to be written first
+    // (`.oh/guardrails/tui-refresh-preserves-scope.md`).
+    let scope = resolved_scope(&store, std::slice::from_ref(&root));
     // Paint the last cached report immediately (milliseconds); observe in
     // the background and swap the result in. With no cache yet, the first
     // observation has to happen before there is anything to show.
@@ -189,29 +221,51 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             let mut a = App::new(r, root.clone());
             a.observed_label = "from last observation".into();
             a.observing = Some((0, 0));
+            a.scope = scope.clone();
             let (tx, rx) = std::sync::mpsc::channel();
-            let (root2, store2) = (root.clone(), store.clone());
+            let (scope2, store2) = (scope.clone(), store.clone());
             std::thread::spawn(move || {
+                let Some(scope2) = scope2 else {
+                    let _ = tx.send(Ok(app::RefreshedObservation {
+                        per_root: Vec::new(),
+                        external_units: None,
+                        agent_units: None,
+                    }));
+                    return;
+                };
                 // include_dirs: the Source row expands into its own
                 // directories, so the startup observe must produce them
                 // too or the first report shows `source` with no children.
-                let res = swamp_core::report::report_with_dirs(
-                    &root2,
+                let res = swamp_core::report::observe_scope(
+                    &scope2,
                     None,
                     false,
                     Some(&store2),
                     None,
                     true,
+                    true,
+                    false,
+                    false,
+                    swamp_core::fs_events::platform_source().as_ref(),
+                    30,
+                    24 * 3600,
                 )
-                .map(|r| vec![(root2.clone(), r)]);
+                .map(|o| app::RefreshedObservation {
+                    per_root: o.per_root.into_iter().collect(),
+                    external_units: Some(o.external_units),
+                    agent_units: Some(o.agent_units),
+                });
                 let _ = tx.send(res);
             });
             a.pending = Some(rx);
             a
         }
         None => {
-            let report = swamp_core::report::report_full_mode(
-                &root,
+            let scope_now = scope.clone().ok_or_else(|| {
+                anyhow::anyhow!("could not resolve a scope for {}", root.display())
+            })?;
+            let observation = swamp_core::report::observe_scope(
+                &scope_now,
                 None,
                 false,
                 Some(&store),
@@ -220,10 +274,18 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                 true, // include_dirs: Source rows expand into their own directories
                 false,
                 false,
+                swamp_core::fs_events::platform_source().as_ref(),
+                30,
+                24 * 3600,
             )?;
-            App::new(report, root.clone())
+            let mut a = App::new(observation.merged, root.clone());
+            a.reports_by_root = observation.per_root;
+            a.set_external_units(observation.external_units);
+            a.set_agent_units(observation.agent_units);
+            a
         }
     };
+    app.scope = scope.clone();
     // The header's coverage clause is about *this report's own* root,
     // not the wider configured-scope catalog `finish_startup` resolves
     // for external/agent-unit discovery (same split the CLI's `report
@@ -277,7 +339,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
         !present_roots.is_empty(),
         "swamp_tui::run_scope requires at least one present root in scope"
     );
-    let (merged, coverage, per_root) = swamp_core::report::report_scope_with_parts(
+    let observation = swamp_core::report::observe_scope(
         scope,
         None,
         false,
@@ -288,9 +350,15 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
         false,
         false,
         swamp_core::fs_events::platform_source().as_ref(),
+        30,
+        24 * 3600,
     )?;
-    let mut app = App::new_multi_root(merged, present_roots);
-    app.reports_by_root = per_root;
+    let coverage = observation.coverage;
+    let mut app = App::new_multi_root(observation.merged, present_roots);
+    app.reports_by_root = observation.per_root;
+    app.set_external_units(observation.external_units);
+    app.set_agent_units(observation.agent_units);
+    app.scope = Some(scope.clone());
     app.observed_label = "just now".into();
     finish_startup(&mut app, &store, no_observe, Some(&coverage));
     run_terminal_loop(&mut app)
@@ -346,63 +414,12 @@ fn finish_startup(
     coverage: Option<&[swamp_core::coverage::RootCoverage]>,
 ) {
     app.store_dir = Some(store.to_path_buf());
-    // External/agent-tool storage (#43/#91/#100): resolved once here, at
-    // startup, alongside the initial report load above -- never on the
-    // event/render loop this function is about to enter. Detector
-    // resolution and measurement are disk I/O with the same cost shape
-    // as the report observation just above it.
-    if let Ok(cfg) = swamp_core::growth::load_config_checked(store) {
-        let env = swamp_core::locations::Environment::from_process();
-        let registry = swamp_core::locations::Registry::with_builtins();
-        let detector_scope = swamp_core::scope::resolve_effective_scope(
-            &env,
-            &cfg.scan,
-            &[],
-            &registry,
-            swamp_core::entities::now(),
-        );
-        let retention_days = cfg.retention_days;
-        if let Ok(mut units) = swamp_core::external::discover_and_measure(
-            &detector_scope,
-            Some(store),
-            !no_observe,
-            swamp_core::entities::now(),
-            retention_days,
-            24 * 3600,
-        ) {
-            // Live tool-version/dependency association wiring (#56/#57):
-            // `app.report` is already loaded above, at this same startup
-            // point -- see `consumer_wiring`'s own module doc for why
-            // this join lives here rather than inside the bus.
-            swamp_core::consumer_wiring::attach_associations(
-                &mut app.report,
-                &mut units,
-                Some(store),
-            );
-            app.set_external_units(units);
-        }
-        // Aider's per-repo units (#96) need every known worktree root;
-        // `app.report` is already loaded above, at this same startup
-        // point, so no extra walk is needed to supply them.
-        let project_worktrees: Vec<std::path::PathBuf> = app
-            .report
-            .projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .map(|wt| wt.path.clone())
-            .collect();
-        if let Ok(units) = swamp_core::agents::discover_and_measure(
-            &detector_scope,
-            &project_worktrees,
-            Some(store),
-            !no_observe,
-            swamp_core::entities::now(),
-            retention_days,
-            24 * 3600,
-        ) {
-            app.set_agent_units(units);
-        }
-    }
+    // External/agent-tool storage is no longer discovered here. It
+    // arrives from the same `report::observe_scope` pass that produced
+    // the report, and is refreshed by every later observation -- the
+    // review found this function was the *only* production caller that
+    // ever set those vectors, so the agents view could be arbitrarily
+    // stale while the header said the report was live.
     if let Some(c) = coverage {
         app.set_scope_note(c);
     }
@@ -462,12 +479,20 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             app.pending = None;
             app.observing = None;
             match res {
-                Ok(pairs) => {
+                Ok(fresh) => {
                     // Each pair replaces exactly its own root's entry
                     // (#51): a live/background refresh of one or more
                     // roots never touches any other root's rows.
-                    for (root, r) in pairs {
+                    for (root, r) in fresh.per_root {
                         app.replace_report_for_root(root, r);
+                    }
+                    // External and agent units come from the same pass,
+                    // so the agent view is never older than the header.
+                    if let Some(units) = fresh.external_units {
+                        app.set_external_units(units);
+                    }
+                    if let Some(units) = fresh.agent_units {
+                        app.set_agent_units(units);
                     }
                     app.observed_label = "just now".into();
                 }

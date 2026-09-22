@@ -35,6 +35,7 @@ fn only_claude_code_config() -> ScanConfig {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["cargo-home".into(), "rustup".into(), "homebrew".into()],
+        enabled_detectors: Vec::new(),
     }
 }
 

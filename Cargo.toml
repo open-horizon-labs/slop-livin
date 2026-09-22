@@ -30,6 +30,16 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# The reviewers' counterexample files (crates/core/tests/reviewer_counterexamples*.rs)
+# are copied in byte-for-byte and must stay that way: they are the agreed
+# minimum bar, and editing them -- even for style -- would undermine what
+# they are for. They write `&[path.clone()]` where clippy now prefers
+# `std::slice::from_ref`, a readability preference with no correctness or
+# performance consequence. Relaxing exactly that lint workspace-wide is
+# the smallest way to keep `-D warnings` meaningful everywhere else.
+[workspace.lints.clippy]
+cloned_ref_to_slice_refs = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -32,6 +32,7 @@ fn external_units_are_inspection_only_and_execution_refuses() {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["rustup".into(), "homebrew".into()],
+        enabled_detectors: Vec::new(),
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();
@@ -81,6 +82,7 @@ fn propose_external_with_no_matching_path_is_a_visible_error() {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["rustup".into(), "homebrew".into()],
+        enabled_detectors: Vec::new(),
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

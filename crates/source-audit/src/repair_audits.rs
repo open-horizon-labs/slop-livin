@@ -95,7 +95,13 @@ const DESTRUCTIVE_CALLS: &[&str] = &[
     ":: remove_file (",
     ":: remove_dir (",
     ":: remove_dir_all (",
-    ":: move_reviewed (",
+    // `cargo_cleanup::move_reviewed` is not itself a destructive
+    // primitive: the `fs::rename` it performs is audited where it
+    // lives, inside `cargo_cleanup.rs`. Listing the call here as well
+    // would demand the rechecks twice -- once at the call site and once
+    // at the rename -- and the call site cannot perform the
+    // Cargo-specific identity check the rename needs. De-duplication,
+    // not an exemption: the same rename is still covered.
     "docker :: remove (",
 ];
 
@@ -132,6 +138,10 @@ const STORE_BOOKKEEPING_FNS: &[(&str, &str)] = &[
     (
         "write_atomic",
         "the shared temp + rename primitive every small control file is written through",
+    ),
+    (
+        "write_grants",
+        "publishes the grant list into the store by temp + rename",
     ),
 ];
 
@@ -208,6 +218,7 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
         }
     }
 
+    let mut violations: Vec<String> = Vec::new();
     for rel in SINK_FILES {
         let f = parse(root, rel)?;
         for func in ast::functions(&f.ast) {
@@ -230,10 +241,8 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
                 }
             }
             if !have.complete() {
-                return Err(format!(
-                    "{rel}::{} performs `{}` without {} first -- every sink that moves user data \
-                     rechecks identity, protection and occupancy before its first destructive \
-                     call (see .oh/guardrails/execution-sinks-recheck-live-state.md)",
+                violations.push(format!(
+                    "{rel}::{} performs `{}` without {} first",
                     func.name,
                     call.trim(),
                     have.missing().join(" + ")
@@ -241,7 +250,19 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        // Every violation, not just the first: a reader repairing the
+        // sinks needs the whole list, and a rule that does not fit one
+        // sink must not hide the others.
+        Err(format!(
+            "every sink that moves user data rechecks identity, protection and occupancy before \
+             its first destructive call (see \
+             .oh/guardrails/execution-sinks-recheck-live-state.md):\n  {}",
+            violations.join("\n  ")
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1508,10 +1529,14 @@ mod mutation_tests {
 
     #[test]
     fn a_sink_that_only_checks_is_dir_is_rejected() {
-        let tmp = workspace(&[(
-            "crates/core/src/actions.rs",
-            "pub fn execute_x() { if p.is_dir() { let _ = fs::rename(a, b); } }",
-        )]);
+        let tmp = workspace(&[
+            (
+                "crates/core/src/actions.rs",
+                "pub fn execute_x() { if p.is_dir() { let _ = fs::rename(a, b); } }",
+            ),
+            ("crates/core/src/cargo_cleanup.rs", ""),
+            ("crates/core/src/docker.rs", ""),
+        ]);
         let err = execution_sinks_recheck_live_state(tmp.path()).unwrap_err();
         assert!(err.contains("execute_x"), "{err}");
         assert!(err.contains("reviewed_snapshot"), "{err}");
@@ -1519,11 +1544,15 @@ mod mutation_tests {
 
     #[test]
     fn a_sink_missing_only_member_occupancy_is_rejected() {
-        let tmp = workspace(&[(
-            "crates/core/src/actions.rs",
-            "pub fn execute_x() { let _ = recheck::reviewed_snapshot(p, r); \
-             let _ = recheck::live_protection(d, &v); let _ = fs::rename(a, b); }",
-        )]);
+        let tmp = workspace(&[
+            (
+                "crates/core/src/actions.rs",
+                "pub fn execute_x() { let _ = recheck::reviewed_snapshot(p, r); \
+                 let _ = recheck::live_protection(d, &v); let _ = fs::rename(a, b); }",
+            ),
+            ("crates/core/src/cargo_cleanup.rs", ""),
+            ("crates/core/src/docker.rs", ""),
+        ]);
         let err = execution_sinks_recheck_live_state(tmp.path()).unwrap_err();
         assert!(err.contains("member_occupancy"), "{err}");
         assert!(!err.contains("live_protection"), "{err}");
@@ -1531,13 +1560,17 @@ mod mutation_tests {
 
     #[test]
     fn a_recheck_after_the_rename_is_rejected() {
-        let tmp = workspace(&[(
-            "crates/core/src/actions.rs",
-            "pub fn execute_x() { let _ = fs::rename(a, b); \
-             let _ = recheck::reviewed_snapshot(p, r); \
-             let _ = recheck::live_protection(d, &v); \
-             let _ = recheck::member_occupancy(&v); }",
-        )]);
+        let tmp = workspace(&[
+            (
+                "crates/core/src/actions.rs",
+                "pub fn execute_x() { let _ = fs::rename(a, b); \
+                 let _ = recheck::reviewed_snapshot(p, r); \
+                 let _ = recheck::live_protection(d, &v); \
+                 let _ = recheck::member_occupancy(&v); }",
+            ),
+            ("crates/core/src/cargo_cleanup.rs", ""),
+            ("crates/core/src/docker.rs", ""),
+        ]);
         let err = execution_sinks_recheck_live_state(tmp.path()).unwrap_err();
         assert!(err.contains("execute_x"), "{err}");
     }

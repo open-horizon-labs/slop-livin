@@ -51,6 +51,7 @@ pub mod matrix;
 pub mod oh_my_pi;
 pub mod opencode;
 pub mod pi;
+pub mod pi_family;
 pub mod roo_code;
 pub mod vscode_family;
 pub mod windsurf;
@@ -482,23 +483,81 @@ pub fn worktree_root_containing(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ProtectFile {
     /// Canonical absolute paths a human explicitly asked to keep.
     paths: Vec<String>,
 }
 
-fn protect_path(swamp_dir: &Path) -> PathBuf {
+pub fn protect_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("agent_protect.json")
 }
 
-fn load_protect(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
-    match fs::read_to_string(protect_path(swamp_dir)) {
+/// The single entry point for protection state
+/// (`.oh/guardrails/protection-fails-closed.md`). An absent file is an
+/// empty keep list -- the ordinary "nothing protected yet" case. A file
+/// that exists but cannot be read or parsed is **not**: protection state
+/// is then *unknown*, and every caller must fail closed rather than
+/// proceed as if nothing were protected. Returning `Result` (and the
+/// `protection_fails_closed` audit forbidding `.unwrap_or_default()` and
+/// friends on it) is what makes that structural instead of a convention.
+pub fn load_protect(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
+    let path = protect_path(swamp_dir);
+    match fs::read_to_string(&path) {
         Ok(text) => {
-            let f: ProtectFile = serde_json::from_str(&text).unwrap_or_default();
+            let f: ProtectFile = serde_json::from_str(&text).map_err(|e| {
+                anyhow::anyhow!(
+                    "protection state unknown: {} is malformed ({e}). Every action is refused \
+                     until it is repaired or removed; `swamp protect list` shows this same error.",
+                    path.display()
+                )
+            })?;
+            for p in &f.paths {
+                if p.trim().is_empty() {
+                    anyhow::bail!(
+                        "protection state unknown: {} contains an empty path entry. Every action \
+                         is refused until it is repaired or removed.",
+                        path.display()
+                    );
+                }
+            }
             Ok(f.paths.into_iter().map(PathBuf::from).collect())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(anyhow::anyhow!(
+            "protection state unknown: {} could not be read ({e}). Every action is refused \
+             until it can be read again.",
+            path.display()
+        )),
+    }
+}
+
+/// Writes `bytes` to `path` through a temp file in the same directory
+/// plus a rename, so a reader never sees a half-written file and a
+/// crash mid-write never turns protection state into an empty list.
+/// Used by every writer of a small control file under the store.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("control"),
+        std::process::id()
+    ));
+    fs::write(&tmp, bytes)?;
+    // Durability before the rename: a rename that wins the race with an
+    // unflushed write would publish an empty protect list.
+    if let Ok(f) = fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
     }
 }
 
@@ -507,8 +566,10 @@ fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
     let f = ProtectFile {
         paths: paths.iter().map(|p| p.display().to_string()).collect(),
     };
-    fs::write(protect_path(swamp_dir), serde_json::to_string_pretty(&f)?)?;
-    Ok(())
+    write_atomic(
+        &protect_path(swamp_dir),
+        serde_json::to_string_pretty(&f)?.as_bytes(),
+    )
 }
 
 /// Adds `path` to the human keep list, used verbatim (never
@@ -542,13 +603,42 @@ pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
     load_protect(swamp_dir)
 }
 
-/// Whether `path`, or any of `unit_paths` (a unit's own members), falls
-/// under a human-protected path (exact match or protected-path is an
-/// ancestor).
-fn is_human_protected(protected: &[PathBuf], candidate: &Path) -> bool {
-    protected
-        .iter()
-        .any(|p| candidate == p || candidate.starts_with(p))
+/// Whether human keep/protect intent covers `candidate` in **either**
+/// direction (`.oh/guardrails/protection-fails-closed.md`):
+///
+/// * `candidate` is the protected path or lies beneath it -- the
+///   original, obvious direction; and
+/// * a protected path lies beneath `candidate` -- the direction the
+///   2026-09-21 review's `protected_descendant_must_prevent_parent_cache_proposal`
+///   counterexample falsified. Protecting `debug/log.txt` and then
+///   removing `debug/` destroys exactly what the human asked to keep, so
+///   a unit *containing* a protected path is protected too.
+///
+/// A one-directional check is a guardrail violation the
+/// `protection_fails_closed` audit rejects.
+pub fn is_human_protected(protected: &[PathBuf], candidate: &Path) -> bool {
+    protection_conflict(protected, candidate).is_some()
+}
+
+/// The reason human keep/protect intent blocks `candidate`, or `None`.
+/// Carries which direction matched so a refusal can say *why*.
+pub fn protection_conflict(protected: &[PathBuf], candidate: &Path) -> Option<String> {
+    for p in protected {
+        if candidate == p {
+            return Some(format!("{} is kept by `swamp protect`", p.display()));
+        }
+        if candidate.starts_with(p) {
+            return Some(format!(
+                "{} is beneath the human-protected path {}",
+                candidate.display(),
+                p.display()
+            ));
+        }
+        if p.starts_with(candidate) {
+            return Some(format!("contains human-protected path {}", p.display()));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------
@@ -612,12 +702,58 @@ fn multi_location_tool(tool_id: &str) -> bool {
     matches!(tool_id, cline::CLINE_TOOL_ID | roo_code::ROO_CODE_TOOL_ID)
 }
 
+/// Every tool home the *authorized* scope lets this pass identify, as
+/// `(tool_id, home)`.
+///
+/// This replaces the old loop over `scope.detectors`' raw `Resolved`
+/// candidates, which never saw exclusions, disabled detectors or
+/// explicit-root replacement -- the review's
+/// `excluded_agent_home_must_not_be_scanned` counterexample. Only
+/// `crate::scope` interprets detector output now
+/// (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+///
+/// A tool whose storage can live in several editor hosts at once
+/// (`multi_location_tool`) contributes every authorized location; every
+/// other tool contributes its first, matching the pre-existing contract.
+fn authorized_tool_homes(scope: &EffectiveScope) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen_single: HashSet<String> = HashSet::new();
+    let mut push = |tool_id: String, path: PathBuf, out: &mut Vec<(String, PathBuf)>| {
+        if multi_location_tool(&tool_id) {
+            if !out.iter().any(|(t, p)| t == &tool_id && p == &path) {
+                out.push((tool_id, path));
+            }
+        } else if seen_single.insert(tool_id.clone()) {
+            out.push((tool_id, path));
+        }
+    };
+    let roots = if scope.explicit {
+        scope.authorized_detector_paths_in_explicit_roots()
+    } else {
+        scope.authorized_roots().0
+    };
+    for root in roots {
+        if let Some(tool_id) = root.detector_id {
+            push(tool_id, root.path, &mut out);
+        }
+    }
+    out
+}
+
+/// The display name the authorized scope carries for this tool. Falls
+/// back to the id: a name is presentation, and an unnamed tool is
+/// better than a discovery pass reaching back into detector output for
+/// one (`.oh/guardrails/discovery-consumes-effective-scope.md`).
 fn tool_name_for(tool_id: &str, scope: &EffectiveScope) -> String {
-    scope
-        .detectors
-        .iter()
-        .find(|d| d.detector_id == tool_id)
-        .map(|d| d.name.clone())
+    let roots = if scope.explicit {
+        scope.authorized_detector_paths_in_explicit_roots()
+    } else {
+        scope.authorized_roots().0
+    };
+    roots
+        .into_iter()
+        .find(|r| r.detector_id.as_deref() == Some(tool_id))
+        .and_then(|r| r.detector_name)
         .unwrap_or_else(|| tool_id.to_string())
 }
 
@@ -637,47 +773,47 @@ pub fn discover_and_measure(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<Vec<AgentUnit>> {
-    let protected_paths = swamp_dir.map(load_protect).transpose()?.unwrap_or_default();
+    // Protection state is consulted here and again, freshly, at every
+    // sink. Corrupt/unreadable state is *unknown*, not empty: rather
+    // than fail the whole report, every unit is marked protected with
+    // that reason, so identification still works and nothing is
+    // proposable (`.oh/guardrails/protection-fails-closed.md`).
+    let (protected_paths, protection_unknown): (Vec<PathBuf>, Option<String>) = match swamp_dir {
+        Some(dir) => match load_protect(dir) {
+            Ok(p) => (p, None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        },
+        None => (Vec::new(), None),
+    };
 
     let mut candidates_by_key: HashMap<String, (String, PathBuf, CandidateAgentUnit, u64)> =
         HashMap::new();
     let mut observed: Vec<ObservedExternal> = Vec::new();
+    let mut covered_roots: Vec<PathBuf> = Vec::new();
 
-    for summary in &scope.detectors {
-        let resolved_locations = summary
-            .locations
-            .iter()
-            .filter(|l| l.status == crate::locations::LocationStatus::Resolved);
-        let homes: Vec<&Path> = if multi_location_tool(&summary.detector_id) {
-            resolved_locations
-                .filter_map(|l| l.path.as_deref())
-                .collect()
-        } else {
-            resolved_locations
-                .filter_map(|l| l.path.as_deref())
-                .take(1)
-                .collect()
+    // Authorized scope only: a tool home the user excluded, or whose
+    // detector is disabled, or that lies outside an explicit command
+    // root, is not discovered at all
+    // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+    for (tool_id, home) in authorized_tool_homes(scope) {
+        let tool_name = tool_name_for(&tool_id, scope);
+        let Some(units) = identify_for_tool(&tool_id, &home, observed_at) else {
+            continue;
         };
-        let tool_name = tool_name_for(&summary.detector_id, scope);
-        for home in homes {
-            let Some(units) = identify_for_tool(&summary.detector_id, home, observed_at) else {
-                continue;
-            };
-            let device = device_of(home);
-            for cand in units {
-                let key = unit_key(&summary.detector_id, cand.category, device, &cand.path);
-                observed.push(ObservedExternal {
-                    key: key.clone(),
-                    detector_id: summary.detector_id.clone(),
-                    category: cand.category.key_str(),
-                    device,
-                    path: cand.path.display().to_string(),
-                    bytes: cand.bytes,
-                    hardlinked: true,
-                });
-                candidates_by_key
-                    .insert(key, (tool_name.clone(), home.to_path_buf(), cand, device));
-            }
+        covered_roots.push(home.clone());
+        let device = device_of(&home);
+        for cand in units {
+            let key = unit_key(&tool_id, cand.category, device, &cand.path);
+            observed.push(ObservedExternal {
+                key: key.clone(),
+                detector_id: tool_id.clone(),
+                category: cand.category.key_str(),
+                device,
+                path: cand.path.display().to_string(),
+                bytes: cand.bytes,
+                hardlinked: true,
+            });
+            candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
         }
     }
 
@@ -688,18 +824,16 @@ pub fn discover_and_measure(
     // `aider` detector itself is disabled, so disabling a detector
     // always turns off everything it would otherwise identify, home-
     // level or project-local alike.
-    let aider_disabled = scope
-        .detectors
-        .iter()
-        .find(|d| d.detector_id == aider::AIDER_TOOL_ID)
-        .is_some_and(|d| {
-            d.locations
-                .iter()
-                .any(|l| l.status == crate::locations::LocationStatus::Disabled)
-        });
-    if !aider_disabled {
+    //
+    // "Enabled" is now decided by the authorized scope, not by reading
+    // the detector's own status: an excluded Aider home, a disabled
+    // detector, or an explicit-root invocation that does not reach it
+    // all mean the same thing here -- no Aider units.
+    let aider_enabled = scope.detector_enabled(aider::AIDER_TOOL_ID);
+    if aider_enabled {
         let tool_name = tool_name_for(aider::AIDER_TOOL_ID, scope);
         for wt_path in project_worktrees {
+            covered_roots.push(wt_path.clone());
             let device = device_of(wt_path);
             for cand in aider::identify_repo_units(wt_path, observed_at) {
                 let key = unit_key(aider::AIDER_TOOL_ID, cand.category, device, &cand.path);
@@ -717,11 +851,19 @@ pub fn discover_and_measure(
         }
     }
 
+    // This observation owns only agent-family rows, and only under the
+    // tool homes / worktrees it actually identified this pass. An
+    // external observation running before or after it in the same store
+    // can no longer tombstone these rows, nor these those
+    // (`.oh/guardrails/history-sweeps-are-owned.md`).
+    let ownership =
+        crate::growth::ObservationOwnership::new(crate::growth::KeyFamily::Agent, covered_roots);
     let annotations: HashMap<String, (Option<i64>, u32)> = match swamp_dir {
         Some(dir) if observe => observe_and_annotate_external(
             dir,
             &observed,
             &HashSet::new(),
+            &ownership,
             observed_at,
             retention_days,
             since_secs,
@@ -737,12 +879,19 @@ pub fn discover_and_measure(
     for (key, (tool_name, tool_home, cand, _device)) in candidates_by_key {
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
         let default_protected = cand.category.default_protected();
-        let human_protected = is_human_protected(&protected_paths, &cand.path)
-            || cand
-                .members
+        // Both directions (`protection_conflict`): a unit beneath a
+        // protected path, *and* a unit containing one. The latter is the
+        // review's `protected_descendant_must_prevent_parent_cache_proposal`
+        // counterexample -- protecting `debug/log.txt` must stop `debug/`
+        // being proposed, or the protection means nothing.
+        let human_protected = protection_conflict(&protected_paths, &cand.path).or_else(|| {
+            cand.members
                 .iter()
-                .any(|m| is_human_protected(&protected_paths, &m.path));
-        let (protected, protect_reason) = if cand.protected {
+                .find_map(|m| protection_conflict(&protected_paths, &m.path))
+        });
+        let (protected, protect_reason) = if let Some(why) = &protection_unknown {
+            (true, Some(format!("protection state unknown: {why}")))
+        } else if cand.protected {
             (true, cand.protect_reason.clone())
         } else if default_protected {
             (
@@ -752,8 +901,8 @@ pub fn discover_and_measure(
                     cand.category.label()
                 )),
             )
-        } else if human_protected {
-            (true, Some("kept by `swamp protect`".to_string()))
+        } else if let Some(reason) = human_protected {
+            (true, Some(reason))
         } else {
             (false, None)
         };

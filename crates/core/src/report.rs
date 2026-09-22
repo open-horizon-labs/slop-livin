@@ -1850,6 +1850,100 @@ pub fn report_scope_with_parts(
     Ok((merged, coverage, per_root))
 }
 
+/// One scope observation's whole result: the merged report, per-root
+/// coverage, each root's own report, and the external and agent units
+/// discovered *in the same pass*.
+pub struct ScopeObservation {
+    pub merged: Report,
+    pub coverage: Vec<crate::coverage::RootCoverage>,
+    pub per_root: std::collections::HashMap<PathBuf, Report>,
+    pub external_units: Vec<crate::external::ExternalUnit>,
+    pub agent_units: Vec<crate::agents::AgentUnit>,
+}
+
+/// The one entry point that observes a scope completely: walk, external
+/// units and agent units, in a single pass with a single ownership.
+///
+/// Two review findings meet here.
+///
+/// *History ownership*: external and agent discovery share one current
+/// table, and running them as separate passes in an order nobody
+/// declared is what let each tombstone the other's rows and invent
+/// regrowth. Running them from one place means the ordering question
+/// does not arise, and each still carries its own
+/// `growth::ObservationOwnership` so it could not matter even if it did.
+///
+/// *TUI staleness*: `finish_startup` was the only production caller that
+/// refreshed the TUI's external/agent unit vectors, so agent storage
+/// could be arbitrarily stale while the header said the report was
+/// live. A refresh that returns all three together cannot update one
+/// without the others.
+#[allow(clippy::too_many_arguments)]
+pub fn observe_scope(
+    scope: &crate::scope::EffectiveScope,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events_source: &dyn crate::fs_events::FsEventsSource,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<ScopeObservation> {
+    let (merged, coverage, per_root) = report_scope_with_parts(
+        scope,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events_source,
+    )?;
+    let observed_at = merged.observed_at;
+    let mut external_units = crate::external::discover_and_measure(
+        scope,
+        store_dir,
+        observe,
+        observed_at,
+        retention_days,
+        since_secs,
+    )
+    .unwrap_or_default();
+    let mut merged = merged;
+    crate::consumer_wiring::attach_associations(&mut merged, &mut external_units, store_dir);
+    // Aider's per-repository units need every known worktree root; the
+    // walk above already produced them, so this costs no extra walk.
+    let project_worktrees: Vec<PathBuf> = merged
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .map(|wt| wt.path.clone())
+        .collect();
+    let agent_units = crate::agents::discover_and_measure(
+        scope,
+        &project_worktrees,
+        store_dir,
+        observe,
+        observed_at,
+        retention_days,
+        since_secs,
+    )
+    .unwrap_or_default();
+    Ok(ScopeObservation {
+        merged,
+        coverage,
+        per_root,
+        external_units,
+        agent_units,
+    })
+}
+
 /// Folds one already-fully-formed single-root [`Report`] `r` into a
 /// running multi-root accumulator `merged` -- the reusable half of
 /// [`report_scope_with_source`]'s per-root merge, factored out (#51) so

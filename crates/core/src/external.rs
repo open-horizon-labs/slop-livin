@@ -23,8 +23,7 @@
 //! `PlanUnit::external_category`. Nothing in this module or in the
 //! detector registry ever authorizes removing external storage.
 
-use crate::locations::{LocationStatus, Provenance, StorageCategory};
-use crate::report::ArtifactKind;
+use crate::locations::{Provenance, StorageCategory};
 use crate::scope::EffectiveScope;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -178,6 +177,40 @@ struct MeasuredUnit {
     hardlinked: bool,
 }
 
+/// Every detector-proposed location the *authorized* scope actually lets
+/// this pass measure. The `builtin-defaults` detector is skipped -- it
+/// proposes ordinary scan roots (`~/src`, ...), not external storage --
+/// so nothing here duplicates `report_scope`'s walked/unowned totals.
+///
+/// Under an explicit-root invocation, detector locations are in scope
+/// only inside the roots the user named
+/// (`EffectiveScope::authorized_detector_paths_in_explicit_roots`), so
+/// `swamp report <some-project> --view external` cannot quietly widen
+/// itself back out to the whole configured catalog.
+fn authorized_candidates(scope: &EffectiveScope) -> Vec<Candidate> {
+    let roots = if scope.explicit {
+        scope.authorized_detector_paths_in_explicit_roots()
+    } else {
+        scope.authorized_roots().0
+    };
+    roots
+        .into_iter()
+        .filter_map(|root| {
+            let detector_id = root.detector_id?;
+            if detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
+                return None;
+            }
+            Some(Candidate {
+                detector_name: root.detector_name.unwrap_or_else(|| detector_id.clone()),
+                detector_id,
+                category: root.category,
+                provenance: root.provenance,
+                path: root.path,
+            })
+        })
+        .collect()
+}
+
 pub fn discover_and_measure(
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
@@ -186,25 +219,20 @@ pub fn discover_and_measure(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<Vec<ExternalUnit>> {
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for summary in &scope.detectors {
-        if summary.detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
-            continue;
-        }
-        for loc in &summary.locations {
-            if loc.status != LocationStatus::Resolved {
-                continue;
-            }
-            let Some(path) = &loc.path else { continue };
-            candidates.push(Candidate {
-                detector_id: summary.detector_id.clone(),
-                detector_name: summary.name.clone(),
-                category: loc.category,
-                provenance: loc.provenance.clone(),
-                path: path.clone(),
-            });
-        }
-    }
+    // Authorized scope only -- never raw detector candidates. The
+    // review's `excluded_agent_home_must_not_be_scanned` counterexample
+    // was exactly this loop reading `scope.detectors` and so never
+    // seeing the user's exclusion
+    // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+    let candidates = authorized_candidates(scope);
+    // Detector display names, captured from the authorized scope before
+    // the candidates are consumed: a coverage note for an unreadable
+    // unit still needs a human-readable tool name, and must not reach
+    // back into detector output for one.
+    let detector_names: HashMap<String, String> = candidates
+        .iter()
+        .map(|c| (c.detector_id.clone(), c.detector_name.clone()))
+        .collect();
 
     // Canonicalize once up front and de-duplicate exact (category,
     // canonical path) repeats -- e.g. a symlinked alias, or two
@@ -262,40 +290,27 @@ pub fn discover_and_measure(
         let device = device_of(&canonical);
         let key = unit_key(&detector_id, category, device, &canonical);
 
-        match fs::symlink_metadata(&canonical) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Genuinely absent: no candidate this pass. If it was
-                // measured before, the growth store's own not-seen sweep
-                // tombstones it correctly (a real removal, e.g. the tool
-                // was uninstalled and its whole home deleted).
-                continue;
-            }
-            Err(_) => {
-                // Exists but could not be statted (permission on a
-                // parent directory): protect it from tombstoning, same
-                // contract as #42's `compute_unconfirmed_worktrees`, and
-                // skip measuring it this pass rather than guessing.
+        // Access and measurement both go through the one folded
+        // measurement seam; nothing in this module lists a directory or
+        // re-sizes a tree itself
+        // (`.oh/guardrails/no-second-traversal-on-report-path.md`).
+        match crate::folded_measurement::access(&canonical) {
+            // Genuinely absent: no candidate this pass. If it was
+            // measured before, this observation's own owned sweep
+            // tombstones it correctly (a real removal, e.g. the tool was
+            // uninstalled and its whole home deleted).
+            crate::folded_measurement::UnitAccess::Absent => continue,
+            // Present but not readable this pass: protect it from
+            // tombstoning, and skip measuring rather than guessing.
+            // Coverage is incomplete, which is not a storage change.
+            crate::folded_measurement::UnitAccess::Unreadable(_) => {
                 protected_keys.insert(key);
                 continue;
             }
-            Ok(meta) if meta.is_dir() && fs::read_dir(&canonical).is_err() => {
-                // `stat` succeeds (traversal to the path itself needs
-                // only the *parent's* execute bit) but the directory's
-                // own contents cannot be listed (e.g. `chmod 000`): the
-                // path still exists, it just cannot be measured this
-                // pass. Same protection as the case above.
-                protected_keys.insert(key);
-                continue;
-            }
-            Ok(_) => {}
+            crate::folded_measurement::UnitAccess::Measurable => {}
         }
 
-        let row = crate::walk::resize_artifact_excluding(
-            &canonical,
-            ArtifactKind::Unknown,
-            observed_at,
-            &nested_exclusions,
-        );
+        let row = crate::folded_measurement::measure(&canonical, &nested_exclusions, observed_at);
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),
             detector_id: detector_id.clone(),
@@ -319,11 +334,21 @@ pub fn discover_and_measure(
         );
     }
 
+    // Only the regions this pass actually measured completely may be
+    // swept for disappearances, and only in this family's rows. A root
+    // that was excluded, whose detector was disabled, or that could not
+    // be read contributes nothing here, so nothing under it is
+    // tombstoned (`.oh/guardrails/history-sweeps-are-owned.md`).
+    let ownership = crate::growth::ObservationOwnership::new(
+        crate::growth::KeyFamily::External,
+        meta_by_key.values().map(|m| m.path.clone()).collect(),
+    );
     let annotations: HashMap<String, (Option<i64>, u32)> = match swamp_dir {
         Some(dir) if observe => crate::growth::observe_and_annotate_external(
             dir,
             &observed,
             &protected_keys,
+            &ownership,
             observed_at,
             retention_days,
             since_secs,
@@ -393,11 +418,11 @@ pub fn discover_and_measure(
             let evidence = consumers_evidence(&consumers);
             units.push(ExternalUnit {
                 detector_id: detector_id.clone(),
-                detector_name: scope
-                    .detectors
-                    .iter()
-                    .find(|d| d.detector_id == detector_id)
-                    .map(|d| d.name.clone())
+                // The authorized scope already told us this detector's
+                // name; never read detector output back for a label.
+                detector_name: detector_names
+                    .get(&detector_id)
+                    .cloned()
                     .unwrap_or_else(|| detector_id.clone()),
                 category: category_from_str(&category_s).unwrap_or(StorageCategory::Unclassified),
                 provenance: Provenance::BuiltinConvention,

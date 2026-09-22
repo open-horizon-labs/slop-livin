@@ -385,6 +385,7 @@ fn plan_scope_drift_refuses_at_execute_for_claude_code() {
             .filter(|d| *d != id)
             .map(str::to_string)
             .collect(),
+            enabled_detectors: Vec::new(),
         }
     }
 

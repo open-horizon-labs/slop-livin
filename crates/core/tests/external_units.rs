@@ -25,6 +25,7 @@ fn only_cargo_home_config() -> ScanConfig {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["rustup".into(), "homebrew".into()],
+        enabled_detectors: Vec::new(),
     }
 }
 
@@ -237,6 +238,7 @@ fn tool_executable_removed_but_storage_remains_still_measures_it() {
         include: Vec::new(),
         exclude: Vec::new(),
         disabled_detectors: vec!["cargo-home".into(), "rustup".into()],
+        enabled_detectors: Vec::new(),
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

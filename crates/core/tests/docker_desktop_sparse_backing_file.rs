@@ -62,6 +62,7 @@ fn sparse_backing_file_reports_allocated_bytes_not_apparent_size() {
     let cfg = ScanConfig {
         defaults: false,
         disabled_detectors: disabled,
+        enabled_detectors: Vec::new(),
         ..ScanConfig::default()
     };
     let scope = resolve_effective_scope(&environment, &cfg, &[], &registry, 1_000);

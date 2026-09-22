@@ -56,6 +56,7 @@ fn only_config(keep: &[&str], registry: &Registry) -> ScanConfig {
     ScanConfig {
         defaults: true,
         disabled_detectors: disabled,
+        enabled_detectors: Vec::new(),
         ..ScanConfig::default()
     }
 }
@@ -185,6 +186,7 @@ fn double_measurement_fix_is_order_independent() {
     let cfg = ScanConfig {
         defaults: true,
         disabled_detectors: keep_disabled,
+        enabled_detectors: Vec::new(),
         ..ScanConfig::default()
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 2_000);

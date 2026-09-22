@@ -13,7 +13,11 @@
 //! provenance and freshness rather than a bare bool.
 
 use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue, Freshness};
-use std::{path::Path, process::Command};
+use std::{
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 /// Short-lived: a process/lock/container state observed now says nothing
 /// about five minutes from now. Existing action boundaries (plan
@@ -21,13 +25,149 @@ use std::{path::Path, process::Command};
 /// past this window.
 pub const CURRENT_USE_EXPIRY_SECS: u64 = 60;
 
+/// How long an occupancy probe may run before it is killed and reported
+/// as [`OccupancyState::Unknown`]. `lsof +D` over a large directory is
+/// bounded by this, never by patience.
+const OCCUPANCY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The answer to "does anything outside this process hold this path (or
+/// anything under it) open right now". Deliberately three-valued: a
+/// failed, timed-out or permission-denied probe is **not** "nothing is
+/// open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`). Every
+/// destructive sink matches on this and refuses on `Unknown`; nothing
+/// that moves user data may consume the boolean [`occupied`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OccupancyState {
+    /// The probe ran to completion and found no open handle.
+    Free,
+    /// The probe found at least one open handle; the payload names the
+    /// member that was open (the anchor itself for a file probe).
+    Occupied(std::path::PathBuf),
+    /// The probe could not answer (binary missing, timed out, permission
+    /// denied, unreadable directory). Treated as a refusal at every sink.
+    Unknown(String),
+}
+
+impl OccupancyState {
+    /// True only for [`OccupancyState::Free`]: the one state in which a
+    /// destructive action may proceed.
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    /// A one-line refusal cause for a sink's outcome/ledger record.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Free => None,
+            Self::Occupied(p) => Some(format!(
+                "refused: an open file handle was found on {} just now, so an active process is \
+                 using it — propose again once it is closed (for a directory this answer covers \
+                 everything under it)",
+                p.display()
+            )),
+            Self::Unknown(why) => Some(format!(
+                "refused: occupancy could not be determined ({why}); refusing rather than guessing that nothing is open"
+            )),
+        }
+    }
+}
+
+/// The one bounded `lsof` probe every occupancy question in this crate
+/// goes through. Directories are probed with `+D` so **every descendant**
+/// is covered, not just the anchor (the review's open-cache-member
+/// counterexample); files are probed directly. `stdout` and `stderr` are
+/// captured separately so an ordinary `lsof` warning is not mistaken for
+/// an open handle, while a permission error still becomes `Unknown`.
+pub fn probe_path(path: &Path) -> OccupancyState {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let is_dir = match std::fs::symlink_metadata(path) {
+        Ok(m) => m.is_dir() && !m.file_type().is_symlink(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing there to hold open. The caller's own identity
+            // recheck is what refuses a vanished path.
+            return OccupancyState::Free;
+        }
+        Err(e) => return OccupancyState::Unknown(format!("cannot stat {}: {e}", path.display())),
+    };
+
+    let mut cmd = Command::new("lsof");
+    if is_dir {
+        cmd.arg("+D").arg(path);
+    } else {
+        cmd.arg("--").arg(path);
+    }
+    let (Ok(out_file), Ok(err_file)) = (tempfile::tempfile(), tempfile::tempfile()) else {
+        return OccupancyState::Unknown("could not create a buffer for the lsof probe".into());
+    };
+    let (Ok(stdout), Ok(stderr)) = (out_file.try_clone(), err_file.try_clone()) else {
+        return OccupancyState::Unknown("could not redirect the lsof probe".into());
+    };
+    let Ok(mut child) = cmd.stdout(stdout).stderr(stderr).spawn() else {
+        return OccupancyState::Unknown("lsof could not be started".into());
+    };
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < OCCUPANCY_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return OccupancyState::Unknown(format!(
+                    "lsof did not answer within {}s for {}",
+                    OCCUPANCY_TIMEOUT.as_secs(),
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return OccupancyState::Unknown(format!("lsof probe failed: {e}"));
+            }
+        }
+    };
+    let read_all = |mut f: std::fs::File| -> String {
+        let mut s = String::new();
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = f.read_to_string(&mut s);
+        s
+    };
+    let stdout_text = read_all(out_file);
+    let stderr_text = read_all(err_file).to_lowercase();
+    match status.code() {
+        // `lsof` exits 0 when it found at least one open handle.
+        Some(0) if !stdout_text.trim().is_empty() => OccupancyState::Occupied(path.to_path_buf()),
+        Some(0) => OccupancyState::Free,
+        // Exit 1 with no output is "nothing found"; exit 1 with a
+        // permission complaint is "could not look".
+        Some(1) if stdout_text.trim().is_empty() => {
+            if stderr_text.contains("permission denied") {
+                OccupancyState::Unknown(format!(
+                    "permission denied querying open files under {}",
+                    path.display()
+                ))
+            } else {
+                OccupancyState::Free
+            }
+        }
+        Some(1) => OccupancyState::Occupied(path.to_path_buf()),
+        other => {
+            OccupancyState::Unknown(format!("lsof exited with {other:?} for {}", path.display()))
+        }
+    }
+}
+
+/// Boolean convenience over [`probe_path`], fail-closed: anything but
+/// [`OccupancyState::Free`] is `true`. **Never call this from a
+/// destructive sink** -- it collapses `Unknown` into `Occupied` and so
+/// cannot record *why* an action was refused; sinks use
+/// `crate::recheck::member_occupancy` (audited by
+/// `occupancy_is_tristate_at_sinks`).
 pub fn occupied(path: &Path) -> bool {
-    Command::new("lsof")
-        .arg("--")
-        .arg(path)
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(true)
+    !probe_path(path).is_free()
 }
 
 /// Pure classification of an `lsof` invocation's outcome, factored out so

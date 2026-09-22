@@ -89,7 +89,20 @@ impl ViewKind {
 /// One background observation's outcome: every `(root, report)` pair it
 /// managed to produce (#51 -- a live/cached refresh can cover more than
 /// one root per worker thread; see `App::pending`'s doc comment).
-type PendingObservation = anyhow::Result<Vec<(PathBuf, Report)>>;
+/// One background/live observation's whole result. External and agent
+/// units travel with the per-root reports because they come from the
+/// *same* pass (`report::observe_scope`): the review found the TUI's
+/// agent view could go arbitrarily stale while the header said the
+/// report was live, because only startup ever refreshed those vectors.
+pub struct RefreshedObservation {
+    pub per_root: Vec<(PathBuf, Report)>,
+    /// `None` when this refresh did not re-derive units (nothing should
+    /// clear them); `Some` replaces them wholesale.
+    pub external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
+    pub agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+}
+
+type PendingObservation = anyhow::Result<RefreshedObservation>;
 
 pub struct App {
     pub operation: Option<Operation>,
@@ -218,6 +231,12 @@ pub struct App {
     /// multi-root, #50's still-open job -- see DESIGN.md). Populated
     /// once at startup, same contract as `external_units`/`agent_units`.
     pub scope_note: Option<String>,
+    /// The authorized scope this TUI is showing. Every refresh --
+    /// background, live watch, post-action re-observe -- goes through it,
+    /// so exclusions and external pruning survive an update rather than
+    /// applying only to the first render
+    /// (`.oh/guardrails/tui-refresh-preserves-scope.md`).
+    pub scope: Option<swamp_core::scope::EffectiveScope>,
 }
 
 pub struct Operation {
@@ -366,6 +385,7 @@ impl App {
             external_units: Vec::new(),
             agent_units: Vec::new(),
             scope_note: None,
+            scope: None,
         }
     }
 
@@ -1668,6 +1688,13 @@ impl App {
         let rec = &mut self.report.reconciliation;
         rec.attributed = rec.attributed.saturating_sub(freed);
         rec.walked_total = rec.walked_total.saturating_sub(freed);
+        // Agent and external unit rows for exactly the successful
+        // outcomes. Without this the agents view kept showing storage
+        // that had just been moved to Trash, until the next full
+        // startup -- one of the review's TUI staleness findings.
+        self.agent_units
+            .retain(|u| !under(&u.path) && !u.members.iter().any(|m| under(&m.path)));
+        self.external_units.retain(|u| !under(&u.path));
         for path in &removed {
             self.track.remove(path);
             self.collapsed.remove(&format!("source:{}", path.display()));
@@ -1786,11 +1813,21 @@ impl App {
             self.live_last_event_id,
             device,
         );
+        // A live refresh re-walks one root -- through that root's own
+        // slice of the authorized scope, so its exclusions and external
+        // prune notes still apply. Without a scope there is nothing
+        // authorized to observe, and refusing is the honest answer.
+        let Some(scope) = self.scope.as_ref().map(|s| s.restricted_to(&root)) else {
+            self.status = Some(
+                "live refresh skipped: no resolved scope for this session; reopen swamp ui".into(),
+            );
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let source = swamp_core::fs_events::testing::CannedSource(plan);
-            let res = swamp_core::report::report_full_mode_with_source(
-                &root,
+            let res = swamp_core::report::observe_scope(
+                &scope,
                 None,
                 false,
                 Some(&store),
@@ -1800,8 +1837,14 @@ impl App {
                 false,
                 false,
                 &source,
+                30,
+                24 * 3600,
             )
-            .map(|r| vec![(root.clone(), r)]);
+            .map(|o| RefreshedObservation {
+                per_root: o.per_root.into_iter().collect(),
+                external_units: Some(o.external_units),
+                agent_units: Some(o.agent_units),
+            });
             let _ = tx.send(res);
         });
         self.pending = Some(rx);
@@ -1825,23 +1868,37 @@ impl App {
         if self.pending.is_some() {
             return;
         }
+        let Some(scope) = self.scope.clone() else {
+            self.status =
+                Some("refresh skipped: no resolved scope for this session; reopen swamp ui".into());
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel();
-        let roots = self.roots.clone();
         std::thread::spawn(move || {
-            let mut fresh = Vec::new();
-            for root in roots {
-                if let Ok(r) = swamp_core::report::report_with_dirs(
-                    &root,
-                    None,
-                    false,
-                    Some(&store),
-                    None,
-                    true,
-                ) {
-                    fresh.push((root, r));
-                }
-            }
-            let _ = tx.send(Ok(fresh));
+            // The same scope-aware entry point startup uses, with the
+            // same exclusions and external pruning, and returning the
+            // external/agent units from that same pass so the agent view
+            // cannot drift out of date behind a "live" header.
+            let res = swamp_core::report::observe_scope(
+                &scope,
+                None,
+                false,
+                Some(&store),
+                None,
+                true,
+                true,
+                false,
+                false,
+                swamp_core::fs_events::platform_source().as_ref(),
+                30,
+                24 * 3600,
+            )
+            .map(|o| RefreshedObservation {
+                per_root: o.per_root.into_iter().collect(),
+                external_units: Some(o.external_units),
+                agent_units: Some(o.agent_units),
+            });
+            let _ = tx.send(res);
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
@@ -2047,6 +2104,7 @@ mod tests {
                 "oh-my-pi".into(),
                 "opencode".into(),
             ],
+            enabled_detectors: Vec::new(),
         };
         let scope = swamp_core::scope::resolve_effective_scope(&env, &cfg, &[], &registry, 1);
         swamp_core::agents::discover_and_measure(&scope, &[], None, false, 1_000, 30, 3600).unwrap()
