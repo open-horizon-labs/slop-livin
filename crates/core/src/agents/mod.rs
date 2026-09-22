@@ -823,7 +823,11 @@ impl<'a> IdentifyCtx<'a> {
     }
 
     fn replay(&self, store: &ContainerCache, key: &str) -> Option<Vec<CandidateAgentUnit>> {
-        let (dirs, units) = {
+        // The borrow of `entries` is scoped: `resolve_memoised` below
+        // takes `links` mutably, and a future edit that reaches
+        // `entries` again would otherwise panic at runtime rather than
+        // fail to compile.
+        let units = {
             let entries = store.entries.borrow();
             let cached = entries.get(key)?;
             let (dirs, units) = decode_container(&cached.rows)?;
@@ -833,9 +837,8 @@ impl<'a> IdentifyCtx<'a> {
             if container_fingerprint(&dirs) != cached.fingerprint {
                 return None;
             }
-            (dirs, units)
+            units
         };
-        let _ = dirs;
         Some(
             units
                 .into_iter()

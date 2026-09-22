@@ -348,3 +348,26 @@ were non-empty. Now:
   - It found a real one on its first run — the Codex desktop paragraph
     claiming no Windows build was confirmed — and rejects the exact
     Continue sentence the re-review quoted (verified by adding it back).
+
+---
+
+# What this chunk did not do
+
+- **Only Claude Code uses the container seam.** `IdentifyCtx::container`
+  is generic and every adapter can call it, but the conversion here is
+  one adapter — the one with the 5,000-session fixture. Codex's
+  `sessions/<yyyy>/<mm>/<dd>/` is the obvious next one and is *not*
+  done, for a specific reason rather than for time: `collect_jsonl_files`
+  carries an entry-count bound (`already_seen + out.len()`) shared across
+  `sessions/` and `archived_sessions/`, so a day container's output
+  depends on how many files the containers before it produced. Replaying
+  one would have to feed replayed unit counts back into that bound or the
+  bound would mean something different on a reused pass than on a fresh
+  one. That is a real change to what the bound guarantees and deserves
+  its own review, not a quiet edit at the end of a chunk.
+- **The activity-gated reuse** described above (re-identify containers
+  whose stored `mtime_max` is recent, replay the dormant tail) is
+  proposed, not implemented.
+- **`reviewer_cost_measurement_stack2` is still red** on two assertions,
+  with the residual attributed above. Nothing else in `scripts/check.sh`
+  fails.
