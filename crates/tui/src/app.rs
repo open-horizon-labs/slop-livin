@@ -1775,12 +1775,38 @@ impl App {
     /// live updates (it still gets refreshed by the scheduled/cached
     /// path). No-op if watches are already running.
     pub fn start_watch(&mut self) {
+        self.start_watch_with(swamp_core::fs_events::watch_pending);
+    }
+
+    /// [`Self::start_watch`] with the stream factory supplied.
+    ///
+    /// Every root's thread is spawned **before** any readiness is
+    /// collected. `FSEventStreamStart` is a synchronous, per-process
+    /// serialized request to `fseventsd` that costs seconds (measured on
+    /// two fresh temp directories: 1.4 s and 2.9 s on a quiet machine,
+    /// 4.7 s and 6.6 s on a loaded one), so waiting for each root's
+    /// stream before spawning the next one made the later roots pay the
+    /// sum of those latencies against a fixed per-stream budget. That is
+    /// how this ended up holding one watcher for two roots while both
+    /// streams had in fact started: the second one reported ready 1.6 s
+    /// after the caller had already given up on it. Spawning first
+    /// bounds the wait by the slowest stream rather than by their total,
+    /// and `fs_events::watch_start_budget` is now larger than the cost
+    /// of the call it is bounding.
+    pub(crate) fn start_watch_with(&mut self, factory: swamp_core::fs_events::WatchFactory) {
         if self.store_dir.is_none() || !self.watches.is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        for root in self.roots.clone() {
-            if let Some(w) = swamp_core::fs_events::watch(&root, tx.clone()) {
+        let pending: Vec<_> = self
+            .roots
+            .clone()
+            .iter()
+            .filter_map(|root| factory(root, tx.clone()))
+            .collect();
+        let budget = swamp_core::fs_events::watch_start_budget();
+        for p in pending {
+            if let Some(w) = p.ready(budget) {
                 self.watches.push(w);
             }
         }
@@ -2962,11 +2988,17 @@ mod tests {
 
     /// `start_watch` opens one FSEvents stream per root in `self.roots`
     /// (#51), not just the primary one -- the concrete "multiple
-    /// watchers" acceptance case. Uses real temp directories since
-    /// `fs_events::watch` is a real platform call; skipped gracefully
-    /// (rather than failing) if this sandbox's FSEvents access itself is
-    /// unavailable, since that is an environment property this test does
-    /// not exist to re-verify.
+    /// watchers" acceptance case.
+    ///
+    /// Driven through the injected stream factory rather than real
+    /// FSEvents. The previous version opened two real streams and could
+    /// only skip itself when it got *zero*; it got one often enough to
+    /// be recorded as a flake, and the cause was not the assertion but
+    /// `start_watch` itself (`fs_events::PendingWatch` documents the
+    /// measurement). With the factory the assertion is about the loop --
+    /// every root gets its own stream, none is shared, none is dropped
+    /// -- and nothing in it depends on how fast `fseventsd` answers, so
+    /// there is no sleep and no bound to lose a race against.
     #[test]
     fn start_watch_opens_one_stream_per_root() {
         let dir_a = tempfile::tempdir().unwrap();
@@ -2982,18 +3014,48 @@ mod tests {
             vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
         );
         app.store_dir = Some(store.path().to_path_buf());
-        app.start_watch();
-        if app.watches.is_empty() {
-            eprintln!(
-                "skipping: FSEvents watch unavailable in this sandbox (0 watches for 2 roots)"
-            );
-            return;
-        }
+        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
         assert_eq!(
             app.watches.len(),
             2,
             "one watcher per root, not one shared watcher for the whole App"
         );
+        assert!(app.watch_rx.is_some());
+        // Already running: a second call must not double the streams.
+        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
+        assert_eq!(app.watches.len(), 2, "start_watch is idempotent");
+    }
+
+    /// A root whose stream never reports ready contributes no watcher,
+    /// and the roots whose streams did start still do -- the partial
+    /// case `start_watch`'s own doc comment promises. Asserted through a
+    /// factory that fails for exactly one root, so "the other roots
+    /// still run" is a property of the loop rather than of which stream
+    /// `fseventsd` happened to be slow about.
+    #[test]
+    fn a_root_whose_stream_fails_does_not_stop_the_others() {
+        fn only_the_first_starts(
+            root: &std::path::Path,
+            tx: std::sync::mpsc::Sender<swamp_core::fs_events::WatchBatch>,
+        ) -> Option<swamp_core::fs_events::PendingWatch> {
+            if root.to_string_lossy().contains("swamp-watch-refuses") {
+                return None;
+            }
+            swamp_core::fs_events::testing::inert_watch_factory(root, tx)
+        }
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let mut app = App::new_multi_root(
+            report,
+            vec![
+                PathBuf::from("/roots/a"),
+                PathBuf::from("/roots/swamp-watch-refuses"),
+                PathBuf::from("/roots/c"),
+            ],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        app.start_watch_with(only_the_first_starts);
+        assert_eq!(app.watches.len(), 2, "two of three roots opened a stream");
         assert!(app.watch_rx.is_some());
     }
 

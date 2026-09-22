@@ -346,6 +346,77 @@ pub struct Watcher {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A stream whose thread has been spawned but whose
+/// `FSEventStreamStart` has not been confirmed yet.
+///
+/// The split exists because starting an FSEvents stream is a synchronous
+/// round-trip to `fseventsd` that is **serialized per process** and
+/// measurably costs seconds: on the development machine two streams over
+/// two fresh temp directories reported ready at 1.4 s / 2.9 s on a quiet
+/// run and at 4.7 s / 6.6 s on a loaded one. A caller that opens one
+/// stream per root and waits for each one before spawning the next pays
+/// the sum of those; with a fixed per-call budget the later roots are
+/// the ones that lose, and the stream they abandon had usually started
+/// successfully a moment later. Spawning every root first and only then
+/// collecting readiness bounds the wait by the slowest stream instead of
+/// their sum.
+pub struct PendingWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    ready: std::sync::mpsc::Receiver<bool>,
+}
+
+impl PendingWatch {
+    /// Waits up to `budget` for this stream to report that
+    /// `FSEventStreamStart` succeeded. A stream that reports failure, or
+    /// that has not reported at all within the budget, is stopped and
+    /// joined: an abandoned stream must not outlive the decision to
+    /// abandon it.
+    pub fn ready(mut self, budget: std::time::Duration) -> Option<Watcher> {
+        match self.ready.recv_timeout(budget) {
+            Ok(true) => Some(Watcher {
+                stop: self.stop.clone(),
+                thread: self.thread.take(),
+            }),
+            _ => {
+                self.stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(t) = self.thread.take() {
+                    let _ = t.join();
+                }
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PendingWatch {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// How long a caller waits for one stream to confirm it started.
+///
+/// Was five seconds, which is smaller than the observed cost of the
+/// *second* `FSEventStreamStart` in a process and is exactly why
+/// `tui::app::start_watch` intermittently ended up with one watcher for
+/// two roots. The budget's job is to stop a caller hanging forever on an
+/// `fseventsd` that never answers, not to second-guess how long a call
+/// that is known to take seconds is allowed to take. Overridable via
+/// `SWAMP_FSEVENTS_WATCH_START_TIMEOUT_SEC`.
+pub fn watch_start_budget() -> std::time::Duration {
+    std::env::var("SWAMP_FSEVENTS_WATCH_START_TIMEOUT_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
+
 impl Watcher {
     pub fn stop(mut self) {
         self.signal_stop();
@@ -371,10 +442,23 @@ impl Drop for Watcher {
 /// [`WatchBatch`] on `tx` each time FSEvents flushes (latency 0.5 s). The
 /// stream runs on its own thread with its own run loop. `None` where the
 /// platform has no FSEvents.
+///
+/// Blocks until the stream confirms it started (see
+/// [`watch_start_budget`]). A caller opening several streams should use
+/// [`watch_pending`] and collect readiness afterwards instead, so the
+/// per-stream `fseventsd` latencies overlap rather than add up.
 pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Watcher> {
+    watch_pending(root, tx)?.ready(watch_start_budget())
+}
+
+/// Spawns `root`'s stream thread and returns immediately; the caller
+/// decides when (and for how long) to wait for it to report ready.
+/// `None` where the platform has no FSEvents, or where the thread itself
+/// could not be spawned.
+pub fn watch_pending(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<PendingWatch> {
     #[cfg(target_os = "macos")]
     {
-        macos::watch(root, tx)
+        macos::watch_pending(root, tx)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -382,6 +466,11 @@ pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Wat
         None
     }
 }
+
+/// The seam `tui::app::start_watch` opens its streams through, so a test
+/// can assert "one stream per root" without depending on `fseventsd`
+/// answering within any particular time.
+pub type WatchFactory = fn(&Path, std::sync::mpsc::Sender<WatchBatch>) -> Option<PendingWatch>;
 
 /// The non-macOS fallback: always refuses, naming the platform as the
 /// cause, never a bug in the replay itself.
@@ -592,10 +681,10 @@ mod macos {
         }
     }
 
-    pub fn watch(
+    pub fn watch_pending(
         root: &Path,
         tx: std::sync::mpsc::Sender<super::WatchBatch>,
-    ) -> Option<super::Watcher> {
+    ) -> Option<super::PendingWatch> {
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -668,17 +757,11 @@ mod macos {
                 drop(state);
             })
             .ok()?;
-        match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(true) => Some(super::Watcher {
-                stop,
-                thread: Some(thread),
-            }),
-            _ => {
-                stop.store(true, Ordering::Relaxed);
-                let _ = thread.join();
-                None
-            }
-        }
+        Some(super::PendingWatch {
+            stop,
+            thread: Some(thread),
+            ready: ready_rx,
+        })
     }
 
     pub struct MacOsFsEventsSource;
@@ -842,7 +925,8 @@ mod macos {
 /// this crate rather than compiling into it -- can use it too. Small and
 /// inert in a release binary: one struct, one trait impl, no I/O.
 pub mod testing {
-    use super::{FsEventsPlan, FsEventsRequest, FsEventsSource};
+    use super::{FsEventsPlan, FsEventsRequest, FsEventsSource, PendingWatch, WatchBatch};
+    use std::path::Path;
 
     /// A canned source: returns whatever plan it was built with,
     /// regardless of the request. Lets every refusal reason and the
@@ -854,6 +938,27 @@ pub mod testing {
         fn replay(&self, _request: &FsEventsRequest) -> FsEventsPlan {
             self.0.clone()
         }
+    }
+
+    /// A [`super::WatchFactory`] that opens no FSEvents stream and
+    /// reports ready immediately.
+    ///
+    /// It exists so "one stream per root" can be asserted as a property
+    /// of the caller's loop rather than of how quickly `fseventsd`
+    /// answers. Starting a real stream is a multi-second, per-process
+    /// serialized call (see [`super::PendingWatch`]), which makes any
+    /// test that opens two real streams a race against its own budget.
+    pub fn inert_watch_factory(
+        _root: &Path,
+        _tx: std::sync::mpsc::Sender<WatchBatch>,
+    ) -> Option<PendingWatch> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let _ = ready_tx.send(true);
+        Some(PendingWatch {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            thread: None,
+            ready: ready_rx,
+        })
     }
 }
 
