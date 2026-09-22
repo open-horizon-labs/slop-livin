@@ -31,7 +31,7 @@ use super::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const COPILOT_CLI_TOOL_ID: &str = crate::locations::copilot_cli::COPILOT_CLI_DETECTOR_ID;
+pub const COPILOT_CLI_TOOL_ID: &str = "github-copilot-cli";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 

@@ -44,7 +44,7 @@ use super::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const PI_TOOL_ID: &str = crate::locations::pi::PI_DETECTOR_ID;
+pub const PI_TOOL_ID: &str = "pi";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Session files one `sessions/<dir>/` container will identify. Per

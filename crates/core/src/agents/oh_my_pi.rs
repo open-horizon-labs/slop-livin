@@ -72,7 +72,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const OH_MY_PI_TOOL_ID: &str = crate::locations::oh_my_pi::OH_MY_PI_DETECTOR_ID;
+pub const OH_MY_PI_TOOL_ID: &str = "oh-my-pi";
 
 /// Entry budget owned outright by **one** container, never shared with a
 /// sibling: a day directory's contents must not depend on how many files

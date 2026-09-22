@@ -42,7 +42,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const WINDSURF_TOOL_ID: &str = crate::locations::windsurf::WINDSURF_DETECTOR_ID;
+pub const WINDSURF_TOOL_ID: &str = "windsurf";
 
 pub struct Adapter;
 

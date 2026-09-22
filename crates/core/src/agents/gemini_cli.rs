@@ -51,7 +51,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-pub const GEMINI_CLI_TOOL_ID: &str = crate::locations::gemini_cli::GEMINI_CLI_DETECTOR_ID;
+pub const GEMINI_CLI_TOOL_ID: &str = "gemini-cli";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 

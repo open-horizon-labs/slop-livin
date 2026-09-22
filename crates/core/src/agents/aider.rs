@@ -29,7 +29,7 @@ use super::{
 use std::fs;
 use std::path::Path;
 
-pub const AIDER_TOOL_ID: &str = crate::locations::aider::AIDER_DETECTOR_ID;
+pub const AIDER_TOOL_ID: &str = "aider";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 

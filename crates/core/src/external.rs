@@ -230,7 +230,7 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
         .into_iter()
         .filter_map(|root| {
             let detector_id = root.detector_id?;
-            if detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
+            if crate::locations::builtin::is_builtin_defaults(&detector_id) {
                 return None;
             }
             Some(Candidate {

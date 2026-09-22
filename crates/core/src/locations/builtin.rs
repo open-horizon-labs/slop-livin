@@ -13,6 +13,14 @@ use super::{
 
 pub const BUILTIN_DEFAULTS_DETECTOR_ID: &str = "builtin-defaults";
 
+/// Whether a detector id names the built-in defaults pseudo-detector
+/// rather than a real tool's detector. Consumers ask this instead of
+/// comparing against the constant, so no module outside the detector
+/// registry names a detector id (`.oh/guardrails/detector-ids-only-in-registry.md`).
+pub fn is_builtin_defaults(detector_id: &str) -> bool {
+    detector_id == BUILTIN_DEFAULTS_DETECTOR_ID
+}
+
 pub struct BuiltinDefaultsDetector;
 
 impl Detector for BuiltinDefaultsDetector {

@@ -1925,11 +1925,19 @@ pub fn protection_conflict(protected: &[PathBuf], candidate: &Path) -> Option<St
 // mean hundreds of process spawns on an ordinary `report`, which is
 // exactly the "unacceptable scanning cost" #91 guards against, and would
 // violate the no-blocking-scan discipline the TUI's render/event path
-// depends on. `crate::occupancy::occupied` is the existing seam.
+// depends on. `crate::occupancy::probe_path` is the existing seam.
 // ---------------------------------------------------------------------
 
+/// Fail-closed: anything but [`crate::occupancy::OccupancyState::Free`]
+/// is active. **Never a sink's gate** -- it collapses `Unknown` into
+/// `Occupied` and cannot say why; sinks use
+/// `crate::recheck::member_occupancy` (audited by
+/// `occupancy_is_tristate_at_sinks`).
 pub fn is_active(path: &Path) -> bool {
-    crate::occupancy::occupied(path)
+    !matches!(
+        crate::occupancy::probe_path(path),
+        crate::occupancy::OccupancyState::Free
+    )
 }
 
 // ---------------------------------------------------------------------

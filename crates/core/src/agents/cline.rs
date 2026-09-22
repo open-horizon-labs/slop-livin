@@ -76,7 +76,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const CLINE_TOOL_ID: &str = crate::locations::cline::CLINE_DETECTOR_ID;
+pub const CLINE_TOOL_ID: &str = "cline";
 
 /// Cline's task history: one JSON array beside the task directories,
 /// keyed by task id, with the working directory in

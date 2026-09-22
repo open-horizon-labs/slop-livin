@@ -28,7 +28,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const CURSOR_TOOL_ID: &str = crate::locations::cursor::CURSOR_DETECTOR_ID;
+pub const CURSOR_TOOL_ID: &str = "cursor";
 
 pub struct Adapter;
 

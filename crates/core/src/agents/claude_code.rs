@@ -59,7 +59,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CLAUDE_CODE_TOOL_ID: &str = crate::locations::claude_code::CLAUDE_CODE_DETECTOR_ID;
+pub const CLAUDE_CODE_TOOL_ID: &str = "claude-code";
 
 /// Bound on any one folded directory's entry count
 /// ([`IdentifyCtx::folded_bytes`]).

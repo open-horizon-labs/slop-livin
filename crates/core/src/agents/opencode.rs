@@ -68,7 +68,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const OPENCODE_TOOL_ID: &str = crate::locations::opencode::OPENCODE_DETECTOR_ID;
+pub const OPENCODE_TOOL_ID: &str = "opencode";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 

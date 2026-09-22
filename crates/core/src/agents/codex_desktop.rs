@@ -10,7 +10,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const CODEX_DESKTOP_TOOL_ID: &str = crate::locations::codex_desktop::CODEX_DESKTOP_DETECTOR_ID;
+pub const CODEX_DESKTOP_TOOL_ID: &str = "codex-desktop";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 

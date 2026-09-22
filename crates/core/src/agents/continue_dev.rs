@@ -40,7 +40,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const CONTINUE_TOOL_ID: &str = crate::locations::continue_dev::CONTINUE_DETECTOR_ID;
+pub const CONTINUE_TOOL_ID: &str = "continue";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Cap for one session file's header read. `Session`'s declaration order

@@ -47,7 +47,7 @@ use super::{
 };
 use std::path::Path;
 
-pub const ROO_CODE_TOOL_ID: &str = crate::locations::roo_code::ROO_CODE_DETECTOR_ID;
+pub const ROO_CODE_TOOL_ID: &str = "roo-code";
 
 /// The confirmed per-task linkage file and field (see the module docs).
 const TASK_LINK: TaskLinkSource = TaskLinkSource::DeclaredField {

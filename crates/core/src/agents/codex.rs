@@ -62,7 +62,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CODEX_TOOL_ID: &str = crate::locations::codex::CODEX_DETECTOR_ID;
+pub const CODEX_TOOL_ID: &str = "codex";
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Rollout files one session-tree **container** will identify. Per
@@ -176,7 +176,7 @@ fn session_unit(
     if archived {
         unit = unit.note(
             "archived: hidden from the default thread list, but still unique conversation \
-             history -- archiving is not evidence this session is unused",
+             history -- archiving says nothing about whether this session is still needed",
         );
     }
     Some(unit.build())
