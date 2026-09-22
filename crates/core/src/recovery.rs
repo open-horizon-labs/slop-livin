@@ -345,6 +345,121 @@ pub fn cache_without_signal_recovery(reason: impl Into<String>) -> RecoveryAsses
     unknown_assessment(reason, true)
 }
 
+/// A Docker image (#58): the generic per-row evidence pass knows only
+/// whether it recorded a repository tag and whether this row was joined
+/// to a known project's worktree (compose/Dockerfile source potentially
+/// present) -- not which of "build:" or "image:" a compose file uses,
+/// so this deliberately never asserts one specific path. `dangling`
+/// (no repository tag recorded at all) leaves even the *tag* origin
+/// unknown; a tagged image joined to a project names both candidate
+/// prerequisites explicitly rather than picking one.
+pub fn docker_image_recovery(
+    repo_tag: Option<&str>,
+    joined_to_project: bool,
+) -> RecoveryAssessment {
+    let observed_at = now();
+    let source = EvidenceSource::DockerApi {
+        detail: "image inspect".into(),
+    };
+    match repo_tag {
+        None => RecoveryAssessment {
+            path: RecoveryPath::Unknown,
+            evidence: Evidence::unknown(
+                FactKind::Recovery,
+                FactSubtype::UnknownPrerequisites,
+                source,
+                observed_at,
+                "dangling image: no repository tag recorded to name a pull source, and no build source is recorded here",
+            ),
+            trash_available: false,
+            prerequisites: Vec::new(),
+            unresolved_unknowns: vec![
+                "neither a pull origin nor a build definition is recorded for this image".into(),
+            ],
+            cost_estimate: None,
+            follow_up_check: Some(
+                "run `docker image inspect` for this image's id to look for a build history or base-image origin before removing it".into(),
+            ),
+        },
+        Some(tag) => {
+            let mut unresolved = vec![
+                "whether this image is defined by a compose/Dockerfile `build:` step (rebuildable) or an `image:` pull reference is not distinguished from the tag alone".into(),
+            ];
+            if joined_to_project {
+                unresolved.push(
+                    "if rebuildable, build toolchain/base-image availability at rebuild time is not checked".into(),
+                );
+            } else {
+                unresolved.push(
+                    "if pulled, registry availability/credentials at restore time are not checked"
+                        .into(),
+                );
+            }
+            RecoveryAssessment {
+                path: RecoveryPath::Unknown,
+                evidence: Evidence::unknown(
+                    FactKind::Recovery,
+                    FactSubtype::UnknownPrerequisites,
+                    source,
+                    observed_at,
+                    format!("tag '{tag}' recorded, but pull-vs-rebuild origin is not distinguished"),
+                ),
+                trash_available: false,
+                prerequisites: vec![RecoveryPrerequisite {
+                    description: format!("repository tag '{tag}' recorded"),
+                    source: EvidenceSource::DockerApi {
+                        detail: "image inspect".into(),
+                    },
+                    satisfied: Some(true),
+                }],
+                unresolved_unknowns: unresolved,
+                cost_estimate: None,
+                follow_up_check: Some(if joined_to_project {
+                    format!(
+                        "check this project's compose file/Dockerfile for a `build:` step naming '{tag}', or try `docker pull {tag}` to confirm a registry origin"
+                    )
+                } else {
+                    format!("try `docker pull {tag}` to confirm this image is still available from a registry")
+                }),
+            }
+        }
+    }
+}
+
+/// Docker build cache (#58): BuildKit cache is only ever locally
+/// generated from a build; `Rebuild` when the worktree that produced it
+/// is still present in this report (mirrors [`build_output_recovery`]'s
+/// own source-presence logic), `Unknown` otherwise. Never a promise that
+/// a rebuild reproduces the cache bit-for-bit.
+pub fn docker_build_cache_recovery(source_present: bool) -> RecoveryAssessment {
+    if source_present {
+        assessment(
+            RecoveryPath::Rebuild,
+            EvidenceSource::DockerApi {
+                detail: "build cache entry joined to a present worktree".into(),
+            },
+            false,
+            vec![RecoveryPrerequisite {
+                description: "joined project's worktree is present in this report".into(),
+                source: EvidenceSource::FilesystemMetadata {
+                    detail: "worktree presence".into(),
+                },
+                satisfied: Some(true),
+            }],
+            vec![
+                "BuildKit cache reconstruction is best-effort; a rebuild is not guaranteed to reproduce this exact cache layer".into(),
+            ],
+            None,
+            Some("run this project's `docker build` again to confirm the cache layer regenerates".into()),
+        )
+    } else {
+        unknown_assessment(
+            "no joined project worktree present in this report to rebuild this cache entry from",
+            false,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +563,52 @@ mod tests {
         assert_eq!(known.path, RecoveryPath::LocalReinstall);
         let unknown = toolchain_installation_recovery("nvm", None);
         assert_eq!(unknown.path, RecoveryPath::Unknown);
+    }
+
+    #[test]
+    fn dangling_docker_image_never_asserts_a_pull_or_rebuild_path() {
+        let a = docker_image_recovery(None, false);
+        assert_eq!(a.path, RecoveryPath::Unknown);
+        assert!(!a.trash_available);
+        assert!(a.follow_up_check.is_some());
+    }
+
+    #[test]
+    fn tagged_docker_image_names_both_candidate_origins_never_picks_one() {
+        // The tempting shortcut this rejects: assuming a tagged image
+        // joined to a project must be locally rebuildable via compose
+        // `build:`, when the tag could equally be a pulled `image:`
+        // reference (e.g. `postgres:16`).
+        let joined = docker_image_recovery(Some("myapp:latest"), true);
+        assert_eq!(joined.path, RecoveryPath::Unknown);
+        assert!(
+            joined
+                .unresolved_unknowns
+                .iter()
+                .any(|u| u.contains("build:") || u.contains("image:"))
+        );
+        let unowned = docker_image_recovery(Some("postgres:16"), false);
+        assert_eq!(unowned.path, RecoveryPath::Unknown);
+        assert!(unowned.follow_up_check.unwrap().contains("docker pull"));
+    }
+
+    #[test]
+    fn docker_build_cache_rebuild_needs_a_present_worktree() {
+        let present = docker_build_cache_recovery(true);
+        assert_eq!(present.path, RecoveryPath::Rebuild);
+        assert!(!present.trash_available);
+        let absent = docker_build_cache_recovery(false);
+        assert_eq!(absent.path, RecoveryPath::Unknown);
+    }
+
+    #[test]
+    fn docker_recovery_never_fabricates_a_cost_estimate() {
+        for a in [
+            docker_image_recovery(Some("myapp:latest"), true),
+            docker_image_recovery(None, false),
+            docker_build_cache_recovery(true),
+        ] {
+            assert!(a.cost_estimate.is_none(), "{:?} fabricated a cost", a.path);
+        }
     }
 }

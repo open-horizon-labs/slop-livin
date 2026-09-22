@@ -156,6 +156,7 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
                 path_or_object: "old-project/tmp".to_string(),
@@ -168,6 +169,7 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
                 path_or_object: "restricted/vault".to_string(),
@@ -180,6 +182,7 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
                 path_or_object: "/Users/x/.cache".to_string(),
@@ -192,6 +195,7 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
         ],
         reconciliation: Reconciliation {
@@ -405,6 +409,7 @@ fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
         shared_with: Vec::new(),
         dangling: false,
         docker_kind: Some("image".to_string()),
+        evidence: Vec::new(),
     });
     let text = render_view_docker(&report, Some("big-grower"));
     assert!(text.contains("unowned, name-alike"));

@@ -722,6 +722,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             });
             return;
         }
@@ -940,6 +941,7 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
         shared_with: Vec::new(),
         dangling: false,
         docker_kind: None,
+        evidence: Vec::new(),
     });
 }
 
@@ -1103,6 +1105,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             });
         }
     }

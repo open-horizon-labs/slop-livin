@@ -366,6 +366,7 @@ impl<'a> Ctx<'a> {
                     shared_with: Vec::new(),
                     dangling: false,
                     docker_kind: None,
+                    evidence: Vec::new(),
                 });
             }
         }
@@ -383,6 +384,7 @@ impl<'a> Ctx<'a> {
             shared_with: Vec::new(),
             dangling: false,
             docker_kind: None,
+            evidence: Vec::new(),
         });
     }
 
@@ -422,6 +424,7 @@ impl<'a> Ctx<'a> {
                     shared_with: Vec::new(),
                     dangling: false,
                     docker_kind: None,
+                    evidence: Vec::new(),
                 });
             }
         }

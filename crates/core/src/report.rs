@@ -378,6 +378,13 @@ pub struct UnownedRow {
     /// True for an image with no `RepoTags` at all.
     #[serde(default)]
     pub dangling: bool,
+    /// Recovery/reclaimability evidence (#58): an unjoined Docker object
+    /// still gets a real per-object recovery assessment -- "no project
+    /// claims it" is a consumer fact, not a reason to skip its own
+    /// recovery/reclaimability facts. Populated at the same join site as
+    /// `ArtifactRow::evidence` for a joined Docker row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,10 +545,42 @@ pub fn attach_decision_evidence(report: &mut Report) {
                     ArtifactKind::Cache => Some(crate::recovery::cache_without_signal_recovery(
                         "no lockfile/source signal collected for this cache in this pass",
                     )),
+                    // Docker recovery (#58): every Docker row reaching
+                    // this loop already lives in `wt.artifacts`, which
+                    // only ever holds a *joined* Docker row (an unjoined
+                    // one becomes an `UnownedRow` instead, a separate
+                    // list this loop never sees) -- so the worktree this
+                    // row is being iterated under is exactly the project
+                    // it was joined to.
+                    ArtifactKind::DockerImage => {
+                        // `a.path` is the image's repo tag when one was
+                        // recorded, or its bare image id when dangling
+                        // (see `join_docker_facts`'s `candidate.reference`
+                        // construction) -- `a.dangling` is the row's own
+                        // recorded fact distinguishing the two, never
+                        // guessed from the string's shape.
+                        let repo_tag = if a.dangling { None } else { a.path.to_str() };
+                        Some(crate::recovery::docker_image_recovery(repo_tag, true))
+                    }
+                    ArtifactKind::DockerBuildCache => {
+                        Some(crate::recovery::docker_build_cache_recovery(true))
+                    }
+                    ArtifactKind::DockerVolume => Some(crate::recovery::docker_volume_recovery(
+                        &a.path.display().to_string(),
+                    )),
                     _ => None,
                 };
                 if let Some(r) = recovery {
-                    a.evidence.push(r.evidence);
+                    // Carry the assessment's own smallest-useful
+                    // follow-up check into the fact's `note` (#60: the
+                    // TUI/CLI evidence-line renderer already prints
+                    // `note`) -- otherwise `RecoveryAssessment`'s richer
+                    // fields never survive past this bare `Evidence`.
+                    let ev = match &r.follow_up_check {
+                        Some(check) => r.evidence.with_note(format!("check: {check}")),
+                        None => r.evidence,
+                    };
+                    a.evidence.push(ev);
                 }
             }
         }
@@ -1446,6 +1485,25 @@ pub(crate) fn join_docker_facts(
                     (None, None) => None,
                 };
                 result.unowned_bytes += candidate.unique_bytes;
+                // Recovery (#58): "no project claims it" is a consumer
+                // fact (`UnownedReason::DockerNoJoin`), not a reason to
+                // skip this object's own recovery assessment -- an
+                // unjoined image/volume/build-cache is exactly as real
+                // as a joined one.
+                let recovery = match candidate.kind {
+                    ArtifactKind::DockerImage => crate::recovery::docker_image_recovery(
+                        (!candidate.dangling).then_some(candidate.reference.as_str()),
+                        false,
+                    ),
+                    ArtifactKind::DockerBuildCache => {
+                        crate::recovery::docker_build_cache_recovery(false)
+                    }
+                    _ => crate::recovery::docker_volume_recovery(&candidate.reference),
+                };
+                let recovery_evidence = match &recovery.follow_up_check {
+                    Some(check) => recovery.evidence.with_note(format!("check: {check}")),
+                    None => recovery.evidence,
+                };
                 result.unowned.push(UnownedRow {
                     path_or_object: candidate.reference,
                     bytes: candidate.unique_bytes,
@@ -1457,6 +1515,7 @@ pub(crate) fn join_docker_facts(
                     containers: candidate.containers,
                     shared_with: candidate.shared_with,
                     dangling: candidate.dangling,
+                    evidence: vec![recovery_evidence],
                 });
             }
         }

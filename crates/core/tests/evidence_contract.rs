@@ -188,3 +188,51 @@ fn missing_stale_and_conflicting_facts_round_trip_through_a_real_report() {
         "expected at least one Unknown fact in a real report"
     );
 }
+
+/// #58's own named gap ("Docker-specific recovery... not wired into the
+/// generic per-row `attach_decision_evidence` pass"): a real joined
+/// Docker row (image/build-cache/volume, from this fixture's Docker
+/// join) must carry its own Recovery fact from the generic pass, not
+/// just some unrelated BuildOutput/DependencyTree/Cache row elsewhere
+/// in the same report.
+#[test]
+fn joined_docker_rows_carry_their_own_recovery_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture::build(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let r = report_for(&fx.root, &fx.docker_facts, store.path());
+
+    let docker_rows: Vec<&swamp_core::report::ArtifactRow> = r
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .flat_map(|w| w.artifacts.iter())
+        .filter(|a| {
+            matches!(
+                a.kind,
+                ArtifactKind::DockerImage
+                    | ArtifactKind::DockerBuildCache
+                    | ArtifactKind::DockerVolume
+            )
+        })
+        .collect();
+    assert!(
+        !docker_rows.is_empty(),
+        "fixture must produce at least one joined Docker row to test against"
+    );
+    for row in docker_rows {
+        assert!(
+            row.evidence.iter().any(|e| e.kind == FactKind::Recovery),
+            "joined Docker row {:?} ({:?}) carries no Recovery fact",
+            row.path,
+            row.kind
+        );
+        // The tempting shortcut this rejects: a Docker volume (mutable,
+        // application-managed state) reported as trash-recoverable.
+        if row.kind == ArtifactKind::DockerVolume {
+            let recovery =
+                swamp_core::recovery::docker_volume_recovery(&row.path.display().to_string());
+            assert!(!recovery.trash_available);
+        }
+    }
+}
