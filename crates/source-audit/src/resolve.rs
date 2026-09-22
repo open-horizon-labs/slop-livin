@@ -1206,6 +1206,15 @@ pub struct Assignment {
     pub lhs: String,
     pub rhs: String,
     pub conditions: Vec<String>,
+    /// The operator, as `syn` spells it: `=` for a plain assignment,
+    /// `+=` for a compound one.
+    ///
+    /// `row.regrowth_count += 1` and `row.regrowth_count = row.regrowth_count + 1`
+    /// are the same write. The old rule matched the token text
+    /// `regrowth_count + 1`, which the compound form does not contain,
+    /// and re-review 3 scored a regrowth for every row with two
+    /// characters.
+    pub op: String,
 }
 
 struct AssignVisitor {
@@ -1260,9 +1269,39 @@ impl<'ast> Visit<'ast> for AssignVisitor {
                 lhs: a.left.to_token_stream().to_string(),
                 rhs: a.right.to_token_stream().to_string(),
                 conditions: self.conditions.clone(),
+                op: "=".to_string(),
             });
         }
         syn::visit::visit_expr_assign(self, a);
+    }
+    /// `x += 1` is a `syn::ExprBinary` with an assigning operator, not an
+    /// `ExprAssign`, so a visitor that only implemented the latter saw
+    /// no write at all.
+    fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        let op = b.op.to_token_stream().to_string();
+        let assigning = matches!(
+            b.op,
+            syn::BinOp::AddAssign(_)
+                | syn::BinOp::SubAssign(_)
+                | syn::BinOp::MulAssign(_)
+                | syn::BinOp::DivAssign(_)
+                | syn::BinOp::RemAssign(_)
+                | syn::BinOp::BitXorAssign(_)
+                | syn::BinOp::BitAndAssign(_)
+                | syn::BinOp::BitOrAssign(_)
+                | syn::BinOp::ShlAssign(_)
+                | syn::BinOp::ShrAssign(_)
+        );
+        if assigning && self.in_test == 0 {
+            self.out.push(Assignment {
+                func: self.func.clone(),
+                lhs: b.left.to_token_stream().to_string(),
+                rhs: b.right.to_token_stream().to_string(),
+                conditions: self.conditions.clone(),
+                op: op.replace(' ', ""),
+            });
+        }
+        syn::visit::visit_expr_binary(self, b);
     }
 }
 

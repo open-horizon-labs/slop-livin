@@ -9,6 +9,7 @@
 
 pub mod ast;
 pub mod audits;
+pub mod program;
 pub mod repair_audits;
 pub mod resolve;
 pub mod tui_nonblocking;
