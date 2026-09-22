@@ -140,6 +140,12 @@ pub struct Row {
     /// artifacts without parsing the rendered label back into an
     /// identity.
     pub project: Option<String>,
+    /// Decision evidence (#53/#60) for the row's own unit -- an
+    /// `ArtifactRow`/`ExternalUnit`/`AgentUnit`'s already-populated
+    /// `evidence`, cloned at row-build time (never a fresh scan). Empty
+    /// for a structural row with no single unit backing it (a project
+    /// header, a worktree row, an aggregated kind/type bucket).
+    pub evidence: Vec<swamp_core::evidence::Evidence>,
 }
 
 impl Row {
@@ -165,6 +171,7 @@ impl Row {
             cleanup_summary: None,
             allocated: false,
             project: None,
+            evidence: Vec::new(),
         }
     }
 }
@@ -535,6 +542,10 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             cleanup_summary: None,
             allocated: false,
             project: Some(p.name.clone()),
+            // No single unit backs a project header (it aggregates every
+            // worktree/artifact below it); drill into the tree/worktree
+            // rows for evidence, same as every other per-project fact.
+            evidence: Vec::new(),
         });
     }
     out
@@ -653,6 +664,17 @@ pub fn tree_rows_with_agents(
             cleanup_summary: None,
             allocated: false,
             project: None,
+            // #60: the worktree's own `Source` row is where
+            // `consumer_wiring::attach_associations` (#56/#57) attaches
+            // this project's toolchain-declaration/dependency-lockfile
+            // facts -- surfacing it here means selecting the worktree
+            // itself, not just one artifact under it, shows them.
+            evidence: source_wt
+                .artifacts
+                .iter()
+                .find(|a| a.kind == ArtifactKind::Source)
+                .map(|a| a.evidence.clone())
+                .unwrap_or_default(),
         });
         if is_collapsed {
             continue;
@@ -727,6 +749,14 @@ pub fn tree_rows_with_agents(
             // path to mark; only an unfolded row is markable.
             if row.folded_count == 1 {
                 out_row.unit = Some(UnitId::for_artifact(&abs));
+                // #60: a folded group has no single evidence source, but
+                // an unfolded row maps to exactly one `ArtifactRow` --
+                // look it up by its already-known absolute path rather
+                // than adding an `evidence` field to `TreeRow` for a
+                // fact this same worktree's `artifacts` already holds.
+                if let Some(a) = source_wt.artifacts.iter().find(|a| a.path == abs) {
+                    out_row.evidence = a.evidence.clone();
+                }
             }
             let cargo_children = if row.kind == Some(ArtifactKind::BuildOutput)
                 || (row.folded_count == 1
@@ -1319,6 +1349,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             cleanup_summary: None,
             allocated: false,
             project: None,
+            evidence: Vec::new(),
         })
         .collect()
 }
@@ -1357,6 +1388,7 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
                 );
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
+                row.evidence = a.evidence.clone();
                 out.push(row);
             }
         }
@@ -1376,6 +1408,7 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
         row.unit = Some(UnitId::for_artifact(std::path::Path::new(
             &u.path_or_object,
         )));
+        row.evidence = u.evidence.clone();
         out.push(row);
     }
     out
@@ -1433,6 +1466,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
                 row.mtime_max = a.mtime_max;
+                row.evidence = a.evidence.clone();
                 row.label.push_str(&swamp_core::render::allocation_note(a));
                 if let Some(t) = &a.ecosystem {
                     row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
@@ -1657,7 +1691,7 @@ pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
             } else {
                 format!("{} consumer(s)", u.consumers.len())
             };
-            Row::leaf(
+            let mut row = Row::leaf(
                 0,
                 format!(
                     "{:?} · {} ({}) · {consumers}",
@@ -1667,7 +1701,9 @@ pub fn external_rows(units: &[swamp_core::external::ExternalUnit]) -> Vec<Row> {
                 ),
                 u.bytes,
                 u.growth_bytes,
-            )
+            );
+            row.evidence = u.evidence.clone();
+            row
         })
         .collect();
     rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
@@ -1712,6 +1748,7 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             );
             row.mtime_max = u.mtime_max;
             row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
+            row.evidence = u.evidence.clone();
             row
         })
         .collect();
@@ -2119,6 +2156,7 @@ mod tests {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 },
                 swamp_core::report::UnownedRow {
                     path_or_object: "cache".into(),
@@ -2131,6 +2169,7 @@ mod tests {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 },
             ],
             reconciliation: swamp_core::report::Reconciliation {

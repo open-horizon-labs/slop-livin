@@ -317,6 +317,7 @@ fn fixture_report() -> Report {
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            evidence: Vec::new(),
         }],
         dirs_by_worktree: None,
         files_by_worktree: None,
@@ -447,6 +448,137 @@ fn deleting_progress_and_cancellation_frames() {
         let frame = capture(&app, w, h);
         assert!(frame.contains("Cancelling after current group"));
         cancel.store(false, Ordering::SeqCst);
+    }
+}
+
+/// #60: the selected-row detail area shows decision-evidence lines
+/// (activity, consumers, current-use, recovery, reclaimability) for an
+/// artifact row, at both first-class terminal sizes. Covers missing
+/// evidence (a `Recovery`/`Consumer` `Unknown` fact, e.g. "no known
+/// project"), multiple consumers (a `Consumer` fact whose value is a
+/// list), and the recovery assessment's own smallest-useful follow-up
+/// check (carried through `Evidence::note`).
+#[test]
+fn evidence_detail_area_frames() {
+    use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    let mut report = fixture_report();
+    let dep_row = report.projects[0].worktrees[0]
+        .artifacts
+        .iter_mut()
+        .find(|a| a.kind == ArtifactKind::DependencyTree)
+        .unwrap();
+    dep_row.evidence = vec![
+        Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            FactValue::Timestamp(1_726_000_000 - 3600),
+            EvidenceSource::FilesystemMetadata {
+                detail: "newest recorded modification among measured children".into(),
+            },
+            1_726_000_000,
+        ),
+        // Multiple consumers: two projects' lockfiles both declare this
+        // exact name+version.
+        Evidence::known(
+            FactKind::Consumer,
+            FactSubtype::DeclaredConsumer,
+            FactValue::List(vec!["mole".into(), "swamp".into()]),
+            EvidenceSource::Lockfile {
+                ecosystem: "npm".into(),
+                path: "lodash@4.17.21".into(),
+            },
+            1_726_000_000,
+        )
+        .with_note("declared by more than one project; a shared reference, not an error"),
+        // Missing evidence / no known project: an explicit Unknown, never
+        // silently omitted.
+        Evidence::unknown(
+            FactKind::Recovery,
+            FactSubtype::UnknownPrerequisites,
+            EvidenceSource::Inferred {
+                basis: "no sourced restoration evidence found".into(),
+            },
+            1_726_000_000,
+            "no lockfile found declaring this dependency tree's origin",
+        )
+        .with_note("check: inspect this unit directly (its manifest/metadata) to find a restoration source before removing it"),
+    ];
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(report.clone(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Deps);
+        app.selected = 0;
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("activity"), "{frame}");
+        assert!(frame.contains("consumer"), "{frame}");
+        assert!(frame.contains("recovery"), "{frame}");
+        assert!(
+            frame.contains("mole") && frame.contains("swamp"),
+            "multiple consumers must both be visible: {frame}"
+        );
+        assert!(
+            frame.contains("unknown"),
+            "missing/unknown evidence must render explicitly, not be silently dropped: {frame}"
+        );
+        check(&format!("evidence_detail_{w}x{h}"), &frame);
+    }
+}
+
+/// #60/#61: the inline confirmation row shows consumer/recovery
+/// warnings sourced from `PlanUnit.evidence` (`render::evidence_warnings`),
+/// distinct from the pre-existing git-status warnings line. Reuses the
+/// same evidence-bearing row `evidence_detail_area_frames` builds, then
+/// actually marks and opens the confirm banner -- the real
+/// `mark_row` -> `actions::propose` -> `PlanUnit.evidence` path, not a
+/// hand-constructed warning string.
+#[test]
+fn confirm_row_shows_evidence_warnings() {
+    use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    let mut report = fixture_report();
+    let dep_row = report.projects[0].worktrees[0]
+        .artifacts
+        .iter_mut()
+        .find(|a| a.kind == ArtifactKind::DependencyTree)
+        .unwrap();
+    dep_row.evidence = vec![
+        Evidence::known(
+            FactKind::Consumer,
+            FactSubtype::DeclaredConsumer,
+            FactValue::List(vec!["mole".into(), "swamp".into()]),
+            EvidenceSource::Lockfile {
+                ecosystem: "npm".into(),
+                path: "lodash@4.17.21".into(),
+            },
+            1_726_000_000,
+        ),
+        Evidence::unknown(
+            FactKind::Recovery,
+            FactSubtype::UnknownPrerequisites,
+            EvidenceSource::Inferred {
+                basis: "no sourced restoration evidence found".into(),
+            },
+            1_726_000_000,
+            "no lockfile found declaring this dependency tree's origin",
+        ),
+    ];
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(report.clone(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Tree);
+        app.selected_project = Some("mole".into());
+        app.selected = 2; // node_modules (deps); see marked_rows_state.
+        app.mark_selected();
+        app.open_confirm();
+        let summary = app.confirm_summary();
+        assert!(
+            summary.contains("declared by") && summary.contains("mole"),
+            "confirm row must surface the Consumer fact: {summary}"
+        );
+        assert!(
+            summary.contains("recovery path unknown"),
+            "confirm row must surface the Recovery fact: {summary}"
+        );
+        check(&format!("evidence_confirm_{w}x{h}"), &capture(&app, w, h));
     }
 }
 
@@ -966,6 +1098,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         cleanup_summary: None,
         allocated: false,
         project: None,
+        evidence: Vec::new(),
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [

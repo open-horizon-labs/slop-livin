@@ -439,6 +439,27 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Orders a row's decision evidence for the detail area (#60): activity
+/// (with its timestamp meaning/source/freshness), consumers, current-
+/// use, recovery, reclaimability -- the order named in the acceptance
+/// criteria, so a terminal too short to show every line clips the tail
+/// (the least decision-relevant facts), never the front.
+fn ordered_evidence_lines(evidence: &[swamp_core::evidence::Evidence]) -> Vec<String> {
+    use swamp_core::evidence::FactKind;
+    fn priority(k: FactKind) -> u8 {
+        match k {
+            FactKind::Activity => 0,
+            FactKind::Consumer => 1,
+            FactKind::CurrentUse => 2,
+            FactKind::Recovery => 3,
+            FactKind::Reclaimability => 4,
+        }
+    }
+    let mut sorted: Vec<swamp_core::evidence::Evidence> = evidence.to_vec();
+    sorted.sort_by_key(|e| priority(e.kind));
+    swamp_core::render::render_evidence_lines(&sorted)
+}
+
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     if app.filter_has_no_data() {
         frame.render_widget(Paragraph::new("no data yet"), area);
@@ -650,7 +671,27 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
     // Keep the selection visible even in projects with hundreds of build groups.
-    let detail_height = (if cleanup_view { 3 } else { 2 }).min(area.height.saturating_sub(2));
+    let selected_evidence_lines: Vec<String> = rows
+        .get(app.selected)
+        .map(|r| ordered_evidence_lines(&r.evidence))
+        .unwrap_or_default();
+    let base_detail = if cleanup_view { 3 } else { 2 };
+    // Each evidence line can itself wrap to several physical rows at a
+    // narrow width (`Wrap { trim: true }` below), so sizing by logical
+    // fact count alone would silently clip real content -- estimate
+    // wrapped rows instead. Capped at half the body height: a unit with
+    // many facts must not push the row table itself off screen.
+    let content_width = (area.width as usize).max(1);
+    let wrapped_rows =
+        |s: &str| -> u16 { (s.chars().count().max(1)).div_ceil(content_width) as u16 };
+    let evidence_rows: u16 = selected_evidence_lines
+        .iter()
+        .take(6)
+        .map(|l| wrapped_rows(l))
+        .sum();
+    let detail_height = (base_detail + evidence_rows)
+        .min(area.height.saturating_sub(2))
+        .min((area.height / 2).max(base_detail));
     let table_height = area.height.saturating_sub(detail_height);
     let header_count = if cleanup_view { 2 } else { 1 };
     let visible = table_height.saturating_sub(header_count) as usize;
@@ -753,8 +794,21 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     if let Some(row) = rows.get(app.selected) {
+        // #60: the selected row's own decision-evidence lines (activity,
+        // consumers, current-use, recovery, reclaimability), below the
+        // existing git-status signal line. Dimmed so the signal line
+        // (the previously-existing content) stays visually primary.
+        let mut detail_lines: Vec<Line> = Vec::new();
+        if !row.signals.is_empty() {
+            detail_lines.push(Line::raw(row.signals.join(" · ")));
+        }
+        detail_lines.extend(
+            selected_evidence_lines
+                .iter()
+                .map(|l| Line::styled(l.clone(), Style::default().add_modifier(Modifier::DIM))),
+        );
         frame.render_widget(
-            Paragraph::new(row.signals.join(" · ")).wrap(ratatui::widgets::Wrap { trim: true }),
+            Paragraph::new(detail_lines).wrap(ratatui::widgets::Wrap { trim: true }),
             Rect {
                 y: area.y + table_height,
                 height: detail_height,

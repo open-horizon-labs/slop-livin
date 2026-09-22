@@ -1170,6 +1170,15 @@ impl App {
             }
             _ => {}
         }
+        // #60/#61: consumer/current-use/recovery/reclaimability facts
+        // from the row's own decision evidence (`model::Row::evidence`,
+        // populated from the same `ArtifactRow`/`AgentUnit` every other
+        // row field already comes from) -- distinct from the git-status
+        // warnings above, and covering every markable row uniformly
+        // rather than only the cargo-container-member/agent-storage
+        // cases that separately call `actions::propose`/`propose_agents`
+        // below.
+        warnings.extend(swamp_core::render::evidence_warnings(&row.evidence));
         let label = row.label.trim().to_string();
         let unit_path = PathBuf::from(&unit_id.0);
         let cargo_plan = if self

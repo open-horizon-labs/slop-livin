@@ -1440,6 +1440,52 @@ pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<Stri
         .collect()
 }
 
+/// Confirm-time warnings derived from a unit's decision evidence (#60,
+/// #61's `PlanUnit.evidence`): consumer/current-use/recovery/
+/// reclaimability facts a human should see before authorizing removal,
+/// distinct from `PlanUnit::warnings`' git-status facts (dirty,
+/// unpushed, no remote). Only facts worth a human's attention are
+/// surfaced -- a routine "known rebuildable, no consumers" unit
+/// produces no line here, never a generic "review this" nag for every
+/// selection.
+pub fn evidence_warnings(evidence: &[crate::evidence::Evidence]) -> Vec<String> {
+    use crate::evidence::{FactKind, FactStatus, FactValue};
+    let mut out = Vec::new();
+    for e in evidence {
+        match (e.kind, &e.status) {
+            (FactKind::Consumer, FactStatus::Known(FactValue::Text(who))) => {
+                out.push(format!("declared consumer: {who}"));
+            }
+            (FactKind::Consumer, FactStatus::Known(FactValue::List(who))) => {
+                out.push(format!(
+                    "declared by {} projects: {}",
+                    who.len(),
+                    who.join(", ")
+                ));
+            }
+            (FactKind::CurrentUse, FactStatus::Known(FactValue::Bool(true))) => {
+                out.push("currently in use".to_string());
+            }
+            (FactKind::Recovery, FactStatus::Known(FactValue::Text(path)))
+                if path == "PotentiallyUniqueLocalState" || path == "BackupDependent" =>
+            {
+                out.push("may hold state that exists nowhere else".to_string());
+            }
+            (FactKind::Recovery, FactStatus::Unknown { reason }) => {
+                out.push(format!("recovery path unknown: {reason}"));
+            }
+            (FactKind::Reclaimability, FactStatus::Conflicting { reason, .. }) => {
+                out.push(format!("reclaimable space is a bound, not exact: {reason}"));
+            }
+            (FactKind::Reclaimability, FactStatus::Unknown { reason }) => {
+                out.push(format!("reclaimable space unknown: {reason}"));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn agent_link_label(link: &crate::agents::ProjectLinkState) -> String {
     use crate::agents::ProjectLinkState as L;
     match link {
@@ -1575,4 +1621,116 @@ pub fn render_view_agents(
         filtered.len()
     );
     out
+}
+
+#[cfg(test)]
+mod evidence_warnings_tests {
+    use super::evidence_warnings;
+    use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+
+    fn now() -> u64 {
+        crate::entities::now()
+    }
+
+    #[test]
+    fn known_consumer_list_names_every_project() {
+        let ev = vec![Evidence::known(
+            FactKind::Consumer,
+            FactSubtype::DeclaredConsumer,
+            FactValue::List(vec!["a".into(), "b".into()]),
+            EvidenceSource::Lockfile {
+                ecosystem: "cargo".into(),
+                path: "serde@1.0".into(),
+            },
+            now(),
+        )];
+        let warnings = evidence_warnings(&ev);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains('a') && warnings[0].contains('b'));
+    }
+
+    #[test]
+    fn current_use_false_produces_no_warning() {
+        // The tempting shortcut this rejects: warning on every CurrentUse
+        // fact regardless of value, which would nag on a unit that is
+        // plainly *not* in use right now.
+        let ev = vec![Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            FactValue::Bool(false),
+            EvidenceSource::ProcessQuery {
+                tool: "lsof".into(),
+            },
+            now(),
+        )];
+        assert!(evidence_warnings(&ev).is_empty());
+    }
+
+    #[test]
+    fn recovery_rebuild_is_routine_not_a_warning() {
+        // A confirmed Rebuild path (source present) is the unremarkable
+        // case -- it must not appear as a warning line beside a genuine
+        // Unknown/PotentiallyUniqueLocalState one.
+        let ev = vec![Evidence::known(
+            FactKind::Recovery,
+            FactSubtype::Rebuild,
+            FactValue::Text("Rebuild".into()),
+            EvidenceSource::FilesystemMetadata {
+                detail: "source present".into(),
+            },
+            now(),
+        )];
+        assert!(evidence_warnings(&ev).is_empty());
+    }
+
+    #[test]
+    fn recovery_unknown_and_unique_state_both_warn() {
+        let unknown = vec![Evidence::unknown(
+            FactKind::Recovery,
+            FactSubtype::UnknownPrerequisites,
+            EvidenceSource::Inferred {
+                basis: "no signal".into(),
+            },
+            now(),
+            "no lockfile found",
+        )];
+        assert_eq!(evidence_warnings(&unknown).len(), 1);
+
+        let unique = vec![Evidence::known(
+            FactKind::Recovery,
+            FactSubtype::PotentiallyUniqueLocalState,
+            FactValue::Text("PotentiallyUniqueLocalState".into()),
+            EvidenceSource::FilesystemMetadata {
+                detail: "docker volume".into(),
+            },
+            now(),
+        )];
+        assert_eq!(evidence_warnings(&unique).len(), 1);
+    }
+
+    #[test]
+    fn reclaimability_known_exact_is_not_a_warning_bounded_and_unknown_are() {
+        let known = vec![Evidence::known(
+            FactKind::Reclaimability,
+            FactSubtype::EstimatedReclaimable,
+            FactValue::Bytes(1024),
+            EvidenceSource::FilesystemMetadata {
+                detail: "allocation".into(),
+            },
+            now(),
+        )];
+        assert!(evidence_warnings(&known).is_empty());
+
+        let bounded = vec![Evidence::conflicting(
+            FactKind::Reclaimability,
+            FactSubtype::EstimatedReclaimable,
+            vec![FactValue::Bytes(100), FactValue::Bytes(500)],
+            EvidenceSource::Inferred {
+                basis: "hardlink membership unresolved".into(),
+            },
+            now(),
+            "unresolved hardlink membership",
+        )];
+        assert_eq!(evidence_warnings(&bounded).len(), 1);
+    }
 }
