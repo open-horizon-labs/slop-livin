@@ -1035,6 +1035,57 @@ impl Default for Registry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_store_anchor_selects_what_the_detector_published_including_custom_paths() {
+        let derived = Path::new("/h/Library/Developer/Xcode/DerivedData");
+        let archives = Path::new("/h/Library/Developer/Xcode/Archives");
+        let custom = Path::new("/Volumes/fast/builds");
+        let locs = [
+            (StorageCategory::BuildOutput, derived),
+            (StorageCategory::BuildOutput, archives),
+            (StorageCategory::BuildOutput, custom),
+        ];
+        let not_archives = StoreAnchor::CategorizedExcept {
+            category: StorageCategory::BuildOutput,
+            except: &[&["Archives"]],
+        };
+        assert_eq!(
+            not_archives.select(&locs),
+            vec![0, 2],
+            "the default and a custom DerivedData, never Archives"
+        );
+        let only_archives = StoreAnchor::Categorized {
+            category: StorageCategory::BuildOutput,
+            suffix: &["Archives"],
+        };
+        assert_eq!(only_archives.select(&locs), vec![1]);
+        // Go: the module cache is derived from its download sibling, so a
+        // free-form GOMODCACHE is still found; the build cache has its
+        // own category.
+        let go = [
+            (
+                StorageCategory::Downloads,
+                Path::new("/x/mods/cache/download"),
+            ),
+            (StorageCategory::Cache, Path::new("/x/mods")),
+            (StorageCategory::BuildOutput, Path::new("/y/compiled")),
+        ];
+        let modcache = StoreAnchor::AncestorOfSibling {
+            sibling: StorageCategory::Downloads,
+            up: 2,
+            category: StorageCategory::Cache,
+        };
+        assert_eq!(modcache.select(&go), vec![1]);
+        assert_eq!(
+            StoreAnchor::Categorized {
+                category: StorageCategory::BuildOutput,
+                suffix: &[]
+            }
+            .select(&go),
+            vec![2]
+        );
+    }
+
     /// The guardrail this capability exists for
     /// (`.oh/guardrails/detector-ids-only-in-registry.md`) only holds if
     /// every declaration file `crate::toolchain_declarations` can parse
