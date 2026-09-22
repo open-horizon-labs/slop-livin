@@ -2618,11 +2618,12 @@ pub fn merge_reports(
     // reads never carried them and every refresh silently erased them
     // (the PR #123 review's consumer_evidence_must_survive_a_per_root_report_refresh).
     // Re-attach from the persisted current-state tables: the
-    // declaration/lockfile/Xcode caches make an unchanged worktree a
-    // table lookup, not a re-read.
+    // declaration/lockfile caches make an unchanged worktree a table
+    // lookup, not a re-read. A merge has no external units to join, so
+    // only the project side runs: nothing here reaches a subprocess, and
+    // the TUI calls this on its event thread.
     if let Some(dir) = merged.store_dir.clone() {
-        let mut no_units: Vec<crate::external::ExternalUnit> = Vec::new();
-        crate::consumer_wiring::attach_associations(&mut merged, &mut no_units, Some(&dir));
+        crate::consumer_wiring::attach_project_associations(&mut merged, Some(&dir));
     }
     merged
 }

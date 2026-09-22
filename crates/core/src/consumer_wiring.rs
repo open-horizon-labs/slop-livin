@@ -699,97 +699,13 @@ pub fn attach_associations(
     // of it.
     let registry = locations::Registry::with_builtins();
 
-    let project_roots: Vec<PathBuf> = report
-        .projects
-        .iter()
-        .flat_map(|p| p.worktrees.iter())
-        .map(|wt| wt.path.clone())
-        .collect();
-
-    // unit index -> evidence to append, collected during the read-only
-    // matching pass below and applied once at the end (avoids mixing
-    // mutable/immutable borrows of `external_units` mid-pass).
-    let mut unit_evidence: HashMap<usize, Vec<crate::evidence::Evidence>> = HashMap::new();
-    // unit index -> confirmed consuming project labels, deduplicated
-    // and combined into one Evidence per unit at the end.
-    let mut unit_consumers: HashMap<usize, Vec<String>> = HashMap::new();
-
-    for project in &mut report.projects {
-        let project_label = project.name.clone();
-        for wt in &mut project.worktrees {
-            let wt_path = wt.path.clone();
-
-            // --- #56: toolchain declarations -> installations ---
-            let declarations = cached_declarations(&wt_path, &mut decl_cache);
-            let mut project_side_evidence = Vec::new();
-            for decl in declarations {
-                let installed = installed_versions_for(&decl, external_units, &registry);
-                let (assoc, contributing_units) = resolve_declaration(decl, &installed);
-                project_side_evidence.push(assoc.evidence.clone());
-                if assoc.evidence.is_known() {
-                    for u in contributing_units {
-                        unit_consumers
-                            .entry(u)
-                            .or_default()
-                            .push(project_label.clone());
-                    }
-                }
-            }
-
-            // --- #57: dependency lockfiles -> shared store entries ---
-            let (identities, parse_errors) = cached_identities(&wt_path, &mut dep_cache);
-            for (ecosystem, message) in &parse_errors {
-                project_side_evidence.push(match ecosystem.strip_suffix("-unresolved") {
-                    Some(base) => external_associations::unresolved_dependency_evidence(
-                        base, &wt_path, message,
-                    ),
-                    None => external_associations::invalid_lockfile_evidence(
-                        ecosystem, &wt_path, message,
-                    ),
-                });
-            }
-            // Stores that can only be joined as a whole are attributed
-            // once per worktree, not once per identity.
-            let mut whole_stores: Vec<usize> = Vec::new();
-            for identity in &identities {
-                whole_stores.extend(whole_store_unit(
-                    &identity.ecosystem,
-                    external_units,
-                    &registry,
-                ));
-                for unit_index in match_identity(identity, external_units, &registry) {
-                    unit_consumers
-                        .entry(unit_index)
-                        .or_default()
-                        .push(project_label.clone());
-                }
-            }
-            whole_stores.sort_unstable();
-            whole_stores.dedup();
-            for i in whole_stores {
-                unit_consumers
-                    .entry(i)
-                    .or_default()
-                    .push(project_label.clone());
-            }
-
-            // Attach every project-side fact to this worktree's own
-            // `Source` row -- "at most one Source row per worktree" is
-            // this pass's single canonical attachment point.
-            if let Some(source_row) = wt
-                .artifacts
-                .iter_mut()
-                .find(|a| a.kind == ArtifactKind::Source)
-            {
-                source_row.evidence.extend(project_side_evidence);
-            }
-        }
-    }
-
-    // Content-addressed stores (npm cacache): the honest "cannot be
-    // mapped to an entry" note, once per measured unit and never per
-    // project -- there is no per-entry attribution to make. Both the
-    // basis and the reason come from the detector's own declaration.
+    let (project_roots, mut unit_evidence, unit_consumers) = attach_project_side(
+        report,
+        external_units,
+        &registry,
+        &mut decl_cache,
+        &mut dep_cache,
+    );
     for detector in registry.detectors() {
         for convention in detector.manager_conventions() {
             let ConventionRole::DependencyStore {
@@ -866,12 +782,140 @@ pub fn attach_associations(
 
     if let Some(dir) = swamp_dir {
         let at = now();
-        // Derived data: a write failure costs the next pass a re-derive,
-        // never correctness, so it is not propagated as an error.
         let _ = crate::assoc_store::DeclarationTable::open(dir).save(&decl_cache, at);
         let _ = crate::assoc_store::IdentityTable::open(dir).save(&dep_cache, at);
         let _ = crate::assoc_store::XcodeJoinTable::open(dir).save(&xcode_cache, at);
     }
+}
+
+/// The project side alone: each worktree's own `Source` row gets the
+/// installations and dependencies it declares, from the cached
+/// declaration/lockfile tables. For a report with no external units to
+/// join against -- `report::merge_reports`, which the TUI calls on its
+/// event thread whenever one root's report arrives -- this is all of
+/// the association work there is, and it never reaches the unit side's
+/// Xcode `plutil` read (`attach_build_output_associations`), which the
+/// source audit `tui_actions_off_event_thread` now sees as a subprocess.
+pub fn attach_project_associations(report: &mut Report, swamp_dir: Option<&Path>) {
+    let mut decl_cache: CacheMap = swamp_dir
+        .map(|d| crate::assoc_store::DeclarationTable::open(d).load())
+        .unwrap_or_default();
+    let mut dep_cache: CacheMap = swamp_dir
+        .map(|d| crate::assoc_store::IdentityTable::open(d).load())
+        .unwrap_or_default();
+    let registry = locations::Registry::with_builtins();
+    let _ = attach_project_side(report, &[], &registry, &mut decl_cache, &mut dep_cache);
+    if let Some(dir) = swamp_dir {
+        let at = now();
+        let _ = crate::assoc_store::DeclarationTable::open(dir).save(&decl_cache, at);
+        let _ = crate::assoc_store::IdentityTable::open(dir).save(&dep_cache, at);
+    }
+}
+
+type UnitEvidence = HashMap<usize, Vec<crate::evidence::Evidence>>;
+type UnitConsumers = HashMap<usize, Vec<String>>;
+
+/// Declarations and lockfile identities per worktree: evidence on each
+/// project's `Source` row, and which unit indices each project consumes.
+fn attach_project_side(
+    report: &mut Report,
+    external_units: &[ExternalUnit],
+    registry: &locations::Registry,
+    decl_cache: &mut CacheMap,
+    dep_cache: &mut CacheMap,
+) -> (Vec<PathBuf>, UnitEvidence, UnitConsumers) {
+    let project_roots: Vec<PathBuf> = report
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .map(|wt| wt.path.clone())
+        .collect();
+
+    // unit index -> evidence to append, collected during the read-only
+    // matching pass below and applied once at the end (avoids mixing
+    // mutable/immutable borrows of `external_units` mid-pass).
+    let unit_evidence: HashMap<usize, Vec<crate::evidence::Evidence>> = HashMap::new();
+    // unit index -> confirmed consuming project labels, deduplicated
+    // and combined into one Evidence per unit at the end.
+    let mut unit_consumers: HashMap<usize, Vec<String>> = HashMap::new();
+
+    for project in &mut report.projects {
+        let project_label = project.name.clone();
+        for wt in &mut project.worktrees {
+            let wt_path = wt.path.clone();
+
+            // --- #56: toolchain declarations -> installations ---
+            let declarations = cached_declarations(&wt_path, decl_cache);
+            let mut project_side_evidence = Vec::new();
+            for decl in declarations {
+                let installed = installed_versions_for(&decl, external_units, registry);
+                let (assoc, contributing_units) = resolve_declaration(decl, &installed);
+                project_side_evidence.push(assoc.evidence.clone());
+                if assoc.evidence.is_known() {
+                    for u in contributing_units {
+                        unit_consumers
+                            .entry(u)
+                            .or_default()
+                            .push(project_label.clone());
+                    }
+                }
+            }
+
+            // --- #57: dependency lockfiles -> shared store entries ---
+            let (identities, parse_errors) = cached_identities(&wt_path, dep_cache);
+            for (ecosystem, message) in &parse_errors {
+                project_side_evidence.push(match ecosystem.strip_suffix("-unresolved") {
+                    Some(base) => external_associations::unresolved_dependency_evidence(
+                        base, &wt_path, message,
+                    ),
+                    None => external_associations::invalid_lockfile_evidence(
+                        ecosystem, &wt_path, message,
+                    ),
+                });
+            }
+            // Stores that can only be joined as a whole are attributed
+            // once per worktree, not once per identity.
+            let mut whole_stores: Vec<usize> = Vec::new();
+            for identity in &identities {
+                whole_stores.extend(whole_store_unit(
+                    &identity.ecosystem,
+                    external_units,
+                    registry,
+                ));
+                for unit_index in match_identity(identity, external_units, registry) {
+                    unit_consumers
+                        .entry(unit_index)
+                        .or_default()
+                        .push(project_label.clone());
+                }
+            }
+            whole_stores.sort_unstable();
+            whole_stores.dedup();
+            for i in whole_stores {
+                unit_consumers
+                    .entry(i)
+                    .or_default()
+                    .push(project_label.clone());
+            }
+
+            // Attach every project-side fact to this worktree's own
+            // `Source` row -- "at most one Source row per worktree" is
+            // this pass's single canonical attachment point.
+            if let Some(source_row) = wt
+                .artifacts
+                .iter_mut()
+                .find(|a| a.kind == ArtifactKind::Source)
+            {
+                source_row.evidence.extend(project_side_evidence);
+            }
+        }
+    }
+
+    // Content-addressed stores (npm cacache): the honest "cannot be
+    // mapped to an entry" note, once per measured unit and never per
+    // project -- there is no per-entry attribution to make. Both the
+    // basis and the reason come from the detector's own declaration.
+    (project_roots, unit_evidence, unit_consumers)
 }
 
 /// Every manager that declares where it records a *machine-wide*
