@@ -74,6 +74,61 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the set of detectors or their resolution semantics
 /// changes, so a persisted `EffectiveScope` (`crate::scope`) can show it
 /// was resolved under an older catalog than the one now running.
+/// The one bounded, single-level directory listing the detector and
+/// adapter layers are allowed to perform.
+///
+/// Detectors probe for existence with `metadata`; where a layout
+/// genuinely requires enumerating one level (a version manager's
+/// `versions/` directory, a toolchain root's installed names), they call
+/// this. It is capped, sorted, never recursive, and never follows a
+/// symlink into another tree -- so "adapters and detectors do not
+/// traverse" stays a structural property rather than a habit
+/// (`.oh/guardrails/no-second-traversal-on-report-path.md`,
+/// `.oh/guardrails/agent-adapters-do-not-traverse.md`).
+pub const SHALLOW_LIST_CAP: usize = 4_096;
+
+/// One entry of a [`shallow_list`]: its name and whether it is a
+/// directory, decided from the entry's own file type (never by asking
+/// the filesystem about the path again, which would follow a symlink).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShallowEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+pub fn shallow_list(dir: &std::path::Path) -> Vec<ShallowEntry> {
+    crate::work_counters::record_dir_listed();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ShallowEntry> = Vec::new();
+    for entry in entries.flatten() {
+        if out.len() >= SHALLOW_LIST_CAP {
+            break;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        out.push(ShallowEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: ft.is_dir(),
+        });
+    }
+    crate::work_counters::record_files_statted(out.len() as u64);
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Just the subdirectory names, the shape most callers want.
+pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
+    shallow_list(dir)
+        .into_iter()
+        .filter(|e| e.is_dir)
+        .map(|e| e.name)
+        .collect()
+}
+
 pub const CATALOG_VERSION: &str = "2026-09-21.4";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any

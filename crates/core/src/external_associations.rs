@@ -75,15 +75,13 @@ pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, Str
 /// build output. Used to find each subfolder's own `info.plist` for
 /// [`read_workspace_path`]/[`xcode_derived_data_association`].
 pub fn list_derived_data_subfolders(derived_data: &Path) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(derived_data)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect()
-        })
-        .unwrap_or_default()
+    // One bounded, single-level listing through the shared helper: this
+    // enumerates DerivedData's immediate children, never descends, and
+    // is capped (`.oh/guardrails/no-second-traversal-on-report-path.md`).
+    crate::locations::shallow_dir_names(derived_data)
+        .into_iter()
+        .map(|name| derived_data.join(name))
+        .collect()
 }
 
 /// Builds the Xcode DerivedData -> project consumer evidence: `Known`
@@ -438,14 +436,12 @@ pub fn go_module_escape(path: &str) -> String {
 /// one, `index.crates.io-<hash>`). `registry_src` is the already-
 /// resolved `registry/src` unit path.
 pub fn cargo_registry_entry_exists(registry_src: &Path, name: &str, version: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(registry_src) else {
-        return false;
-    };
     let want = format!("{name}-{version}");
-    entries.filter_map(|e| e.ok()).any(|e| {
-        let idx_dir = e.path();
-        idx_dir.is_dir() && idx_dir.join(&want).exists()
-    })
+    // One bounded listing of the index directories, then one `exists`
+    // probe each -- never a walk into the registry's contents.
+    crate::locations::shallow_dir_names(registry_src)
+        .into_iter()
+        .any(|idx| registry_src.join(idx).join(&want).exists())
 }
 
 /// Go module cache `<GOMODCACHE>/<escaped-module>@<version>`.

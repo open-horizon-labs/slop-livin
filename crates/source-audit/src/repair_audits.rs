@@ -753,6 +753,16 @@ pub fn store_data_is_parquet_not_json_sidecars(root: &Path) -> Result<(), String
             continue;
         }
         for func in ast::functions(&f.ast) {
+            // Only a function that actually handles a store path can be
+            // naming a store file. `read_identities(root)` joining
+            // `package-lock.json` is reading the *user's project*, which
+            // is this tool's whole job.
+            if !["swamp_dir", "store_dir", "store"]
+                .iter()
+                .any(|s| func.body.contains(s))
+            {
+                continue;
+            }
             for lit in string_literals_in(&func.body) {
                 if !(lit.ends_with(".json")
                     || lit.ends_with(".jsonl")
@@ -861,6 +871,36 @@ pub const JSON_WRITE_ALLOWLIST: &[(&str, &str, &str)] = &[
         "move_reviewed",
         "Trash envelope recovery manifest for an exact reviewed Cargo group",
     ),
+    (
+        "crates/core/src/growth.rs",
+        "write_fsevents_state",
+        "the FSEvents cursor: one event id and a mode, read once per observation",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_topology",
+        "the worktree topology snapshot an incremental replay diffs against",
+    ),
+    (
+        "crates/core/src/growth.rs",
+        "write_unowned",
+        "the unowned-paths cache an incremental pass carries forward",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_report",
+        "the compressed last-report cache the TUI paints from before observing",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_scope_report",
+        "the same last-report cache, keyed by a multi-root scope",
+    ),
+    (
+        "crates/tui/src/app.rs",
+        "persist_ui_state",
+        "the remembered filter/sort/reverse of the last TUI session",
+    ),
 ];
 
 const JSON_SERIALIZE_CALLS: &[&str] = &[
@@ -876,6 +916,9 @@ const WRITE_SINKS: &[&str] = &[
     ". write_all (",
     "File :: create (",
     ". persist (",
+    // The ledger is append-only jsonl written through `writeln!` into an
+    // opened file: persistence, and audited as such.
+    "writeln !",
 ];
 
 /// Does a *serialized JSON value* reach a write sink in this function?
@@ -1830,7 +1873,7 @@ mod mutation_tests {
     fn a_json_sidecar_under_the_store_is_rejected() {
         let tmp = workspace(&[(
             "crates/core/src/external.rs",
-            "fn p(d: &Path) -> PathBuf { d.join(\"external_consumers.json\") }",
+            "fn p(swamp_dir: &Path) -> PathBuf { swamp_dir.join(\"external_consumers.json\") }",
         )]);
         let err = store_data_is_parquet_not_json_sidecars(tmp.path()).unwrap_err();
         assert!(err.contains("external_consumers.json"), "{err}");
@@ -1840,7 +1883,7 @@ mod mutation_tests {
     fn a_parquet_table_passes() {
         let tmp = workspace(&[(
             "crates/core/src/external.rs",
-            "fn p(d: &Path) -> PathBuf { d.join(\"consumers/current.parquet\") }",
+            "fn p(swamp_dir: &Path) -> PathBuf { swamp_dir.join(\"consumers/current.parquet\") }",
         )]);
         assert_eq!(store_data_is_parquet_not_json_sidecars(tmp.path()), Ok(()));
     }
@@ -1849,7 +1892,7 @@ mod mutation_tests {
     fn a_named_control_file_passes() {
         let tmp = workspace(&[(
             "crates/core/src/scope.rs",
-            "fn p(d: &Path) -> PathBuf { d.join(\"scope.json\") }",
+            "fn p(swamp_dir: &Path) -> PathBuf { swamp_dir.join(\"scope.json\") }",
         )]);
         assert_eq!(store_data_is_parquet_not_json_sidecars(tmp.path()), Ok(()));
     }

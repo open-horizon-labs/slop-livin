@@ -212,6 +212,16 @@ pub struct IdentityTable(KeyedTable);
 /// by the `info.plist`'s own `(size, mtime)`.
 pub struct XcodeJoinTable(KeyedTable);
 
+/// `external unit key -> (consumer label, note)`: the declared-consumer
+/// sidecar. Human intent rather than derived data, so it is *not*
+/// fingerprint-invalidated -- the fingerprint column is a constant --
+/// but it is still per-unit data and so still a table, not a JSON file.
+pub struct ConsumerTable(KeyedTable);
+
+/// The fingerprint used for tables whose rows are declarations rather
+/// than derivations: nothing invalidates them but an explicit change.
+pub const DECLARED_BY_HAND: &str = "declared";
+
 impl DeclarationTable {
     pub fn open(swamp_dir: &Path) -> Self {
         Self(KeyedTable {
@@ -247,6 +257,21 @@ impl XcodeJoinTable {
         Self(KeyedTable {
             path: dir(swamp_dir).join("xcode_derived_data.parquet"),
             value_columns: &["outcome", "detail"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl ConsumerTable {
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("external_consumers.parquet"),
+            value_columns: &["label", "note"],
         })
     }
     pub fn load(&self) -> HashMap<String, CachedRows> {

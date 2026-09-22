@@ -342,16 +342,10 @@ fn cached_identities(
 // Matching declarations against measured installations (#56).
 // ---------------------------------------------------------------------
 
+/// Installed version names under a manager's root: one bounded,
+/// single-level listing through the shared helper, never a traversal.
 fn readdir_names(dir: &Path) -> Vec<String> {
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::locations::shallow_dir_names(dir)
 }
 
 /// Installed version identifiers for one declaration's `(manager,

@@ -476,27 +476,51 @@ fn last_known_external(swamp_dir: &Path, key: &str) -> Result<Option<(u64, u32)>
 // Parquet store: touching it can never affect growth/regrowth.
 // ---------------------------------------------------------------------
 
-fn consumers_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("external_consumers.json")
-}
-
+/// The declared-consumer sidecar lives in the store's own columnar
+/// table (`crate::assoc_store::ConsumerTable`), not a JSON file: it is
+/// per-unit data, and a JSON map rewritten whole on every association
+/// change is a parallel database with a JSON syntax
+/// (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`). It
+/// still lives apart from the byte-history store, so touching an
+/// association can never affect growth or regrowth.
 fn load_all_consumers(swamp_dir: &Path) -> Result<HashMap<String, Vec<ExternalConsumer>>> {
-    let path = consumers_path(swamp_dir);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text).unwrap_or_default()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(e) => Err(e.into()),
+    let mut out: HashMap<String, Vec<ExternalConsumer>> = HashMap::new();
+    for (key, cached) in crate::assoc_store::ConsumerTable::open(swamp_dir).load() {
+        let entry = out.entry(key).or_default();
+        for row in cached.rows {
+            let label = row.first().cloned().unwrap_or_default();
+            if label.is_empty() {
+                continue;
+            }
+            entry.push(ExternalConsumer {
+                label,
+                note: row.get(1).filter(|n| !n.is_empty()).cloned(),
+            });
+        }
     }
+    Ok(out)
 }
 
 fn save_all_consumers(
     swamp_dir: &Path,
     map: &HashMap<String, Vec<ExternalConsumer>>,
 ) -> Result<()> {
-    fs::create_dir_all(swamp_dir)?;
-    let text = serde_json::to_string_pretty(map)?;
-    fs::write(consumers_path(swamp_dir), text)?;
-    Ok(())
+    let cache: HashMap<String, crate::assoc_store::CachedRows> = map
+        .iter()
+        .map(|(key, consumers)| {
+            (
+                key.clone(),
+                crate::assoc_store::CachedRows {
+                    fingerprint: crate::assoc_store::DECLARED_BY_HAND.to_string(),
+                    rows: consumers
+                        .iter()
+                        .map(|c| vec![c.label.clone(), c.note.clone().unwrap_or_default()])
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+    crate::assoc_store::ConsumerTable::open(swamp_dir).save(&cache, crate::entities::now())
 }
 
 /// This unit's declared consumers, `[]` when none are recorded.
