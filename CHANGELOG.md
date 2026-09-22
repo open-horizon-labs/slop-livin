@@ -4,6 +4,78 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Repairs after review
+
+Two independent adversarial reviews blocked the #116-#123 stack with
+seventeen falsifying tests. All seventeen now pass, and the repairs are
+at the shared layers the reviews pointed at rather than in the adapters
+where the symptoms appeared.
+
+- **An approval now buys the bytes that were reviewed.** New
+  `swamp_core::recheck` is one live-state recheck model every
+  destructive sink shares: reviewed identity and membership, human
+  keep/protect intent reloaded from disk, and tri-state occupancy over
+  every member. A directory renamed aside and replaced with unrelated
+  content, a `swamp protect` entry added after approval, and a file held
+  open *inside* a cache directory each previously let an approved plan
+  proceed; each now refuses and says which.
+- **Occupancy is three-valued.** `OccupancyState::{Free, Occupied,
+  Unknown}`, probed with `lsof +D` for directories so the answer covers
+  descendants. A probe that times out or is denied permission is
+  `Unknown`, and `Unknown` refuses -- the previous recheck fell through
+  on exactly that case, and the confirmation showed nothing at all for
+  it. Both the detail area and the delete confirmation now surface
+  "could not check whether this is in use right now".
+- **Protection fails closed and works in both directions.** An
+  unreadable or malformed `agent_protect.json` is *unknown*, not an
+  empty keep list; every action refuses until it can be read, and
+  `swamp protect list` reports the same error. Protecting a file inside
+  a directory now stops the directory being removed. Writes are atomic.
+- **`[scan] defaults = false` means explicit-only scope**, with a new
+  `enabled_detectors` allow-list. The earlier reading -- drop the
+  built-in default roots, keep inferring from every other detector --
+  is reverted; see the dated correction in
+  `.oh/sessions/2026-09-21-scope-and-detector-registry.md`.
+- **Discovery consumes the authorized scope.** External and agent
+  discovery read `EffectiveScope::authorized_roots()` instead of raw
+  detector candidates, so an excluded tool home yields zero units, a
+  disabled detector yields zero units, and an explicit `--root` no
+  longer quietly widens back out to the whole configured catalog.
+- **History sweeps are owned.** `growth::ObservationOwnership` (key
+  family plus completely-covered roots) guards the shared current
+  table's tombstone loop, so two observations over one store can no
+  longer tombstone each other's rows and report the resurrection as
+  regrowth. `report::observe_scope` runs the walk and both discoveries
+  as one pass.
+- **Every TUI refresh preserves the scope.** Background, live-watch and
+  post-action re-observation all go through the scope-aware path, so
+  excluded subtrees and pruned external locations stay absent; external
+  and agent units are refreshed from the same pass, so the agents view
+  can no longer be stale behind a "live" header; and `prune_removed`
+  drops exactly the successful agent and external rows.
+- **Evidence says what it knows, and from where.** Rendered facts carry
+  their subtype, so allocated bytes and estimated reclaimable bytes no
+  longer render identically. Docker rows keep daemon provenance and an
+  explicit unknown for host backing store instead of a filesystem
+  number nobody measured. An unresolved Maven `${property}` or
+  parent-inherited version is a stated identity gap rather than a
+  silently dropped dependency. Consumer facts survive a per-root report
+  refresh.
+- **The store holds Parquet tables and small control files, nothing
+  else.** `external_consumers.json`,
+  `toolchain_declarations_cache.json` and
+  `dependency_identities_cache.json` are gone, replaced by columnar
+  current-state tables keyed by identity plus a source `(size, mtime)`
+  fingerprint (`swamp_core::assoc_store`). The Xcode DerivedData join
+  is now cached at all: it used to spawn one `plutil` per locally-built
+  project on every report, propose and TUI refresh. No migration --
+  derived data is re-derived, and the removed files are ignored.
+- **Enforcement landed before the repairs.** 22 new AST audits, each
+  with a `.oh/guardrails/<id>.md` and mutation tests proving both
+  directions, plus five runtime test files named explicitly in
+  `scripts/check.sh`. 13 of the 22 pass; the rest enumerate the work
+  that remains, which is recorded rather than described.
+
 - **Closed the decision-evidence follow-ups** (#56-#58, #60): live
   wiring of tool-version declarations and dependency-lockfile/shared-
   store associations into the report/external-unit pipeline (new

@@ -87,10 +87,24 @@ The effective scope is built from four sources, in this order:
    Cargo detector does not hide `~/.cargo` if it happens to live inside
    `~/src`, which is still in scope via the built-in defaults).
 
-`[scan] defaults = false` turns off just the three built-in default
-roots (source 1); every detector not separately named in
-`disabled_detectors` still runs. This is "explicit-only scope": only
-what you named in `include`, plus whatever detectors remain enabled.
+`[scan] defaults = false` means **explicit-only scope**: swamp infers
+nothing. In scope are your `include` entries, any explicit command
+root, and detectors your config actually names -- either through the
+`enabled_detectors` allow-list, or (equivalently) as the complement of a
+non-empty `disabled_detectors` deny-list. With `defaults = false` and
+neither list set, **nothing** is in scope and every command says so.
+
+```toml
+[scan]
+defaults = false                     # infer nothing
+include = ["~/code"]                 # ...except this
+enabled_detectors = ["huggingface"]  # ...and this one detector
+```
+
+An earlier release read `defaults = false` as "drop the three built-in
+default roots, keep inferring from every other detector", which put
+paths in scope that nothing in the config had asked for. That reading is
+gone.
 
 Passing an explicit root (`swamp report ~/other-tree`) replaces sources
 1-3 entirely for that invocation -- `exclude` still applies. A root that
@@ -100,11 +114,31 @@ marked `skipped-as-nested`, so you can see exactly why it did not get
 its own line.
 
 An effective scope that resolves to nothing at all -- `defaults =
-false`, no `include`, and every detector disabled -- is a visible error,
+false` with no `include` and no enabled detectors -- is a visible error,
 never a silent fallback to the current directory or your home
 directory. Malformed `[scan]` config (e.g. `defaults = "yes"` instead
 of a bool) is also a visible, nonzero-exit error rather than a silently
 broadened scope.
+
+### Keeping things: `swamp protect`
+
+`swamp protect add <path>` records that you want a path kept. It blocks
+in **both** directions:
+
+- anything at or beneath a protected path is never proposed or removed; and
+- anything that *contains* a protected path is never proposed or removed
+  either. Protecting `~/.claude/debug/log.txt` therefore also stops
+  `~/.claude/debug/` being removed, because removing the parent would
+  destroy exactly what you asked to keep.
+
+Protection is re-read from disk at the moment an action executes, not
+captured when the plan was proposed: adding a protection after approving
+a plan stops that plan. If the protect list cannot be read or parsed,
+protection state is **unknown**, and every action refuses with that
+reason until the file is repaired or removed -- `swamp protect list`
+reports the same error rather than printing an empty list. The file is
+written atomically (temp file plus rename), so an interrupted write
+cannot turn your keep list into an empty one.
 
 Coverage is not storage: adding a root, excluding one, or a detector
 newly resolving a path is a change in what swamp *looks at*, not a
@@ -711,10 +745,11 @@ defaults = true
 include = []
 exclude = []
 disabled_detectors = []
+enabled_detectors = []
 ```
 
 `config init`'s `[scan]` table is not a frozen copy of the built-in
-default roots or the detector catalog -- it documents the four keys
+default roots or the detector catalog -- it documents the five keys
 with their meaning; the actual defaults and detector catalog live in
 the binary and can grow across releases without editing every user's
 config. See [Scope and coverage](#scope-and-coverage) for what each key

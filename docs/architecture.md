@@ -203,6 +203,111 @@ Every scope-resolving CLI command (`scope`, `report`, `observe`, `ui`,
 its own. See [Scope and coverage](usage.md#scope-and-coverage) for the
 user-facing behavior this produces.
 
+### Scope authority: only `scope.rs` interprets detector output
+
+A detector proposes candidates. Whether a candidate is *in scope* is
+decided in exactly one place, and everything downstream is told the
+answer rather than re-deriving it.
+
+`EffectiveScope::authorized_roots()` returns `(authorized,
+unauthorized)`: roots this pass may look at, each carrying its
+detector's id, display name, category and provenance plus any exclusion
+patterns inside it; and roots the scope considered but did not
+authorize, each with a reason and a flag distinguishing *deliberately
+out of scope* (excluded, disabled detector, outside an explicit command
+root) from *in scope but not observable* (missing, unreadable). Only the
+second is a coverage gap.
+
+`external::discover_and_measure` and `agents::discover_and_measure`
+consume that. Neither reads `scope.detectors`; the
+`discovery_consumes_effective_scope` audit forbids it. The 2026-09-21
+review found both of them iterating raw `Resolved` detector candidates,
+which is detector *output*: an exclusion, a disabled detector and
+explicit-root replacement could not reach them, so excluding a tool home
+outright still produced units for it.
+
+Explicit command roots replace inferred ones. Under `--root`, a
+detector-proposed path is authorized only if it lies inside an explicit,
+present root (`authorized_detector_paths_in_explicit_roots`). The CLI
+and TUI pass their explicit roots into scope resolution rather than
+re-resolving with an empty list, which is how `swamp ui <one-project>`
+used to widen itself back out to the whole configured catalog for
+external and agent discovery.
+
+`defaults = false` means explicit-only scope, with an
+`enabled_detectors` allow-list for turning individual detectors back on;
+`detectors_permitted` is the single predicate that decides whether
+detector inference runs at all. See
+[explicit-only-scope-when-defaults-false](../.oh/guardrails/explicit-only-scope-when-defaults-false.md).
+
+### Observation ownership: who may tombstone a row
+
+External units and agent units share one key family in one Parquet
+current table -- one store, one key scheme, two granularities. That
+sharing is deliberate, and it means neither observation may assume a key
+it did not see has disappeared.
+
+`growth::ObservationOwnership` carries a `KeyFamily` (external or agent)
+and the roots that observation covered *completely* this pass. The
+tombstone loop in `observe_and_annotate_external` is guarded by
+`ownership.owns(key)`: the row must belong to this family and lie inside
+a covered region. A root that was excluded, whose detector was disabled,
+that was missing or unreadable, or that simply was not part of this pass
+contributes no covered root, so nothing under it can be marked absent.
+
+`report::observe_scope` runs the walk, external discovery and agent
+discovery as one pass, so the ordering question does not arise either.
+Before this, running them in sequence over an unchanged filesystem had
+each tombstoning the other's rows, and the next pass reported the
+resurrection as regrowth. Coverage changes are not storage changes.
+
+### The recheck model at destructive sinks
+
+`crate::recheck` is the one live-state recheck every sink shares:
+
+- `reviewed_snapshot(path, reviewed)` recomputes the anchor's `(device,
+  inode)` and its membership and refuses on any drift. Membership is
+  exact (one entry per member with size, mtime and inode) up to
+  `EXACT_MEMBER_LIMIT`, and above it a bounded summary -- entry count,
+  allocated bytes, newest mtime -- plus a blake3 fingerprint of the
+  sorted metadata tuples. Ordinary filesystem artifact rows record an
+  anchor-only identity instead, so proposal stays a `stat` rather than a
+  traversal per matched row. Nothing here reads file contents.
+- `live_protection(store_dir, paths)` loads human keep/protect intent
+  from disk at the moment of the call and tests both directions.
+- `member_occupancy(paths)` probes with `lsof +D` for directories, so
+  the answer covers descendants, and returns
+  `OccupancyState::{Free, Occupied, Unknown}`. `Unknown` refuses.
+
+Strength differs by domain; the model does not. `cargo_cleanup`
+additionally digests its members' *contents* under a held Cargo build
+lock, which is affordable for small build outputs and would be both
+unaffordable and a privacy violation for a model cache or a transcript
+directory.
+
+### Incremental measurement, and what is still a full pass
+
+`folded_measurement` is the single seam that turns a unit into bytes, so
+there is one implementation to make incremental and one place the work
+counters live. `crate::work_counters` counts directory listings, stats
+and header bytes; `crates/core/tests/incremental_external_and_agent_measurement.rs`
+reads them over a 5,000-session agent home and a 20k-file cache root, so
+"unchanged work is cheap" is a number rather than a claim.
+
+`agents::bounded_io` is the only way an adapter may read file contents,
+capped at `MAX_HEADER_BYTES`. The association layer's caches
+(`assoc_store`) are Parquet current-state tables keyed by identity plus
+a source `(size, mtime)` fingerprint, so an unchanged worktree is a
+table lookup and an unchanged Xcode DerivedData folder costs no `plutil`
+subprocess.
+
+What is *not* yet incremental, measured rather than asserted: an
+unchanged agent home still re-reads its session headers, and an
+unchanged external root is still folded afresh. See the "still open"
+section of `.oh/sessions/2026-09-21-foundation-repairs.md` for the
+numbers and why the remaining half belongs with the `AgentAdapter`
+trait.
+
 ### Location detector registry
 
 A detector proposes candidate storage locations for one developer tool

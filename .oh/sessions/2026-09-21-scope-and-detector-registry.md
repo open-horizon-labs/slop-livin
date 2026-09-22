@@ -220,3 +220,40 @@ single-digit seconds including the new tests.
   as an explicit root list always had).
 - Revisit the `defaults = false` reading above if #45-#50's real usage,
   or the epic owner, disagrees with treating it as builtin-defaults-only.
+
+## Correction, 2026-09-21 (later the same day)
+
+The `defaults = false` decision recorded above -- that it turns off only
+the `builtin-defaults` detector while every other enabled detector keeps
+contributing roots -- **was rejected by the user.**
+
+An independent review reproduced it as `defaults_false_must_mean_explicit_only`:
+`defaults = false` with no `include` still resolved 111 candidate roots.
+The review's objection is the one that matters, and it is not about
+which reading is more useful:
+
+> The implementation records a rationale and relabels the result
+> explicit-only; a documented judgment call is not user approval to
+> change the explicit scope contract.
+
+That is right. Writing down a deviation makes it visible; it does not
+make it agreed. The scope contract came from the user, and a session
+note is not the place to amend it.
+
+In force now (`crates/core/src/scope.rs`, and
+`.oh/guardrails/explicit-only-scope-when-defaults-false.md`):
+
+- `defaults = false` means swamp infers **nothing**. In scope are
+  `include` entries, explicit command roots, and detectors the config
+  names.
+- `[scan] enabled_detectors = [...]` is the documented way to name
+  them. A non-empty `disabled_detectors` counts as equally explicit
+  curation ("run everything except these"), which is also what the
+  reviewer's own fixtures rely on.
+- With neither list set, the scope is empty and every command reports
+  that, through the pre-existing empty-scope path.
+
+Pinned by `scope.rs::tests::defaults_false_without_includes_or_enabled_detectors_is_empty`,
+`..::defaults_false_with_an_enabled_detector_allow_list_runs_only_that_detector`,
+and the reviewer's unchanged
+`crates/core/tests/reviewer_counterexamples.rs::defaults_false_must_mean_explicit_only`.
