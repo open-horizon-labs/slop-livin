@@ -125,11 +125,19 @@ impl<J: Send> Pool<J> {
     /// responsible for calling `pool.push` for follow-on work and must
     /// not call `finish_one` itself.
     fn drain(self: &Arc<Self>, workers: usize, process: impl Fn(J) + Sync) {
+        // The work these threads do belongs to whoever started the pool:
+        // without this, a `work_counters::measured` scope would miss
+        // every listing and stat the pool performs, which is exactly how
+        // the instrument came to report "2 dirs listed" for a
+        // 20,000-file traversal.
+        let counters = crate::work_counters::current();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let pool = Arc::clone(self);
                 let process = &process;
+                let counters = counters.clone();
                 scope.spawn(move || {
+                    crate::work_counters::install(counters);
                     while let Some(job) = pool.next() {
                         process(job);
                         pool.finish_one();
@@ -170,6 +178,7 @@ pub(crate) struct DirectoryMeasurement {
 /// worker are materialized; no per-file measurements survive the call.
 pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasurement> {
     let entries = Mutex::new(fs::read_dir(path)?);
+    crate::work_counters::record_dir_listed();
     let result = Mutex::new(DirectoryMeasurement::default());
     let error = Mutex::new(None);
     let pool = Arc::new(Pool::new());
@@ -202,6 +211,7 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
                         .children
                         .push(entry.file_name().to_string_lossy().into_owned());
                 } else if ft.is_file() {
+                    crate::work_counters::record_files_statted(1);
                     let m = match fs::symlink_metadata(entry.path()) {
                         Ok(m) => m,
                         Err(e) => {
@@ -302,6 +312,7 @@ fn discover_one(
     if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
         return;
     }
+    crate::work_counters::record_files_statted(1);
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return;
     };
@@ -310,6 +321,7 @@ fn discover_one(
     }
 
     let git_path = dir.join(".git");
+    crate::work_counters::record_files_statted(1);
     if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
         let dw = if git_meta.is_dir() {
             classify_main_checkout(dir, &git_path)
@@ -326,6 +338,7 @@ fn discover_one(
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    crate::work_counters::record_dir_listed();
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -526,6 +539,26 @@ struct AttrShared {
     /// one of these is never entered: not measured, not reported as
     /// unowned, not walked at all. Excluded, never partially observed.
     excluded: Vec<PathBuf>,
+    /// One entry per directory a `Size` job actually listed, with the
+    /// stamp that decides whether the same directory can be believed
+    /// unchanged on a later pass without listing it again
+    /// (`folded_measurement::reuse_folded_measurement`). Populated only
+    /// when `stamp_dirs` is set -- the full walk has no use for it and
+    /// would pay for a vector the size of the tree's directory count.
+    dir_stamps: Mutex<Vec<DirStamp>>,
+    stamp_dirs: bool,
+}
+
+/// One directory's identity and change stamp, recorded while it was
+/// listed. `mtime_ns`/`ctime_ns` are the directory's own, so an entry
+/// added, removed or renamed inside it moves the stamp; a file rewritten
+/// *in place* does not (see the limitation recorded on
+/// `folded_measurement::reuse_folded_measurement`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirStamp {
+    pub path: PathBuf,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
 }
 
 /// Parallel equivalent of `attribution::attribute`: same classification
@@ -606,6 +639,8 @@ fn attribute_parallel_inner(
         large_file_min_bytes,
         carry,
         excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs: false,
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -694,6 +729,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     {
         return;
     }
+    crate::work_counters::record_files_statted(1);
     let Ok(meta) = fs::symlink_metadata(&path) else {
         return;
     };
@@ -709,7 +745,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     }
 
     let entries = match fs::read_dir(&path) {
-        Ok(e) => e,
+        Ok(e) => {
+            crate::work_counters::record_dir_listed();
+            e
+        }
         Err(_) => {
             shared.unowned.lock().unwrap().push(UnownedRow {
                 path_or_object: path.display().to_string(),
@@ -746,6 +785,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         let child_path = entry.path();
         if ft.is_symlink() {
             dir_symlink_count += 1;
+            crate::work_counters::record_files_statted(1);
             if let Ok(smeta) = fs::symlink_metadata(&child_path) {
                 dir_mtime_max = dir_mtime_max.max(smeta.mtime());
             }
@@ -876,6 +916,7 @@ fn record_file_typed(
     known: &[KnownWorktree],
     shared: &AttrShared,
 ) -> Option<(i64, Option<u64>)> {
+    crate::work_counters::record_files_statted(1);
     let meta = fs::symlink_metadata(path).ok()?;
     Some(record_file(path, &meta, known, shared))
 }
@@ -969,12 +1010,24 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         finish_size_job(group, shared);
         return;
     };
+    crate::work_counters::record_dir_listed();
     // This directory's own rollup (store depth inside the folded unit).
     let mut own_allocated: u64 = 0;
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    let mut dir_mtime_max: i64 = fs::symlink_metadata(&path).map(|m| m.mtime()).unwrap_or(0);
+    crate::work_counters::record_files_statted(1);
+    let own_meta = fs::symlink_metadata(&path);
+    if shared.stamp_dirs
+        && let Ok(m) = own_meta.as_ref()
+    {
+        shared.dir_stamps.lock().unwrap().push(DirStamp {
+            path: path.clone(),
+            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+        });
+    }
+    let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
@@ -989,6 +1042,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
                 group: Arc::clone(group),
             });
         } else if ft.is_file() {
+            crate::work_counters::record_files_statted(1);
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
                 continue;
             };
@@ -1216,6 +1270,25 @@ pub fn resize_artifact_with_dirs_excluding(
     worktree: Option<(&str, &Path)>,
     excluded: &[PathBuf],
 ) -> (ArtifactRow, Vec<DirRollup>) {
+    let (row, dirs, _) =
+        resize_artifact_stamped(root_path, kind, observed_at, worktree, excluded, false);
+    (row, dirs)
+}
+
+/// [`resize_artifact_with_dirs_excluding`] that can also return one
+/// [`DirStamp`] per directory it listed, so the next pass can decide
+/// whether this unit still measures the same without listing anything
+/// (`folded_measurement::reuse_folded_measurement`). The stamps come
+/// from the `symlink_metadata` each `Size` job already takes, so
+/// `stamp_dirs` costs a push per directory and no extra syscall.
+pub fn resize_artifact_stamped(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    worktree: Option<(&str, &Path)>,
+    excluded: &[PathBuf],
+    stamp_dirs: bool,
+) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>) {
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
@@ -1235,6 +1308,8 @@ pub fn resize_artifact_with_dirs_excluding(
         large_file_min_bytes: u64::MAX,
         carry: HashMap::new(),
         excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs,
     });
     let wt_id = worktree
         .map(|(id, _)| id.to_string())
@@ -1263,6 +1338,7 @@ pub fn resize_artifact_with_dirs_excluding(
     });
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
     let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
+    let stamps: Vec<DirStamp> = shared.dir_stamps.into_inner().unwrap();
     let mut rows = shared
         .artifacts_by_worktree
         .into_inner()
@@ -1299,7 +1375,7 @@ pub fn resize_artifact_with_dirs_excluding(
     // `local_bytes` (the full walk charges shared inodes to whichever row
     // saw them first; the incremental merge applies the local delta).
     row.local_bytes = row.bytes.max(row.local_bytes);
-    (row, dirs)
+    (row, dirs, stamps)
 }
 
 /// Checkouts at `dir` and its immediate children only: what a changed
@@ -1308,6 +1384,7 @@ pub fn resize_artifact_with_dirs_excluding(
 /// the clone itself); a recursive discovery of `~/src` here cost ~0.5 s
 /// per incremental observation and found nothing new.
 pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
+    crate::work_counters::record_files_statted(1);
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return Vec::new();
     };
@@ -1325,6 +1402,7 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
     // discover_one queued the children it would have recursed into; take
     // exactly one level of them, without recursing further.
     while let Some(child) = pool.try_pop() {
+        crate::work_counters::record_files_statted(2);
         let Ok(cm) = fs::symlink_metadata(&child) else {
             continue;
         };

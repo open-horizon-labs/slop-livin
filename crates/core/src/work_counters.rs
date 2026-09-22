@@ -1,5 +1,5 @@
-//! Cheap process-global counters for the work an observation actually
-//! did: directories listed, files statted, session-header bytes read.
+//! Counters for the work an observation actually did: directories
+//! listed, files statted, session-header bytes read.
 //!
 //! These exist because "incremental" is otherwise unfalsifiable. The
 //! handoff requires unchanged work to scale with roots and changed
@@ -8,32 +8,95 @@
 //! `crates/core/tests/incremental_external_and_agent_measurement.rs`
 //! does exactly that.
 //!
-//! The counters are **per thread**. They were process-global
-//! `AtomicU64`s, which made every assertion in this crate's own tests a
-//! race: `cargo test` runs the lib tests in parallel threads, so one
-//! adapter's `header_bytes_read == 0` could be falsified by a different
-//! adapter's fixture reading a header at the same moment. An
-//! intermittently wrong measurement is worse than no measurement.
+//! # Why there are two sinks
 //!
-//! Per-thread is also the *right* scope for what these measure:
-//! identification, folded measurement and the bounded listings all run
-//! on the caller's own thread, and a caller asking "what did my pass
-//! cost" means its own pass. Incrementing a `Cell<u64>` is cheaper than
-//! an atomic, and nothing reads these except tests and `swamp report
-//! --json`'s optional work block.
+//! The counters began as process-global `AtomicU64`s, which made every
+//! assertion in this crate's own tests a race: `cargo test` runs lib
+//! tests in parallel threads, so one adapter's `header_bytes_read == 0`
+//! could be falsified by a different adapter's fixture reading a header
+//! at the same moment. They were then made `thread_local!`, which fixed
+//! the race and broke the instrument: `walk.rs` does its listing and
+//! stat'ing on a worker pool (`Pool::drain` spawns `std::thread::scope`
+//! workers), so the measuring thread saw none of the traversal it was
+//! measuring. The 2026-09-22 re-review measured a 20,000-file traversal
+//! reporting "2 dirs listed, 0 files statted" and called it a P1 on the
+//! audit itself: "any future incrementality claim measured with this
+//! instrument will pass vacuously".
+//!
+//! Neither scope alone is right, so there are two, and every record
+//! writes to both:
+//!
+//! * a **process-global** sink, read by [`snapshot`]/[`since`]/[`reset`].
+//!   It sees every thread, which is what an integration test measuring a
+//!   whole observation wants. Such a test serializes itself (its own
+//!   mutex, or `--test-threads=1`).
+//! * a **scoped** sink installed by [`measured`] on the calling thread
+//!   and *inherited by the pool workers that thread spawns*
+//!   ([`current`]/[`install`], called from `Pool::drain`). Two tests
+//!   calling `measured` at the same time cannot see each other's work,
+//!   and each still sees its own pool.
+//!
+//! Relaxed ordering throughout: these are counters, not synchronization.
 
-use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-thread_local! {
-    static DIRS_LISTED: Cell<u64> = const { Cell::new(0) };
-    static FILES_STATTED: Cell<u64> = const { Cell::new(0) };
-    static HEADER_BYTES: Cell<u64> = const { Cell::new(0) };
-    static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
-    static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
+/// One set of counters. The process-global sink is one of these; each
+/// [`measured`] scope allocates another.
+#[derive(Debug, Default)]
+pub struct Counters {
+    dirs_listed: AtomicU64,
+    files_statted: AtomicU64,
+    header_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
-fn add(counter: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
-    counter.with(|c| c.set(c.get().saturating_add(n)));
+impl Counters {
+    fn snapshot(&self) -> WorkCounters {
+        WorkCounters {
+            dirs_listed: self.dirs_listed.load(Ordering::Relaxed),
+            files_statted: self.files_statted.load(Ordering::Relaxed),
+            header_bytes_read: self.header_bytes.load(Ordering::Relaxed),
+            identification_cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            identification_cache_misses: self.cache_misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static GLOBAL: Counters = Counters {
+    dirs_listed: AtomicU64::new(0),
+    files_statted: AtomicU64::new(0),
+    header_bytes: AtomicU64::new(0),
+    cache_hits: AtomicU64::new(0),
+    cache_misses: AtomicU64::new(0),
+};
+
+thread_local! {
+    static SCOPE: std::cell::RefCell<Option<Arc<Counters>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The scoped sink this thread is recording into, if any. `walk.rs`'s
+/// pool captures this on the spawning thread and [`install`]s it on each
+/// worker, so a [`measured`] scope sees the traversal it started.
+pub fn current() -> Option<Arc<Counters>> {
+    SCOPE.with(|s| s.borrow().clone())
+}
+
+/// Installs `scope` as this thread's scoped sink. Called by pool workers
+/// with the value [`current`] returned on the thread that spawned them.
+pub fn install(scope: Option<Arc<Counters>>) {
+    SCOPE.with(|s| *s.borrow_mut() = scope);
+}
+
+fn add(pick: fn(&Counters) -> &AtomicU64, n: u64) {
+    pick(&GLOBAL).fetch_add(n, Ordering::Relaxed);
+    SCOPE.with(|s| {
+        if let Some(c) = s.borrow().as_ref() {
+            pick(c).fetch_add(n, Ordering::Relaxed);
+        }
+    });
 }
 
 /// A snapshot of the work counters, for a test or a `--json` work block.
@@ -47,50 +110,59 @@ pub struct WorkCounters {
 }
 
 pub fn record_dir_listed() {
-    add(&DIRS_LISTED, 1);
+    add(|c| &c.dirs_listed, 1);
 }
 
 pub fn record_files_statted(n: u64) {
-    add(&FILES_STATTED, n);
+    add(|c| &c.files_statted, n);
 }
 
 pub fn record_header_bytes(n: u64) {
-    add(&HEADER_BYTES, n);
+    add(|c| &c.header_bytes, n);
 }
 
 pub fn record_cache_hit() {
-    add(&CACHE_HITS, 1);
+    add(|c| &c.cache_hits, 1);
 }
 
 pub fn record_cache_miss() {
-    add(&CACHE_MISSES, 1);
+    add(|c| &c.cache_misses, 1);
 }
 
+/// The process-global counters. Sees every thread; a caller that wants
+/// an exact number either serializes itself or uses [`measured`].
 pub fn snapshot() -> WorkCounters {
-    WorkCounters {
-        dirs_listed: DIRS_LISTED.with(Cell::get),
-        files_statted: FILES_STATTED.with(Cell::get),
-        header_bytes_read: HEADER_BYTES.with(Cell::get),
-        identification_cache_hits: CACHE_HITS.with(Cell::get),
-        identification_cache_misses: CACHE_MISSES.with(Cell::get),
-    }
+    GLOBAL.snapshot()
 }
 
-/// Zeroes this thread's counters. Tests call this immediately before the
-/// pass they are measuring; nothing in production resets them.
+/// Runs `f` with a fresh scoped sink installed on this thread, returning
+/// its value and exactly the work `f` did -- including the work of any
+/// `walk.rs` pool `f` started, and excluding every other thread's.
+pub fn measured<T>(f: impl FnOnce() -> T) -> (T, WorkCounters) {
+    let previous = current();
+    let scope = Arc::new(Counters::default());
+    install(Some(Arc::clone(&scope)));
+    let out = f();
+    install(previous);
+    (out, scope.snapshot())
+}
+
+/// Zeroes the process-global counters. Tests that measure through
+/// [`snapshot`] call this immediately before the pass they are
+/// measuring; nothing in production resets them.
 pub fn reset() {
     for c in [
-        &DIRS_LISTED,
-        &FILES_STATTED,
-        &HEADER_BYTES,
-        &CACHE_HITS,
-        &CACHE_MISSES,
+        &GLOBAL.dirs_listed,
+        &GLOBAL.files_statted,
+        &GLOBAL.header_bytes,
+        &GLOBAL.cache_hits,
+        &GLOBAL.cache_misses,
     ] {
-        c.with(|c| c.set(0));
+        c.store(0, Ordering::Relaxed);
     }
 }
 
-/// The work done between `before` and now.
+/// The global work done between `before` and now.
 pub fn since(before: WorkCounters) -> WorkCounters {
     let now = snapshot();
     WorkCounters {
@@ -105,5 +177,20 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         identification_cache_misses: now
             .identification_cache_misses
             .saturating_sub(before.identification_cache_misses),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The scoped sink is what makes a `== 0` assertion in a parallel
+    /// test suite mean anything: work another thread does outside this
+    /// scope must not land in it.
+    #[test]
+    fn a_measured_scope_does_not_see_another_thread() {
+        let (_, counted) = super::measured(|| {
+            std::thread::spawn(super::record_dir_listed).join().unwrap();
+            super::record_dir_listed();
+        });
+        assert_eq!(counted.dirs_listed, 1);
     }
 }

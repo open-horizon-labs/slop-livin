@@ -1471,10 +1471,11 @@ pub(crate) mod contract {
     /// Runs `identify` and returns what it produced plus the work it
     /// did, so a test can assert on bytes read rather than trusting a
     /// comment.
+    /// Scoped, not global: these tests run in parallel, and a global
+    /// counter read here is a race against every other adapter's
+    /// fixture (`crate::work_counters`).
     pub fn measured<T>(f: impl FnOnce() -> T) -> (T, crate::work_counters::WorkCounters) {
-        let before = crate::work_counters::snapshot();
-        let out = f();
-        (out, crate::work_counters::since(before))
+        crate::work_counters::measured(f)
     }
 
     /// Every unit in a default-protected category arrives protected, and
@@ -1689,16 +1690,17 @@ mod tests {
         let cache = IdentificationCache::disabled();
         // Disabled: every call reads.
         let ctx = IdentifyCtx::new(1, &cache);
-        let before = crate::work_counters::snapshot();
-        for _ in 0..3 {
-            assert_eq!(
-                ctx.derived("t", "cwd", &f, 4096, &|s| Some(
-                    s.lines().next()?.to_string()
-                )),
-                Some("{\"cwd\":\"/x\"}".to_string())
-            );
-        }
-        assert!(crate::work_counters::since(before).header_bytes_read > 0);
+        let (_, counted) = crate::work_counters::measured(|| {
+            for _ in 0..3 {
+                assert_eq!(
+                    ctx.derived("t", "cwd", &f, 4096, &|s| Some(
+                        s.lines().next()?.to_string()
+                    )),
+                    Some("{\"cwd\":\"/x\"}".to_string())
+                );
+            }
+        });
+        assert!(counted.header_bytes_read > 0);
 
         // Enabled: the first call reads, the rest do not.
         let store = tempfile::tempdir().unwrap();
@@ -1707,15 +1709,15 @@ mod tests {
         let _ = ctx.derived("t", "cwd", &f, 4096, &|s| {
             Some(s.lines().next()?.to_string())
         });
-        let before = crate::work_counters::snapshot();
-        for _ in 0..3 {
-            let _ = ctx.derived("t", "cwd", &f, 4096, &|s| {
-                Some(s.lines().next()?.to_string())
-            });
-        }
+        let (_, counted) = crate::work_counters::measured(|| {
+            for _ in 0..3 {
+                let _ = ctx.derived("t", "cwd", &f, 4096, &|s| {
+                    Some(s.lines().next()?.to_string())
+                });
+            }
+        });
         assert_eq!(
-            crate::work_counters::since(before).header_bytes_read,
-            0,
+            counted.header_bytes_read, 0,
             "a cached derivation must not re-read the file"
         );
 
@@ -1723,15 +1725,14 @@ mod tests {
         // a slow one.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&f, b"{\"cwd\":\"/y\"}\nBODY\n").unwrap();
-        let before = crate::work_counters::snapshot();
-        assert_eq!(
-            ctx.derived("t", "cwd", &f, 4096, &|s| Some(
-                s.lines().next()?.to_string()
-            )),
-            Some("{\"cwd\":\"/y\"}".to_string())
-        );
+        let (got, counted) = crate::work_counters::measured(|| {
+            ctx.derived("t", "cwd", &f, 4096, &|s| {
+                Some(s.lines().next()?.to_string())
+            })
+        });
+        assert_eq!(got, Some("{\"cwd\":\"/y\"}".to_string()));
         assert!(
-            crate::work_counters::since(before).header_bytes_read > 0,
+            counted.header_bytes_read > 0,
             "a changed file must be re-read"
         );
     }
@@ -1813,9 +1814,10 @@ mod tests {
         let cache = IdentificationCache::load(store.path());
         let ctx = IdentifyCtx::new(1, &cache);
         assert_eq!(ctx.derived("t", "cwd", &f, 4096, &|_| None), None);
-        let before = crate::work_counters::snapshot();
-        assert_eq!(ctx.derived("t", "cwd", &f, 4096, &|_| None), None);
-        assert_eq!(crate::work_counters::since(before).header_bytes_read, 0);
+        let (got, counted) =
+            crate::work_counters::measured(|| ctx.derived("t", "cwd", &f, 4096, &|_| None));
+        assert_eq!(got, None);
+        assert_eq!(counted.header_bytes_read, 0);
     }
 
     #[test]
@@ -1832,14 +1834,12 @@ mod tests {
         }
         let cache = IdentificationCache::load(store.path());
         let ctx = IdentifyCtx::new(2, &cache);
-        let before = crate::work_counters::snapshot();
+        let (got, counted) = crate::work_counters::measured(|| {
+            ctx.derived("t", "cwd", &f, 4096, &|s| Some(s.trim().to_string()))
+        });
+        assert_eq!(got, Some("{\"cwd\":\"/x\"}".to_string()));
         assert_eq!(
-            ctx.derived("t", "cwd", &f, 4096, &|s| Some(s.trim().to_string())),
-            Some("{\"cwd\":\"/x\"}".to_string())
-        );
-        assert_eq!(
-            crate::work_counters::since(before).header_bytes_read,
-            0,
+            counted.header_bytes_read, 0,
             "a cache that does not survive a restart closes nothing"
         );
     }

@@ -82,10 +82,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("s.jsonl");
         fs::write(&p, b"{}").unwrap();
-        let before = crate::work_counters::snapshot();
-        let _ = read_header(&p, 8192);
+        let (_, counted) = crate::work_counters::measured(|| read_header(&p, 8192));
         assert!(
-            crate::work_counters::since(before).header_bytes_read > 0,
+            counted.header_bytes_read > 0,
             "header reads must be counted, or \"zero header reads\" is unprovable"
         );
     }

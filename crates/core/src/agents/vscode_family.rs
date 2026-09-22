@@ -759,9 +759,7 @@ mod tests {
             );
         }
         let start = SystemTime::now();
-        let before = crate::work_counters::snapshot();
-        let units = ext(&ext_home, ROO);
-        let counted = crate::work_counters::since(before);
+        let (units, counted) = crate::work_counters::measured(|| ext(&ext_home, ROO));
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         eprintln!(
             "[measured] vscode_family identify_extension_globalstorage() over 500 synthetic \
@@ -795,11 +793,11 @@ mod tests {
         let ctx = IdentifyCtx::new(1, &cache);
         let first = identify_extension_globalstorage(&ext_home, &ctx, ROO);
         assert_eq!(first.len(), 20);
-        let before = crate::work_counters::snapshot();
-        let second = identify_extension_globalstorage(&ext_home, &ctx, ROO);
+        let (second, counted) = crate::work_counters::measured(|| {
+            identify_extension_globalstorage(&ext_home, &ctx, ROO)
+        });
         assert_eq!(
-            crate::work_counters::since(before).header_bytes_read,
-            0,
+            counted.header_bytes_read, 0,
             "an unchanged task must not be re-read"
         );
         assert!(

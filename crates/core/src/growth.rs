@@ -32,7 +32,8 @@ use crate::report::{
 };
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
@@ -421,6 +422,12 @@ fn downcast_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Arra
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
         .with_context(|| format!("column {name} is not UInt32"))
+}
+fn downcast_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .with_context(|| format!("column {name} is not Int64"))
 }
 fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
     batch
@@ -3544,6 +3551,147 @@ fn read_external_rows(path: &Path) -> Result<Vec<StoredExternalRow>> {
         }
     }
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// external/folded.parquet -- the measurement the next pass may reuse
+// ---------------------------------------------------------------------
+
+/// One row per directory a unit's folded measurement listed, plus one
+/// root row (`rel_dir == ""`) carrying the measurement itself.
+///
+/// This is a *measurement cache*, not history: it never feeds growth,
+/// tombstones or regrowth, and deleting it only costs one full
+/// re-measurement. It is per **directory**, never per file -- the
+/// handoff forbids a per-file persistent inventory, and a directory's
+/// own `mtime`/`ctime` already move when an entry inside it is created,
+/// removed or renamed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedRow {
+    pub unit_path: String,
+    pub rel_dir: String,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    /// Root row only: the folded byte total, whether any member was
+    /// hardlinked, the newest member mtime, when it was measured, and a
+    /// digest of the exclusion list it was measured under.
+    pub bytes: u64,
+    pub hardlinked: bool,
+    pub mtime_max: u64,
+    pub observed_at: u64,
+    pub exclusions: String,
+}
+
+fn folded_path(swamp_dir: &Path) -> PathBuf {
+    external_dir(swamp_dir).join("folded.parquet")
+}
+
+fn folded_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("unit_path", DataType::Utf8, false),
+        Field::new("rel_dir", DataType::Utf8, false),
+        Field::new("mtime_ns", DataType::Int64, false),
+        Field::new("ctime_ns", DataType::Int64, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("hardlinked", DataType::Boolean, false),
+        Field::new("mtime_max", DataType::UInt64, false),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("exclusions", DataType::Utf8, false),
+    ]))
+}
+
+fn write_folded_rows(path: &Path, rows: &[FoldedRow]) -> Result<()> {
+    let schema = folded_schema();
+    let unit_path: Vec<&str> = rows.iter().map(|r| r.unit_path.as_str()).collect();
+    let rel_dir: Vec<&str> = rows.iter().map(|r| r.rel_dir.as_str()).collect();
+    let mtime_ns: Vec<i64> = rows.iter().map(|r| r.mtime_ns).collect();
+    let ctime_ns: Vec<i64> = rows.iter().map(|r| r.ctime_ns).collect();
+    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
+    let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
+    let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+    let exclusions: Vec<&str> = rows.iter().map(|r| r.exclusions.as_str()).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(unit_path)) as ArrayRef,
+            Arc::new(StringArray::from(rel_dir)),
+            Arc::new(Int64Array::from(mtime_ns)),
+            Arc::new(Int64Array::from(ctime_ns)),
+            Arc::new(UInt64Array::from(bytes)),
+            Arc::new(BooleanArray::from(hardlinked)),
+            Arc::new(UInt64Array::from(mtime_max)),
+            Arc::new(UInt64Array::from(observed_at)),
+            Arc::new(StringArray::from(exclusions)),
+        ],
+    )?;
+    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
+}
+
+fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let unit_path = downcast_str(&batch, "unit_path")?;
+        let rel_dir = downcast_str(&batch, "rel_dir")?;
+        let mtime_ns = downcast_i64(&batch, "mtime_ns")?;
+        let ctime_ns = downcast_i64(&batch, "ctime_ns")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let hardlinked = downcast_bool(&batch, "hardlinked")?;
+        let mtime_max = downcast_u64(&batch, "mtime_max")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        let exclusions = downcast_str(&batch, "exclusions")?;
+        for i in 0..batch.num_rows() {
+            rows.push(FoldedRow {
+                unit_path: unit_path.value(i).to_string(),
+                rel_dir: rel_dir.value(i).to_string(),
+                mtime_ns: mtime_ns.value(i),
+                ctime_ns: ctime_ns.value(i),
+                bytes: bytes.value(i),
+                hardlinked: hardlinked.value(i),
+                mtime_max: mtime_max.value(i),
+                observed_at: observed_at.value(i),
+                exclusions: exclusions.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Every stored folded row for `unit_path`, root row first. Empty when
+/// nothing is stored, the store is unreadable, or the table is corrupt:
+/// a cache that cannot be read is a cache miss, never an error.
+pub fn folded_rows_for(swamp_dir: &Path, unit_path: &str) -> Vec<FoldedRow> {
+    let mut rows: Vec<FoldedRow> = read_folded_rows(&folded_path(swamp_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.unit_path == unit_path)
+        .collect();
+    rows.sort_by(|a, b| a.rel_dir.len().cmp(&b.rel_dir.len()));
+    rows
+}
+
+/// Replaces the stored folded rows for `unit_path` with `rows`, leaving
+/// every other unit's rows alone. A unit whose rows are dropped simply
+/// re-measures next pass.
+pub fn store_folded_rows(swamp_dir: &Path, unit_path: &str, rows: &[FoldedRow]) -> Result<()> {
+    let dir = external_dir(swamp_dir);
+    fs::create_dir_all(&dir)?;
+    let path = folded_path(swamp_dir);
+    let mut all: Vec<FoldedRow> = read_folded_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.unit_path != unit_path)
+        .collect();
+    all.extend(rows.iter().cloned());
+    write_folded_rows(&path, &all)
 }
 
 /// Which family of rows in the shared external current table an

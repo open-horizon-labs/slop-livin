@@ -341,23 +341,29 @@ pub fn discover_and_measure(
         // measurement seam; nothing in this module lists a directory or
         // re-sizes a tree itself
         // (`.oh/guardrails/no-second-traversal-on-report-path.md`).
-        match crate::folded_measurement::access(&canonical) {
+        // `observe_unit` tries the stored folded rows first, so an
+        // unchanged unit costs one stat per directory and no listing at
+        // all -- not even the readability probe's.
+        let row = match crate::folded_measurement::observe_unit(
+            swamp_dir,
+            &canonical,
+            &nested_exclusions,
+            observed_at,
+        ) {
             // Genuinely absent: no candidate this pass. If it was
             // measured before, this observation's own owned sweep
             // tombstones it correctly (a real removal, e.g. the tool was
             // uninstalled and its whole home deleted).
-            crate::folded_measurement::UnitAccess::Absent => continue,
+            crate::folded_measurement::UnitObservation::Absent => continue,
             // Present but not readable this pass: protect it from
             // tombstoning, and skip measuring rather than guessing.
             // Coverage is incomplete, which is not a storage change.
-            crate::folded_measurement::UnitAccess::Unreadable(_) => {
+            crate::folded_measurement::UnitObservation::Unreadable(_) => {
                 protected_keys.insert(key);
                 continue;
             }
-            crate::folded_measurement::UnitAccess::Measurable => {}
-        }
-
-        let row = crate::folded_measurement::measure(&canonical, &nested_exclusions, observed_at);
+            crate::folded_measurement::UnitObservation::Unit(row) => row,
+        };
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),
             detector_id: detector_id.clone(),

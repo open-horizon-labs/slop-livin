@@ -253,6 +253,24 @@ fn legacy_invariants(root: &Path) -> Result<(), String> {
             "scan.rs: roots must be canonicalized at the boundary (canonical_roots)".into(),
         );
     }
+    // A name is not the invariant. Every definition called
+    // `canonical_roots` has to canonicalize -- one that returns its
+    // argument unchanged satisfies the reference check above while the
+    // boundary does nothing (slip class 4: an existence check standing
+    // in for semantics). Every definition, not the first: a second one
+    // beside the real one is the same defect.
+    for f in ast::functions(&scan.ast)
+        .iter()
+        .filter(|f| f.name == "canonical_roots")
+    {
+        if !f.body.contains("canonicalize") {
+            return Err(format!(
+                "scan.rs::{} is named `canonical_roots` and never calls `canonicalize`: the \
+                 boundary invariant is the canonicalization, not the name",
+                f.name
+            ));
+        }
+    }
     let grants = core(root, "grants.rs")?;
     if !grants.text.contains("created_outside_index") {
         return Err("grants.rs: grants need non-index provenance".into());
@@ -341,11 +359,12 @@ fn reverse_delta_current_plus_deltas(root: &Path) -> Result<(), String> {
             "next_seq_path",
         ),
     ] {
-        let f = ast::function(&funcs, name)?;
-        if !f.body.contains(current) || !f.body.contains(delta) {
-            return Err(format!(
-                "growth::{name} must rewrite the current file ({current}) and append a delta ({delta})"
-            ));
+        for f in ast::functions_named(&funcs, name)? {
+            if !f.body.contains(current) || !f.body.contains(delta) {
+                return Err(format!(
+                    "growth::{name} must rewrite the current file ({current}) and append a delta ({delta})"
+                ));
+            }
         }
     }
     Ok(())
@@ -379,18 +398,17 @@ fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
             .enclosing_if_let_inits
             .iter()
             .any(|init| init.contains("classify_at"));
-        // `process_size` recurses inside an already-folded unit;
-        // `resize_artifact`/`resize_artifact_with_dirs` (and their
-        // `_excluding` variants, #45-#49: an external unit's own
-        // measurement can exclude a nested, separately-measured
-        // sub-location) re-size a path the caller already classified --
-        // the exclusion list only prunes what is folded, it never
-        // widens what may be folded without a classify_at guard.
-        if !guarded
-            && s.func != "process_size"
-            && s.func != "resize_artifact_with_dirs"
-            && s.func != "resize_artifact_with_dirs_excluding"
-        {
+        // `process_size` recurses inside an already-folded unit; the
+        // `resize_artifact*` family (the `_with_dirs`, `_excluding` and
+        // `_stamped` variants) re-sizes a path the caller already
+        // classified -- the exclusion list only prunes what is folded
+        // and the stamps only record what was listed, neither widens
+        // what may be folded without a classify_at guard. A prefix
+        // rather than a list of three spellings: the 2026-09-22 mutation
+        // sweep's first structural finding is that a rename defeats a
+        // name list, and this audit's own list went stale the first time
+        // the entry point was renamed.
+        if !guarded && s.func != "process_size" && !s.func.starts_with("resize_artifact") {
             return Err(format!(
                 "walk::{}: builds AttrJob::Size outside an `if let Some(kind) = classify_at(..)`: a directory would be folded without being an artifact",
                 s.func
@@ -533,14 +551,15 @@ fn symlinks_never_followed(root: &Path) -> Result<(), String> {
 fn incremental_walk_only_changed_subtrees(root: &Path) -> Result<(), String> {
     let g = core(root, "growth.rs")?;
     let funcs = ast::functions(&g.ast);
-    let f = ast::function(&funcs, "apply_incremental")?;
-    if !f.body.contains("attribute_one_worktree") || !f.body.contains("resize_artifact") {
-        return Err(
-            "growth::apply_incremental must re-walk only implicated worktrees/artifacts".into(),
-        );
-    }
-    if f.body.contains("full_walk") || f.body.contains("attribute_parallel") {
-        return Err("growth::apply_incremental falls back to a full walk".into());
+    for f in ast::functions_named(&funcs, "apply_incremental")? {
+        if !f.body.contains("attribute_one_worktree") || !f.body.contains("resize_artifact") {
+            return Err(
+                "growth::apply_incremental must re-walk only implicated worktrees/artifacts".into(),
+            );
+        }
+        if f.body.contains("full_walk") || f.body.contains("attribute_parallel") {
+            return Err("growth::apply_incremental falls back to a full walk".into());
+        }
     }
     Ok(())
 }
@@ -571,12 +590,16 @@ fn walk_optimized_parallel_pool(root: &Path) -> Result<(), String> {
 fn dir_mtime_int32_minutes(root: &Path) -> Result<(), String> {
     let g = core(root, "growth.rs")?;
     let funcs = ast::functions(&g.ast);
+    // Every definition with the name, not the first: a second, wrong
+    // `dirs_schema` beside the right one is how "seconds in the minutes
+    // column" walked past this audit.
     for name in ["dirs_schema", "files_schema"] {
-        let f = ast::function(&funcs, name)?;
-        if !f.body.contains("\"mod_time_min\"") || !f.body.contains("Int32") {
-            return Err(format!(
-                "growth::{name}: mod_time_min must be an Int32 (minutes) column"
-            ));
+        for f in ast::functions_named(&funcs, name)? {
+            if !f.body.contains("\"mod_time_min\"") || !f.body.contains("Int32") {
+                return Err(format!(
+                    "growth::{name}: mod_time_min must be an Int32 (minutes) column"
+                ));
+            }
         }
     }
     Ok(())

@@ -342,12 +342,12 @@ mod tests {
         let ctx = IdentifyCtx::new(1, &cache);
         let layouts = [HeaderLayout::OffsetZero];
         let _ = derived_header(&ctx, "t", "header", &p, HEADER_READ_BYTES, &layouts);
-        let before = crate::work_counters::snapshot();
-        let again = derived_header(&ctx, "t", "header", &p, HEADER_READ_BYTES, &layouts);
+        let (again, counted) = crate::work_counters::measured(|| {
+            derived_header(&ctx, "t", "header", &p, HEADER_READ_BYTES, &layouts)
+        });
         assert_eq!(again.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(
-            crate::work_counters::since(before).header_bytes_read,
-            0,
+            counted.header_bytes_read, 0,
             "an unchanged session must cost zero header bytes on a second pass"
         );
     }

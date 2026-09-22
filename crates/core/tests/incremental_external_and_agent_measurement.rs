@@ -267,15 +267,83 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
         first.dirs_listed, first.files_statted, second.dirs_listed, second.files_statted
     );
 
-    // KNOWN GAP, measured rather than claimed: external unit bytes still
-    // come from a fresh folded measurement on every pass, so this
-    // assertion is deliberately the weak one -- it pins that the work is
-    // *counted*, which is what makes the gap visible and the next
-    // repair testable. See the "still open" section of
-    // `.oh/sessions/2026-09-21-foundation-repairs.md`.
     assert!(
         first.dirs_listed > 0,
         "the first pass must be counted, or the counters are not wired"
+    );
+    // THE CLOSED GAP (2026-09-22). External unit bytes used to come from
+    // a fresh recursive folded measurement on every pass; this file's
+    // previous version asserted only that the work was *counted*,
+    // deliberately, so the gap stayed visible. It is now closed:
+    // `folded_measurement::reuse_folded_measurement` answers an
+    // unchanged unit from the folded rows the previous pass persisted,
+    // paying one `stat` per directory and no listing at all.
+    //
+    // Strict on purpose. "Fewer" would pass with a reuse that worked for
+    // the small directories and re-walked the big one.
+    assert_eq!(
+        second.dirs_listed, 0,
+        "an unchanged external root must not re-list a single directory: {} listings over {} \
+         files",
+        second.dirs_listed, EXTERNAL_FILES
+    );
+    // The stat cost is the directory count, not the file count: that is
+    // the whole claim ("scales with roots and changed containers, not
+    // all files"), and a bound of "fewer than the first pass" would not
+    // show it.
+    assert!(
+        second.files_statted < 100,
+        "an unchanged external root costs one stat per directory, not per file: {} stats over \
+         {} files (first pass: {})",
+        second.files_statted,
+        EXTERNAL_FILES,
+        first.files_statted
+    );
+}
+
+/// The reuse must not survive a change it cannot see the inside of: a
+/// file added under the unit costs a real re-measurement, and the new
+/// bytes are reported.
+#[test]
+fn a_changed_external_cache_root_is_measured_again() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let cargo_home = root.join("cargo-home");
+    let registry = cargo_home.join("registry/cache/index.crates.io-abc");
+    fs::create_dir_all(&registry).unwrap();
+    for i in 0..50 {
+        fs::write(registry.join(format!("crate-{i}.crate")), b"x").unwrap();
+    }
+    let scope = scope_with(
+        HashMap::from([("CARGO_HOME".to_string(), cargo_home.display().to_string())]),
+        &root,
+        &["cargo-home"],
+    );
+    let store = tempfile::tempdir().unwrap();
+    let measure_pass = |at: u64| {
+        swamp_core::external::discover_and_measure(&scope, Some(store.path()), true, at, 30, 3600)
+            .expect("external discovery")
+            .into_iter()
+            .map(|u| u.bytes)
+            .sum::<u64>()
+    };
+    let (first_bytes, _) = measure(|| measure_pass(1_000));
+    let (_, second) = measure(|| measure_pass(2_000));
+    assert_eq!(
+        second.dirs_listed, 0,
+        "precondition: the unchanged pass reuses"
+    );
+
+    fs::write(registry.join("added.crate"), vec![b'x'; 200_000]).unwrap();
+    let (third_bytes, third) = measure(|| measure_pass(3_000));
+    assert!(
+        third.dirs_listed > 0,
+        "a directory whose contents changed must be listed again"
+    );
+    assert!(
+        third_bytes > first_bytes,
+        "the added file's bytes must be reported: {third_bytes} vs {first_bytes}"
     );
 }
 
