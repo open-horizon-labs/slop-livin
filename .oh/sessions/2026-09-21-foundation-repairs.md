@@ -138,3 +138,119 @@ call-site half (no CLI/TUI caller) is enforceable today and is being
 repaired; the visibility half stays failing until either the reviewers'
 tests move in-crate or the rule is restated as "no CLI/TUI caller". See
 `.oh/guardrails/discovery-owned-by-report-pipeline.md`.
+
+## What was repaired
+
+Seventeen falsifying tests, from two independent reviews, now pass: the
+seven in `crates/core/tests/reviewer_counterexamples.rs` and the ten in
+`crates/core/tests/reviewer_counterexamples_123.rs`, both copied in
+byte-for-byte and never edited.
+
+The repairs are at the shared layers, because the symptoms were shared:
+
+**One recheck model at every destructive sink** (`crate::recheck`).
+Identity and membership against what was reviewed; protection reloaded
+from disk in both directions; occupancy over every member, tri-state,
+with `Unknown` refusing. Agent cache moves, agent session removals,
+ordinary filesystem rows and Cargo groups all run all three before their
+first rename. Plans carry the reviewed identity: bounded member sets
+exactly, large caches as a bounded summary plus a metadata fingerprint,
+and ordinary artifact rows anchor-only so proposal stays a `stat` rather
+than a traversal per matched row.
+
+**One scope authority** (`EffectiveScope::authorized_roots`). Discovery
+is told what is in scope rather than re-deriving it from detector
+output. `defaults = false` is explicit-only, with an `enabled_detectors`
+allow-list; the earlier reading is reverted and the correction is dated
+in the scope session note.
+
+**One owned sweep** (`growth::ObservationOwnership`). A row may be
+marked absent only by its own key family, inside a region that
+observation covered completely. `report::observe_scope` runs the walk
+and both discoveries as one pass, so ordering cannot matter either.
+
+**One scope-aware refresh path** in the TUI, carrying external and agent
+units from the same observation.
+
+**One store format for data**: four Parquet current-state tables
+(`assoc_store`) replace three JSON sidecars and add the Xcode join cache
+that never existed.
+
+## Measurements
+
+From `crates/core/tests/incremental_external_and_agent_measurement.rs`,
+on this machine, debug build:
+
+| Fixture | First pass | Unchanged second pass |
+| --- | --- | --- |
+| Agent home, 5,000 synthetic sessions | ~375 ms, 740 KB of header reads | ~326 ms, **740 KB** |
+| External cache root, 20,000 files | ~67 ms, 2 directory listings | ~47 ms, 2 directory listings |
+
+The bolded number is the gap, not the result. It should be zero.
+
+Store size on the multi-ecosystem fixture
+(`crates/core/tests/store_contents_are_allowlisted.rs`) after a full
+observe/report/propose/approve/execute cycle: every file is a `.parquet`
+table or one of the named small control files, and no JSON file exceeds
+64 KiB. Before this work the same cycle left
+`toolchain_declarations_cache.json`, `dependency_identities_cache.json`
+and `external_consumers.json`, each growing with the number of
+worktrees and units observed and rewritten whole on every change.
+
+## Still open, with the audit that says so
+
+`cargo run -p swamp-source-audit`: **33 pass, 9 fail** (from 18 failing
+at the baseline above). The nine are the honest list of what the next
+worker starts from.
+
+Seven of them are one piece of work -- the `AgentAdapter` trait and
+registry (spec section 13/14):
+
+- `agent_adapters_are_pluggable` — `agents/mod.rs::identify_for_tool` is
+  still a fourteen-arm `match tool_id`, duplicated in
+  `actions.rs::execute_agent_session_removal`. `agents/registry.rs` does
+  not exist yet.
+- `agent_adapters_read_bounded_headers_only` — `agents/bounded_io.rs`
+  exists and Claude Code goes through it; the other fourteen adapters do
+  not.
+- `agent_adapters_do_not_traverse` and
+  `no_second_traversal_on_report_path` — adapters still call
+  `fs::read_dir` directly instead of `locations::shallow_list`, which
+  now exists and is used by the association layer.
+- `agent_units_built_through_builder` — `AgentUnitBuilder` is not built;
+  adapters still construct `CandidateAgentUnit` literals, so
+  protected-by-default is a habit rather than a constructor.
+- `agent_adapter_test_contract` — the five required per-adapter tests
+  exist for no adapter yet.
+- `detector_ids_only_in_registry` — needs
+  `Detector::manager_conventions()` so `consumer_wiring` matches on
+  capabilities instead of detector id constants.
+
+These were deliberately not started: the identification cache that
+closes the measured header-read gap has to arrive *through* that trait,
+and threading it through fifteen adapters by hand first would mean
+writing the per-adapter plumbing twice. That is the coordinator's own
+instruction and it is the right call.
+
+The remaining two:
+
+- `no_dead_public_evidence_api` — seventeen `pub fn`s in the evidence
+  modules have no non-test caller while the docs describe them as
+  delivered. Each needs wiring where its issue requires, or deleting
+  along with the claim. The audit prints the list.
+- `discovery_owned_by_report_pipeline` — **left failing on purpose.**
+  Its `pub(crate)` requirement is directly incompatible with the
+  reviewers' mandatory, unchanged counterexample files, which call both
+  discovery functions from integration tests. Weakening the audit to
+  pass would have been the easy move and the wrong one. Its call-site
+  half is already satisfied: no CLI or TUI function runs its own
+  discovery pass. Either the reviewers' tests move in-crate, or the rule
+  is restated as "no CLI/TUI caller"; that is a decision for a human,
+  not for this worker.
+
+Not attempted, and not audited yet: the support-matrix verification
+against upstream source (spec section 15's `SupportLevel::Unverified`
+work). The matrix still labels every tool `Supported`, and
+`docs/agent-storage.md`'s own session notes still admit an assumed
+Windsurf layout and unconfirmed Cline/Roo project fields. That claim
+remains unearned.
