@@ -188,7 +188,7 @@ fn store(table: &KeyedTable, cache: &HashMap<String, CachedRows>, observed_at: u
             rows.push((
                 key.clone(),
                 entry.fingerprint.clone(),
-                vec![String::new(); 8],
+                vec![String::new(); table.value_columns.len()],
             ));
             continue;
         }
@@ -224,6 +224,29 @@ pub struct XcodeJoinTable(KeyedTable);
 /// `(size, mtime)` plus the adapter version, so an unchanged session is
 /// a table lookup and a changed or appended one is read exactly once.
 pub struct IdentificationTable(KeyedTable);
+
+/// `adapter\u{1}container directory -> the units that directory
+/// produced`, keyed by the stamps of every directory the identification
+/// of that container actually listed: the agent family's container-level
+/// reuse.
+///
+/// [`IdentificationTable`] removes the header *reads* from an unchanged
+/// pass but not the `stat`s: its validity key is each session file's own
+/// `(len, mtime_ns, ctime_ns, inode)`, so knowing a session is unchanged
+/// costs one `stat` per session, and a 5,000-session home costs 5,000 of
+/// them plus a listing per container. That is the "scales with all
+/// files" shape the handoff forbids, and the 2026-09-22 cost measurement
+/// recorded it as 10,580 stats over 46 listings.
+///
+/// This table is the other half, and it is the same bargain
+/// `external/folded.parquet` already strikes for external units: one row
+/// per **directory** the container's identification listed (never one
+/// per file -- the handoff forbids a per-file persistent inventory),
+/// plus the units that identification produced. An unchanged container
+/// costs one `stat` per recorded directory and no listing at all; a
+/// changed container is re-identified file by file, with the per-file
+/// identification cache still keeping its header reads at zero.
+pub struct ContainerTable(KeyedTable);
 
 /// `external unit key -> (consumer label, note)`: the declared-consumer
 /// sidecar. Human intent rather than derived data, so it is *not*
@@ -285,6 +308,43 @@ impl IdentificationTable {
         Self(KeyedTable {
             path: dir(swamp_dir).join("agent_identifications.parquet"),
             value_columns: &["value"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl ContainerTable {
+    /// The value columns, in order. `row_kind` distinguishes the three
+    /// row shapes this table holds: `dir` (a directory whose stamp the
+    /// fingerprint covers), `unit` (an identified unit) and `member` (a
+    /// member of the unit above it). Columns, not a JSON blob in a
+    /// Parquet cell: `.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`
+    /// is about the shape of the data, not only the file extension.
+    pub const COLUMNS: &'static [&'static str] = &[
+        "row_kind",
+        "path",
+        "category",
+        "rel_path",
+        "bytes",
+        "mtime_max",
+        "action",
+        "note",
+        "protected",
+        "protect_reason",
+        "link_kind",
+        "link_declared",
+        "link_reason",
+    ];
+
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("agent_containers.parquet"),
+            value_columns: Self::COLUMNS,
         })
     }
     pub fn load(&self) -> HashMap<String, CachedRows> {

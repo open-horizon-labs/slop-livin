@@ -50,6 +50,8 @@ pub struct Counters {
     header_bytes: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    containers_reused: AtomicU64,
+    containers_identified: AtomicU64,
 }
 
 impl Counters {
@@ -60,6 +62,8 @@ impl Counters {
             header_bytes_read: self.header_bytes.load(Ordering::Relaxed),
             identification_cache_hits: self.cache_hits.load(Ordering::Relaxed),
             identification_cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            containers_reused: self.containers_reused.load(Ordering::Relaxed),
+            containers_identified: self.containers_identified.load(Ordering::Relaxed),
         }
     }
 }
@@ -70,6 +74,8 @@ static GLOBAL: Counters = Counters {
     header_bytes: AtomicU64::new(0),
     cache_hits: AtomicU64::new(0),
     cache_misses: AtomicU64::new(0),
+    containers_reused: AtomicU64::new(0),
+    containers_identified: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -107,6 +113,15 @@ pub struct WorkCounters {
     pub header_bytes_read: u64,
     pub identification_cache_hits: u64,
     pub identification_cache_misses: u64,
+    /// Container directories replayed from the store without a listing
+    /// (`crate::agents::ContainerCache`). Counted separately from the
+    /// per-file derivation cache above so neither number can be read as
+    /// the other: a pass that reuses every container makes *no* per-file
+    /// derivation at all, so its `identification_cache_hits` is zero and
+    /// that is the right answer, not a regression.
+    pub containers_reused: u64,
+    /// Container directories identified file by file this pass.
+    pub containers_identified: u64,
 }
 
 pub fn record_dir_listed() {
@@ -127,6 +142,14 @@ pub fn record_cache_hit() {
 
 pub fn record_cache_miss() {
     add(|c| &c.cache_misses, 1);
+}
+
+pub fn record_container_reused() {
+    add(|c| &c.containers_reused, 1);
+}
+
+pub fn record_container_identified() {
+    add(|c| &c.containers_identified, 1);
 }
 
 /// The process-global counters. Sees every thread; a caller that wants
@@ -157,6 +180,8 @@ pub fn reset() {
         &GLOBAL.header_bytes,
         &GLOBAL.cache_hits,
         &GLOBAL.cache_misses,
+        &GLOBAL.containers_reused,
+        &GLOBAL.containers_identified,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -177,6 +202,12 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         identification_cache_misses: now
             .identification_cache_misses
             .saturating_sub(before.identification_cache_misses),
+        containers_reused: now
+            .containers_reused
+            .saturating_sub(before.containers_reused),
+        containers_identified: now
+            .containers_identified
+            .saturating_sub(before.containers_identified),
     }
 }
 

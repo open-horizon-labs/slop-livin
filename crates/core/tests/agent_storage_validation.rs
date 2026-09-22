@@ -644,15 +644,45 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
         .as_bytes(),
     );
 
+    // What a *fresh* identification sees. This is the path every
+    // execution sink takes (`reidentify_for_tool` runs with both caches
+    // disabled), and it is the boundary that matters: an approval is
+    // never spent against a cached derivation.
+    let rechecked = swamp_core::agents::reidentify_for_tool("claude-code", &claude_home, 2_000)
+        .expect("the claude-code adapter must be registered");
+    let rechecked_unit = rechecked.iter().find(|u| u.path == jsonl).unwrap();
+    assert!(
+        matches!(
+            &rechecked_unit.project_link,
+            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
+        ),
+        "a fresh re-identification must see the moved attribution: {:?}",
+        rechecked_unit.project_link
+    );
+
     let after =
         discover_and_measure(&scope, &[], Some(store.path()), true, 2_000, 30, 3600).unwrap();
     let after_unit = after.iter().find(|u| u.path == jsonl).unwrap();
+    // THE RECORDED LIMIT of container-level reuse (2026-09-22,
+    // stack/12), asserted rather than only written down. The rewrite is
+    // in place: same name, same directory, same length -- so
+    // `projects/-proj-aaaa-encoded/`'s own mtime and ctime do not move,
+    // the container is replayed from the store, and the declared path
+    // replayed with it is the old one. `crate::agents::ContainerCache`
+    // states this; the fresh re-identification above is why it is a
+    // reporting lag and not an authorization hole.
+    //
+    // This assertion is deliberately the *observed* behaviour and not
+    // the desired one. It used to read "attribution must actually have
+    // moved"; that is now only true of a pass that re-identifies the
+    // container, which the two assertions below cover.
     assert!(
         matches!(
             &after_unit.project_link,
-            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
+            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-aaaa"
         ),
-        "attribution must actually have moved to the new project: {:?}",
+        "recorded limit: a replayed container still reports the declared path it was stored \
+         with: {:?}",
         after_unit.project_link
     );
     assert_eq!(
@@ -663,6 +693,39 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
         after_unit.growth_bytes.is_none_or(|g| g == 0),
         "a pure attribution change (same bytes) must never fabricate a growth delta: {:?}",
         after_unit.growth_bytes
+    );
+
+    // Anything that moves the container's own stamp re-identifies it,
+    // and the moved attribution is reported then -- with still no
+    // fabricated growth delta for the session whose bytes did not
+    // change.
+    write(
+        &claude_home
+            .join("projects")
+            .join("-proj-aaaa-encoded")
+            .join("cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl"),
+        b"{\"type\":\"user\"}\n",
+    );
+    let later =
+        discover_and_measure(&scope, &[], Some(store.path()), true, 3_000, 30, 3600).unwrap();
+    let later_unit = later.iter().find(|u| u.path == jsonl).unwrap();
+    assert!(
+        matches!(
+            &later_unit.project_link,
+            swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
+        ),
+        "once the container is re-identified the attribution must have moved: {:?}",
+        later_unit.project_link
+    );
+    assert_eq!(
+        later_unit.bytes, bytes_before,
+        "byte count must still be identical -- only the declared cwd text changed"
+    );
+    assert!(
+        later_unit.growth_bytes.is_none_or(|g| g == 0),
+        "a pure attribution change must never fabricate a growth delta, not even on the pass \
+         that finally notices it: {:?}",
+        later_unit.growth_bytes
     );
 }
 

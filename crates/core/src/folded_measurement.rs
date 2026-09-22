@@ -285,25 +285,50 @@ pub fn observe_unit(
 /// (`.oh/guardrails/no-second-traversal-on-report-path.md`); adapters
 /// reach it through `agents::IdentifyCtx::folded_bytes`, never directly.
 pub fn folded_bytes_bounded(path: &Path, max_entries: usize) -> (u64, u64, bool) {
+    let (bytes, mtime_max, truncated, _stamps) = folded_bytes_bounded_stamped(path, max_entries);
+    (bytes, mtime_max, truncated)
+}
+
+/// [`folded_bytes_bounded`] plus one [`crate::walk::DirStamp`] per
+/// directory it listed, taken from the `stat` that listing already did.
+///
+/// This is the agent family's half of the bargain
+/// [`crate::walk::resize_artifact_stamped`] strikes for the external
+/// family: the pass that pays for a fold hands back exactly what a later
+/// pass needs in order to decide, from `stat`s alone, whether that fold
+/// still describes the tree. A *truncated* fold returns no stamps at
+/// all -- a measurement that stopped at the bound does not describe the
+/// whole subtree, so it must never anchor a reuse.
+pub fn folded_bytes_bounded_stamped(
+    path: &Path,
+    max_entries: usize,
+) -> (u64, u64, bool, Vec<crate::walk::DirStamp>) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return (0, 0, false);
+        return (0, 0, false, Vec::new());
     };
     if meta.is_file() {
-        return (meta.len(), mtime_secs(&meta), false);
+        return (meta.len(), mtime_secs(&meta), false, Vec::new());
     }
     if !meta.is_dir() || meta.file_type().is_symlink() {
-        return (0, 0, false);
+        return (0, 0, false, Vec::new());
     }
     let mut total = 0u64;
     let mut mtime_max = mtime_secs(&meta);
-    let mut stack = vec![path.to_path_buf()];
+    let mut stack = vec![(path.to_path_buf(), meta)];
     let mut seen = 0usize;
     let mut truncated = false;
-    while let Some(dir) = stack.pop() {
+    let mut stamps: Vec<crate::walk::DirStamp> = Vec::new();
+    while let Some((dir, dir_meta)) = stack.pop() {
         crate::work_counters::record_dir_listed();
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
+        let (mtime_ns, ctime_ns) = stamp_ns(&dir_meta);
+        stamps.push(crate::walk::DirStamp {
+            path: dir.clone(),
+            mtime_ns,
+            ctime_ns,
+        });
         let mut here = 0u64;
         for entry in rd.flatten() {
             seen += 1;
@@ -315,7 +340,7 @@ pub fn folded_bytes_bounded(path: &Path, max_entries: usize) -> (u64, u64, bool)
             here += 1;
             mtime_max = mtime_max.max(mtime_secs(&m));
             if m.is_dir() && !m.file_type().is_symlink() {
-                stack.push(entry.path());
+                stack.push((entry.path(), m));
             } else if m.is_file() {
                 total += m.len();
             }
@@ -325,7 +350,10 @@ pub fn folded_bytes_bounded(path: &Path, max_entries: usize) -> (u64, u64, bool)
             break;
         }
     }
-    (total, mtime_max, truncated)
+    if truncated {
+        stamps.clear();
+    }
+    (total, mtime_max, truncated, stamps)
 }
 
 pub fn mtime_secs(meta: &std::fs::Metadata) -> u64 {

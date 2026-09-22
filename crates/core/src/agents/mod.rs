@@ -100,6 +100,25 @@ impl AgentCategory {
         }
     }
 
+    /// The inverse of [`AgentCategory::label`], for the container table.
+    /// Written as an exhaustive `match` rather than a serde round-trip
+    /// so a new variant fails to compile here instead of silently
+    /// becoming `Unclassified` on the way back out of the store.
+    pub fn from_label(label: &str) -> Option<Self> {
+        let all = [
+            Self::Sessions,
+            Self::Attachments,
+            Self::Checkpoints,
+            Self::Caches,
+            Self::Logs,
+            Self::ManagedWorktrees,
+            Self::Plugins,
+            Self::ProtectedConfig,
+            Self::Unclassified,
+        ];
+        all.into_iter().find(|c| c.label() == label)
+    }
+
     /// The `"agent:"`-prefixed string used in the growth-store key, kept
     /// distinct from `StorageCategory`'s own kebab strings (see module
     /// docs) even though nothing currently collides in practice.
@@ -215,6 +234,40 @@ pub enum AgentMemberKind {
     SessionData,
 }
 
+impl AgentMemberKind {
+    /// The stored spelling used by the container table. Explicit, so a
+    /// new variant is a compile error here rather than a value that
+    /// round-trips into the wrong kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::SubagentDir => "subagent-dir",
+            Self::Todos => "todos",
+            Self::FileHistory => "file-history",
+            Self::Attachments => "attachments",
+            Self::CategoryDir => "category-dir",
+            Self::ConfigFile => "config-file",
+            Self::Database => "database",
+            Self::SessionData => "session-data",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        let all = [
+            Self::Transcript,
+            Self::SubagentDir,
+            Self::Todos,
+            Self::FileHistory,
+            Self::Attachments,
+            Self::CategoryDir,
+            Self::ConfigFile,
+            Self::Database,
+            Self::SessionData,
+        ];
+        all.into_iter().find(|k| k.label() == label)
+    }
+}
+
 /// One physical path this unit's byte total is made of. A session unit
 /// typically has several (transcript file, companion subagent dir,
 /// matching todos entries, a `file-history/<session>/` directory); a
@@ -241,6 +294,22 @@ pub enum AgentActionCapability {
     /// with reference/occupancy re-verification and explicit loss
     /// warnings (#101's "explicit individual session removal").
     SessionRemoval,
+}
+
+impl AgentActionCapability {
+    /// The stored spelling used by the container table.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CacheOrLogTrash => "cache-or-log-trash",
+            Self::SessionRemoval => "session-removal",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        let all = [Self::None, Self::CacheOrLogTrash, Self::SessionRemoval];
+        all.into_iter().find(|a| a.label() == label)
+    }
 }
 
 /// One identified unit of agent-tool storage: a session, or a folded
@@ -312,6 +381,43 @@ pub struct CandidateAgentUnit {
     pub project_link: ProjectLinkState,
     pub action: AgentActionCapability,
     pub note: Option<String>,
+    /// How `project_link` was arrived at, so container-level reuse can
+    /// tell a fact that lives inside the container from one that does
+    /// not. See [`LinkBasis`].
+    pub link_basis: LinkBasis,
+}
+
+/// Where a unit's [`ProjectLinkState`] came from.
+///
+/// Container-level reuse ([`IdentifyCtx::container`]) replays a
+/// container's units from the store when none of the directories that
+/// identification listed have moved. That is sound for bytes and
+/// members, which live inside those directories -- and *not* sound for
+/// project linkage, which is resolved against a declared path somewhere
+/// else on the disk entirely: a worktree deleted between two passes
+/// would keep reporting `Linked` forever.
+///
+/// So linkage is not replayed. A unit whose link came from
+/// [`resolve_declared_path`] records the declared path instead, and a
+/// reused container re-resolves it live, memoised per distinct declared
+/// path -- which is one resolution per project, not one per session, and
+/// so still scales with containers rather than files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LinkBasis {
+    /// Computed by [`resolve_declared_path`] from `declared`; recomputed
+    /// live whenever the container is reused.
+    Declared {
+        declared: Option<String>,
+        missing_reason: String,
+    },
+    /// Nothing to recompute. Only a state that cannot go stale --
+    /// [`ProjectLinkState::NotApplicable`] and
+    /// [`ProjectLinkState::Unresolved`] -- may carry this basis and
+    /// still be persisted; any other state makes its whole container
+    /// unpersistable, so a link this layer cannot refresh is never
+    /// replayed from the store.
+    #[default]
+    Fixed,
 }
 
 // ---------------------------------------------------------------------
@@ -442,21 +548,309 @@ fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
     parts
 }
 
+/// Bumped whenever the *encoding* of a container's persisted units
+/// changes, so rows written by an older binary are a miss rather than a
+/// misread. Part of every container fingerprint.
+const CONTAINER_VERSION: &str = "agent-container/2026-09-22.1";
+
+/// The memo that makes an unchanged container cost `stat`s instead of a
+/// listing and a `stat` per file.
+///
+/// [`IdentificationCache`] removed the header *reads* from an unchanged
+/// pass. It could not remove the `stat`s: its validity key is each
+/// session file's own `(len, mtime_ns, ctime_ns, inode)`, so knowing a
+/// session is unchanged costs one `stat` per session by construction.
+/// The 2026-09-22 cost measurement recorded what that means on a
+/// 5,000-session home: 10,580 `stat`s and 46 listings on a pass where
+/// nothing had changed -- work that scales with files, which the handoff
+/// forbids.
+///
+/// This is the container-level half, and it is deliberately the same
+/// bargain `external/folded.parquet` strikes for external units:
+///
+/// * an adapter wraps the identification of one **container directory**
+///   (`projects/<encoded-cwd>/`, `sessions/<yyyy>/<mm>/<dd>/`, a tool's
+///   session parent) in [`IdentifyCtx::container`];
+/// * every directory that identification lists or folds is recorded,
+///   and the container's fingerprint is those directories' own
+///   `mtime`/`ctime` -- the stamp the walk's `stat` already produced;
+/// * an unchanged container is replayed from the stored rows, paying one
+///   `stat` per recorded directory and no listing at all;
+/// * a changed container is re-identified file by file, where the
+///   per-file [`IdentificationCache`] still keeps its header reads at
+///   zero for the sessions that did not move.
+///
+/// **What this cannot see**, stated here rather than left for the next
+/// reviewer, and it is exactly the limit
+/// [`crate::folded_measurement::reuse_folded_measurement`] records for
+/// the external family: a file rewritten *in place* -- same name, same
+/// directory -- does not move that directory's stamp. Creating,
+/// deleting, renaming or replacing an entry does; rewriting one does
+/// not. So a session transcript rewritten in place keeps its stored byte
+/// total until something else in its container changes, or the store is
+/// cleared. The per-file identification key still catches it the moment
+/// the container *is* re-visited, and the safety boundary for acting on
+/// any of this is not the cache at all: it is the reviewed snapshot
+/// re-derived from the live filesystem at execution
+/// (`reidentify_for_tool`, which runs with the cache
+/// [`IdentificationCache::disabled`]).
+pub struct ContainerCache {
+    entries: std::cell::RefCell<HashMap<String, crate::assoc_store::CachedRows>>,
+    /// Live re-resolution of declared paths, memoised per distinct
+    /// declared path for this pass: see [`LinkBasis`].
+    links: std::cell::RefCell<HashMap<(String, String), ProjectLinkState>>,
+    enabled: bool,
+}
+
+/// The directories one container's identification depended on, recorded
+/// while it ran. Paths only: the stamps are read when the fingerprint is
+/// built, so a recording costs nothing on the hot path.
+#[derive(Default)]
+struct ContainerRecorder {
+    dirs: Vec<PathBuf>,
+    seen: HashSet<PathBuf>,
+    /// Set when this container measured something directory stamps
+    /// cannot describe (a truncated fold), so it must be re-identified
+    /// every pass rather than replayed from a key that cannot see the
+    /// change.
+    unstorable: bool,
+}
+
+impl ContainerRecorder {
+    fn record(&mut self, dir: &Path) {
+        if self.seen.insert(dir.to_path_buf()) {
+            self.dirs.push(dir.to_path_buf());
+        }
+    }
+}
+
+impl ContainerCache {
+    /// No container reuse at all: every container is identified live.
+    /// Used by `reidentify` at every execution sink, and by callers with
+    /// no store.
+    pub fn disabled() -> Self {
+        Self {
+            entries: std::cell::RefCell::new(HashMap::new()),
+            links: std::cell::RefCell::new(HashMap::new()),
+            enabled: false,
+        }
+    }
+
+    pub fn load(swamp_dir: &Path) -> Self {
+        Self {
+            entries: std::cell::RefCell::new(
+                crate::assoc_store::ContainerTable::open(swamp_dir).load(),
+            ),
+            links: std::cell::RefCell::new(HashMap::new()),
+            enabled: true,
+        }
+    }
+
+    pub fn save(&self, swamp_dir: &Path, observed_at: u64) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        crate::assoc_store::ContainerTable::open(swamp_dir)
+            .save(&self.entries.borrow(), observed_at)
+    }
+
+    /// Resolves `declared` once per pass, however many sessions in a
+    /// container declared it. This is why replaying a container does not
+    /// have to replay its linkage: the honest answer costs one
+    /// resolution per *project*, not one per session.
+    fn resolve_memoised(&self, declared: &Option<String>, reason: &str) -> ProjectLinkState {
+        let key = (declared.clone().unwrap_or_default(), reason.to_string());
+        if let Some(hit) = self.links.borrow().get(&key) {
+            return hit.clone();
+        }
+        let resolved = resolve_declared_path(declared.clone(), reason);
+        self.links.borrow_mut().insert(key, resolved.clone());
+        resolved
+    }
+}
+
+/// One `stat` per recorded directory, rendered as the single comparable
+/// string [`crate::assoc_store::fingerprint_string`] wants. An absent
+/// directory, or one that has become a file or a symlink, is a distinct
+/// value rather than a missing one, so an appearance and a disappearance
+/// are both changes.
+fn container_fingerprint(dirs: &[PathBuf]) -> String {
+    let mut parts: Vec<(String, u64)> = vec![(CONTAINER_VERSION.to_string(), 1)];
+    for d in dirs {
+        crate::work_counters::record_files_statted(1);
+        let rendered = d.display().to_string();
+        match fs::symlink_metadata(d) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                use std::os::unix::fs::MetadataExt;
+                parts.push((
+                    format!("{rendered}\u{2}mtime"),
+                    (meta.mtime() as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(meta.mtime_nsec() as u64),
+                ));
+                parts.push((
+                    format!("{rendered}\u{2}ctime"),
+                    (meta.ctime() as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(meta.ctime_nsec() as u64),
+                ));
+            }
+            // A watched path that is not a directory is stamped by its
+            // own size and mtime instead: it is the one case where a
+            // rewrite in place *is* visible, and there is no reason to
+            // throw that away.
+            Ok(meta) => {
+                parts.push((format!("{rendered}\u{2}len"), meta.len()));
+                parts.push((
+                    format!("{rendered}\u{2}file-mtime"),
+                    meta.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                ));
+            }
+            Err(_) => parts.push((format!("{rendered}\u{2}absent"), 1)),
+        }
+    }
+    crate::assoc_store::fingerprint_string(&parts)
+}
+
 /// Everything an adapter is allowed to see and do during identification.
 ///
 /// It carries the folded/listing primitives (so no adapter calls
 /// `read_dir`), the one capped content reader (so no adapter calls
-/// `read_to_string`), and the identification cache (so an unchanged
-/// session is never re-read). An adapter that wants a fact it cannot get
-/// from here is asking for a capability the guardrails deny.
+/// `read_to_string`), the identification cache (so an unchanged session
+/// is never re-read) and the container cache (so an unchanged container
+/// is never re-listed). An adapter that wants a fact it cannot get from
+/// here is asking for a capability the guardrails deny.
 pub struct IdentifyCtx<'a> {
     observed_at: u64,
     cache: &'a IdentificationCache,
+    containers: Option<&'a ContainerCache>,
+    /// The container currently being recorded, if any. One level deep by
+    /// design: see [`IdentifyCtx::container`].
+    recording: std::cell::RefCell<Option<ContainerRecorder>>,
 }
 
 impl<'a> IdentifyCtx<'a> {
     pub fn new(observed_at: u64, cache: &'a IdentificationCache) -> Self {
-        Self { observed_at, cache }
+        Self {
+            observed_at,
+            cache,
+            containers: None,
+            recording: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The identification context the ordinary report path uses: with
+    /// container-level reuse as well as the per-file derivation cache.
+    pub fn with_containers(
+        observed_at: u64,
+        cache: &'a IdentificationCache,
+        containers: &'a ContainerCache,
+    ) -> Self {
+        Self {
+            observed_at,
+            cache,
+            containers: Some(containers),
+            recording: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Records `dir` as one of the directories the container currently
+    /// being identified depends on, without listing it.
+    ///
+    /// Needed where a container's units are affected by a directory it
+    /// does not itself list -- Claude Code's `file-history/`,
+    /// `image-cache/`, `uploads/` and `todos/` all gain a
+    /// `<session-id>` entry when a session acquires one, and the parent
+    /// directory's own stamp is what moves. Outside a container this is
+    /// a no-op.
+    pub fn watch(&self, dir: &Path) {
+        if let Some(rec) = self.recording.borrow_mut().as_mut() {
+            rec.record(dir);
+        }
+    }
+
+    /// Identifies one container directory, replaying the stored result
+    /// when every directory that identification listed still carries the
+    /// stamp it did last pass.
+    ///
+    /// `identify` must be self-contained: everything its units depend on
+    /// has to be reached through this same `ctx` (so it is recorded) or
+    /// declared with [`IdentifyCtx::watch`]. Nesting is deliberately not
+    /// supported -- a `container` call inside another container's
+    /// `identify` runs inline and folds its directories into the outer
+    /// container's fingerprint, because a nested container that missed
+    /// while its parent hit could not be re-identified without re-running
+    /// the parent, which is the work the reuse exists to avoid.
+    ///
+    /// A container whose units cannot be re-derived honestly is run and
+    /// **not stored**: see [`LinkBasis`].
+    pub fn container(
+        &self,
+        adapter_id: &str,
+        container: &Path,
+        identify: &dyn Fn() -> Vec<CandidateAgentUnit>,
+    ) -> Vec<CandidateAgentUnit> {
+        let Some(store) = self.containers.filter(|c| c.enabled) else {
+            return identify();
+        };
+        if self.recording.borrow().is_some() {
+            return identify();
+        }
+        let key = format!("{adapter_id}\u{1}{}", container.display());
+        if let Some(units) = self.replay(store, &key) {
+            crate::work_counters::record_container_reused();
+            return units;
+        }
+        crate::work_counters::record_container_identified();
+        *self.recording.borrow_mut() = Some(ContainerRecorder::default());
+        let units = identify();
+        let recorder = self.recording.borrow_mut().take().unwrap_or_default();
+        if recorder.unstorable {
+            return units;
+        }
+        if let Some(rows) = encode_container(&recorder.dirs, &units) {
+            let fingerprint = container_fingerprint(&recorder.dirs);
+            store
+                .entries
+                .borrow_mut()
+                .insert(key, crate::assoc_store::CachedRows { fingerprint, rows });
+        }
+        units
+    }
+
+    fn replay(&self, store: &ContainerCache, key: &str) -> Option<Vec<CandidateAgentUnit>> {
+        let (dirs, units) = {
+            let entries = store.entries.borrow();
+            let cached = entries.get(key)?;
+            let (dirs, units) = decode_container(&cached.rows)?;
+            // The stamps cost one `stat` each and are read *after* the
+            // rows decode, so a corrupt or older-format row set is a miss
+            // that costs nothing.
+            if container_fingerprint(&dirs) != cached.fingerprint {
+                return None;
+            }
+            (dirs, units)
+        };
+        let _ = dirs;
+        Some(
+            units
+                .into_iter()
+                .map(|mut u| {
+                    if let LinkBasis::Declared {
+                        declared,
+                        missing_reason,
+                    } = &u.link_basis
+                    {
+                        u.project_link = store.resolve_memoised(declared, missing_reason);
+                    }
+                    u
+                })
+                .collect(),
+        )
     }
 
     pub fn observed_at(&self) -> u64 {
@@ -466,6 +860,7 @@ impl<'a> IdentifyCtx<'a> {
     /// One bounded, single-level, symlink-refusing listing. Sorted, so
     /// identification output does not depend on directory order.
     pub fn list(&self, dir: &Path) -> Vec<Entry> {
+        self.watch(dir);
         crate::locations::shallow_list(dir)
             .into_iter()
             .map(|e| Entry {
@@ -499,7 +894,38 @@ impl<'a> IdentifyCtx<'a> {
     }
 
     pub fn folded_bytes(&self, path: &Path, max_entries: usize) -> (u64, u64, bool) {
-        crate::folded_measurement::folded_bytes_bounded(path, max_entries)
+        let (bytes, mtime_max, truncated, stamps) =
+            crate::folded_measurement::folded_bytes_bounded_stamped(path, max_entries);
+        if self.recording.borrow().is_some() {
+            if truncated {
+                // A fold that stopped at its bound does not describe the
+                // whole subtree, so nothing about it may be replayed:
+                // watching the anchor path (whose stamp will not move
+                // when a deep file changes) would be a reuse key that
+                // cannot see the thing it is caching.
+                self.abandon_container_recording();
+            } else {
+                for stamp in &stamps {
+                    self.watch(&stamp.path);
+                }
+                // A path that folded to nothing because it does not
+                // exist (or is a plain file) produces no stamps, and its
+                // *appearance* still has to be a change.
+                if stamps.is_empty() {
+                    self.watch(path);
+                }
+            }
+        }
+        (bytes, mtime_max, truncated)
+    }
+
+    /// Marks the container being recorded as one that must not be
+    /// stored: whatever was just measured cannot be described by
+    /// directory stamps alone.
+    fn abandon_container_recording(&self) {
+        if let Some(rec) = self.recording.borrow_mut().as_mut() {
+            rec.unstorable = true;
+        }
     }
 
     /// An uncached capped header read. Prefer [`IdentifyCtx::derived`]:
@@ -569,6 +995,165 @@ impl<'a> IdentifyCtx<'a> {
             derive(text.lines().next().unwrap_or(""))
         })
     }
+}
+
+// ---------------------------------------------------------------------
+// The container table's row encoding.
+//
+// Columns, not a JSON blob in a Parquet cell: the guardrail is about the
+// shape of stored data, not the file extension
+// (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`). Every
+// enum is written through its own explicit `label`/`from_label`, so a
+// new variant is a compile error rather than a value that silently
+// round-trips into the wrong one.
+// ---------------------------------------------------------------------
+
+/// `None` -> `""`, `Some(s)` -> `"=s"`. A one-character tag, so
+/// `Some("")` and `None` are different stored values rather than the
+/// same one.
+fn encode_opt(value: &Option<String>) -> String {
+    match value {
+        None => String::new(),
+        Some(s) => format!("={s}"),
+    }
+}
+
+fn decode_opt(value: &str) -> Option<String> {
+    value.strip_prefix('=').map(str::to_string)
+}
+
+fn col(row: &[String], n: usize) -> &str {
+    row.get(n).map(String::as_str).unwrap_or_default()
+}
+
+/// The rows for one container, or `None` when this container must not be
+/// stored at all.
+///
+/// The one thing that makes a container unstorable is a unit whose
+/// project link cannot be recomputed on replay and cannot go stale
+/// either: see [`LinkBasis`]. Refusing to store is the conservative
+/// outcome -- the container is simply re-identified next pass.
+fn encode_container(dirs: &[PathBuf], units: &[CandidateAgentUnit]) -> Option<Vec<Vec<String>>> {
+    let n = crate::assoc_store::ContainerTable::COLUMNS.len();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(dirs.len() + units.len());
+    let blank = || vec![String::new(); n];
+    for dir in dirs {
+        let mut row = blank();
+        row[0] = "dir".to_string();
+        row[1] = dir.display().to_string();
+        rows.push(row);
+    }
+    for unit in units {
+        let (link_kind, link_declared, link_reason) = match (&unit.link_basis, &unit.project_link) {
+            (
+                LinkBasis::Declared {
+                    declared,
+                    missing_reason,
+                },
+                _,
+            ) => ("declared", encode_opt(declared), missing_reason.clone()),
+            (LinkBasis::Fixed, ProjectLinkState::NotApplicable) => {
+                ("not-applicable", String::new(), String::new())
+            }
+            (LinkBasis::Fixed, ProjectLinkState::Unresolved { reason }) => {
+                ("unresolved", String::new(), reason.clone())
+            }
+            // Linked/Missing/NotAProject/Moved/Remote/Shared with no
+            // declared path to re-resolve: replaying it could report a
+            // project that has since been deleted or moved. Do not store
+            // the container.
+            (LinkBasis::Fixed, _) => return None,
+        };
+        let mut row = blank();
+        row[0] = "unit".to_string();
+        row[1] = unit.path.display().to_string();
+        row[2] = unit.category.label().to_string();
+        row[3] = unit.relative_path.clone();
+        row[4] = unit.bytes.to_string();
+        row[5] = unit.mtime_max.to_string();
+        row[6] = unit.action.label().to_string();
+        row[7] = encode_opt(&unit.note);
+        row[8] = if unit.protected { "1" } else { "0" }.to_string();
+        row[9] = encode_opt(&unit.protect_reason);
+        row[10] = link_kind.to_string();
+        row[11] = link_declared;
+        row[12] = link_reason;
+        rows.push(row);
+        for member in &unit.members {
+            let mut row = blank();
+            row[0] = "member".to_string();
+            row[1] = member.path.display().to_string();
+            row[2] = member.kind.label().to_string();
+            row[4] = member.bytes.to_string();
+            rows.push(row);
+        }
+    }
+    Some(rows)
+}
+
+/// The inverse. `None` for any row set this binary cannot read back
+/// exactly -- an unknown category, kind or action, a `member` row with
+/// no unit above it, a malformed number. A cache that cannot be decoded
+/// is a cache miss, never a wrong answer and never an error.
+fn decode_container(rows: &[Vec<String>]) -> Option<(Vec<PathBuf>, Vec<CandidateAgentUnit>)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut units: Vec<CandidateAgentUnit> = Vec::new();
+    for row in rows {
+        match col(row, 0) {
+            "dir" => dirs.push(PathBuf::from(col(row, 1))),
+            "unit" => {
+                let category = AgentCategory::from_label(col(row, 2))?;
+                let action = AgentActionCapability::from_label(col(row, 6))?;
+                let link_declared = decode_opt(col(row, 11));
+                let link_reason = col(row, 12).to_string();
+                let (project_link, link_basis) = match col(row, 10) {
+                    "declared" => (
+                        // Replaced live by `ContainerCache::replay`; this
+                        // placeholder is never the value a caller sees.
+                        ProjectLinkState::Unresolved {
+                            reason: link_reason.clone(),
+                        },
+                        LinkBasis::Declared {
+                            declared: link_declared,
+                            missing_reason: link_reason,
+                        },
+                    ),
+                    "not-applicable" => (ProjectLinkState::NotApplicable, LinkBasis::Fixed),
+                    "unresolved" => (
+                        ProjectLinkState::Unresolved {
+                            reason: link_reason,
+                        },
+                        LinkBasis::Fixed,
+                    ),
+                    _ => return None,
+                };
+                units.push(CandidateAgentUnit {
+                    category,
+                    relative_path: col(row, 3).to_string(),
+                    path: PathBuf::from(col(row, 1)),
+                    members: Vec::new(),
+                    bytes: col(row, 4).parse().ok()?,
+                    mtime_max: col(row, 5).parse().ok()?,
+                    protected: col(row, 8) == "1",
+                    protect_reason: decode_opt(col(row, 9)),
+                    project_link,
+                    action,
+                    note: decode_opt(col(row, 7)),
+                    link_basis,
+                });
+            }
+            "member" => {
+                let kind = AgentMemberKind::from_label(col(row, 2))?;
+                units.last_mut()?.members.push(AgentMember {
+                    path: PathBuf::from(col(row, 1)),
+                    bytes: col(row, 4).parse().ok()?,
+                    kind,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some((dirs, units))
 }
 
 /// What an adapter's storage *shape* requires of the shared layer.
@@ -674,6 +1259,7 @@ impl AgentUnitBuilder {
                 project_link: ProjectLinkState::NotApplicable,
                 action: AgentActionCapability::None,
                 note: None,
+                link_basis: LinkBasis::Fixed,
             },
         }
     }
@@ -716,6 +1302,21 @@ impl AgentUnitBuilder {
 
     pub fn project_link(mut self, link: ProjectLinkState) -> Self {
         self.unit.project_link = link;
+        self.unit.link_basis = LinkBasis::Fixed;
+        self
+    }
+
+    /// Resolves a path the tool itself declared, and records that this
+    /// is where the link came from, so a reused container re-resolves it
+    /// live instead of replaying a state that may since have gone stale
+    /// ([`LinkBasis`]). The only form of linkage a container may be
+    /// reused around.
+    pub fn project_link_declared(mut self, declared: Option<String>, missing_reason: &str) -> Self {
+        self.unit.project_link = resolve_declared_path(declared.clone(), missing_reason);
+        self.unit.link_basis = LinkBasis::Declared {
+            declared,
+            missing_reason: missing_reason.to_string(),
+        };
         self
     }
 
@@ -1224,7 +1825,14 @@ pub fn discover_and_measure(
         Some(dir) => IdentificationCache::load(dir),
         None => IdentificationCache::disabled(),
     };
-    let ctx = IdentifyCtx::new(observed_at, &cache);
+    // The container cache is the reason an unchanged pass costs a `stat`
+    // per container rather than a `stat` per session file. Same terms as
+    // the derivation cache above: no store, no reuse.
+    let containers = match swamp_dir {
+        Some(dir) => ContainerCache::load(dir),
+        None => ContainerCache::disabled(),
+    };
+    let ctx = IdentifyCtx::with_containers(observed_at, &cache, &containers);
 
     // Authorized scope only: a tool home the user excluded, or whose
     // detector is disabled, or that lies outside an explicit command
@@ -1301,6 +1909,7 @@ pub fn discover_and_measure(
         && observe
     {
         cache.save(dir, observed_at)?;
+        containers.save(dir, observed_at)?;
     }
 
     // This observation owns only agent-family rows, and only under the

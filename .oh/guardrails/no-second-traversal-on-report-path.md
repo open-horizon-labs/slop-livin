@@ -82,14 +82,50 @@ else in that directory changes. The alternative is stat'ing every file
 on every pass, which is the "scales with all files" shape the handoff
 forbids.
 
+Since 2026-09-22 the **agent** family has the same reuse, keyed per
+container directory (`crate::agents::ContainerCache`,
+`IdentifyCtx::container`), and therefore the same blind spot — with one
+consequence that is materially larger than it is for external caches
+and is recorded here rather than left for the next reviewer to find:
+
+> A tool **appends to an open session transcript in place**. An append
+> moves the file's own `mtime` and size but not its parent directory's
+> `mtime`/`ctime`, so a container whose shape has not changed is
+> replayed and the growing session's stored byte total stands. The
+> container is re-identified the moment anything is created, removed or
+> renamed inside it — which for a session home is the next new session,
+> the next companion directory, the next `todos/` entry — and the real
+> size is reported then. Reporting lag, bounded by the container's next
+> shape change; never an authorization hole, because every execution
+> sink re-derives from the live filesystem with both caches disabled
+> (`reidentify_for_tool`).
+
+Two runtime tests pin this rather than leaving it as prose:
+`a_session_rewritten_in_place_is_not_seen_until_its_container_moves`
+(bytes) and
+`relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_unchanged`
+(declared linkage, plus the fresh re-identification that does see it).
+
+The cost of removing the lag is exactly one `stat` per session file per
+pass, which is the shape the handoff forbids; the cost of keeping it is
+a stale byte total for actively-appended sessions between container
+shape changes. That trade is stated, measured and flagged for
+adjudication — it was not chosen quietly.
+
 ## Runtime tests that complete it
 
 - `crates/core/tests/incremental_external_and_agent_measurement.rs` —
   work counters (`crate::work_counters`) over a synthetic 5,000-session
   agent home and a 20k-file external cache root: first observation reads
   headers; an unchanged second observation reads **zero** header bytes
-  (asserted as `== 0` since the identification cache landed, with
-  `identification_cache_hits >= SESSIONS`); appending one session costs
+  (asserted as `== 0` since the identification cache landed); since
+  2026-09-22 it also lists at most one directory per *container* and
+  pays at most ten stats per container over 5,000 sessions (measured:
+  11 listings / 5,031 stats on the first pass, **5 listings / 31 stats**
+  on the unchanged second, over 5 containers), and
+  `appending_one_session_re_identifies_exactly_one_container` asserts
+  that one appended session re-identifies exactly one container and
+  replays the other four; appending one session costs
   at most one capped header read and exactly one cache miss; and, since
   2026-09-22, an unchanged external cache root lists **zero**
   directories and pays fewer than 100 stats over 20,000 files
@@ -104,11 +140,34 @@ forbids.
   unchanged full observations over a multi-ecosystem fixture, measured
   with an instrumented `walk.rs` rather than an instrument blind to it.
   Zero header bytes and zero subprocess spawns hold. Its `dirs_listed
-  == 0` / `files_statted == 0` assertions **do not** hold and are not
-  currently satisfiable: see the "measured, not satisfied" entry in
-  `.oh/sessions/2026-09-22-review-2-repairs.md` for the numbers and the
-  two structural reasons (the agent identification cache's validity key
-  is each session file's own `(len, mtime_ns, ctime_ns, inode)`, so an
-  unchanged agent home costs one stat per session by construction; and
-  a fresh fixture's walk cannot be event-incremental in two passes,
-  because the first pass is the one that anchors the event stream).
+  == 0` / `files_statted == 0` assertions **do not** hold. The exact
+  residuals on the unchanged pass, measured 2026-09-22 after the
+  container-level reuse landed, with the fixture's parts observed
+  separately so the number is attributed rather than assumed:
+
+  | part of the unchanged pass | `dirs_listed` | `files_statted` |
+  |---|---|---|
+  | the walk alone (`ObservationParts::WALK_ONLY`) | 34 | 5,553 |
+  | the agent family's share | 6 | 33 |
+  | the external family's share | 0 | 19 |
+  | **total (`ALL`, what the reviewer test asserts on)** | **40** | **5,605** |
+
+  The agent family's share fell from 12 listings / 5,027 stats to 6 / 33
+  over 5,000 sessions. The **walk** is now the whole of the residual,
+  it is identical on both passes, and it is not reachable by the reuse
+  in this fixture: pass 1 takes the `full_rules_changed` branch of
+  `growth::observe`, which deliberately anchors no FSEvents id (there
+  was no replay), so pass 2 replays from nothing and refuses with
+  `no_stored_event_id`. Anchoring an id at the start of a full walk
+  would make the second pass depend on `fseventsd`'s own log lag — the
+  reason `RefreshRefusal::TooSoon` exists — so it is timing-dependent,
+  not deterministic; and the reviewer test constructs its own source
+  (`fs_events::platform_source()`), so no fixture source can be
+  injected without editing a file this chunk may not edit.
+
+  Even a zero-cost walk would leave `files_statted` at 52 — the
+  container and folded-row stamp checks, which are the reuse's *own*
+  cost and are counted as the real `stat`s they are. `== 0` is
+  therefore not reachable without reclassifying counted work, which is
+  the vacuous-instrument sin the re-review named. Left failing, with
+  the numbers, for re-review 3 to adjudicate.

@@ -53,7 +53,7 @@
 
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
-    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
+    AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -146,17 +146,71 @@ fn identify_sessions(
     if project_names.is_empty() {
         return;
     }
-    // `todos/` is listed once, up front, and matched in-memory per
-    // session -- never one listing per session.
+    // `todos/` is listed once for the whole home, matched in-memory per
+    // session -- never one listing per session. Lazily, because a pass
+    // in which every project container is replayed from the store must
+    // not pay even that one listing: the containers watch `todos/`'s own
+    // stamp instead (`IdentifyCtx::watch`).
     let todos_dir = home.join("todos");
-    let todos: Vec<PathBuf> = ctx
-        .list(&todos_dir)
-        .into_iter()
-        .map(|e| todos_dir.join(e.name))
-        .collect();
+    let todos: std::cell::OnceCell<Vec<PathBuf>> = std::cell::OnceCell::new();
+    let todos = || -> &Vec<PathBuf> {
+        todos.get_or_init(|| {
+            ctx.list(&todos_dir)
+                .into_iter()
+                .map(|e| todos_dir.join(e.name))
+                .collect()
+        })
+    };
 
     for project_name in project_names {
         let project_path = projects_dir.join(&project_name);
+        // One container per `projects/<encoded-cwd>/`. An unchanged
+        // container is replayed from the folded rows the previous pass
+        // persisted, paying one `stat` per watched directory and no
+        // listing; a changed one is re-identified file by file, where
+        // the per-file identification cache still keeps the header reads
+        // of the sessions that did not move at zero.
+        let units = ctx.container(CLAUDE_CODE_TOOL_ID, &project_path, &|| {
+            identify_one_project(home, ctx, &project_path, &todos_dir, todos())
+        });
+        for unit in &units {
+            // The claimed-session set is derived from the units rather
+            // than accumulated as the loop runs, so a replayed container
+            // claims exactly what an identified one does -- otherwise a
+            // reused pass would report every `file-history/<id>` as an
+            // orphan.
+            if unit.category == AgentCategory::Sessions
+                && let Some(stem) = unit.path.file_stem().and_then(|s| s.to_str())
+            {
+                claimed.insert(stem.to_string());
+            }
+        }
+        out.extend(units);
+    }
+}
+
+/// One `projects/<encoded-cwd>/` container's units.
+///
+/// Everything this reads is either reached through `ctx` (and so
+/// recorded as part of the container's reuse key) or declared with
+/// [`IdentifyCtx::watch`]: `file-history/`, `image-cache/`, `uploads/`
+/// and `todos/` all gain a `<session-id>` entry when a session acquires
+/// one, and it is those parent directories' own stamps that move.
+fn identify_one_project(
+    home: &Path,
+    ctx: &IdentifyCtx,
+    project_path: &Path,
+    todos_dir: &Path,
+    todos: &[PathBuf],
+) -> Vec<CandidateAgentUnit> {
+    let mut out: Vec<CandidateAgentUnit> = Vec::new();
+    ctx.watch(todos_dir);
+    for sibling in ["file-history", "image-cache", "uploads"] {
+        ctx.watch(&home.join(sibling));
+    }
+    {
+        let project_path = project_path.to_path_buf();
+        let out = &mut out;
         let mut jsonl_files: Vec<PathBuf> = Vec::new();
         let mut companion_dirs: HashMap<String, PathBuf> = HashMap::new();
         for e in ctx.list(&project_path) {
@@ -225,7 +279,7 @@ fn identify_sessions(
                 }
             }
 
-            for todo in &todos {
+            for todo in todos {
                 let Some(name) = todo.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
@@ -248,15 +302,20 @@ fn identify_sessions(
                 }
             }
 
-            claimed.insert(session_id.clone());
-            let project_link = resolve_project_link(&jsonl, ctx);
             let relative_path = relative_to(home, &jsonl);
             out.push(
-                AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Sessions, jsonl)
+                AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
                     .relative_path(relative_path)
                     .members(members)
                     .mtime_max(mtime_max)
-                    .project_link(project_link)
+                    // The declared path, not the resolved state: a
+                    // container replayed from the store re-resolves it
+                    // live, once per distinct project rather than once
+                    // per session (`crate::agents::LinkBasis`).
+                    .project_link_declared(
+                        read_header_cwd(&jsonl, ctx),
+                        "no cwd field found in the session's first line",
+                    )
                     .action(AgentActionCapability::SessionRemoval)
                     .build(),
             );
@@ -297,24 +356,20 @@ fn identify_sessions(
             out.push(unit.build());
         }
     }
+    out
 }
 
 /// Reads only the *first line* of `jsonl` (bounded to
-/// `HEADER_READ_BYTES`), looks for a top-level string `cwd` field, and
-/// resolves it to a swamp project identity by walking upward from that
-/// path looking for a `.git` directory/file -- `crate::git`'s own
-/// identity primitives (shared object store, never a filesystem path),
-/// never a basename guess and never a second directory-name decoding
-/// heuristic (the `projects/<encoded>` directory name is not reversible
-/// to a real path in general: a literal hyphen in a real path is
-/// indistinguishable from an encoded path separator).
-fn resolve_project_link(jsonl: &Path, ctx: &IdentifyCtx) -> ProjectLinkState {
-    super::resolve_declared_path(
-        read_header_cwd(jsonl, ctx),
-        "no cwd field found in the session's first line",
-    )
-}
-
+/// `HEADER_READ_BYTES`) and returns a top-level string `cwd` field if it
+/// has one. The declared path is handed to
+/// `AgentUnitBuilder::project_link_declared`, which resolves it to a
+/// swamp project identity by walking upward looking for a `.git`
+/// directory/file -- `crate::git`'s own identity primitives (shared
+/// object store, never a filesystem path), never a basename guess and
+/// never a second directory-name decoding heuristic (the
+/// `projects/<encoded>` directory name is not reversible to a real path
+/// in general: a literal hyphen in a real path is indistinguishable from
+/// an encoded path separator).
 fn read_header_cwd(jsonl: &Path, ctx: &IdentifyCtx) -> Option<String> {
     // Through the shared *memoised* capped reader, so the privacy bound
     // is one reviewed function rather than fifteen open-coded reads, the
@@ -659,6 +714,7 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::ProjectLinkState;
     use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};
 
