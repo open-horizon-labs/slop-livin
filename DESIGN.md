@@ -193,16 +193,23 @@ Project rows expand to actionable artifacts. If none exist, a direct project act
 
 Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.
 
-Known, named gap (#60/#61): the confirmation row's warnings line comes
-from `PlanUnit::warnings` (dirty/unpushed/untracked/no-remote facts),
-which predates the decision-evidence contract (#53) and is not yet
-extended to render `PlanUnit::evidence`'s activity/consumer/recovery/
-reclaimability facts inline. The CLI (`report --view external` text,
-and the default/`--view external`/`--view agents` JSON) is the
-currently-wired presentation surface for that contract -- see
-`docs/usage.md`'s "Decision evidence" section. Revisit alongside the
-`history_secs` simplification noted above the next time this file's
-Actions/confirmation area is touched.
+The selected row's own decision evidence (#53/#60) renders below the
+table, in the existing signals/detail area: one line per fact
+(`render::render_evidence_lines`, shared with the CLI text output),
+ordered activity/consumer/current-use/recovery/reclaimability so a
+short terminal shows the most decision-relevant facts first if it
+cannot show them all. The detail area's height grows to fit (estimated
+by wrapped-row count at the terminal's actual width, not raw fact
+count), capped at half the body height so a unit with many facts can
+never push the row table itself off screen. The confirmation row's
+warnings line adds `render::evidence_warnings(&row.evidence)` --
+a declared consumer, current use, or an uncertain recovery/
+reclaimability fact, stated selectively rather than every fact restated
+as a warning -- next to the pre-existing `PlanUnit::warnings`
+(dirty/unpushed/untracked/no-remote facts). Both read `model::Row`'s
+own `evidence` field, populated from the same `ArtifactRow`/
+`ExternalUnit`/`AgentUnit` every other row field already comes from, so
+there is no second, presentation-only evidence path to keep in sync.
 
 ## Review
 

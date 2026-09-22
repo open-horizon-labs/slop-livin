@@ -90,25 +90,40 @@ reusing facts a pass already has in hand:
 |---|---|---|
 | `activity.rs` (#54) | Activity | `ArtifactRow`/`ExternalUnit`/`AgentUnit`'s already-recorded `mtime_max`; `statfs` flags (macOS) / `/proc/mounts` (Linux) to detect `noatime`/`relatime` before ever trusting an access-time read; Docker's own `last_used`, kept as a separate fact from filesystem mtime |
 | `occupancy.rs` (#55) | CurrentUse | `lsof` (existing `occupied()`'s underlying command, now also exposed as structured evidence distinguishing "no match" from "query failed"), already-collected Docker `ContainerRef`s, a non-blocking `flock` probe for manager lock files, and the bounded, allow-listed `xcrun simctl list devices -j` query (new `locations::ALLOWED_COMMANDS` entry) for simulator booted state |
-| `toolchain_declarations.rs` (#56) | Consumer | Read-only parsers for `.tool-versions`/`mise.toml`, `.python-version`, `.ruby-version`, `.nvmrc`/`.node-version`, `rust-toolchain(.toml)`, rustup's global `default_toolchain`; matched against measured installations with manager semantics (an alias/range like `lts/*` or a bare `3.12` stays an explicit unresolved range unless exactly one installation uniquely matches) |
-| `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`) joined by exact name+version; `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
-| `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven `_remote.repositories` marker (network fetch vs. unknown -- directory category alone never decides this), a known toolchain version string (local reinstall); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
+| `toolchain_declarations.rs` (#56) | Consumer | Read-only parsers for `.tool-versions`/`mise.toml`, `.python-version`, `.ruby-version`, `.nvmrc`/`.node-version`, `rust-toolchain(.toml)`, rustup's global `default_toolchain`; matched against measured installations with manager semantics (an alias/range like `lts/*` or a bare `3.12` stays an explicit unresolved range unless exactly one installation uniquely matches); `resolve_rustup_channel_to_dir` widens a bare channel (`stable`) to its one installed `<channel>-<host-triple>` directory only when unambiguous |
+| `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml` via the `roxmltree` dependency) joined by exact name+version; targeted existence-check joins (`cargo_registry_entry_exists`, `go_module_cache_entry_exists`, `gradle_cache_entry_exists`, `maven_repo_entry_exists` -- one `Path::exists()` hash lookup per declared identity, never a store enumeration); `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
+| `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven `_remote.repositories` marker (network fetch vs. unknown -- directory category alone never decides this), a known toolchain version string (local reinstall), Docker image/build-cache/volume context (`docker_image_recovery` names pull-vs-rebuild as two candidate, never-picked-for-you prerequisites; `docker_build_cache_recovery` requires a present joined worktree; `docker_volume_recovery` is always potentially-unique local state with no Trash); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
 | `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice |
+| `consumer_wiring.rs` (#56/#57 live wiring) | Consumer | The caller that actually runs the two modules above against real worktrees/external units: a per-worktree mtime-keyed cache (`toolchain_declarations_cache.json`/`dependency_identities_cache.json` sidecars under `${SWAMP_DIR}`, mirroring `external.rs`'s existing `external_consumers.json` precedent) so an unchanged worktree's declaration/lockfile files are never re-parsed; attaches consumer evidence both ways (an installation/shared-store `ExternalUnit` <- every project declaring/depending on it; a project's own `Source` row -> the installations/dependencies it declares); a rustup `settings.toml` global default gets its own role, distinct from any project's declaration; Xcode DerivedData subfolders are enumerated (one `plutil` read per subfolder) and joined by `WorkspacePath` |
 
 Attachment point: `report::attach_decision_evidence`, called exactly
 once from `bus::run_report` -- the single choke point every report
 caller (CLI text/JSON, TUI, single- and multi-root) goes through --
 populates every `ArtifactRow.evidence` with Activity, Reclaimability
-and (for `BuildOutput`/`DependencyTree`/`Cache` kinds) Recovery facts.
-The Docker-join site in `report.rs` and `external::discover_and_measure`
-attach Consumer facts from data they already collected. `CurrentUse` is
-deliberately *not* attached during a passive report (a live
-process/lock/container check is short-lived and only meaningful right
-before an action): `actions::plan_unit_evidence` takes it fresh at
-proposal time, and `execute_with_trash_opts` takes it fresh *again*
-immediately before acting, so a fact that changes between propose and
-execute is always caught rather than compared against a possibly-stale
-snapshot.
+and (for `BuildOutput`/`DependencyTree`/`Cache`/`DockerImage`/
+`DockerBuildCache`/`DockerVolume` kinds) Recovery facts. The Docker-join
+site in `report.rs` and `external::discover_and_measure` attach Consumer
+facts from data they already collected; a Recovery assessment's own
+`follow_up_check` ("the smallest useful check") is carried into the
+attached `Evidence::note` rather than dropped, so it survives into
+every presentation surface that already renders `note` (CLI text, the
+TUI detail area, JSON). `CurrentUse` is deliberately *not* attached
+during a passive report (a live process/lock/container check is
+short-lived and only meaningful right before an action):
+`actions::plan_unit_evidence` takes it fresh at proposal time, and
+`execute_with_trash_opts` takes it fresh *again* immediately before
+acting, so a fact that changes between propose and execute is always
+caught rather than compared against a possibly-stale snapshot.
+
+`consumer_wiring::attach_associations(report, external_units, swamp_dir)`
+is called once per call site that has *both* a computed `Report` and a
+computed `Vec<ExternalUnit>` in hand at the same time -- the CLI's
+`report --view external`/unified `propose` routes and the TUI's
+startup -- mirroring how `agents::discover_and_measure` already takes
+`project_worktrees` from an already-computed report rather than
+re-walking anything. It cannot run inside `bus::run_report` itself:
+external units are not part of `Report` (see `external.rs`'s own module
+doc), so the join needs both objects already built.
 
 Cost discipline: every population step above is O(rows) arithmetic
 over numbers the walk/measurement pass already produced, or one
@@ -118,7 +133,12 @@ row for `CurrentUse`) -- see `crates/core/tests/evidence_contract.rs`'s
 two observations with nothing changed on disk produce byte-identical
 `bytes`/`growth_bytes`/`regrowth_count`, and that calling
 `attach_decision_evidence` again on an already-annotated report changes
-nothing.
+nothing. `consumer_wiring`'s own cost shape: a handful of
+`fs::metadata` calls per worktree per report to build a cheap
+fingerprint (a full re-parse only on a fingerprint change), and a
+`Path::exists()` hash lookup per declared dependency identity against
+its ecosystem's shared store -- never an enumeration of the store's
+contents.
 
 Human keep/protect intent (`swamp protect`, previously effective only
 for agent-storage units) is extended to ordinary artifact rows via
@@ -129,15 +149,43 @@ dropped or silently left plannable. Only `agents::protect_add`/
 subcommand) can change the underlying list -- a scanned project file or
 an agent's own observation cannot.
 
-Known gaps, named rather than silently absent: the bespoke-shaped JSON
-views (`kinds`/`builds`/`deps`/`unowned`/`worktrees`) do not yet carry
-`evidence` (only the default report view and `--view external`/
-`--view agents` do, since those pass whole structs through serde); the
-TUI's detail rendering of evidence is not yet wired; Maven's
-declared-dependency join (#57) still relies on the `_remote.repositories`
-marker rather than a parsed dependency list (no XML parser dependency
-in this workspace); `pom.xml` dependency parsing is not implemented for
-the same reason.
+Presentation (#60): `render::render_evidence_lines` (CLI text,
+`render_view_external`) and the TUI's `ui::draw_body` detail area (the
+selected row's own evidence, ordered activity/consumer/current-use/
+recovery/reclaimability so a short terminal clips the least
+decision-relevant lines first, sized by estimated wrapped-row count so
+a long fact list never silently overflows its allotted height) both
+read `model::Row::evidence`/`ArtifactRow`/`ExternalUnit`/`AgentUnit`
+evidence directly -- no separate presentation-only data path. The
+inline confirmation row (`app::mark_row`'s `warnings`, shown in
+`actions::confirm_summary`) adds `render::evidence_warnings(&row.evidence)`
+next to the pre-existing git-status warnings: a selective filter (a
+declared consumer, current use, an uncertain recovery/reclaimability
+fact), never every fact restated as a warning. JSON: the default report
+view, `--view external`/`--view agents` (whole structs through serde)
+and now the bespoke-shaped `kinds`/`builds`/`deps`/`unowned`/
+`worktrees`/`docker` views (`agent_json::view_payload`/
+`docker_objects_payload`/`list_worktrees_payload`) all carry `evidence`
+per row -- a `kinds` bucket (no single row backs it) carries the
+concatenation of every underlying row's evidence; a `worktrees` row
+carries its own `Source` row's evidence, the same lookup the TUI's
+`tree_rows` uses.
+
+Known gaps, named rather than silently absent: `uv`/Conda project-level
+declarations (#56's own "where source metadata establishes them"
+qualifier) have no parser in `toolchain_declarations.rs` yet, so
+`consumer_wiring` cannot wire what does not exist; pyenv/rbenv/nvm/
+asdf/mise global defaults are not read (only rustup's `settings.toml`
+is -- the only manager `toolchain_declarations.rs` already had a
+global-default parser for); npm's cacache and pnpm's content-addressed
+store cannot be matched to a specific declared name+version (stated as
+`Unknown`/a coarse per-worktree-declared fact respectively, per #57's
+own acceptance criteria); a Gradle/Maven artifact's downloaded-vs-
+locally-installed distinction still relies on the `_remote.repositories`
+marker (`docs/locations.md`'s named limit, unrelated to this chunk); a
+custom (non-default) `GOMODCACHE`/pnpm per-volume store is identified
+via its documented sibling-directory shape, not guessed, but an
+unconventional override could still miss.
 
 ## Effective scope and location detectors
 

@@ -552,13 +552,45 @@ value:
   indefinitely) and/or a stated coverage limit (e.g. "only measured
   children the folded walk recorded this pass").
 
-`report --json` (default view, `--view external`, `--view agents`)
-includes each row's `evidence` array; the interactive CLI text output
-(`--view external`) prints one line per fact. `swamp propose` snapshots
-a unit's report-row evidence plus a fresh current-use reading at
-proposal time; `swamp execute` re-takes current-use fresh immediately
-before acting rather than trusting that snapshot, so something that
-started using a unit between proposal and execution is still caught.
+`report --json` includes each row's `evidence` array in every view --
+the default report view, `--view external`/`--view agents` (whole
+structs), and `--view kinds`/`--view builds`/`--view deps`/
+`--view unowned`/`--view worktrees`/`--view docker` (each row's own
+evidence; a `kinds` bucket, which aggregates many rows into one, carries
+the concatenation of all of them; a `worktrees` row carries its own
+`Source` row's evidence). The interactive CLI text output
+(`--view external`) prints one line per fact; so does the TUI's
+selected-row detail area, ordered activity/consumer/current-use/
+recovery/reclaimability so a narrow terminal shows the most
+decision-relevant facts first, and the TUI's inline delete-confirmation
+row adds a short warning for a declared consumer, current use, or an
+uncertain recovery/reclaimability fact next to the existing git-status
+warnings. `swamp propose` snapshots a unit's report-row evidence plus a
+fresh current-use reading at proposal time; `swamp execute` re-takes
+current-use fresh immediately before acting rather than trusting that
+snapshot, so something that started using a unit between proposal and
+execution is still caught.
+
+Tool-version declarations (#56) and dependency-lockfile/shared-store
+associations (#57) are wired live into the report/external-unit
+pipeline (`crates/core/src/consumer_wiring.rs`), not just implemented
+as library code: a project's `.tool-versions`/`mise.toml`/
+`.python-version`/`.ruby-version`/`.nvmrc`/`rust-toolchain(.toml)` is
+read (cached per worktree, keyed by those files' own mtimes) and
+matched against measured mise/asdf/pyenv/rbenv/rvm/nvm/rustup
+installations; a project's `Cargo.lock`/`package-lock.json`/
+`pnpm-lock.yaml`/`go.sum`/`gradle.lockfile`/`pom.xml` (cached the same
+way) is joined against the Cargo registry/Go module cache/Gradle
+caches/Maven local repository via one path-existence check per declared
+dependency -- never an enumeration of the shared store. npm's cacache
+and pnpm's content-addressed store cannot be matched to a specific
+declared name+version, so they report that limit explicitly (`unknown`
+for npm; a coarse "declared by this project's lockfile" fact for pnpm)
+rather than guessing. A resolved match attaches a `consumer` fact both
+ways: on the installation/shared-store unit (which project(s) declare
+it) and on the declaring project's own `Source` row (which
+installation it resolved to); rustup's `settings.toml` global default
+gets its own distinct role, never folded into a project's declaration.
 
 What each domain actually establishes:
 

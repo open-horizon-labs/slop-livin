@@ -8,12 +8,19 @@ fact is not proof of no use; it means this pass could not establish it.
 
 ## Where to find it
 
-`report --json` (default view, `--view external`, `--view agents`)
-includes an `"evidence"` array on each row/unit. `swamp propose --json`
-includes the same array per plan unit, plus one fresh current-use
-reading taken at proposal time. The interactive CLI's
+`report --json` includes an `"evidence"` array on each row/unit in
+every view: the default report view, `--view external`/`--view agents`
+(whole structs), and `--view kinds`/`--view builds`/`--view deps`/
+`--view unowned`/`--view worktrees`/`--view docker` (each row's own
+evidence; a `kinds` row is a bucket aggregating many artifact rows, so
+its `evidence` is the concatenation of all of theirs). `swamp propose
+--json` includes the same array per plan unit, plus one fresh
+current-use reading taken at proposal time. The interactive CLI's
 `report --view external` text output prints one line per fact under
-each unit.
+each unit; the TUI's selected-row detail area does the same (ordered
+activity/consumer/current-use/recovery/reclaimability), and its
+delete-confirmation row adds a short warning line for a declared
+consumer, current use, or an uncertain recovery/reclaimability fact.
 
 ## Reading one fact
 
@@ -61,6 +68,22 @@ each unit.
 | `current-use` | A live, bounded, read-only check right now: an open file handle, a running Docker container, a simulator's booted state, a manager lock file's holder | Proof of *no* consumer when the check comes back negative -- it only means nothing matched this specific bounded check |
 | `recovery` | A sourced restoration path (`rebuild`, `network-fetch`, `local-reinstall`, `potentially-unique-local-state`, or `unknown`) with named prerequisites and a concrete smallest-useful follow-up check | A guarantee that the network/registry/credentials needed at restore time are actually available -- always named as a material unknown |
 | `reclaimability` | Allocated bytes (always known); an estimated-reclaimable figure that is a bounded range rather than an exact number when hardlinks/APFS clones/snapshots are involved; an observed post-action free-space change (`statvfs` before/after) | An exact freed-byte promise from a scan alone -- Trash, snapshots, open files and concurrent writers can all suppress the expected change |
+
+Consumer facts are live-wired, not just implemented: a project's own
+version-manager files and dependency lockfiles are read (cached per
+worktree, keyed by those files' mtimes) and matched against measured
+mise/asdf/pyenv/rbenv/rvm/nvm/rustup installations and the Cargo
+registry/Go module cache/Gradle caches/Maven local repository, via one
+existence check per declared dependency -- never a scan of the whole
+shared store. npm's cacache and pnpm's content-addressed store cannot
+be resolved to one specific declared name+version, so they say so
+(`unknown` / a coarse per-worktree fact) instead of guessing. Docker
+images/build-cache/volumes now carry `recovery` facts too: a tagged
+image names pull and rebuild as two candidate origins without
+asserting either (tag format alone does not say whether a compose file
+defines `build:` or `image:`); a build-cache entry needs its joined
+project's worktree present; a volume is always potentially-unique local
+state with no Trash recovery.
 
 ## Acting on it
 

@@ -4,6 +4,30 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+- **Closed the decision-evidence follow-ups** (#56-#58, #60): live
+  wiring of tool-version declarations and dependency-lockfile/shared-
+  store associations into the report/external-unit pipeline (new
+  `crates/core/src/consumer_wiring.rs`), with a per-worktree cache
+  keyed by declaration/lockfile mtimes so an unchanged worktree is
+  never re-parsed; Maven `pom.xml` dependency parsing via the new
+  `roxmltree` dependency (MIT/Apache-2.0); Docker image/build-cache/
+  volume rows now carry `recovery` facts from the same generic
+  per-row pass (`recovery::docker_image_recovery`/
+  `docker_build_cache_recovery`, alongside the existing
+  `docker_volume_recovery`), joined and unjoined objects alike; a
+  Recovery assessment's own smallest-useful follow-up check now
+  survives into the attached fact's `note` instead of being dropped;
+  the TUI's selected-row detail area and inline delete-confirmation
+  row now render `evidence` (`render::render_evidence_lines`/
+  `render::evidence_warnings`), ordered so a narrow terminal shows the
+  most decision-relevant facts first; the bespoke-shaped JSON views
+  (`--view kinds`/`builds`/`deps`/`unowned`/`worktrees`/`docker`) now
+  carry `evidence` per row, matching the default report view. See
+  [docs/architecture.md](docs/architecture.md)'s "Decision evidence
+  contract" section for the remaining named gaps (uv/Conda project
+  declarations, pyenv/rbenv/nvm/asdf/mise global defaults, npm/pnpm
+  store opacity).
+
 - **Added the current-state decision-evidence contract** (#53-#61):
   activity, consumer, current-use, recovery and reclaimability facts,
   each carrying a source, observation/event time and freshness/
@@ -37,10 +61,8 @@ Release notes describe behavior at the named version. See the [README](README.md
   artifact rows. See [docs/usage.md](docs/usage.md)'s "Decision
   evidence" section and
   [docs/architecture.md](docs/architecture.md)'s "Decision evidence
-  contract" section for the full picture, including named gaps (the
-  bespoke-shaped JSON views and the TUI's detail rendering do not yet
-  carry evidence; Maven/`pom.xml` dependency parsing is not
-  implemented).
+  contract" section for the full picture (see the entry above for the
+  gaps this originally left, since closed).
 
 - **Added the full developer-storage detector catalog** (#45-#49):
   language version managers (mise, asdf, pyenv, uv, Conda, rbenv, RVM,
