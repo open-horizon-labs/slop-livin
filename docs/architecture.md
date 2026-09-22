@@ -92,7 +92,7 @@ reusing facts a pass already has in hand:
 | `occupancy.rs` (#55) | CurrentUse | `lsof` (existing `occupied()`'s underlying command, now also exposed as structured evidence distinguishing "no match" from "query failed"), already-collected Docker `ContainerRef`s, a non-blocking `flock` probe for manager lock files, and the bounded, allow-listed `xcrun simctl list devices -j` query (new `locations::ALLOWED_COMMANDS` entry) for simulator booted state |
 | `toolchain_declarations.rs` (#56) | Consumer | Read-only parsers for `.tool-versions`/`mise.toml`, `.python-version`, `.ruby-version`, `.nvmrc`/`.node-version`, `rust-toolchain(.toml)`, rustup's global `default_toolchain`; matched against measured installations with manager semantics (an alias/range like `lts/*` or a bare `3.12` stays an explicit unresolved range unless exactly one installation uniquely matches); `resolve_rustup_channel_to_dir` widens a bare channel (`stable`) to its one installed `<channel>-<host-triple>` directory only when unambiguous |
 | `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml` via the `roxmltree` dependency -- `parse_pom_xml_with_gaps` returns both the resolved identities and the ones it could not resolve, such as a `${property}` or parent-inherited version) joined by exact name+version; targeted existence-check joins (`cargo_registry_entry_exists`, `go_module_cache_entry_exists`, `gradle_cache_entry_exists`, `maven_repo_entry_exists` -- one `Path::exists()` hash lookup per declared identity, never a store enumeration); `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
-| `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven `_remote.repositories` marker (network fetch vs. unknown -- directory category alone never decides this), a known toolchain version string (local reinstall), Docker image/build-cache/volume context (`docker_image_recovery` names pull-vs-rebuild as two candidate, never-picked-for-you prerequisites; `docker_build_cache_recovery` requires a present joined worktree; `docker_volume_recovery` is always potentially-unique local state with no Trash); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
+| `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven local repository (the **limit**, not a classification: swamp never reads the per-artifact `_remote.repositories` marker, so the whole tree's recovery fact is `Unknown` with that limit stated -- `maven_artifact_recovery` is called with `false` at its one production call site, `actions.rs::external_recovery_facts`, and `docs/locations.md` says the same), a known toolchain version string (local reinstall), Docker image/build-cache/volume context (`docker_image_recovery` names pull-vs-rebuild as two candidate, never-picked-for-you prerequisites; `docker_build_cache_recovery` requires a present joined worktree; `docker_volume_recovery` is always potentially-unique local state with no Trash); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
 | `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice, and `actions::propose*` carries its result on the `Plan` as `selection` next to the plain `planned_bytes` sum |
 | `consumer_wiring.rs` (#56/#57 live wiring) | Consumer | The caller that actually runs the two modules above against real worktrees/external units: a per-worktree mtime-keyed cache (`toolchain_declarations_cache.json`/`dependency_identities_cache.json` sidecars under `${SWAMP_DIR}`, mirroring `external.rs`'s existing `external_consumers.json` precedent) so an unchanged worktree's declaration/lockfile files are never re-parsed; attaches consumer evidence both ways (an installation/shared-store `ExternalUnit` <- every project declaring/depending on it; a project's own `Source` row -> the installations/dependencies it declares); a rustup `settings.toml` global default gets its own role, distinct from any project's declaration; Xcode DerivedData subfolders are enumerated (one `plutil` read per subfolder) and joined by `WorkspacePath` |
 
@@ -205,8 +205,11 @@ global-default parser for); npm's cacache and pnpm's content-addressed
 store cannot be matched to a specific declared name+version (stated as
 `Unknown`/a coarse per-worktree-declared fact respectively, per #57's
 own acceptance criteria); a Gradle/Maven artifact's downloaded-vs-
-locally-installed distinction still relies on the `_remote.repositories`
-marker (`docs/locations.md`'s named limit, unrelated to this chunk); a
+locally-installed distinction would need the per-artifact
+`_remote.repositories` marker, which swamp does **not** read (reading
+one per artifact is a traversal of the whole local repository, which the
+report path forbids); the recovery fact for a Maven store is therefore
+`Unknown` with that limit named, per `docs/locations.md`'s row; a
 custom (non-default) `GOMODCACHE`/pnpm per-volume store is identified
 via its documented sibling-directory shape, not guessed, but an
 unconventional override could still miss.
@@ -522,13 +525,31 @@ identity `(detector_id, category, device, canonical path)`, independent
 of any project or worktree. Two things distinguish it from an ordinary
 artifact row:
 
-- **Measurement, not a walk.** `walk::resize_artifact` sizes the whole
-  location as one opaque unit (hardlink-deduped within the call, same
-  as an artifact's own folded measurement); nothing inside it is
+- **Measurement, not a walk.** `folded_measurement::measure` sizes the
+  whole location as one opaque unit (hardlink-deduped within the call,
+  same as an artifact's own folded measurement); nothing inside it is
   discovered as a project or classified by ecosystem. This is
   deliberate: `~/.cargo` or a Homebrew prefix has no worktrees to find,
   and walking it as an ordinary scan root would either find nothing
   useful or (worse) misclassify its contents.
+- **And, since 2026-09-22, not even that on an unchanged pass.** The
+  measuring walk records one stamp per directory it listed --
+  `(relative path, mtime_ns, ctime_ns)`, taken from the `stat` the
+  sizing job already performs -- into `${SWAMP_DIR}/external/folded.parquet`
+  beside a root row carrying the folded bytes, `hardlinked`,
+  `mtime_max` and a digest of the exclusion list the measurement was
+  taken under. The next pass stats those directories and, if every
+  stamp matches, returns the stored measurement without listing a
+  single directory: a 20,000-file Cargo registry cache costs four stats
+  instead of 20,004 stats and six listings (73 ms to 1.9 ms, measured
+  in `crates/core/tests/incremental_external_and_agent_measurement.rs`).
+  This is a *measurement cache*, per directory and never per file: it
+  feeds no growth, no tombstone and no regrowth, and deleting it costs
+  one full re-measurement. Its stated blind spot is on
+  `folded_measurement::reuse_folded_measurement` -- a file rewritten in
+  place does not move its directory's stamp, so a rewrite that also
+  changes the file's allocation leaves the reused total stale until
+  something else in that directory changes.
 - **A new key family in the existing store, not a second store.**
   `growth::observe_and_annotate_external`/`annotate_readonly_external`
   reuse the same current+reverse-delta Parquet design as artifact rows,
@@ -996,13 +1017,22 @@ To add artifact recognition, update the ecosystem rules and fixtures. Classifica
   `actions::propose_agents`/the ordinary background-worker execute
   path, the same as every other markable view; a protected/unsupported
   row cannot be marked and the footer says why. Bulk marking
-  (`Shift+A`) does not yet reach agent rows -- a named gap, not a silent
-  one.
-- Agent-storage coverage: five tools have real identification code
-  (Claude Code #92; Codex, its desktop app, Oh My Pi and OpenCode
-  #93/#94/#95); `crate::agents::matrix` lists the remaining nine named
-  tools (#96-#99) as `Planned` with sourced home-path notes, not
-  implemented. Within Claude Code, `todos/<session-id>*` matching is a
+  (`Shift+A`) reaches agent rows too (`tui/src/app.rs`, test
+  `shift_a_over_agents_marks_only_actionable_rows`, two committed
+  goldens); it skips protected and unsupported rows for the same reason
+  a single mark does. The 2026-09-22 re-review found this paragraph
+  still claiming the gap after it was closed.
+- Agent-storage coverage: all fourteen matrix rows have identification
+  code (#92-#99), which is what `:729` of this file already said and
+  what this paragraph contradicted until 2026-09-22. `matrix.rs` has no
+  `Planned` rows left; what it does have is a **support level per
+  storage family**, and the honest count is the one the matrix itself
+  renders: `Supported` where a cited upstream file backs the path and
+  the linkage, `Partial` where a family is modelled but one fact is
+  missing, and `Unverified` where the row rests on a citation nobody has
+  re-fetched. `Unverified` is not a synonym for absent -- the storage is
+  measured; the *claim about what it is* is the part not yet confirmed.
+  Within Claude Code, `todos/<session-id>*` matching is a
   documented, bounded filename-prefix heuristic (the exact naming
   convention is not in Claude Code's own documentation); `~/.claude.json`
   (a sibling of the `~/.claude/` home directory, not inside it) is not

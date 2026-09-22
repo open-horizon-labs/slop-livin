@@ -4,6 +4,43 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Repairs after review 2
+
+A second independent review, plus a background mutation sweep that
+bypassed all 42 source audits on the first try, found that several
+claims in the section below were checked by machinery that could not
+see the thing it claimed to check. These are the repairs.
+
+- **An unchanged external storage location is no longer re-measured.**
+  `swamp` records one stamp per directory it folded and reuses the
+  stored measurement when every stamp still matches, so an unchanged
+  cache costs one `stat` per directory and no directory listing at all.
+  Measured over a 20,000-file Cargo registry cache: 73 ms and 20,004
+  stats on the first pass, 1.9 ms and 4 stats on the second. A file
+  added anywhere under the location is a real re-measurement, and its
+  bytes are reported. Stated limit: a file rewritten *in place* does not
+  move its directory's stamp, so if that rewrite also changes the file's
+  allocation the reused total is stale until something else in that
+  directory changes.
+- **The work counters now see the walker.** They were per-thread while
+  the walk runs on a worker pool, so a 20,000-file traversal reported
+  "2 directories listed". Every incrementality number in this changelog
+  from before this release was measured with that instrument; the ones
+  above are not.
+- **The Maven claim is withdrawn.** `swamp` does not read a
+  `_remote.repositories` marker and never did: reading one per artifact
+  would mean traversing the whole local repository. A Maven local
+  repository's recovery fact is `Unknown` with that limit named, which
+  is what `docs/locations.md` always said and what
+  `docs/architecture.md` now says too.
+- **The external view has rendering tests**, including that an empty
+  view says it is empty and that no verdict word ("safe", "unused",
+  "stale") can reach it.
+- Internal: the source-audit mutation corpus covers all 45 audits (136
+  fixtures, each applied to a copy of the real workspace); the CLI's
+  agent-storage tests no longer scan the machine's real disk (over
+  twenty minutes to 4.7 s).
+
 ### Repairs after review
 
 Two independent adversarial reviews blocked the #116-#123 stack with

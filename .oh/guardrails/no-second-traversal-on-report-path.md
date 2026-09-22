@@ -72,8 +72,15 @@ folded rows (`reuse_folded_measurement`) *before* it may reach
 
 **Limits.** This is a syscall-shape check plus one call-order check
 inside `measure`. It cannot prove the reuse is *correct* — that an
-unchanged root really is unchanged; the work-counter tests below prove
-that.
+unchanged root really is unchanged; the work-counter tests below
+measure that, and the reuse's own blind spot is stated on
+`folded_measurement::reuse_folded_measurement`: the stamp is each
+directory's `mtime`/`ctime`, so a file rewritten **in place** (same
+name, same directory) does not move it. If such a rewrite also changes
+the file's allocation, the reused byte total is stale until something
+else in that directory changes. The alternative is stat'ing every file
+on every pass, which is the "scales with all files" shape the handoff
+forbids.
 
 ## Runtime tests that complete it
 
@@ -85,11 +92,23 @@ that.
   `identification_cache_hits >= SESSIONS`); appending one session costs
   at most one capped header read and exactly one cache miss; and, since
   2026-09-22, an unchanged external cache root lists **zero**
-  directories and stats **zero** files
-  (`an_unchanged_external_cache_root_is_not_re_traversed`, no longer a
-  measured known gap).
+  directories and pays fewer than 100 stats over 20,000 files
+  (`an_unchanged_external_cache_root_is_not_re_traversed`: measured
+  6 listings / 20,004 stats / 73 ms on the first pass, 0 listings /
+  4 stats / 1.9 ms on the second). The stat count is the unit's
+  directory count, which is the claim: work scales with containers,
+  not with files. `a_changed_external_cache_root_is_measured_again`
+  is the other half — a file added under the unit costs a real
+  re-measurement and its bytes are reported.
 - `crates/core/tests/reviewer_cost_measurement_stack2.rs` — two
-  unchanged full observations over a multi-ecosystem fixture: zero
-  header bytes, zero directories listed, zero files statted, zero
-  subprocess spawns, measured with an instrumented `walk.rs` rather than
-  an instrument that is blind to it.
+  unchanged full observations over a multi-ecosystem fixture, measured
+  with an instrumented `walk.rs` rather than an instrument blind to it.
+  Zero header bytes and zero subprocess spawns hold. Its `dirs_listed
+  == 0` / `files_statted == 0` assertions **do not** hold and are not
+  currently satisfiable: see the "measured, not satisfied" entry in
+  `.oh/sessions/2026-09-22-review-2-repairs.md` for the numbers and the
+  two structural reasons (the agent identification cache's validity key
+  is each session file's own `(len, mtime_ns, ctime_ns, inode)`, so an
+  unchanged agent home costs one stat per session by construction; and
+  a fresh fixture's walk cannot be event-incremental in two passes,
+  because the first pass is the one that anchors the event stream).

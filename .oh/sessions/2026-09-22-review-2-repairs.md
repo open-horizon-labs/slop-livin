@@ -225,3 +225,178 @@ store + one walked project root.
 walker spawns a pool, so a 20,000-file traversal reports "2 dirs listed, 0 files
 statted". Nothing below this line is measured with that instrument until
 `walk.rs` is instrumented and the counters are made process-global.
+
+---
+
+# Part 2 — the walker instrument, the reuse, and the corpus ratchet
+
+Written after the repairs above landed. Three things here: a measurement that
+was lying, a claim that was not implemented, and 26 audits nobody had shown
+reject anything.
+
+## The instrument (P1 on the audit itself)
+
+`work_counters` began as process-global atomics, went `thread_local!` because
+parallel lib tests raced on them, and in doing so went blind: `walk.rs` lists
+and stats on a worker pool, so the measuring thread saw none of the traversal.
+A 20,000-file walk measured "2 dirs listed, 0 files statted".
+
+Neither scope alone is right, so there are two and every record writes to both:
+a **process-global** sink (`snapshot`/`since`/`reset`, what an integration test
+measuring a whole observation wants, serialized by the test itself) and a
+**scoped** sink installed by `measured` and inherited by the pool workers that
+thread spawns (`Pool::drain` captures `work_counters::current()` and `install`s
+it on each worker). A `== 0` assertion in a parallel suite is meaningful again
+*and* the pool is visible. Every lib test that read the counters moved to
+`measured`; the two integration files keep the global sink.
+
+`walk.rs` then records at the real syscall sites (every `read_dir` in
+`process_walk`/`process_size`/`discover_one`/`measure_directory`, every
+`symlink_metadata`). The same fixture that reported 18 dirs / 5,008 stats above
+reports 71 / 36,281 once the walker is counted — the *first* honest number this
+measurement has produced.
+
+## The reuse (the other half of incrementality)
+
+`folded_measurement::measure` re-walked every external root on every pass while
+the guardrail above it claimed reuse. It now consults the folded rows the
+previous pass persisted:
+
+- `walk::resize_artifact_stamped` returns one `DirStamp` per directory a Size
+  job listed, taken from the `symlink_metadata` that job already does — a push
+  per directory, no extra syscall.
+- `external/folded.parquet` stores them: one row per **directory** (never per
+  file — the handoff forbids a per-file persistent inventory), plus a root row
+  carrying `bytes`/`hardlinked`/`mtime_max` and a digest of the exclusion list
+  the measurement was taken under, so a changed exclusion set is a miss rather
+  than a silently wrong answer.
+- `reuse_folded_measurement` stats those directories and returns the stored
+  measurement when every `mtime`/`ctime` still matches. `external.rs` asks
+  through `observe_unit`, so a reused unit does not even pay the readability
+  probe's listing.
+
+**Measured** (`an_unchanged_external_cache_root_is_not_re_traversed`, 20,000-file
+Cargo registry fixture):
+
+| | first pass | unchanged second pass |
+|---|---|---|
+| wall time | 73 ms | 1.9 ms |
+| `dirs_listed` | 6 | **0** |
+| `files_statted` | 20,004 | **4** |
+
+Four stats is the unit's directory count. That is the claim — work scales with
+containers, not with files — and a bound of "fewer than last time" would not
+show it. `a_changed_external_cache_root_is_measured_again` is the other half: a
+file added under the unit costs a real re-measurement and its bytes are
+reported.
+
+**What the reuse cannot see**, stated here and on the function rather than left
+for the next reviewer: the stamp is each directory's `mtime`/`ctime`, so a file
+rewritten *in place* (same name, same directory) does not move it. If that
+rewrite also changes the file's allocation, the reused byte total is stale until
+something else in that directory changes or the store is cleared. The
+alternative is stat'ing every file on every pass, which is exactly the "scales
+with all files" shape the handoff forbids.
+
+## Cost after the repairs (`reviewer_cost_measurement_stack2`)
+
+Same fixture as the baseline table above, now with the instrumented walker:
+
+| | pass 1 | pass 2 (unchanged) |
+|---|---|---|
+| wall time | 586 ms | 981 ms |
+| session-header bytes | 205,000 | **0** |
+| identification cache hits / misses | 0 / 5,006 | 5,006 / **0** |
+| `dirs_listed` | 71 | 46 |
+| `files_statted` | 36,281 | 10,580 |
+| subprocess spawns | **0** | **0** |
+
+## Measured, not satisfied: two assertions in the reviewer cost test
+
+`two_unchanged_full_observations_cost_report` asserts four things about the
+unchanged pass. Two hold (`header_bytes_read == 0`, zero subprocess spawns).
+Two do not, and I could not make them hold honestly:
+
+    assert_eq!(second.dirs_listed, 0, ...)    // actual: 46
+    assert_eq!(second.files_statted, 0, ...)  // actual: 10,580
+
+Not for want of reuse — the external family went from 36,281 stats to 4 for its
+biggest unit. Two structural reasons, both of which are properties of designs
+this project already reviewed and accepted:
+
+1. **The identification cache's validity key is each session file's own
+   `(len, mtime_ns, ctime_ns, inode)`.** That is what makes
+   `a_large_agent_home_reads_headers_once_and_not_again` able to assert *zero*
+   header bytes over 5,000 sessions. You cannot know a session is unchanged
+   without stat'ing it, so an unchanged agent home costs one stat per session by
+   construction, and its containers have to be listed to know which sessions
+   exist. `second.files_statted == 0` contradicts the cache it is measuring.
+2. **A fresh fixture's walk cannot be event-incremental in two passes.** Pass 1
+   is a `full_rules_changed` walk, which deliberately does not touch the
+   FSEvents source (so it anchors no event id); pass 2 therefore replays from
+   nothing and refuses with `no_stored_event_id`. I verified FSEvents itself
+   works under the test's tempdir, and that a replay taken immediately after a
+   write still reports that write as a change — fseventsd's own log lag, which
+   is why `RefreshRefusal::TooSoon` exists. So even a three-pass version would
+   be timing-dependent, not deterministic. A full walk of the fixture's project
+   root costs 6 listings and 10 stats.
+
+The honest options were: relax the reviewer's assertions (forbidden, and it
+would hide a real number), reclassify cache-validation stats as "the
+events/coverage check" so they stop being counted (the same vacuous-instrument
+sin the re-review just caught), or leave the test failing with the numbers
+recorded. I left it failing. `scripts/check.sh` is red on exactly this one
+test and on nothing else.
+
+Reducing it further is real work, not a trick, and it is the obvious next
+chunk: give the agent family the same folded-row reuse the external family now
+has, keyed per *container* rather than per session file. That would take
+`dirs_listed` to the walk's 6 and `files_statted` to the walk's 10. It would
+still not be zero.
+
+## The mutation-corpus ratchet, emptied
+
+`NOT_YET_IN_THE_CORPUS` listed 26 audits. It is now empty: 45 audits, 136
+fixtures, at least three rejections each, applied to a copy of the real
+workspace. Writing them found three holes in the *shared* layer — which is why
+the fixtures are worth more than the audits they test:
+
+- `ast::functions` attributed macro literals by function **name**, so a second,
+  wrong `files_schema` in a submodule inherited the real one's
+  `vec![Field::new("mod_time_min", ..)]` and passed `dir_mtime_int32_minutes`
+  while storing seconds in the minutes column. A shadowing `canonical_roots`
+  inherited the real one's `"canonicalize {}"` the same way.
+- `ast::function` returned the **first** definition with a name, so "the
+  function named X must have property P" was satisfied by whichever X came
+  first. `ast::functions_named` returns all of them.
+- `Func` carried no **signature**, so `fn f(d: &dyn locations::Detector)` was
+  invisible to every body-based rule.
+
+Four audits also stopped accepting a name in place of a semantics: every
+`canonical_roots` must call `canonicalize`; `detectors_permitted` must read both
+`defaults` and `enabled_detectors`; an `#[ignore]`d required adapter test does
+not count; and `impls_of`/`pub_struct_fields` resolve through `use` renames.
+
+## Fixture hygiene
+
+`crates/cli/tests/agent_storage_cli.rs` scoped with a *deny*-list of two or
+three detector ids, and four of its tests wrote no scope config at all.
+`core-simulator`, `homebrew` and `ruby-install` resolve absolute system paths no
+injected `HOME` can confine, so those runs read this machine's real disk: the
+file took **over twenty minutes**. With allow-list scopes it takes **4.7 s**,
+and `a_fixture_scope_reaches_nothing_outside_its_fixture_home` drives the real
+binary and fails on any resolved root outside the tempdir.
+
+## Overclaims closed here
+
+- **Maven `_remote.repositories`** — withdrawn, not wired. Reading one marker
+  per artifact is a traversal of the whole local repository, which the report
+  path forbids; the single production call site passes `false` and always did.
+  `docs/architecture.md:95` and its Limits paragraph now say what
+  `docs/locations.md` already said, so the two docs agree.
+- **`docs/architecture.md`'s Limits section**, both directions: bulk marking
+  *does* reach agent rows (it claimed a gap that was closed), and the
+  "five tools implemented, nine `Planned`" paragraph contradicted `:729` of the
+  same file — `matrix.rs` has no `Planned` rows; what it has is a support level
+  per row, where `Unverified` means the citation has not been re-fetched, not
+  that the storage is unmeasured.
