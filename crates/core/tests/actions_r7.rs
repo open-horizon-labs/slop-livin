@@ -249,7 +249,12 @@ fn stale_unique_bytes_do_not_spend_a_standing_grant() {
     }
     let plan = propose(&r, None, std::slice::from_ref(&nm), "test").unwrap();
     assert!(plan.units[0].dedup_stale);
-    assert!(plan.units[0].warnings.iter().any(|w| w.contains("stale")));
+    assert!(
+        plan.units[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("out of date"))
+    );
     save_plan(store.path(), &plan).unwrap();
     add_standing_grant(
         store.path(),

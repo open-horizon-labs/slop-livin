@@ -820,7 +820,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.min(90);
-    let h = area.height.min(42);
+    let h = area.height.min(48);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -887,8 +887,22 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     // the constant by `evidence_contract.rs`.
     text.push(Line::from(""));
     text.push(Line::from("Activity evidence this pass can establish"));
+    // Wrapped rather than clipped: the clipped tail is where each entry
+    // says what the evidence cannot establish.
+    let room = usize::from(w.saturating_sub(2)).max(20);
     for (domain, evidence) in swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY {
-        text.push(Line::from(format!("  {domain}: {evidence}")));
+        let mut line = String::from(" ");
+        for word in format!("{domain}: {evidence}").split_whitespace() {
+            if line.chars().count() + 1 + word.chars().count() > room && !line.trim().is_empty() {
+                text.push(Line::from(std::mem::replace(
+                    &mut line,
+                    String::from("   "),
+                )));
+            }
+            line.push(' ');
+            line.push_str(word);
+        }
+        text.push(Line::from(line));
     }
     let block = Block::default()
         .borders(Borders::ALL)

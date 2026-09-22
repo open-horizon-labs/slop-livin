@@ -353,7 +353,13 @@ fn stale_same_size_member_refuses_entire_group() {
         actions::execute_with_trash(store.path(), &plan.id, "test", &store.path().join("trash"))
             .unwrap();
     assert_ne!(result.outcomes[0].status, "completed");
-    assert!(result.outcomes[0].cause.as_ref().unwrap().contains("stale"));
+    assert!(
+        result.outcomes[0]
+            .cause
+            .as_ref()
+            .unwrap()
+            .contains("changed since review")
+    );
     assert!(selected.exists());
     assert!(selected.with_extension("d").exists());
 }
