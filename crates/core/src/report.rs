@@ -1237,8 +1237,14 @@ pub(crate) fn aggregate_dir_totals(
 ) {
     let mut totals: std::collections::HashMap<(String, String), u64> =
         std::collections::HashMap::new();
+    // Completeness rolls up with the bytes: a directory is complete only
+    // if every measured descendant was. An unreadable directory deep in a
+    // tree is otherwise invisible from every ancestor's row.
+    let mut complete: std::collections::HashMap<(String, String), bool> =
+        std::collections::HashMap::new();
     for d in dirs.iter() {
         totals.insert((d.worktree_id.clone(), d.rel_path.clone()), d.own_allocated);
+        complete.insert((d.worktree_id.clone(), d.rel_path.clone()), d.complete);
     }
     let mut order: Vec<usize> = (0..dirs.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(dirs[i].rel_path.matches('/').count()));
@@ -1248,14 +1254,19 @@ pub(crate) fn aggregate_dir_totals(
             continue;
         }
         let value = *totals.get(&key).unwrap_or(&0);
+        let whole = *complete.get(&key).unwrap_or(&true);
         if let Some(parent_rel) = dirs[i].parent_rel_path.clone() {
             let pkey = (dirs[i].worktree_id.clone(), parent_rel);
-            *totals.entry(pkey).or_insert(0) += value;
+            *totals.entry(pkey.clone()).or_insert(0) += value;
+            if !whole && let Some(c) = complete.get_mut(&pkey) {
+                *c = false;
+            }
         }
     }
     for d in dirs.iter_mut() {
         let key = (d.worktree_id.clone(), d.rel_path.clone());
         d.allocated_total = *totals.get(&key).unwrap_or(&d.own_allocated);
+        d.complete = *complete.get(&key).unwrap_or(&d.complete);
     }
 }
 

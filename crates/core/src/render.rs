@@ -1021,7 +1021,11 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
                 crate::artifact::RoleFamily::Residual.title(),
                 crate::build_adapters::family_guidance(crate::artifact::RoleFamily::Residual),
                 summary.unsupported_count,
-                if summary.unsupported_count == 1 { "y" } else { "ies" },
+                if summary.unsupported_count == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
                 match summary.unaccounted_bytes {
                     Some(b) => format!(
                         "{} {} in total, {} of it claimed by no unit",
