@@ -303,8 +303,28 @@ pub fn parse_go_sum(text: &str) -> Vec<DependencyIdentity> {
 /// [`parse_gradle_lockfile`]'s own coordinate convention so both
 /// ecosystems' identities compare the same way.
 pub fn parse_pom_xml(text: &str) -> Result<Vec<DependencyIdentity>, String> {
+    parse_pom_xml_with_gaps(text).map(|(ids, _gaps)| ids)
+}
+
+/// `parse_pom_xml`, also returning the dependencies whose *identity*
+/// could not be established: a `${property}` version this parser does
+/// not evaluate, or a version inherited from a parent POM that is not
+/// on disk here.
+///
+/// These used to be skipped silently, so a Maven project with a
+/// property-driven version read as declaring nothing and its local
+/// repository read as having no consumer -- the PR #123 review's
+/// `a_pom_whose_versions_cannot_be_resolved_must_state_the_gap`
+/// counterexample. Swamp does not implement Maven's property and
+/// inheritance resolution, and guessing a version would be worse; what
+/// it can do is say which dependency it could not resolve and why.
+pub fn parse_pom_xml_with_gaps(
+    text: &str,
+) -> Result<(Vec<DependencyIdentity>, Vec<String>), String> {
     let doc = roxmltree::Document::parse(text).map_err(|e| format!("invalid pom.xml: {e}"))?;
     let mut out = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
+    let inherits_from_parent = doc.descendants().any(|n| n.has_tag_name("parent"));
     for node in doc.descendants().filter(|n| n.has_tag_name("dependency")) {
         if node
             .ancestors()
@@ -320,15 +340,31 @@ pub fn parse_pom_xml(text: &str) -> Result<Vec<DependencyIdentity>, String> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        let (Some(group), Some(artifact), Some(version)) = (
+        let (group, artifact, version) = (
             child_text("groupId"),
             child_text("artifactId"),
             child_text("version"),
-        ) else {
+        );
+        let (Some(group), Some(artifact)) = (group, artifact) else {
+            continue;
+        };
+        let Some(version) = version else {
+            gaps.push(format!(
+                "{group}:{artifact} declares no version{}",
+                if inherits_from_parent {
+                    ", so it is inherited from a parent POM this parser does not resolve"
+                } else {
+                    ""
+                }
+            ));
             continue;
         };
         if version.contains("${") {
-            continue; // unresolved Maven property; never guessed
+            // Never guessed -- but never dropped either.
+            gaps.push(format!(
+                "{group}:{artifact} version is the unresolved Maven property {version}"
+            ));
+            continue;
         }
         out.push(DependencyIdentity {
             ecosystem: "maven",
@@ -336,7 +372,7 @@ pub fn parse_pom_xml(text: &str) -> Result<Vec<DependencyIdentity>, String> {
             version,
         });
     }
-    Ok(out)
+    Ok((out, gaps))
 }
 
 /// `gradle.lockfile`: `group:artifact:version=configurations` lines
@@ -516,6 +552,23 @@ pub fn join_cache_entry(
 /// An unparseable lockfile is a named evidence gap, never a silent
 /// "no dependencies declared" (which would be indistinguishable from a
 /// project that genuinely has none).
+/// A dependency the manifest declares but whose identity this parser
+/// cannot resolve. `Unknown`, not absent: the project *does* declare a
+/// consumer relationship, swamp just cannot say which cache entry it
+/// points at.
+pub fn unresolved_dependency_evidence(ecosystem: &str, path: &Path, gap: &str) -> Evidence {
+    Evidence::unknown(
+        FactKind::Consumer,
+        FactSubtype::DeclaredConsumer,
+        EvidenceSource::Lockfile {
+            ecosystem: ecosystem.to_string(),
+            path: path.display().to_string(),
+        },
+        now(),
+        format!("declared dependency with an unresolved identity: {gap}"),
+    )
+}
+
 pub fn invalid_lockfile_evidence(ecosystem: &str, path: &Path, parse_error: &str) -> Evidence {
     Evidence::unavailable(
         FactKind::Consumer,

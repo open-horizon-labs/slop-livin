@@ -1,0 +1,338 @@
+//! Current-state Parquet tables for the association layer's caches:
+//! toolchain declarations, dependency identities, and the Xcode
+//! DerivedData -> workspace join.
+//!
+//! These were three JSON sidecars under the store
+//! (`toolchain_declarations_cache.json`,
+//! `dependency_identities_cache.json`, and no cache at all for the Xcode
+//! join). Per-worktree, per-unit, per-row data rewritten whole on every
+//! change is a parallel database with a JSON syntax, which the handoff
+//! rules out and `.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`
+//! now enforces. They live here instead, as properly columnar
+//! current-state tables written through the store's own atomic
+//! zstd-Parquet writer.
+//!
+//! Every table is keyed by an identity plus a *source fingerprint* --
+//! the `(name, size, mtime)` of the files the cached value was derived
+//! from -- so invalidation is a comparison, never a timestamp guess. An
+//! unchanged worktree is a table lookup; an unchanged DerivedData folder
+//! costs no `plutil` subprocess at all, which is what the PR #123
+//! review's `a_second_unchanged_pass_must_not_respawn_plutil_for_every_derived_data_folder`
+//! counterexample demanded.
+//!
+//! There is deliberately no migration from the JSON files: this is a
+//! brand-new project, and a stale cache is re-derived on first use.
+
+use anyhow::{Context, Result};
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+const ZSTD_LEVEL: i32 = 9;
+
+fn dir(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("associations")
+}
+
+/// A source fingerprint, rendered as one stable string so it is a single
+/// comparable column rather than a nested list.
+pub fn fingerprint_string(parts: &[(String, u64)]) -> String {
+    let mut parts: Vec<String> = parts
+        .iter()
+        .map(|(name, mtime)| format!("{name}@{mtime}"))
+        .collect();
+    parts.sort();
+    parts.join("\u{1}")
+}
+
+/// One `(key, fingerprint) -> values` table. Three columns, so a reader
+/// can scan one without materializing the others, and one row per cached
+/// value rather than one blob per key.
+struct KeyedTable {
+    path: PathBuf,
+    value_columns: &'static [&'static str],
+}
+
+impl KeyedTable {
+    fn schema(&self) -> Arc<Schema> {
+        let mut fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("fingerprint", DataType::Utf8, false),
+            Field::new("observed_at", DataType::UInt64, false),
+        ];
+        for c in self.value_columns {
+            fields.push(Field::new(*c, DataType::Utf8, false));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Every row as `(key, fingerprint, values)`.
+    fn read(&self) -> Result<Vec<(String, String, Vec<String>)>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let file =
+            File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .and_then(|b| b.build())
+            .with_context(|| {
+                format!(
+                    "read {} (delete it to re-derive this cache)",
+                    self.path.display()
+                )
+            })?;
+        let mut out = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let col = |name: &str| -> Result<&StringArray> {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .with_context(|| format!("column {name} is not Utf8"))
+            };
+            let keys = col("key")?;
+            let fps = col("fingerprint")?;
+            let value_cols: Vec<&StringArray> = self
+                .value_columns
+                .iter()
+                .map(|c| col(c))
+                .collect::<Result<_>>()?;
+            for i in 0..batch.num_rows() {
+                out.push((
+                    keys.value(i).to_string(),
+                    fps.value(i).to_string(),
+                    value_cols.iter().map(|c| c.value(i).to_string()).collect(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn write(&self, rows: &[(String, String, Vec<String>)], observed_at: u64) -> Result<()> {
+        let schema = self.schema();
+        let keys: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let fps: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let times: Vec<u64> = vec![observed_at; rows.len()];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(StringArray::from(fps)),
+            Arc::new(UInt64Array::from(times)),
+        ];
+        for (n, _) in self.value_columns.iter().enumerate() {
+            let vals: Vec<&str> = rows
+                .iter()
+                .map(|r| r.2.get(n).map(String::as_str).unwrap_or_default())
+                .collect();
+            columns.push(Arc::new(StringArray::from(vals)));
+        }
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        crate::growth::write_parquet_batches_atomic(
+            &self.path,
+            schema,
+            std::iter::once(Ok(batch)),
+            ZSTD_LEVEL,
+        )
+    }
+}
+
+/// The cached values for one key, with the fingerprint they were derived
+/// under. A caller compares the fingerprint before trusting the values.
+pub struct CachedRows {
+    pub fingerprint: String,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// A whole table as `key -> CachedRows`. Keys with rows under more than
+/// one fingerprint keep the newest read.
+fn load(table: &KeyedTable) -> HashMap<String, CachedRows> {
+    let mut out: HashMap<String, CachedRows> = HashMap::new();
+    // A corrupt cache is re-derived, never fatal: this is derived data,
+    // not history. The error is swallowed here and only here.
+    let Ok(rows) = table.read() else {
+        return out;
+    };
+    for (key, fingerprint, values) in rows {
+        let entry = out.entry(key).or_insert_with(|| CachedRows {
+            fingerprint: fingerprint.clone(),
+            rows: Vec::new(),
+        });
+        if entry.fingerprint != fingerprint {
+            entry.fingerprint = fingerprint;
+            entry.rows.clear();
+        }
+        // A fingerprint-only row (every value column empty) records
+        // "this key genuinely has nothing", which is a cached answer,
+        // not a cached value.
+        if values.iter().all(String::is_empty) {
+            continue;
+        }
+        entry.rows.push(values);
+    }
+    out
+}
+
+fn store(table: &KeyedTable, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+    let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut keys: Vec<&String> = cache.keys().collect();
+    keys.sort();
+    for key in keys {
+        let entry = &cache[key];
+        if entry.rows.is_empty() {
+            // A key with no values still needs its fingerprint recorded,
+            // or "this worktree genuinely declares nothing" would be
+            // re-derived on every pass.
+            rows.push((
+                key.clone(),
+                entry.fingerprint.clone(),
+                vec![String::new(); 8],
+            ));
+            continue;
+        }
+        for values in &entry.rows {
+            rows.push((key.clone(), entry.fingerprint.clone(), values.clone()));
+        }
+    }
+    table.write(&rows, observed_at)
+}
+
+// ---------------------------------------------------------------------
+// The three tables
+// ---------------------------------------------------------------------
+
+/// `worktree -> (tool, version, source_file, role)`.
+pub struct DeclarationTable(KeyedTable);
+/// `worktree -> (ecosystem, name, version)` plus `(ecosystem, message)`
+/// gap rows, distinguished by a leading marker column.
+pub struct IdentityTable(KeyedTable);
+/// `DerivedData subfolder -> workspace path` (or the read error), keyed
+/// by the `info.plist`'s own `(size, mtime)`.
+pub struct XcodeJoinTable(KeyedTable);
+
+impl DeclarationTable {
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("declarations.parquet"),
+            value_columns: &["tool", "version", "source_file", "role"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl IdentityTable {
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("dependency_identities.parquet"),
+            value_columns: &["row_kind", "ecosystem", "name", "version"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl XcodeJoinTable {
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("xcode_derived_data.parquet"),
+            value_columns: &["outcome", "detail"],
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_table_round_trips_rows_and_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = DeclarationTable::open(tmp.path());
+        let mut cache = HashMap::new();
+        cache.insert(
+            "/proj/a".to_string(),
+            CachedRows {
+                fingerprint: "tool-versions@100".into(),
+                rows: vec![vec![
+                    "nodejs".into(),
+                    "20.11.1".into(),
+                    ".tool-versions".into(),
+                    "project".into(),
+                ]],
+            },
+        );
+        table.save(&cache, 1_000).unwrap();
+        let back = table.load();
+        assert_eq!(back.len(), 1);
+        let entry = &back["/proj/a"];
+        assert_eq!(entry.fingerprint, "tool-versions@100");
+        assert_eq!(entry.rows[0][1], "20.11.1");
+    }
+
+    #[test]
+    fn a_key_with_no_values_still_records_its_fingerprint() {
+        // Otherwise "this worktree declares nothing" is re-derived on
+        // every pass, which is exactly the cost the cache exists to
+        // avoid.
+        let tmp = tempfile::tempdir().unwrap();
+        let table = IdentityTable::open(tmp.path());
+        let mut cache = HashMap::new();
+        cache.insert(
+            "/proj/empty".to_string(),
+            CachedRows {
+                fingerprint: "none".into(),
+                rows: Vec::new(),
+            },
+        );
+        table.save(&cache, 1_000).unwrap();
+        let back = table.load();
+        assert_eq!(back["/proj/empty"].fingerprint, "none");
+        assert!(back["/proj/empty"].rows.is_empty());
+    }
+
+    #[test]
+    fn the_store_holds_parquet_not_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = XcodeJoinTable::open(tmp.path());
+        table.save(&HashMap::new(), 1).unwrap();
+        let files: Vec<String> = std::fs::read_dir(tmp.path().join("associations"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            files.iter().all(|f| f.ends_with(".parquet")),
+            "the association store must be columnar: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_is_re_derived_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = DeclarationTable::open(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("associations")).unwrap();
+        std::fs::write(
+            tmp.path().join("associations/declarations.parquet"),
+            b"not parquet",
+        )
+        .unwrap();
+        assert!(table.load().is_empty());
+    }
+}

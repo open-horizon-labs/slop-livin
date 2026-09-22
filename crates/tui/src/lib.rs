@@ -527,6 +527,7 @@ mod tests {
 
     fn empty_report() -> Report {
         Report {
+            store_dir: None,
             observed_at: 0,
             root: "/root".into(),
             projects: vec![],

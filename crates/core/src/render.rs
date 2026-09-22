@@ -1388,6 +1388,37 @@ fn age_label(mtime_max: u64, now: u64) -> String {
 /// conflicting reason, and where it came from. Never a verdict word --
 /// `agent_interface_facts_not_verdicts` audits this file for exactly
 /// that.
+/// The human-facing name of one fact's subtype. Plain words, not the
+/// enum's spelling: a reader sees "estimated reclaimable", not
+/// `EstimatedReclaimable`.
+pub fn evidence_subtype_label(subtype: crate::evidence::FactSubtype) -> &'static str {
+    use crate::evidence::FactSubtype as S;
+    match subtype {
+        S::Modified => "modified",
+        S::Accessed => "accessed",
+        S::ToolReportedUse => "tool-reported use",
+        S::DeclaredConsumer => "declared consumer",
+        S::InferredConsumer => "inferred consumer",
+        S::Process => "process",
+        S::OpenFile => "open file",
+        S::Lock => "lock",
+        S::RunningContainer => "running container",
+        S::Mounted => "mounted",
+        S::Booted => "booted",
+        S::Rebuild => "rebuild",
+        S::NetworkFetch => "network fetch",
+        S::LocalReinstall => "local reinstall",
+        S::TrashRecovery => "Trash recovery",
+        S::BackupDependent => "backup dependent",
+        S::PotentiallyUniqueLocalState => "potentially unique local state",
+        S::UnknownPrerequisites => "unknown prerequisites",
+        S::LogicalBytes => "logical bytes",
+        S::AllocatedBytes => "allocated bytes",
+        S::EstimatedReclaimable => "estimated reclaimable",
+        S::ObservedFreed => "observed freed",
+    }
+}
+
 pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<String> {
     use crate::evidence::{FactKind, FactStatus, FactValue};
     evidence
@@ -1423,6 +1454,13 @@ pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<Stri
                         .join(", ")
                 ),
             };
+            // The subtype is what distinguishes two facts of the same
+            // kind, and leaving it out made "allocated bytes" and
+            // "estimated reclaimable bytes" render as byte-identical
+            // lines -- which is the one distinction a reader deciding
+            // what to remove most needs (the PR #123 review's
+            // rendered_reclaimability counterexample).
+            let subtype = evidence_subtype_label(e.subtype);
             let source = format!("{:?}", e.source);
             let coverage = e
                 .freshness
@@ -1435,7 +1473,7 @@ pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<Stri
                 .as_deref()
                 .map(|n| format!("; note: {n}"))
                 .unwrap_or_default();
-            format!("{kind}: {value}  [source: {source}]{coverage}{note}")
+            format!("{kind} ({subtype}): {value}  [source: {source}]{coverage}{note}")
         })
         .collect()
 }
@@ -1465,6 +1503,20 @@ pub fn evidence_warnings(evidence: &[crate::evidence::Evidence]) -> Vec<String> 
             }
             (FactKind::CurrentUse, FactStatus::Known(FactValue::Bool(true))) => {
                 out.push("currently in use".to_string());
+            }
+            // A current-use question that could not be *answered* must
+            // not look like one answered "no". The PR #123 review:
+            // `Unavailable`/`Unknown` produced no confirmation line at
+            // all, so a unit whose occupancy probe failed read exactly
+            // like a unit confirmed idle
+            // (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`).
+            (FactKind::CurrentUse, FactStatus::Unavailable { reason }) => {
+                out.push(format!(
+                    "could not check whether this is in use right now: {reason}"
+                ));
+            }
+            (FactKind::CurrentUse, FactStatus::Unknown { reason }) => {
+                out.push(format!("whether this is in use is unresolved: {reason}"));
             }
             (FactKind::Recovery, FactStatus::Known(FactValue::Text(path)))
                 if path == "PotentiallyUniqueLocalState" || path == "BackupDependent" =>

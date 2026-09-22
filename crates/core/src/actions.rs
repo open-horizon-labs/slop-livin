@@ -522,15 +522,31 @@ pub fn propose_checking_protection(
     protected: &[PathBuf],
 ) -> Result<Plan> {
     let mut plan = propose(report, filter, paths, proposed_by)?;
+    // The caller's list is a convenience, never the authority. The PR
+    // #123 review's counterexample: an unreadable `agent_protect.json`
+    // reached this function as an *empty* list through the CLI's
+    // `.unwrap_or_default()`, so a protected unit became plannable
+    // exactly when protection state broke. When the report knows which
+    // store it came from, protection is reloaded here and an error is a
+    // refusal (`.oh/guardrails/protection-fails-closed.md`).
+    let live: Vec<PathBuf> = match report.store_dir.as_deref() {
+        Some(dir) => crate::agents::load_protect(dir)?,
+        None => Vec::new(),
+    };
+    let mut protected: Vec<PathBuf> = protected.to_vec();
+    for p in live {
+        if !protected.contains(&p) {
+            protected.push(p);
+        }
+    }
     if protected.is_empty() {
         return Ok(plan);
     }
     let mut kept = Vec::new();
     for u in plan.units {
-        if protected
-            .iter()
-            .any(|p| u.path == *p || u.path.starts_with(p))
-        {
+        // Both directions, as everywhere else: a unit beneath a
+        // protected path, and a unit that *contains* one.
+        if crate::agents::is_human_protected(&protected, &u.path) {
             plan.refused.push(Refused {
                 path: u.path.clone(),
                 cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),

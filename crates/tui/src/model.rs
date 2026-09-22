@@ -2043,6 +2043,7 @@ mod tests {
     #[test]
     fn tree_rail_marks_last_sibling_with_an_elbow() {
         let report = Report {
+            store_dir: None,
             observed_at: 0,
             root: "/r".into(),
             projects: vec![swamp_core::report::ProjectRow {
@@ -2141,6 +2142,7 @@ mod tests {
     #[test]
     fn docker_unowned_bytes_sums_only_docker_no_join() {
         let report = Report {
+            store_dir: None,
             observed_at: 0,
             root: "/r".into(),
             projects: vec![],

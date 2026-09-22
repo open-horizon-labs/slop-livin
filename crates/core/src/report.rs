@@ -458,6 +458,16 @@ pub struct Report {
         serialize_with = "crate::cargo_cleanup::serialize_units"
     )]
     pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
+    /// The store this report was produced against, when there was one.
+    ///
+    /// Carried so a later decision can consult *live* state rather than
+    /// a snapshot taken when the report was built. `propose` uses it to
+    /// reload human keep/protect intent at proposal time: the PR #123
+    /// review found protection was checked against a caller-supplied
+    /// list that an unreadable protect file silently emptied
+    /// (`.oh/guardrails/protection-fails-closed.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_dir: Option<PathBuf>,
 }
 
 /// Live GitHub enrichment stats for one `report_full(.., enrich: true)`
@@ -508,18 +518,35 @@ pub fn attach_decision_evidence(report: &mut Report) {
                 // known; whether they are uniquely this row's is bounded,
                 // not asserted, when the row is flagged hardlinked or its
                 // dedup is stale.
-                let acc = if a.hardlinked || a.dedup_stale {
-                    crate::reclaimability::hardlink_unresolved_bound(a.bytes)
+                // A Docker object's bytes came from the daemon
+                // (`docker system df -v`): a layer-shared, logical
+                // number that no directory walk measured. Giving it
+                // filesystem provenance and an exact reclaimable equal
+                // to its allocation was the PR #123 review's
+                // docker_reclaimability counterexample.
+                if matches!(
+                    a.kind,
+                    ArtifactKind::DockerImage
+                        | ArtifactKind::DockerVolume
+                        | ArtifactKind::DockerBuildCache
+                ) {
+                    a.evidence.extend(
+                        crate::reclaimability::DockerByteAccounting::for_object(a.bytes).evidence(),
+                    );
                 } else {
-                    crate::reclaimability::exclusive_allocation(a.bytes)
-                };
-                a.evidence
-                    .extend(crate::reclaimability::accounting_evidence(
-                        &acc,
-                        crate::evidence::EvidenceSource::FilesystemMetadata {
-                            detail: "folded directory allocation".into(),
-                        },
-                    ));
+                    let acc = if a.hardlinked || a.dedup_stale {
+                        crate::reclaimability::hardlink_unresolved_bound(a.bytes)
+                    } else {
+                        crate::reclaimability::exclusive_allocation(a.bytes)
+                    };
+                    a.evidence
+                        .extend(crate::reclaimability::accounting_evidence(
+                            &acc,
+                            crate::evidence::EvidenceSource::FilesystemMetadata {
+                                detail: "folded directory allocation".into(),
+                            },
+                        ));
+                }
 
                 // Recovery (#58): only for kinds this pass can source
                 // without guessing. A worktree appearing in this report at
@@ -852,7 +879,9 @@ pub fn report_full_mode_with_exclusions(
         fs_events_source,
         &pruned_subtrees,
     );
-    crate::bus::run_report(&ctx)
+    let mut report = crate::bus::run_report(&ctx)?;
+    report.store_dir = store_dir.map(Path::to_path_buf);
+    Ok(report)
 }
 
 /// Fills `track` on every artifact row and top-level Source directory:
@@ -1725,6 +1754,7 @@ pub fn report_scope_with_parts(
         summary: Summary::default(),
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        store_dir: store_dir.map(Path::to_path_buf),
     };
 
     for scope_root in &scope.roots {
@@ -2041,6 +2071,8 @@ pub fn merge_reports(
         .unwrap_or_else(crate::entities::now);
     let mut merged = Report {
         observed_at,
+        // Every per-root report of one scope shares one store.
+        store_dir: reports_by_root.values().find_map(|r| r.store_dir.clone()),
         root: PathBuf::new(),
         projects: Vec::new(),
         unowned: Vec::new(),
@@ -2078,6 +2110,17 @@ pub fn merge_reports(
         if let Some(r) = reports_by_root.get(root) {
             merge_root_report_into(&mut merged, r.clone());
         }
+    }
+    // Consumer/association facts (#56/#57) were attached to the *merged*
+    // report of the previous pass, so the per-root reports this re-fold
+    // reads never carried them and every refresh silently erased them
+    // (the PR #123 review's consumer_evidence_must_survive_a_per_root_report_refresh).
+    // Re-attach from the persisted current-state tables: the
+    // declaration/lockfile/Xcode caches make an unchanged worktree a
+    // table lookup, not a re-read.
+    if let Some(dir) = merged.store_dir.clone() {
+        let mut no_units: Vec<crate::external::ExternalUnit> = Vec::new();
+        crate::consumer_wiring::attach_associations(&mut merged, &mut no_units, Some(&dir));
     }
     merged
 }

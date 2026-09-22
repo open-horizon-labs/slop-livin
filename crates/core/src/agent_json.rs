@@ -683,6 +683,7 @@ mod tests {
 
     fn fixture_report() -> Report {
         Report {
+            store_dir: None,
             observed_at: 1_000_000,
             root: PathBuf::from("/src"),
             projects: vec![ProjectRow {

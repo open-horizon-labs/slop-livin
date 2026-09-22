@@ -35,7 +35,6 @@ use crate::external_associations;
 use crate::locations::StorageCategory;
 use crate::report::{ArtifactKind, Report};
 use crate::toolchain_declarations::{self, ProjectDeclarationSources, ToolVersionDeclaration};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,53 +99,19 @@ fn fingerprint(root: &Path, names: &[&str]) -> Vec<(String, u64)> {
     out
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DeclarationCacheEntry {
-    fingerprint: Vec<(String, u64)>,
-    declarations: Vec<ToolVersionDeclaration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedIdentity {
     ecosystem: String,
     name: String,
     version: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DependencyCacheEntry {
-    fingerprint: Vec<(String, u64)>,
-    identities: Vec<CachedIdentity>,
-    /// Named parse failures this worktree's lockfiles produced this
-    /// pass (#57: "an unparseable lockfile is a named evidence gap,
-    /// never a silent empty list").
-    parse_errors: Vec<(String, String)>, // (ecosystem, message)
-}
-
-type DeclarationCacheMap = HashMap<String, DeclarationCacheEntry>;
-type DependencyCacheMap = HashMap<String, DependencyCacheEntry>;
-
-fn declaration_cache_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("toolchain_declarations_cache.json")
-}
-fn dependency_cache_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("dependency_identities_cache.json")
-}
-
-fn load_json<T: Default + serde::de::DeserializeOwned>(path: &Path) -> T {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-fn save_json<T: Serialize>(path: &Path, value: &T) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(value) {
-        let _ = fs::write(path, text);
-    }
-}
+/// The three caches now live in the store's own columnar tables
+/// (`crate::assoc_store`), not in JSON sidecars: they are per-worktree,
+/// per-unit data, and a JSON file rewritten whole on every change is a
+/// parallel database with a JSON syntax
+/// (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`).
+type CacheMap = HashMap<String, crate::assoc_store::CachedRows>;
 
 // ---------------------------------------------------------------------
 // Toolchain declarations (#56): real file reads, cached per worktree.
@@ -178,26 +143,61 @@ fn read_declarations(root: &Path) -> Vec<ToolVersionDeclaration> {
 
 /// Declarations for one worktree, reusing the cache when the worktree's
 /// declaration files have not changed since the last call.
-fn cached_declarations(
-    worktree: &Path,
-    cache: &mut DeclarationCacheMap,
-) -> Vec<ToolVersionDeclaration> {
+fn cached_declarations(worktree: &Path, cache: &mut CacheMap) -> Vec<ToolVersionDeclaration> {
     let key = worktree.display().to_string();
-    let fp = fingerprint(worktree, DECLARATION_FILENAMES);
+    let fp = crate::assoc_store::fingerprint_string(&fingerprint(worktree, DECLARATION_FILENAMES));
     if let Some(entry) = cache.get(&key)
         && entry.fingerprint == fp
     {
-        return entry.declarations.clone();
+        crate::work_counters::record_cache_hit();
+        return entry
+            .rows
+            .iter()
+            .map(Vec::as_slice)
+            .filter_map(declaration_from_row)
+            .collect();
     }
+    crate::work_counters::record_cache_miss();
     let declarations = read_declarations(worktree);
     cache.insert(
         key,
-        DeclarationCacheEntry {
+        crate::assoc_store::CachedRows {
             fingerprint: fp,
-            declarations: declarations.clone(),
+            rows: declarations.iter().map(declaration_to_row).collect(),
         },
     );
     declarations
+}
+
+fn declaration_to_row(d: &ToolVersionDeclaration) -> Vec<String> {
+    let (role, scope_path) = match &d.scope {
+        toolchain_declarations::DeclarationScope::Project(p) => {
+            ("project", p.display().to_string())
+        }
+        toolchain_declarations::DeclarationScope::GlobalDefault => ("global", String::new()),
+    };
+    vec![
+        format!("{}\u{2}{}", d.manager, d.tool),
+        d.version_spec.clone(),
+        d.source_path.display().to_string(),
+        format!("{role}\u{2}{scope_path}"),
+    ]
+}
+
+fn declaration_from_row(row: &[String]) -> Option<ToolVersionDeclaration> {
+    let (manager, tool) = row.first()?.split_once('\u{2}')?;
+    let (role, scope_path) = row.get(3)?.split_once('\u{2}')?;
+    Some(ToolVersionDeclaration {
+        manager: manager.to_string(),
+        tool: tool.to_string(),
+        version_spec: row.get(1)?.clone(),
+        source_path: PathBuf::from(row.get(2)?),
+        scope: if role == "global" {
+            toolchain_declarations::DeclarationScope::GlobalDefault
+        } else {
+            toolchain_declarations::DeclarationScope::Project(PathBuf::from(scope_path))
+        },
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -261,12 +261,21 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
         );
     }
     if let Ok(text) = fs::read_to_string(root.join("pom.xml")) {
-        match external_associations::parse_pom_xml(&text) {
-            Ok(ids) => out.extend(ids.into_iter().map(|i| CachedIdentity {
-                ecosystem: i.ecosystem.to_string(),
-                name: i.name,
-                version: i.version,
-            })),
+        match external_associations::parse_pom_xml_with_gaps(&text) {
+            Ok((ids, gaps)) => {
+                out.extend(ids.into_iter().map(|i| CachedIdentity {
+                    ecosystem: i.ecosystem.to_string(),
+                    name: i.name,
+                    version: i.version,
+                }));
+                // A dependency whose version is a property or inherited
+                // from a parent POM is a *stated gap*, not a silent
+                // absence.
+                errors.extend(
+                    gaps.into_iter()
+                        .map(|g| ("maven-unresolved".to_string(), g)),
+                );
+            }
             Err(e) => errors.push(("maven".to_string(), e)),
         }
     }
@@ -275,22 +284,55 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
 
 fn cached_identities(
     worktree: &Path,
-    cache: &mut DependencyCacheMap,
+    cache: &mut CacheMap,
 ) -> (Vec<CachedIdentity>, Vec<(String, String)>) {
     let key = worktree.display().to_string();
-    let fp = fingerprint(worktree, LOCKFILE_FILENAMES);
+    let fp = crate::assoc_store::fingerprint_string(&fingerprint(worktree, LOCKFILE_FILENAMES));
     if let Some(entry) = cache.get(&key)
         && entry.fingerprint == fp
     {
-        return (entry.identities.clone(), entry.parse_errors.clone());
+        crate::work_counters::record_cache_hit();
+        let mut identities = Vec::new();
+        let mut errors = Vec::new();
+        for row in &entry.rows {
+            match row.first().map(String::as_str) {
+                Some("identity") => identities.push(CachedIdentity {
+                    ecosystem: row.get(1).cloned().unwrap_or_default(),
+                    name: row.get(2).cloned().unwrap_or_default(),
+                    version: row.get(3).cloned().unwrap_or_default(),
+                }),
+                Some("gap") => errors.push((
+                    row.get(1).cloned().unwrap_or_default(),
+                    row.get(2).cloned().unwrap_or_default(),
+                )),
+                _ => {}
+            }
+        }
+        return (identities, errors);
     }
+    crate::work_counters::record_cache_miss();
     let (identities, errors) = read_identities(worktree);
+    let mut rows: Vec<Vec<String>> = identities
+        .iter()
+        .map(|i| {
+            vec![
+                "identity".to_string(),
+                i.ecosystem.clone(),
+                i.name.clone(),
+                i.version.clone(),
+            ]
+        })
+        .collect();
+    rows.extend(
+        errors
+            .iter()
+            .map(|(eco, msg)| vec!["gap".to_string(), eco.clone(), msg.clone(), String::new()]),
+    );
     cache.insert(
         key,
-        DependencyCacheEntry {
+        crate::assoc_store::CachedRows {
             fingerprint: fp,
-            identities: identities.clone(),
-            parse_errors: errors.clone(),
+            rows,
         },
     );
     (identities, errors)
@@ -557,11 +599,14 @@ pub fn attach_associations(
     external_units: &mut [ExternalUnit],
     swamp_dir: Option<&Path>,
 ) {
-    let mut decl_cache: DeclarationCacheMap = swamp_dir
-        .map(|d| load_json(&declaration_cache_path(d)))
+    let mut decl_cache: CacheMap = swamp_dir
+        .map(|d| crate::assoc_store::DeclarationTable::open(d).load())
         .unwrap_or_default();
-    let mut dep_cache: DependencyCacheMap = swamp_dir
-        .map(|d| load_json(&dependency_cache_path(d)))
+    let mut dep_cache: CacheMap = swamp_dir
+        .map(|d| crate::assoc_store::IdentityTable::open(d).load())
+        .unwrap_or_default();
+    let mut xcode_cache: CacheMap = swamp_dir
+        .map(|d| crate::assoc_store::XcodeJoinTable::open(d).load())
         .unwrap_or_default();
 
     let project_roots: Vec<PathBuf> = report
@@ -604,9 +649,14 @@ pub fn attach_associations(
             // --- #57: dependency lockfiles -> shared store entries ---
             let (identities, parse_errors) = cached_identities(&wt_path, &mut dep_cache);
             for (ecosystem, message) in &parse_errors {
-                project_side_evidence.push(external_associations::invalid_lockfile_evidence(
-                    ecosystem, &wt_path, message,
-                ));
+                project_side_evidence.push(match ecosystem.strip_suffix("-unresolved") {
+                    Some(base) => external_associations::unresolved_dependency_evidence(
+                        base, &wt_path, message,
+                    ),
+                    None => external_associations::invalid_lockfile_evidence(
+                        ecosystem, &wt_path, message,
+                    ),
+                });
             }
             let mut has_pnpm_identity = false;
             for identity in &identities {
@@ -672,7 +722,12 @@ pub fn attach_associations(
     // Xcode DerivedData -> project (#57's own listed shared-store join):
     // one `plutil` read per DerivedData subfolder, bounded by how many
     // Xcode projects have ever built locally.
-    attach_xcode_associations(external_units, &project_roots, &mut unit_evidence);
+    attach_xcode_associations(
+        external_units,
+        &project_roots,
+        &mut unit_evidence,
+        &mut xcode_cache,
+    );
 
     for (i, labels) in unit_consumers {
         let mut labels = labels;
@@ -705,8 +760,12 @@ pub fn attach_associations(
     }
 
     if let Some(dir) = swamp_dir {
-        save_json(&declaration_cache_path(dir), &decl_cache);
-        save_json(&dependency_cache_path(dir), &dep_cache);
+        let at = now();
+        // Derived data: a write failure costs the next pass a re-derive,
+        // never correctness, so it is not propagated as an error.
+        let _ = crate::assoc_store::DeclarationTable::open(dir).save(&decl_cache, at);
+        let _ = crate::assoc_store::IdentityTable::open(dir).save(&dep_cache, at);
+        let _ = crate::assoc_store::XcodeJoinTable::open(dir).save(&xcode_cache, at);
     }
 }
 
@@ -760,10 +819,20 @@ fn attach_rustup_global_default(units: &mut [ExternalUnit]) {
     units[toolchains_idx].evidence.push(ev);
 }
 
+/// The Xcode DerivedData -> workspace join, cached by each subfolder's
+/// own `info.plist` `(size, mtime)`.
+///
+/// `read_workspace_path` spawns `plutil`. Uncached, that is one
+/// subprocess per locally-built Xcode project on *every* `report --view
+/// external`, every unified `propose` and every TUI refresh -- fifty
+/// spawns for fifty projects that did not change, which is what the PR
+/// #123 review measured (6 folders, 6 spawns, then 6 more on an
+/// identical second pass). An unchanged folder now costs a table lookup.
 fn attach_xcode_associations(
     units: &mut [ExternalUnit],
     project_roots: &[PathBuf],
     unit_evidence: &mut HashMap<usize, Vec<crate::evidence::Evidence>>,
+    cache: &mut CacheMap,
 ) {
     let Some(idx) = unit_index_by_suffix(
         units,
@@ -776,37 +845,73 @@ fn attach_xcode_associations(
     let derived_data_path = units[idx].path.clone();
     for subfolder in external_associations::list_derived_data_subfolders(&derived_data_path) {
         let info_plist = subfolder.join("info.plist");
-        if !info_plist.exists() {
+        let Ok(meta) = fs::symlink_metadata(&info_plist) else {
+            continue;
+        };
+        if !meta.is_file() {
             continue;
         }
         let name = subfolder
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        match external_associations::read_workspace_path(&info_plist) {
-            Ok(workspace_path) => {
-                let ev = external_associations::xcode_derived_data_association(
-                    workspace_path.as_deref(),
-                    project_roots,
+        let key = subfolder.display().to_string();
+        let fp = crate::assoc_store::fingerprint_string(&[(
+            format!("info.plist:{}", meta.len()),
+            mtime_secs(&meta),
+        )]);
+        let cached: Option<(String, String)> = cache
+            .get(&key)
+            .filter(|e| e.fingerprint == fp)
+            .and_then(|e| e.rows.first())
+            .map(|row| {
+                (
+                    row.first().cloned().unwrap_or_default(),
+                    row.get(1).cloned().unwrap_or_default(),
                 )
-                .with_note(format!("DerivedData/{name}"));
-                unit_evidence.entry(idx).or_default().push(ev);
+            });
+        let (outcome, detail) = match cached {
+            Some(hit) => {
+                crate::work_counters::record_cache_hit();
+                hit
             }
-            Err(e) => {
-                unit_evidence.entry(idx).or_default().push(
-                    crate::evidence::Evidence::unavailable(
-                        crate::evidence::FactKind::Consumer,
-                        crate::evidence::FactSubtype::DeclaredConsumer,
-                        crate::evidence::EvidenceSource::BuildMetadata {
-                            path: info_plist.display().to_string(),
-                        },
-                        now(),
-                        e,
-                    )
-                    .with_note(format!("DerivedData/{name}")),
+            None => {
+                crate::work_counters::record_cache_miss();
+                let fresh = match external_associations::read_workspace_path(&info_plist) {
+                    Ok(Some(path)) => ("workspace".to_string(), path),
+                    Ok(None) => ("no-workspace".to_string(), String::new()),
+                    Err(e) => ("error".to_string(), e),
+                };
+                cache.insert(
+                    key,
+                    crate::assoc_store::CachedRows {
+                        fingerprint: fp,
+                        rows: vec![vec![fresh.0.clone(), fresh.1.clone()]],
+                    },
                 );
+                fresh
             }
-        }
+        };
+        let ev = match outcome.as_str() {
+            "error" => crate::evidence::Evidence::unavailable(
+                crate::evidence::FactKind::Consumer,
+                crate::evidence::FactSubtype::DeclaredConsumer,
+                crate::evidence::EvidenceSource::BuildMetadata {
+                    path: info_plist.display().to_string(),
+                },
+                now(),
+                detail,
+            ),
+            "workspace" => external_associations::xcode_derived_data_association(
+                Some(detail.as_str()),
+                project_roots,
+            ),
+            _ => external_associations::xcode_derived_data_association(None, project_roots),
+        };
+        unit_evidence
+            .entry(idx)
+            .or_default()
+            .push(ev.with_note(format!("DerivedData/{name}")));
     }
 }
 
@@ -863,6 +968,7 @@ mod tests {
 
     fn empty_report(root: &Path, projects: Vec<ProjectRow>) -> Report {
         Report {
+            store_dir: None,
             observed_at: now(),
             root: root.to_path_buf(),
             projects,
@@ -954,7 +1060,7 @@ mod tests {
     fn cached_declarations_reuses_result_when_files_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".ruby-version"), "3.2.0\n").unwrap();
-        let mut cache = DeclarationCacheMap::new();
+        let mut cache = CacheMap::new();
         let first = cached_declarations(tmp.path(), &mut cache);
         assert_eq!(first.len(), 1);
         // Mutate the cache entry's stored declarations directly to a
@@ -963,8 +1069,7 @@ mod tests {
         cache
             .get_mut(&tmp.path().display().to_string())
             .unwrap()
-            .declarations[0]
-            .version_spec = "sentinel".into();
+            .rows[0][1] = "sentinel".into();
         let second = cached_declarations(tmp.path(), &mut cache);
         assert_eq!(second[0].version_spec, "sentinel");
     }
@@ -973,7 +1078,7 @@ mod tests {
     fn cached_declarations_reparses_after_mtime_change() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".ruby-version"), "3.2.0\n").unwrap();
-        let mut cache = DeclarationCacheMap::new();
+        let mut cache = CacheMap::new();
         let _ = cached_declarations(tmp.path(), &mut cache);
         // Simulate a real edit: change content and force a different
         // mtime (some filesystems have 1s mtime resolution).

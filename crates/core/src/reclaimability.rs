@@ -172,6 +172,17 @@ pub struct DockerByteAccounting {
 }
 
 impl DockerByteAccounting {
+    /// One Docker object's own daemon-reported size, with no host
+    /// backing-file measurement attached. What a joined Docker row
+    /// (image, volume, build cache) uses: its bytes came from `docker
+    /// system df -v`, never from a folded directory walk.
+    pub fn for_object(logical_object_bytes: u64) -> Self {
+        Self {
+            logical_object_bytes,
+            host_backing_allocated_bytes: None,
+        }
+    }
+
     /// Evidence facts for both numbers, explicit that they are not
     /// summed into a combined total.
     pub fn evidence(&self) -> Vec<Evidence> {
@@ -200,15 +211,29 @@ impl DockerByteAccounting {
                 )
                 .with_note("host disk-image allocation; not the same accounting as Docker's own logical object sizes"),
             ),
-            None => out.push(Evidence::unknown(
-                FactKind::Reclaimability,
-                FactSubtype::AllocatedBytes,
-                EvidenceSource::FilesystemMetadata {
-                    detail: "Docker Desktop/OrbStack VM backing file".into(),
-                },
-                now(),
-                "backing-file location out of scope or unreadable this pass",
-            )),
+            // No host backing-file measurement this pass. Naming
+            // `FilesystemMetadata` as the source of a number no
+            // filesystem produced is exactly the provenance error the
+            // PR #123 review found on joined Docker rows; the honest
+            // fact is that reclaimable space is unknown, sourced from
+            // the daemon that reported the object.
+            None => out.push(
+                Evidence::unknown(
+                    FactKind::Reclaimability,
+                    FactSubtype::EstimatedReclaimable,
+                    EvidenceSource::DockerApi {
+                        detail: "docker system df object accounting".into(),
+                    },
+                    now(),
+                    "removing this object frees an unknown amount of host backing store: layers \
+                     may be shared with other images, and the VM disk image does not shrink on \
+                     its own",
+                )
+                .with_note(
+                    "the host disk-image allocation was not measured this pass, so no filesystem \
+                     number is claimed for it",
+                ),
+            ),
         }
         out
     }
@@ -486,19 +511,25 @@ mod tests {
 
     #[test]
     fn docker_missing_host_backing_is_unknown_not_zero() {
-        let acc = DockerByteAccounting {
-            logical_object_bytes: 5_000,
-            host_backing_allocated_bytes: None,
-        };
+        let acc = DockerByteAccounting::for_object(5_000);
         let evidence = acc.evidence();
-        let host_fact = evidence
+        // Unknown reclaimable, not zero -- and sourced from the daemon
+        // that reported the object, never from a filesystem that never
+        // measured it (the PR #123 review's provenance finding).
+        let gap = evidence
             .iter()
-            .find(|e| e.subtype == FactSubtype::AllocatedBytes)
-            .unwrap();
+            .find(|e| e.subtype == FactSubtype::EstimatedReclaimable)
+            .expect("an unmeasured host backing store is a stated unknown");
         assert!(matches!(
-            host_fact.status,
+            gap.status,
             crate::evidence::FactStatus::Unknown { .. }
         ));
+        assert!(
+            evidence
+                .iter()
+                .all(|e| !matches!(e.source, EvidenceSource::FilesystemMetadata { .. })),
+            "no filesystem provenance may be claimed for a Docker object: {evidence:?}"
+        );
     }
 
     #[test]

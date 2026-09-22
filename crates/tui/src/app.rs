@@ -2216,6 +2216,7 @@ mod tests {
 
     fn fixture_report() -> Report {
         Report {
+            store_dir: None,
             observed_at: 1000,
             root: "/root".into(),
             projects: vec![ProjectRow {
@@ -2712,6 +2713,7 @@ mod tests {
 
     fn minimal_report(root: &str, project_name: &str, worktree_path: &str) -> Report {
         Report {
+            store_dir: None,
             observed_at: 1000,
             root: root.into(),
             projects: vec![ProjectRow {
@@ -2922,6 +2924,21 @@ mod tests {
             vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
         );
         app.store_dir = Some(store.path().to_path_buf());
+        // A refresh without an authorized scope is refused by design
+        // (`.oh/guardrails/tui-refresh-preserves-scope.md`), so the
+        // fixture supplies the one this App is showing -- exactly what
+        // `tui::run`/`run_scope` do at startup.
+        app.scope = Some(swamp_core::scope::resolve_effective_scope(
+            &swamp_core::locations::Environment::fixture(
+                dir_a.path().to_path_buf(),
+                std::collections::HashMap::new(),
+                swamp_core::locations::Platform::MacOS,
+            ),
+            &swamp_core::scope::ScanConfig::default(),
+            &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            &swamp_core::locations::Registry::with_builtins(),
+            1_000,
+        ));
         app.live_changes.insert(dir_a.path().join("changed-a"));
         app.live_changes.insert(dir_b.path().join("changed-b"));
         app.live_last_batch = Some(Instant::now() - App::LIVE_QUIET - Duration::from_millis(10));

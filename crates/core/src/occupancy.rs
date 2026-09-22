@@ -135,25 +135,39 @@ pub fn probe_path(path: &Path) -> OccupancyState {
         let _ = f.read_to_string(&mut s);
         s
     };
-    let stdout_text = read_all(out_file);
-    let stderr_text = read_all(err_file).to_lowercase();
-    match status.code() {
+    classify_lsof_exit(
+        status.code(),
+        &read_all(out_file),
+        &read_all(err_file),
+        path,
+    )
+}
+
+/// Pure classification of a completed `lsof` run, factored out so the
+/// fail-closed rules are unit-testable without spawning a process.
+///
+/// The distinction that matters: exit 1 with no output means "looked,
+/// found nothing"; exit 1 with a permission complaint means "could not
+/// look", which is `Unknown` and refuses. Treating the second as the
+/// first is how a permission-denied probe came to authorize a removal.
+fn classify_lsof_exit(
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    path: &Path,
+) -> OccupancyState {
+    let found = !stdout.trim().is_empty();
+    let denied = stderr.to_lowercase().contains("permission denied");
+    match code {
         // `lsof` exits 0 when it found at least one open handle.
-        Some(0) if !stdout_text.trim().is_empty() => OccupancyState::Occupied(path.to_path_buf()),
+        Some(0) if found => OccupancyState::Occupied(path.to_path_buf()),
         Some(0) => OccupancyState::Free,
-        // Exit 1 with no output is "nothing found"; exit 1 with a
-        // permission complaint is "could not look".
-        Some(1) if stdout_text.trim().is_empty() => {
-            if stderr_text.contains("permission denied") {
-                OccupancyState::Unknown(format!(
-                    "permission denied querying open files under {}",
-                    path.display()
-                ))
-            } else {
-                OccupancyState::Free
-            }
-        }
-        Some(1) => OccupancyState::Occupied(path.to_path_buf()),
+        Some(1) if found => OccupancyState::Occupied(path.to_path_buf()),
+        Some(1) if denied => OccupancyState::Unknown(format!(
+            "permission denied querying open files under {}",
+            path.display()
+        )),
+        Some(1) => OccupancyState::Free,
         other => {
             OccupancyState::Unknown(format!("lsof exited with {other:?} for {}", path.display()))
         }
@@ -170,61 +184,51 @@ pub fn occupied(path: &Path) -> bool {
     !probe_path(path).is_free()
 }
 
-/// Pure classification of an `lsof` invocation's outcome, factored out so
-/// it is unit-testable without spawning a real process. `spawn_ok` is
-/// `false` only when the process itself could not be started (missing
-/// binary, permission to exec); a completed run with a non-zero exit
-/// still reaches the `Some(status_success)` branch.
-fn classify_lsof(spawn_ok: bool, status_success: bool, stdout: &[u8], stderr: &[u8]) -> Evidence {
-    let observed_at = crate::entities::now();
-    if !spawn_ok {
-        return Evidence::unavailable(
-            FactKind::CurrentUse,
-            FactSubtype::OpenFile,
-            EvidenceSource::ProcessQuery {
-                tool: "lsof".into(),
-            },
-            observed_at,
-            "lsof could not be started",
-        );
-    }
-    let stderr_text = String::from_utf8_lossy(stderr).to_lowercase();
-    if !status_success && stderr_text.contains("permission") {
-        return Evidence::unavailable(
-            FactKind::CurrentUse,
-            FactSubtype::OpenFile,
-            EvidenceSource::ProcessQuery {
-                tool: "lsof".into(),
-            },
-            observed_at,
-            "permission denied querying open files for this path",
-        );
-    }
-    let has_match = status_success && !stdout.is_empty();
-    let mut ev = Evidence::known(
-        FactKind::CurrentUse,
-        FactSubtype::OpenFile,
-        FactValue::Bool(has_match),
-        EvidenceSource::ProcessQuery {
-            tool: "lsof".into(),
-        },
-        observed_at,
-    )
-    .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS));
-    if !has_match {
-        ev = ev.with_note(
-            "no open-file match this pass; not proof that no process or consumer needs this path",
-        );
-    }
-    ev
-}
-
 /// Structured current-use evidence for whether some process holds this
-/// path open right now (the same signal [`occupied`] reduces to a bool).
+/// unit open right now.
+///
+/// A unit *is* the path and everything under it -- that is what an action
+/// renames away -- so this asks about the whole unit, through the same
+/// bounded [`probe_path`] the sinks use (`lsof +D` for a directory). The
+/// PR #123 review's counterexample: `lsof -- <dir>` reports only handles
+/// on the directory inode, and the old implementation turned that into a
+/// published `Known(false)` fact reading "no open-file match this pass"
+/// for a unit whose contents were demonstrably open. A negative answer
+/// to a question that was never asked is worse than no answer.
 pub fn open_file_evidence(path: &Path) -> Evidence {
-    match Command::new("lsof").arg("--").arg(path).output() {
-        Ok(o) => classify_lsof(true, o.status.success(), &o.stdout, &o.stderr),
-        Err(_) => classify_lsof(false, false, &[], &[]),
+    let observed_at = crate::entities::now();
+    let source = EvidenceSource::ProcessQuery {
+        tool: "lsof".into(),
+    };
+    match probe_path(path) {
+        OccupancyState::Occupied(open_at) => Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            FactValue::Bool(true),
+            source,
+            observed_at,
+        )
+        .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS))
+        .with_note(format!("open handle found on {}", open_at.display())),
+        OccupancyState::Free => Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            FactValue::Bool(false),
+            source,
+            observed_at,
+        )
+        .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS))
+        .with_note(
+            "no open-file match for this path or anything under it this pass; not proof that no \
+             process or consumer needs it",
+        ),
+        OccupancyState::Unknown(reason) => Evidence::unavailable(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            source,
+            observed_at,
+            reason,
+        ),
     }
 }
 
@@ -405,40 +409,50 @@ fn find_simulator_state(json_text: &str, udid: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::evidence::FactStatus;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn probe(code: Option<i32>, stdout: &str, stderr: &str) -> OccupancyState {
+        classify_lsof_exit(code, stdout, stderr, Path::new("/x"))
+    }
+
     #[test]
-    fn lsof_positive_match_is_known_true() {
-        let ev = classify_lsof(true, true, b"COMMAND PID\nswamp 1 /x", b"");
-        assert!(ev.is_known());
+    fn lsof_positive_match_is_occupied() {
         assert!(matches!(
-            ev.status,
-            FactStatus::Known(FactValue::Bool(true))
+            probe(Some(0), "COMMAND PID\nswamp 1 /x", ""),
+            OccupancyState::Occupied(_)
         ));
     }
 
     #[test]
-    fn lsof_no_match_is_known_false_with_limits_note() {
-        let ev = classify_lsof(true, false, b"", b"");
-        assert!(matches!(
-            ev.status,
-            FactStatus::Known(FactValue::Bool(false))
-        ));
-        assert!(ev.note.as_deref().unwrap().contains("not proof"));
+    fn lsof_no_match_is_free() {
+        assert_eq!(probe(Some(1), "", ""), OccupancyState::Free);
     }
 
     #[test]
-    fn lsof_permission_denied_is_unavailable_not_known_false() {
-        // The tempting shortcut this rejects: treating a failed query the
-        // same as "checked, found nothing".
-        let ev = classify_lsof(true, false, b"", b"lsof: WARNING: Permission denied");
-        assert!(matches!(ev.status, FactStatus::Unavailable { .. }));
+    fn lsof_permission_denied_is_unknown_not_free() {
+        // The tempting shortcut this rejects: treating a query that
+        // could not run the same as "checked, found nothing". A sink
+        // refuses on Unknown, so this distinction is the difference
+        // between refusing and deleting.
+        let state = probe(Some(1), "", "lsof: WARNING: Permission denied");
+        assert!(matches!(state, OccupancyState::Unknown(_)), "{state:?}");
+        assert!(!state.is_free());
+        assert!(state.refusal().is_some());
     }
 
     #[test]
-    fn lsof_spawn_failure_is_unavailable() {
-        let ev = classify_lsof(false, false, b"", b"");
-        assert!(matches!(ev.status, FactStatus::Unavailable { .. }));
+    fn an_unexpected_lsof_exit_code_is_unknown() {
+        assert!(matches!(probe(Some(9), "", ""), OccupancyState::Unknown(_)));
+        assert!(matches!(probe(None, "", ""), OccupancyState::Unknown(_)));
+    }
+
+    #[test]
+    fn a_free_probe_is_the_only_state_that_permits_an_action() {
+        assert!(OccupancyState::Free.is_free());
+        assert!(OccupancyState::Free.refusal().is_none());
+        assert!(!OccupancyState::Occupied(PathBuf::from("/x")).is_free());
+        assert!(!OccupancyState::Unknown("nope".into()).is_free());
     }
 
     #[test]
@@ -587,7 +601,17 @@ mod tests {
 
     #[test]
     fn all_current_use_facts_expire_and_are_not_trusted_forever() {
-        let ev = classify_lsof(true, true, b"x", b"");
+        let ev = manager_lock_evidence("cargo", Path::new("/nowhere/does-not-exist"));
+        let ev = Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            FactValue::Bool(true),
+            EvidenceSource::ProcessQuery {
+                tool: "lsof".into(),
+            },
+            ev.observed_at,
+        )
+        .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS));
         assert!(!ev.is_stale(ev.observed_at + CURRENT_USE_EXPIRY_SECS));
         assert!(ev.is_stale(ev.observed_at + CURRENT_USE_EXPIRY_SECS + 1));
     }

@@ -69,6 +69,7 @@ impl Consumer for ReportAssembler {
         let report = Report {
             observed_at: ctx.observed_at,
             root: ctx.root.clone(),
+            store_dir: ctx.store_dir.clone(),
             projects: d.projects,
             unowned: d.unowned,
             series_by_key: (*series_by_key).clone(),

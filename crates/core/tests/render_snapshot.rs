@@ -44,6 +44,7 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
 
 fn fixture_report() -> Report {
     Report {
+        store_dir: None,
         observed_at: 1_000_000,
         root: PathBuf::from("/src"),
         projects: vec![

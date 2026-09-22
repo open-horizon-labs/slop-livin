@@ -8,6 +8,7 @@ pub mod activity;
 pub mod agent_json;
 pub mod agents;
 pub mod artifact;
+pub mod assoc_store;
 pub mod attribution;
 pub mod bus;
 pub mod cargo_artifacts;

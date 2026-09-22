@@ -233,6 +233,7 @@ fn art(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> Artif
 
 fn fixture_report() -> Report {
     Report {
+        store_dir: None,
         observed_at: 1_726_000_000,
         root: PathBuf::from("/Users/dev/src"),
         projects: vec![
