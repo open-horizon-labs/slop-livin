@@ -5,7 +5,9 @@
 //! builtin) -- only the documented `NVM_DIR` env var / convention path.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory,
 };
 
 pub const NVM_DETECTOR_ID: &str = "nvm";
@@ -27,6 +29,25 @@ impl Detector for NvmDetector {
 
     fn version_note(&self) -> &'static str {
         "nvm README, current stable NVM_DIR layout"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("nodejs"),
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".nvmrc", ".node-version"],
+                layout: InstalledVersionLayout::VersionPerEntry,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "nvm install <version>",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

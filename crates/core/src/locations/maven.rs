@@ -17,7 +17,9 @@
 //! fabricating a whole-directory download/local split it cannot support.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 
 pub const MAVEN_DETECTOR_ID: &str = "maven";
@@ -53,6 +55,25 @@ impl Detector for MavenDetector {
 
     fn version_note(&self) -> &'static str {
         "Maven local-repository reference, current stable"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("maven"),
+            role: ConventionRole::DependencyStore {
+                // The local repository is the only location this
+                // detector proposes.
+                anchor: StoreAnchor::SoleLocation,
+                lookup: StoreEntryLookup::MavenLayout,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "mvn dependency:go-offline",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

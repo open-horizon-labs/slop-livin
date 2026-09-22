@@ -489,6 +489,203 @@ impl Environment {
     }
 }
 
+// ---------------------------------------------------------------------
+// Declared capabilities: what a detector's storage *does*, so consumers
+// never hold a table mapping tool names to detector ids
+// (`.oh/guardrails/detector-ids-only-in-registry.md`).
+// ---------------------------------------------------------------------
+
+/// How installed version identifiers are arranged underneath one of a
+/// manager's `Installation` locations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledVersionLayout {
+    /// `<installation>/<version>` -- pyenv's `versions/`, rbenv's
+    /// `versions/`, RVM's `rubies/`, nvm's `versions/node/`, rustup's
+    /// `toolchains/`.
+    VersionPerEntry,
+    /// `<installation>/<tool>/<version>` -- asdf's and mise's
+    /// `installs/`, where one root serves every tool.
+    ToolThenVersion,
+}
+
+/// How an installed directory's *name* relates to the version a project
+/// declares, which decides whether a declaration can be compared to it
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledVersionNaming {
+    /// The directory name is the identifier the declaration names
+    /// (`3.12.1`, `v20.11.0`).
+    AsDeclared,
+    /// The directory name qualifies a declared *channel* with the host
+    /// triple (`stable` -> `stable-aarch64-apple-darwin`), so a
+    /// declaration has to be widened to the installed name before it can
+    /// match.
+    ChannelWithHostTriple,
+}
+
+/// The shape of a file under a manager's own `LocalState` location that
+/// records a *machine-wide* default version -- a real role of its own,
+/// distinct from any project's declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalDefaultFormat {
+    /// TOML whose top-level `field` is the version identifier
+    /// (`default_toolchain = "stable"`). The *shape* is named, not the
+    /// manager, so a second manager that writes the same shape needs no
+    /// consumer change.
+    TomlTopLevelString,
+}
+
+/// Where a manager records its global default, if it records one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalDefaultFile {
+    /// File name relative to the manager's own `LocalState` location.
+    pub file_name: &'static str,
+    /// The field in that file holding the default version identifier.
+    pub field: &'static str,
+    pub format: GlobalDefaultFormat,
+}
+
+/// Which of a detector's own proposed locations is the joinable store.
+/// Expressed against what the detector already publishes (category and
+/// path shape), never as a path literal a consumer has to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreAnchor {
+    /// The detector proposes exactly one store and nothing that could be
+    /// confused with it, so every location it proposes is the store
+    /// (Maven's local repository, pnpm's store, npm's cache).
+    SoleLocation,
+    /// The detector's location in `category` whose path ends with
+    /// `suffix` (an empty suffix means "its only location in that
+    /// category").
+    Categorized {
+        category: StorageCategory,
+        suffix: &'static [&'static str],
+    },
+    /// The store's own path is a free-form override with no fixed shape
+    /// (`GOMODCACHE`), but the detector derives a sibling location from
+    /// it at a fixed depth: the store is that sibling's ancestor `up`
+    /// components above, carrying `category`. Derived, never guessed
+    /// from a path shape.
+    AncestorOfSibling {
+        sibling: StorageCategory,
+        up: usize,
+        category: StorageCategory,
+    },
+}
+
+/// How a shared package store answers "do you hold this exact package
+/// identity?". Each variant names an on-disk *layout*, so a new detector
+/// for a tool that reuses an existing layout needs no consumer change;
+/// only a genuinely new layout needs a new bounded lookup, which has to
+/// be written anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreEntryLookup {
+    /// `<store>/<registry-host>/<name>-<version>/`: Cargo's extracted
+    /// registry sources.
+    RegistrySourceTree,
+    /// `<store>/<escaped-module-path>@<version>/`: Go's module cache.
+    GoModulePath,
+    /// `<store>/modules-N/<group>/<name>/<version>/`: Gradle's
+    /// dependency cache.
+    GradleModules,
+    /// `<store>/<group-path>/<name>/<version>/`: a Maven-layout local
+    /// repository.
+    MavenLayout,
+    /// Content-addressed by hash: a declared name+version can never be
+    /// mapped to a specific entry, so the join is reported as an honest
+    /// `Unknown` carrying this basis and reason rather than guessed.
+    ContentAddressed {
+        basis: &'static str,
+        reason: &'static str,
+    },
+    /// The store holds the ecosystem's packages but exposes no
+    /// per-identity path a bounded lookup could test; a project naming
+    /// any identity in this ecosystem consumes the store as a whole
+    /// (pnpm).
+    WholeStore,
+}
+
+/// What a detector's storage does for one named tool or package
+/// ecosystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConventionRole {
+    /// The detector's `Installation` locations hold the installed
+    /// versions that satisfy a project's *declared* version of this
+    /// tool. `declaration_files` are the filenames a project uses to pin
+    /// it (`.nvmrc`, `.node-version`); the rest says how to read and
+    /// compare what is installed.
+    DeclaredVersions {
+        declaration_files: &'static [&'static str],
+        layout: InstalledVersionLayout,
+        naming: InstalledVersionNaming,
+        global_default: Option<GlobalDefaultFile>,
+    },
+    /// The detector proposes a shared package store a project's lockfile
+    /// identities can be joined against.
+    DependencyStore {
+        anchor: StoreAnchor,
+        lookup: StoreEntryLookup,
+    },
+    /// The detector proposes a build-output store whose immediate
+    /// subfolders each record which workspace produced them, so a folder
+    /// can be joined back to a project root.
+    BuildOutputWorkspaceIndex { anchor: StoreAnchor },
+}
+
+/// One thing a detector's storage does for a tool a project can name.
+///
+/// This is the capability consumers match on. A detector may declare
+/// several (mise satisfies both `.tool-versions` and `mise.toml`;
+/// nothing stops a detector from being both an installation store and a
+/// dependency store), and three detectors may declare the same one
+/// (rbenv, RVM and ruby-install all satisfy `.ruby-version`) -- which is
+/// exactly the "which of several managers actually holds it" question
+/// the wiring used to answer with a hand-written id list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagerConvention {
+    /// The tool or package ecosystem this convention speaks for, spelled
+    /// the way `crate::toolchain_declarations` and
+    /// `crate::external_associations` spell it: `"python"`, `"nodejs"`,
+    /// `"rust"`, `"cargo"`, `"go"`. `None` when the declaration file
+    /// names the tool itself (asdf's `.tool-versions`, mise's
+    /// `mise.toml`), so the convention answers for whichever tool is
+    /// named there.
+    pub tool: Option<&'static str>,
+    pub role: ConventionRole,
+}
+
+impl ManagerConvention {
+    /// Whether this convention answers for `tool`. A convention with no
+    /// tool of its own answers for any.
+    pub fn answers_for(&self, tool: &str) -> bool {
+        self.tool.is_none_or(|t| t == tool)
+    }
+}
+
+/// How expensive re-obtaining a store's contents is once it is gone --
+/// the thing a human actually weighs before deleting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCost {
+    /// Re-materialized locally from something still on disk (Cargo's
+    /// `registry/src` from `registry/cache`).
+    LocalRematerialization,
+    /// Re-downloaded from the network.
+    NetworkRefetch,
+    /// Rebuilt from the project's own sources.
+    LocalRebuild,
+}
+
+/// What a human can do to re-obtain a detector's store if it is removed.
+/// Facts, never a verdict: this says what re-obtaining costs, not
+/// whether removing it is a good idea.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryHint {
+    /// The command that re-obtains the contents, exactly as a human
+    /// would type it.
+    pub command: &'static str,
+    pub cost: RecoveryCost,
+}
+
 /// One fact source under the registry. Copy `builtin.rs` or
 /// `cargo_home.rs` for the pattern; see `docs/architecture.md`.
 pub trait Detector: Send + Sync {
@@ -505,6 +702,23 @@ pub trait Detector: Send + Sync {
     /// output and docs generation; not machine-checked.
     fn version_note(&self) -> &'static str {
         "current documented layout"
+    }
+    /// Which declaration files / package managers an installation store
+    /// under this detector satisfies -- e.g. pyenv <-> `.python-version`.
+    ///
+    /// Declaring this here is what lets `crate::consumer_wiring` wire a
+    /// new detector into association evidence without editing a table
+    /// somewhere else
+    /// (`.oh/guardrails/detector-ids-only-in-registry.md`).
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[]
+    }
+    /// What a human can do to re-obtain this store's contents if it is
+    /// removed. Describes the detector's primary store; a detector whose
+    /// locations have materially different recovery stories declares
+    /// none rather than picking one to stand for the rest.
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        None
     }
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation>;
 }
@@ -609,5 +823,166 @@ impl Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self::with_builtins()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guardrail this capability exists for
+    /// (`.oh/guardrails/detector-ids-only-in-registry.md`) only holds if
+    /// every declaration file `crate::toolchain_declarations` can parse
+    /// is claimed by *some* detector. A detector added without its
+    /// convention would otherwise produce no associations silently,
+    /// which is the failure mode the hand-written wiring table had.
+    #[test]
+    fn every_supported_declaration_file_is_claimed_by_a_detector() {
+        let registry = Registry::with_builtins();
+        let claimed: Vec<&'static str> = registry
+            .detectors()
+            .iter()
+            .flat_map(|d| d.manager_conventions())
+            .filter_map(|c| match c.role {
+                ConventionRole::DeclaredVersions {
+                    declaration_files, ..
+                } => Some(declaration_files),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        // `.java-version` is deliberately absent: no detector in this
+        // catalog measures a jenv/SDKMAN installation, and an empty
+        // installed list is the honest answer (see
+        // `consumer_wiring::installed_versions_for`).
+        for file in [
+            ".tool-versions",
+            ".mise.toml",
+            ".python-version",
+            ".ruby-version",
+            ".nvmrc",
+            ".node-version",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+        ] {
+            assert!(
+                claimed.contains(&file),
+                "no detector declares a convention for `{file}`, so a project pinning a \
+                 version there can never be joined to an installation"
+            );
+        }
+        assert!(
+            !claimed.contains(&".java-version"),
+            "a detector now claims `.java-version`; drop it from this exclusion and check \
+             `toolchain_declarations`'s `jenv-or-sdkman` note still reads true"
+        );
+    }
+
+    /// Three managers install into `.ruby-version`'s tool, and the
+    /// wiring has to consult all three -- which is exactly what a single
+    /// hard-coded detector id could not express.
+    #[test]
+    fn several_detectors_may_satisfy_the_same_declaration_file() {
+        let registry = Registry::with_builtins();
+        let ruby: Vec<&'static str> = registry
+            .detectors()
+            .iter()
+            .filter(|d| {
+                d.manager_conventions().iter().any(|c| match c.role {
+                    ConventionRole::DeclaredVersions {
+                        declaration_files, ..
+                    } => declaration_files.contains(&".ruby-version") && c.answers_for("ruby"),
+                    _ => false,
+                })
+            })
+            .map(|d| d.id())
+            .collect();
+        assert!(
+            ruby.len() >= 3,
+            "rbenv, RVM and ruby-install all satisfy `.ruby-version`; got {ruby:?}"
+        );
+    }
+
+    /// A convention with no tool of its own (asdf's `.tool-versions`)
+    /// answers for whatever the declaration names; a convention that
+    /// names one answers only for that tool.
+    #[test]
+    fn a_convention_answers_only_for_the_tool_it_names() {
+        let any = ManagerConvention {
+            tool: None,
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".tool-versions"],
+                layout: InstalledVersionLayout::ToolThenVersion,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        };
+        assert!(any.answers_for("nodejs"));
+        assert!(any.answers_for("anything-at-all"));
+        let python = ManagerConvention {
+            tool: Some("python"),
+            ..any
+        };
+        assert!(python.answers_for("python"));
+        assert!(!python.answers_for("nodejs"));
+    }
+
+    /// Only rustup records a machine-wide default in this catalog, and
+    /// its installed directories are the channel-qualified ones -- both
+    /// facts the wiring used to hard-code against the `"rustup"` id.
+    #[test]
+    fn a_global_default_and_channel_qualified_naming_are_declared_not_assumed() {
+        let registry = Registry::with_builtins();
+        let mut with_default = Vec::new();
+        for d in registry.detectors() {
+            for c in d.manager_conventions() {
+                if let ConventionRole::DeclaredVersions {
+                    naming,
+                    global_default: Some(file),
+                    ..
+                } = c.role
+                {
+                    assert_eq!(
+                        naming,
+                        InstalledVersionNaming::ChannelWithHostTriple,
+                        "{}: a manager recording a global default channel must also say its \
+                         installed directories are channel-qualified, or the default can never \
+                         be matched",
+                        d.id()
+                    );
+                    assert_eq!(file.file_name, "settings.toml");
+                    assert_eq!(file.field, "default_toolchain");
+                    with_default.push(d.id());
+                }
+            }
+        }
+        assert_eq!(with_default, vec!["rustup"]);
+    }
+
+    /// Every dependency store names the ecosystem it serves: a store
+    /// convention with no tool would silently claim every lockfile
+    /// identity in `consumer_wiring::dependency_stores_for`.
+    #[test]
+    fn every_dependency_store_names_its_ecosystem() {
+        let registry = Registry::with_builtins();
+        let mut ecosystems = Vec::new();
+        for d in registry.detectors() {
+            for c in d.manager_conventions() {
+                if matches!(c.role, ConventionRole::DependencyStore { .. }) {
+                    assert!(
+                        c.tool.is_some(),
+                        "{}: a dependency store must name its ecosystem",
+                        d.id()
+                    );
+                    ecosystems.push(c.tool.unwrap());
+                }
+            }
+        }
+        ecosystems.sort_unstable();
+        assert_eq!(
+            ecosystems,
+            vec!["cargo", "go", "gradle", "maven", "npm", "pnpm"]
+        );
     }
 }

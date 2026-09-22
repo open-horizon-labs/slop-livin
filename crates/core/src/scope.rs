@@ -1055,6 +1055,57 @@ mod tests {
         }));
     }
 
+    /// Names the reading of "explicit" that [`detectors_permitted`]
+    /// actually implements, which was true but undocumented:
+    ///
+    /// - `disabled_detectors` under `defaults = false` is read as **the
+    ///   catalog minus these**. Naming detectors to turn off is itself an
+    ///   explicit curation of the detector set ("run everything except
+    ///   these"), so the rest still run -- it is not treated as silence.
+    /// - `enabled_detectors`, when present, is read as an **allow-list**:
+    ///   only what it names runs, and everything else is disabled (see
+    ///   `defaults_false_with_an_enabled_detector_allow_list_runs_only_that_detector`).
+    ///
+    /// Neither list present is the only silence, and that is the empty
+    /// scope (`defaults_false_without_includes_or_enabled_detectors_is_empty`,
+    /// and `tests/reviewer_counterexamples.rs::defaults_false_must_mean_explicit_only`).
+    #[test]
+    fn defaults_false_with_only_disabled_detectors_still_runs_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        mk(home, ".cargo");
+        mk(home, ".rustup");
+        let env = env_at(home);
+        let registry = Registry::with_builtins();
+        let cfg = ScanConfig {
+            defaults: false,
+            disabled_detectors: vec!["cargo-home".to_string()],
+            ..ScanConfig::default()
+        };
+        assert!(
+            detectors_permitted(&cfg),
+            "a non-empty disabled_detectors list is an explicit statement about detectors, so \
+             detectors are permitted even under defaults = false"
+        );
+        let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1000);
+        assert!(
+            scope.scan_paths().contains(&home.join(".rustup")),
+            "a detector the deny-list does not name still runs: disabled_detectors under \
+             defaults = false means the catalog minus these, not an allow-list"
+        );
+        assert!(
+            !scope.roots.iter().any(|r| r.path == home.join(".cargo")),
+            "the detector named in disabled_detectors must contribute no root"
+        );
+        // Still explicit-only in the other direction: the builtin
+        // defaults detector never runs under `defaults = false`.
+        assert!(!scope.roots.iter().any(|r| {
+            r.reasons
+                .iter()
+                .any(|reason| matches!(reason, RootReason::BuiltinDefault))
+        }));
+    }
+
     #[test]
     fn defaults_false_with_an_enabled_detector_allow_list_runs_only_that_detector() {
         let tmp = tempfile::tempdir().unwrap();

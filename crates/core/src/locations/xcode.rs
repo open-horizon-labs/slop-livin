@@ -16,8 +16,9 @@
 //! A failed/absent query still leaves the conventional path proposed.
 
 use super::{
-    CommandOutcome, Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance,
-    StorageCategory,
+    CommandOutcome, ConventionRole, Detector, Environment, LocationStatus, ManagerConvention,
+    Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
+    StoreAnchor,
 };
 
 pub const XCODE_DETECTOR_ID: &str = "xcode";
@@ -39,6 +40,29 @@ impl Detector for XcodeDetector {
 
     fn version_note(&self) -> &'static str {
         "Xcode component documentation, current stable ~/Library/Developer/Xcode layout"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("xcode"),
+            role: ConventionRole::BuildOutputWorkspaceIndex {
+                // `Archives` and any custom DerivedData location share
+                // the BuildOutput category, so the suffix picks the one
+                // whose subfolders carry an `info.plist` naming the
+                // workspace that produced them.
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::BuildOutput,
+                    suffix: &["DerivedData"],
+                },
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "xcodebuild build",
+            cost: RecoveryCost::LocalRebuild,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

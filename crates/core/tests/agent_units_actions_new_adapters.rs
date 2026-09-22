@@ -36,31 +36,24 @@ fn only_detector(id: &str) -> ScanConfig {
         // same fixture session -- caught by `propose_agents`'s own
         // overlap refusal (#101's refusal-matrix hardening), not a bug
         // in that refusal.
-        disabled_detectors: ["cargo-home", "rustup", "homebrew"]
-            .into_iter()
-            .chain(
-                [
-                    "claude-code",
-                    "codex",
-                    "codex-desktop",
-                    "oh-my-pi",
-                    "opencode",
-                    "gemini-cli",
-                    "pi",
-                    "aider",
-                    "github-copilot-cli",
-                    "cursor",
-                    "windsurf",
-                    "cline",
-                    "roo-code",
-                    "continue",
-                ]
-                .into_iter()
-                .filter(|d| *d != id),
-            )
-            .map(str::to_string)
-            .collect(),
-        enabled_detectors: Vec::new(),
+        // An allow-list of exactly the detector under test. It used to
+        // be a deny-list of the other agent detectors plus three
+        // build-tool ones, which left `core-simulator`, `homebrew` and
+        // `ruby-install` reaching machine-wide paths no injected `HOME`
+        // can relocate -- see
+        // `external_units.rs::a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_byte_total`.
+        //
+        // The original reason for naming every other agent detector
+        // still holds and is now structural: Pi and Oh My Pi share
+        // `PI_CODING_AGENT_DIR` as a disclosed collision-risk override
+        // (see `crate::locations::pi`'s own doc comment), so an
+        // `only_detector("oh-my-pi")` fixture that also left `pi` in
+        // scope had both adapters independently identify the same
+        // fixture session -- caught by `propose_agents`'s own overlap
+        // refusal (#101's refusal-matrix hardening), not a bug in that
+        // refusal. An allow-list of one cannot reintroduce it.
+        disabled_detectors: Vec::new(),
+        enabled_detectors: vec![id.to_string()],
     }
 }
 
@@ -280,9 +273,16 @@ fn oh_my_pi_session_removal_preserves_repo_and_blob_store() {
 // OpenCode
 // ---------------------------------------------------------------------
 
+/// Returns `(tempdir, data root, repo, session)`. The data root sits at
+/// `<xdg-data>/opencode` because that is the only way the detector
+/// resolves it: there is no `OPENCODE_DATA_DIR` upstream (sst/opencode
+/// `dev` @ `fe3f3a41f79ad292cc3c7c629567385a20ec5130` computes it in
+/// `packages/core/src/global.ts` as `$XDG_DATA_HOME/opencode`), so these
+/// fixtures point the detector at a synthetic home by setting
+/// `XDG_DATA_HOME` to the data root's parent.
 fn opencode_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let root = tempfile::tempdir().unwrap();
-    let home = root.path().join("opencode-data");
+    let home = root.path().join("xdg-data").join("opencode");
     let repo = root.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
     write(
@@ -311,7 +311,10 @@ fn opencode_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
 fn opencode_cache_removal_preserves_auth_and_project_metadata() {
     let (root, home, _repo, _session) = opencode_fixture();
     let mut env_vars = HashMap::new();
-    env_vars.insert("OPENCODE_DATA_DIR".to_string(), home.display().to_string());
+    env_vars.insert(
+        "XDG_DATA_HOME".to_string(),
+        home.parent().unwrap().display().to_string(),
+    );
     let units = units_for(env_vars, "opencode");
     let store = tempfile::tempdir().unwrap();
     let log_dir = home.join("log");
@@ -336,7 +339,10 @@ fn opencode_cache_removal_preserves_auth_and_project_metadata() {
 fn opencode_session_removal_moves_the_message_companion_together() {
     let (root, home, repo, session) = opencode_fixture();
     let mut env_vars = HashMap::new();
-    env_vars.insert("OPENCODE_DATA_DIR".to_string(), home.display().to_string());
+    env_vars.insert(
+        "XDG_DATA_HOME".to_string(),
+        home.parent().unwrap().display().to_string(),
+    );
     let units = units_for(env_vars, "opencode");
     let unit = units
         .iter()

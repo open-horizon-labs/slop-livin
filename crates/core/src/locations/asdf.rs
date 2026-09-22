@@ -3,7 +3,9 @@
 //! https://asdf-vm.com/guide/getting-started.html
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory,
 };
 
 pub const ASDF_DETECTOR_ID: &str = "asdf";
@@ -25,6 +27,27 @@ impl Detector for AsdfDetector {
 
     fn version_note(&self) -> &'static str {
         "asdf getting-started guide, current stable data dir layout"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            // `.tool-versions` names the tool on each line, so this
+            // convention answers for whichever tool is declared there.
+            tool: None,
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".tool-versions"],
+                layout: InstalledVersionLayout::ToolThenVersion,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "asdf install <tool> <version>",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

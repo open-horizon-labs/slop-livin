@@ -11,7 +11,9 @@
 //! dir and its named children never double-counts their bytes.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -43,6 +45,27 @@ impl Detector for MiseDetector {
 
     fn version_note(&self) -> &'static str {
         "mise directories reference, current stable (data dir is ~/.local/share/mise, not ~/.mise)"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            // mise reads asdf's `.tool-versions` as well as its own
+            // config, and both name the tool themselves.
+            tool: None,
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".tool-versions", ".mise.toml", "mise.toml"],
+                layout: InstalledVersionLayout::ToolThenVersion,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "mise install",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

@@ -3,7 +3,9 @@
 //! `plugins/`. https://github.com/pyenv/pyenv
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory,
 };
 
 pub const PYENV_DETECTOR_ID: &str = "pyenv";
@@ -25,6 +27,25 @@ impl Detector for PyenvDetector {
 
     fn version_note(&self) -> &'static str {
         "pyenv README, current stable PYENV_ROOT layout"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("python"),
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".python-version"],
+                layout: InstalledVersionLayout::VersionPerEntry,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "pyenv install <version>",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

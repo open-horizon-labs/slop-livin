@@ -16,7 +16,9 @@
 use std::path::PathBuf;
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 
 pub const CARGO_HOME_DETECTOR_ID: &str = "cargo-home";
@@ -38,6 +40,30 @@ impl Detector for CargoHomeDetector {
 
     fn version_note(&self) -> &'static str {
         "Cargo Book cargo-home layout, current stable"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("cargo"),
+            role: ConventionRole::DependencyStore {
+                // `registry/src` holds the *extracted* sources, the one
+                // subtree where a name+version is a real directory;
+                // `git/checkouts` is the detector's other Cache
+                // location, which the suffix keeps distinct.
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["registry", "src"],
+                },
+                lookup: StoreEntryLookup::RegistrySourceTree,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "cargo fetch",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

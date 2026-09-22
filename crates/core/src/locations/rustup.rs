@@ -8,7 +8,9 @@
 //! https://rust-lang.github.io/rustup/environment-variables.html
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, GlobalDefaultFile, GlobalDefaultFormat,
+    InstalledVersionLayout, InstalledVersionNaming, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
 };
 
 pub const RUSTUP_DETECTOR_ID: &str = "rustup";
@@ -30,6 +32,31 @@ impl Detector for RustupDetector {
 
     fn version_note(&self) -> &'static str {
         "rustup environment-variables reference, current stable"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("rust"),
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &["rust-toolchain", "rust-toolchain.toml"],
+                layout: InstalledVersionLayout::VersionPerEntry,
+                // `toolchains/` entries are `<channel>-<host-triple>`,
+                // never the bare `stable`/`1.82.0` a project pins.
+                naming: InstalledVersionNaming::ChannelWithHostTriple,
+                global_default: Some(GlobalDefaultFile {
+                    file_name: "settings.toml",
+                    field: "default_toolchain",
+                    format: GlobalDefaultFormat::TomlTopLevelString,
+                }),
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "rustup toolchain install <toolchain>",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

@@ -6,7 +6,9 @@
 //! cache). https://docs.gradle.org/current/userguide/directory_layout.html
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 
 pub const GRADLE_DETECTOR_ID: &str = "gradle";
@@ -28,6 +30,26 @@ impl Detector for GradleDetector {
 
     fn version_note(&self) -> &'static str {
         "Gradle directory layout reference, current stable"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("gradle"),
+            role: ConventionRole::DependencyStore {
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["caches"],
+                },
+                lookup: StoreEntryLookup::GradleModules,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "gradle build",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

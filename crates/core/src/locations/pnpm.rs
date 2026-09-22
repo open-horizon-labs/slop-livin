@@ -13,7 +13,9 @@
 //! a real, named gap, not silently claimed as covered.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 use std::path::PathBuf;
 
@@ -54,6 +56,27 @@ impl Detector for PnpmDetector {
 
     fn version_note(&self) -> &'static str {
         "pnpm store settings reference, current stable (per-disk stores not enumerated)"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("pnpm"),
+            role: ConventionRole::DependencyStore {
+                anchor: StoreAnchor::SoleLocation,
+                // The store is content-addressed *and* per-file, so a
+                // package identity maps to no single entry -- a project
+                // that names any pnpm identity consumes the store as a
+                // whole, which is all that can honestly be said.
+                lookup: StoreEntryLookup::WholeStore,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "pnpm install",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

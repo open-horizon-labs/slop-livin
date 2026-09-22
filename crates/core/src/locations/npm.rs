@@ -12,7 +12,9 @@
 //! get cache` (no npm process is ever spawned by this detector).
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 
 pub const NPM_DETECTOR_ID: &str = "npm";
@@ -48,6 +50,27 @@ impl Detector for NpmDetector {
 
     fn version_note(&self) -> &'static str {
         "npm-cache CLI reference, current stable"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("npm"),
+            role: ConventionRole::DependencyStore {
+                anchor: StoreAnchor::SoleLocation,
+                lookup: StoreEntryLookup::ContentAddressed {
+                    basis: "npm cacache content-addressed store",
+                    reason: "npm's cache is content-addressed (sha-keyed); a declared package \
+                             name+version cannot be mapped to a specific cache entry",
+                },
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "npm install",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

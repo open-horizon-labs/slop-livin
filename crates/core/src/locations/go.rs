@@ -15,7 +15,9 @@
 //! https://pkg.go.dev/cmd/go
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
+    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    StoreEntryLookup,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,6 +62,32 @@ impl Detector for GoDetector {
 
     fn version_note(&self) -> &'static str {
         "go command reference, current stable GOMODCACHE/GOCACHE defaults"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("go"),
+            role: ConventionRole::DependencyStore {
+                // `GOMODCACHE` is a free-form override, so the module
+                // cache has no fixed path suffix of its own -- but the
+                // `cache/download` location this detector derives from
+                // it always does, so the module cache is that sibling's
+                // grandparent rather than a guess at a path shape.
+                anchor: StoreAnchor::AncestorOfSibling {
+                    sibling: StorageCategory::Downloads,
+                    up: 2,
+                    category: StorageCategory::Cache,
+                },
+                lookup: StoreEntryLookup::GoModulePath,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "go mod download",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

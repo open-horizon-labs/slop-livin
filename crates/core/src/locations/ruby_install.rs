@@ -12,7 +12,9 @@
 //! between; a config-only tool never needs its own storage detector.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory,
 };
 
 pub const RUBY_INSTALL_DETECTOR_ID: &str = "ruby-install";
@@ -34,6 +36,25 @@ impl Detector for RubyInstallDetector {
 
     fn version_note(&self) -> &'static str {
         "ruby-install/chruby READMEs, current stable convention paths"
+    }
+
+    fn manager_conventions(&self) -> &'static [ManagerConvention] {
+        &[ManagerConvention {
+            tool: Some("ruby"),
+            role: ConventionRole::DeclaredVersions {
+                declaration_files: &[".ruby-version"],
+                layout: InstalledVersionLayout::VersionPerEntry,
+                naming: InstalledVersionNaming::AsDeclared,
+                global_default: None,
+            },
+        }]
+    }
+
+    fn recovery_hint(&self) -> Option<RecoveryHint> {
+        Some(RecoveryHint {
+            command: "ruby-install ruby <version>",
+            cost: RecoveryCost::NetworkRefetch,
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

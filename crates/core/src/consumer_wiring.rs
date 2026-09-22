@@ -29,10 +29,39 @@
 //! mirroring how `agents::discover_and_measure` already takes
 //! `project_worktrees` from that same already-computed report rather
 //! than re-walking anything.
+//!
+//! **Which detector answers which question is never decided here.**
+//! This module used to hold a hand-written table mapping manager names
+//! (`"pyenv"`, `"rbenv-or-rvm"`, `"asdf-or-mise"`) and ecosystems
+//! (`"cargo"`, `"go"`) onto detector id constants, so adding a detector
+//! meant editing a table in a file the detector's author never opened --
+//! and forgetting to meant the new detector silently produced no
+//! associations. Every such question is now asked of
+//! `locations::Registry::with_builtins()` and answered by what the
+//! detector itself declares in `Detector::manager_conventions()`
+//! (`.oh/guardrails/detector-ids-only-in-registry.md`):
+//!
+//! - "whose installed versions satisfy this project's declared version"
+//!   -> the detectors whose [`ConventionRole::DeclaredVersions`] names
+//!   the declaration file the project actually used (`.nvmrc`,
+//!   `.tool-versions`) and answers for the tool it named;
+//! - "which unit is the Cargo registry / Go module cache / Maven
+//!   repository" -> the detectors whose
+//!   [`ConventionRole::DependencyStore`] claims that ecosystem, anchored
+//!   to one of their own proposed locations by category and path shape;
+//! - "which unit is a per-project build-output store" -> the detectors
+//!   declaring [`ConventionRole::BuildOutputWorkspaceIndex`].
+//!
+//! Detector *ids* still appear, but only as `Detector::id()` read back
+//! out of the registry to match `ExternalUnit::detector_id` -- identity
+//! flows from the registry to the consumer, never the other way.
 
 use crate::external::ExternalUnit;
 use crate::external_associations;
-use crate::locations::StorageCategory;
+use crate::locations::{
+    self, ConventionRole, GlobalDefaultFile, GlobalDefaultFormat, InstalledVersionLayout,
+    InstalledVersionNaming, StorageCategory, StoreAnchor, StoreEntryLookup,
+};
 use crate::report::{ArtifactKind, Report};
 use crate::toolchain_declarations::{self, ProjectDeclarationSources, ToolVersionDeclaration};
 use std::collections::HashMap;
@@ -377,70 +406,85 @@ fn add_per_tool(
     }
 }
 
+/// What the measured installation stores in this catalog actually offer
+/// for one declaration.
+#[derive(Debug, Default)]
+struct InstalledVersions {
+    /// `(installed version identifier, index into `units`)`.
+    named: Vec<(String, usize)>,
+    /// At least one contributing store names its installed directories
+    /// `<channel>-<host-triple>` rather than the identifier a project
+    /// declares, so the declared spec has to be widened before it can be
+    /// compared (declared by the detector as
+    /// [`InstalledVersionNaming::ChannelWithHostTriple`]).
+    channel_qualified: bool,
+}
+
+/// Installed version identifiers for one declaration, paired with the
+/// index into `units` each one came from -- so a real match can be
+/// attributed back to the specific external unit(s) that measured it,
+/// without guessing which of possibly several (asdf+mise,
+/// rbenv+RVM+ruby-install) actually holds it.
+///
+/// The declaration is matched to detectors purely by what they declare:
+/// a detector satisfies it when one of its `manager_conventions()` names
+/// the declaration's *own source file* and answers for the tool the
+/// declaration names. A tool nothing in the catalog measures (`java`
+/// from `.java-version`) yields an empty list, which is exactly the
+/// honest answer `match_version`'s own docs give it --
+/// `NoMatchingInstallation`/`UnresolvedRange`, "the installation may be
+/// outside scanned scope" -- never a fabricated source.
 fn installed_versions_for(
-    manager: &str,
-    tool: &str,
+    decl: &ToolVersionDeclaration,
     units: &[ExternalUnit],
-) -> Vec<(String, usize)> {
-    let mut out = Vec::new();
-    match manager {
-        "pyenv" => add_flat(&mut out, units, crate::locations::pyenv::PYENV_DETECTOR_ID),
-        "rbenv-or-rvm" => {
-            add_flat(&mut out, units, crate::locations::rbenv::RBENV_DETECTOR_ID);
-            add_flat(&mut out, units, crate::locations::rvm::RVM_DETECTOR_ID);
-            add_flat(
-                &mut out,
-                units,
-                crate::locations::ruby_install::RUBY_INSTALL_DETECTOR_ID,
-            );
+    registry: &locations::Registry,
+) -> InstalledVersions {
+    let mut out = InstalledVersions::default();
+    let Some(file) = decl.source_path.file_name().and_then(|n| n.to_str()) else {
+        return out;
+    };
+    for detector in registry.detectors() {
+        for convention in detector.manager_conventions() {
+            let ConventionRole::DeclaredVersions {
+                declaration_files,
+                layout,
+                naming,
+                ..
+            } = convention.role
+            else {
+                continue;
+            };
+            if !declaration_files.contains(&file) || !convention.answers_for(&decl.tool) {
+                continue;
+            }
+            match layout {
+                InstalledVersionLayout::VersionPerEntry => {
+                    add_flat(&mut out.named, units, detector.id())
+                }
+                InstalledVersionLayout::ToolThenVersion => {
+                    add_per_tool(&mut out.named, units, detector.id(), &decl.tool)
+                }
+            }
+            if naming == InstalledVersionNaming::ChannelWithHostTriple {
+                out.channel_qualified = true;
+            }
         }
-        "nvm" => add_flat(&mut out, units, crate::locations::nvm::NVM_DETECTOR_ID),
-        "rustup" => add_flat(
-            &mut out,
-            units,
-            crate::locations::rustup::RUSTUP_DETECTOR_ID,
-        ),
-        "asdf-or-mise" => {
-            add_per_tool(
-                &mut out,
-                units,
-                crate::locations::asdf::ASDF_DETECTOR_ID,
-                tool,
-            );
-            add_per_tool(
-                &mut out,
-                units,
-                crate::locations::mise::MISE_DETECTOR_ID,
-                tool,
-            );
-        }
-        "mise" => add_per_tool(
-            &mut out,
-            units,
-            crate::locations::mise::MISE_DETECTOR_ID,
-            tool,
-        ),
-        // "jenv-or-sdkman" and anything else: no detector measures it in
-        // this catalog. An empty installed list is exactly the honest
-        // answer `match_version`'s own docs already give it --
-        // `NoMatchingInstallation`/`UnresolvedRange`, "the installation
-        // may be outside scanned scope" -- never a fabricated source.
-        _ => {}
     }
     out
 }
 
-/// Resolves one declaration, applying rustup's channel-to-host-triple
-/// widening ([`toolchain_declarations::resolve_rustup_channel_to_dir`])
-/// only for the `rustup` manager, where the installed directory naming
-/// convention (`<channel>-<host-triple>`) is not the dotted-version
-/// convention `match_version`'s own alias/range logic models.
+/// Resolves one declaration, applying channel-to-host-triple widening
+/// ([`toolchain_declarations::resolve_rustup_channel_to_dir`]) only when
+/// a contributing store declared that naming, where the installed
+/// directory convention (`<channel>-<host-triple>`) is not the
+/// dotted-version convention `match_version`'s own alias/range logic
+/// models.
 fn resolve_declaration(
     decl: ToolVersionDeclaration,
-    named: &[(String, usize)],
+    installed: &InstalledVersions,
 ) -> (toolchain_declarations::ToolVersionAssociation, Vec<usize>) {
-    let names: Vec<String> = named.iter().map(|(n, _)| n.clone()).collect();
-    let assoc = if decl.manager == "rustup" && !names.contains(&decl.version_spec) {
+    let names: Vec<String> = installed.named.iter().map(|(n, _)| n.clone()).collect();
+    let assoc = if installed.channel_qualified && !names.contains(&decl.version_spec) {
         match toolchain_declarations::resolve_rustup_channel_to_dir(&decl.version_spec, &names) {
             Some(dir) => toolchain_declarations::resolve_explicit(
                 decl,
@@ -452,9 +496,10 @@ fn resolve_declaration(
         toolchain_declarations::resolve(decl, &names)
     };
     let contributing_units: Vec<usize> = match &assoc.match_result {
-        toolchain_declarations::VersionMatch::Exact { installed } => named
+        toolchain_declarations::VersionMatch::Exact { installed: name } => installed
+            .named
             .iter()
-            .filter(|(n, _)| n == installed)
+            .filter(|(n, _)| n == name)
             .map(|(_, i)| *i)
             .collect(),
         _ => Vec::new(),
@@ -478,102 +523,144 @@ fn path_ends_with(path: &Path, suffix: &[&str]) -> bool {
     comps[comps.len() - suffix.len()..] == suffix.iter().map(|s| s.to_string()).collect::<Vec<_>>()
 }
 
-fn unit_index_by_suffix(
-    units: &[ExternalUnit],
-    detector_id: &str,
-    category: StorageCategory,
-    suffix: &[&str],
-) -> Option<usize> {
-    units.iter().position(|u| {
-        u.detector_id == detector_id && u.category == category && path_ends_with(&u.path, suffix)
-    })
+/// Which of `units` measure the store a detector anchored a convention
+/// to. The anchor is expressed against what the detector already
+/// publishes -- a category, a path shape, or a location derived from a
+/// sibling -- so no consumer ever holds a path literal for a store.
+fn anchored_units(units: &[ExternalUnit], detector_id: &str, anchor: StoreAnchor) -> Vec<usize> {
+    let of_detector = |category: StorageCategory, pred: &dyn Fn(&ExternalUnit) -> bool| {
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.detector_id == detector_id && u.category == category && pred(u))
+            .map(|(i, _)| i)
+            .collect::<Vec<usize>>()
+    };
+    match anchor {
+        StoreAnchor::SoleLocation => units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.detector_id == detector_id)
+            .map(|(i, _)| i)
+            .collect(),
+        StoreAnchor::Categorized { category, suffix } => {
+            of_detector(category, &|u| path_ends_with(&u.path, suffix))
+        }
+        StoreAnchor::AncestorOfSibling {
+            sibling,
+            up,
+            category,
+        } => {
+            let Some(mut path) = units
+                .iter()
+                .find(|u| u.detector_id == detector_id && u.category == sibling)
+                .map(|u| u.path.clone())
+            else {
+                return Vec::new();
+            };
+            for _ in 0..up {
+                let Some(parent) = path.parent() else {
+                    return Vec::new();
+                };
+                path = parent.to_path_buf();
+            }
+            of_detector(category, &|u| u.path == path)
+        }
+    }
 }
 
-/// The Go module cache unit's own path has no fixed relative suffix
-/// (`GOMODCACHE` is a free-form override) -- but its sibling
-/// `cache/download` unit's path is always `<GOMODCACHE>/cache/download`
-/// (`go.rs` derives it programmatically), so the module cache is
-/// identified as that sibling's grandparent rather than guessed from a
-/// path shape.
-fn go_modcache_unit_index(units: &[ExternalUnit]) -> Option<usize> {
-    let download_path = units
-        .iter()
-        .find(|u| {
-            u.detector_id == crate::locations::go::GO_DETECTOR_ID
-                && u.category == StorageCategory::Downloads
-        })
-        .map(|u| u.path.clone())?;
-    let modcache_path = download_path.parent()?.parent()?;
-    units.iter().position(|u| {
-        u.detector_id == crate::locations::go::GO_DETECTOR_ID
-            && u.category == StorageCategory::Cache
-            && u.path == modcache_path
-    })
+/// Whether the store at `path`, laid out the way `lookup` describes,
+/// holds an entry for one package identity: exactly one bounded,
+/// deterministic probe through `external_associations`, never a store
+/// enumeration. `None` for the two layouts that cannot answer per
+/// identity at all (see [`StoreEntryLookup::ContentAddressed`] and
+/// [`StoreEntryLookup::WholeStore`], both handled by the caller).
+fn store_holds_entry(
+    lookup: StoreEntryLookup,
+    path: &Path,
+    identity: &CachedIdentity,
+) -> Option<bool> {
+    let name = identity.name.as_str();
+    let version = identity.version.as_str();
+    match lookup {
+        StoreEntryLookup::RegistrySourceTree => Some(
+            external_associations::cargo_registry_entry_exists(path, name, version),
+        ),
+        StoreEntryLookup::GoModulePath => Some(
+            external_associations::go_module_cache_entry_exists(path, name, version),
+        ),
+        StoreEntryLookup::GradleModules => Some(external_associations::gradle_cache_entry_exists(
+            path, name, version,
+        )),
+        StoreEntryLookup::MavenLayout => Some(external_associations::maven_repo_entry_exists(
+            path, name, version,
+        )),
+        StoreEntryLookup::ContentAddressed { .. } | StoreEntryLookup::WholeStore => None,
+    }
+}
+
+/// Every `(detector id, anchor, lookup)` in the catalog whose declared
+/// dependency store claims `ecosystem`.
+fn dependency_stores_for<'a>(
+    ecosystem: &str,
+    registry: &'a locations::Registry,
+) -> Vec<(&'a str, StoreAnchor, StoreEntryLookup)> {
+    let mut out = Vec::new();
+    for detector in registry.detectors() {
+        for convention in detector.manager_conventions() {
+            if convention.tool != Some(ecosystem) {
+                continue;
+            }
+            if let ConventionRole::DependencyStore { anchor, lookup } = convention.role {
+                out.push((detector.id(), anchor, lookup));
+            }
+        }
+    }
+    out
 }
 
 /// Which shared-store unit indices actually hold an entry for
 /// `identity`, via one deterministic `Path::exists()` lookup per
-/// candidate unit -- never a store enumeration. npm cacache (content-
-/// addressed) and pnpm's store (handled collectively, see the caller)
-/// are not resolved here: neither can be mapped to a specific entry.
-fn match_identity(identity: &CachedIdentity, units: &[ExternalUnit]) -> Vec<usize> {
+/// candidate unit -- never a store enumeration. A content-addressed
+/// store (npm cacache) and a whole-store-only one (pnpm) are not
+/// resolved here: neither can be mapped to a specific entry, and both
+/// are handled by the caller.
+fn match_identity(
+    identity: &CachedIdentity,
+    units: &[ExternalUnit],
+    registry: &locations::Registry,
+) -> Vec<usize> {
     let mut out = Vec::new();
-    match identity.ecosystem.as_str() {
-        "cargo" => {
-            if let Some(i) = unit_index_by_suffix(
-                units,
-                crate::locations::cargo_home::CARGO_HOME_DETECTOR_ID,
-                StorageCategory::Cache,
-                &["registry", "src"],
-            ) && external_associations::cargo_registry_entry_exists(
-                &units[i].path,
-                &identity.name,
-                &identity.version,
-            ) {
-                out.push(i);
-            }
+    for (detector_id, anchor, lookup) in dependency_stores_for(&identity.ecosystem, registry) {
+        if let Some(i) = anchored_units(units, detector_id, anchor)
+            .into_iter()
+            .next()
+            && store_holds_entry(lookup, &units[i].path, identity) == Some(true)
+        {
+            out.push(i);
         }
-        "go" => {
-            if let Some(i) = go_modcache_unit_index(units)
-                && external_associations::go_module_cache_entry_exists(
-                    &units[i].path,
-                    &identity.name,
-                    &identity.version,
-                )
-            {
-                out.push(i);
-            }
-        }
-        "gradle" => {
-            if let Some(i) = unit_index_by_suffix(
-                units,
-                crate::locations::gradle::GRADLE_DETECTOR_ID,
-                StorageCategory::Cache,
-                &["caches"],
-            ) && external_associations::gradle_cache_entry_exists(
-                &units[i].path,
-                &identity.name,
-                &identity.version,
-            ) {
-                out.push(i);
-            }
-        }
-        "maven" => {
-            if let Some(i) = units
-                .iter()
-                .position(|u| u.detector_id == crate::locations::maven::MAVEN_DETECTOR_ID)
-                && external_associations::maven_repo_entry_exists(
-                    &units[i].path,
-                    &identity.name,
-                    &identity.version,
-                )
-            {
-                out.push(i);
-            }
-        }
-        _ => {}
     }
     out
+}
+
+/// The measured unit of a store that can only ever answer "yes,
+/// something from this ecosystem is here" (pnpm's per-file
+/// content-addressed store): a project naming any identity in the
+/// ecosystem consumes the store as a whole, which is all that can
+/// honestly be said about it.
+fn whole_store_unit(
+    ecosystem: &str,
+    units: &[ExternalUnit],
+    registry: &locations::Registry,
+) -> Option<usize> {
+    dependency_stores_for(ecosystem, registry)
+        .into_iter()
+        .filter(|(_, _, lookup)| matches!(lookup, StoreEntryLookup::WholeStore))
+        .find_map(|(detector_id, anchor, _)| {
+            anchored_units(units, detector_id, anchor)
+                .into_iter()
+                .next()
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -603,6 +690,13 @@ pub fn attach_associations(
         .map(|d| crate::assoc_store::XcodeJoinTable::open(d).load())
         .unwrap_or_default();
 
+    // The catalog itself, asked instead of a wiring table. Constructing
+    // it boxes the detector list and touches nothing on disk (no
+    // `detect` call happens here); `detector_id` on an already-measured
+    // `ExternalUnit` is matched against `Detector::id()` read back out
+    // of it.
+    let registry = locations::Registry::with_builtins();
+
     let project_roots: Vec<PathBuf> = report
         .projects
         .iter()
@@ -627,8 +721,8 @@ pub fn attach_associations(
             let declarations = cached_declarations(&wt_path, &mut decl_cache);
             let mut project_side_evidence = Vec::new();
             for decl in declarations {
-                let named = installed_versions_for(&decl.manager, &decl.tool, external_units);
-                let (assoc, contributing_units) = resolve_declaration(decl, &named);
+                let installed = installed_versions_for(&decl, external_units, &registry);
+                let (assoc, contributing_units) = resolve_declaration(decl, &installed);
                 project_side_evidence.push(assoc.evidence.clone());
                 if assoc.evidence.is_known() {
                     for u in contributing_units {
@@ -652,24 +746,25 @@ pub fn attach_associations(
                     ),
                 });
             }
-            let mut has_pnpm_identity = false;
+            // Stores that can only be joined as a whole are attributed
+            // once per worktree, not once per identity.
+            let mut whole_stores: Vec<usize> = Vec::new();
             for identity in &identities {
-                if identity.ecosystem == "pnpm" {
-                    has_pnpm_identity = true;
-                    continue; // handled collectively below
-                }
-                for unit_index in match_identity(identity, external_units) {
+                whole_stores.extend(whole_store_unit(
+                    &identity.ecosystem,
+                    external_units,
+                    &registry,
+                ));
+                for unit_index in match_identity(identity, external_units, &registry) {
                     unit_consumers
                         .entry(unit_index)
                         .or_default()
                         .push(project_label.clone());
                 }
             }
-            if has_pnpm_identity
-                && let Some(i) = external_units
-                    .iter()
-                    .position(|u| u.detector_id == crate::locations::pnpm::PNPM_DETECTOR_ID)
-            {
+            whole_stores.sort_unstable();
+            whole_stores.dedup();
+            for i in whole_stores {
                 unit_consumers
                     .entry(i)
                     .or_default()
@@ -689,38 +784,52 @@ pub fn attach_associations(
         }
     }
 
-    // npm cacache: opaque content-addressed cache, once per unit
-    // (never per project -- there is no per-entry attribution to make).
-    for (i, u) in external_units.iter().enumerate() {
-        if u.detector_id == crate::locations::npm::NPM_DETECTOR_ID {
-            unit_evidence.entry(i).or_default().push(
-                crate::evidence::Evidence::unknown(
-                    crate::evidence::FactKind::Consumer,
-                    crate::evidence::FactSubtype::DeclaredConsumer,
-                    crate::evidence::EvidenceSource::Inferred {
-                        basis: "npm cacache content-addressed store".into(),
-                    },
-                    now(),
-                    "npm's cache is content-addressed (sha-keyed); a declared package name+version cannot be mapped to a specific cache entry",
-                ),
-            );
+    // Content-addressed stores (npm cacache): the honest "cannot be
+    // mapped to an entry" note, once per measured unit and never per
+    // project -- there is no per-entry attribution to make. Both the
+    // basis and the reason come from the detector's own declaration.
+    for detector in registry.detectors() {
+        for convention in detector.manager_conventions() {
+            let ConventionRole::DependencyStore {
+                anchor,
+                lookup: StoreEntryLookup::ContentAddressed { basis, reason },
+            } = convention.role
+            else {
+                continue;
+            };
+            for i in anchored_units(external_units, detector.id(), anchor) {
+                unit_evidence
+                    .entry(i)
+                    .or_default()
+                    .push(crate::evidence::Evidence::unknown(
+                        crate::evidence::FactKind::Consumer,
+                        crate::evidence::FactSubtype::DeclaredConsumer,
+                        crate::evidence::EvidenceSource::Inferred {
+                            basis: basis.into(),
+                        },
+                        now(),
+                        reason,
+                    ));
+            }
         }
     }
 
-    // rustup global default (#56's "global defaults as their own role"):
-    // read from the rustup LocalState unit's own `settings.toml` (real
-    // ExternalUnit already resolved by this same call, not a fresh
-    // Environment/env-var lookup).
-    attach_rustup_global_default(external_units);
+    // Global defaults (#56's "global defaults as their own role"): read
+    // from the manager's own `LocalState` unit, using the file the
+    // detector declares (rustup's `settings.toml`) -- a real
+    // ExternalUnit already resolved by this same call, never a fresh
+    // Environment/env-var lookup.
+    attach_global_defaults(external_units, &registry);
 
-    // Xcode DerivedData -> project (#57's own listed shared-store join):
-    // one `plutil` read per DerivedData subfolder, bounded by how many
-    // Xcode projects have ever built locally.
-    attach_xcode_associations(
+    // Build-output store -> project (#57's own listed shared-store
+    // join): for Xcode DerivedData, one `plutil` read per subfolder,
+    // bounded by how many Xcode projects have ever built locally.
+    attach_build_output_associations(
         external_units,
         &project_roots,
         &mut unit_evidence,
         &mut xcode_cache,
+        &registry,
     );
 
     for (i, labels) in unit_consumers {
@@ -763,32 +872,73 @@ pub fn attach_associations(
     }
 }
 
-fn attach_rustup_global_default(units: &mut [ExternalUnit]) {
-    let Some(local_state_idx) = units.iter().position(|u| {
-        u.detector_id == crate::locations::rustup::RUSTUP_DETECTOR_ID
-            && u.category == StorageCategory::LocalState
-    }) else {
-        return;
-    };
-    let Some(toolchains_idx) = units.iter().position(|u| {
-        u.detector_id == crate::locations::rustup::RUSTUP_DETECTOR_ID
-            && u.category == StorageCategory::Installation
-    }) else {
-        return;
-    };
-    let settings_path = units[local_state_idx].path.join("settings.toml");
-    let Some(default_toolchain) = fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|t| toolchain_declarations::parse_rustup_default_toolchain(&t))
+/// Every manager that declares where it records a *machine-wide*
+/// default version gets that default read and joined against its own
+/// installation store.
+fn attach_global_defaults(units: &mut [ExternalUnit], registry: &locations::Registry) {
+    for detector in registry.detectors() {
+        for convention in detector.manager_conventions() {
+            let ConventionRole::DeclaredVersions {
+                naming,
+                global_default: Some(global_default),
+                ..
+            } = convention.role
+            else {
+                continue;
+            };
+            attach_global_default(
+                units,
+                detector.id(),
+                detector.name(),
+                global_default,
+                naming,
+            );
+        }
+    }
+}
+
+fn attach_global_default(
+    units: &mut [ExternalUnit],
+    detector_id: &str,
+    manager_name: &str,
+    global_default: GlobalDefaultFile,
+    naming: InstalledVersionNaming,
+) {
+    let Some(local_state_idx) = units
+        .iter()
+        .position(|u| u.detector_id == detector_id && u.category == StorageCategory::LocalState)
     else {
         return;
     };
-    let installed = readdir_names(&units[toolchains_idx].path);
-    let matched = if installed.contains(&default_toolchain) {
-        Some(default_toolchain.clone())
-    } else {
-        toolchain_declarations::resolve_rustup_channel_to_dir(&default_toolchain, &installed)
+    let Some(installs_idx) = units
+        .iter()
+        .position(|u| u.detector_id == detector_id && u.category == StorageCategory::Installation)
+    else {
+        return;
     };
+    let settings_path = units[local_state_idx].path.join(global_default.file_name);
+    let Some(text) = fs::read_to_string(&settings_path).ok() else {
+        return;
+    };
+    let declared = match global_default.format {
+        // `toolchain_declarations` already models this file shape, and
+        // its typed reader is the one place the field name lives.
+        GlobalDefaultFormat::TomlTopLevelString => {
+            toolchain_declarations::parse_rustup_default_toolchain(&text)
+        }
+    };
+    let Some(declared) = declared else {
+        return;
+    };
+    let installed = readdir_names(&units[installs_idx].path);
+    let matched = if installed.contains(&declared) {
+        Some(declared.clone())
+    } else if naming == InstalledVersionNaming::ChannelWithHostTriple {
+        toolchain_declarations::resolve_rustup_channel_to_dir(&declared, &installed)
+    } else {
+        None
+    };
+    let field = global_default.field;
     let ev = match matched {
         Some(installed_name) => crate::evidence::Evidence::known(
             crate::evidence::FactKind::Consumer,
@@ -806,14 +956,38 @@ fn attach_rustup_global_default(units: &mut [ExternalUnit]) {
                 path: settings_path.display().to_string(),
             },
             now(),
-            format!("rustup default_toolchain '{default_toolchain}' matches no installed toolchain directory"),
+            format!("{manager_name} {field} '{declared}' matches no installed toolchain directory"),
         ),
     }
-    .with_note("global default (rustup settings.toml default_toolchain), not a per-project declaration");
-    units[toolchains_idx].evidence.push(ev);
+    .with_note(format!(
+        "global default ({manager_name} {} {field}), not a per-project declaration",
+        global_default.file_name
+    ));
+    units[installs_idx].evidence.push(ev);
 }
 
-/// The Xcode DerivedData -> workspace join, cached by each subfolder's
+/// Every detector that declares a per-project build-output store gets
+/// its subfolders joined back to the projects that produced them.
+fn attach_build_output_associations(
+    units: &[ExternalUnit],
+    project_roots: &[PathBuf],
+    unit_evidence: &mut HashMap<usize, Vec<crate::evidence::Evidence>>,
+    cache: &mut CacheMap,
+    registry: &locations::Registry,
+) {
+    for detector in registry.detectors() {
+        for convention in detector.manager_conventions() {
+            let ConventionRole::BuildOutputWorkspaceIndex { anchor } = convention.role else {
+                continue;
+            };
+            for idx in anchored_units(units, detector.id(), anchor) {
+                attach_workspace_index(units, idx, project_roots, unit_evidence, cache);
+            }
+        }
+    }
+}
+
+/// The build-output-store -> workspace join, cached by each subfolder's
 /// own `info.plist` `(size, mtime)`.
 ///
 /// `read_workspace_path` spawns `plutil`. Uncached, that is one
@@ -822,20 +996,13 @@ fn attach_rustup_global_default(units: &mut [ExternalUnit]) {
 /// spawns for fifty projects that did not change, which is what the PR
 /// #123 review measured (6 folders, 6 spawns, then 6 more on an
 /// identical second pass). An unchanged folder now costs a table lookup.
-fn attach_xcode_associations(
-    units: &mut [ExternalUnit],
+fn attach_workspace_index(
+    units: &[ExternalUnit],
+    idx: usize,
     project_roots: &[PathBuf],
     unit_evidence: &mut HashMap<usize, Vec<crate::evidence::Evidence>>,
     cache: &mut CacheMap,
 ) {
-    let Some(idx) = unit_index_by_suffix(
-        units,
-        crate::locations::xcode::XCODE_DETECTOR_ID,
-        StorageCategory::BuildOutput,
-        &["DerivedData"],
-    ) else {
-        return;
-    };
     let derived_data_path = units[idx].path.clone();
     for subfolder in external_associations::list_derived_data_subfolders(&derived_data_path) {
         let info_plist = subfolder.join("info.plist");
