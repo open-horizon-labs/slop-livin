@@ -371,3 +371,19 @@ were non-empty. Now:
 - **`reviewer_cost_measurement_stack2` is still red** on two assertions,
   with the residual attributed above. Nothing else in `scripts/check.sh`
   fails.
+
+- **`mutation_corpus` costs about two minutes** on this machine
+  (`every_mutation_fixture_is_rejected_by_its_audit`): it copies the
+  whole workspace and re-parses it once *per fixture*, 136 times. Making
+  it parse once and apply each fixture in memory is a real speedup and
+  is deliberately **not** done in this chunk -- it changes the machinery
+  the audits' own evidence rests on, which deserves its own review.
+- **`reviewer_counterexamples_stack2` must be run `--test-threads=1`**,
+  as `scripts/check.sh` does. Running it under a plain
+  `cargo test --workspace` fails
+  `a_disabled_detector_must_not_probe_its_tool` with
+  `["lsof", "lsof"]`: the test installs PATH shims process-wide and
+  counts spawns in a shared file, so a sibling test in the same binary
+  that probes occupancy pollutes the count. Pre-existing, unrelated to
+  this chunk, and worth a note because the failure reads like a real
+  regression.
