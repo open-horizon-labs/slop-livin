@@ -651,13 +651,13 @@ mod tests {
             crate::artifact::NestedActionCapability::InspectionOnly,
             "a very old unit is still only inspectable; age offers no action"
         );
-        let text = format!("{old:?}").to_ascii_lowercase();
-        for verdict in ["unused", "obsolete", "safe to", "can be deleted", "stale"] {
-            assert!(
-                !text.contains(verdict),
-                "an identified unit rendered the verdict {verdict:?}: {text}"
-            );
-        }
+        // The verdict-vocabulary scan over every string this unit can
+        // put in front of a person lives in
+        // `crates/core/tests/build_adapter_contract.rs::no_unit_renders_a_verdict`.
+        // It is not repeated here, because spelling the banned words in
+        // `crates/core/src` is itself what `scripts/check.sh`'s grep
+        // audit rejects -- and a weaker copy of a stronger check is not
+        // worth the exemption.
     }
 
     #[test]

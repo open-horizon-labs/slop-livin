@@ -9,7 +9,7 @@
 //! returns something.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use swamp_core::build_adapters::{
     BuildContainer, BuildCtx, ContainerCache, FoldedDir, FoldedIndex, identify_all,
     registry::Registry,
@@ -21,7 +21,7 @@ const NOW: u64 = 2_000;
 
 /// A Node project big enough that re-identification is visibly
 /// expensive: 300 installed packages, each with a manifest.
-fn node_project(root: &PathBuf) -> Vec<(PathBuf, u64, u64)> {
+fn node_project(root: &Path) -> Vec<(PathBuf, u64, u64)> {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("package.json"), br#"{"name":"app"}"#).unwrap();
     let nm = root.join("node_modules");
@@ -52,7 +52,7 @@ fn index(dirs: &[(PathBuf, u64, u64)]) -> FoldedIndex {
 }
 
 fn run(
-    root: &PathBuf,
+    root: &Path,
     dirs: &[(PathBuf, u64, u64)],
     coverage: &EventCoverage,
     cache: &ContainerCache,
@@ -62,7 +62,7 @@ fn run(
     let candidates: Vec<PathBuf> = dirs.iter().map(|(p, _, _)| p.clone()).collect();
     identify_all(
         &Registry::with_builtins(),
-        &[(root.clone(), candidates)],
+        &[(root.to_path_buf(), candidates)],
         &[],
         &ctx,
     )

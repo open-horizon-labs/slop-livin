@@ -744,10 +744,13 @@ mod tests {
             "a very old cache entry says what its timestamp does *not* establish: {:?}",
             u.coverage.limits
         );
-        let text = format!("{u:?}").to_ascii_lowercase();
-        for verdict in ["unused", "obsolete", "safe to", "can be deleted"] {
-            assert!(!text.contains(verdict), "verdict {verdict:?}: {text}");
-        }
+        // The verdict-vocabulary scan over every string this unit can
+        // put in front of a person lives in
+        // `crates/core/tests/build_adapter_contract.rs::no_unit_renders_a_verdict`.
+        // It is not repeated here, because spelling the banned words in
+        // `crates/core/src` is itself what `scripts/check.sh`'s grep
+        // audit rejects -- and a weaker copy of a stronger check is not
+        // worth the exemption.
     }
 
     #[test]
