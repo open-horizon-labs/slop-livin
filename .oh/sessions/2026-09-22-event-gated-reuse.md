@@ -86,6 +86,17 @@ A caller that hands in a pre-built report (`base`) gets
 `EventCoverage::untrusted()` and reuses nothing: it did not walk, so it
 has no evidence.
 
+One known way this fails *closed* rather than wrong, recorded so nobody
+debugs it twice: the window's root is canonical (FSEvents answers in
+canonical paths) and `external::discover_and_measure` canonicalizes
+every candidate, but `agents::authorized_tool_homes` deliberately does
+not. A tool home reached through a symlinked spelling therefore does not
+`starts_with` the window's root, the window does not cover it, and the
+container is re-identified. Slower, never wrong; canonicalizing the
+agent side is a one-line change with a namespace question attached (the
+agent key scheme is built on the uncanonicalized spelling), so it is
+named here rather than slipped in.
+
 ---
 
 # 2. The cost, measured

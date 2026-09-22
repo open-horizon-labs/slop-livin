@@ -414,7 +414,10 @@ pub fn discover_and_measure(
     if let Some(dir) = swamp_dir
         && observe
     {
-        crate::growth::touch_folded_rows(dir, &reused_unit_paths, observed_at)?;
+        // A failed cache write is a cache that will miss next pass,
+        // which is the correct outcome and not worth failing a report
+        // over -- the same terms `record_folded_measurement` writes on.
+        let _ = crate::growth::touch_folded_rows(dir, &reused_unit_paths, observed_at);
     }
     let annotations: HashMap<String, (Option<i64>, u32)> = match swamp_dir {
         Some(dir) if observe => crate::growth::observe_and_annotate_external(
