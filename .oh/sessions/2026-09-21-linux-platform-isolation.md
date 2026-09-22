@@ -235,33 +235,62 @@ pin CI's toolchain is a call for the owner, and is in the follow-ups.
 `fsevents_before_full_walk` and `scheduled_refresh_launchagent` keep
 their ids — renaming them would churn the corpus directories and the
 guardrail frontmatter for no gain — and their *statements* are now
-platform-neutral, with the backend-specific checks kept alongside rather
-than in place of them. The ordering invariant ("the continuity source is
-consulted before anything is walked") is genuinely the same on both
-platforms; only which source answers differs.
+platform-neutral in the guardrail docs. Their *code* I left alone:
+re-review 3 lists both among the 43 slips, and rewriting the audit
+layer is `stack/17-audit-rules-redesign`'s job, running in parallel.
+Editing the same rules on two branches would be a merge conflict dressed
+up as progress.
 
-The new half is `platform_capabilities_gate_their_backends`:
+The new audit, `platform_capabilities_gate_their_backends`, was written
+after re-review 3 and to its standard (`review/REVIEW-STACK-3.md` §1:
+derived sets, never hand-written file or name lists):
 
-1. `platform/mod.rs` declares `CAPABILITIES` and `Os::current` is
-   target-gated.
-2. Every definition of `schedule::install` — not the first found, since
-   the corpus puts its variant beside the original — asks the scheduling
-   capability, **honours** the answer (§17 item 2: a discarded result
-   fails), and asks **before** any write. A refusal after a write is not
-   a refusal.
-3. The two platform refusals are named in exactly one function, which
-   reads `platform::ContinuitySource`.
+1. **Capability queries are derived** — any definition in
+   `crates/{core,cli,tui}/src` whose return type is a capability enum.
+2. **Asking is not refusing** — every call that may reach one must be
+   honoured (§17 item 2).
+3. **The guard comes first, transitively.** The scheduling feature is
+   derived from the CLI's own `Command::Schedule` arm (minus what any
+   other subcommand reaches); every path from it to a write passes an
+   exact, honoured capability check first. Helpers called *before* the
+   check are walked. Writes are an inverted set (all of `std::fs` but
+   the reads, plus `File::create`, `OpenOptions::new`, `Command::new`).
+4. **The platform refusal is decided once**, by the one function that
+   reads `ContinuitySource`; the variants it builds are derived, not
+   listed.
 
-Six rejection fixtures, including the two §17 requires: an alias/rename
-variant spelling the write through `use std::fs::write as emit` (which
-defeats a text-matching rule and lets an installer run on a platform
-with no scheduler), and a discarded-result variant that asks first, in
-the right place, and throws the answer away.
+**The finding worth keeping.** The version the previous worker left
+uncommitted keyed the call graph by function *name*, with a comment
+that collapsing namesakes over-approximates and so fails closed. It
+fails **open** wherever the graph is subtracted: `work_counters::install`
+is called by every subcommand, so the name `install` counted as shared,
+and `schedule::install` — the function the rule exists for — was never
+walked. Five of its nine corpus fixtures (no check, check after the
+write, alias, helper, `OpenOptions`) were **accepted**. Keying by
+definition (file + name), resolving call paths through the module
+layout, and using only *exact* edges on the subtracted side fixed all
+five; fixture 10 pins the namesake case directly. Over-approximation is
+only fail-closed on the side of a set you add to, never on the side you
+subtract.
 
-The capability table is checked against `docs/platform.md` in **both**
-directions by `platform_matrix_matches_docs`, so a claim cannot appear
-in prose without appearing in the code, or leave the code without
-leaving the prose.
+Two smaller things: the workspace is parsed once per audit run instead
+of five times (16 s → 5 s for this audit in a debug build), and the
+old text checks for `CAPABILITIES` and `#[cfg(target_os)]` in
+`platform/mod.rs` were dropped rather than ported — they were
+existence checks on one hand-named file, and both properties already
+have stronger evidence (`scripts/platform-isolation.sh` on each built
+binary; `platform_matrix_matches_docs` on the table).
+
+Ten rejection fixtures, all rejected, including alias/rename (03) and
+discarded-result (04). The capability table is checked against
+`docs/platform.md` in **both** directions by `platform_matrix_matches_docs`.
+
+Also fixed on the way: the `free-space` capability note still said
+`statvfs` on both platforms after macOS had moved to `statfs`; code and
+doc now both say which syscall each uses. And the env-mutating unit
+tests in `platform` and `schedule` each had their own mutex, which
+serialises each module against itself and not against the other — one
+unsets `HOME`, the other reads it. They now share `crate::TEST_ENV_LOCK`.
 
 ---
 
@@ -284,6 +313,22 @@ Linux build has none. Whoever implements the per-unit-root cursors
 should give it a Linux expectation at the same time — under
 `ContinuitySource::LiveWatchEpochOnly` the honest expectation is the
 named full-walk fallback, not zero listings.
+
+---
+
+**Status at the end of this chunk (2026-09-22).** It is the *only*
+failing test on either CI job: run 35766818429 failed on both jobs, and
+on each the sole failure was this test (`dirs_listed` 71, expected 0);
+every other step — fmt, both isolation checks, clippy, source audit,
+the #80 traversal step, `check.sh`'s greps — passed. Locally on macOS
+the workspace suite is 1,161 passed, 1 failed, the same one. It also
+still fails on `stack/14-detector-root-cursors`, whose note attributes
+it to the preserved 3 s `TooSoon` floor and says it was left failing for
+re-review 3 on purpose. So CI on this branch cannot be green on either
+OS without someone deciding what that auditor-written test should assert
+— on macOS, and separately on Linux, where no continuity source exists
+at all. That is a decision for the owner, not a fix for this chunk; I
+did not edit, gate or `#[ignore]` it.
 
 ---
 

@@ -815,7 +815,11 @@ The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store di
 
 `swamp scope` (text and `--json`) reports which platform's conventions
 produced its roots, so a scope read on the other machine is not just a
-list of missing paths.
+list of missing paths. Detectors that do not apply to the running platform are
+listed rather than omitted -- under *not applicable on this platform* in
+text, as `not_applicable_detectors` in JSON, each with the platforms it
+does apply to -- so "does not apply here" is never confused with "found
+nothing" or "failed".
 
 For a trace of stage timings:
 

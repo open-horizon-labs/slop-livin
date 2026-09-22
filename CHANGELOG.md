@@ -27,7 +27,9 @@ Release notes describe behavior at the named version. See the [README](README.md
   another mount belongs in that mount's own `.Trash-$uid` rather than a
   cross-device copy into the home trash. macOS paths are unchanged, including
   the growth store's, so no existing install's history moves. `swamp scope`
-  now reports which platform's conventions produced its roots.
+  now reports which platform's conventions produced its roots, and lists the
+  detectors that do not apply to this platform (`not_applicable_detectors`)
+  instead of omitting them.
 - **A missing `HOME` is an error, not the current directory.** With no `HOME`
   and no `SWAMP_DIR`, swamp used to write its growth store into whatever
   directory it was run from -- where the next run from somewhere else would
@@ -38,6 +40,11 @@ Release notes describe behavior at the named version. See the [README](README.md
   so that field can be the capacity percentage. macOS now uses `statfs` and
   Linux `statvfs`; macOS's POSIX `statvfs` has 32-bit block counts, which
   overflow on a volume above 16 TB. One fewer subprocess per call, too.
+- **The platform invariants are audited, not just tested.** A new source audit,
+  `platform_capabilities_gate_their_backends`, derives the capability queries
+  and the scheduling feature from the code itself and requires every path from
+  `swamp schedule` to a write to pass an honoured capability check first, with
+  ten rejection fixtures in the mutation corpus.
 - **Documented**: [docs/platform.md](docs/platform.md) carries the supported
   targets, the capability table (checked against the code in both directions),
   where each platform's files live, the traversal limits on overlay, network,
