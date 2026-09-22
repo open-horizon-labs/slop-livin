@@ -7,14 +7,45 @@ use std::{
 };
 use syn::visit::Visit;
 
-const ROOTS: &[&str] = &[
+/// The entry points that must exist. Beyond these, roots are *derived*
+/// from the crate (`derived_roots`): a hand-written list meant a new
+/// `handle_*`/`on_*` entry point was unaudited until someone remembered
+/// to add it, and the mutation sweep put a blocking `probe_path` on
+/// exactly such a function.
+const REQUIRED_ROOTS: &[&str] = &[
     "event_loop",
     "handle_terminal_key",
     "handle_key",
     "handle_key_mod",
     "draw",
 ];
+
+/// Name fragments that make a function an event/render entry point.
+const ROOT_PATTERNS: &[&str] = &[
+    "handle_key",
+    "handle_terminal",
+    "on_key",
+    "event_loop",
+    "draw",
+];
 const SINKS: &[&str] = &[
+    // Anything that spawns a subprocess or probes the filesystem for
+    // open handles is seconds of latency on a keystroke. `probe_path`
+    // (an `lsof` spawn) and `Command::output`/`status`/`spawn` were
+    // absent from this list, which is how the sweep got an `lsof` per
+    // keystroke past it.
+    "probe_path",
+    "occupied",
+    "spawn_subprocess",
+    // A synchronous report is the original blocking-scan defect.
+    "report_full_mode",
+    "report_full_mode_with_source",
+    "report_full_mode_with_exclusions",
+    "report_scope",
+    "report_scope_with_source",
+    "report_scope_with_parts",
+    "observe_scope",
+    "discover_and_measure",
     "mark_row",
     "mark_project",
     "mark_selected",
@@ -50,6 +81,13 @@ impl<'ast> Visit<'ast> for Calls {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*call.func {
             let path = path_name(&p.path);
+            // A subprocess is seconds of latency on a keystroke. Matched
+            // on the `Command::new` path rather than on the method names
+            // `output`/`status`/`spawn`, which collide with ordinary
+            // fields and helpers.
+            if path.ends_with("Command::new") {
+                self.edges.insert("spawn_subprocess".into());
+            }
             if path == "std::thread::spawn" {
                 // Argument expressions still execute on the calling thread.
                 // Only an inline closure body is skipped, not spawn(make_job()).
@@ -182,13 +220,27 @@ fn check(graph: &Graph, roots: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// Every function in the crate whose name marks it an event/render
+/// entry point, plus the required ones.
+fn derived_roots(graph: &Graph) -> Vec<String> {
+    let mut out: Vec<String> = REQUIRED_ROOTS.iter().map(|s| s.to_string()).collect();
+    for name in graph.keys() {
+        if ROOT_PATTERNS.iter().any(|p| name.contains(p)) && !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
 pub fn audit(root: &Path) -> Result<(), String> {
     let mut graph = Graph::new();
     for file in crate::ast::rust_files_under(root, "crates/tui/src") {
         let source = crate::ast::parse(root, &file)?;
         collect(&source.ast.items, &file, &mut graph);
     }
-    check(&graph, ROOTS)
+    let roots = derived_roots(&graph);
+    let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    check(&graph, &refs)
 }
 
 #[cfg(test)]

@@ -1072,10 +1072,30 @@ const REUSE_LOOKUPS: &[&str] = &[
 // 7. occupancy_is_tristate_at_sinks
 // ---------------------------------------------------------------------
 
-const SINK_FILES_TRISTATE: &[&str] = &[
-    "crates/core/src/actions.rs",
-    "crates/core/src/cargo_cleanup.rs",
-    "crates/tui/src/actions.rs",
+/// Shapes that make an arm a refusal rather than a fall-through.
+/// Shapes that make an arm a refusal rather than a fall-through. An
+/// evidence builder is not a sink: turning an unanswerable probe into an
+/// explicit `Evidence::unavailable` fact is the correct treatment of the
+/// same unknown, and is what `.oh/guardrails/activity-and-consumer-evidence-have-limits.md`
+/// requires. What is forbidden is treating `Unknown` as `Free`.
+const REFUSALS: &[&str] = &[
+    "bail !",
+    "Err (",
+    "refuse",
+    "Refusal",
+    "anyhow !",
+    "continue",
+    "return",
+    "panic !",
+    "Evidence :: unavailable",
+    "Evidence :: unknown",
+];
+
+/// `(file, fn)`: the two definitions that legitimately produce the
+/// boolean answer. Everything else consumes the tri-state.
+const BOOLEAN_OCCUPANCY_DEFINITIONS: &[(&str, &str)] = &[
+    ("crates/core/src/occupancy.rs", "occupied"),
+    ("crates/core/src/agents/mod.rs", "is_active"),
 ];
 
 pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
@@ -1088,41 +1108,66 @@ pub fn occupancy_is_tristate_at_sinks(root: &Path) -> Result<(), String> {
             ));
         }
     }
-    for rel in SINK_FILES_TRISTATE {
-        let Some(f) = maybe_parse(root, rel) else {
+    let mut problems: Vec<String> = Vec::new();
+    // Whole workspace, resolved: the boolean answer has exactly two
+    // definitions and no consumers.
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(f) = crate::resolve::maybe(root, &rel) else {
             continue;
         };
-        for func in ast::functions(&f.ast) {
-            for boolean in ["occupancy :: occupied (", "agents :: is_active ("] {
-                if func.body.contains(boolean) {
-                    return Err(format!(
-                        "{rel}::{} consumes the boolean `{boolean}`: a sink must use \
-                         `recheck::member_occupancy`, whose `Unknown` is a refusal rather than a \
-                         silent \"nothing open\"",
-                        func.name,
-                        boolean = boolean.trim()
-                    ));
-                }
+        for c in crate::resolve::production_calls(&f.ast) {
+            let boolean = crate::resolve::path_ends_with(&c.path, "occupancy::occupied")
+                || crate::resolve::path_ends_with(&c.path, "agents::is_active")
+                || (!c.method && c.path == "occupied");
+            if boolean
+                && !BOOLEAN_OCCUPANCY_DEFINITIONS
+                    .iter()
+                    .any(|(file, name)| *file == rel && *name == c.func)
+            {
+                problems.push(format!(
+                    "{rel}::{} consumes the boolean `{}`: every consumer uses \
+                     `recheck::member_occupancy`, whose `Unknown` is a refusal rather than a \
+                     silent \"nothing open\"",
+                    c.func, c.written
+                ));
             }
-            // An Unknown arm that does nothing is the same bug with more
-            // syntax.
-            for empty in [
-                "Unknown (_) => { }",
-                "Unknown (..) => { }",
-                "Unknown (_) => ()",
-                "Unknown (_) => { () }",
-            ] {
-                if func.body.contains(empty) {
-                    return Err(format!(
-                        "{rel}::{} matches `OccupancyState::{empty}`: an unanswerable occupancy \
-                         probe must refuse, not fall through to the destructive call",
-                        func.name
-                    ));
-                }
+            // The tri-state answer must reach control flow.
+            if crate::resolve::path_ends_with(&c.path, "recheck::member_occupancy")
+                && c.honoured == crate::resolve::Honoured::Discarded
+            {
+                problems.push(format!(
+                    "{rel}::{} discards the result of `member_occupancy`: a probe whose answer \
+                     nothing reads is not a probe",
+                    c.func
+                ));
+            }
+        }
+        // Every `Unknown` arm of an occupancy match refuses.
+        for arm in crate::resolve::match_arms(&f.ast) {
+            let about_occupancy = arm.scrutinee.contains("member_occupancy")
+                || arm.scrutinee.contains("probe_path")
+                || arm.pattern.contains("OccupancyState");
+            if !about_occupancy || !arm.pattern.contains("Unknown") {
+                continue;
+            }
+            let refuses = REFUSALS.iter().any(|r| arm.body.contains(r));
+            if !refuses {
+                problems.push(format!(
+                    "{rel}::{}: `OccupancyState::Unknown` arm `{}` does not refuse; an \
+                     unanswerable occupancy probe must refuse, not fall through",
+                    arm.func,
+                    arm.body.replace('\n', " ")
+                ));
             }
         }
     }
-    Ok(())
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        problems.sort();
+        problems.dedup();
+        Err(problems.join("\n  "))
+    }
 }
 
 // ---------------------------------------------------------------------

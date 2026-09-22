@@ -1254,3 +1254,73 @@ pub fn assignments(file: &syn::File) -> Vec<Assignment> {
     v.visit_file(file);
     v.out
 }
+
+// ---------------------------------------------------------------------
+// Match arms
+// ---------------------------------------------------------------------
+
+/// One `match` arm: the function it is in, the scrutinee's token text,
+/// the pattern's token text and the arm body's token text.
+///
+/// "The `Unknown` arm exists" is not "the `Unknown` arm refuses": the
+/// sweep wrote `Unknown(_) => true`.
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub func: String,
+    pub scrutinee: String,
+    pub pattern: String,
+    pub body: String,
+}
+
+struct ArmVisitor {
+    func: String,
+    in_test: usize,
+    out: Vec<MatchArm>,
+}
+
+impl<'ast> Visit<'ast> for ArmVisitor {
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let test = is_test_attr(&m.attrs);
+        if test {
+            self.in_test += 1;
+        }
+        syn::visit::visit_item_mod(self, m);
+        if test {
+            self.in_test -= 1;
+        }
+    }
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let prev = std::mem::replace(&mut self.func, f.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, f);
+        self.func = prev;
+    }
+    fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
+        if self.in_test == 0 {
+            let scrutinee = m.expr.to_token_stream().to_string();
+            for arm in &m.arms {
+                self.out.push(MatchArm {
+                    func: self.func.clone(),
+                    scrutinee: scrutinee.clone(),
+                    pattern: arm.pat.to_token_stream().to_string(),
+                    body: arm.body.to_token_stream().to_string(),
+                });
+            }
+        }
+        syn::visit::visit_expr_match(self, m);
+    }
+}
+
+pub fn match_arms(file: &syn::File) -> Vec<MatchArm> {
+    let mut v = ArmVisitor {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_file(file);
+    v.out
+}
