@@ -124,6 +124,18 @@ impl<'ast> Visit<'ast> for Calls {
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         self.edges.insert(path_name(&path.path));
     }
+    /// `syn::visit` stops at a macro. `vec![occupancy::probe_path(p)]`
+    /// on a key handler was therefore an `lsof` per keystroke that this
+    /// graph never saw (re-review 3). The macro's tokens are walked for
+    /// every call written inside them.
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        for (path, method, _, _) in crate::program::calls_in_tokens(&m.tokens) {
+            if !method && path.ends_with("Command::new") {
+                self.edges.insert("spawn_subprocess".into());
+            }
+            self.edges.insert(path);
+        }
+    }
 }
 
 type Graph = BTreeMap<String, Vec<(String, BTreeSet<String>)>>;

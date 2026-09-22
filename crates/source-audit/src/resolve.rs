@@ -125,6 +125,13 @@ fn walk_use(tree: &syn::UseTree, prefix: &str, out: &mut Resolver) {
         syn::UseTree::Path(p) => {
             walk_use(&p.tree, &join(prefix, &p.ident.to_string()), out);
         }
+        // `use std::fs::{self, File}` names the module itself: the alias
+        // is `fs`, not a local called `self`.
+        syn::UseTree::Name(n) if n.ident == "self" => {
+            if let Some(last) = prefix.rsplit("::").next().filter(|s| !s.is_empty()) {
+                out.aliases.insert(last.to_string(), prefix.to_string());
+            }
+        }
         syn::UseTree::Name(n) => {
             let full = join(prefix, &n.ident.to_string());
             out.aliases.insert(n.ident.to_string(), full);
@@ -670,6 +677,9 @@ pub struct MacroSite {
     pub in_test: bool,
     /// Last segment of the macro's path (`format`, `concat`, `json`).
     pub name: String,
+    /// The macro's path as written (`log::info`, `tracing::warn`,
+    /// `println`), so a rule can tell a logging macro from a local one.
+    pub path: String,
     /// Every string literal inside the macro's token stream, in order.
     pub literals: Vec<String>,
     pub tokens: String,
@@ -727,6 +737,13 @@ impl<'ast> Visit<'ast> for MacroVisitor {
         self.out.push(MacroSite {
             func: self.func.clone(),
             in_test: self.in_test > 0,
+            path: m
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
             name,
             literals: literals_in_tokens(m.tokens.clone()),
             tokens,
@@ -1384,4 +1401,120 @@ pub fn match_arms(file: &syn::File) -> Vec<MatchArm> {
     };
     v.visit_file(file);
     v.out
+}
+
+// ---------------------------------------------------------------------
+// Per-function entry points
+// ---------------------------------------------------------------------
+//
+// The file-level extractors above key their output on the enclosing
+// function's *name*, so two definitions with one name in one file (a
+// `new` per `impl`, or a second `stage_tracked_with_source` in an inline
+// module beside the real one) were one merged record. The program model
+// (`program.rs`) runs each extractor over exactly one definition instead,
+// with the file's resolver, and keeps only what belongs to it -- a
+// nested `fn` inside the body is its own definition and is reported
+// there.
+
+/// Every call in `item`'s own body, resolved through `res`.
+pub fn calls_in_fn(item: &syn::ItemFn, res: &Resolver) -> Vec<CallSite> {
+    let mut v = CallVisitor {
+        res,
+        out: Vec::new(),
+        func: String::new(),
+        in_test: 0,
+        dead_code: false,
+        stmt: 0,
+        conditions: Vec::new(),
+        honour: Vec::new(),
+        body_text: String::new(),
+    };
+    v.visit_item_fn(item);
+    let name = item.sig.ident.to_string();
+    v.out.into_iter().filter(|c| c.func == name).collect()
+}
+
+/// Every assignment in `item`'s own body.
+pub fn assignments_in_fn(item: &syn::ItemFn) -> Vec<Assignment> {
+    let mut v = AssignVisitor {
+        func: String::new(),
+        in_test: 0,
+        conditions: Vec::new(),
+        out: Vec::new(),
+    };
+    v.visit_item_fn(item);
+    let name = item.sig.ident.to_string();
+    v.out.into_iter().filter(|a| a.func == name).collect()
+}
+
+/// Every `match` arm in `item`'s own body.
+pub fn match_arms_in_fn(item: &syn::ItemFn) -> Vec<MatchArm> {
+    let mut v = ArmVisitor {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_item_fn(item);
+    let name = item.sig.ident.to_string();
+    v.out.into_iter().filter(|a| a.func == name).collect()
+}
+
+/// Every `let`/`for` binding in `item`'s own body.
+pub fn bindings_in_fn(item: &syn::ItemFn) -> Vec<Binding> {
+    let mut v = BindingVisitor {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_item_fn(item);
+    let name = item.sig.ident.to_string();
+    v.out.into_iter().filter(|b| b.func == name).collect()
+}
+
+/// Every macro invocation in `item`'s own body.
+pub fn macro_sites_in_fn(item: &syn::ItemFn) -> Vec<MacroSite> {
+    let mut v = MacroVisitor {
+        func: String::new(),
+        in_test: 0,
+        out: Vec::new(),
+    };
+    v.visit_item_fn(item);
+    let name = item.sig.ident.to_string();
+    v.out.into_iter().filter(|m| m.func == name).collect()
+}
+
+/// Every plain string literal in `item`'s own body (macro contents come
+/// from [`macro_sites_in_fn`]; attributes are metadata, not output).
+pub fn plain_literals_in_fn(item: &syn::ItemFn) -> Vec<String> {
+    struct V {
+        depth: usize,
+        out: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            // Only the outermost definition: a nested `fn` is its own
+            // record.
+            self.depth += 1;
+            if self.depth == 1 {
+                syn::visit::visit_item_fn(self, f);
+            }
+            self.depth -= 1;
+        }
+        fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
+            self.out.push(l.value());
+        }
+        fn visit_attribute(&mut self, _a: &'ast syn::Attribute) {}
+        fn visit_macro(&mut self, _m: &'ast syn::Macro) {}
+    }
+    let mut v = V {
+        depth: 0,
+        out: Vec::new(),
+    };
+    v.visit_item_fn(item);
+    v.out
+}
+
+/// The string literals inside a token stream, placeholders normalised.
+pub fn literals_in(tokens: proc_macro2::TokenStream) -> Vec<String> {
+    literals_in_tokens(tokens)
 }

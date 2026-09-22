@@ -26,6 +26,14 @@ pub struct CachedAst {
     file: syn::File,
 }
 
+impl CachedAst {
+    /// The identity of these exact bytes, parsed once. Never reused, so a
+    /// derivation keyed on it can only be returned for the same contents.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl std::ops::Deref for CachedAst {
     type Target = syn::File;
     fn deref(&self) -> &syn::File {
@@ -163,7 +171,7 @@ pub struct Func {
 /// `std :: fs :: metadata`). It can over-replace a local binding that
 /// shares a name with an import, which makes an audit stricter, never
 /// laxer.
-fn resolve_body(res: &crate::resolve::Resolver, body: &str) -> String {
+pub fn resolve_body(res: &crate::resolve::Resolver, body: &str) -> String {
     let mut out = body.to_string();
     for (alias, full) in res.alias_pairs() {
         if alias == full {
