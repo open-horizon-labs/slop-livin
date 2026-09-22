@@ -90,6 +90,20 @@ jobs:
       - name: Build tests
         run: cargo test --workspace --locked --no-run
 
+      # #80, as its own step rather than buried in the suite: allocated
+      # bytes, hardlink dedup, sparse files, symlink loops and volume
+      # identity, checked against the filesystem and against `du` on the
+      # filesystem this runner actually mounts -- ext4 (or whatever the runner mounts).
+      # The benchmark prints; it gates nothing, because wall time on a
+      # shared runner is not a merge criterion. Its numbers are what
+      # docs/platform.md quotes.
+      - name: Traversal, accounting and volume identity
+        run: |
+          set -euo pipefail
+          cargo test --locked -p swamp-core --test traversal_accounting_and_volume_identity -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --ignored --nocapture
+
       # `--no-fail-fast`: bringing a second platform up, the useful
       # signal is every test that fails, not the first binary that does.
       - name: Test (native Linux)
@@ -150,6 +164,20 @@ jobs:
 
       - name: Build tests
         run: cargo test --workspace --locked --no-run
+
+      # #80, as its own step rather than buried in the suite: allocated
+      # bytes, hardlink dedup, sparse files, symlink loops and volume
+      # identity, checked against the filesystem and against `du` on the
+      # filesystem this runner actually mounts -- APFS.
+      # The benchmark prints; it gates nothing, because wall time on a
+      # shared runner is not a merge criterion. Its numbers are what
+      # docs/platform.md quotes.
+      - name: Traversal, accounting and volume identity
+        run: |
+          set -euo pipefail
+          cargo test --locked -p swamp-core --test traversal_accounting_and_volume_identity -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --ignored --nocapture
 
       # `--no-fail-fast`: bringing a second platform up, the useful
       # signal is every test that fails, not the first binary that does.

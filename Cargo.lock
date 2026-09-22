@@ -2660,6 +2660,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "walkdir",
  "zstd",
 ]
 

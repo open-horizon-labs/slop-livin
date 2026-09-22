@@ -22,6 +22,15 @@ uuid.workspace = true
 tempfile.workspace = true
 roxmltree = "0.21.1"
 
+# Test-only. `walkdir` is the generic directory walker swamp's own is
+# measured against (#80): one comparison test proves a generic walk
+# cannot reproduce swamp's accounting without swamp's semantics, and one
+# ignored benchmark produces the numbers in docs/platform.md. A
+# dev-dependency ships in nothing -- `cargo tree -e normal` excludes it,
+# which is what scripts/platform-isolation.sh checks.
+[dev-dependencies]
+walkdir = "2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
