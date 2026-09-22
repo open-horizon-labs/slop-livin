@@ -2131,7 +2131,7 @@ mod tests {
         let rows = builds_rows(&report, &Filter::default());
         assert!(
             rows.iter()
-                .any(|r| r.label.contains("unique stale; allocated"))
+                .any(|r| r.label.contains("unique not recomputed; allocated"))
         );
         let selected = UnitId::for_artifact(&target.join("debug/incremental/crate-a"));
         assert!(rows.iter().any(|r| r.unit == Some(selected.clone())));

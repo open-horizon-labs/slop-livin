@@ -3,10 +3,7 @@
 //! or ADR may reference); a plain run executes them all and fails on the
 //! first broken constraint per audit, naming the file and shape.
 
-mod ast;
-mod audits;
-mod repair_audits;
-mod tui_nonblocking;
+use swamp_source_audit::audits;
 
 use std::path::{Path, PathBuf};
 

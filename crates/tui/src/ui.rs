@@ -148,7 +148,7 @@ fn header_line(app: &App, width: usize) -> String {
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
         if stale {
-            format!("unique totals stale · {}", app.root.display())
+            format!("unique totals not recomputed · {}", app.root.display())
         } else {
             app.root.display().to_string()
         },

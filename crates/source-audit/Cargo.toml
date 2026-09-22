@@ -3,6 +3,14 @@ name = "swamp-source-audit"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "swamp_source_audit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swamp-source-audit"
+path = "src/main.rs"
+
 [dependencies]
 syn.workspace = true
 quote = "1"

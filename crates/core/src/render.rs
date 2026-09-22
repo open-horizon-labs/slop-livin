@@ -87,7 +87,7 @@ pub fn allocation_note(row: &crate::report::ArtifactRow) -> String {
         .allocated_growth_bytes
         .map(|g| format!("; allocated growth {}", human_signed_bytes(g)))
         .unwrap_or_default();
-    format!(" [unique stale; allocated {allocated}{growth}]")
+    format!(" [unique not recomputed; allocated {allocated}{growth}]")
 }
 
 pub fn kind_label(kind: &ArtifactKind) -> &'static str {

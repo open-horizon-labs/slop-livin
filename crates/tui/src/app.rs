@@ -1334,6 +1334,12 @@ impl App {
             MarkedUnit {
                 cargo_plan,
                 agent_plan,
+                // One `stat` at mark time, on the path the human just
+                // selected: what the sink re-checks against. Not a walk
+                // -- `capture_anchor` never lists a directory, so this
+                // stays off the blocking-scan list the TUI event path
+                // depends on (`.oh/guardrails/tui-actions-off-event-thread.md`).
+                reviewed: swamp_core::recheck::capture_anchor(&unit_path).ok(),
                 path: unit_path,
                 docker,
                 worktree_path,
@@ -2021,6 +2027,7 @@ mod tests {
                 MarkedUnit {
                     cargo_plan: None,
                     agent_plan: None,
+                    reviewed: swamp_core::recheck::capture_anchor(&path).ok(),
                     path,
                     docker: None,
                     worktree_path: PathBuf::new(),
@@ -2078,6 +2085,7 @@ mod tests {
             MarkedUnit {
                 cargo_plan: None,
                 agent_plan: None,
+                reviewed: swamp_core::recheck::capture_anchor(&path).ok(),
                 path: path.clone(),
                 docker: None,
                 worktree_path: tmp.path().into(),

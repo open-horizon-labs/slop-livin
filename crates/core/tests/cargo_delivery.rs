@@ -769,7 +769,8 @@ fn hardlinked_updates_skip_untouched_interiors_and_keep_allocated_sizes_current(
             "untouched unreadable subtree must be carried, not rewalked"
         );
         assert!(
-            swamp_core::render::render_view_builds(&next, None).contains("unique stale; allocated")
+            swamp_core::render::render_view_builds(&next, None)
+                .contains("unique not recomputed; allocated")
         );
         let full = report(&root, store.path());
         assert!(!row(&full).dedup_stale);

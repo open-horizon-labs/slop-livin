@@ -24,23 +24,14 @@ pub fn parse(root: &Path, rel: &str) -> Result<SourceFile, String> {
     })
 }
 
+/// Every `.rs` file at or below `rel_dir`, relative to `root`.
+///
+/// This used to list one directory level. Moving a violation into
+/// `agents/`, `bus/`, `consumers/` or `locations/` was therefore
+/// invisible unless an audit remembered to name the subdirectory by
+/// hand -- slip class 3 in `review/AUDIT-MUTATION-SWEEP.md`.
 pub fn rust_files_under(root: &Path, rel_dir: &str) -> Vec<String> {
-    let dir = root.join(rel_dir);
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) == Some("rs") {
-            out.push(format!(
-                "{rel_dir}/{}",
-                p.file_name().unwrap().to_string_lossy()
-            ));
-        }
-    }
-    out.sort();
-    out
+    crate::resolve::rust_files_recursive(root, rel_dir)
 }
 
 /// Every free function and impl method in the file, with its name and
@@ -51,7 +42,101 @@ pub struct Func {
     pub stmts: Vec<String>,
 }
 
+/// Rewrites a token-text body so every path is the path it *resolves*
+/// to, and every macro's literal content is visible.
+///
+/// Slip classes 1 and 4 in `review/AUDIT-MUTATION-SWEEP.md`: `use
+/// std::fs::metadata as stat_path_inner` walked past
+/// `symlinks_never_followed`, `use actions::add_standing_grant as mint`
+/// walked past `human_only_authorization`, and `concat!("can", " be
+/// deleted")` walked past the verdict-vocabulary audit. Every audit
+/// reads function bodies through this function, so the whole set is
+/// alias- and macro-aware rather than each audit remembering to be.
+///
+/// The rewrite is textual over `syn`'s spaced token rendering: an alias
+/// identifier standing alone becomes its full path (`stat_path_inner` ->
+/// `std :: fs :: metadata`). It can over-replace a local binding that
+/// shares a name with an import, which makes an audit stricter, never
+/// laxer.
+fn resolve_body(res: &crate::resolve::Resolver, body: &str) -> String {
+    let mut out = body.to_string();
+    for (alias, full) in res.alias_pairs() {
+        if alias == full {
+            continue;
+        }
+        let spelled = full.replace("::", " :: ");
+        out = replace_token(&out, &alias, &spelled);
+    }
+    out
+}
+
+/// Replaces `needle` where it stands as a whole token in `haystack`
+/// (surrounded by non-identifier characters), never as part of a longer
+/// identifier.
+fn replace_token(haystack: &str, needle: &str, with: &str) -> String {
+    fn ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let bytes: Vec<char> = haystack.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let matches = i + n.len() <= bytes.len()
+            && bytes[i..i + n.len()] == n[..]
+            && (i == 0 || !ident_char(bytes[i - 1]))
+            && (i + n.len() == bytes.len() || !ident_char(bytes[i + n.len()]));
+        if matches {
+            out.push_str(with);
+            i += n.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Every macro's literal content in this function, appended to its body
+/// so a literal-matching audit sees through `concat!`/`format!`/`json!`.
+fn macro_literal_text(file: &syn::File, func: &str) -> String {
+    let mut out = String::new();
+    for m in crate::resolve::macro_sites(file) {
+        if m.in_test || m.func != func {
+            continue;
+        }
+        for l in &m.literals {
+            out.push_str(" \"");
+            out.push_str(l);
+            out.push_str("\" ");
+        }
+        if m.literals.len() > 1 {
+            out.push_str(" \"");
+            out.push_str(&m.literals.concat());
+            out.push_str("\" ");
+        }
+    }
+    out
+}
+
 pub fn functions(file: &syn::File) -> Vec<Func> {
+    let res = crate::resolve::resolver(file);
+    let raw = functions_raw(file);
+    raw.into_iter()
+        .map(|f| {
+            let extra = macro_literal_text(file, &f.name);
+            Func {
+                body: format!("{}{extra}", resolve_body(&res, &f.body)),
+                stmts: f.stmts.iter().map(|s| resolve_body(&res, s)).collect(),
+                name: f.name,
+            }
+        })
+        .collect()
+}
+
+/// The unresolved bodies, for the few rules that genuinely want the
+/// source's own spelling (a doc/comment check, a formatting rule).
+pub fn functions_raw(file: &syn::File) -> Vec<Func> {
     struct V {
         out: Vec<Func>,
         in_tests: usize,
@@ -120,7 +205,26 @@ pub fn function<'a>(funcs: &'a [Func], name: &str) -> Result<&'a Func, String> {
 /// Idents that appear as the last segment of a called path, method
 /// name, or `use` path anywhere outside test modules: what the file
 /// *reaches for*.
+///
+/// Aliases are expanded: a file that writes `use crate::x::forbidden as
+/// ok; ok()` reaches for `forbidden`, and this reports it.
 pub fn referenced_idents(file: &syn::File) -> Vec<String> {
+    let res = crate::resolve::resolver(file);
+    let mut out = referenced_idents_raw(file);
+    for ident in out.clone() {
+        let resolved = res.resolve(&ident);
+        for seg in resolved.split("::") {
+            if !seg.is_empty() {
+                out.push(seg.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn referenced_idents_raw(file: &syn::File) -> Vec<String> {
     struct V {
         out: Vec<String>,
         in_tests: usize,
@@ -172,8 +276,21 @@ pub fn referenced_idents(file: &syn::File) -> Vec<String> {
     v.out
 }
 
-/// Full paths (`a::b::c`) of every call expression outside tests.
+/// Full paths (`a::b::c`) of every call expression outside tests,
+/// **resolved** through the file's `use` table: `use std::fs::metadata
+/// as stat_path_inner` then `stat_path_inner(p)` is reported as
+/// `std::fs::metadata`. That alias is how the mutation sweep walked past
+/// `symlinks_never_followed`.
 pub fn call_paths(file: &syn::File) -> Vec<String> {
+    let res = crate::resolve::resolver(file);
+    call_paths_raw(file)
+        .into_iter()
+        .map(|p| res.resolve(&p))
+        .collect()
+}
+
+/// The paths exactly as written.
+pub fn call_paths_raw(file: &syn::File) -> Vec<String> {
     struct V {
         out: Vec<String>,
         in_tests: usize,
@@ -215,8 +332,25 @@ pub fn call_paths(file: &syn::File) -> Vec<String> {
     v.out
 }
 
-/// Every string literal outside test modules.
+/// Every string a production function in this file can produce: plain
+/// literals *and* every literal inside `concat!`/`format!`/`json!`/
+/// `write!`, plus the concatenation of a multi-literal macro's pieces.
+///
+/// `concat!("can", " be deleted")` was how the sweep hid a verdict from
+/// `agent_interface_facts_not_verdicts`, and `format!("project-{}.json")`
+/// was how it hid a JSON sidecar from `store_data_is_parquet_not_json_sidecars`.
 pub fn string_literals(file: &syn::File) -> Vec<String> {
+    let mut out = string_literals_raw(file);
+    for (_, l) in crate::resolve::literals(file) {
+        out.push(l);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Plain `syn::LitStr` nodes only.
+pub fn string_literals_raw(file: &syn::File) -> Vec<String> {
     struct V {
         out: Vec<String>,
         in_tests: usize,

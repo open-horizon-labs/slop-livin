@@ -87,38 +87,6 @@ fn find_first(haystack: &str, needles: &[&str]) -> Option<(usize, String)> {
 // 1. execution_sinks_recheck_live_state
 // ---------------------------------------------------------------------
 
-/// Calls that move or remove user data. A function whose body contains
-/// one of these is a destructive sink and must have rechecked live state
-/// first.
-const DESTRUCTIVE_CALLS: &[&str] = &[
-    ":: rename (",
-    ":: remove_file (",
-    ":: remove_dir (",
-    ":: remove_dir_all (",
-    // `cargo_cleanup::move_reviewed` is not itself a destructive
-    // primitive: the `fs::rename` it performs is audited where it
-    // lives, inside `cargo_cleanup.rs`. Listing the call here as well
-    // would demand the rechecks twice -- once at the call site and once
-    // at the rename -- and the call site cannot perform the
-    // Cargo-specific identity check the rename needs. De-duplication,
-    // not an exemption: the same rename is still covered.
-    "docker :: remove (",
-];
-
-/// The three rechecks, by the exact names the repair introduces.
-const RECHECK_SNAPSHOT: &str = "reviewed_snapshot (";
-const RECHECK_PROTECTION: &str = "live_protection (";
-const RECHECK_OCCUPANCY: &str = "member_occupancy (";
-
-/// Files that define destructive sinks. `recheck.rs` is the recheck
-/// model itself and `growth.rs`/`store.rs` rename their own Parquet temp
-/// files (store bookkeeping, never user data), so both are excluded.
-const SINK_FILES: &[&str] = &[
-    "crates/core/src/actions.rs",
-    "crates/core/src/cargo_cleanup.rs",
-    "crates/core/src/docker.rs",
-];
-
 /// `(fn, why)`: functions inside the sink files whose rename/remove
 /// touches swamp's *own* store bookkeeping, never a path the user asked
 /// about. Publishing a control file by temp-then-rename is the atomic
@@ -126,22 +94,56 @@ const SINK_FILES: &[&str] = &[
 /// allow-list ("the recheck module itself, test code, and the Trash
 /// backend's internal file ops") named this category; these are the
 /// concrete members of it.
-const STORE_BOOKKEEPING_FNS: &[(&str, &str)] = &[
+const STORE_BOOKKEEPING_FNS: &[(&str, &str, &str)] = &[
     (
+        "crates/core/src/actions.rs",
         "save_plan",
         "publishes an unapproved plan file into the store by temp + rename",
     ),
     (
+        "crates/core/src/actions.rs",
         "write_restore_manifest",
         "writes a Trash envelope's own recovery manifest beside content already moved",
     ),
     (
+        "crates/core/src/cargo_cleanup.rs",
+        "write_restore_manifest",
+        "the Cargo envelope's own recovery manifest",
+    ),
+    (
+        "crates/core/src/agents/mod.rs",
         "write_atomic",
         "the shared temp + rename primitive every small control file is written through",
     ),
     (
+        "crates/core/src/actions.rs",
         "write_grants",
         "publishes the grant list into the store by temp + rename",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_report",
+        "publishes the compressed last-report cache into the store by temp + rename",
+    ),
+    (
+        "crates/core/src/report.rs",
+        "write_last_scope_report",
+        "publishes the per-scope last-report cache into the store by temp + rename",
+    ),
+    (
+        "crates/core/src/schedule.rs",
+        "acquire_lock",
+        "removes swamp's own stale observation lock file, never a user path",
+    ),
+    (
+        "crates/core/src/schedule.rs",
+        "drop",
+        "releases swamp's own observation lock file",
+    ),
+    (
+        "crates/core/src/schedule.rs",
+        "uninstall",
+        "removes the LaunchAgent plist swamp itself installed",
     ),
 ];
 
@@ -178,74 +180,204 @@ impl Rechecks {
     }
 }
 
-/// Rechecks a function performs anywhere in its body, following calls to
-/// other functions in the same crate transitively.
-fn rechecks_provided(
+/// Resolved destructive primitives. Every one of them is matched by
+/// resolved path, so `use std::fs::remove_dir_all as sweep; sweep(p)` is
+/// still a destructive call -- slip class 1 in the mutation sweep, which
+/// also got `fs::remove_dir_all` into an adapter's `identify`.
+const DESTRUCTIVE_PATHS: &[&str] = &[
+    "fs::rename",
+    "fs::remove_file",
+    "fs::remove_dir",
+    "fs::remove_dir_all",
+];
+
+/// A Docker object is not a filesystem path, so the three path rechecks
+/// cannot apply to it: there is no inode to compare, no protect entry
+/// that can name it and no `lsof` that can answer for it. Its
+/// equivalent is the daemon's own re-derivation, and the rule is the
+/// same shape -- honoured, immediately before the destructive call.
+const DOCKER_SINK: &str = "docker::remove";
+const DOCKER_RECHECK: &str = "docker::still_removable";
+
+/// Argument literals that make a `docker` subprocess destructive. The
+/// primitive may exist in exactly one place.
+const DOCKER_DESTRUCTIVE_ARGS: &[&str] = &["rm", "rmi", "prune"];
+
+/// The three rechecks by resolved path.
+const RECHECK_PATHS: &[(&str, &str)] = &[
+    ("recheck::reviewed_snapshot", "recheck::reviewed_snapshot"),
+    ("recheck::live_protection", "recheck::live_protection"),
+    ("recheck::member_occupancy", "recheck::member_occupancy"),
+];
+
+/// A recheck whose answer is thrown away is not a recheck. `let _ =
+/// recheck::live_protection(..)` compiles, keeps the call the audit was
+/// looking for, and refuses nothing -- slip class 2.
+fn honoured_recheck(c: &crate::resolve::CallSite) -> bool {
+    c.honoured != crate::resolve::Honoured::Discarded
+}
+
+/// Every function in the workspace, with its resolved call sites. Sink
+/// files are *derived* from this (any function containing a destructive
+/// call), never hand-listed: moving a sink one file away used to make it
+/// invisible.
+fn workspace_functions(root: &Path) -> Vec<(String, String, Vec<crate::resolve::CallSite>)> {
+    let mut out: Vec<(String, String, Vec<crate::resolve::CallSite>)> = Vec::new();
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(f) = crate::resolve::maybe(root, &rel) else {
+            continue;
+        };
+        let mut by_fn: HashMap<String, Vec<crate::resolve::CallSite>> = HashMap::new();
+        for c in crate::resolve::production_calls(&f.ast) {
+            by_fn.entry(c.func.clone()).or_default().push(c);
+        }
+        for (name, calls) in by_fn {
+            out.push((rel.clone(), name, calls));
+        }
+    }
+    out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    out
+}
+
+/// Which rechecks `name` performs, following calls to other functions in
+/// the workspace transitively. Only honoured calls count.
+fn rechecks_of(
     name: &str,
-    bodies: &HashMap<String, String>,
+    index: &HashMap<String, Vec<crate::resolve::CallSite>>,
     seen: &mut HashSet<String>,
 ) -> Rechecks {
     if !seen.insert(name.to_string()) {
         return Rechecks::default();
     }
-    let Some(body) = bodies.get(name) else {
+    let Some(calls) = index.get(name) else {
         return Rechecks::default();
     };
     let mut r = Rechecks {
-        snapshot: body.contains(RECHECK_SNAPSHOT),
-        protection: body.contains(RECHECK_PROTECTION),
-        occupancy: body.contains(RECHECK_OCCUPANCY),
+        snapshot: calls.iter().any(|c| {
+            crate::resolve::path_ends_with(&c.path, RECHECK_PATHS[0].1) && honoured_recheck(c)
+        }),
+        protection: calls.iter().any(|c| {
+            crate::resolve::path_ends_with(&c.path, RECHECK_PATHS[1].1) && honoured_recheck(c)
+        }),
+        occupancy: calls.iter().any(|c| {
+            crate::resolve::path_ends_with(&c.path, RECHECK_PATHS[2].1) && honoured_recheck(c)
+        }),
     };
-    for callee in bodies.keys() {
-        if callee != name && body.contains(&format!("{callee} (")) {
-            r = r.union(rechecks_provided(callee, bodies, seen));
+    for c in calls {
+        let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
+        if callee != name && index.contains_key(&callee) {
+            r = r.union(rechecks_of(&callee, index, seen));
         }
     }
     r
 }
 
 pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
-    // Every function in the crate, so helper credit can be followed
-    // across files (a sink in actions.rs may recheck through a helper
-    // defined in recheck.rs).
-    let mut bodies: HashMap<String, String> = HashMap::new();
-    for rel in workspace_src_files(root) {
-        let Some(f) = maybe_parse(root, &rel) else {
-            continue;
-        };
-        for func in ast::functions(&f.ast) {
-            bodies.entry(func.name.clone()).or_insert(func.body);
-        }
+    let functions = workspace_functions(root);
+    let mut index: HashMap<String, Vec<crate::resolve::CallSite>> = HashMap::new();
+    for (_, name, calls) in &functions {
+        index.entry(name.clone()).or_default().extend(calls.clone());
     }
 
     let mut violations: Vec<String> = Vec::new();
-    for rel in SINK_FILES {
-        let f = parse(root, rel)?;
-        for func in ast::functions(&f.ast) {
-            if STORE_BOOKKEEPING_FNS.iter().any(|(n, _)| *n == func.name) {
-                continue;
-            }
-            let Some((destructive_at, call)) = find_first(&func.body, DESTRUCTIVE_CALLS) else {
-                continue;
-            };
-            let prefix = &func.body[..destructive_at];
-            let mut have = Rechecks {
-                snapshot: prefix.contains(RECHECK_SNAPSHOT),
-                protection: prefix.contains(RECHECK_PROTECTION),
-                occupancy: prefix.contains(RECHECK_OCCUPANCY),
-            };
-            for callee in bodies.keys() {
-                if callee != &func.name && prefix.contains(&format!("{callee} (")) {
+    for (rel, name, calls) in &functions {
+        if STORE_BOOKKEEPING_FNS
+            .iter()
+            .any(|(f, n, _)| f == rel && n == name)
+        {
+            continue;
+        }
+        // The recheck model itself, the Trash backend's internal file
+        // ops and the store's own Parquet publishing are not user data.
+        if rel.ends_with("/recheck.rs") || rel.ends_with("/store.rs") || rel.ends_with("/growth.rs")
+        {
+            continue;
+        }
+        // EVERY destructive call, not just the first: the sweep moved a
+        // second `fs::rename` after the audited one.
+        let destructive: Vec<&crate::resolve::CallSite> = calls
+            .iter()
+            .filter(|c| {
+                !c.method
+                    && DESTRUCTIVE_PATHS
+                        .iter()
+                        .any(|d| crate::resolve::path_ends_with(&c.path, d))
+            })
+            .collect();
+        for d in destructive {
+            let mut have = Rechecks::default();
+            for c in calls.iter().filter(|c| c.stmt <= d.stmt) {
+                for (i, (_, path)) in RECHECK_PATHS.iter().enumerate() {
+                    if crate::resolve::path_ends_with(&c.path, path) && honoured_recheck(c) {
+                        match i {
+                            0 => have.snapshot = true,
+                            1 => have.protection = true,
+                            _ => have.occupancy = true,
+                        }
+                    }
+                }
+                // Helper credit, transitively, but only for helpers
+                // called *before* the destructive statement.
+                let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
+                if &callee != name && index.contains_key(&callee) {
                     let mut seen = HashSet::new();
-                    have = have.union(rechecks_provided(callee, &bodies, &mut seen));
+                    have = have.union(rechecks_of(&callee, &index, &mut seen));
                 }
             }
             if !have.complete() {
                 violations.push(format!(
-                    "{rel}::{} performs `{}` without {} first",
-                    func.name,
-                    call.trim(),
+                    "{rel}::{name} performs `{}` without {} first (a recheck whose result is \
+                     discarded does not count)",
+                    d.written,
                     have.missing().join(" + ")
+                ));
+            }
+        }
+
+        // The Docker sink, with its own domain recheck.
+        for d in calls
+            .iter()
+            .filter(|c| !c.method && crate::resolve::path_ends_with(&c.path, DOCKER_SINK))
+        {
+            let rechecked = calls.iter().any(|c| {
+                c.stmt <= d.stmt
+                    && crate::resolve::path_ends_with(&c.path, DOCKER_RECHECK)
+                    && honoured_recheck(c)
+            });
+            if !rechecked {
+                violations.push(format!(
+                    "{rel}::{name} removes a Docker object without an honoured \
+                     `docker::still_removable` first"
+                ));
+            }
+        }
+    }
+
+    // The destructive `docker` subprocess itself may be built in exactly
+    // one function, so "every caller rechecks" is a claim about a
+    // reachable set rather than about whichever call site an audit
+    // happened to look at.
+    for rel in crate::resolve::workspace_files(root) {
+        let Some(f) = crate::resolve::maybe(root, &rel) else {
+            continue;
+        };
+        for m in crate::resolve::macro_sites(&f.ast) {
+            let _ = m;
+        }
+        for func in ast::functions(&f.ast) {
+            let builds_command = func.body.contains("Command :: new (\"docker\")")
+                || func.body.contains("Command :: new (\"docker\" )");
+            if !builds_command {
+                continue;
+            }
+            let destructive = DOCKER_DESTRUCTIVE_ARGS
+                .iter()
+                .any(|a| func.body.contains(&format!("\"{a}\"")));
+            if destructive && !(rel == "crates/core/src/docker.rs" && func.name == "remove") {
+                violations.push(format!(
+                    "{rel}::{} builds a destructive `docker` subprocess; the only place that may \
+                     is docker.rs::remove, so that every path to it is auditable",
+                    func.name
                 ));
             }
         }
@@ -253,9 +385,8 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
     if violations.is_empty() {
         Ok(())
     } else {
-        // Every violation, not just the first: a reader repairing the
-        // sinks needs the whole list, and a rule that does not fit one
-        // sink must not hide the others.
+        violations.sort();
+        violations.dedup();
         Err(format!(
             "every sink that moves user data rechecks identity, protection and occupancy before \
              its first destructive call (see \
@@ -2079,12 +2210,21 @@ mod mutation_tests {
 
     // -- 1 --------------------------------------------------------------
 
+    /// Every recheck's answer reaches control flow: `?` on two of them
+    /// and a `match` on the third. The version of this fixture that
+    /// wrote `let _ = recheck::live_protection(..)` is now a *rejection*
+    /// fixture, because that is the mutation the sweep used.
     const GOOD_SINK: &str = r#"
-        pub fn execute_x(dir: &std::path::Path) {
-            let _ = recheck::reviewed_snapshot(path, reviewed);
-            let _ = recheck::live_protection(dir, &paths);
-            match recheck::member_occupancy(&paths) { _ => {} }
-            let _ = fs::rename(a, b);
+        pub fn execute_x(dir: &std::path::Path) -> anyhow::Result<()> {
+            let fresh = recheck::reviewed_snapshot(path, reviewed)?;
+            recheck::live_protection(dir, &paths)?;
+            match recheck::member_occupancy(&paths) {
+                OccupancyState::Free => {}
+                _ => anyhow::bail!("refused"),
+            }
+            let _ = fresh;
+            fs::rename(a, b)?;
+            Ok(())
         }
     "#;
 
@@ -2108,8 +2248,8 @@ mod mutation_tests {
         let tmp = workspace(&[
             (
                 "crates/core/src/actions.rs",
-                "pub fn execute_x() { let _ = recheck::reviewed_snapshot(p, r); \
-                 let _ = recheck::live_protection(d, &v); let _ = fs::rename(a, b); }",
+                "pub fn execute_x() -> R { recheck::reviewed_snapshot(p, r)?; \
+                 recheck::live_protection(d, &v)?; fs::rename(a, b)?; Ok(()) }",
             ),
             ("crates/core/src/cargo_cleanup.rs", ""),
             ("crates/core/src/docker.rs", ""),
@@ -2141,10 +2281,10 @@ mod mutation_tests {
         let tmp = workspace(&[
             (
                 "crates/core/src/actions.rs",
-                "pub fn execute_x() { gate(); let _ = fs::rename(a, b); }\n\
-                 fn gate() { let _ = recheck::reviewed_snapshot(p, r); \
-                 let _ = recheck::live_protection(d, &v); \
-                 let _ = recheck::member_occupancy(&v); }",
+                "pub fn execute_x() -> R { gate()?; fs::rename(a, b)?; Ok(()) }\n\
+                 fn gate() -> R { recheck::reviewed_snapshot(p, r)?; \
+                 recheck::live_protection(d, &v)?; \
+                 match recheck::member_occupancy(&v) { S::Free => {} _ => bail!(\"no\") } Ok(()) }",
             ),
             ("crates/core/src/cargo_cleanup.rs", ""),
             ("crates/core/src/docker.rs", ""),

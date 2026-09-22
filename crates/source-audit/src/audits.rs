@@ -376,10 +376,36 @@ fn folding_only_for_artifacts(root: &Path) -> Result<(), String> {
     let e = core(root, "ecosystem.rs")?;
     let efuncs = ast::functions(&e.ast);
     let cg = ast::function(&efuncs, "classify_gated")?;
+    // Until the resolver landed, this check read the *written* text and
+    // so could not see `use ArtifactKind::{DependencyTree as Deps}`
+    // followed by `Some(Deps)` -- slip class 1. Now that it can, the
+    // rule has to say what is actually allowed rather than what the
+    // alias happened to hide: a kind may be produced from the
+    // ECOSYSTEMS table, or under a guard calling a *convention
+    // predicate* defined in this module whose own body names a manifest
+    // marker file. `if name == "node_modules" { return Some(Cache) }`
+    // has no such guard and is rejected; `ruby_vendor_bundle`, which
+    // requires a sibling `Gemfile`, has one.
     if cg.body.contains("Some (ArtifactKind") || cg.body.contains("Some(ArtifactKind") {
-        return Err(
-            "ecosystem::classify_gated invents a kind instead of consulting ECOSYSTEMS".into(),
-        );
+        let guards: Vec<&str> = cg
+            .body
+            .split("Some (ArtifactKind")
+            .next()
+            .into_iter()
+            .collect();
+        let predicate = efuncs.iter().find(|f| {
+            f.name != "classify_gated"
+                && guards.iter().any(|g| g.contains(&format!("{} (", f.name)))
+                && (f.body.contains("marker_present") || f.body.contains("manifest"))
+        });
+        let Some(predicate) = predicate else {
+            return Err(
+                "ecosystem::classify_gated invents a kind instead of consulting ECOSYSTEMS or a \
+                 marker-file convention predicate defined in this module"
+                    .into(),
+            );
+        };
+        let _ = predicate;
     }
     Ok(())
 }
@@ -504,8 +530,17 @@ fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
     files.extend(ast::rust_files_under(root, "crates/tui/src"));
     for rel in files {
         let f = ast::parse(root, &rel)?;
+        // A macro this layer cannot see through is not a pass: the sweep
+        // hid `concat!("can", " be deleted")` from this rule.
+        let blind = crate::resolve::unknown_macros(&f.ast);
+        if let Some((func, name)) = blind.first() {
+            return Err(format!(
+                "{rel}::{func} emits through `{name}!`, which the resolver cannot see through; a \
+                 verdict assembled inside an unknown macro would be invisible here"
+            ));
+        }
         for lit in ast::string_literals(&f.ast) {
-            let l = lit.to_ascii_lowercase();
+            let l = strip_negations(&lit.to_ascii_lowercase());
             if let Some(v) = VERDICTS.iter().find(|v| l.contains(*v)) {
                 return Err(format!(
                     "{rel}: string literal {lit:?} carries the verdict word {v:?}"
@@ -514,6 +549,32 @@ fn agent_interface_facts_not_verdicts(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Phrases that *deny* a verdict. "unchecked = review required, not
+/// proven unused" is the guardrail being honoured in prose, not broken;
+/// scanning for the bare word would ban the sentence that exists to say
+/// the tool does not conclude it.
+///
+/// This is deliberately a list of whole negating phrases rather than a
+/// "preceded by not" rule: `"not safe to keep"` would otherwise pass, and
+/// that *is* a verdict.
+const NEGATED_VERDICTS: &[&str] = &[
+    "not proven unused",
+    "not proven safe",
+    "not proven stale",
+    "never unused",
+    "never safe",
+    "never stale",
+    "not a verdict",
+];
+
+fn strip_negations(lit: &str) -> String {
+    let mut out = lit.to_string();
+    for phrase in NEGATED_VERDICTS {
+        out = out.replace(phrase, "");
+    }
+    out
 }
 
 /// The three functions that mint or change authorization

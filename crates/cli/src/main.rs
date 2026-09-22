@@ -1425,7 +1425,7 @@ fn main() -> Result<()> {
                     .any(|a| a.dedup_stale)
             {
                 eprintln!(
-                    "Unique-byte totals are stale; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
+                    "Unique-byte totals were not recomputed this pass; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
                 );
             }
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {

@@ -42,6 +42,20 @@ pub struct MarkedUnit {
     /// Facts the human should see before confirming (dirty, unpushed,
     /// untracked content, no remote…). Shown, never enforced.
     pub warnings: Vec<String>,
+    /// What was at `path` when the human marked it, so the sink can
+    /// refuse a unit that changed between marking and confirming.
+    ///
+    /// The hardened `execution_sinks_recheck_live_state` audit found
+    /// this missing on 2026-09-22: `trash_path` is the TUI's live delete
+    /// path, it moved user data after only a `symlink_metadata`
+    /// existence check, and its own doc comment pointed at
+    /// `core::execution::execute_delete` -- a function with no callers
+    /// at all. The hand-written sink-file list never covered
+    /// `crates/tui/src/actions.rs`, so nothing saw it.
+    ///
+    /// `None` is itself a refusal at the sink, exactly as it is in
+    /// `recheck::reviewed_snapshot`.
+    pub reviewed: Option<swamp_core::recheck::ReviewedIdentity>,
 }
 
 /// The terms a worktree removal was authorized on; recorded in the ledger.
@@ -297,9 +311,17 @@ fn remove_docker(
     })
 }
 
-/// Moves one path to Trash and records it. The only refusal is a path
-/// that no longer exists: the human already confirmed with the warnings
-/// in front of them, and Trash keeps the move reversible.
+/// Moves one path to Trash and records it, after the same three live
+/// rechecks every other destructive sink performs
+/// (`.oh/guardrails/execution-sinks-recheck-live-state.md`): the unit is
+/// still the thing that was marked, no `swamp protect` entry covers it
+/// in either direction (loaded fresh, never from the mark), and nothing
+/// holds it open (`Unknown` refuses).
+///
+/// Before 2026-09-22 the only refusal here was "the path no longer
+/// exists". Human confirmation authorizes removing *what was shown*; it
+/// does not authorize removing whatever happens to be at that path when
+/// the worker thread gets there.
 fn trash_path(
     unit: &MarkedUnit,
     verb: Verb,
@@ -312,6 +334,26 @@ fn trash_path(
     let path = &unit.path;
     if std::fs::symlink_metadata(path).is_err() {
         anyhow::bail!("path no longer exists");
+    }
+    let fresh = swamp_core::recheck::reviewed_snapshot(path, unit.reviewed.as_ref())?;
+    let covered = swamp_core::recheck::covered_paths(&fresh);
+    let store = ledger
+        .path()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no store directory for the protect list"))?
+        .to_path_buf();
+    swamp_core::recheck::live_protection(&store, &covered)?;
+    match swamp_core::recheck::member_occupancy(&covered) {
+        swamp_core::occupancy::OccupancyState::Free => {}
+        swamp_core::occupancy::OccupancyState::Occupied(member) => {
+            anyhow::bail!("refused: {} is open", member.display())
+        }
+        swamp_core::occupancy::OccupancyState::Unknown(reason) => {
+            anyhow::bail!(
+                "refused: could not check whether {} is in use ({reason})",
+                path.display()
+            )
+        }
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
     let dest = trash_root.join(format!("{name}-{}", now()));
@@ -618,6 +660,7 @@ mod tests {
         MarkedUnit {
             cargo_plan: None,
             agent_plan: None,
+            reviewed: swamp_core::recheck::capture_anchor(std::path::Path::new(path)).ok(),
             path: PathBuf::from(path),
             docker,
             worktree_path: PathBuf::new(),
@@ -753,6 +796,7 @@ mod tests {
         let unit = MarkedUnit {
             cargo_plan: None,
             agent_plan: None,
+            reviewed: swamp_core::recheck::capture_anchor(&target).ok(),
             path: target.clone(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -784,6 +828,7 @@ mod tests {
         let clean = MarkedUnit {
             cargo_plan: None,
             agent_plan: None,
+            reviewed: None,
             path: "/tmp/target".into(),
             docker: None,
             worktree_path: PathBuf::new(),
@@ -796,6 +841,7 @@ mod tests {
         let risky = MarkedUnit {
             cargo_plan: None,
             agent_plan: None,
+            reviewed: None,
             path: "/tmp/raw".into(),
             docker: None,
             worktree_path: PathBuf::new(),
