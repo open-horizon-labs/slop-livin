@@ -53,6 +53,16 @@ const NO_WORKSPACE_FIELD_REASON: &str = "no workspaceDirectory field found in th
      file is a single JSON object rather than one record per line, so this confirmed field \
      (Session.workspaceDirectory, core/index.d.ts) can sit past the bounded read's cap; this \
      adapter stops at the cap rather than reading the conversation body";
+/// Upstream's own fallback value, which is not a path and must never be
+/// resolved as one. `core/util/history.ts:105` writes
+/// `workspaceDirectory: ""` from the `catch` of `load(sessionId)` @
+/// `5522c6f44ca0ac3528b37244818fbfa39b5af470`, so an empty string is an
+/// *expected* value on disk: the session genuinely declares nothing, and
+/// that is `Unresolved`, never `Missing` (which would claim a path was
+/// named and has since disappeared).
+const EMPTY_WORKSPACE_REASON: &str = "this session's workspaceDirectory is the empty string, which is what Continue itself \
+     writes when it cannot load a session (core/util/history.ts:105) -- an expected value, not \
+     a path, so the workspace is unresolved rather than reported missing";
 const SESSION_DIR_REASON: &str = "this session is a directory, not the single JSON object core/util/history.ts writes, so it \
      carries no workspaceDirectory header this adapter can read; the workspace is left \
      unresolved rather than guessed from the directory name";
@@ -155,7 +165,16 @@ fn resolve_session_workspace(path: &Path, ctx: &IdentifyCtx) -> ProjectLinkState
         HEADER_READ_BYTES,
         &|text| declared_workspace(text),
     );
-    super::resolve_declared_path(declared, NO_WORKSPACE_FIELD_REASON)
+    match declared.as_deref() {
+        // Present and empty. Handing `""` to `resolve_declared_path`
+        // would turn it into `Missing { path: "" }` -- a claim that
+        // Continue named a directory which has since disappeared, when
+        // in fact Continue named nothing.
+        Some("") => ProjectLinkState::Unresolved {
+            reason: EMPTY_WORKSPACE_REASON.to_string(),
+        },
+        _ => super::resolve_declared_path(declared, NO_WORKSPACE_FIELD_REASON),
+    }
 }
 
 /// Extracts the top-level string `workspaceDirectory` from a session
@@ -165,10 +184,12 @@ fn declared_workspace(text: &str) -> Option<String> {
     // When the whole object fits inside the cap this is exact, and the
     // field is unambiguously the top-level one Continue declares.
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(text) {
+        // An empty string is *kept*, not filtered away: upstream writes
+        // it deliberately, and "declared empty" and "no field at all"
+        // deserve different answers (see `EMPTY_WORKSPACE_REASON`).
         return map
             .get(WORKSPACE_FIELD)
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
             .map(str::to_string);
     }
     // A session larger than the cap arrives truncated mid-object, so it
@@ -397,6 +418,38 @@ mod tests {
             "{{\"sessionId\":\"s1\",\"title\":\"{canary}\",\"workspaceDirectory\":\"{workspace}\",\
              \"history\":[{{\"message\":{{\"role\":\"user\",\"content\":\"{canary}\"}}}}]}}"
         )
+    }
+
+    /// Upstream's own empty-string fallback is `unresolved`, never
+    /// `missing`. `core/util/history.ts:105` writes
+    /// `workspaceDirectory: ""` from the `catch` of `load(sessionId)`
+    /// (@ `5522c6f44ca0ac3528b37244818fbfa39b5af470`, vendored at
+    /// `crates/core/tests/fixtures/upstream/continue/5522c6f44c/history.ts`),
+    /// so it is an expected value on disk. `Missing` would assert that a
+    /// path was named and has since gone.
+    #[test]
+    fn an_empty_workspace_directory_is_unresolved_not_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        touch(
+            &home.join("sessions/s-empty.json"),
+            b"{\"sessionId\":\"s-empty\",\"title\":\"t\",\"workspaceDirectory\":\"\",\"history\":[]}",
+        );
+        let units = run(home);
+        let session = units
+            .iter()
+            .find(|u| u.relative_path.ends_with("s-empty.json"))
+            .expect("session identified");
+        let ProjectLinkState::Unresolved { reason } = &session.project_link else {
+            panic!(
+                "an empty workspaceDirectory must be Unresolved, got {:?}",
+                session.project_link
+            );
+        };
+        assert!(
+            reason.contains("empty string") && reason.contains("history.ts"),
+            "the reason must say it is upstream's own fallback: {reason}"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
-    mtime_secs, resolve_declared_path,
+    mtime_secs,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,16 +34,6 @@ use std::path::{Path, PathBuf};
 pub const COPILOT_CLI_TOOL_ID: &str = crate::locations::copilot_cli::COPILOT_CLI_DETECTOR_ID;
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
-/// Bound on how many bytes of any one metadata file this adapter reads
-/// looking for a `cwd`/`workspace` field -- session/task content itself
-/// is never read (guardrail: no prompt/transcript content in output).
-/// Matches every other adapter's per-file header cap.
-const HEADER_READ_BYTES: usize = 8192;
-/// A metadata file bigger than this is not a small declaration file and
-/// is skipped outright rather than header-read: the reference page
-/// documents no large-JSON session descriptor, so a big file here is an
-/// unconfirmed shape, not something to guess at.
-const MAX_METADATA_SCAN_BYTES: u64 = 65_536;
 
 const PROTECTED_CONFIG_FILES: &[(&str, &str)] = &[
     (
@@ -198,60 +188,53 @@ fn protected_unit(
 /// `HEADER_READ_BYTES` of the ones it does look at, and never returns
 /// anything but the one field value -- no content is retained. The read
 /// goes through `IdentifyCtx::derived`, so an unchanged metadata file is
-/// a cache lookup rather than a second read.
-fn declared_path_in_dir(dir: &Path, ctx: &IdentifyCtx) -> Option<String> {
-    for entry in ctx.list(dir) {
-        if entry.is_dir || !entry.name.ends_with(".json") {
-            continue;
-        }
-        let path = dir.join(&entry.name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.is_file() || meta.len() > MAX_METADATA_SCAN_BYTES {
-            continue;
-        }
-        let declared = ctx.derived(
-            COPILOT_CLI_TOOL_ID,
-            "declared-path",
-            &path,
-            HEADER_READ_BYTES,
-            &|text| {
-                let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
-                for field in ["cwd", "workspace", "workspaceFolder"] {
-                    if let Some(s) = value.get(field).and_then(|v| v.as_str())
-                        && !s.is_empty()
-                    {
-                        return Some(s.to_string());
-                    }
-                }
-                None
-            },
-        );
-        if declared.is_some() {
-            return declared;
-        }
-    }
-    None
-}
+/// Why Copilot CLI sessions carry no project link and no selective
+/// action.
+///
+/// This adapter used to parse a `cwd` / `workspace` / `workspaceFolder`
+/// field out of the small JSON files beside a session, and
+/// `docs/agent-storage.md` promised the field came from a documented
+/// schema and was "never a guess at an undocumented schema". The
+/// 2026-09-22 re-review checked: the sole citation, GitHub's own
+/// `cli-config-dir-reference`, documents *directory names* and contains
+/// zero occurrences of `cwd` or `workspaceFolder`. Those three field
+/// names were the guess the doc promised not to make.
+///
+/// Re-checked 2026-09-22 across four pinned `github/docs` pages @
+/// `72e940d15a9aff06b6e84216f3c97dac25c47d9b`
+/// (`cli-config-dir-reference.md`, `cli-command-reference.md`,
+/// `chronicle.md`, `acp-server.md`): `workspaceFolder` and
+/// `workingDirectory` appear **zero** times; every `cwd` hit is the
+/// `/cwd` slash command, prose, an MCP server launch key, or an ACP wire
+/// parameter in client-side example code -- none is an on-disk session
+/// field. `github/copilot-cli` is closed source (its repository holds
+/// only a README, a changelog, an installer and issue templates), so
+/// there is no schema to pin.
+///
+/// The directory layout itself stays confirmed, so the bytes are still
+/// identified and measured. What is withdrawn is the claim about what is
+/// *inside* them.
+const NO_LINKAGE_SOURCE_REASON: &str = "no upstream source documents a working-directory field in Copilot CLI session state: \
+     GitHub's cli-config-dir-reference documents directory names only, and the CLI itself is \
+     closed source. The cwd/workspace/workspaceFolder fields this adapter used to parse were a \
+     guess at an undocumented schema, so linkage is unresolved and no selective action is \
+     offered";
 
 fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("session-state");
     for entry in ctx.list(&base) {
         let path = base.join(&entry.name);
-        let (bytes, mtime, truncated, declared) = if entry.is_dir {
-            let (b, m, t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-            (b, m, t, declared_path_in_dir(&path, ctx))
+        let (bytes, mtime, truncated) = if entry.is_dir {
+            ctx.folded_bytes(&path, MAX_FOLD_ENTRIES)
         } else {
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
-            (meta.len(), mtime_secs(&meta), false, None)
+            (meta.len(), mtime_secs(&meta), false)
         };
-        let project_link = resolve_declared_path(
-            declared,
-            "no cwd/workspace field found in this session artifact's own small metadata files",
-        );
+        let project_link = ProjectLinkState::Unresolved {
+            reason: NO_LINKAGE_SOURCE_REASON.to_string(),
+        };
         let member_kind = if entry.is_dir {
             AgentMemberKind::SessionData
         } else {
@@ -268,9 +251,19 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
                 }])
                 .mtime_max(mtime)
                 .project_link(project_link)
-                .action(AgentActionCapability::SessionRemoval);
+                // No action on session state. The removal capability was
+                // justified by knowing which project a session belonged
+                // to; with the linkage claim withdrawn, offering to move
+                // a session whose project this tool cannot name is
+                // exactly the "inspection is not authorization" line.
+                .action(AgentActionCapability::None)
+                .note(NO_LINKAGE_SOURCE_REASON);
         if truncated {
-            unit = unit.note("directory entry count bound reached");
+            unit = unit.note(concat!(
+                "directory entry count bound reached. ",
+                "Linkage and selective removal are withheld: no upstream source documents a \
+                 working-directory field in Copilot CLI session state"
+            ));
         }
         out.push(unit.build());
     }
@@ -539,8 +532,24 @@ mod tests {
         );
     }
 
+    /// A `cwd` that *looks* like the answer is still not a citation.
+    ///
+    /// This adapter used to parse `cwd`/`workspace`/`workspaceFolder`
+    /// out of the small JSON files beside a session, and this test used
+    /// to assert it linked. The 2026-09-22 re-review checked the only
+    /// cited source -- GitHub's `cli-config-dir-reference` -- and found
+    /// zero occurrences of `cwd` or `workspaceFolder`; a re-check across
+    /// four pinned `github/docs` pages @
+    /// `72e940d15a9aff06b6e84216f3c97dac25c47d9b` found the same, and
+    /// the CLI is closed source. So the field names were the guess the
+    /// doc promised never to make, and a fixture that contains one
+    /// proves only that the fixture was written by the same guess.
+    ///
+    /// The test is kept, inverted: a plausible field must **not** link,
+    /// and no action may be offered on a session whose project this tool
+    /// cannot name.
     #[test]
-    fn session_state_links_via_bounded_metadata_scan() {
+    fn a_plausible_cwd_field_is_not_a_citation_and_must_not_link() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         touch(&home.join("settings.json"), b"{}");
@@ -556,8 +565,25 @@ mod tests {
             .iter()
             .find(|u| u.category == AgentCategory::Sessions && u.relative_path.contains("s1"))
             .expect("session unit present");
-        assert!(matches!(s.project_link, ProjectLinkState::Linked { .. }));
-        assert_eq!(s.action, AgentActionCapability::SessionRemoval);
+        let ProjectLinkState::Unresolved { reason } = &s.project_link else {
+            panic!(
+                "an undocumented field must not produce a link: {:?}",
+                s.project_link
+            );
+        };
+        assert!(
+            reason.contains("no upstream source documents"),
+            "the reason must say the schema is undocumented: {reason}"
+        );
+        assert_eq!(
+            s.action,
+            AgentActionCapability::None,
+            "no selective action on a session whose project this tool cannot name"
+        );
+        // The bytes are still identified and measured -- the directory
+        // layout is confirmed; only the claim about what is inside is
+        // withdrawn.
+        assert!(s.bytes > 0, "the session's bytes must still be reported");
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -750,9 +776,16 @@ mod tests {
                 .count(),
             sessions
         );
-        assert!(
-            counters.header_bytes_read <= (sessions * HEADER_READ_BYTES) as u64,
-            "read {} bytes, above {sessions} x this adapter's {HEADER_READ_BYTES} byte cap",
+        // Zero, and strictly so. Since the linkage guess was withdrawn
+        // (2026-09-22) this adapter reads no file contents at all --
+        // there is no documented field to read -- so the cap it has to
+        // respect is the strongest one available. `bounded_io` is still
+        // the only route if a documented field ever appears, which the
+        // shared ceiling below keeps honest.
+        assert_eq!(
+            counters.header_bytes_read, 0,
+            "no upstream source documents a session field, so this adapter reads no contents \
+             at all; it read {} bytes",
             counters.header_bytes_read
         );
         assert!(
@@ -761,8 +794,8 @@ mod tests {
         );
         const {
             assert!(
-                HEADER_READ_BYTES <= bounded_io::MAX_HEADER_BYTES,
-                "this adapter's cap must sit under the shared ceiling"
+                bounded_io::MAX_HEADER_BYTES <= 64 * 1024,
+                "the shared ceiling any future read here must sit under"
             )
         };
         contract::within_header_cap(counters, sessions as u64);
@@ -794,7 +827,10 @@ mod tests {
 
     #[test]
     fn project_link_is_declared_or_unresolved_never_basename_guess() {
-        // (a) a session whose own metadata declares a real worktree.
+        // (a) a session whose own metadata carries a plausible `cwd`
+        // pointing at a real worktree. Not a link: no upstream source
+        // documents that field (see
+        // `a_plausible_cwd_field_is_not_a_citation_and_must_not_link`).
         let repo_dir = tempfile::tempdir().unwrap();
         let repo = repo_dir.path().join("declared-worktree");
         fs::create_dir_all(repo.join(".git")).unwrap();
@@ -816,12 +852,11 @@ mod tests {
             .iter()
             .find(|u| u.relative_path.contains("declared"))
             .unwrap();
-        match &a.project_link {
-            ProjectLinkState::Linked { source, .. } => {
-                assert_eq!(*source, crate::agents::LinkSource::Declared)
-            }
-            other => panic!("a declared cwd must link: {other:?}"),
-        }
+        assert!(
+            matches!(a.project_link, ProjectLinkState::Unresolved { .. }),
+            "an undocumented field must never become a link: {:?}",
+            a.project_link
+        );
         let b = units
             .iter()
             .find(|u| u.relative_path.contains("looks-like-a-project"))

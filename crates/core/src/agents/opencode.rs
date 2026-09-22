@@ -297,21 +297,54 @@ fn identify_file_tree_sessions(
             }];
             let mut bytes = meta.len();
             let mut mtime_max = mtime_secs(&meta);
-            for (dir_name, kind) in [
-                ("message", AgentMemberKind::SessionData),
-                ("session_diff", AgentMemberKind::SessionData),
+            // `storage/message/<session-id>/` is a directory of
+            // per-message files. `storage/session_diff/<session-id>` is
+            // **not**: the universal key->path builder appends `.json`
+            // (`packages/opencode/src/storage/storage.ts:62-64` @
+            // `fe3f3a41f79ad292cc3c7c629567385a20ec5130`, reached from
+            // `storage.write(["session_diff", input.sessionID], diffs)`
+            // in `session/revert.ts:77`), so it is a single file.
+            //
+            // This adapter gated both on `is_dir()`, so every byte of
+            // every session diff was in no unit at all -- the one thing
+            // `docs/agent-storage.md` promises never happens. Both
+            // shapes are accepted here: a `.json` file is the current
+            // one, a directory of the same name is folded if some
+            // version writes one, and neither is assumed.
+            let message_dir = home.join("storage").join("message").join(&session_id);
+            if message_dir.is_dir() {
+                let (b, m, _t) = ctx.folded_bytes(&message_dir, MAX_FOLD_ENTRIES);
+                bytes += b;
+                mtime_max = mtime_max.max(m);
+                members.push(AgentMember {
+                    path: message_dir,
+                    bytes: b,
+                    kind: AgentMemberKind::SessionData,
+                });
+            }
+            let diff_base = home.join("storage").join("session_diff");
+            for diff in [
+                diff_base.join(format!("{session_id}.json")),
+                diff_base.join(&session_id),
             ] {
-                let companion = home.join("storage").join(dir_name).join(&session_id);
-                if companion.is_dir() {
-                    let (b, m, _t) = ctx.folded_bytes(&companion, MAX_FOLD_ENTRIES);
-                    bytes += b;
-                    mtime_max = mtime_max.max(m);
-                    members.push(AgentMember {
-                        path: companion,
-                        bytes: b,
-                        kind,
-                    });
-                }
+                let Ok(meta) = fs::symlink_metadata(&diff) else {
+                    continue;
+                };
+                let (b, m) = if meta.is_dir() {
+                    let (b, m, _t) = ctx.folded_bytes(&diff, MAX_FOLD_ENTRIES);
+                    (b, m)
+                } else if meta.is_file() {
+                    (meta.len(), mtime_secs(&meta))
+                } else {
+                    continue;
+                };
+                bytes += b;
+                mtime_max = mtime_max.max(m);
+                members.push(AgentMember {
+                    path: diff,
+                    bytes: b,
+                    kind: AgentMemberKind::SessionData,
+                });
             }
             claimed.insert(session_id);
             let relative_path = relative_to(home, &path);
@@ -345,11 +378,28 @@ fn identify_storage_auxiliary(
         let mut bytes = 0u64;
         let mut mtime_max = 0u64;
         let mut any = false;
-        for name in ctx.dir_names(&base) {
-            if claimed.contains(&name) {
+        // Entries, not only subdirectories: `storage/session_diff/`
+        // holds `<session-id>.json` *files*, and a sweep that listed
+        // only directories dropped every unclaimed one on the floor.
+        for entry in ctx.list(&base) {
+            let key = entry
+                .name
+                .strip_suffix(".json")
+                .unwrap_or(&entry.name)
+                .to_string();
+            if claimed.contains(&key) {
                 continue;
             }
-            let (b, m, _t) = ctx.folded_bytes(&base.join(&name), MAX_FOLD_ENTRIES);
+            let path = base.join(&entry.name);
+            let (b, m) = if entry.is_dir {
+                let (b, m, _t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+                (b, m)
+            } else {
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_file() => (meta.len(), mtime_secs(&meta)),
+                    _ => continue,
+                }
+            };
             bytes += b;
             mtime_max = mtime_max.max(m);
             any = true;
@@ -583,6 +633,67 @@ mod tests {
         assert_eq!(session.members.len(), 2, "transcript + message companion");
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
+    }
+
+    /// `storage/session_diff/<id>.json` is a **file**, and its bytes have
+    /// to be in some unit.
+    ///
+    /// Upstream builds every storage path as
+    /// `path.join(dir, ...key) + ".json"`
+    /// (`packages/opencode/src/storage/storage.ts:62-64` @
+    /// `fe3f3a41f79ad292cc3c7c629567385a20ec5130`, vendored at
+    /// `crates/core/tests/fixtures/upstream/opencode/fe3f3a41f7/storage.ts`),
+    /// and `session/revert.ts:77` writes
+    /// `storage.write(["session_diff", input.sessionID], diffs)`. This
+    /// adapter gated on `is_dir()` and swept with `dir_names`, so every
+    /// diff -- claimed or not -- appeared in no unit at all. The
+    /// assertion is on the *byte total*, because a member list that
+    /// merely names the file would satisfy a weaker one.
+    #[test]
+    fn session_diff_files_are_counted_claimed_or_not() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("fixture-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(
+            &home.join("storage/project/p1.json"),
+            project_json(&repo.display().to_string()).as_bytes(),
+        );
+        touch(&home.join("storage/session/p1/s1.json"), b"{\"id\":\"s1\"}");
+        let diff = vec![b'd'; 4096];
+        touch(&home.join("storage/session_diff/s1.json"), &diff);
+        // A diff whose session is gone: still bytes on the disk, still
+        // never silently dropped.
+        let orphan = vec![b'o'; 2048];
+        touch(&home.join("storage/session_diff/gone.json"), &orphan);
+
+        let units = run(home);
+        let session = units
+            .iter()
+            .find(|u| u.category == AgentCategory::Sessions)
+            .expect("session identified");
+        assert!(
+            session.members.iter().any(|m| m
+                .path
+                .to_string_lossy()
+                .ends_with("storage/session_diff/s1.json")),
+            "the diff file must be a member of its session: {:?}",
+            session.members
+        );
+        assert!(
+            session.bytes >= 4096,
+            "the diff's bytes must be in the session's total, not merely named: {}",
+            session.bytes
+        );
+
+        let residual = units
+            .iter()
+            .find(|u| u.relative_path == "storage/session_diff (unlinked)")
+            .expect("an unclaimed diff file must still be reported");
+        assert_eq!(
+            residual.bytes, 2048,
+            "exactly the orphan's bytes, and only once"
+        );
     }
 
     #[test]

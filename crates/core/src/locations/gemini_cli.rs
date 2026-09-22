@@ -70,7 +70,7 @@ impl Detector for GeminiCliDetector {
             ),
             _ => (env.home.join(".gemini"), Provenance::BuiltinConvention),
         };
-        vec![ProposedLocation {
+        let mut out = vec![ProposedLocation {
             detector_id: GEMINI_CLI_DETECTOR_ID.to_string(),
             path: Some(base),
             category: StorageCategory::LocalState,
@@ -78,11 +78,43 @@ impl Detector for GeminiCliDetector {
             status: LocationStatus::Resolved,
             note: Some(
                 "Gemini CLI home: settings/GEMINI.md/extensions/trustedFolders (protected), \
-                 per-project-hash tmp/ (shell history, checkpoints, saved chats) and history/ \
-                 (shadow Git checkpoint repos); see crate::agents::gemini_cli"
+                 per-project-id tmp/ (shell history, checkpoints, saved chats, tmp/bin \
+                 downloaded tools) and history/ (shadow Git checkpoint repos); see \
+                 crate::agents::gemini_cli"
                     .to_string(),
             ),
-        }]
+        }];
+        // Under macOS Seatbelt the CLI cannot write to the home
+        // `.gemini` directory, so it routes *runtime* state -- `tmp/`
+        // (with `tmp/bin`), `history/`, `projects.json` -- to
+        // `~/.cache/.gemini` instead, while settings and credentials
+        // stay at the home location above. Upstream:
+        // `Storage.getGlobalRuntimeDir()` returns
+        // `join(homeDir, '.cache', GEMINI_DIR)` when
+        // `process.env['SANDBOX'] === 'sandbox-exec'`
+        // (`packages/core/src/config/storage.ts:86-107` @
+        // `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`).
+        //
+        // Proposed only when this process is itself running under that
+        // sandbox, because that is the only evidence there is: a
+        // `~/.cache/.gemini` on an unsandboxed machine would be a guess,
+        // and this detector never guesses a second root.
+        if env.env_var("SANDBOX") == Some("sandbox-exec") {
+            out.push(ProposedLocation {
+                detector_id: GEMINI_CLI_DETECTOR_ID.to_string(),
+                path: Some(env.home.join(".cache").join(".gemini")),
+                category: StorageCategory::LocalState,
+                provenance: Provenance::EnvVar("SANDBOX".to_string()),
+                status: LocationStatus::Resolved,
+                note: Some(
+                    "Gemini CLI runtime state under macOS Seatbelt (SANDBOX=sandbox-exec): the \
+                     home .gemini directory is not writable there, so tmp/ (including tmp/bin), \
+                     history/ and projects.json live here instead"
+                        .to_string(),
+                ),
+            });
+        }
+        out
     }
 }
 
@@ -99,6 +131,43 @@ mod tests {
         let got = GeminiCliDetector.detect(&env);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, Some(PathBuf::from("/Users/dev/.gemini")));
+    }
+
+    /// The sandbox root, both ways: proposed when this process is under
+    /// Seatbelt, and never proposed otherwise.
+    #[test]
+    fn seatbelt_moves_the_runtime_dir_to_the_cache_and_only_then() {
+        let plain =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        assert_eq!(
+            GeminiCliDetector.detect(&plain).len(),
+            1,
+            "a ~/.cache/.gemini outside the sandbox would be a guess, not a detection"
+        );
+
+        let sandboxed = Environment::fixture(
+            PathBuf::from("/Users/dev"),
+            HashMap::from([("SANDBOX".to_string(), "sandbox-exec".to_string())]),
+            Platform::MacOS,
+        );
+        let got = GeminiCliDetector.detect(&sandboxed);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].path, Some(PathBuf::from("/Users/dev/.gemini")));
+        assert_eq!(
+            got[1].path,
+            Some(PathBuf::from("/Users/dev/.cache/.gemini")),
+            "under SANDBOX=sandbox-exec the runtime dir moves to ~/.cache/.gemini"
+        );
+
+        // A different sandbox value is a different launcher (the
+        // container case), which mounts an ephemeral directory at the
+        // ordinary path -- not this one.
+        let other = Environment::fixture(
+            PathBuf::from("/Users/dev"),
+            HashMap::from([("SANDBOX".to_string(), "docker".to_string())]),
+            Platform::MacOS,
+        );
+        assert_eq!(GeminiCliDetector.detect(&other).len(), 1);
     }
 
     #[test]

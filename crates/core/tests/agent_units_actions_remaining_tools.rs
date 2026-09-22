@@ -124,7 +124,12 @@ fn gemini_cli_bin_removal_preserves_settings_and_leaves_project_hash_unresolved(
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("gemini-home");
     write(&home.join("settings.json"), b"{}");
-    write(&home.join("bin/litert/tool"), b"binary-bytes");
+    // `tmp/bin`, not `bin`: upstream builds the downloaded-tools cache as
+    // `join(getGlobalTempDir(), 'bin')` (`packages/core/src/config/storage.ts:195-201`
+    // @ `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`). `~/.gemini/bin` was a
+    // path no version writes, so this test used to act on a directory
+    // that would never exist on a real machine.
+    write(&home.join("tmp/bin/litert/tool"), b"binary-bytes");
     let hash = "a".repeat(64);
     write(
         &home.join(format!("tmp/{hash}/shell_history")),
@@ -145,7 +150,7 @@ fn gemini_cli_bin_removal_preserves_settings_and_leaves_project_hash_unresolved(
         ProjectLinkState::Unresolved { .. }
     ));
 
-    let bin_dir = home.join("bin");
+    let bin_dir = home.join("tmp").join("bin");
     let status = execute_one(&units, &bin_dir, store.path());
     assert_eq!(status, "completed");
     assert!(!bin_dir.exists());

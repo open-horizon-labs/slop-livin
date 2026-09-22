@@ -79,7 +79,6 @@ const FORMAT_MARKERS: &[&str] = &[
     "tmp",
     "history",
     "trustedFolders.json",
-    "bin",
     OAUTH_CREDS_FILE,
 ];
 
@@ -219,12 +218,20 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
                 .build(),
         );
     }
-    let bin = home.join("bin");
+    // `tmp/bin`, not `bin`. Upstream builds it as
+    // `getGlobalBinDir() = join(getGlobalTempDir(), BIN_DIR_NAME)` and
+    // `getGlobalTempDir() = join(getGlobalRuntimeDir(), TMP_DIR_NAME)`
+    // (`packages/core/src/config/storage.ts:24-25,195-201` @
+    // `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`). This adapter looked
+    // at `~/.gemini/bin`, a path that does not exist in any version --
+    // dead code that reported nothing, found by the 2026-09-22
+    // re-review fetching the file the row already cited.
+    let bin = home.join("tmp").join("bin");
     if bin.is_dir() {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&bin, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Caches, bin)
-                .relative_path("bin")
+                .relative_path("tmp/bin")
                 .bytes(bytes)
                 .mtime_max(mtime)
                 .project_link(ProjectLinkState::NotApplicable)
@@ -246,6 +253,13 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
     // a current short slug id are handled identically, because neither is
     // invertible here (see the module docs).
     for project_id in ctx.dir_names(&base) {
+        // `tmp/bin` is the downloaded-runtime-tools cache
+        // (`Storage.getGlobalBinDir()`), not a project id. It has its own
+        // unit above; treating it as a project directory here would both
+        // double-count it and invent a project that does not exist.
+        if project_id == "bin" {
+            continue;
+        }
         let project_dir = base.join(&project_id);
         let mut seen: HashSet<&str> = HashSet::new();
 
@@ -407,7 +421,6 @@ fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
         "GEMINI.md",
         "trustedFolders.json",
         "extensions",
-        "bin",
         "tmp",
         "history",
     ]
@@ -595,6 +608,46 @@ mod tests {
         assert_eq!(chat.action, AgentActionCapability::SessionRemoval);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "chat content leaked");
+    }
+
+    /// The corrected path, asserted both ways: `tmp/bin` is the cache,
+    /// and the old `~/.gemini/bin` guess is not.
+    ///
+    /// Upstream: `getGlobalBinDir() = join(getGlobalTempDir(), 'bin')`,
+    /// `getGlobalTempDir() = join(getGlobalRuntimeDir(), 'tmp')`
+    /// (`packages/core/src/config/storage.ts:24-25,195-201` @
+    /// `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`, vendored at
+    /// `crates/core/tests/fixtures/upstream/gemini-cli/d5b3e3accb/storage.ts`).
+    #[test]
+    fn the_downloaded_tools_cache_is_tmp_bin_and_not_a_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        touch(&home.join("tmp/bin/litert-lm"), &vec![b'x'; 4096]);
+        touch(&home.join("bin/should-not-be-found"), &vec![b'y'; 8192]);
+        let units = run(home);
+        let cache = units
+            .iter()
+            .find(|u| u.relative_path == "tmp/bin")
+            .expect("tmp/bin must be the downloaded-tools cache");
+        assert_eq!(cache.category, AgentCategory::Caches);
+        assert!(cache.bytes >= 4096, "{}", cache.bytes);
+        assert!(
+            !units.iter().any(|u| u.relative_path == "bin"),
+            "~/.gemini/bin is not a path this tool writes; identifying it would be a guess"
+        );
+        // And `tmp/bin` must not also be reported as a per-project
+        // directory, which is what iterating `tmp/`'s children blind
+        // would do.
+        assert!(
+            !units
+                .iter()
+                .any(|u| u.relative_path.starts_with("tmp/bin/")),
+            "tmp/bin is the tools cache, not a project id: {:?}",
+            units
+                .iter()
+                .map(|u| u.relative_path.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

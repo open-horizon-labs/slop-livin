@@ -71,6 +71,12 @@ const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Bound on a task's own small metadata file -- never its conversation
 /// content (guardrail: no prompt/transcript content in output).
 const MAX_METADATA_SCAN_BYTES: usize = 65_536;
+/// Bound on a *shared* history file -- one array covering every task on
+/// this host, so it is read once per host rather than once per task. The
+/// same hard ceiling as every other content read
+/// (`bounded_io::MAX_HEADER_BYTES`); a history past it is reported
+/// truncated, never silently treated as "this task declares nothing".
+const MAX_HISTORY_SCAN_BYTES: usize = 65_536;
 
 /// Where one extension records a task's project, if anywhere. The
 /// caller's own verified schema, never this module's guess.
@@ -86,6 +92,98 @@ pub enum TaskLinkSource {
     /// not read. `reason` is surfaced verbatim as the `Unresolved`
     /// reason, so a user sees *which* store holds the answer.
     NotInAnyFileWeRead { reason: &'static str },
+    /// One JSON array of history entries, beside the task directories
+    /// rather than inside them, read **once per host** and indexed by
+    /// task id -- the shape Cline uses
+    /// (`{globalStorage}/state/taskHistory.json`, an array of
+    /// `HistoryItem`). `file` is relative to the extension's
+    /// globalStorage directory.
+    ///
+    /// Read through the same capped reader as everything else, so a
+    /// history longer than the cap is *partly* readable and honestly
+    /// reported: entries inside the window resolve, entries past it get
+    /// an `Unresolved` reason that says the file was truncated at the
+    /// bound rather than pretending the field is absent.
+    SharedHistoryFile {
+        file: &'static str,
+        id_field: &'static str,
+        path_field: &'static str,
+        /// Named in the `Unresolved` reason for a task the file does not
+        /// mention, so the user is told which upstream spelling was
+        /// looked for.
+        ambiguity_note: &'static str,
+    },
+}
+
+/// `task id -> declared working directory`, plus whether the bounded
+/// read saw the end of the file.
+struct SharedHistory {
+    by_id: std::collections::HashMap<String, String>,
+    truncated: bool,
+}
+
+/// Parses as many complete top-level objects as the capped read window
+/// contains.
+///
+/// Deliberately not `serde_json::from_str::<Vec<Value>>`: the read is
+/// capped (privacy is the hard contract, and a task history holds the
+/// first line of every prompt), so the text is usually a *prefix* of a
+/// JSON array and would not parse as one. Scanning for balanced
+/// `{...}` at depth 1 and parsing each on its own recovers every entry
+/// the window actually contains and drops the partial one at the end.
+/// String and escape state are tracked so a brace inside a task title
+/// cannot end an object early.
+fn parse_shared_history(text: &str, id_field: &str, path_field: &str) -> SharedHistory {
+    let mut by_id = std::collections::HashMap::new();
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut closed_any = false;
+    for (i, b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *b == b'\\' {
+                escaped = true;
+            } else if *b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    closed_any = true;
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text[start..=i])
+                        && let Some(id) = value.get(id_field).and_then(|v| v.as_str())
+                        && let Some(cwd) = value
+                            .get(path_field)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                    {
+                        by_id.insert(id.to_string(), cwd.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // The window ended mid-object, or ended without ever closing one:
+    // either way there may be entries beyond it.
+    SharedHistory {
+        by_id,
+        truncated: depth > 0 || !closed_any,
+    }
 }
 
 /// Which host directories a VS-Code-family profile keeps beside `User/`.
@@ -354,11 +452,51 @@ pub fn identify_extension_globalstorage(
             })
             .collect();
     }
+    // One shared history file per host, read once for every task in it
+    // rather than once per task. Lazily, so an extension that does not
+    // use this shape never opens it.
+    let shared: std::cell::OnceCell<SharedHistory> = std::cell::OnceCell::new();
     let mut units = Vec::new();
     for name in ctx.dir_names(&tasks) {
         let task_dir = tasks.join(&name);
         let (bytes, mtime, truncated) = ctx.folded_bytes(&task_dir, MAX_FOLD_ENTRIES);
-        let project_link = task_link(&task_dir, ctx, link_source);
+        let project_link = match link_source {
+            TaskLinkSource::SharedHistoryFile {
+                file,
+                id_field,
+                path_field,
+                ambiguity_note,
+            } => {
+                let history = shared.get_or_init(|| {
+                    let path = ext_home.join(file);
+                    match ctx.read_header(&path, MAX_HISTORY_SCAN_BYTES) {
+                        Some(text) => parse_shared_history(&text, id_field, path_field),
+                        // No file at all: nothing is resolvable, and
+                        // saying so once is the same answer as saying it
+                        // per task.
+                        None => SharedHistory {
+                            by_id: std::collections::HashMap::new(),
+                            truncated: false,
+                        },
+                    }
+                });
+                match history.by_id.get(&name) {
+                    Some(declared) => resolve_declared_path(Some(declared.clone()), ""),
+                    None if history.truncated => ProjectLinkState::Unresolved {
+                        reason: format!(
+                            "{file} is longer than the {MAX_HISTORY_SCAN_BYTES}-byte bounded \
+                             read and this task's entry is past the bound; {ambiguity_note}"
+                        ),
+                    },
+                    None => ProjectLinkState::Unresolved {
+                        reason: format!(
+                            "this task has no {path_field} entry in {file}; {ambiguity_note}"
+                        ),
+                    },
+                }
+            }
+            other => task_link(&task_dir, ctx, other),
+        };
         units.push(
             AgentUnitBuilder::new("vscode-family", AgentCategory::Sessions, task_dir.clone())
                 .relative_path(format!("{host}/tasks/{name}"))
@@ -395,6 +533,13 @@ fn task_link(task_dir: &Path, ctx: &IdentifyCtx, source: TaskLinkSource) -> Proj
             };
         }
         TaskLinkSource::DeclaredField { file, field } => (file, field),
+        // Handled by the caller, which reads the one shared file per
+        // host rather than once per task.
+        TaskLinkSource::SharedHistoryFile { .. } => {
+            return ProjectLinkState::Unresolved {
+                reason: "shared history file not read for this task".to_string(),
+            };
+        }
     };
     let path = task_dir.join(file);
     let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -491,11 +636,15 @@ mod tests {
         file: "history_item.json",
         field: "workspace",
     };
-    /// Cline's honest "not in any file we read".
-    const CLINE: TaskLinkSource = TaskLinkSource::NotInAnyFileWeRead {
-        reason: "Cline records a task's working directory in its taskHistory extension state \
-                 (HistoryItem.cwdOnTaskInitialization, itself optional), which lives inside \
-                 state.vscdb or under ~/.cline/data -- neither is read here",
+    /// The honest "not in any file we read" shape. No shipped adapter
+    /// uses it today -- Cline moved to `SharedHistoryFile` once the
+    /// 2026-09-22 re-review showed the file is inside the directory the
+    /// adapter already walks -- but the variant is the one place an
+    /// extension whose store really is unreachable can say so, and an
+    /// untested variant is a variant nobody has shown works.
+    const ELSEWHERE: TaskLinkSource = TaskLinkSource::NotInAnyFileWeRead {
+        reason: "this extension records a task's working directory in a store this catalog \
+                 does not read (state.vscdb)",
     };
 
     fn touch(path: &Path, content: &[u8]) {
@@ -714,18 +863,69 @@ mod tests {
     }
 
     #[test]
-    fn cline_says_which_store_holds_the_answer() {
+    fn an_extension_that_keeps_linkage_elsewhere_says_which_store() {
         let dir = tempfile::tempdir().unwrap();
         let ext_home = dir
             .path()
             .join("Library/Application Support/Code/User/globalStorage/some.ext");
         touch(&ext_home.join("tasks/t1/ui_messages.json"), b"[]");
-        let units = ext(&ext_home, CLINE);
+        let units = ext(&ext_home, ELSEWHERE);
         let ProjectLinkState::Unresolved { reason } = &units[0].project_link else {
             panic!("expected Unresolved, got {:?}", units[0].project_link);
         };
-        assert!(reason.contains("taskHistory"), "{reason}");
         assert!(reason.contains("state.vscdb"), "{reason}");
+    }
+
+    /// A shared history file longer than the bounded read is reported
+    /// *truncated*, never as "this task declares nothing": the entries
+    /// inside the window still resolve, and the ones past it say why.
+    #[test]
+    fn a_history_file_past_the_read_bound_says_so_rather_than_claiming_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_home = dir
+            .path()
+            .join("Library/Application Support/Code/User/globalStorage/some.ext");
+        let repo = dir.path().join("in-window-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(&ext_home.join("tasks/first/ui_messages.json"), b"[]");
+        touch(&ext_home.join("tasks/last/ui_messages.json"), b"[]");
+        let mut history = format!("[{{\"id\":\"first\",\"cwd0\":\"{}\"}}", repo.display());
+        // Pad past the cap so `last`'s entry can never be in the window.
+        while history.len() < MAX_HISTORY_SCAN_BYTES + 4096 {
+            history.push_str(",{\"id\":\"pad\",\"note\":\"");
+            history.push_str(&"p".repeat(512));
+            history.push_str("\"}");
+        }
+        history.push_str(",{\"id\":\"last\",\"cwd0\":\"/nowhere\"}]");
+        touch(&ext_home.join("state/taskHistory.json"), history.as_bytes());
+
+        let source = TaskLinkSource::SharedHistoryFile {
+            file: "state/taskHistory.json",
+            id_field: "id",
+            path_field: "cwd0",
+            ambiguity_note: "note",
+        };
+        let units = ext(&ext_home, source);
+        let first = units
+            .iter()
+            .find(|u| u.relative_path.ends_with("tasks/first"))
+            .unwrap();
+        assert!(
+            matches!(&first.project_link, ProjectLinkState::Linked { .. }),
+            "an entry inside the window must still resolve: {:?}",
+            first.project_link
+        );
+        let last = units
+            .iter()
+            .find(|u| u.relative_path.ends_with("tasks/last"))
+            .unwrap();
+        let ProjectLinkState::Unresolved { reason } = &last.project_link else {
+            panic!("expected Unresolved, got {:?}", last.project_link);
+        };
+        assert!(
+            reason.contains("bounded read"),
+            "a truncated history must say so rather than claim the field is absent: {reason}"
+        );
     }
 
     #[test]

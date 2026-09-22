@@ -127,8 +127,75 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         "web/mobile attachments with no matching current session transcript",
     );
 
+    identify_unmatched_todos(home, ctx, &claimed_session_ids, &mut units);
     identify_static_categories(home, ctx, &mut units);
     units
+}
+
+/// `todos/` entries no session claimed, folded into one unit.
+///
+/// Previously these were in no unit at all: `todos/` is excluded from
+/// the unclassified residual (its entries are normally *members* of the
+/// sessions they belong to), and nothing swept the leftovers -- so an
+/// orphan's bytes were silently dropped, which is the one thing
+/// `docs/agent-storage.md` promises never happens. A test asserted the
+/// gap rather than closing it.
+///
+/// The note carries what the cited page actually says about this
+/// directory, which is not what this adapter used to say: `todos/` is a
+/// legacy directory "from older versions", "no longer written"
+/// (<https://code.claude.com/docs/en/claude-directory>, retrieved
+/// 2026-09-22). So an orphan here is not a cache that will come back --
+/// it is residue, and removing it costs nothing.
+fn identify_unmatched_todos(
+    home: &Path,
+    ctx: &IdentifyCtx,
+    claimed: &HashSet<String>,
+    out: &mut Vec<CandidateAgentUnit>,
+) {
+    let todos_dir = home.join("todos");
+    // `is_dir` rather than a listing, so a home without the legacy
+    // directory pays nothing at all.
+    if !todos_dir.is_dir() {
+        return;
+    }
+    let mut bytes = 0u64;
+    let mut mtime_max = 0u64;
+    let mut count = 0usize;
+    for entry in ctx.list(&todos_dir) {
+        if claimed.iter().any(|id| entry.name.starts_with(id.as_str())) {
+            continue;
+        }
+        let path = todos_dir.join(&entry.name);
+        let (b, m) = if entry.is_dir {
+            let (b, m, _t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+            (b, m)
+        } else {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => (meta.len(), super::mtime_secs(&meta)),
+                Err(_) => continue,
+            }
+        };
+        bytes += b;
+        mtime_max = mtime_max.max(m);
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    out.push(
+        AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, AgentCategory::Unclassified, todos_dir)
+            .relative_path("todos (unlinked)")
+            .bytes(bytes)
+            .mtime_max(mtime_max)
+            .action(AgentActionCapability::None)
+            .note(
+                "todo lists with no matching current session transcript. todos/ is documented \
+                 upstream as a legacy directory from older versions that is no longer written, \
+                 so nothing here regenerates",
+            )
+            .build(),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -585,13 +652,42 @@ const STATIC_ENTRIES: &[StaticEntry] = &[
         protected: false,
         note: "shell alias/function snapshots; regenerated automatically",
     },
+    // The three legacy directories, and the provenance note that was
+    // wrong about all of them.
+    //
+    // This adapter said `statsig` was "community-documented; not found
+    // in this chunk's official-documentation fetch" and modelled it as a
+    // cache that "regenerated automatically". Both halves are false. The
+    // cited page documents it explicitly, in one row with `todos/` and
+    // `logs/`: "Legacy directories from older versions. No longer
+    // written." Its own "what you lose" table answers "Nothing. Legacy
+    // directories not written by current versions."
+    // (https://code.claude.com/docs/en/claude-directory, retrieved
+    // 2026-09-22; vendored at
+    // `crates/core/tests/fixtures/upstream/claude-code/2026-09-22/claude-directory.md`.)
+    //
+    // So the consequence text has to change too, in the direction that
+    // matters to a user: removing these does not cost a regeneration, it
+    // costs nothing, because nothing writes them any more. `todos/` is
+    // the exception that keeps a caveat: its per-session entries are
+    // still *members* of the sessions this adapter identifies, so an
+    // entry that matches a live session is reported with that session
+    // and only an unmatched one reaches this rule.
     StaticEntry {
         rel: "statsig",
         category: AgentCategory::Caches,
         action: AgentActionCapability::CacheOrLogTrash,
         protected: false,
-        note: "feature-flag/analytics client cache (community-documented; not found in this \
-               chunk's official-documentation fetch); regenerated automatically if present",
+        note: "legacy feature-flag/analytics directory from older versions, documented upstream \
+               as no longer written; nothing regenerates it",
+    },
+    StaticEntry {
+        rel: "logs",
+        category: AgentCategory::Logs,
+        action: AgentActionCapability::CacheOrLogTrash,
+        protected: false,
+        note: "legacy log directory from older versions, documented upstream as no longer \
+               written; nothing regenerates it",
     },
     StaticEntry {
         rel: "debug",
@@ -976,21 +1072,69 @@ mod tests {
         assert_eq!(u.action, AgentActionCapability::None);
     }
 
+    /// THE CLOSED GAP (2026-09-22). This test used to assert the gap --
+    /// "the file is not folded into the static/residual scan ...
+    /// documented gap" -- which is to say it asserted that some bytes on
+    /// the disk appeared in no unit at all. That is exactly what
+    /// `docs/agent-storage.md` promises never happens. The assertion is
+    /// now on the bytes.
     #[test]
     fn unmatched_todos_are_folded_into_one_orphan_note_not_dropped() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        touch(&home.join("todos").join("no-such-session.json"), b"[]");
+        touch(
+            &home.join("todos").join("no-such-session.json"),
+            &vec![b'x'; 2048],
+        );
         let units = run(home);
-        // No session claimed this todos file; it must not silently
-        // vanish -- but this adapter also must not fabricate a session
-        // unit for it. `todos/` on its own (with no session directory)
-        // simply produces no session units and the file is not folded
-        // into the static/residual scan (it lives under a dir this
-        // adapter treats specially). Documented gap, asserted here so a
-        // future change to fold orphan todos in does not silently
-        // change behavior unnoticed.
+        // Still never a fabricated session.
         assert!(units.iter().all(|u| u.category != AgentCategory::Sessions));
+        let orphan = units
+            .iter()
+            .find(|u| u.relative_path == "todos (unlinked)")
+            .expect("an unmatched todos entry must be reported somewhere");
+        assert_eq!(orphan.bytes, 2048, "exactly its bytes, and only once");
+        assert_eq!(orphan.action, AgentActionCapability::None);
+        let note = orphan.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("no longer written"),
+            "the note must carry what the cited page says about todos/: {note}"
+        );
+    }
+
+    /// A todos entry that *does* belong to a live session stays with
+    /// that session and must not also appear in the orphan unit --
+    /// otherwise the same bytes are counted twice.
+    #[test]
+    fn a_matched_todos_entry_is_not_also_swept_as_an_orphan() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let id = "11111111-1111-4111-8111-111111111111";
+        touch(
+            &home.join("projects/-p").join(format!("{id}.jsonl")),
+            b"{\"type\":\"user\"}\n",
+        );
+        touch(
+            &home.join("todos").join(format!("{id}-agent.json")),
+            &vec![b'y'; 512],
+        );
+        let units = run(home);
+        let session = units
+            .iter()
+            .find(|u| u.category == AgentCategory::Sessions)
+            .expect("session identified");
+        assert!(
+            session
+                .members
+                .iter()
+                .any(|m| m.kind == AgentMemberKind::Todos),
+            "the matching todos entry belongs to its session: {:?}",
+            session.members
+        );
+        assert!(
+            !units.iter().any(|u| u.relative_path == "todos (unlinked)"),
+            "a claimed todos entry must not also be swept as an orphan"
+        );
     }
 
     #[test]

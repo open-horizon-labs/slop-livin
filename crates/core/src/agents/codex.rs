@@ -33,9 +33,15 @@
 //!   pinned to one shape here: this is genuinely internal wire format,
 //!   read only for this one field, and any shape not matched resolves to
 //!   `Unresolved`, never a guess or a panic.
-//! - `codex-rs/state/src/sqlite.rs`: `state_5.sqlite`, `logs_2.sqlite`,
-//!   `goals_1.sqlite`, `memories_1.sqlite`, `queue_1.sqlite`,
+//! - `codex-rs/state/src/sqlite.rs` @
+//!   `ac7634b9f73ec1bf96466be7a5869f0949d20b30`:
+//!   `const RUNTIME_DBS: [RuntimeDbSpec; 7]` -- `state_5.sqlite`,
+//!   `logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`,
+//!   `memories_v2_1.sqlite`, `queue_1.sqlite`,
 //!   `thread_history_1.sqlite`, each `codex_home.join(<filename>)`.
+//!   Seven, not six: `memories_v2_1.sqlite` is declared as a
+//!   struct-update over `MEMORIES_DB` with its filename inline, so
+//!   counting the `*_DB_FILENAME` consts gives six and misses it.
 //!   `SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"` can relocate all of them
 //!   *outside* `CODEX_HOME`; this adapter does not follow that override
 //!   (documented gap, same shape as `claude_code`'s undstood
@@ -230,6 +236,17 @@ const SQLITE_STORES: &[SqliteStore] = &[
         filename: "memories_1.sqlite",
         purpose: "episodic memory store",
     },
+    // The seventh. `RUNTIME_DBS: [RuntimeDbSpec; 7]` is easy to
+    // under-count because this one's filename is an inline literal in a
+    // struct-update expression rather than a `*_DB_FILENAME` const, and
+    // there are exactly six of those. Missing it meant a state store
+    // that was never folded with its `-wal`/`-shm` sidecars and never
+    // put in the protected SQLite category -- the 2026-09-22 re-review
+    // found it by reading the file this row already cited.
+    SqliteStore {
+        filename: "memories_v2_1.sqlite",
+        purpose: "episodic memory store, v2 schema",
+    },
     SqliteStore {
         filename: "queue_1.sqlite",
         purpose: "task queue store",
@@ -374,6 +391,14 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     }
     for store in SQLITE_STORES {
         seen_top_level.insert(store.filename.to_string());
+        // The sidecars too. They are already members of the store's own
+        // unit; leaving them out of this set counted their bytes a
+        // second time in the unclassified residual, and reported a
+        // `-wal` file as an unrecognized top-level entry of a layout
+        // this adapter does in fact recognize.
+        for sidecar_ext in ["-wal", "-shm"] {
+            seen_top_level.insert(format!("{}{sidecar_ext}", store.filename));
+        }
     }
 
     let mut residual_bytes = 0u64;
@@ -551,6 +576,64 @@ mod tests {
                 .iter()
                 .all(|m| m.kind == AgentMemberKind::Database),
             "every member of a SQLite store stays a Database member"
+        );
+    }
+
+    /// All **seven** runtime databases, each folded with its sidecars and
+    /// each protected. The count is the assertion: `RUNTIME_DBS` is
+    /// declared `[RuntimeDbSpec; 7]` upstream
+    /// (`codex-rs/state/src/sqlite.rs:105-113` @
+    /// `ac7634b9f73ec1bf96466be7a5869f0949d20b30`, vendored at
+    /// `crates/core/tests/fixtures/upstream/codex/ac7634b9f7/sqlite.rs`),
+    /// and this adapter modelled six -- `memories_v2_1.sqlite` was
+    /// unprotected, unfolded and uncounted.
+    #[test]
+    fn every_one_of_the_seven_runtime_databases_is_folded_and_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let expected = [
+            "state_5.sqlite",
+            "logs_2.sqlite",
+            "goals_1.sqlite",
+            "memories_1.sqlite",
+            "memories_v2_1.sqlite",
+            "queue_1.sqlite",
+            "thread_history_1.sqlite",
+        ];
+        for name in expected {
+            touch(&home.join(name), b"sqlite-bytes");
+            touch(&home.join(format!("{name}-wal")), b"wal");
+            touch(&home.join(format!("{name}-shm")), b"shm");
+        }
+        let units = run(home);
+        for name in expected {
+            let db = units
+                .iter()
+                .find(|u| u.relative_path == name)
+                .unwrap_or_else(|| panic!("{name} must be identified as its own store"));
+            assert!(db.protected, "{name} must be protected");
+            assert_eq!(db.action, AgentActionCapability::None, "{name}");
+            assert_eq!(
+                db.members.len(),
+                3,
+                "{name}: db + wal + shm folded together"
+            );
+            assert!(
+                db.members
+                    .iter()
+                    .all(|m| m.kind == AgentMemberKind::Database),
+                "{name}"
+            );
+        }
+        // And nothing leaks into the unclassified residual, which is
+        // where an unmodelled store would otherwise have shown up.
+        let residual = units
+            .iter()
+            .find(|u| u.category == AgentCategory::Unclassified);
+        assert!(
+            residual.is_none(),
+            "every runtime database must have its own unit: {:?}",
+            residual.map(|u| u.relative_path.clone())
         );
     }
 
