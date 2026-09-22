@@ -121,7 +121,7 @@ fn execute_one(
     _plan_unit: &swamp_core::grants::PlanUnit,
     grant: &Grant,
     ledger: &Ledger,
-    trash_root: &Path,
+    trash_root: &swamp_core::platform::trash::Target,
     actor: &str,
     keep_executables: bool,
 ) -> UnitResult {
@@ -150,8 +150,12 @@ fn execute_one(
             }
             swamp_core::actions::save_plan(store, plan)?;
             swamp_core::actions::approve(store, &plan.id, actor)?;
-            let result =
-                swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
+            let result = swamp_core::actions::execute_with_target(
+                store,
+                &plan.id,
+                actor,
+                trash_root.clone(),
+            )?;
             let outcome = result
                 .outcomes
                 .first()
@@ -197,8 +201,12 @@ fn execute_one(
             }
             swamp_core::actions::save_plan(store, plan)?;
             swamp_core::actions::approve(store, &plan.id, actor)?;
-            let result =
-                swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
+            let result = swamp_core::actions::execute_with_target(
+                store,
+                &plan.id,
+                actor,
+                trash_root.clone(),
+            )?;
             let outcome = result
                 .outcomes
                 .first()
@@ -327,7 +335,7 @@ fn trash_path(
     verb: Verb,
     grant: &Grant,
     ledger: &Ledger,
-    trash_root: &Path,
+    trash_root: &swamp_core::platform::trash::Target,
     actor: &str,
     extra: Option<serde_json::Value>,
 ) -> Result<Outcome> {
@@ -356,14 +364,18 @@ fn trash_path(
         }
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-    let dest = trash_root.join(format!("{name}-{}", now()));
-    std::fs::create_dir_all(trash_root)?;
-    std::fs::rename(path, &dest)?;
+    // The one shared backend the CLI's `execute` uses too: `~/.Trash`
+    // on macOS, the freedesktop Trash with a `.trashinfo` on Linux, a
+    // rename or a refusal on both (`swamp_core::platform::trash`).
+    let moved =
+        swamp_core::platform::trash::move_item(path, trash_root, &format!("{name}-{}", now()))?;
+    let dest = moved.location.clone();
     let mut evidence = serde_json::json!({
         "label": unit.label,
         "bytes": unit.bytes,
         "observed_at": unit.observed_at,
         "warnings_shown": unit.warnings,
+        "trash_info": moved.info,
     });
     if let Some(extra) = extra
         && let (Some(map), Some(more)) = (evidence.as_object_mut(), extra.as_object())
@@ -403,7 +415,7 @@ fn remove_worktree(
     terms: &WorktreeTerms,
     grant: &Grant,
     ledger: &Ledger,
-    trash_root: &Path,
+    trash_root: &swamp_core::platform::trash::Target,
     actor: &str,
 ) -> Result<Outcome> {
     let path = &unit.path;
@@ -468,7 +480,7 @@ pub fn execute_plan(
     plan: &swamp_core::grants::Plan,
     grant: &Grant,
     ledger: &Ledger,
-    trash_root: &Path,
+    trash_root: &swamp_core::platform::trash::Target,
     actor: &str,
     keep_executables: bool,
 ) -> Vec<UnitResult> {
@@ -491,7 +503,7 @@ pub fn execute_plan_progress(
     plan: &swamp_core::grants::Plan,
     grant: &Grant,
     ledger: &Ledger,
-    trash_root: &Path,
+    trash_root: &swamp_core::platform::trash::Target,
     actor: &str,
     keep_executables: bool,
     mut progress: impl FnMut(usize, &Path, Option<bool>) -> bool,
@@ -539,8 +551,8 @@ pub fn execute_plan_progress(
 /// it: the TUI and the CLI executing the same plan must put a unit in
 /// the same place, and two copies of a path convention is how they stop
 /// doing that.
-pub fn trash_root() -> PathBuf {
-    swamp_core::actions::trash_root()
+pub fn trash_root() -> anyhow::Result<swamp_core::platform::trash::Target> {
+    swamp_core::actions::trash_target()
 }
 
 /// Free space on the volume containing `path`, in bytes.
@@ -648,6 +660,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn dir_target(p: &Path) -> swamp_core::platform::trash::Target {
+        swamp_core::platform::trash::Target::Directory(p.to_path_buf())
+    }
+
     fn unit(path: &str, bytes: u64, docker: Option<swamp_core::docker::Removal>) -> MarkedUnit {
         MarkedUnit {
             cargo_plan: None,
@@ -754,13 +770,29 @@ mod tests {
         let trash = store.path().join("Trash");
         grant.created_outside_index = false;
         assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
-                .outcome
-                .is_err()
+            execute_plan(
+                &units,
+                &plan,
+                &grant,
+                &ledger,
+                &dir_target(&trash),
+                "human",
+                false
+            )[0]
+            .outcome
+            .is_err()
         );
         assert!(selected.exists());
         grant.created_outside_index = true;
-        let results = execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false);
+        let results = execute_plan(
+            &units,
+            &plan,
+            &grant,
+            &ledger,
+            &dir_target(&trash),
+            "human",
+            false,
+        );
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
         assert!(!selected.exists());
         assert!(
@@ -771,9 +803,17 @@ mod tests {
                 .any(|r| r.outcome == "completed")
         );
         assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
-                .outcome
-                .is_err()
+            execute_plan(
+                &units,
+                &plan,
+                &grant,
+                &ledger,
+                &dir_target(&trash),
+                "human",
+                false
+            )[0]
+            .outcome
+            .is_err()
         );
     }
 
@@ -801,7 +841,15 @@ mod tests {
         let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
         let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
         let trash = workdir.path().join("Trash");
-        let results = execute_plan(&[unit], &plan, &grant, &ledger, &trash, "human", false);
+        let results = execute_plan(
+            &[unit],
+            &plan,
+            &grant,
+            &ledger,
+            &dir_target(&trash),
+            "human",
+            false,
+        );
 
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
@@ -871,7 +919,7 @@ mod tests {
             &plan,
             &grant,
             &ledger,
-            &tmp.path().join("Trash"),
+            &dir_target(&tmp.path().join("Trash")),
             "human",
             false,
             |done, _, outcome| {

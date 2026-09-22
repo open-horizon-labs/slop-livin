@@ -105,26 +105,26 @@ pub fn platform_capabilities_gate_their_backends(root: &Path) -> Result<(), Stri
 /// name `install` landed in the "shared" set and `schedule::install` --
 /// the one function this rule exists to read -- was never walked. Four
 /// of the corpus's installers passed that way.
-type Node = (String, String);
+pub(crate) type Node = (String, String);
 
-struct FileModel {
-    rel: String,
+pub(crate) struct FileModel {
+    pub(crate) rel: String,
     /// The module path inside the crate (`["platform"]` for
     /// `platform/mod.rs`, `[]` for `lib.rs`/`main.rs`).
-    mods: Vec<String>,
-    funcs: Vec<ast::Func>,
-    arms: Vec<resolve::MatchArm>,
+    pub(crate) mods: Vec<String>,
+    pub(crate) funcs: Vec<ast::Func>,
+    pub(crate) arms: Vec<resolve::MatchArm>,
     /// Every call, test code included (the dispatch derivation filters).
-    all_calls: Vec<CallSite>,
+    pub(crate) all_calls: Vec<CallSite>,
 }
 
 /// Every file under `crates/{core,cli,tui}/src`, parsed and resolved
 /// **once**. The three rules read the same derived sets; building them
 /// per rule parsed the workspace five times.
-struct Workspace {
-    files: Vec<FileModel>,
+pub(crate) struct Workspace {
+    pub(crate) files: Vec<FileModel>,
     /// Production calls only, tagged with the calling file.
-    calls: Vec<(String, CallSite)>,
+    pub(crate) calls: Vec<(String, CallSite)>,
     /// Function name -> every definition with that name.
     by_name: BTreeMap<String, Vec<Node>>,
     /// File -> (crate directory, module path).
@@ -161,7 +161,7 @@ fn crate_dir(head: &str) -> Option<&'static str> {
 }
 
 impl Workspace {
-    fn load(root: &Path) -> Self {
+    pub(crate) fn load(root: &Path) -> Self {
         let mut files = Vec::new();
         let mut calls = Vec::new();
         let mut by_name: BTreeMap<String, Vec<Node>> = BTreeMap::new();
@@ -210,7 +210,7 @@ impl Workspace {
     /// which of the two they can afford: a walk that must reach every
     /// write takes all candidates, a set that is *subtracted* takes only
     /// exact ones.
-    fn targets(&self, caller: &str, c: &CallSite) -> Vec<Node> {
+    pub(crate) fn targets(&self, caller: &str, c: &CallSite) -> Vec<Node> {
         let name = last_segment(&c.path);
         let Some(cands) = self.by_name.get(name) else {
             return Vec::new();
@@ -309,7 +309,7 @@ impl Workspace {
     }
 
     /// The one definition a call reaches, when it is unambiguous.
-    fn exact_target(&self, caller: &str, c: &CallSite) -> Option<Node> {
+    pub(crate) fn exact_target(&self, caller: &str, c: &CallSite) -> Option<Node> {
         let t = self.targets(caller, c);
         (t.len() == 1).then(|| t[0].clone())
     }
@@ -368,7 +368,7 @@ fn capability_queries(ws: &Workspace) -> Result<BTreeSet<Node>, String> {
     Ok(out)
 }
 
-fn last_segment(path: &str) -> &str {
+pub(crate) fn last_segment(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
@@ -441,9 +441,9 @@ struct SchedulingFeature {
     owned: BTreeSet<Node>,
 }
 
-type Graph = BTreeMap<Node, BTreeSet<Node>>;
+pub(crate) type Graph = BTreeMap<Node, BTreeSet<Node>>;
 
-fn closure(seed: &BTreeSet<Node>, graph: &Graph) -> BTreeSet<Node> {
+pub(crate) fn closure(seed: &BTreeSet<Node>, graph: &Graph) -> BTreeSet<Node> {
     let mut seen = seed.clone();
     let mut queue: Vec<Node> = seed.iter().cloned().collect();
     while let Some(f) = queue.pop() {
@@ -459,7 +459,7 @@ fn closure(seed: &BTreeSet<Node>, graph: &Graph) -> BTreeSet<Node> {
 /// `definition -> definitions it may call`, production code only.
 /// `exact_only` selects which of the two edge sets (see
 /// [`SchedulingFeature`]).
-fn call_graph(ws: &Workspace, exact_only: bool) -> Graph {
+pub(crate) fn call_graph(ws: &Workspace, exact_only: bool) -> Graph {
     let mut g: Graph = BTreeMap::new();
     for (rel, c) in &ws.calls {
         if c.func.is_empty() {
@@ -550,7 +550,7 @@ enum Guarded {
     No,
 }
 
-fn show(n: &Node) -> String {
+pub(crate) fn show(n: &Node) -> String {
     format!("{}::{}", n.0, n.1)
 }
 

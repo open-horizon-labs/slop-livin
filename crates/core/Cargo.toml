@@ -31,6 +31,16 @@ roxmltree = "0.21.1"
 [dev-dependencies]
 walkdir = "2"
 
+# Linux-only and test-only: the independent freedesktop Trash reader.
+# swamp's own backend (`platform::trash`) does the move -- `trash::delete`
+# copies across devices and does not say where an item went (see
+# docs/platform.md) -- and these tests list and restore swamp's items
+# through the crate, which is the evidence that a file manager following
+# the same specification can find and restore them. `default-features =
+# false` still keeps `chrono`, which its Linux listing needs.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+trash = { version = "=5.2.9", default-features = false, features = ["chrono"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"

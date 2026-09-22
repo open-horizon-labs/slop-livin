@@ -675,7 +675,7 @@ pub(crate) fn move_reviewed(
     store_dir: &Path,
     group: &CargoGroup,
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
-    trash: &Path,
+    trash: &crate::platform::trash::Target,
 ) -> Result<PathBuf> {
     if locks(&group.profile)? != group.lock_paths {
         bail!("Cargo lock set changed; propose again");
@@ -735,36 +735,36 @@ pub(crate) fn move_reviewed(
                 .unwrap_or_else(|| "occupancy refused this group".to_string())
         ),
     }
-    fs::create_dir_all(trash)?;
-    if fs::metadata(trash)?.dev() != group.members[0].device {
+    // The reviewed device first: the group was proposed on one
+    // filesystem, and a member now on another is a different group.
+    if group
+        .members
+        .iter()
+        .any(|m| m.device != group.members[0].device)
+    {
         bail!("cross-device Trash unsupported; no permanent fallback");
     }
-    let dest = trash.join(format!("swamp-cargo-{}", crate::entities::new_id()));
-    fs::create_dir(&dest)?;
+    // One recoverable Trash item on the members' own filesystem
+    // (`platform::trash::Envelope`): refused before anything moves when
+    // the trash is on another one, and every member move is a rename.
+    let mut envelope = crate::platform::trash::Envelope::open(
+        &group.members[0].path,
+        trash,
+        &format!("swamp-cargo-{}", crate::entities::new_id()),
+    )?;
+    let dest = envelope.dir().to_path_buf();
     fs::write(dest.join("restore.json"), serde_json::to_vec_pretty(group)?)?;
     fs::File::open(dest.join("restore.json"))?.sync_all()?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (i, member) in group.members.iter().enumerate() {
-        let to = dest.join(format!(
-            "{i}-{}",
-            member.path.file_name().unwrap().to_string_lossy()
-        ));
-        if let Err(e) = fs::rename(&member.path, &to) {
-            let mut failures = Vec::new();
-            for (from, to) in moved.iter().rev() {
-                if from.exists() {
-                    failures.push(format!("{} reappeared", from.display()));
-                } else if let Err(e) = fs::rename(to, from) {
-                    failures.push(e.to_string());
-                }
-            }
+        let name = format!("{i}-{}", member.path.file_name().unwrap().to_string_lossy());
+        if let Err(e) = envelope.move_member(&member.path, &name) {
+            let failures = envelope.rollback();
             bail!(
                 "Cargo move failed: {e}; recovery manifest {}; rollback errors: {:?}",
                 dest.display(),
                 failures
             );
         }
-        moved.push((member.path.clone(), to));
     }
     Ok(dest)
 }

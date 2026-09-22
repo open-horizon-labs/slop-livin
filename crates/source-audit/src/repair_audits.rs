@@ -265,7 +265,10 @@ fn rechecks_of(
     };
     for c in calls {
         let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
-        if callee != name && index.contains_key(&callee) {
+        let is_recheck = RECHECK_PATHS
+            .iter()
+            .any(|(_, p)| crate::resolve::path_ends_with(&c.path, p));
+        if callee != name && !is_recheck && index.contains_key(&callee) {
             r = r.union(rechecks_of(&callee, index, seen));
         }
     }
@@ -305,6 +308,38 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
         index.entry(name.clone()).or_default().extend(calls.clone());
     }
 
+    // The Trash backend (#85, `platform::trash`, found by module path)
+    // performs the renames every recoverable action ends in. Its own
+    // file operations are not audited in place -- the backend has no
+    // unit to recheck -- they are audited *at every caller*: a call into
+    // a backend definition that moves or removes is itself a
+    // destructive call here, and needs the full, honoured rechecks
+    // before it exactly as a bare `fs::rename` would. Derived: whichever
+    // backend definitions reach a destructive path, transitively.
+    let in_backend = |rel: &str| rel.contains("/src/platform/trash");
+    let mut backend_destructive: HashSet<String> = HashSet::new();
+    loop {
+        let before = backend_destructive.len();
+        for (rel, name, calls) in &functions {
+            if !in_backend(rel) {
+                continue;
+            }
+            let destroys = calls.iter().any(|c| {
+                (!c.method
+                    && DESTRUCTIVE_PATHS
+                        .iter()
+                        .any(|d| crate::resolve::path_ends_with(&c.path, d)))
+                    || backend_destructive.contains(c.path.rsplit("::").next().unwrap_or(""))
+            });
+            if destroys {
+                backend_destructive.insert(name.clone());
+            }
+        }
+        if backend_destructive.len() == before {
+            break;
+        }
+    }
+
     let mut violations: Vec<String> = Vec::new();
     for (rel, name, calls) in &functions {
         if STORE_BOOKKEEPING_FNS
@@ -313,9 +348,13 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
         {
             continue;
         }
-        // The recheck model itself, the Trash backend's internal file
-        // ops and the store's own Parquet publishing are not user data.
-        if rel.ends_with("/recheck.rs") || rel.ends_with("/store.rs") || rel.ends_with("/growth.rs")
+        // The recheck model itself and the store's own Parquet
+        // publishing are not user data; the Trash backend is audited at
+        // its callers (above).
+        if rel.ends_with("/recheck.rs")
+            || rel.ends_with("/store.rs")
+            || rel.ends_with("/growth.rs")
+            || in_backend(rel)
         {
             continue;
         }
@@ -324,10 +363,12 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
         let destructive: Vec<&crate::resolve::CallSite> = calls
             .iter()
             .filter(|c| {
-                !c.method
+                (!c.method
                     && DESTRUCTIVE_PATHS
                         .iter()
-                        .any(|d| crate::resolve::path_ends_with(&c.path, d))
+                        .any(|d| crate::resolve::path_ends_with(&c.path, d)))
+                    || (backend_destructive.contains(c.path.rsplit("::").next().unwrap_or(""))
+                        && (c.method || c.path.contains("trash::")))
             })
             .collect();
         for d in destructive {
@@ -343,9 +384,17 @@ pub fn execution_sinks_recheck_live_state(root: &Path) -> Result<(), String> {
                     }
                 }
                 // Helper credit, transitively, but only for helpers
-                // called *before* the destructive statement.
+                // called *before* the destructive statement -- and never
+                // through a recheck's own body: `let _ =
+                // member_occupancy(..)` is a discarded recheck, and the
+                // name-keyed walk into what `member_occupancy` calls
+                // must not hand the credit back (it did, once the probe
+                // grew helpers of its own).
                 let callee = c.path.rsplit("::").next().unwrap_or(&c.path).to_string();
-                if &callee != name && index.contains_key(&callee) {
+                let is_recheck = RECHECK_PATHS
+                    .iter()
+                    .any(|(_, p)| crate::resolve::path_ends_with(&c.path, p));
+                if &callee != name && !is_recheck && index.contains_key(&callee) {
                     let mut seen = HashSet::new();
                     have = have.union(rechecks_of(&callee, &index, &mut seen));
                 }

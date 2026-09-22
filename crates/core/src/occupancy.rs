@@ -79,6 +79,41 @@ impl OccupancyState {
 /// captured separately so an ordinary `lsof` warning is not mistaken for
 /// an open handle, while a permission error still becomes `Unknown`.
 pub fn probe_path(path: &Path) -> OccupancyState {
+    probe_paths(&[path])
+}
+
+/// [`probe_path`] over several anchors at once. On Linux that is one
+/// procfs pass for all of them (a process table scan per anchor would
+/// multiply); on macOS it is one bounded `lsof` per anchor, as it
+/// always was. The first non-`Free` answer wins.
+pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
+    match crate::platform::OccupancyProbe::for_os(crate::platform::Os::current()) {
+        crate::platform::OccupancyProbe::Lsof => {
+            for p in paths {
+                match lsof_probe(p) {
+                    OccupancyState::Free => {}
+                    other => return other,
+                }
+            }
+            OccupancyState::Free
+        }
+        crate::platform::OccupancyProbe::Procfs => {
+            // SAFETY: getuid/getpid cannot fail and read no memory.
+            let (uid, pid) = unsafe { (libc::getuid(), libc::getpid() as u32) };
+            procfs_probe(Path::new("/proc"), paths, uid, pid, OCCUPANCY_TIMEOUT)
+        }
+    }
+}
+
+/// The name a current-use fact gives for where its answer came from.
+fn probe_tool() -> &'static str {
+    match crate::platform::OccupancyProbe::for_os(crate::platform::Os::current()) {
+        crate::platform::OccupancyProbe::Lsof => "lsof",
+        crate::platform::OccupancyProbe::Procfs => "procfs",
+    }
+}
+
+fn lsof_probe(path: &Path) -> OccupancyState {
     use std::io::{Read, Seek, SeekFrom};
 
     let is_dir = match std::fs::symlink_metadata(path) {
@@ -130,18 +165,25 @@ pub fn probe_path(path: &Path) -> OccupancyState {
             }
         }
     };
-    let read_all = |mut f: std::fs::File| -> String {
+    // A capture that cannot be read back is a probe that did not
+    // answer. Reading it as empty would turn "could not look" into
+    // "found nothing" -- a fail-open `occupancy_gaps_are_unknown_never_free`
+    // found in this function when it was written.
+    let read_all = |mut f: std::fs::File| -> std::io::Result<String> {
         let mut s = String::new();
-        let _ = f.seek(SeekFrom::Start(0));
-        let _ = f.read_to_string(&mut s);
-        s
+        f.seek(SeekFrom::Start(0))?;
+        f.read_to_string(&mut s)?;
+        Ok(s)
     };
-    classify_lsof_exit(
-        status.code(),
-        &read_all(out_file),
-        &read_all(err_file),
-        path,
-    )
+    let stdout = match read_all(out_file) {
+        Ok(s) => s,
+        Err(e) => return OccupancyState::Unknown(format!("could not read lsof's output: {e}")),
+    };
+    let stderr = match read_all(err_file) {
+        Ok(s) => s,
+        Err(e) => return OccupancyState::Unknown(format!("could not read lsof's errors: {e}")),
+    };
+    classify_lsof_exit(status.code(), &stdout, &stderr, path)
 }
 
 /// Pure classification of a completed `lsof` run, factored out so the
@@ -175,6 +217,261 @@ fn classify_lsof_exit(
     }
 }
 
+// ---------------------------------------------------------------------
+// Linux: procfs (#86)
+// ---------------------------------------------------------------------
+
+/// Linux occupancy from procfs, unprivileged: for every process running
+/// as this user, its `cwd`, `root` and `exe` links, every open file
+/// descriptor, and every file it has mapped (`maps`) are compared with
+/// the anchors. Anything at or under an anchor is `Occupied`.
+///
+/// **What it can see, and what it answers when it cannot.** An
+/// unprivileged process can read the fd table of the processes that run
+/// as its own user and no others; that is the same boundary `lsof`
+/// has without root, on either platform. So the question answered is
+/// "does any process running as you hold this" -- the evidence says so
+/// in its coverage note -- and every way *that* question can go
+/// unanswered is `Unknown`, never `Free`:
+///
+/// * a process running as this user whose fd table, links or maps
+///   cannot be read (a non-dumpable process such as an agent that
+///   called `prctl(PR_SET_DUMPABLE, 0)`; a Yama or LSM restriction);
+/// * a procfs that belongs to another PID namespace (`/proc/self` is
+///   not this process), where the processes listed are not the ones
+///   that share this filesystem view;
+/// * a process table or `/proc` that cannot be listed at all;
+/// * the scan running past its time bound.
+///
+/// A process that exits mid-scan (`ENOENT`/`ESRCH` on its entries) is
+/// skipped: it holds nothing any more. Another user's processes are
+/// counted, not read. `hidepid` hides only those, so it narrows nothing
+/// the question depends on.
+///
+/// Pure over `proc_root` so the fail-closed rules are testable against
+/// a fixture tree on either platform; the real call passes `/proc`.
+pub fn procfs_probe(
+    proc_root: &Path,
+    anchors: &[&Path],
+    self_uid: u32,
+    self_pid: u32,
+    budget: Duration,
+) -> OccupancyState {
+    use std::io::ErrorKind;
+    let started = Instant::now();
+
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    for a in anchors {
+        match std::fs::canonicalize(a) {
+            Ok(c) => targets.push(c),
+            // Nothing there to hold open; the caller's identity recheck
+            // is what refuses a vanished path.
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return OccupancyState::Unknown(format!("cannot resolve {}: {e}", a.display()));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return OccupancyState::Free;
+    }
+
+    // The procfs must be this PID namespace's.
+    match std::fs::read_link(proc_root.join("self")) {
+        Ok(link) if link.to_str() == Some(self_pid.to_string().as_str()) => {}
+        Ok(link) => {
+            return OccupancyState::Unknown(format!(
+                "{}/self is {} rather than this process ({self_pid}): the process table belongs \
+                 to another PID namespace, so the processes sharing this filesystem are not the \
+                 ones listed",
+                proc_root.display(),
+                link.display()
+            ));
+        }
+        Err(e) => {
+            return OccupancyState::Unknown(format!(
+                "cannot read {}/self ({e}); procfs is not usable here",
+                proc_root.display()
+            ));
+        }
+    }
+
+    let entries = match std::fs::read_dir(proc_root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            return OccupancyState::Unknown(format!("cannot list {} ({e})", proc_root.display()));
+        }
+    };
+    let held = |p: &Path| -> Option<std::path::PathBuf> {
+        let text = p.to_string_lossy();
+        let text = text.strip_suffix(" (deleted)").unwrap_or(&text);
+        let p = Path::new(text);
+        targets
+            .iter()
+            .find(|t| p.starts_with(t))
+            .map(|_| p.to_path_buf())
+    };
+
+    for entry in entries {
+        if started.elapsed() > budget {
+            return OccupancyState::Unknown(format!(
+                "the procfs scan did not finish within {}s",
+                budget.as_secs()
+            ));
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                return OccupancyState::Unknown(format!(
+                    "listing {} failed part-way ({e})",
+                    proc_root.display()
+                ));
+            }
+        };
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let dir = entry.path();
+        let owner = match process_uid(&dir) {
+            Ok(Some(uid)) => uid,
+            // Exited between the listing and now.
+            Ok(None) => continue,
+            Err(why) => return OccupancyState::Unknown(format!("process {pid}: {why}")),
+        };
+        if owner != self_uid {
+            // Another user's process: outside what an unprivileged probe
+            // can read, and outside the question (see the doc comment).
+            continue;
+        }
+        match process_holds(&dir, &held) {
+            Ok(Some(member)) => return OccupancyState::Occupied(member),
+            Ok(None) => {}
+            Err(why) => {
+                return OccupancyState::Unknown(format!(
+                    "process {pid} ({}) runs as this user but {why}, so whether it holds \
+                     anything under the selection is not known",
+                    process_name(&dir)
+                ));
+            }
+        }
+    }
+    OccupancyState::Free
+}
+
+/// The effective uid a process runs as: `status`'s `Uid:` line, whose
+/// second field is the effective uid. `status` stays readable for a
+/// non-dumpable process, whose other entries become root-owned -- which
+/// is why the directory's owner is not used when `status` answers.
+/// `Ok(None)` when the process has exited.
+fn process_uid(dir: &Path) -> Result<Option<u32>, String> {
+    use std::io::ErrorKind;
+    match std::fs::read_to_string(dir.join("status")) {
+        Ok(text) => {
+            let uid = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .and_then(|rest| rest.split_whitespace().nth(1))
+                .and_then(|u| u.parse::<u32>().ok());
+            match uid {
+                Some(u) => Ok(Some(u)),
+                None => Err("its status has no readable Uid line".into()),
+            }
+        }
+        Err(e) if gone(&e) => Ok(None),
+        // `hidepid=1`: another user's status is unreadable. The
+        // directory's owner still says whose it is.
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::symlink_metadata(dir) {
+                Ok(m) => Ok(Some(m.uid())),
+                Err(e) if gone(&e) => Ok(None),
+                Err(e) => Err(format!("cannot stat it ({e})")),
+            }
+        }
+        Err(e) => Err(format!("cannot read its status ({e})")),
+    }
+}
+
+fn gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn process_name(dir: &Path) -> String {
+    match std::fs::read_to_string(dir.join("comm")) {
+        Ok(c) => c.trim().to_string(),
+        Err(e) => format!("name unreadable: {e}"),
+    }
+}
+
+/// Whether one process holds anything under an anchor: its `cwd`,
+/// `root` and `exe` links, each fd, each mapped file. `Ok(None)` also
+/// when the process exited while it was being read.
+fn process_holds(
+    dir: &Path,
+    held: &dyn Fn(&Path) -> Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    for link in ["cwd", "root", "exe"] {
+        match std::fs::read_link(dir.join(link)) {
+            Ok(t) => {
+                if let Some(m) = held(&t) {
+                    return Ok(Some(m));
+                }
+            }
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(format!("its {link} link cannot be read ({e})")),
+        }
+    }
+    let fds = match std::fs::read_dir(dir.join("fd")) {
+        Ok(rd) => rd,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(format!("its open files cannot be listed ({e})")),
+    };
+    for fd in fds {
+        let fd = match fd {
+            Ok(f) => f,
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(format!("its open files cannot be listed ({e})")),
+        };
+        match std::fs::read_link(fd.path()) {
+            Ok(t) => {
+                if let Some(m) = held(&t) {
+                    return Ok(Some(m));
+                }
+            }
+            // That descriptor closed since the listing.
+            Err(e) if gone(&e) => {}
+            Err(e) => {
+                return Err(format!(
+                    "its descriptor {:?} cannot be read ({e})",
+                    fd.file_name()
+                ));
+            }
+        }
+    }
+    match std::fs::read_to_string(dir.join("maps")) {
+        Ok(maps) => {
+            for line in maps.lines() {
+                // address perms offset dev inode pathname
+                let Some(path) = line.split_whitespace().nth(5) else {
+                    continue;
+                };
+                if path.starts_with('/')
+                    && let Some(m) = held(Path::new(path))
+                {
+                    return Ok(Some(m));
+                }
+            }
+            Ok(None)
+        }
+        Err(e) if gone(&e) => Ok(None),
+        Err(e) => Err(format!("its memory maps cannot be read ({e})")),
+    }
+}
+
 /// Boolean convenience over [`probe_path`], fail-closed: anything but
 /// [`OccupancyState::Free`] is `true`. **Never call this from a
 /// destructive sink** -- it collapses `Unknown` into `Occupied` and so
@@ -199,7 +496,7 @@ pub fn occupied(path: &Path) -> bool {
 pub fn open_file_evidence(path: &Path) -> Evidence {
     let observed_at = crate::entities::now();
     let source = EvidenceSource::ProcessQuery {
-        tool: "lsof".into(),
+        tool: probe_tool().into(),
     };
     match probe_path(path) {
         OccupancyState::Occupied(open_at) => Evidence::known(
@@ -218,7 +515,11 @@ pub fn open_file_evidence(path: &Path) -> Evidence {
             source,
             observed_at,
         )
-        .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS))
+        .with_freshness(Freshness::expires_after_with_coverage(
+            CURRENT_USE_EXPIRY_SECS,
+            "only processes this user can inspect: those running as this user. Another user's \
+             process (a root daemon, a container runtime) is not visible without privileges",
+        ))
         .with_note(
             "no open-file match for this path or anything under it this pass; not proof that no \
              process or consumer needs it",
@@ -429,6 +730,7 @@ fn find_simulator_state(json_text: &str, udid: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::evidence::FactStatus;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -634,5 +936,171 @@ mod tests {
         .with_freshness(Freshness::expires_after(CURRENT_USE_EXPIRY_SECS));
         assert!(!ev.is_stale(ev.observed_at + CURRENT_USE_EXPIRY_SECS));
         assert!(ev.is_stale(ev.observed_at + CURRENT_USE_EXPIRY_SECS + 1));
+    }
+
+    // ---- procfs (#86): the fail-closed rules against fixture trees ----
+
+    struct FakeProc {
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        work: std::path::PathBuf,
+    }
+
+    const ME: u32 = 1000;
+    const MY_PID: u32 = 4242;
+
+    fn fake_proc() -> FakeProc {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("proc");
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join("target/debug")).unwrap();
+        std::fs::write(work.join("target/debug/app"), b"x").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(MY_PID.to_string(), root.join("self")).unwrap();
+        FakeProc {
+            _tmp: tmp,
+            root,
+            work,
+        }
+    }
+
+    fn process(fp: &FakeProc, pid: u32, uid: u32, cwd: &Path, fds: &[&Path]) -> std::path::PathBuf {
+        let d = fp.root.join(pid.to_string());
+        std::fs::create_dir_all(d.join("fd")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("comm"), "fixture\n").unwrap();
+        std::os::unix::fs::symlink(cwd, d.join("cwd")).unwrap();
+        std::os::unix::fs::symlink("/", d.join("root")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/fixture", d.join("exe")).unwrap();
+        for (i, f) in fds.iter().enumerate() {
+            std::os::unix::fs::symlink(f, d.join("fd").join(i.to_string())).unwrap();
+        }
+        std::fs::write(d.join("maps"), "").unwrap();
+        d
+    }
+
+    fn proc_probe(fp: &FakeProc) -> OccupancyState {
+        let target = fp.work.join("target");
+        procfs_probe(&fp.root, &[&target], ME, MY_PID, Duration::from_secs(10))
+    }
+
+    #[test]
+    fn procfs_a_process_holding_a_descendant_file_or_cwd_is_occupied() {
+        let fp = fake_proc();
+        process(&fp, 10, ME, Path::new("/"), &[Path::new("/dev/null")]);
+        assert_eq!(proc_probe(&fp), OccupancyState::Free);
+
+        let app = fp.work.join("target/debug/app");
+        process(&fp, 11, ME, Path::new("/"), &[&app]);
+        assert_eq!(proc_probe(&fp), OccupancyState::Occupied(app));
+
+        let fp = fake_proc();
+        let cwd = fp.work.join("target/debug");
+        process(&fp, 12, ME, &cwd, &[]);
+        assert_eq!(proc_probe(&fp), OccupancyState::Occupied(cwd));
+
+        let fp = fake_proc();
+        let d = process(&fp, 13, ME, Path::new("/"), &[]);
+        let app = fp.work.join("target/debug/app");
+        std::fs::write(
+            d.join("maps"),
+            format!("7f00-7f01 r-xp 00000000 08:01 1234  {}\n", app.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            proc_probe(&fp),
+            OccupancyState::Occupied(app),
+            "a mapped file counts"
+        );
+    }
+
+    /// A deleted-but-open file under the anchor still holds its space.
+    #[test]
+    fn procfs_a_deleted_open_file_under_the_anchor_still_counts() {
+        let fp = fake_proc();
+        let gone = format!("{}/target/debug/old.o (deleted)", fp.work.display());
+        process(&fp, 20, ME, Path::new("/"), &[Path::new(&gone)]);
+        assert!(matches!(proc_probe(&fp), OccupancyState::Occupied(_)));
+    }
+
+    /// Another user's process is outside the question; one of *ours*
+    /// whose fd table cannot be read is `Unknown`, never `Free`.
+    #[test]
+    fn procfs_an_unreadable_process_of_this_user_is_unknown_not_free() {
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("SKIP procfs_an_unreadable_process: root ignores the mode bits");
+            return;
+        }
+        let fp = fake_proc();
+        let d = process(&fp, 30, ME + 1, Path::new("/"), &[]);
+        std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            proc_probe(&fp),
+            OccupancyState::Free,
+            "another user's process is not read"
+        );
+        std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let fp = fake_proc();
+        let d = process(&fp, 31, ME, Path::new("/"), &[]);
+        std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = proc_probe(&fp);
+        std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        match got {
+            OccupancyState::Unknown(why) => {
+                assert!(why.contains("31") && why.contains("open files"), "{why}")
+            }
+            other => panic!("a same-user process we cannot read must be Unknown: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn procfs_a_foreign_pid_namespace_or_missing_proc_is_unknown() {
+        let fp = fake_proc();
+        std::fs::remove_file(fp.root.join("self")).unwrap();
+        std::os::unix::fs::symlink("1", fp.root.join("self")).unwrap();
+        match proc_probe(&fp) {
+            OccupancyState::Unknown(why) => assert!(why.contains("namespace"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let fp = fake_proc();
+        let target = fp.work.join("target");
+        let got = procfs_probe(
+            &fp.root.join("missing"),
+            &[&target],
+            ME,
+            MY_PID,
+            Duration::from_secs(10),
+        );
+        assert!(matches!(got, OccupancyState::Unknown(_)), "{got:?}");
+    }
+
+    /// A process that exits mid-scan holds nothing; its vanished entries
+    /// are not an error and not a reason to refuse.
+    #[test]
+    fn procfs_a_process_that_exited_mid_scan_is_skipped() {
+        let fp = fake_proc();
+        let d = fp.root.join("40");
+        std::fs::create_dir_all(&d).unwrap();
+        // status present, everything else gone: exited after listing.
+        std::fs::write(d.join("status"), format!("Uid:\t{ME}\t{ME}\t{ME}\t{ME}\n")).unwrap();
+        assert_eq!(proc_probe(&fp), OccupancyState::Free);
+    }
+
+    #[test]
+    fn procfs_past_its_time_bound_is_unknown() {
+        let fp = fake_proc();
+        process(&fp, 50, ME, Path::new("/"), &[]);
+        let target = fp.work.join("target");
+        let got = procfs_probe(&fp.root, &[&target], ME, MY_PID, Duration::ZERO);
+        assert!(
+            matches!(got, OccupancyState::Unknown(ref w) if w.contains("did not finish")),
+            "{got:?}"
+        );
     }
 }

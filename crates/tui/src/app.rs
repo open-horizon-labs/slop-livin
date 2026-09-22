@@ -212,6 +212,16 @@ pub struct App {
     /// When the last batch arrived; observation starts once the stream has
     /// been quiet for `LIVE_QUIET`.
     pub live_last_batch: Option<Instant>,
+    /// Roots whose next live refresh must walk fully, and why: the
+    /// watch lost coverage (Linux: overflow, watch limit, permissions),
+    /// or its epoch opened after the root's last observation, leaving a
+    /// gap nothing covers. Empty on macOS, whose stream reports neither.
+    pub live_full_walk:
+        std::collections::HashMap<PathBuf, (swamp_core::fs_events::RefreshRefusal, String)>,
+    /// Roots whose watch cannot vouch for anything any more (a watch
+    /// limit, a permission gap): live refresh is off for them and the
+    /// status line says why. The background refresh still covers them.
+    pub live_off: std::collections::HashMap<PathBuf, String>,
     /// External/shared storage units (#43), for `ViewKind::External`.
     /// Empty until `set_external_units` is called (once, at startup --
     /// detector resolution is disk I/O and never runs on this struct's
@@ -380,6 +390,8 @@ impl App {
             live_changes: std::collections::HashSet::new(),
             live_last_event_id: 0,
             live_last_batch: None,
+            live_full_walk: std::collections::HashMap::new(),
+            live_off: std::collections::HashMap::new(),
             track: std::collections::HashMap::new(),
             history_secs: None,
             external_units: Vec::new(),
@@ -1547,10 +1559,18 @@ impl App {
     /// human authorization for this one plan. Drives plan -> grant ->
     /// execute -> ledger, then re-observes the affected worktrees only.
     pub fn confirm_delete(&mut self) {
-        self.start_delete(crate::ledger_path(), actions::trash_root());
+        match actions::trash_root() {
+            Ok(trash) => self.start_delete(crate::ledger_path(), trash),
+            // Unknown recovery capability refuses: nothing is moved when
+            // there is no Trash to say where it would go.
+            Err(e) => {
+                self.confirm_open = false;
+                self.refusal = Some((format!("refused: {e:#}"), Instant::now()));
+            }
+        }
     }
 
-    fn start_delete(&mut self, ledger_path: PathBuf, trash: PathBuf) {
+    fn start_delete(&mut self, ledger_path: PathBuf, trash: swamp_core::platform::trash::Target) {
         if !self.confirm_open || self.operation.is_some() {
             return;
         }
@@ -1593,7 +1613,7 @@ impl App {
                     return;
                 }
             };
-            let free_before = actions::free_space_bytes(&trash);
+            let free_before = actions::free_space_bytes(&trash.probe_path());
             let results = actions::execute_plan_progress(
                 &units,
                 &plan,
@@ -1612,7 +1632,7 @@ impl App {
                     !cancel.load(std::sync::atomic::Ordering::SeqCst)
                 },
             );
-            let measured = match (free_before, actions::free_space_bytes(&trash)) {
+            let measured = match (free_before, actions::free_space_bytes(&trash.probe_path())) {
                 (Some(b), Some(a)) => Some(a as i64 - b as i64),
                 _ => None,
             };
@@ -1779,8 +1799,13 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        // swamp's own store is never watched: writing an observation's
+        // results must not trigger the next live refresh.
+        let exclude: Vec<PathBuf> = self.store_dir.iter().cloned().collect();
         for root in self.roots.clone() {
-            if let Some(w) = swamp_core::fs_events::watch(&root, tx.clone()) {
+            if let Some(w) =
+                swamp_core::fs_events::watch_excluding(&root, exclude.clone(), tx.clone())
+            {
                 self.watches.push(w);
             }
         }
@@ -1809,10 +1834,52 @@ impl App {
         let Some(rx) = &self.watch_rx else {
             return;
         };
+        let mut batches = Vec::new();
         while let Ok(batch) = rx.try_recv() {
-            self.live_changes.extend(batch.changed_dirs);
-            self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
-            self.live_last_batch = Some(Instant::now());
+            batches.push(batch);
+        }
+        for batch in batches {
+            self.apply_watch_batch(batch);
+        }
+    }
+
+    /// One batch's effect. Changes accumulate for the next quiet-window
+    /// refresh; a coverage loss or an epoch newer than the root's last
+    /// observation turns that refresh into a full walk with the reason
+    /// named, never an incremental one over an incomplete change list.
+    fn apply_watch_batch(&mut self, batch: swamp_core::fs_events::WatchBatch) {
+        use swamp_core::fs_events::RefreshRefusal;
+        self.live_changes.extend(batch.changed_dirs);
+        self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
+        self.live_last_batch = Some(Instant::now());
+        if let Some((reason, detail)) = batch.coverage_lost {
+            let unrecoverable = matches!(
+                reason,
+                RefreshRefusal::WatchLimitReached | RefreshRefusal::WatchPermissionGap
+            );
+            if unrecoverable {
+                self.status = Some(format!(
+                    "live refresh off for {}: {detail} ({})",
+                    batch.root.display(),
+                    reason.as_str()
+                ));
+                self.live_off.insert(batch.root.clone(), detail.clone());
+            }
+            self.live_full_walk
+                .insert(batch.root.clone(), (reason, detail));
+        }
+        if let Some(opened_at) = batch.epoch_opened_at {
+            let observed = self
+                .reports_by_root
+                .get(&batch.root)
+                .map(|r| r.observed_at)
+                .or_else(|| (self.roots.len() == 1).then_some(self.report.observed_at));
+            if observed.is_none_or(|t| t < opened_at) {
+                self.live_full_walk.entry(batch.root.clone()).or_insert((
+                    RefreshRefusal::LiveWatchGap,
+                    "the watch opened after this root's last observation".into(),
+                ));
+            }
         }
     }
 
@@ -1820,7 +1887,7 @@ impl App {
     /// been quiet long enough.
     pub fn live_observe_due(&self) -> bool {
         self.pending.is_none()
-            && !self.live_changes.is_empty()
+            && (!self.live_changes.is_empty() || !self.live_full_walk.is_empty())
             && self
                 .live_last_batch
                 .is_some_and(|t| t.elapsed() >= Self::LIVE_QUIET)
@@ -1846,10 +1913,21 @@ impl App {
         let Some(store) = self.store_dir.clone() else {
             return;
         };
-        if self.pending.is_some() || self.live_changes.is_empty() {
+        if self.pending.is_some()
+            || (self.live_changes.is_empty() && self.live_full_walk.is_empty())
+        {
             return;
         }
-        let Some(root) = self.live_changes.iter().find_map(|p| self.root_for_path(p)) else {
+        // A root owed a full walk goes first: its changes, if any, are
+        // covered by that walk.
+        let forced = self
+            .roots
+            .iter()
+            .find(|r| self.live_full_walk.contains_key(*r))
+            .cloned();
+        let Some(root) =
+            forced.or_else(|| self.live_changes.iter().find_map(|p| self.root_for_path(p)))
+        else {
             // Every pending change is outside every known root (a root
             // was removed from scope since the watcher was started);
             // drop them rather than looping forever on changes nothing
@@ -1866,11 +1944,22 @@ impl App {
         let device = std::fs::metadata(&root)
             .ok()
             .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
-        let plan = swamp_core::fs_events::FsEventsPlan::from_live(
-            changed,
-            self.live_last_event_id,
-            device,
-        );
+        let plan = match self.live_full_walk.remove(&root) {
+            Some((reason, _)) => swamp_core::fs_events::FsEventsPlan::refused(reason, device),
+            // A root whose watch can no longer vouch for anything is not
+            // refreshed from its partial change list.
+            None if self.live_off.contains_key(&root) => {
+                swamp_core::fs_events::FsEventsPlan::refused(
+                    swamp_core::fs_events::RefreshRefusal::WatchLimitReached,
+                    device,
+                )
+            }
+            None => swamp_core::fs_events::FsEventsPlan::from_live(
+                changed,
+                self.live_last_event_id,
+                device,
+            ),
+        };
         // A live refresh re-walks one root -- through that root's own
         // slice of the authorized scope, so its exclusions and external
         // prune notes still apply. Without a scope there is nothing
@@ -2115,7 +2204,10 @@ mod tests {
             },
         );
         app.confirm_open = true;
-        app.start_delete(tmp.path().join("ledger.jsonl"), tmp.path().join("Trash"));
+        app.start_delete(
+            tmp.path().join("ledger.jsonl"),
+            swamp_core::platform::trash::Target::Directory(tmp.path().join("Trash")),
+        );
         assert!(app.operation.is_some());
         assert!(!app.confirm_open);
         wait_operation(&mut app);
@@ -2228,7 +2320,7 @@ mod tests {
         app.confirm_open = true;
         app.start_delete(
             claude_home.path().join("ledger.jsonl"),
-            claude_home.path().join("Trash"),
+            swamp_core::platform::trash::Target::Directory(claude_home.path().join("Trash")),
         );
         wait_operation(&mut app);
         assert!(!cache_path.exists(), "marked cache dir must be trashed");
@@ -2536,6 +2628,91 @@ mod tests {
         );
     }
 
+    /// A watch that lost coverage (Linux: an inotify queue overflow)
+    /// never lets its partial change list drive an incremental refresh:
+    /// the next live refresh of that root is a full walk naming the loss.
+    #[test]
+    fn a_coverage_loss_turns_the_next_live_refresh_into_a_named_full_walk() {
+        use swamp_core::fs_events::RefreshRefusal;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(std::env::temp_dir());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.watch_rx = Some(rx);
+        tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            changed_dirs: vec![PathBuf::from("/root/mole")],
+            last_event_id: 3,
+            coverage_lost: Some((RefreshRefusal::WatchQueueOverflow, "overflowed".into())),
+            epoch_opened_at: None,
+        })
+        .unwrap();
+        app.drain_watch();
+        assert_eq!(
+            app.live_full_walk
+                .get(&PathBuf::from("/root"))
+                .map(|(r, _)| *r),
+            Some(RefreshRefusal::WatchQueueOverflow)
+        );
+        app.live_last_batch = Some(Instant::now() - Duration::from_secs(1));
+        assert!(app.live_observe_due());
+        assert!(
+            app.live_off.is_empty(),
+            "an overflow is recoverable: live refresh stays on"
+        );
+
+        // A watch limit is not recoverable: live refresh goes off for the
+        // root, and the status line says why.
+        tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            coverage_lost: Some((RefreshRefusal::WatchLimitReached, "no watches left".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        app.drain_watch();
+        assert!(app.live_off.contains_key(&PathBuf::from("/root")));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("watch_limit_reached")
+        );
+    }
+
+    /// A watch whose epoch opened after the root's last observation
+    /// cannot vouch for the gap in between: one full walk first.
+    #[test]
+    fn an_epoch_newer_than_the_last_observation_owes_a_full_walk() {
+        use swamp_core::fs_events::RefreshRefusal;
+        let mut report = fixture_report();
+        report.observed_at = 1_000;
+        let mut app = App::new(report, "/root".into());
+        app.store_dir = Some(std::env::temp_dir());
+        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            epoch_opened_at: Some(2_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.live_full_walk
+                .get(&PathBuf::from("/root"))
+                .map(|(r, _)| *r),
+            Some(RefreshRefusal::LiveWatchGap)
+        );
+
+        let mut report = fixture_report();
+        report.observed_at = 3_000;
+        let mut app = App::new(report, "/root".into());
+        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            epoch_opened_at: Some(2_000),
+            ..Default::default()
+        });
+        assert!(
+            app.live_full_walk.is_empty(),
+            "an observation inside the epoch is covered"
+        );
+    }
+
     #[test]
     fn live_changes_are_observed_after_the_stream_goes_quiet() {
         let mut app = App::new(fixture_report(), "/root".into());
@@ -2543,8 +2720,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.watch_rx = Some(rx);
         tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
             changed_dirs: vec![PathBuf::from("/root/mole/node_modules")],
             last_event_id: 42,
+            ..Default::default()
         })
         .unwrap();
         app.drain_watch();

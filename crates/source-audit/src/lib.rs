@@ -9,6 +9,7 @@
 
 pub mod ast;
 pub mod audits;
+pub mod linux_audits;
 pub mod platform_audits;
 pub mod repair_audits;
 pub mod resolve;

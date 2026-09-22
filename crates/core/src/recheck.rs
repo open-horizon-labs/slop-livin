@@ -508,13 +508,8 @@ pub fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
         }
         probed.push(p);
     }
-    for p in probed {
-        match crate::occupancy::probe_path(p) {
-            OccupancyState::Free => {}
-            other => return other,
-        }
-    }
-    OccupancyState::Free
+    let anchors: Vec<&Path> = probed.iter().map(|p| p.as_path()).collect();
+    crate::occupancy::probe_paths(&anchors)
 }
 
 #[cfg(test)]

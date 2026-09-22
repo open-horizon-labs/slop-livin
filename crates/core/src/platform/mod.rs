@@ -318,19 +318,26 @@ impl Scheduling {
 
 /// How a build answers "does anything have this path open right now".
 ///
-/// Both targets shell out to `lsof` today. The distinction that matters
-/// is not which tool but that a *missing* tool is
-/// [`crate::occupancy::OccupancyState::Unknown`], never "free" -- which
-/// is enforced at the sinks, not here.
+/// The distinction that matters is not which mechanism but that an
+/// unanswerable question is [`crate::occupancy::OccupancyState::Unknown`],
+/// never "free" -- which is enforced at the sinks, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OccupancyProbe {
-    /// `lsof +D` for directories, `lsof --` for files.
+    /// macOS: `lsof +D` for directories, `lsof --` for files, bounded.
     Lsof,
+    /// Linux: procfs, read directly and unprivileged (#86) -- `cwd`,
+    /// `root`, `exe`, every fd and every mapped file of each process
+    /// running as this user. No `lsof` dependency, which a minimal
+    /// Ubuntu install does not have.
+    Procfs,
 }
 
 impl OccupancyProbe {
-    pub fn for_os(_os: Os) -> Self {
-        OccupancyProbe::Lsof
+    pub fn for_os(os: Os) -> Self {
+        match os {
+            Os::MacOs => OccupancyProbe::Lsof,
+            Os::Linux => OccupancyProbe::Procfs,
+        }
     }
 }
 

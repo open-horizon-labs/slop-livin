@@ -61,6 +61,16 @@ pub const AUDITS: &[(&str, Audit)] = &[
         "platform_capabilities_gate_their_backends",
         crate::platform_audits::platform_capabilities_gate_their_backends,
     ),
+    // #85/#86: the Trash backend owns every move, and an occupancy
+    // probe's visibility gaps are Unknown (`linux_audits.rs`).
+    (
+        "trash_backend_owns_every_move",
+        crate::linux_audits::trash_backend_owns_every_move,
+    ),
+    (
+        "occupancy_gaps_are_unknown_never_free",
+        crate::linux_audits::occupancy_gaps_are_unknown_never_free,
+    ),
     (
         "execution_sinks_recheck_live_state",
         crate::repair_audits::execution_sinks_recheck_live_state,

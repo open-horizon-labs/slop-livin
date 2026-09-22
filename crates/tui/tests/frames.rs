@@ -1228,7 +1228,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
         &plan,
         &grant,
         &ledger,
-        &trash,
+        &swamp_core::platform::trash::Target::Directory(trash.clone()),
         "human",
         false,
     );

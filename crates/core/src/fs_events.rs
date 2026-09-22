@@ -71,6 +71,37 @@ pub enum RefreshRefusal {
     /// running". #81 adds the live watch, which narrows the gap to the
     /// time before the watch opened; it does not remove it.
     NoPersistedChangeHistory,
+    /// Linux live watch: the kernel's inotify queue overflowed
+    /// (`IN_Q_OVERFLOW`) and dropped events. Nothing since the watch's
+    /// epoch opened can be vouched for.
+    WatchQueueOverflow,
+    /// Linux live watch: `inotify_add_watch` ran out of watches
+    /// (`fs.inotify.max_user_watches`), so part of the root is unwatched.
+    WatchLimitReached,
+    /// Linux live watch: a directory under the root could not be watched
+    /// or listed.
+    WatchPermissionGap,
+    /// Linux live watch: a watched filesystem was unmounted.
+    WatchedFilesystemUnmounted,
+    /// Linux live watch: the kernel removed a watch swamp did not ask it
+    /// to remove.
+    WatchRemoved,
+    /// Linux: a live watch (TUI or `swamp collect`) is running, but the
+    /// stored observation of this root predates its epoch -- the gap
+    /// between the two is not covered by anything.
+    LiveWatchGap,
+    /// Linux: a collector checkpoint exists for this root, but its
+    /// collector is not running (it exited, was killed, or the machine
+    /// rebooted), so the checkpoint says nothing about what happened
+    /// since.
+    CollectorStopped,
+    /// Linux: the collector did not confirm it had drained its event
+    /// queue in time, so its checkpoint might miss a change that has
+    /// already happened.
+    CollectorUnresponsive,
+    /// Linux: the running collector's scope (root identity or
+    /// exclusions) is not the scope this observation walks.
+    ScopeChanged,
 }
 
 impl RefreshRefusal {
@@ -87,8 +118,40 @@ impl RefreshRefusal {
             RefreshRefusal::TooSoon => "too_soon",
             RefreshRefusal::UnsupportedPlatform => "unsupported_platform",
             RefreshRefusal::NoPersistedChangeHistory => "no_persisted_change_history",
+            RefreshRefusal::WatchQueueOverflow => "watch_queue_overflow",
+            RefreshRefusal::WatchLimitReached => "watch_limit_reached",
+            RefreshRefusal::WatchPermissionGap => "watch_permission_gap",
+            RefreshRefusal::WatchedFilesystemUnmounted => "watched_filesystem_unmounted",
+            RefreshRefusal::WatchRemoved => "watch_removed",
+            RefreshRefusal::LiveWatchGap => "live_watch_gap",
+            RefreshRefusal::CollectorStopped => "collector_stopped",
+            RefreshRefusal::CollectorUnresponsive => "collector_unresponsive",
+            RefreshRefusal::ScopeChanged => "scope_changed",
         }
     }
+
+    /// Every variant, for the tests that hold the vocabulary to the
+    /// docs.
+    pub const ALL: &'static [RefreshRefusal] = &[
+        RefreshRefusal::NoStoredEventId,
+        RefreshRefusal::EventIdFromFuture,
+        RefreshRefusal::RootMismatch,
+        RefreshRefusal::FseventsdUnavailable,
+        RefreshRefusal::HelperInconclusive,
+        RefreshRefusal::TooManyChanges,
+        RefreshRefusal::TooSoon,
+        RefreshRefusal::UnsupportedPlatform,
+        RefreshRefusal::NoPersistedChangeHistory,
+        RefreshRefusal::WatchQueueOverflow,
+        RefreshRefusal::WatchLimitReached,
+        RefreshRefusal::WatchPermissionGap,
+        RefreshRefusal::WatchedFilesystemUnmounted,
+        RefreshRefusal::WatchRemoved,
+        RefreshRefusal::LiveWatchGap,
+        RefreshRefusal::CollectorStopped,
+        RefreshRefusal::CollectorUnresponsive,
+        RefreshRefusal::ScopeChanged,
+    ];
 
     /// The sentence a coverage note or `--json` explanation carries
     /// beside the code. A reason code tells a script what happened; this
@@ -99,6 +162,45 @@ impl RefreshRefusal {
             RefreshRefusal::NoPersistedChangeHistory => {
                 crate::platform::ContinuitySource::LiveWatchEpochOnly.no_history_reason()
             }
+            RefreshRefusal::WatchQueueOverflow => Some(
+                "the kernel's inotify queue overflowed and dropped events, so the watch cannot \
+                 say what changed; a full walk re-establishes the baseline and a new watch epoch \
+                 starts from it",
+            ),
+            RefreshRefusal::WatchLimitReached => Some(
+                "part of the root has no inotify watch because fs.inotify.max_user_watches was \
+                 reached; raise it (sysctl, as root) or narrow the scope. Until then every \
+                 observation of this root walks fully",
+            ),
+            RefreshRefusal::WatchPermissionGap => Some(
+                "a directory under the root could not be watched or listed, so changes there \
+                 are invisible to the watch; every observation of this root walks fully",
+            ),
+            RefreshRefusal::WatchedFilesystemUnmounted => {
+                Some("a watched filesystem was unmounted; the watch no longer covers it")
+            }
+            RefreshRefusal::WatchRemoved => Some(
+                "the kernel removed a watch swamp did not ask it to remove, so part of the root \
+                 went unwatched",
+            ),
+            RefreshRefusal::LiveWatchGap => Some(
+                "a live watch is running, but the last observation of this root happened before \
+                 it started; the time in between is covered by nothing, so this walk is full \
+                 and the next one can use the watch",
+            ),
+            RefreshRefusal::CollectorStopped => Some(
+                "the collector that kept this root's change list is not running (it exited, was \
+                 stopped, or the machine restarted), so its list says nothing about what changed \
+                 since; `swamp collect` (or `swamp schedule --collector`) starts one",
+            ),
+            RefreshRefusal::CollectorUnresponsive => Some(
+                "the collector did not confirm it had read every pending event in time, so its \
+                 change list might be missing one that already happened",
+            ),
+            RefreshRefusal::ScopeChanged => Some(
+                "the running collector watches a different scope (root identity or exclusions) \
+                 than this observation walks; restart it with the current scope",
+            ),
             _ => None,
         }
     }
@@ -179,6 +281,13 @@ impl FsEventsPlan {
             device,
             live: true,
         }
+    }
+
+    /// A refusal a live consumer builds itself: the watch lost coverage,
+    /// or the stored observation predates the watch's epoch. The walk is
+    /// full, and `reason` is what the coverage note names.
+    pub fn refused(reason: RefreshRefusal, device: Option<u64>) -> Self {
+        Self::refuse(reason, 0, device)
     }
 
     fn refuse(reason: RefreshRefusal, current_event_id: u64, device: Option<u64>) -> Self {
@@ -362,12 +471,27 @@ pub fn platform_source() -> Box<dyn FsEventsSource> {
     }
 }
 
-/// One delivery from a live [`watch`]: the directories FSEvents reported
-/// (each with its parent, within the root) and the newest event id seen.
-#[derive(Debug, Clone)]
+/// One delivery from a live [`watch`]: the directories the platform's
+/// watcher reported (each with its parent, within the root) and the
+/// newest event id (FSEvents) or sequence number (inotify) seen.
+#[derive(Debug, Clone, Default)]
 pub struct WatchBatch {
+    /// The root the watch is on (the key a consumer with several roots
+    /// needs for a batch that names no path: an epoch opening, a loss).
+    pub root: PathBuf,
     pub changed_dirs: Vec<PathBuf>,
     pub last_event_id: u64,
+    /// The watch stopped being able to vouch for its root (Linux: queue
+    /// overflow, watch limit, permissions, unmount, a removed watch).
+    /// The consumer must walk the root fully, with this reason, and must
+    /// not treat `changed_dirs` as the whole change. Always `None` from
+    /// FSEvents, whose own "rescan" flags are reported as the root.
+    pub coverage_lost: Option<(RefreshRefusal, String)>,
+    /// Linux: when this watch's epoch opened. A root whose stored
+    /// observation predates it is not covered by the watch and needs one
+    /// full walk before live batches can be applied incrementally.
+    /// `None` from FSEvents, whose replay covers the gap itself.
+    pub epoch_opened_at: Option<u64>,
 }
 
 /// A running live stream. Dropping it, or calling `stop`, ends the
@@ -378,6 +502,19 @@ pub struct Watcher {
 }
 
 impl Watcher {
+    /// A watcher whose thread was started elsewhere in this crate (the
+    /// Linux inotify watch, `live_watch::spawn_watch`).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_parts(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
     pub fn stop(mut self) {
         self.signal_stop();
         if let Some(t) = self.thread.take() {
@@ -403,14 +540,27 @@ impl Drop for Watcher {
 /// stream runs on its own thread with its own run loop. `None` where the
 /// platform has no FSEvents.
 pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Watcher> {
+    watch_excluding(root, Vec::new(), tx)
+}
+
+/// [`watch`], never reporting a change under `exclude` -- swamp's own
+/// store, so writing an observation's results cannot trigger the next
+/// live refresh. macOS's stream is unchanged (the exclusion is applied
+/// on Linux, where the watcher registers directories itself and so can
+/// simply not register those).
+pub fn watch_excluding(
+    root: &Path,
+    exclude: Vec<PathBuf>,
+    tx: std::sync::mpsc::Sender<WatchBatch>,
+) -> Option<Watcher> {
     #[cfg(target_os = "macos")]
     {
+        let _ = exclude;
         macos::watch(root, tx)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = (root, tx);
-        None
+        crate::live_watch::spawn_watch(root, exclude, tx)
     }
 }
 
@@ -636,8 +786,11 @@ mod macos {
         }
         if !changes.is_empty() {
             let _ = state.tx.send(super::WatchBatch {
+                root: state.root.clone(),
                 changed_dirs: changes.into_iter().collect(),
                 last_event_id: last_id,
+                coverage_lost: None,
+                epoch_opened_at: None,
             });
         }
     }

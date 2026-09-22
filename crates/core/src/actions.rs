@@ -1313,9 +1313,9 @@ fn execute_agent_cache_trash(
     store_dir: &Path,
     path: &Path,
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
-    trash: &Path,
+    trash: &crate::platform::trash::Target,
     at: u64,
-) -> Result<(PathBuf, u64)> {
+) -> Result<(crate::platform::trash::Trashed, u64)> {
     let fresh = crate::recheck::reviewed_snapshot(path, reviewed)?;
     if !fresh.is_dir {
         bail!("path is no longer a directory (or is a symlink)");
@@ -1336,9 +1336,9 @@ fn execute_agent_cache_trash(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("agent-cache");
-    let dest = trash.join(format!("agent-cache-{basename}-{at}"));
-    fs::rename(path, &dest).context("rename to Trash failed")?;
-    Ok((dest, bytes))
+    let moved =
+        crate::platform::trash::move_item(path, trash, &format!("agent-cache-{basename}-{at}"))?;
+    Ok((moved, bytes))
 }
 
 /// One member's fate inside a session-removal Trash envelope's own
@@ -1415,9 +1415,9 @@ fn execute_agent_session_removal(
     session_path: &Path,
     planned_members: &[PathBuf],
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
-    trash: &Path,
+    trash: &crate::platform::trash::Target,
     at: u64,
-) -> Result<(PathBuf, u64)> {
+) -> Result<(crate::platform::trash::Trashed, u64)> {
     // One registry dispatch, never a second fourteen-arm tool-id match:
     // this used to be its own copy of `agents::identify_for_tool`'s
     // table, and a tool added to one and not the other identified fine
@@ -1492,8 +1492,16 @@ fn execute_agent_session_removal(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("session");
-    let envelope = trash.join(format!("agent-session-{slug}-{at}"));
-    fs::create_dir_all(&envelope).context("could not create Trash envelope")?;
+    // One recoverable Trash item for the whole session, on the members'
+    // own filesystem (`platform::trash::Envelope`): every member move
+    // below is a rename or a refusal, never a copy.
+    let mut env = crate::platform::trash::Envelope::open(
+        session_path,
+        trash,
+        &format!("agent-session-{slug}-{at}"),
+    )
+    .context("could not create Trash envelope")?;
+    let envelope = env.dir().to_path_buf();
 
     let mut manifest = RestoreManifest {
         tool_id: meta.tool_id.clone(),
@@ -1521,8 +1529,7 @@ fn execute_agent_session_removal(
             .and_then(|n| n.to_str())
             .unwrap_or("member");
         let dest_name = format!("{i}-{name}");
-        let dest = envelope.join(&dest_name);
-        if let Err(e) = fs::rename(member, &dest).with_context(|| {
+        if let Err(e) = env.move_member(member, &dest_name).with_context(|| {
             format!(
                 "rename to Trash failed for {} ({} of {} members already moved into {})",
                 member.display(),
@@ -1549,7 +1556,15 @@ fn execute_agent_session_removal(
         // members 0..=i having actually moved.
         write_restore_manifest(&envelope, &manifest)?;
     }
-    Ok((envelope, moved_bytes))
+    Ok((
+        crate::platform::trash::Trashed {
+            location: envelope,
+            info: env.info().map(Path::to_path_buf),
+            kind: env.kind(),
+            original: session_path.to_path_buf(),
+        },
+        moved_bytes,
+    ))
 }
 
 /// A whole worktree (linked → `remove-worktree`) or checkout (→ `archive`)
@@ -1938,40 +1953,16 @@ fn newest_mtime(path: &Path, max_entries: usize) -> Option<u64> {
     Some(newest)
 }
 
-/// The directory a recoverable removal moves things into.
+/// Where a recoverable removal moves things: `~/.Trash` on macOS, what
+/// Finder reads; the freedesktop system Trash on Linux (home trash, or
+/// the mount's own `.Trash-$uid`, with a `.trashinfo` restore record);
+/// `SWAMP_TRASH_DIR` as a plain directory on both. See
+/// [`crate::platform::trash`] for the move itself.
 ///
-/// `~/.Trash` on macOS, what Finder reads. On Linux the freedesktop
-/// Trash spec's *home trash* (`$XDG_DATA_HOME/Trash`, default
-/// `~/.local/share/Trash`), resolved through [`crate::platform::trash`]
-/// so the two conventions have one implementation rather than two
-/// spellings of `~/.Trash`.
-///
-/// This is the same-filesystem answer. An item on another mount belongs
-/// in that mount's own `.Trash-$uid`
-/// ([`crate::platform::trash::resolve`]); performing that cross-device
-/// move, and writing the `.trashinfo` record a file manager restores
-/// from, is #85. Until then a Linux build reports the `trash` capability
-/// as planned rather than claiming freedesktop compliance.
-pub fn trash_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
-    let ctx = crate::platform::trash::Context {
-        os: crate::platform::Os::current(),
-        home: home.clone(),
-        xdg_data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        uid: current_uid(),
-    };
-    // Same-device resolution: the home trash (or `~/.Trash`). The
-    // cross-device branch needs the item's own device, which only a
-    // caller performing a move knows, and is #85's to supply.
-    crate::platform::trash::resolve(&ctx, &home, 0, 0, Path::new("/"), false).dir
-}
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() cannot fail and reads no caller-owned memory.
-    unsafe { libc::getuid() }
+/// `Err` when no Trash can be resolved (no home directory): every unit
+/// that would move is then refused with that reason, and nothing moves.
+pub fn trash_target() -> Result<crate::platform::trash::Target> {
+    crate::platform::trash::Target::system()
 }
 
 /// Bytes an unprivileged process can still write to the filesystem
@@ -1994,7 +1985,7 @@ fn ledger_path(dir: &Path) -> PathBuf {
 /// aborts the rest. Without a covering grant for any unit the plan is not
 /// executed at all and the result names the command a human runs.
 pub fn execute(dir: &Path, plan_id: &str, actor: &str) -> Result<ExecuteResult> {
-    execute_with_trash(dir, plan_id, actor, &trash_root())
+    execute_with_target_opts(dir, plan_id, actor, trash_target(), false)
 }
 
 /// `execute`, first copying compiled outputs out of each unit into
@@ -2004,7 +1995,7 @@ pub fn execute_keeping_executables(
     plan_id: &str,
     actor: &str,
 ) -> Result<ExecuteResult> {
-    execute_with_trash_opts(dir, plan_id, actor, &trash_root(), true)
+    execute_with_target_opts(dir, plan_id, actor, trash_target(), true)
 }
 
 /// A file preserved by `preserve_executables`: where it was, where it went.
@@ -2114,11 +2105,43 @@ pub fn execute_with_trash(
     execute_with_trash_opts(dir, plan_id, actor, trash, false)
 }
 
+/// `execute_with_trash`'s explicit directory is a
+/// [`crate::platform::trash::Target::Directory`]: a plain rename target,
+/// the same on both platforms.
 pub fn execute_with_trash_opts(
     dir: &Path,
     plan_id: &str,
     actor: &str,
     trash: &Path,
+    keep_executables: bool,
+) -> Result<ExecuteResult> {
+    execute_with_target_opts(
+        dir,
+        plan_id,
+        actor,
+        Ok(crate::platform::trash::Target::Directory(
+            trash.to_path_buf(),
+        )),
+        keep_executables,
+    )
+}
+
+/// `execute` against an explicit Trash target (the Linux tests drive the
+/// freedesktop target through this with a fixture `$XDG_DATA_HOME`).
+pub fn execute_with_target(
+    dir: &Path,
+    plan_id: &str,
+    actor: &str,
+    trash: crate::platform::trash::Target,
+) -> Result<ExecuteResult> {
+    execute_with_target_opts(dir, plan_id, actor, Ok(trash), false)
+}
+
+pub fn execute_with_target_opts(
+    dir: &Path,
+    plan_id: &str,
+    actor: &str,
+    trash: Result<crate::platform::trash::Target>,
     keep_executables: bool,
 ) -> Result<ExecuteResult> {
     let mut plan = load_plan(dir, plan_id)?;
@@ -2167,7 +2190,13 @@ pub fn execute_with_trash_opts(
     }
 
     let ledger = Ledger::open(ledger_path(dir))?;
-    fs::create_dir_all(trash)?;
+    // Unknown recovery capability refuses: a unit that would move is
+    // refused with this reason below, and nothing moves.
+    let trash: std::result::Result<crate::platform::trash::Target, String> =
+        trash.map_err(|e| format!("{e:#}"));
+    if let Ok(crate::platform::trash::Target::Directory(d)) = &trash {
+        fs::create_dir_all(d)?;
+    }
     let free_before = free_space_bytes(&plan.root);
     let mut outcomes = Vec::new();
     let mut trashed = 0u64;
@@ -2227,6 +2256,14 @@ pub fn execute_with_trash_opts(
         // Agent-storage action (#101): occupancy, reference and identity
         // are all rechecked fresh here, never trusted from the plan.
         if let Some(meta) = &unit.agent_meta {
+            let trash = match &trash {
+                Ok(t) => t,
+                Err(why) => {
+                    outcome.cause = Some(format!("refused: {why}"));
+                    outcomes.push(outcome);
+                    continue;
+                }
+            };
             let agent_result = match &meta.session_members {
                 Some(planned_members) => execute_agent_session_removal(
                     dir,
@@ -2241,10 +2278,12 @@ pub fn execute_with_trash_opts(
                     execute_agent_cache_trash(dir, &unit.path, unit.reviewed.as_ref(), trash, at)
                 }
             };
+            let mut trash_info: Option<PathBuf> = None;
             match agent_result {
-                Ok((dest, moved_bytes)) => {
+                Ok((moved, moved_bytes)) => {
                     outcome.status = "completed".into();
-                    outcome.recovery_location = Some(dest);
+                    outcome.recovery_location = Some(moved.location);
+                    trash_info = moved.info;
                     trashed += moved_bytes;
                     spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
                 }
@@ -2276,6 +2315,7 @@ pub fn execute_with_trash_opts(
                     "bytes": unit.bytes,
                     "recovery": unit.recovery,
                     "cause": outcome.cause,
+                    "trash_info": trash_info,
                 }),
                 grant_id: g.id.clone(),
                 actor: actor.into(),
@@ -2363,7 +2403,11 @@ pub fn execute_with_trash_opts(
                 observed_path_state: Some("preflight".into()),
                 recorded_at: at,
             })?;
-            match crate::cargo_cleanup::move_reviewed(dir, group, unit.reviewed.as_ref(), trash) {
+            let moved = match &trash {
+                Ok(t) => crate::cargo_cleanup::move_reviewed(dir, group, unit.reviewed.as_ref(), t),
+                Err(why) => Err(anyhow!("refused: {why}")),
+            };
+            match moved {
                 Ok(dest) => {
                     outcome.status = "completed".into();
                     outcome.recovery_location = Some(dest);
@@ -2501,16 +2545,21 @@ pub fn execute_with_trash_opts(
                 }
             }
         }
-        let dest = trash.join(format!(
-            "{}-{}-{}",
-            basename,
-            unit.project.replace('/', "_"),
-            at
-        ));
-        match fs::rename(&unit.path, &dest) {
-            Ok(()) => {
+        let trash = match &trash {
+            Ok(t) => t,
+            Err(why) => {
+                outcome.cause = Some(format!("refused: {why}"));
+                outcomes.push(outcome);
+                continue;
+            }
+        };
+        let flat_name = format!("{}-{}-{}", basename, unit.project.replace('/', "_"), at);
+        let mut trash_info: Option<PathBuf> = None;
+        match crate::platform::trash::move_item(&unit.path, trash, &flat_name) {
+            Ok(moved) => {
                 outcome.status = "completed".into();
-                outcome.recovery_location = Some(dest.clone());
+                outcome.recovery_location = Some(moved.location);
+                trash_info = moved.info;
                 trashed += unit.bytes;
                 spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
                 if let Some(c) = &linked_common {
@@ -2524,7 +2573,7 @@ pub fn execute_with_trash_opts(
             }
             Err(e) => {
                 outcome.status = "failed".into();
-                outcome.cause = Some(format!("rename to Trash failed: {e}"));
+                outcome.cause = Some(format!("{e:#}"));
             }
         }
         ledger.append(&ActionRecord {
@@ -2550,6 +2599,7 @@ pub fn execute_with_trash_opts(
                 "verb": unit.verb,
                 "track": unit.track,
                 "warnings_shown": unit.warnings,
+                "trash_info": trash_info,
             }),
             grant_id: g.id.clone(),
             actor: actor.to_string(),
@@ -2745,7 +2795,7 @@ mod agent_partial_removal_tests {
             &session_path,
             &members,
             reviewed.as_ref(),
-            trash.path(),
+            &crate::platform::trash::Target::Directory(trash.path().to_path_buf()),
             at,
         )
         .expect_err("the last member's rename was deliberately blocked");
