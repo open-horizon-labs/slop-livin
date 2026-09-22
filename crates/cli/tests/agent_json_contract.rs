@@ -119,6 +119,73 @@ fn report_json_carries_decision_evidence_on_artifact_rows() {
     assert!(kinds.contains(&"reclaimability"), "{kinds:?}");
 }
 
+/// #60's own named gap ("bespoke-shaped JSON views (`kinds`/`builds`/
+/// `deps`/`unowned`/`worktrees`)... do not carry evidence; only the
+/// default report view... does"): every one of these views' row objects
+/// must carry an `evidence` field once this fixture has real evidence
+/// to attach, not just the default report view.
+#[test]
+fn bespoke_json_views_carry_evidence_on_their_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = make_checkout(root.path(), "repo", 4096);
+    // A real Rust build-output directory (#54/#58/#59 wire Activity/
+    // Recovery/Reclaimability onto `BuildOutput` rows), gated on the
+    // real `Cargo.toml` marker `ecosystem::classify_gated` requires --
+    // `make_checkout`'s own `node_modules` alone only exercises `deps`.
+    fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"repo\"\n").unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
+    fs::write(repo.join("target/debug/seed"), vec![b'x'; 4096]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+
+    for view in ["builds", "deps", "kinds", "worktrees"] {
+        let v = run_json(
+            store.path(),
+            &[
+                "report",
+                root.path().to_str().unwrap(),
+                "--json",
+                "--view",
+                view,
+            ],
+        );
+        let rows = v["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("--view {view} did not print a result array: {v:#}"));
+        assert!(!rows.is_empty(), "--view {view} produced no rows to check");
+        for row in rows {
+            assert!(
+                row.get("evidence").is_some(),
+                "--view {view} row missing `evidence` field entirely: {row:#}"
+            );
+        }
+        // At least one row across the whole view carries a real,
+        // non-empty fact list -- never every row silently defaulting to
+        // an empty array because the field was added but never wired.
+        assert!(
+            rows.iter()
+                .any(|r| r["evidence"].as_array().is_some_and(|e| !e.is_empty())),
+            "--view {view}: every row's evidence array is empty: {rows:#?}"
+        );
+    }
+
+    // `unowned` is checked separately: this fixture's single clean
+    // checkout attributes everything, so the unowned view is
+    // legitimately empty here -- confirm the field is at least present
+    // on the JSON shape by checking the payload is an empty array, not
+    // an error or a differently-shaped object.
+    let v = run_json(
+        store.path(),
+        &[
+            "report",
+            root.path().to_str().unwrap(),
+            "--json",
+            "--view",
+            "unowned",
+        ],
+    );
+    assert!(v["result"].as_array().is_some());
+}
+
 /// A fresh `report --json` call (no prior observation) is a coherent
 /// no-growth baseline, not an error: the grown view is empty and the
 /// coverage block says plainly that there is no history yet instead of

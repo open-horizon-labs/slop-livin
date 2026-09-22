@@ -223,23 +223,36 @@ pub fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value
     match view {
         "types" => serde_json::to_value(&r.summary.by_type).unwrap_or(Value::Null),
         "kinds" => {
-            let mut agg: std::collections::BTreeMap<&'static str, (u64, u64)> =
-                std::collections::BTreeMap::new();
+            // #60: no single row backs a kind bucket, so `evidence` here
+            // is every underlying row's own evidence concatenated --
+            // still the same per-fact shape a contract test can check
+            // for, rather than a silently missing field on the one JSON
+            // view with no 1:1 unit.
+            let mut agg: std::collections::BTreeMap<
+                &'static str,
+                (u64, u64, Vec<crate::evidence::Evidence>),
+            > = std::collections::BTreeMap::new();
             for p in &r.projects {
                 if only_project.is_some_and(|name| name != p.name) {
                     continue;
                 }
                 for wt in &p.worktrees {
                     for a in &wt.artifacts {
-                        let entry = agg.entry(kind_label(&a.kind)).or_insert((0, 0));
+                        let entry = agg.entry(kind_label(&a.kind)).or_insert((0, 0, Vec::new()));
                         entry.0 += a.bytes;
                         entry.1 += 1;
+                        entry.2.extend(a.evidence.iter().cloned());
                     }
                 }
             }
             json!(
                 agg.into_iter()
-                    .map(|(kind, (bytes, count))| json!({"kind": kind, "bytes": bytes, "count": count}))
+                    .map(|(kind, (bytes, count, evidence))| json!({
+                        "kind": kind,
+                        "bytes": bytes,
+                        "count": count,
+                        "evidence": evidence,
+                    }))
                     .collect::<Vec<_>>()
             )
         }
@@ -265,6 +278,7 @@ pub fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value
                             "path": a.path,
                             "bytes": a.bytes,
                             "growth_bytes": a.growth_bytes,
+                            "evidence": a.evidence,
                         }));
                     }
                 }
@@ -290,6 +304,7 @@ pub fn view_payload(r: &Report, view: &str, only_project: Option<&str>) -> Value
                         "shared_bytes": row.shared_bytes,
                         "docker_kind": row.docker_kind,
                         "note": row.note,
+                        "evidence": row.evidence,
                     })
                 })
                 .collect();
@@ -338,6 +353,7 @@ pub fn docker_objects_payload(r: &Report, unowned_only: bool, only_project: Opti
                         "dangling": a.dangling,
                         "note": a.note,
                         "unowned": false,
+                        "evidence": a.evidence,
                     }));
                 }
             }
@@ -373,6 +389,7 @@ pub fn docker_objects_payload(r: &Report, unowned_only: bool, only_project: Opti
             "dangling": row.dangling,
             "note": row.note,
             "unowned": true,
+            "evidence": row.evidence,
         }));
     }
     rows.sort_by(|a, b| {
@@ -513,6 +530,17 @@ pub fn list_worktrees_payload(r: &Report, filter: &Filter, only_project: Option<
                 })),
                 "pull_request": render_pr_json(pr),
                 "remove_command": format!("git worktree remove {}", wt.path.display()),
+                // #60: the worktree's own `Source` row is where
+                // `consumer_wiring::attach_associations` (#56/#57)
+                // attaches this project's toolchain-declaration/
+                // dependency-lockfile facts -- see `model::tree_rows`'s
+                // identical lookup in the TUI.
+                "evidence": wt
+                    .artifacts
+                    .iter()
+                    .find(|a| a.kind == ArtifactKind::Source)
+                    .map(|a| a.evidence.clone())
+                    .unwrap_or_default(),
             }));
         }
     }
