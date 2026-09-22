@@ -506,6 +506,12 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            bail!(
+                "{} already exists in the Trash; nothing was moved",
+                to.display()
+            );
+        }
         if err.raw_os_error() != Some(libc::EINVAL) {
             return Err(move_error(from, to, err));
         }

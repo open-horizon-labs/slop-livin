@@ -18,6 +18,8 @@ use std::path::PathBuf;
 /// One root to collect for, with the exclusions under it.
 pub struct Root {
     pub path: PathBuf,
+    /// Read only by the Linux collector.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub excluded: Vec<PathBuf>,
 }
 
@@ -52,8 +54,7 @@ fn run(store_dir: PathBuf, roots: Vec<Root>) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_store_dir: PathBuf, roots: Vec<Root>) -> Result<()> {
-    let _ = roots.iter().map(|r| (&r.path, &r.excluded)).count();
+fn run(_store_dir: PathBuf, _roots: Vec<Root>) -> Result<()> {
     anyhow::bail!("swamp collect has no backend on this platform")
 }
 

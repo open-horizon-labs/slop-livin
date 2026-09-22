@@ -212,9 +212,12 @@ fn a_real_queue_overflow_is_reported_as_a_loss() {
         return;
     }
     let (_t, root) = root();
-    let mut t = open_tree(&root, Vec::new());
+    // The directory exists, and is watched, before the burst: files
+    // created in a directory whose watch is not yet installed produce no
+    // events at all, and so no overflow.
     let dir = root.join("burst");
     std::fs::create_dir(&dir).unwrap();
+    let mut t = open_tree(&root, Vec::new());
     // Each create is at least two events (IN_CREATE, IN_CLOSE_WRITE).
     for i in 0..(limit as usize / 2 + 2_000) {
         std::fs::write(dir.join(format!("f{i}")), b"").unwrap();

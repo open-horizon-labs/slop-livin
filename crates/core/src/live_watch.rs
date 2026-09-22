@@ -372,11 +372,9 @@ impl<K: Kernel> LiveTree<K> {
         }
     }
 
-    /// A reported directory and its parent, within the root: the same
-    /// "path and its parent" rule the FSEvents replay applies, so the
-    /// incremental pipeline sees one shape from either platform.
-    fn mark_with_parent(&mut self, dir: &Path) {
-        self.mark(dir);
+    /// A directory that vanished (its own `IN_DELETE_SELF`): the change
+    /// is visible in its parent's listing, so the parent is what is dirty.
+    fn mark_parent(&mut self, dir: &Path) {
         if let Some(parent) = dir.parent()
             && parent.starts_with(&self.root)
         {
@@ -531,7 +529,7 @@ impl<K: Kernel> LiveTree<K> {
         };
         if ev.mask & IN_DELETE_SELF != 0 {
             self.deleted.insert(ev.wd);
-            self.mark_with_parent(&dir);
+            self.mark_parent(&dir);
             return;
         }
         if ev.mask & IN_MOVE_SELF != 0 {
@@ -551,7 +549,13 @@ impl<K: Kernel> LiveTree<K> {
         {
             return;
         }
-        self.mark_with_parent(&dir);
+        // inotify names the directory an entry changed in exactly, so
+        // that directory is what is dirty -- plus the entry itself when
+        // it is a directory. FSEvents' directory-level stream is coarser
+        // and its replay adds each reported path's parent; here the
+        // parent is only dirty when its own listing changed, which is an
+        // event on the parent's watch.
+        self.mark(&dir);
         let is_dir = ev.mask & IN_ISDIR != 0;
         let Some(child) = child else {
             return;
@@ -932,14 +936,22 @@ mod tests {
         assert_eq!(t.dirty().count(), 0);
     }
 
+    /// Exactly the directory the entry changed in: marking its parent
+    /// too would turn a write inside a build directory into a re-walk of
+    /// the worktree around it.
     #[test]
-    fn a_file_change_marks_its_directory_and_parent() {
+    fn a_file_change_marks_exactly_its_directory() {
         let (_t, root) = fixture();
         let mut t = tree_at(&root);
         let b = root.join("a/b");
         t.apply(&[ev(wd_of(&t, &b), IN_MODIFY, "x.o")]);
         let dirty: Vec<PathBuf> = t.dirty().map(|(p, _)| p.to_path_buf()).collect();
-        assert_eq!(dirty, vec![root.join("a"), b]);
+        assert_eq!(dirty, vec![b.clone()]);
+        // A new directory: the parent's listing changed, and the child is
+        // new -- both.
+        t.apply(&[ev(wd_of(&t, &b), IN_CREATE | IN_ISDIR, "new")]);
+        std::fs::create_dir_all(b.join("new")).ok();
+        assert!(t.dirty().any(|(p, _)| p == b.join("new")));
     }
 
     /// A new directory tree is registered and every directory in it is

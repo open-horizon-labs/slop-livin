@@ -98,9 +98,15 @@ pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
             OccupancyState::Free
         }
         crate::platform::OccupancyProbe::Procfs => {
-            // SAFETY: getuid/getpid cannot fail and read no memory.
-            let (uid, pid) = unsafe { (libc::getuid(), libc::getpid() as u32) };
-            procfs_probe(Path::new("/proc"), paths, uid, pid, OCCUPANCY_TIMEOUT)
+            // SAFETY: getpid cannot fail and reads no memory.
+            let pid = unsafe { libc::getpid() as u32 };
+            procfs_probe(
+                Path::new("/proc"),
+                paths,
+                &Creds::of_self(),
+                pid,
+                OCCUPANCY_TIMEOUT,
+            )
         }
     }
 }
@@ -234,9 +240,10 @@ fn classify_lsof_exit(
 /// in its coverage note -- and every way *that* question can go
 /// unanswered is `Unknown`, never `Free`:
 ///
-/// * a process running as this user whose fd table, links or maps
-///   cannot be read (a non-dumpable process such as an agent that
-///   called `prctl(PR_SET_DUMPABLE, 0)`; a Yama or LSM restriction);
+/// * a process with exactly this user's credentials whose fd table,
+///   links or maps cannot be read although its procfs entries are still
+///   this user's (an LSM denial; anything the kernel's own ownership
+///   rules do not explain);
 /// * a procfs that belongs to another PID namespace (`/proc/self` is
 ///   not this process), where the processes listed are not the ones
 ///   that share this filesystem view;
@@ -244,16 +251,22 @@ fn classify_lsof_exit(
 /// * the scan running past its time bound.
 ///
 /// A process that exits mid-scan (`ENOENT`/`ESRCH` on its entries) is
-/// skipped: it holds nothing any more. Another user's processes are
-/// counted, not read. `hidepid` hides only those, so it narrows nothing
-/// the question depends on.
+/// skipped: it holds nothing any more. Processes the kernel does not let
+/// this user read -- another user's, one with more privilege (a
+/// capability this process lacks, a saved uid of root), or one marked
+/// non-dumpable (root-owned procfs entries; measured on the Ubuntu 24.04
+/// runner: `systemd --user` holds `CAP_WAKE_ALARM`, its `(sd-pam)` is
+/// non-dumpable) -- are outside the question, as they are for `lsof`
+/// run without root; the evidence's coverage note says so. `hidepid`
+/// hides only other users' processes, so it narrows nothing the question
+/// depends on.
 ///
 /// Pure over `proc_root` so the fail-closed rules are testable against
 /// a fixture tree on either platform; the real call passes `/proc`.
 pub fn procfs_probe(
     proc_root: &Path,
     anchors: &[&Path],
-    self_uid: u32,
+    me: &Creds,
     self_pid: u32,
     budget: Duration,
 ) -> OccupancyState {
@@ -336,58 +349,157 @@ pub fn procfs_probe(
             continue;
         };
         let dir = entry.path();
-        let owner = match process_uid(&dir) {
-            Ok(Some(uid)) => uid,
+        let creds = match process_creds(&dir, me.uids[0]) {
+            Ok(Some(c)) => c,
             // Exited between the listing and now.
             Ok(None) => continue,
             Err(why) => return OccupancyState::Unknown(format!("process {pid}: {why}")),
         };
-        if owner != self_uid {
-            // Another user's process: outside what an unprivileged probe
-            // can read, and outside the question (see the doc comment).
+        if !creds.same_privilege_as(me) {
+            // Another user's process, or one running with more privilege
+            // than this user (a setuid program, a process holding
+            // capabilities): the kernel does not let this user read it,
+            // and it is outside the question (see the doc comment).
             continue;
         }
         match process_holds(&dir, &held) {
             Ok(Some(member)) => return OccupancyState::Occupied(member),
             Ok(None) => {}
-            Err(why) => {
-                return OccupancyState::Unknown(format!(
-                    "process {pid} ({}) runs as this user but {why}, so whether it holds \
-                     anything under the selection is not known",
-                    process_name(&dir)
-                ));
-            }
+            Err(why) => match kernel_withholds(&dir, me.uids[0]) {
+                // The kernel marks the process non-dumpable (its procfs
+                // entries turn root-owned): no unprivileged tool may read
+                // it, the same boundary as a more privileged process.
+                Ok(true) => continue,
+                Ok(false) => {
+                    return OccupancyState::Unknown(format!(
+                        "process {pid} ({}) runs as this user but {why}, so whether it holds \
+                         anything under the selection is not known",
+                        process_name(&dir)
+                    ));
+                }
+                Err(e) if gone(&e) => continue,
+                Err(e) => {
+                    return OccupancyState::Unknown(format!(
+                        "process {pid}: {why}, and its procfs entry cannot be examined ({e})"
+                    ));
+                }
+            },
         }
     }
     OccupancyState::Free
 }
 
-/// The effective uid a process runs as: `status`'s `Uid:` line, whose
-/// second field is the effective uid. `status` stays readable for a
-/// non-dumpable process, whose other entries become root-owned -- which
-/// is why the directory's owner is not used when `status` answers.
-/// `Ok(None)` when the process has exited.
-fn process_uid(dir: &Path) -> Result<Option<u32>, String> {
-    use std::io::ErrorKind;
-    match std::fs::read_to_string(dir.join("status")) {
-        Ok(text) => {
-            let uid = text
-                .lines()
-                .find_map(|l| l.strip_prefix("Uid:"))
-                .and_then(|rest| rest.split_whitespace().nth(1))
-                .and_then(|u| u.parse::<u32>().ok());
-            match uid {
-                Some(u) => Ok(Some(u)),
-                None => Err("its status has no readable Uid line".into()),
+/// Whether the kernel itself withholds a same-credential process from
+/// this user: a process whose memory is marked non-dumpable (one that
+/// changed credentials without an `exec`, like a PAM session holder, or
+/// that asked for it with `prctl(PR_SET_DUMPABLE, 0)`) has its procfs
+/// entries owned by root, and no unprivileged reader, `lsof` included,
+/// can see its open files. That is the same boundary as a process with
+/// more privilege than this user, and is treated the same way: outside
+/// the question this probe answers, stated in the evidence's coverage.
+///
+/// A same-user process whose entries are still *this user's* and yet
+/// cannot be read (an LSM denial, anything unexplained) is not that
+/// boundary, and stays `Unknown`.
+fn kernel_withholds(dir: &Path, my_uid: u32) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir.join("fd"))?;
+    Ok(withheld_owner(m.uid(), my_uid))
+}
+
+/// The ownership rule `kernel_withholds` reads, pure so both platforms
+/// test it.
+fn withheld_owner(fd_dir_owner: u32, my_uid: u32) -> bool {
+    fd_dir_owner != my_uid
+}
+
+/// A process's credentials as procfs states them: real, effective,
+/// saved and filesystem uid and gid, and its permitted capability set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Creds {
+    pub uids: [u32; 4],
+    pub gids: [u32; 4],
+    pub cap_prm: u64,
+}
+
+impl Creds {
+    /// This process's own credentials.
+    pub fn of_self() -> Creds {
+        let text = std::fs::read_to_string("/proc/self/status");
+        match text.as_deref().map(parse_status) {
+            Ok(Some(c)) => c,
+            // Without procfs there is nothing to compare against; the
+            // probe itself then fails on `/proc/self` and says Unknown.
+            _ => {
+                // SAFETY: plain getters.
+                let (u, g) = unsafe { (libc::getuid(), libc::getgid()) };
+                Creds {
+                    uids: [u; 4],
+                    gids: [g; 4],
+                    cap_prm: 0,
+                }
             }
         }
+    }
+
+    /// The kernel's own test for "this user may read that process"
+    /// (`ptrace_may_access` with `PTRACE_MODE_READ`): every uid and gid
+    /// equal, and no capability this process lacks. A process that fails
+    /// it is another user's, or runs with more privilege than this user
+    /// has -- outside what an unprivileged probe can see, on either
+    /// platform, and so outside the question it answers. A process that
+    /// passes it and still cannot be read is the gap that is `Unknown`.
+    pub fn same_privilege_as(&self, me: &Creds) -> bool {
+        self.uids.iter().all(|u| *u == me.uids[0])
+            && self.gids.iter().all(|g| *g == me.gids[0])
+            && self.cap_prm & !me.cap_prm == 0
+    }
+}
+
+/// `status`'s `Uid:`, `Gid:` and `CapPrm:` lines.
+fn parse_status(text: &str) -> Option<Creds> {
+    let four = |key: &str| -> Option<[u32; 4]> {
+        let line = text.lines().find_map(|l| l.strip_prefix(key))?;
+        let v: Vec<u32> = line
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+    };
+    let cap_prm = text
+        .lines()
+        .find_map(|l| l.strip_prefix("CapPrm:"))
+        .and_then(|h| u64::from_str_radix(h.trim(), 16).ok())
+        .unwrap_or(0);
+    Some(Creds {
+        uids: four("Uid:")?,
+        gids: four("Gid:")?,
+        cap_prm,
+    })
+}
+
+/// One process's credentials, from `status`. `status` stays readable
+/// for a non-dumpable process, whose other entries become root-owned.
+/// `Ok(None)` when the process has exited. Under `hidepid=1` another
+/// user's `status` is unreadable; its directory's owner still says it is
+/// not ours.
+fn process_creds(dir: &Path, my_uid: u32) -> Result<Option<Creds>, String> {
+    use std::io::ErrorKind;
+    match std::fs::read_to_string(dir.join("status")) {
+        Ok(text) => match parse_status(&text) {
+            Some(c) => Ok(Some(c)),
+            None => Err("its status has no readable Uid/Gid lines".into()),
+        },
         Err(e) if gone(&e) => Ok(None),
-        // `hidepid=1`: another user's status is unreadable. The
-        // directory's owner still says whose it is.
         Err(e) if e.kind() == ErrorKind::PermissionDenied => {
             use std::os::unix::fs::MetadataExt;
             match std::fs::symlink_metadata(dir) {
-                Ok(m) => Ok(Some(m.uid())),
+                Ok(m) if m.uid() != my_uid => Ok(Some(Creds {
+                    uids: [m.uid(); 4],
+                    gids: [m.gid(); 4],
+                    cap_prm: 0,
+                })),
+                Ok(_) => Err(format!("its status cannot be read ({e})")),
                 Err(e) if gone(&e) => Ok(None),
                 Err(e) => Err(format!("cannot stat it ({e})")),
             }
@@ -517,8 +629,10 @@ pub fn open_file_evidence(path: &Path) -> Evidence {
         )
         .with_freshness(Freshness::expires_after_with_coverage(
             CURRENT_USE_EXPIRY_SECS,
-            "only processes this user can inspect: those running as this user. Another user's \
-             process (a root daemon, a container runtime) is not visible without privileges",
+            "only processes this user can inspect: those running with this user's credentials \
+             and no more. Another user's process, a more privileged one (a root daemon, a \
+             container runtime, a setuid program) and one the kernel marks non-dumpable (a PAM \
+             session holder, an agent that hides its memory) are not visible without privileges",
         ))
         .with_note(
             "no open-file match for this path or anything under it this pass; not proof that no \
@@ -946,8 +1060,21 @@ mod tests {
         work: std::path::PathBuf,
     }
 
-    const ME: u32 = 1000;
+    /// "This user" in the fixtures is the real one: whether the kernel
+    /// withholds a process is read from who owns its fixture entries,
+    /// and the test's files are owned by whoever runs it.
+    fn uid() -> u32 {
+        unsafe { libc::getuid() }
+    }
     const MY_PID: u32 = 4242;
+
+    fn me() -> Creds {
+        Creds {
+            uids: [uid(); 4],
+            gids: [uid(); 4],
+            cap_prm: 0,
+        }
+    }
 
     fn fake_proc() -> FakeProc {
         let tmp = tempfile::tempdir().unwrap();
@@ -965,12 +1092,21 @@ mod tests {
         }
     }
 
-    fn process(fp: &FakeProc, pid: u32, uid: u32, cwd: &Path, fds: &[&Path]) -> std::path::PathBuf {
+    fn process(
+        fp: &FakeProc,
+        pid: u32,
+        owner: u32,
+        cwd: &Path,
+        fds: &[&Path],
+    ) -> std::path::PathBuf {
+        let (uid, me) = (owner, uid());
         let d = fp.root.join(pid.to_string());
         std::fs::create_dir_all(d.join("fd")).unwrap();
         std::fs::write(
             d.join("status"),
-            format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            format!(
+                "Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{me}\t{me}\t{me}\t{me}\nCapPrm:\t0000000000000000\n"
+            ),
         )
         .unwrap();
         std::fs::write(d.join("comm"), "fixture\n").unwrap();
@@ -986,26 +1122,26 @@ mod tests {
 
     fn proc_probe(fp: &FakeProc) -> OccupancyState {
         let target = fp.work.join("target");
-        procfs_probe(&fp.root, &[&target], ME, MY_PID, Duration::from_secs(10))
+        procfs_probe(&fp.root, &[&target], &me(), MY_PID, Duration::from_secs(10))
     }
 
     #[test]
     fn procfs_a_process_holding_a_descendant_file_or_cwd_is_occupied() {
         let fp = fake_proc();
-        process(&fp, 10, ME, Path::new("/"), &[Path::new("/dev/null")]);
+        process(&fp, 10, uid(), Path::new("/"), &[Path::new("/dev/null")]);
         assert_eq!(proc_probe(&fp), OccupancyState::Free);
 
         let app = fp.work.join("target/debug/app");
-        process(&fp, 11, ME, Path::new("/"), &[&app]);
+        process(&fp, 11, uid(), Path::new("/"), &[&app]);
         assert_eq!(proc_probe(&fp), OccupancyState::Occupied(app));
 
         let fp = fake_proc();
         let cwd = fp.work.join("target/debug");
-        process(&fp, 12, ME, &cwd, &[]);
+        process(&fp, 12, uid(), &cwd, &[]);
         assert_eq!(proc_probe(&fp), OccupancyState::Occupied(cwd));
 
         let fp = fake_proc();
-        let d = process(&fp, 13, ME, Path::new("/"), &[]);
+        let d = process(&fp, 13, uid(), Path::new("/"), &[]);
         let app = fp.work.join("target/debug/app");
         std::fs::write(
             d.join("maps"),
@@ -1024,7 +1160,7 @@ mod tests {
     fn procfs_a_deleted_open_file_under_the_anchor_still_counts() {
         let fp = fake_proc();
         let gone = format!("{}/target/debug/old.o (deleted)", fp.work.display());
-        process(&fp, 20, ME, Path::new("/"), &[Path::new(&gone)]);
+        process(&fp, 20, uid(), Path::new("/"), &[Path::new(&gone)]);
         assert!(matches!(proc_probe(&fp), OccupancyState::Occupied(_)));
     }
 
@@ -1037,7 +1173,7 @@ mod tests {
             return;
         }
         let fp = fake_proc();
-        let d = process(&fp, 30, ME + 1, Path::new("/"), &[]);
+        let d = process(&fp, 30, uid() + 1, Path::new("/"), &[]);
         std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
             proc_probe(&fp),
@@ -1047,7 +1183,7 @@ mod tests {
         std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let fp = fake_proc();
-        let d = process(&fp, 31, ME, Path::new("/"), &[]);
+        let d = process(&fp, 31, uid(), Path::new("/"), &[]);
         std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let got = proc_probe(&fp);
         std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1057,6 +1193,63 @@ mod tests {
             }
             other => panic!("a same-user process we cannot read must be Unknown: {other:?}"),
         }
+    }
+
+    /// The kernel's own read rule decides who is in the question: a
+    /// process running with more privilege than this user -- a saved uid
+    /// of root (a setuid program), a permitted capability -- is not
+    /// readable by this user and is outside the question, like another
+    /// user's; one with exactly this user's credentials that still
+    /// cannot be read is `Unknown`.
+    #[test]
+    fn procfs_privilege_not_the_uid_alone_decides_who_is_in_scope() {
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("SKIP procfs_privilege: root ignores the mode bits");
+            return;
+        }
+        for status in [
+            format!(
+                "Uid:\t{u}\t{u}\t0\t{u}\nGid:\t{u}\t{u}\t{u}\t{u}\nCapPrm:\t0\n",
+                u = uid()
+            ),
+            format!(
+                "Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{u}\t{u}\t{u}\t{u}\nCapPrm:\t0000000000200000\n",
+                u = uid()
+            ),
+        ] {
+            let fp = fake_proc();
+            let d = process(&fp, 60, uid(), Path::new("/"), &[]);
+            std::fs::write(d.join("status"), &status).unwrap();
+            std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            let got = proc_probe(&fp);
+            std::fs::set_permissions(d.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                got,
+                OccupancyState::Free,
+                "a more-privileged process is not read: {status}"
+            );
+        }
+        assert!(
+            parse_status("Uid:\t1\t2\t3\t4\nGid:\t5\t6\t7\t8\nCapPrm:\t00000000000000ff\n")
+                .is_some_and(|c| c.uids == [1, 2, 3, 4]
+                    && c.gids == [5, 6, 7, 8]
+                    && c.cap_prm == 0xff)
+        );
+    }
+
+    /// A same-credential process whose procfs entries turned root-owned
+    /// (non-dumpable) is withheld by the kernel and outside the question;
+    /// one whose entries are still ours and unreadable is not.
+    #[test]
+    fn procfs_the_kernels_non_dumpable_boundary_is_read_from_ownership() {
+        assert!(
+            withheld_owner(0, 1000),
+            "root-owned entries: the kernel withholds it"
+        );
+        assert!(
+            !withheld_owner(1000, 1000),
+            "our own entries, unreadable: Unknown, not withheld"
+        );
     }
 
     #[test]
@@ -1073,7 +1266,7 @@ mod tests {
         let got = procfs_probe(
             &fp.root.join("missing"),
             &[&target],
-            ME,
+            &me(),
             MY_PID,
             Duration::from_secs(10),
         );
@@ -1088,16 +1281,23 @@ mod tests {
         let d = fp.root.join("40");
         std::fs::create_dir_all(&d).unwrap();
         // status present, everything else gone: exited after listing.
-        std::fs::write(d.join("status"), format!("Uid:\t{ME}\t{ME}\t{ME}\t{ME}\n")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            format!(
+                "Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{u}\t{u}\t{u}\t{u}\n",
+                u = uid()
+            ),
+        )
+        .unwrap();
         assert_eq!(proc_probe(&fp), OccupancyState::Free);
     }
 
     #[test]
     fn procfs_past_its_time_bound_is_unknown() {
         let fp = fake_proc();
-        process(&fp, 50, ME, Path::new("/"), &[]);
+        process(&fp, 50, uid(), Path::new("/"), &[]);
         let target = fp.work.join("target");
-        let got = procfs_probe(&fp.root, &[&target], ME, MY_PID, Duration::ZERO);
+        let got = procfs_probe(&fp.root, &[&target], &me(), MY_PID, Duration::ZERO);
         assert!(
             matches!(got, OccupancyState::Unknown(ref w) if w.contains("did not finish")),
             "{got:?}"
