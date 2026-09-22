@@ -283,11 +283,10 @@ fn recheck_result_bindings(root: &Path, rel: &str, func: &str) -> Vec<String> {
         .into_iter()
         .filter(|b| {
             b.func == func
-                && (RECHECK_PATHS.iter().any(|(_, p)| {
-                    b.from
-                        .replace(' ', "")
-                        .contains(&p.replace("::", "::").replace(' ', ""))
-                }) || b.from.contains("covered_paths"))
+                && (RECHECK_PATHS
+                    .iter()
+                    .any(|(_, p)| b.from.replace(' ', "").contains(&p.replace(' ', "")))
+                    || b.from.contains("covered_paths"))
         })
         .map(|b| b.name)
         .collect()
@@ -802,20 +801,37 @@ pub fn explicit_only_scope_when_defaults_false(root: &Path) -> Result<(), String
     if !has_field {
         return Err("scope.rs: `ScanConfig` has no `enabled_detectors` allow-list field".into());
     }
-    if !ast::functions(&scope.ast)
+    let funcs = ast::functions(&scope.ast);
+    let predicates: Vec<&ast::Func> = funcs
         .iter()
-        .any(|f| f.name == "detectors_permitted")
-    {
+        .filter(|f| f.name == "detectors_permitted")
+        .collect();
+    if predicates.is_empty() {
         return Err("scope.rs does not define the `detectors_permitted(config)` predicate".into());
     }
-    let resolve = ast::functions(&scope.ast);
-    let resolve = ast::function(&resolve, "resolve_effective_scope")?;
-    if !resolve.body.contains("detectors_permitted (") {
-        return Err(
-            "scope.rs::resolve_effective_scope does not guard detector inference with \
-             `detectors_permitted(config)`"
-                .into(),
-        );
+    // The predicate has to *read the config*. One that returns a
+    // constant keeps the name and drops the contract -- slip class 4,
+    // an existence check standing in for semantics. Every definition,
+    // not the first: a second one beside the real one is the same
+    // defect.
+    for p in predicates {
+        if !(p.body.contains("defaults") && p.body.contains("enabled_detectors")) {
+            return Err(
+                "scope.rs::detectors_permitted does not read both `defaults` and \
+                 `enabled_detectors`: explicit-only scope is decided by the config, not by a \
+                 constant"
+                    .into(),
+            );
+        }
+    }
+    for resolve in ast::functions_named(&funcs, "resolve_effective_scope")? {
+        if !resolve.body.contains("detectors_permitted (") {
+            return Err(
+                "scope.rs::resolve_effective_scope does not guard detector inference with \
+                 `detectors_permitted(config)`"
+                    .into(),
+            );
+        }
     }
     // Semantics are pinned by tests, not by the AST. Both must exist.
     if !scope
@@ -1909,10 +1925,14 @@ pub fn agent_adapters_do_not_reach_detectors(root: &Path) -> Result<(), String> 
     for rel in agent_adapter_files(root) {
         let f = parse(root, &rel)?;
         for func in ast::functions(&f.ast) {
+            // Signature *and* body: a parameter typed
+            // `&dyn locations::Detector` is the same coupling as a call,
+            // and a body-only rule cannot see it.
+            let surface = format!("{} {}", func.sig, func.body);
             let mut at = 0usize;
-            while let Some(i) = func.body[at..].find("locations ::") {
+            while let Some(i) = surface[at..].find("locations ::") {
                 let start = at + i + "locations ::".len();
-                let tail = func.body[start..].trim_start();
+                let tail = surface[start..].trim_start();
                 let ident: String = tail
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -1940,14 +1960,29 @@ const REQUIRED_ADAPTER_TESTS: &[&str] = &[
     "project_link_is_declared_or_unresolved_never_basename_guess",
 ];
 
+/// Whether `text` defines a test named `name` that is not `#[ignore]`d.
+/// The attributes are the ~200 characters before the `fn` keyword, which
+/// is where `#[test]`/`#[ignore]` sit.
+fn defines_running_test(text: &str, name: &str) -> bool {
+    let needle = format!("fn {name}(");
+    text.match_indices(&needle).any(|(at, _)| {
+        let start = at.saturating_sub(200);
+        !text[start..at].contains("#[ignore")
+    })
+}
+
 pub fn agent_adapter_test_contract(root: &Path) -> Result<(), String> {
     let mut missing: Vec<String> = Vec::new();
     for rel in agent_adapter_files(root) {
         let f = parse(root, &rel)?;
+        // Present *and* not `#[ignore]`d. Slip class 4 in the 2026-09-22
+        // mutation sweep: a named test resolves by name whether or not
+        // it ever runs, so "the adapter has this test" was satisfied by
+        // an ignored stub.
         let absent: Vec<&str> = REQUIRED_ADAPTER_TESTS
             .iter()
             .copied()
-            .filter(|t| !f.text.contains(&format!("fn {t}(")))
+            .filter(|t| !defines_running_test(&f.text, t))
             .collect();
         if !absent.is_empty() {
             missing.push(format!("{rel}: missing {}", absent.join(", ")));

@@ -40,6 +40,11 @@ pub struct Func {
     pub name: String,
     pub body: String,
     pub stmts: Vec<String>,
+    /// The declaration's own token text (generics, parameter types,
+    /// return type). A body-only rule cannot see a coupling written as
+    /// `fn f(d: &dyn locations::Detector)`, which is how
+    /// `agent_adapters_do_not_reach_detectors` was bypassed.
+    pub sig: String,
 }
 
 /// Rewrites a token-text body so every path is the path it *resolves*
@@ -99,10 +104,19 @@ fn replace_token(haystack: &str, needle: &str, with: &str) -> String {
 
 /// Every macro's literal content in this function, appended to its body
 /// so a literal-matching audit sees through `concat!`/`format!`/`json!`.
-fn macro_literal_text(file: &syn::File, func: &str) -> String {
+///
+/// `body` is *this* definition's own token text, and a macro site only
+/// contributes when its tokens appear in it. Matching on the function
+/// name alone silently merged two same-named definitions: a second,
+/// wrong `files_schema` in a submodule inherited the real one's
+/// `vec![Field::new("mod_time_min", ..)]` literal and so satisfied an
+/// audit that the mutation had in fact broken (found by the mutation
+/// corpus, 2026-09-22, on `dir_mtime_int32_minutes` and
+/// `legacy_invariants`).
+fn macro_literal_text(file: &syn::File, func: &str, body: &str) -> String {
     let mut out = String::new();
     for m in crate::resolve::macro_sites(file) {
-        if m.in_test || m.func != func {
+        if m.in_test || m.func != func || !body.contains(&m.tokens) {
             continue;
         }
         for l in &m.literals {
@@ -124,10 +138,11 @@ pub fn functions(file: &syn::File) -> Vec<Func> {
     let raw = functions_raw(file);
     raw.into_iter()
         .map(|f| {
-            let extra = macro_literal_text(file, &f.name);
+            let extra = macro_literal_text(file, &f.name, &f.body);
             Func {
                 body: format!("{}{extra}", resolve_body(&res, &f.body)),
                 stmts: f.stmts.iter().map(|s| resolve_body(&res, s)).collect(),
+                sig: resolve_body(&res, &f.sig),
                 name: f.name,
             }
         })
@@ -161,6 +176,7 @@ pub fn functions_raw(file: &syn::File) -> Vec<Func> {
                 self.out.push(Func {
                     name: f.sig.ident.to_string(),
                     body: f.block.to_token_stream().to_string(),
+                    sig: f.sig.to_token_stream().to_string(),
                     stmts: f
                         .block
                         .stmts
@@ -176,6 +192,7 @@ pub fn functions_raw(file: &syn::File) -> Vec<Func> {
                 self.out.push(Func {
                     name: f.sig.ident.to_string(),
                     body: f.block.to_token_stream().to_string(),
+                    sig: f.sig.to_token_stream().to_string(),
                     stmts: f
                         .block
                         .stmts
@@ -200,6 +217,22 @@ pub fn function<'a>(funcs: &'a [Func], name: &str) -> Result<&'a Func, String> {
         .iter()
         .find(|f| f.name == name)
         .ok_or_else(|| format!("function `{name}` not found"))
+}
+
+/// **Every** definition with this name, not the first one found.
+///
+/// Slip class 3 in `review/AUDIT-MUTATION-SWEEP.md`: an audit that reads
+/// `function(&funcs, "dirs_schema")` is satisfied by the first
+/// definition and blind to a second, wrong one in a submodule -- which
+/// is how "seconds in the minutes column" walked past
+/// `dir_mtime_int32_minutes`. An audit that says "the function named X
+/// must have property P" means every X.
+pub fn functions_named<'a>(funcs: &'a [Func], name: &str) -> Result<Vec<&'a Func>, String> {
+    let found: Vec<&Func> = funcs.iter().filter(|f| f.name == name).collect();
+    if found.is_empty() {
+        return Err(format!("function `{name}` not found"));
+    }
+    Ok(found)
 }
 
 /// Idents that appear as the last segment of a called path, method
@@ -387,14 +420,25 @@ pub fn string_literals_raw(file: &syn::File) -> Vec<String> {
 
 /// Names of types that `impl <Trait> for <Type>` in this file.
 pub fn impls_of(file: &syn::File, trait_name: &str) -> Vec<String> {
+    // Resolved, not spelled: `use crate::bus::Consumer as Stage; impl
+    // Stage for X` is an impl of `Consumer`, and a trait-name needle
+    // alone does not see it (sweep slip class 1).
+    let res = crate::resolve::resolver(file);
     let mut out = Vec::new();
     for item in &file.items {
         if let syn::Item::Impl(i) = item
             && let Some((_, path, _)) = &i.trait_
-            && path.segments.last().is_some_and(|s| s.ident == trait_name)
             && let syn::Type::Path(tp) = &*i.self_ty
         {
-            out.push(tp.path.segments.last().unwrap().ident.to_string());
+            let written = path.to_token_stream().to_string();
+            let named = path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if named == trait_name || res.is(&written, trait_name) {
+                out.push(tp.path.segments.last().unwrap().ident.to_string());
+            }
         }
     }
     out
@@ -664,7 +708,42 @@ pub struct PubField {
 /// Every `pub` field of every struct in the file (test modules excluded).
 /// What an audit needs to ask "is this declared surface actually
 /// delivered?".
+/// Replaces whole-identifier occurrences of `from` with `to`, so
+/// rewriting `Fact` in `Vec<Fact>` does not also rewrite `FactStatus`.
+fn replace_ident(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < text.len() {
+        if text[i..].starts_with(from) {
+            let before_ok = i == 0 || {
+                let c = bytes[i - 1] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+            let after = i + from.len();
+            let after_ok = after >= text.len() || {
+                let c = bytes[after] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+            if before_ok && after_ok {
+                out.push_str(to);
+                i = after;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub fn pub_struct_fields(file: &syn::File) -> Vec<PubField> {
+    // `ty` is resolved through the file's `use` renames: a field
+    // declared `Vec<Fact>` where `use evidence::Evidence as Fact` is a
+    // field of `Evidence`, and a rule reading the written spelling
+    // alone misses it (sweep slip class 1).
+    let res = crate::resolve::resolver(file);
     let mut out = Vec::new();
     for item in &file.items {
         let syn::Item::Struct(s) = item else { continue };
@@ -679,7 +758,14 @@ pub fn pub_struct_fields(file: &syn::File) -> Vec<PubField> {
             out.push(PubField {
                 struct_name: s.ident.to_string(),
                 field: ident.to_string(),
-                ty: f.ty.to_token_stream().to_string(),
+                ty: {
+                    let written = f.ty.to_token_stream().to_string();
+                    let mut resolved = written.clone();
+                    for (alias, full) in res.alias_pairs() {
+                        resolved = replace_ident(&resolved, &alias, &full);
+                    }
+                    format!("{written} {resolved}")
+                },
                 attrs: f
                     .attrs
                     .iter()

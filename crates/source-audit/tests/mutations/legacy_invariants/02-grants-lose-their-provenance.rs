@@ -1,0 +1,10 @@
+//! target: crates/core/src/grants.rs
+//! mode: replace
+//! why: grants without non-index provenance -- a grant minted outside the reviewed index becomes indistinguishable from one inside it
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct Grant {
+    pub id: String,
+    pub path: String,
+}

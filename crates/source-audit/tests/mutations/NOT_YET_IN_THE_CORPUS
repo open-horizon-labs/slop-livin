@@ -1,37 +1,26 @@
 # Audits not yet in the mutation corpus (GUARDRAILS_SPEC.md section 17, item 6)
 #
 # A background mutation sweep bypassed all 42 audits. The shared layer
-# (crates/source-audit/src/resolve.rs) closes the four structural causes for
-# every audit at once, and the audits below are ported but have not yet had
-# three rejection fixtures written against them -- so nobody has *shown* they
-# reject their sweep mutation.
+# (crates/source-audit/src/{resolve,ast}.rs) closes the structural causes for
+# every audit at once; a fixture here is what *shows* a given audit rejects
+# its sweep mutation rather than merely being ported onto the hardened layer.
 #
 # This list can only shrink: `every_audit_has_rejection_fixtures_or_is_on_the_shrinking_list`
 # fails if an audit here gains three fixtures without being removed, and fails
 # if an audit not here has fewer than three.
-legacy_invariants
-column_store_parquet_zstd
-reverse_delta_current_plus_deltas
-scheduled_refresh_launchagent
-folding_only_for_artifacts
-incremental_walk_only_changed_subtrees
-walk_optimized_parallel_pool
-dir_mtime_int32_minutes
-no_consumer_knows_other_consumers
-static_registration_only
-all_report_paths_through_bus
-extractors_are_pluggable
-event_bus_pluggable_consumers
-adr_validation
-discovery_consumes_effective_scope
-explicit_only_scope_when_defaults_false
-no_second_traversal_on_report_path
-tui_refresh_preserves_scope
-agent_adapters_are_pluggable
-agent_adapters_do_not_reach_detectors
-agent_adapter_test_contract
-detector_ids_only_in_registry
-discovery_owned_by_report_pipeline
-computed_but_not_delivered
-coverage_changes_are_not_storage_changes
-activity_and_consumer_evidence_have_limits
+#
+# 2026-09-22: emptied. Every registered audit has at least three rejection
+# fixtures, including an alias/rename variant and (where the audit is about a
+# result rather than a call) a discarded-result variant. Writing them found
+# three real holes in the shared layer, not just in the audits:
+#
+#   * `ast::functions` attributed macro literals by function *name*, so a
+#     second, wrong `files_schema` inherited the real one's
+#     `vec![Field::new("mod_time_min", ..)]` and passed;
+#   * `ast::function` returned the first definition, so "the function named X
+#     must have property P" was satisfied by whichever X came first;
+#   * `Func` carried no signature, so a coupling written as
+#     `fn f(d: &dyn locations::Detector)` was invisible to every body rule.
+#
+# Keep it empty. A new audit lands with its fixtures, or it lands here with a
+# reason and a date.
