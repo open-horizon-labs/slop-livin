@@ -446,3 +446,123 @@ fn worktrees_view_shows_removal_hint_only_for_linked() {
     // command -- it isn't a worktree `git worktree remove` can act on.
     assert!(!text.contains("git worktree remove /src/big-grower\n"));
 }
+
+// ---------------------------------------------------------------------
+// `render_view_external`: the CLI text evidence surface DESIGN.md names.
+//
+// The 2026-09-22 re-review found it referenced by no test in the
+// workspace -- so the one place a user reads an external unit's
+// decision evidence in the terminal had no rendering test at all, and
+// the guardrails about *what may be printed* (facts, never verdicts;
+// an unknown always with its reason; a modification age labelled
+// correctly) were unenforced on this surface.
+// ---------------------------------------------------------------------
+
+fn external_unit(
+    path: &str,
+    bytes: u64,
+    mtime_max: u64,
+    evidence: Vec<swamp_core::evidence::Evidence>,
+) -> swamp_core::external::ExternalUnit {
+    use swamp_core::locations::{Provenance, StorageCategory};
+    swamp_core::external::ExternalUnit {
+        detector_id: "cargo-home".into(),
+        detector_name: "Cargo home".into(),
+        category: StorageCategory::Cache,
+        provenance: Provenance::BuiltinConvention,
+        path: PathBuf::from(path),
+        bytes,
+        mtime_max,
+        hardlinked: false,
+        growth_bytes: Some(4_096),
+        regrowth_count: 0,
+        observed_at: 1_000_000,
+        consumers: Vec::new(),
+        note: None,
+        evidence,
+    }
+}
+
+#[test]
+fn external_view_renders_units_largest_first_with_a_total() {
+    let out = swamp_core::render::render_view_external(&[
+        external_unit("/fixture/small", 1_024, 0, Vec::new()),
+        external_unit("/fixture/large", 1_048_576, 0, Vec::new()),
+    ]);
+    let large_at = out.find("/fixture/large").expect("large unit rendered");
+    let small_at = out.find("/fixture/small").expect("small unit rendered");
+    assert!(large_at < small_at, "largest unit first:\n{out}");
+    assert!(
+        out.contains("external storage total:"),
+        "the view must state its own total:\n{out}"
+    );
+    assert!(
+        out.contains("(2 units"),
+        "the total must say what it covers:\n{out}"
+    );
+}
+
+#[test]
+fn an_empty_external_view_says_so_rather_than_rendering_nothing() {
+    let out = swamp_core::render::render_view_external(&[]);
+    assert!(
+        out.contains("no external storage units detected"),
+        "an empty view must say it is empty, never print a blank screen: {out:?}"
+    );
+    // "none detected" is a coverage statement, not a verdict about the
+    // disk: it must not claim there is nothing there.
+    assert!(!out.contains("total:"), "{out:?}");
+}
+
+#[test]
+fn external_view_prints_an_unknown_together_with_its_reason() {
+    use swamp_core::evidence::{Evidence, FactKind};
+    let unit = external_unit(
+        "/fixture/cache",
+        2_048,
+        0,
+        vec![Evidence::unavailable(
+            FactKind::Activity,
+            swamp_core::evidence::FactSubtype::Accessed,
+            swamp_core::evidence::EvidenceSource::FilesystemMetadata {
+                detail: "atime".into(),
+            },
+            1_000,
+            "atime is not recorded on this volume",
+        )],
+    );
+    let out = swamp_core::render::render_view_external(&[unit]);
+    assert!(
+        out.contains("atime is not recorded on this volume"),
+        "an unknown printed without its reason reads as \"nothing there\":\n{out}"
+    );
+}
+
+/// The verdict-vocabulary guardrail, enforced on this surface rather
+/// than only on the source: a rendered external view never tells the
+/// reader what to conclude.
+#[test]
+fn external_view_never_renders_a_verdict_word() {
+    use swamp_core::evidence::{Evidence, FactKind, FactSubtype};
+    let unit = external_unit(
+        "/fixture/cache",
+        2_048,
+        1_000,
+        vec![Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            swamp_core::evidence::FactValue::Timestamp(1_000),
+            swamp_core::evidence::EvidenceSource::FilesystemMetadata {
+                detail: "mtime".into(),
+            },
+            1_000,
+        )],
+    );
+    let out = swamp_core::render::render_view_external(&[unit]).to_lowercase();
+    for verdict in ["safe", "unused", "stale", "can be deleted", "junk"] {
+        assert!(
+            !out.contains(verdict),
+            "the external view rendered the verdict word {verdict:?}:\n{out}"
+        );
+    }
+}

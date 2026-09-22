@@ -1724,6 +1724,25 @@ pub fn render_view_agents(
     out
 }
 
+/// The activity-evidence inventory (`activity::ACTIVITY_EVIDENCE_INVENTORY`)
+/// rendered as the Markdown table `docs/usage.md` carries.
+///
+/// The constant is the #54 "inventory" deliverable and, until
+/// 2026-09-22, it had **zero** readers: `activity.rs` claimed that
+/// `crates/core/tests/evidence_contract.rs` asserted the doc table
+/// listed every entry, and no test referenced the constant at all. A
+/// rendered form is what makes the claim checkable -- the test below
+/// regenerates this table and compares it to the file, so editing either
+/// side alone fails.
+pub fn activity_evidence_inventory_markdown() -> String {
+    let mut out =
+        String::from("| Domain | Activity evidence this pass can establish |\n|---|---|\n");
+    for (domain, evidence) in crate::activity::ACTIVITY_EVIDENCE_INVENTORY {
+        out.push_str(&format!("| {domain} | {evidence} |\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod evidence_warnings_tests {
     use super::evidence_warnings;
@@ -1834,23 +1853,4 @@ mod evidence_warnings_tests {
         )];
         assert_eq!(evidence_warnings(&bounded).len(), 1);
     }
-}
-
-/// The activity-evidence inventory (`activity::ACTIVITY_EVIDENCE_INVENTORY`)
-/// rendered as the Markdown table `docs/usage.md` carries.
-///
-/// The constant is the #54 "inventory" deliverable and, until
-/// 2026-09-22, it had **zero** readers: `activity.rs` claimed that
-/// `crates/core/tests/evidence_contract.rs` asserted the doc table
-/// listed every entry, and no test referenced the constant at all. A
-/// rendered form is what makes the claim checkable -- the test below
-/// regenerates this table and compares it to the file, so editing either
-/// side alone fails.
-pub fn activity_evidence_inventory_markdown() -> String {
-    let mut out =
-        String::from("| Domain | Activity evidence this pass can establish |\n|---|---|\n");
-    for (domain, evidence) in crate::activity::ACTIVITY_EVIDENCE_INVENTORY {
-        out.push_str(&format!("| {domain} | {evidence} |\n"));
-    }
-    out
 }

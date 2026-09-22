@@ -6,6 +6,21 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Fixture scopes are **allow-lists**, never deny-lists.
+///
+/// `core-simulator`, `homebrew` and `ruby-install` resolve absolute
+/// system paths (`/Library/Developer/CoreSimulator/Volumes`,
+/// `/opt/homebrew`, `/opt/rubies`) that no injected `HOME` can confine,
+/// so a deny-list of two or three ids leaves the developer's real disk
+/// in a test fixture's scope: this file's `report` runs took ~1m34s each
+/// and read tens of gigabytes of real storage. The core tests already
+/// learned this
+/// (`crates/core/tests/external_units.rs::a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_byte_total`);
+/// `a_fixture_scope_reaches_nothing_outside_its_fixture_home` below is
+/// this file's copy of the guard.
+const CLAUDE_ONLY_SCOPE: &str = "[scan]\ndefaults = false\nenabled_detectors = [\"claude-code\"]\n";
+const CARGO_ONLY_SCOPE: &str = "[scan]\ndefaults = false\nenabled_detectors = [\"cargo-home\"]\n";
+
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_swamp"))
 }
@@ -49,11 +64,7 @@ fn report_view_agents_lists_a_claude_code_session_with_project_linkage() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
-    std::fs::write(
-        store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\"]\n",
-    )
-    .unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
 
     let output = Command::new(bin())
         .arg("report")
@@ -93,11 +104,7 @@ fn report_view_agents_project_filter_narrows_to_linked_units() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, _repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
-    std::fs::write(
-        store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\"]\n",
-    )
-    .unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
 
     let output = Command::new(bin())
         .arg("report")
@@ -191,6 +198,7 @@ fn propose_agents_approve_execute_moves_an_unprotected_cache_to_trash() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, _repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let trash = tempfile::tempdir().unwrap();
     let target = claude_home.join("shell-snapshots");
 
@@ -268,6 +276,7 @@ fn unified_propose_path_routes_to_an_agent_unit_without_a_root() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, _repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let trash = tempfile::tempdir().unwrap();
     let target = claude_home.join("shell-snapshots");
 
@@ -332,6 +341,7 @@ fn propose_agents_alias_prints_a_deprecation_note() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, _repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let trash = tempfile::tempdir().unwrap();
     let target = claude_home.join("shell-snapshots");
 
@@ -359,11 +369,7 @@ fn propose_agents_alias_prints_a_deprecation_note() {
 fn unified_propose_errors_when_nothing_matches_and_no_root_was_given() {
     let home = tempfile::tempdir().unwrap();
     let store = tempfile::tempdir().unwrap();
-    std::fs::write(
-        store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\"]\n",
-    )
-    .unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
 
     let output = Command::new(bin())
         .arg("propose")
@@ -387,6 +393,7 @@ fn unified_propose_errors_when_nothing_matches_and_no_root_was_given() {
 #[test]
 fn unified_propose_errors_when_neither_root_nor_path_is_given() {
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let output = Command::new(bin())
         .arg("propose")
         .env("SWAMP_DIR", store.path())
@@ -411,11 +418,7 @@ fn unified_propose_external_route_is_refused_at_execute() {
     std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
     std::fs::write(cargo_home.join("bin/cargo"), vec![9u8; 5_000]).unwrap();
     let store = tempfile::tempdir().unwrap();
-    std::fs::write(
-        store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"rustup\", \"homebrew\"]\n",
-    )
-    .unwrap();
+    std::fs::write(store.path().join("config.toml"), CARGO_ONLY_SCOPE).unwrap();
 
     let envs = |cmd: &mut Command| {
         cmd.env("SWAMP_DIR", store.path())
@@ -464,6 +467,7 @@ fn unified_propose_external_route_is_refused_at_execute() {
 #[test]
 fn unified_propose_external_rejects_a_root() {
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let output = Command::new(bin())
         .arg("propose")
         .arg(".")
@@ -483,11 +487,7 @@ fn report_project_json_without_view_includes_linked_agent_storage() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
-    std::fs::write(
-        store.path().join("config.toml"),
-        "[scan]\ndefaults = false\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\"]\n",
-    )
-    .unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let project_name = repo.file_name().unwrap().to_str().unwrap().to_string();
 
     let output = Command::new(bin())
@@ -526,6 +526,7 @@ fn propose_agents_refuses_a_protected_path() {
     let home = tempfile::tempdir().unwrap();
     let (claude_home, _repo) = fixture(home.path());
     let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let settings = claude_home.join("settings.json");
 
     let output = Command::new(bin())
@@ -545,4 +546,60 @@ fn propose_agents_refuses_a_protected_path() {
         "{stderr}"
     );
     assert!(settings.exists());
+}
+
+/// This file's copy of the core suite's escaping-detector guard: a
+/// fixture scope must reach nothing outside its fixture home.
+///
+/// The core tests catch a *detector* that escapes; this catches a
+/// *fixture* that lets one in, which is the failure this file actually
+/// had. It runs the real binary with the same scope constant the report
+/// tests use and fails on any resolved root outside the tempdir --
+/// including the absolute system paths (`/opt/homebrew`,
+/// `/Library/Developer/CoreSimulator/Volumes`, `/opt/rubies`) that a
+/// deny-list of two or three detector ids leaves in scope.
+#[test]
+fn a_fixture_scope_reaches_nothing_outside_its_fixture_home() {
+    for scope in [CLAUDE_ONLY_SCOPE, CARGO_ONLY_SCOPE] {
+        let home = tempfile::tempdir().unwrap();
+        let (claude_home, _repo) = fixture(home.path());
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(store.path().join("config.toml"), scope).unwrap();
+        let output = Command::new(bin())
+            .arg("scope")
+            .arg("--json")
+            .env("SWAMP_DIR", store.path())
+            .env("HOME", home.path())
+            .env("CLAUDE_CONFIG_DIR", &claude_home)
+            .env("CARGO_HOME", home.path().join("fixture-cargo"))
+            .env("SWAMP_TEST_MODE", "1")
+            .output()
+            .expect("run scope --json");
+        assert!(
+            output.status.success(),
+            "scope --json failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let home_prefix = std::fs::canonicalize(home.path())
+            .unwrap()
+            .display()
+            .to_string();
+        let escaping: Vec<String> = json["roots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r["status"]["state"] == "present")
+            .filter_map(|r| r["path"].as_str().map(str::to_string))
+            .filter(|p| {
+                !p.starts_with(&home_prefix) && !p.starts_with(home.path().to_str().unwrap())
+            })
+            .collect();
+        assert!(
+            escaping.is_empty(),
+            "a fixture scope resolved roots outside its fixture home, so this test reads real \
+             user data: {escaping:?} (scope was {scope:?})"
+        );
+    }
 }
