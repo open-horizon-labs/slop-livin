@@ -5,15 +5,17 @@
 
 mod ast;
 mod audits;
+mod repair_audits;
 mod tui_nonblocking;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let default_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("workspace root");
+        .expect("workspace root")
+        .to_path_buf();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--list") {
         for (name, _) in audits::AUDITS {
@@ -21,7 +23,24 @@ fn main() {
         }
         return;
     }
-    let only: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `--root <dir>` audits another checkout of this workspace. That is
+    // how the pre-repair baseline in
+    // `.oh/sessions/2026-09-21-foundation-repairs.md` was produced: the
+    // audits had to enumerate violations in the *reviewed* code, not in
+    // a working tree that was already being repaired.
+    let mut root_buf = default_root;
+    let mut only: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--root" && i + 1 < args.len() {
+            root_buf = PathBuf::from(&args[i + 1]);
+            i += 2;
+            continue;
+        }
+        only.push(args[i].as_str());
+        i += 1;
+    }
+    let root: &Path = &root_buf;
     let mut failed = 0;
     for (name, audit) in audits::AUDITS {
         if !only.is_empty() && !only.contains(name) {

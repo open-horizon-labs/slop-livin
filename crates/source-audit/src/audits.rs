@@ -51,6 +51,97 @@ pub const AUDITS: &[(&str, Audit)] = &[
         event_bus_pluggable_consumers,
     ),
     ("adr_validation", adr_validation),
+    // The 2026-09-21 review repairs (`repair_audits.rs`). Landed before
+    // the repairs themselves, deliberately failing, so the baseline is
+    // the audit's own enumeration rather than a prose list.
+    (
+        "execution_sinks_recheck_live_state",
+        crate::repair_audits::execution_sinks_recheck_live_state,
+    ),
+    (
+        "protection_fails_closed",
+        crate::repair_audits::protection_fails_closed,
+    ),
+    (
+        "discovery_consumes_effective_scope",
+        crate::repair_audits::discovery_consumes_effective_scope,
+    ),
+    (
+        "explicit_only_scope_when_defaults_false",
+        crate::repair_audits::explicit_only_scope_when_defaults_false,
+    ),
+    (
+        "history_sweeps_are_owned",
+        crate::repair_audits::history_sweeps_are_owned,
+    ),
+    (
+        "no_second_traversal_on_report_path",
+        crate::repair_audits::no_second_traversal_on_report_path,
+    ),
+    (
+        "occupancy_is_tristate_at_sinks",
+        crate::repair_audits::occupancy_is_tristate_at_sinks,
+    ),
+    (
+        "tui_refresh_preserves_scope",
+        crate::repair_audits::tui_refresh_preserves_scope,
+    ),
+    (
+        "store_data_is_parquet_not_json_sidecars",
+        crate::repair_audits::store_data_is_parquet_not_json_sidecars,
+    ),
+    (
+        "json_persistence_is_allowlisted",
+        crate::repair_audits::json_persistence_is_allowlisted,
+    ),
+    (
+        "agent_adapters_are_pluggable",
+        crate::repair_audits::agent_adapters_are_pluggable,
+    ),
+    (
+        "agent_adapters_read_bounded_headers_only",
+        crate::repair_audits::agent_adapters_read_bounded_headers_only,
+    ),
+    (
+        "agent_adapters_do_not_traverse",
+        crate::repair_audits::agent_adapters_do_not_traverse,
+    ),
+    (
+        "agent_adapters_are_inspection_only",
+        crate::repair_audits::agent_adapters_are_inspection_only,
+    ),
+    (
+        "agent_adapters_do_not_emit_content",
+        crate::repair_audits::agent_adapters_do_not_emit_content,
+    ),
+    (
+        "agent_units_built_through_builder",
+        crate::repair_audits::agent_units_built_through_builder,
+    ),
+    (
+        "agent_adapters_are_environment_free",
+        crate::repair_audits::agent_adapters_are_environment_free,
+    ),
+    (
+        "agent_adapters_do_not_reach_detectors",
+        crate::repair_audits::agent_adapters_do_not_reach_detectors,
+    ),
+    (
+        "agent_adapter_test_contract",
+        crate::repair_audits::agent_adapter_test_contract,
+    ),
+    (
+        "detector_ids_only_in_registry",
+        crate::repair_audits::detector_ids_only_in_registry,
+    ),
+    (
+        "discovery_owned_by_report_pipeline",
+        crate::repair_audits::discovery_owned_by_report_pipeline,
+    ),
+    (
+        "no_dead_public_evidence_api",
+        crate::repair_audits::no_dead_public_evidence_api,
+    ),
 ];
 
 /// The guardrail-level umbrella: the three bus audits together.
