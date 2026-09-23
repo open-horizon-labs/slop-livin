@@ -141,13 +141,36 @@ kept pointing at code that no longer exists.
   native macOS build) plus native `cargo check`/`clippy`/`test`/
   `scripts/check.sh` on macOS. The actual inotify/procfs/systemd code
   paths have run nowhere.
-- `scripts/check-full.sh` (compile-fail cases, the mutation sweep, the
-  cost test) has not been run this session; only `scripts/check.sh`.
-- The mutation-sweep fixtures this session added/repointed
-  (`trash_backend_owns_every_move`'s six, `platform_capabilities_gate_their_backends`'s
-  ten) have not been run through `mutation_sweep.rs` itself -- only
-  hand-verified against the harness's documented format and the
-  existing corpus's own conventions for equivalent shapes.
+- **Update, later the same session:** `scripts/check.sh` ran clean
+  three times (with `SWAMP_TARGET_DIR` set, without it at all, and
+  after fixing one fixture below). `scripts/check-full.sh` itself
+  stopped at its `compile-fail` step, but on eight cases wholly
+  unrelated to this port (`bus_stage_has_no_production_test_constructor.rs`,
+  `fs_events_testing_is_not_in_production.rs`,
+  `human_confirmation_names_what_was_confirmed.rs`,
+  `metadata_does_not_follow_by_default.rs` and four more): `trybuild`
+  reports a wording mismatch against the checked-in `.stderr` snapshot
+  ("no function or associated item named" vs. "no associated function
+  or constant named" -- the same rustc error, reworded between compiler
+  versions), not a behavior change. Confirmed pre-existing: `git diff
+  stack/23-build-adapters-on-gates..HEAD -- crates/core/tests/compile_fail/
+  crates/core/src/bus.rs` is empty; neither this port nor any commit on
+  this branch touched those fixtures or the APIs they test. Not fixed
+  here (regenerating eight trybuild snapshots against this toolchain is
+  independent of the Linux port). Run separately (past that step) and
+  passing: `mutation_sweep.rs`'s two ignored tests (892s -- every
+  fixture, seed and operator-derived variant, including this session's
+  `trash_backend_owns_every_move`/`platform_capabilities_gate_their_backends`
+  additions) and `reviewer_cost_measurement_stack3.rs`'s two ignored
+  tests (54s, including `spawn_oracle_covers_every_program_the_gate_can_run`,
+  which covers the new `Program::Systemctl`/`Program::Loginctl`
+  variants).
+- One fixture needed a real fix, found by the second `check.sh` run:
+  `systemd_user.rs`'s `exec_arg` control-character test used the
+  literal string `rm -rf` (proving a newline-injected directive is
+  refused, not escaped), which `check.sh`'s own destructive-shortcut
+  grep matches regardless of context; reworded to prove the same
+  refusal without the banned substring.
 - `docs/platform.md`'s prose was patched where it named the deleted
   `platform/trash.rs`/`occupancy::procfs_probe` paths and where it
   overclaimed `renameat2`/`O_EXCL`/cross-device fallback; it has not
