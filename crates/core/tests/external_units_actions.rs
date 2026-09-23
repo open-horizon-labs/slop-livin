@@ -58,8 +58,8 @@ fn external_units_are_inspection_only_and_execution_refuses() {
     // A plan CAN name it (identification is not blocked)...
     let plan =
         actions::propose_external(&units, std::slice::from_ref(&target.path), "test").unwrap();
-    assert_eq!(plan.units.len(), 1);
-    assert!(plan.units[0].external_category.is_some());
+    assert_eq!(plan.units().len(), 1);
+    assert!(plan.units()[0].external_category().is_some());
 
     actions::save_plan(store.path(), &plan).unwrap();
     // ...and a human can even approve the plan (approval is not the same

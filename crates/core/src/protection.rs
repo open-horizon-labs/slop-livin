@@ -13,6 +13,7 @@
 //! (`crates/core/tests/compile_fail/protect_list_*.rs`). That replaces
 //! the `protection_fails_closed` call-graph audit.
 
+use crate::authority::{HumanConfirmed, ProtectChange};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -114,7 +115,11 @@ impl ProtectList {
 
 /// What `swamp protect list` prints: the entries as text, one per line
 /// (`Display`), or as a JSON array (`Serialize`). Nothing else: it is a
-/// rendering, not a second copy of the list to test paths against.
+/// rendering, not a second copy of the list to test paths against --
+/// there is no iterator, no accessor to an entry and no containment
+/// query, so a caller cannot grow a second protection predicate over it
+/// (the production listing; the raw `protect_list` exists only under the
+/// `testing` feature).
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct ProtectListing(Vec<String>);
@@ -191,7 +196,9 @@ fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
         paths: paths.iter().map(|p| p.display().to_string()).collect(),
     };
     crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::ProtectList { store: swamp_dir },
+        crate::fs_gate::store::JsonFile::ProtectList {
+            store: &crate::fs_gate::store::StoreDir::at(swamp_dir)?,
+        },
         &f,
     )?;
     Ok(())
@@ -219,7 +226,35 @@ fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
 ///
 /// Idempotent; a not-yet-observed path can still be protected in
 /// advance.
+///
+/// **Human-only** (re-review 5, finding 7): takes the
+/// [`HumanConfirmed`] the CLI's `cmd_protect` minted for exactly this
+/// change, and spends it. A keep-list change is as consequential as a
+/// grant -- removing an entry is what lets an approved plan move what it
+/// protected -- so no other code path may make one.
+pub fn protect_add_confirmed(
+    swamp_dir: &Path,
+    path: &Path,
+    confirmed: HumanConfirmed,
+) -> Result<()> {
+    if !confirmed.confirms_protect(&ProtectChange::Add(path.to_path_buf())) {
+        anyhow::bail!(
+            "refused: this confirmation is not `swamp protect add {}`",
+            path.display()
+        );
+    }
+    protect_add_unchecked(swamp_dir, path)
+}
+
+/// The test-fixture spelling of [`protect_add_confirmed`] (`testing`
+/// only; no production build has it). The reviewers' counterexample files
+/// call it by this name.
+#[cfg(feature = "testing")]
 pub fn protect_add(swamp_dir: &Path, path: &Path) -> Result<()> {
+    protect_add_unchecked(swamp_dir, path)
+}
+
+fn protect_add_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         anyhow::bail!("refused: an empty path protects nothing");
     }
@@ -240,7 +275,31 @@ pub fn protect_add(swamp_dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Removes `path` from the human keep list. Human-only, like
+/// [`protect_add_confirmed`]: it spends the CLI's confirmation for exactly
+/// this removal.
+pub fn protect_remove_confirmed(
+    swamp_dir: &Path,
+    path: &Path,
+    confirmed: HumanConfirmed,
+) -> Result<()> {
+    if !confirmed.confirms_protect(&ProtectChange::Remove(path.to_path_buf())) {
+        anyhow::bail!(
+            "refused: this confirmation is not `swamp protect remove {}`",
+            path.display()
+        );
+    }
+    protect_remove_unchecked(swamp_dir, path)
+}
+
+/// The test-fixture spelling of [`protect_remove_confirmed`] (`testing`
+/// only).
+#[cfg(feature = "testing")]
 pub fn protect_remove(swamp_dir: &Path, path: &Path) -> Result<()> {
+    protect_remove_unchecked(swamp_dir, path)
+}
+
+fn protect_remove_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
     let mut paths = load_paths(swamp_dir)?;
     let before = paths.len();
     paths.retain(|p| p != path);

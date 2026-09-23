@@ -60,9 +60,21 @@ pub const MAX_PROOF_AGE: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub struct RecheckProof {
     anchor: PathBuf,
-    identity: ReviewedIdentity,
+    kind: ProofKind,
     covered: Vec<PathBuf>,
     taken_at: Instant,
+    /// For a linked worktree: its common git dir, read from the anchor's
+    /// `.git` pointer during the recheck (`git worktree prune` runs there
+    /// after the move, and nowhere a caller names).
+    linked_common: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum ProofKind {
+    /// A filesystem unit: its identity as the recheck observed it.
+    Path(ReviewedIdentity),
+    /// A Docker object the daemon still has.
+    Docker(crate::docker::Removal),
 }
 
 impl RecheckProof {
@@ -71,13 +83,29 @@ impl RecheckProof {
         &self.anchor
     }
 
-    /// The identity the recheck observed (equal to the reviewed one).
-    pub fn identity(&self) -> &ReviewedIdentity {
-        &self.identity
+    /// The identity the recheck observed (equal to the reviewed one);
+    /// `None` for a Docker object.
+    pub fn identity(&self) -> Option<&ReviewedIdentity> {
+        match &self.kind {
+            ProofKind::Path(identity) => Some(identity),
+            ProofKind::Docker(_) => None,
+        }
+    }
+
+    /// The Docker removal the daemon was just asked about.
+    pub(crate) fn docker(&self) -> Option<&crate::docker::Removal> {
+        match &self.kind {
+            ProofKind::Docker(r) => Some(r),
+            ProofKind::Path(_) => None,
+        }
+    }
+
+    pub(crate) fn linked_common(&self) -> Option<&Path> {
+        self.linked_common.as_deref()
     }
 
     /// Every path the proof covers: the anchor, each exactly-recorded
-    /// member, and any extra members the caller asked to be checked.
+    /// member, and each reviewed sidecar member with its own members.
     pub fn covers(&self, path: &Path) -> bool {
         self.covered.iter().any(|p| p == path)
     }
@@ -91,23 +119,49 @@ impl RecheckProof {
 /// All three rechecks, in order, failing closed: the only constructor of
 /// a [`RecheckProof`].
 ///
-/// `extra_members` are paths the caller re-derived itself (a session's
-/// current member files, a Cargo group's companions); they are protection-
-/// and occupancy-checked with the snapshot's own members.
-pub fn run_all(
-    store_dir: &Path,
-    path: &Path,
-    reviewed: Option<&ReviewedIdentity>,
-    extra_members: &[PathBuf],
-) -> Result<RecheckProof> {
-    let identity = reviewed_snapshot(path, reviewed)?;
+/// Every input comes from `auth` -- the anchor, the identity a human
+/// reviewed, the sidecar members recorded at proposal (each with its own
+/// identity, rechecked exactly like the anchor's), the store whose
+/// protect list applies, and for a Docker object the removal the plan
+/// named -- never from the sink that calls this (re-review 5, finding 3:
+/// a caller-chosen `reviewed`, store or member list made the recheck say
+/// whatever the caller wanted). A store with no authority key is not the
+/// store the authorization came from, and refuses; a store with a key
+/// and no protect file is simply a store where nothing is protected.
+pub fn run_all(auth: &crate::authority::Authorized) -> Result<RecheckProof> {
+    let target = auth.target();
+    let store = auth.store();
+    if !crate::fs_gate::key::has_authority_key(store) {
+        bail!(
+            "refused: {} holds no swamp authority key, so it is not the store this \
+             authorization was issued from; protection cannot be read from it",
+            store.path().display()
+        );
+    }
+    if let Some(removal) = &target.docker {
+        crate::docker::still_removable(removal).map_err(|why| anyhow!("{why}"))?;
+        return Ok(RecheckProof {
+            anchor: target.anchor.clone(),
+            kind: ProofKind::Docker(removal.clone()),
+            covered: vec![target.anchor.clone()],
+            taken_at: Instant::now(),
+            linked_common: None,
+        });
+    }
+    let identity = reviewed_snapshot(&target.anchor, target.reviewed.as_ref())?;
     let mut covered = covered_paths(&identity);
-    for m in extra_members {
-        if !covered.contains(m) {
-            covered.push(m.clone());
+    for member in &target.members {
+        if member.path == target.anchor {
+            continue;
+        }
+        let fresh = reviewed_snapshot(&member.path, Some(member))?;
+        for p in covered_paths(&fresh) {
+            if !covered.contains(&p) {
+                covered.push(p);
+            }
         }
     }
-    live_protection(store_dir, &covered)?;
+    live_protection(store.path(), &covered)?;
     match member_occupancy(&covered) {
         OccupancyState::Free => {}
         other => bail!(
@@ -117,11 +171,17 @@ pub fn run_all(
                 .unwrap_or_else(|| "occupancy refused this unit".to_string())
         ),
     }
+    let linked_common = if target.linked_worktree {
+        crate::git::linked_common_dir(&target.anchor)
+    } else {
+        None
+    };
     Ok(RecheckProof {
-        anchor: path.to_path_buf(),
-        identity,
+        anchor: target.anchor.clone(),
+        kind: ProofKind::Path(identity),
         covered,
         taken_at: Instant::now(),
+        linked_common,
     })
 }
 
@@ -277,6 +337,17 @@ fn ids_of(_meta: &Metadata) -> (u64, u64) {
 /// Records what is at `path` right now, for a plan to carry. Called at
 /// **proposal** time; [`reviewed_snapshot`] is its counterpart at
 /// execution time, which recaptures and compares.
+///
+/// Private to the crate (the propose path), so no caller outside it can
+/// take a "reviewed" identity at execution time and hand it to the
+/// recheck; the `testing` feature re-exports it for fixtures.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn capture(path: &Path) -> Result<ReviewedIdentity> {
+    Ok(collect(path)?.0)
+}
+
+/// [`capture`], for integration-test fixtures (`testing` only).
+#[cfg(feature = "testing")]
 pub fn capture(path: &Path) -> Result<ReviewedIdentity> {
     Ok(collect(path)?.0)
 }
@@ -284,6 +355,9 @@ pub fn capture(path: &Path) -> Result<ReviewedIdentity> {
 /// Records the anchor's identity without enumerating its members: the
 /// [`ReviewedMembership::Anchor`] mode, for ordinary filesystem artifact
 /// rows. One `stat`, no traversal.
+///
+/// Public for the TUI, whose marking of a row is its propose step; the
+/// gate audit allows naming it only there and in `actions`.
 pub fn capture_anchor(path: &Path) -> Result<ReviewedIdentity> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| anyhow!("{} could not be observed: {e}", path.display()))?;
@@ -421,7 +495,23 @@ fn collect(path: &Path) -> Result<(ReviewedIdentity, Vec<ReviewedMember>)> {
 /// reviewed identity was never reviewed against live state and must be
 /// proposed again. Every destructive sink calls this before its first
 /// destructive statement.
+#[cfg(feature = "testing")]
 pub fn reviewed_snapshot(
+    path: &Path,
+    reviewed: Option<&ReviewedIdentity>,
+) -> Result<ReviewedIdentity> {
+    reviewed_snapshot_impl(path, reviewed)
+}
+
+#[cfg(not(feature = "testing"))]
+pub(crate) fn reviewed_snapshot(
+    path: &Path,
+    reviewed: Option<&ReviewedIdentity>,
+) -> Result<ReviewedIdentity> {
+    reviewed_snapshot_impl(path, reviewed)
+}
+
+fn reviewed_snapshot_impl(
     path: &Path,
     reviewed: Option<&ReviewedIdentity>,
 ) -> Result<ReviewedIdentity> {

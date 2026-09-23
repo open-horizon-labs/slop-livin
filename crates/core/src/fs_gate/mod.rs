@@ -44,10 +44,17 @@
 
 pub mod columns;
 pub mod destroy;
+pub mod git;
+pub mod key;
 pub mod read;
 pub mod spawn;
 pub mod store;
 pub mod sys;
+
+/// A swamp state directory (see [`store::StoreDir`]). Named here so any
+/// module can hold or pass one; building one from a caller's path
+/// (`StoreDir::at`) is the store modules' capability.
+pub use store::StoreDir;
 
 use std::io;
 use std::path::{Path, PathBuf};

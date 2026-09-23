@@ -522,20 +522,16 @@ pub enum Removal {
 /// Runs a removal, permanently, in the daemon. Returns the daemon's own
 /// refusal text when it declines (an image still referenced by a
 /// container, a volume still mounted), because that reason is the fact
-/// the human needs. Takes the [`crate::authority::Authorized`] naming the
-/// unit's `anchor`: `docker … rm` is reachable only through
-/// [`crate::fs_gate::destroy::docker_remove`].
+/// the human needs. Takes the recheck proof `recheck::run_all` took for
+/// the [`crate::authority::Authorized`] unit (which asked the daemon
+/// about exactly this object): `docker … rm` is reachable only through
+/// [`crate::fs_gate::destroy::docker_remove`], which builds its
+/// arguments from that proof.
 pub fn remove(
-    target: &Removal,
+    proof: crate::recheck::RecheckProof,
     auth: &crate::authority::Authorized,
-    anchor: &Path,
 ) -> Result<(), String> {
-    let (kind, id) = match target {
-        Removal::Image { id } => ("image", id.as_str()),
-        Removal::Volume { name } => ("volume", name.as_str()),
-        Removal::Refused(why) => return Err((*why).to_string()),
-    };
-    crate::fs_gate::destroy::docker_remove(auth, anchor, kind, id)
+    crate::fs_gate::destroy::docker_remove(proof, auth)
 }
 
 /// Is this object still present, and still unused? Re-derived at the sink
@@ -646,10 +642,12 @@ pub fn load_cached(
     let facts = load_live();
     // The unavailable answer is cached too. Caching only success meant
     // an unreachable daemon was re-probed on every pass forever.
-    let _ = crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::DockerFacts { store: dir },
-        &facts,
-    );
+    if let Ok(store) = crate::fs_gate::store::StoreDir::at(dir) {
+        let _ = crate::fs_gate::store::write_json(
+            crate::fs_gate::store::JsonFile::DockerFacts { store: &store },
+            &facts,
+        );
+    }
     facts
 }
 

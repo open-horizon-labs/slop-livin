@@ -32,8 +32,24 @@ pub fn is_gate(m: &Module) -> bool {
     m.is_within(Krate::Core, &["fs_gate"]) || m.is_within(Krate::Core, &["fs_events", "macos"])
 }
 
+/// Modules outside `fs_gate` that may lower a gate lint
+/// (`#[allow(clippy::disallowed_methods)]` and friends): the FSEvents FFI
+/// (a gate module) and the TUI's one thread spawner, which is the TUI's
+/// own `std::thread` gate (tui-actions-off-event-thread).
+const LINT_ALLOW_MODULES: &[(Krate, &[&str])] = &[
+    (Krate::Core, &["fs_events", "macos"]),
+    (Krate::Tui, &["worker"]),
+];
+
+/// `include!` targets allowed outside a crate's own `src/` (none).
+const INCLUDE_ALLOW: &[&str] = &[];
+
 /// External paths only the gate may name (prefix match, segment-wise).
+/// `gix` and every `gix_*` crate are here too (see [`names_gated`]): the
+/// gitoxide crates re-export file removal, subprocesses, temp files and
+/// lock files (`fs_gate::git`).
 const GATED: &[&str] = &[
+    "gix",
     "std::fs",
     "core::fs",
     "std::os::unix::fs",
@@ -133,6 +149,27 @@ const GROUPS: &[Group] = &[
         path: "@core::fs_gate::store",
         allowed: STORE_MODULES,
         why: "writes to swamp's own files belong to the store modules",
+    },
+    Group {
+        path: "@core::fs_gate::StoreDir::at",
+        allowed: STORE_MODULES,
+        why: "a store directory is built from a caller's path only by the store modules; \
+              everything else uses the resolved swamp dir (`StoreDir::resolved`)",
+    },
+    Group {
+        path: "@core::fs_gate::key",
+        allowed: &[
+            (Krate::Core, &["actions"]),
+            (Krate::Core, &["authority"]),
+            (Krate::Core, &["recheck"]),
+        ],
+        why: "the authority key binds plans and grants to swamp's own propose/approve paths; \
+              only those paths and the recheck read it",
+    },
+    Group {
+        path: "@core::fs_gate::git",
+        allowed: &[(Krate::Core, &["signals"]), (Krate::Core, &["ignore"])],
+        why: "gitoxide queries belong to the git-signal and ignore-lens modules",
     },
     Group {
         path: "@core::fs_gate::read::read_owned_string",
@@ -246,15 +283,14 @@ const GROUPS: &[Group] = &[
         why: "liveness of the observation lock holder",
     },
     Group {
-        path: "@core::authority::HumanConfirmed::cli_command",
-        allowed: &[(Krate::Cli, &[])],
-        why: "authorization is minted only at the reviewed CLI approve/grant handlers \
-              (human-only-authorization)",
-    },
-    Group {
-        path: "@core::authority::HumanConfirmed::tui_dialog",
-        allowed: &[(Krate::Tui, &["app"])],
-        why: "authorization is minted only at the TUI's confirm dialog (human-only-authorization)",
+        path: "@core::recheck::capture_anchor",
+        allowed: &[
+            (Krate::Core, &["actions"]),
+            (Krate::Core, &["recheck"]),
+            (Krate::Tui, &["app"]),
+        ],
+        why: "a reviewed identity is recorded when a unit is proposed (actions) or marked (the \
+              TUI), never taken at execution time and handed to the recheck",
     },
     Group {
         path: "@core::authority::authorize",
@@ -305,6 +341,42 @@ const GROUPS: &[Group] = &[
 type MintSite = (Krate, &'static [&'static str], &'static str);
 const MINT_SITES: &[(&str, &[MintSite], &str)] = &[
     (
+        "@core::authority::HumanConfirmed::cli_approve",
+        &[(Krate::Cli, &[], "cmd_approve")],
+        "a plan approval is confirmed only by `cmd_approve`, which has just shown the human that \
+         plan's units (human-only-authorization)",
+    ),
+    (
+        "@core::authority::HumanConfirmed::cli_grant",
+        &[(Krate::Cli, &[], "cmd_grant_add")],
+        "a standing grant is confirmed only by `cmd_grant_add`, from the terms the human typed \
+         (human-only-authorization)",
+    ),
+    (
+        "@core::authority::HumanConfirmed::cli_protect",
+        &[(Krate::Cli, &[], "cmd_protect")],
+        "a keep-list change is confirmed only by `cmd_protect`, from the path the human typed \
+         (protection-fails-closed)",
+    ),
+    (
+        "@core::authority::HumanConfirmed::tui_dialog",
+        &[(Krate::Tui, &["app"], "start_delete")],
+        "the TUI confirms only in `start_delete`, the Enter on the summary the human just read \
+         (human-only-authorization)",
+    ),
+    (
+        "@core::authority::authorize",
+        &[(Krate::Core, &["actions"], "execute_with_trash_opts")],
+        "a stored grant becomes an authorization only in the plan executor \
+         (human-only-authorization)",
+    ),
+    (
+        "@core::authority::authorize_confirmed",
+        &[(Krate::Tui, &["actions"], "execute_one")],
+        "a TUI confirmation becomes an authorization only in the TUI sink, one unit at a time \
+         (human-only-authorization)",
+    ),
+    (
         "@core::report::pass::DiscoveryPass::begin",
         &[
             (Krate::Core, &["report"], "observe_scope"),
@@ -324,6 +396,66 @@ const MINT_SITES: &[(&str, &[MintSite], &str)] = &[
     ),
 ];
 
+/// Token and record types whose struct literal may appear only in the
+/// named functions: privacy makes a literal outside the defining module
+/// a compile error, and this pins which functions *inside* it build one
+/// (re-review 5, finding 1: construction only through the propose,
+/// approve and loader paths).
+const LITERAL_SITES: &[(&str, &[MintSite], &str)] = &[
+    (
+        "@core::actions::Plan",
+        &[
+            (Krate::Core, &["actions"], "propose"),
+            (Krate::Core, &["actions"], "propose_external"),
+            (Krate::Core, &["actions"], "propose_agents"),
+            (Krate::Core, &["actions"], "plan_from_record"),
+        ],
+        "a plan is built by a propose path or by the store loader that verified its binding",
+    ),
+    (
+        "@core::actions::PlanUnit",
+        &[
+            (Krate::Core, &["actions"], "unit_from_row"),
+            (Krate::Core, &["actions"], "unit_from_external"),
+            (Krate::Core, &["actions"], "unit_from_agent"),
+        ],
+        "a plan unit is built from a report row, an external unit or an agent unit",
+    ),
+    (
+        "@core::actions::Grant",
+        &[
+            (Krate::Core, &["actions"], "approve_confirmed"),
+            (Krate::Core, &["actions"], "add_standing_grant_confirmed"),
+            (Krate::Core, &["actions"], "list_grants"),
+        ],
+        "a grant is built only where a human confirmation is spent, or by the store loader that \
+         verified its binding (human-only-authorization)",
+    ),
+    (
+        "@core::authority::Authorized",
+        &[
+            (Krate::Core, &["authority"], "authorize"),
+            (Krate::Core, &["authority"], "authorize_confirmed"),
+        ],
+        "an authorization is minted only from a verified grant or one TUI confirmation",
+    ),
+    (
+        "@core::authority::HumanConfirmed",
+        &[(Krate::Core, &["authority"], "mint")],
+        "a confirmation is built only by its site constructors",
+    ),
+    (
+        "@core::recheck::RecheckProof",
+        &[(Krate::Core, &["recheck"], "run_all")],
+        "a recheck proof comes only from the live recheck",
+    ),
+    (
+        "@core::fs_gate::destroy::Trashed",
+        &[(Krate::Core, &["fs_gate", "destroy"], "trash_move")],
+        "a Trash receipt comes only from the move it records",
+    ),
+];
+
 /// The report functions the TUI may name: the scope-aware observation,
 /// loading a stored report back, and the pure merge of per-root reports.
 const TUI_REPORT_API: &[&str] = &[
@@ -339,6 +471,13 @@ fn allowed(m: &Module, list: &[(Krate, &[&str])]) -> bool {
 fn names_gated(abs: &str) -> Option<&'static str> {
     if PROCESS_OK.iter().any(|ok| under(abs, ok)) {
         return None;
+    }
+    if abs
+        .split("::")
+        .next()
+        .is_some_and(|c| c.starts_with("gix_"))
+    {
+        return Some("gix_*");
     }
     GATED.iter().copied().find(|g| under(abs, g))
 }
@@ -371,8 +510,70 @@ pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
              never builds cannot be audited as if it were, so it may not exist"
         ));
     }
+    for script in &ws.unmodelled_build_scripts {
+        problems.push(format!(
+            "{script}: a build script in a workspace crate the audits do not model: it runs on \
+             every `cargo build --workspace`, outside every rule"
+        ));
+    }
     for (mi, m) in ws.modules.iter().enumerate() {
         let gate = is_gate(m);
+        for lit in &m.struct_literals {
+            if lit.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &lit.segments).join("::");
+            for (ty, sites, why) in LITERAL_SITES {
+                if abs != *ty {
+                    continue;
+                }
+                let f = lit.in_fn.map(|f| ws.fns[f].name.as_str()).unwrap_or("");
+                let ok = sites
+                    .iter()
+                    .any(|(k, p, name)| m.krate == *k && m.path == *p && f == *name);
+                if !ok {
+                    problems.push(format!(
+                        "{}: a `{}` literal in {}::{f}: {why}",
+                        lit.site,
+                        ty.trim_start_matches("@core::"),
+                        m.display()
+                    ));
+                }
+            }
+        }
+        for (what, site, test) in &m.lint_allows {
+            if !*test && !gate && !allowed(m, LINT_ALLOW_MODULES) {
+                problems.push(format!(
+                    "{site}: {what} outside the capability gate: the crate root denies the gate's \
+                     lints so a path the gate owns does not compile elsewhere; lowering one \
+                     re-opens it (crates/core/src/fs_gate)"
+                ));
+            }
+        }
+        for inc in &m.includes {
+            if inc.test {
+                continue;
+            }
+            let src = format!("{}/src/", m.krate.dir());
+            match &inc.target {
+                None => problems.push(format!(
+                    "{}: `{}!` of a computed path: its target cannot be followed, so what it \
+                     splices in is outside every rule",
+                    inc.site, inc.kind
+                )),
+                Some(t) if !t.starts_with(&src) && !INCLUDE_ALLOW.contains(&t.as_str()) => problems
+                    .push(format!(
+                        "{}: `{}!(\"{t}\")` reaches outside {src}: code and data a crate \
+                         splices in live in its own source tree, where every rule reads them",
+                        inc.site, inc.kind
+                    )),
+                Some(t) if !ws.root.join(t).is_file() => problems.push(format!(
+                    "{}: `{}!` target {t} does not exist",
+                    inc.site, inc.kind
+                )),
+                Some(_) => {}
+            }
+        }
         for h in &m.hazards {
             if h.test {
                 continue;

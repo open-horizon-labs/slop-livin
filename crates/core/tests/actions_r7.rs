@@ -51,49 +51,49 @@ fn propose_plans_any_path_and_names_evidence_and_warnings() {
     let r = report_for(&fx.root, store.path());
 
     let plan = propose(&r, None, &[], "test").expect("plan");
-    assert!(!plan.units.is_empty());
-    for u in &plan.units {
+    assert!(!plan.units().is_empty());
+    for u in plan.units() {
         assert!(
             !matches!(
-                u.kind,
+                u.kind(),
                 ArtifactKind::DockerImage
                     | ArtifactKind::DockerBuildCache
                     | ArtifactKind::DockerVolume
             ),
             "docker objects are never planned, got {:?}",
-            u.kind
+            u.kind()
         );
-        assert!(!u.project.is_empty() && !u.worktree_id.is_empty());
-        assert!(!u.recovery.is_empty());
-        assert_eq!(u.verb, "delete");
+        assert!(!u.project().is_empty() && !u.worktree_id().is_empty());
+        assert!(!u.recovery().is_empty());
+        assert_eq!(u.verb(), "delete");
     }
     // Anything with a path is plannable — a .git store and a Source tree
     // included — carrying the warning a human weighs instead of a refusal.
     let git = row_path(&r, ArtifactKind::Git, "/.git");
     let source = row_path(&r, ArtifactKind::Source, "/checkout");
     let plan = propose(&r, None, &[git.clone(), source.clone()], "test").unwrap();
-    assert_eq!(plan.units.len(), 2);
-    let git_unit = plan.units.iter().find(|u| u.path == git).unwrap();
+    assert_eq!(plan.units().len(), 2);
+    let git_unit = plan.units().iter().find(|u| u.path() == git).unwrap();
     assert!(
         git_unit
-            .warnings
+            .warnings()
             .iter()
             .any(|w| w.contains("git object store")),
         "{:?}",
-        git_unit.warnings
+        git_unit.warnings()
     );
     // The checkout root path is the whole checkout: the archive verb, with
     // the checkout's facts (the fixture has untracked loose files and no
     // remote) as warnings rather than a refusal.
-    let src_unit = plan.units.iter().find(|u| u.path == source).unwrap();
-    assert_eq!(src_unit.verb, "archive");
+    let src_unit = plan.units().iter().find(|u| u.path() == source).unwrap();
+    assert_eq!(src_unit.verb(), "archive");
     assert!(
         src_unit
-            .warnings
+            .warnings()
             .iter()
             .any(|w| w.contains("untracked") || w.contains("no remote")),
         "{:?}",
-        src_unit.warnings
+        src_unit.warnings()
     );
     // A path that is not in the report at all is refused, naming why.
     let err = propose(
@@ -110,8 +110,8 @@ fn propose_plans_any_path_and_names_evidence_and_warnings() {
     // Mixed: one plannable + one unknown -> plan with a refused entry.
     let nm = row_path(&r, ArtifactKind::DependencyTree, "/node_modules");
     let plan = propose(&r, None, &[nm.clone(), PathBuf::from("/nope")], "test").unwrap();
-    assert_eq!(plan.units.len(), 1);
-    assert_eq!(plan.refused.len(), 1);
+    assert_eq!(plan.units().len(), 1);
+    assert_eq!(plan.refused().len(), 1);
 }
 
 #[test]
@@ -139,20 +139,20 @@ fn a_worktree_path_plans_as_remove_worktree_and_a_checkout_as_archive_with_warni
         (main.path.clone(), link.path.clone())
     };
     let plan = propose(&r, None, &[checkout.clone(), linked.clone()], "agent").unwrap();
-    let c = plan.units.iter().find(|u| u.path == checkout).unwrap();
-    let l = plan.units.iter().find(|u| u.path == linked).unwrap();
-    assert_eq!(c.verb, "archive");
-    assert_eq!(l.verb, "remove-worktree");
-    assert!(c.bytes > 0 && l.bytes > 0);
+    let c = plan.units().iter().find(|u| u.path() == checkout).unwrap();
+    let l = plan.units().iter().find(|u| u.path() == linked).unwrap();
+    assert_eq!(c.verb(), "archive");
+    assert_eq!(l.verb(), "remove-worktree");
+    assert!(c.bytes() > 0 && l.bytes() > 0);
     // The fixture checkout has untracked loose files and a remote: the
     // warnings say so, and nothing here is a refusal.
     assert!(
-        c.warnings.iter().any(|w| w.contains("untracked"))
-            || c.warnings.iter().any(|w| w.contains("no remote")),
+        c.warnings().iter().any(|w| w.contains("untracked"))
+            || c.warnings().iter().any(|w| w.contains("no remote")),
         "{:?}",
-        c.warnings
+        c.warnings()
     );
-    assert!(plan.refused.is_empty());
+    assert!(plan.refused().is_empty());
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn execute_without_grant_is_awaiting_authorization_and_deletes_nothing() {
     assert!(nm.exists(), "nothing may be touched without a grant");
     assert!(res.outcomes.is_empty());
     assert_eq!(
-        load_plan(store.path(), &plan.id).unwrap().status,
+        *load_plan(store.path(), &plan.id).unwrap().status(),
         PlanStatus::Proposed
     );
 }
@@ -193,7 +193,7 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
     save_plan(store.path(), &plan).unwrap();
 
     let g = approve(store.path(), &plan.id, "human:test").unwrap();
-    assert_eq!(g.plan_id.as_deref(), Some(plan.id.as_str()));
+    assert_eq!(g.plan_id().as_deref(), Some(plan.id.as_str()));
 
     let res = execute_with_trash(store.path(), &plan.id, "agent:test", &trash).unwrap();
     assert_eq!(res.state, "executed", "{res:?}");
@@ -217,7 +217,7 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
     let recs = ledger.all().unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].actor, "agent:test");
-    assert_eq!(recs[0].grant_id, g.id);
+    assert_eq!(recs[0].grant_id, g.id());
     assert_eq!(recs[0].evidence["kind"], "DependencyTree");
     assert!(recs[0].evidence["project"].as_str().is_some());
 
@@ -226,7 +226,7 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
     assert_eq!(again.state, "already-executed");
     // The one-shot grant's budget is spent.
     let gs = list_grants(store.path()).unwrap();
-    assert_eq!(gs[0].spent_bytes, plan.planned_bytes());
+    assert_eq!(gs[0].spent_bytes(), plan.planned_bytes());
 }
 
 #[test]
@@ -248,10 +248,10 @@ fn stale_unique_bytes_do_not_spend_a_standing_grant() {
         }
     }
     let plan = propose(&r, None, std::slice::from_ref(&nm), "test").unwrap();
-    assert!(plan.units[0].dedup_stale);
+    assert!(plan.units()[0].dedup_stale());
     assert!(
-        plan.units[0]
-            .warnings
+        plan.units()[0]
+            .warnings()
             .iter()
             .any(|w| w.contains("out of date"))
     );
@@ -268,7 +268,7 @@ fn stale_unique_bytes_do_not_spend_a_standing_grant() {
     let result = execute_with_trash(store.path(), &plan.id, "test", &trash).unwrap();
     assert_eq!(result.state, "awaiting-authorization");
     assert!(nm.exists());
-    assert_eq!(list_grants(store.path()).unwrap()[0].spent_bytes, 0);
+    assert_eq!(list_grants(store.path()).unwrap()[0].spent_bytes(), 0);
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn standing_grant_covers_by_predicate_and_budget_refuses_overrun() {
     assert!(nm.exists());
 
     // Adequate standing grant for DependencyTree in this project: executes.
-    let project = plan2.units[0].project.clone();
+    let project = plan2.units()[0].project().to_string();
     add_standing_grant(
         store.path(),
         &format!("kind:DependencyTree project:{project}"),
@@ -354,9 +354,10 @@ fn activity_after_the_plan_refuses_at_the_sink() {
     let trash = set_trash(store.path());
     let r = report_for(&fx.root, store.path());
     let dist = row_path(&r, ArtifactKind::BuildOutput, "/checkout/dist");
-    let mut plan = propose(&r, None, std::slice::from_ref(&dist), "agent:test").unwrap();
+    let plan = propose(&r, None, std::slice::from_ref(&dist), "agent:test").unwrap();
     // Make the plan look older than the write below.
-    plan.created_at -= 10;
+    let (created, expires) = (plan.created_at() - 10, plan.expires_at());
+    let plan = plan.with_times_for_tests(created, expires);
     save_plan(store.path(), &plan).unwrap();
     approve(store.path(), &plan.id, "human:test").unwrap();
     fs::write(dist.join("fresh.bin"), b"activity").unwrap();
@@ -380,8 +381,9 @@ fn expired_plan_cannot_be_approved_or_executed() {
     let trash = set_trash(store.path());
     let r = report_for(&fx.root, store.path());
     let dist = row_path(&r, ArtifactKind::BuildOutput, "/checkout/dist");
-    let mut plan = propose(&r, None, std::slice::from_ref(&dist), "agent:test").unwrap();
-    plan.expires_at = plan.created_at - 1;
+    let plan = propose(&r, None, std::slice::from_ref(&dist), "agent:test").unwrap();
+    let created = plan.created_at();
+    let plan = plan.with_times_for_tests(created, created - 1);
     save_plan(store.path(), &plan).unwrap();
     assert!(approve(store.path(), &plan.id, "human:test").is_err());
     let res = execute_with_trash(store.path(), &plan.id, "agent:test", &trash).unwrap();

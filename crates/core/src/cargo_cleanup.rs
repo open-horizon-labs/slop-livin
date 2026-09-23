@@ -295,24 +295,24 @@ pub fn check(
                 Ok(plan) => {
                     crate::actions::save_plan(store, &plan)?;
                     result.members = plan
-                        .units
+                        .units()
                         .iter()
-                        .filter_map(|u| u.cargo_group.as_ref())
+                        .filter_map(|u| u.cargo_group())
                         .flat_map(|g| g.members.iter().map(|m| m.path.clone()))
                         .collect();
-                    result.recovery = plan.units.first().map(|u| u.recovery.clone());
+                    result.recovery = plan.units().first().map(|u| u.recovery().to_string());
                     result.warnings = plan
-                        .units
+                        .units()
                         .iter()
-                        .flat_map(|u| u.warnings.iter().cloned())
+                        .flat_map(|u| u.warnings().iter().cloned())
                         .collect();
                     result.check_status = "ready_for_review";
                     result.reason_code = "checks_passed";
                     result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
                     result.next_action = "review_plan";
                     result.next_command = vec!["swamp".into(), "plans".into(), "--json".into()];
+                    result.allocated_bytes = plan.planned_bytes();
                     result.plan_id = Some(plan.id);
-                    result.allocated_bytes = plan.units.iter().map(|u| u.bytes).sum();
                 }
                 Err(error) => {
                     result.check_status = "blocked";
@@ -637,12 +637,16 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
 /// members are checked before the first move. Failure rolls back completed
 /// moves where possible, with the recovery envelope retained on disk.
 pub(crate) fn move_reviewed(
-    store_dir: &Path,
     group: &CargoGroup,
-    reviewed: Option<&crate::recheck::ReviewedIdentity>,
     trash: &Path,
     auth: &crate::authority::Authorized,
 ) -> Result<PathBuf> {
+    if !auth.covers(&group.selected) {
+        bail!(
+            "refused: the authorization does not name {}",
+            group.selected.display()
+        );
+    }
     if locks(&group.profile)? != group.lock_paths {
         bail!("Cargo lock set changed; propose again");
     }
@@ -691,8 +695,9 @@ pub(crate) fn move_reviewed(
     // both directions, which it never was before; and occupancy is
     // tri-state over every member, so a probe that could not run refuses
     // instead of reading as "nothing open".
-    let members: Vec<PathBuf> = group.members.iter().map(|m| m.path.clone()).collect();
-    let proof = crate::recheck::run_all(store_dir, &group.selected, reviewed, &members)?;
+    // Every input from the authorization: the selected path's reviewed
+    // identity and each companion's, as the plan recorded them.
+    let proof = crate::recheck::run_all(auth)?;
     let mut envelope = fs::destroy::Envelope::open(
         proof,
         auth,

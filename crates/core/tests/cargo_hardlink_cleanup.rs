@@ -117,7 +117,7 @@ fn internal_and_external_aliases_are_reviewable_and_external_alias_survives() {
     let (_tmp, root, group, external) = fixture(true, true);
     let store = tempfile::tempdir().unwrap();
     let plan = plan_for(&root, store.path(), &group);
-    let cargo = plan.units[0].cargo_group.as_ref().unwrap();
+    let cargo = plan.units()[0].cargo_group().unwrap();
     assert!(cargo.shared_storage);
     assert!(cargo.hardlink_members >= 2);
     assert_eq!(cargo.reclaimable_bytes, None);
@@ -144,7 +144,7 @@ fn internal_aliases_only_can_execute_as_one_reviewed_group() {
     let (_tmp, root, group, _external) = fixture(true, false);
     let store = tempfile::tempdir().unwrap();
     let plan = plan_for(&root, store.path(), &group);
-    let cargo = plan.units[0].cargo_group.as_ref().unwrap();
+    let cargo = plan.units()[0].cargo_group().unwrap();
     assert!(cargo.shared_storage);
     assert_eq!(cargo.hardlink_members, 2);
     actions::save_plan(store.path(), &plan).unwrap();
@@ -212,7 +212,7 @@ fn unshared_group_reports_allocation_and_trash_not_promised_free_space() {
     let (_tmp, root, group, _external) = fixture(false, false);
     let store = tempfile::tempdir().unwrap();
     let plan = plan_for(&root, store.path(), &group);
-    let cargo = plan.units[0].cargo_group.as_ref().unwrap();
+    let cargo = plan.units()[0].cargo_group().unwrap();
     assert!(!cargo.shared_storage);
     assert_eq!(cargo.hardlink_members, 0);
     assert_eq!(cargo.reclaimable_bytes, None);

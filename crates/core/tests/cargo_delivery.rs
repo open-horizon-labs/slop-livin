@@ -97,7 +97,7 @@ fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
     assert_eq!(shared[0].check_status, "ready_for_review");
     let shared_plan =
         actions::load_plan(store.path(), shared[0].plan_id.as_ref().unwrap()).unwrap();
-    let shared_group = shared_plan.units[0].cargo_group.as_ref().unwrap();
+    let shared_group = shared_plan.units()[0].cargo_group().unwrap();
     assert!(shared_group.shared_storage);
     assert_eq!(shared_group.reclaimable_bytes, None);
     let selected = target.join("debug/deps/fixture-aaa");
@@ -105,8 +105,8 @@ fn cleanup_guidance_and_bounded_checks_do_not_widen_or_authorize() {
     assert_eq!(checked[0].check_status, "ready_for_review");
     let id = checked[0].plan_id.as_ref().unwrap();
     let plan = actions::load_plan(store.path(), id).unwrap();
-    assert_eq!(plan.units.len(), 1);
-    assert_eq!(plan.units[0].path, selected);
+    assert_eq!(plan.units().len(), 1);
+    assert_eq!(plan.units()[0].path(), selected);
     assert_eq!(
         actions::execute_with_trash(store.path(), id, "test", &store.path().join("trash"))
             .unwrap()
@@ -304,7 +304,7 @@ fn normal_report_identifies_tests_and_exact_cleanup_preserves_neighbors() {
         ArtifactRole::TestExecutable
     );
     let plan = actions::propose(&r, None, std::slice::from_ref(&selected), "test").unwrap();
-    assert_eq!(plan.units[0].cargo_group.as_ref().unwrap().members.len(), 2);
+    assert_eq!(plan.units()[0].cargo_group().unwrap().members.len(), 2);
     actions::save_plan(store.path(), &plan).unwrap();
     let trash = store.path().join("trash");
     assert_eq!(
@@ -394,7 +394,7 @@ fn shared_hardlink_remains_reviewable_with_unknown_reclaim() {
     fs::hard_link(&selected, target.join("retained-alias")).unwrap();
     let r = report(&root, store.path());
     let plan = actions::propose(&r, None, &[selected], "test").unwrap();
-    let group = plan.units[0].cargo_group.as_ref().unwrap();
+    let group = plan.units()[0].cargo_group().unwrap();
     assert!(group.shared_storage);
     assert_eq!(group.reclaimable_bytes, None);
 }

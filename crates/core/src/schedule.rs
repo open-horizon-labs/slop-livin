@@ -28,15 +28,10 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
 
-pub fn agents_dir() -> PathBuf {
-    env_dir(
-        "SWAMP_LAUNCH_AGENTS_DIR",
-        home().join("Library/LaunchAgents"),
-    )
-}
-
+/// Swamp's LaunchAgent plist, where the gate resolves it
+/// (`fs_gate::store::launch_agent_plist`).
 pub fn plist_path() -> PathBuf {
-    agents_dir().join(format!("{LABEL}.plist"))
+    store::launch_agent_plist().unwrap_or_else(|_| PathBuf::from(format!("{LABEL}.plist")))
 }
 
 pub fn log_dir() -> PathBuf {
@@ -214,10 +209,6 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     let exe = current_exe()?;
     let plist = plist_path();
     let log = log_file();
-    store::create_dir_all(log_dir()).context("create log dir")?;
-    if let Some(parent) = plist.parent() {
-        store::create_dir_all(parent).context("create LaunchAgents dir")?;
-    }
 
     // Installing over an existing agent replaces it: unload first so
     // launchd never holds two generations of the same label.
@@ -227,7 +218,7 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
 
     let swamp_dir_env = std::env::var("SWAMP_DIR").ok();
     let body = render_plist(&exe, roots, seconds, &log, swamp_dir_env.as_deref());
-    store::write_text(store::TextFile::LaunchAgent { plist: &plist }, &body)
+    store::write_text(store::TextFile::LaunchAgent, &body)
         .with_context(|| format!("write {}", plist.display()))?;
 
     load_plist(&plist)?;
@@ -258,7 +249,7 @@ pub fn uninstall() -> Result<String> {
         return Ok("No scheduled observation is installed\n".to_string());
     }
     unload_plist(&plist);
-    store::remove_text(store::TextFile::LaunchAgent { plist: &plist })
+    store::remove_text(store::TextFile::LaunchAgent)
         .with_context(|| format!("remove {}", plist.display()))?;
     Ok(format!("Removed the scheduled observation ({LABEL})\n"))
 }
@@ -365,9 +356,6 @@ impl RunOutcome {
 
 /// Appends one line to the observation log.
 pub fn append_log(path: &Path, outcome: &RunOutcome) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        store::create_dir_all(parent)?;
-    }
     store::append_line(store::LogFile::Observations(path), &outcome.to_log_line())
         .with_context(|| format!("open {}", path.display()))?;
     Ok(())
@@ -387,8 +375,13 @@ fn last_run_path(store_dir: &Path) -> PathBuf {
 /// the report header can read it without parsing the log.
 pub fn write_last_run(store_dir: &Path, outcome: &RunOutcome) -> Result<()> {
     let path = last_run_path(store_dir);
-    store::write_json(store::JsonFile::LastRun { store: store_dir }, outcome)
-        .with_context(|| format!("write {}", path.display()))
+    store::write_json(
+        store::JsonFile::LastRun {
+            store: &store::StoreDir::at(store_dir)?,
+        },
+        outcome,
+    )
+    .with_context(|| format!("write {}", path.display()))
 }
 
 pub fn read_last_run(store_dir: &Path) -> Option<RunOutcome> {
@@ -514,7 +507,7 @@ pub fn status(store_dir: &Path) -> Result<String> {
 /// holding `pid<TAB>started_at`; not `flock` because the loser needs to
 /// print a friendly message rather than block.
 pub struct LockGuard {
-    store: PathBuf,
+    store: store::StoreDir,
 }
 
 impl Drop for LockGuard {
@@ -524,7 +517,7 @@ impl Drop for LockGuard {
 }
 
 fn lock_path(store_dir: &Path) -> PathBuf {
-    store::ObserveLock { store: store_dir }.path()
+    store_dir.join("observe.lock")
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -546,16 +539,21 @@ pub enum LockOutcome {
 /// Attempts to take the lock. A stale lock (owner pid no longer alive) is
 /// reclaimed automatically.
 pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
-    store::create_dir_all(store_dir)?;
+    let store_dir_typed = store::StoreDir::at(store_dir)?;
+    store_dir_typed.create()?;
     let path = lock_path(store_dir);
 
     loop {
         let pid = std::process::id();
         let since = crate::entities::now();
-        match (store::ObserveLock { store: store_dir }).create(&format!("{pid}\t{since}\n")) {
+        match (store::ObserveLock {
+            store: &store_dir_typed,
+        })
+        .create(&format!("{pid}\t{since}\n"))
+        {
             Ok(()) => {
                 return Ok(LockOutcome::Acquired(LockGuard {
-                    store: store_dir.to_path_buf(),
+                    store: store_dir_typed,
                 }));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -570,7 +568,10 @@ pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
                     _ => {
                         // Stale lock: owner is gone or unparsable. Reclaim
                         // and retry once.
-                        let _ = store::ObserveLock { store: store_dir }.remove(); // our own stale lock, owner pid confirmed dead
+                        let _ = store::ObserveLock {
+                            store: &store_dir_typed,
+                        }
+                        .remove(); // our own stale lock, owner pid confirmed dead
                         continue;
                     }
                 }

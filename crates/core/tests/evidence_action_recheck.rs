@@ -51,10 +51,10 @@ fn every_external_storage_category_is_inspection_only_never_recursive_delete() {
         };
         let plan_unit = actions::unit_from_external(&unit);
         assert!(
-            plan_unit.external_category.is_some(),
+            plan_unit.external_category().is_some(),
             "{category:?} must carry external_category so execute refuses it unconditionally"
         );
-        assert_eq!(plan_unit.verb, "inspect");
+        assert_eq!(plan_unit.verb(), "inspect");
     }
 }
 
@@ -82,20 +82,23 @@ fn proposal_carries_evidence_including_activity_reclaimability_and_current_use()
 
     let plan = propose(&r, None, &[], "test").expect("plan");
     let build_output_unit = plan
-        .units
+        .units()
         .iter()
-        .find(|u| u.kind == ArtifactKind::BuildOutput)
+        .find(|u| *u.kind() == ArtifactKind::BuildOutput)
         .expect("a build-output unit in the plan");
 
     // The tempting shortcut this rejects: an empty evidence list on a
     // proposal, or one that names only current-use and drops the
     // report row's own Activity/Reclaimability/Recovery facts.
     assert!(
-        !build_output_unit.evidence.is_empty(),
+        !build_output_unit.evidence().is_empty(),
         "proposal must carry evidence, not just bytes/kind"
     );
-    let kinds: std::collections::HashSet<_> =
-        build_output_unit.evidence.iter().map(|e| e.kind).collect();
+    let kinds: std::collections::HashSet<_> = build_output_unit
+        .evidence()
+        .iter()
+        .map(|e| e.kind)
+        .collect();
     assert!(kinds.contains(&swamp_core::evidence::FactKind::Activity));
     assert!(kinds.contains(&swamp_core::evidence::FactKind::Reclaimability));
     assert!(kinds.contains(&swamp_core::evidence::FactKind::CurrentUse));
@@ -109,9 +112,9 @@ fn occupancy_change_between_propose_and_execute_refuses_execution() {
     let r = report_for(&fx.root, store.path());
 
     let plan = propose(&r, None, std::slice::from_ref(&fx.target_dir), "test").expect("plan");
-    assert_eq!(plan.units.len(), 1, "exactly the requested unit");
+    assert_eq!(plan.units().len(), 1, "exactly the requested unit");
     assert!(
-        plan.units[0].evidence.iter().any(|e| {
+        plan.units()[0].evidence().iter().any(|e| {
             e.kind == swamp_core::evidence::FactKind::CurrentUse
                 && matches!(
                     e.status,
@@ -205,15 +208,15 @@ fn human_protected_ordinary_artifact_is_refused_at_proposal_not_silently_dropped
     let plan = actions::propose_checking_protection(&r, None, &[], "test", &protected)
         .expect("other unprotected units remain plannable");
     assert!(
-        plan.refused
+        plan.refused()
             .iter()
             .any(|r| r.path == fx.target_dir && r.cause.contains("human-protected"))
     );
     assert!(
-        plan.units.len() < unfiltered.units.len(),
+        plan.units().len() < unfiltered.units().len(),
         "the protected unit must be removed from the plannable set"
     );
-    assert!(!plan.units.iter().any(|u| u.path == fx.target_dir));
+    assert!(!plan.units().iter().any(|u| u.path() == fx.target_dir));
 }
 
 /// The integration owner's 2026-09-21 mutation check, as a runtime test.
@@ -263,14 +266,14 @@ fn ordinary_unit_containing_protected_descendant_is_refused_at_proposal() {
     let plan = actions::propose_checking_protection(&r, None, &[], "test", &protected)
         .expect("other units remain plannable");
     assert!(
-        plan.refused
+        plan.refused()
             .iter()
             .any(|x| x.path == fx.target_dir && x.cause.contains("human-protected")),
         "the containing directory must appear in `refused` with a named cause: {:?}",
-        plan.refused
+        plan.refused()
     );
     assert!(
-        !plan.units.iter().any(|u| u.path == fx.target_dir),
+        !plan.units().iter().any(|u| u.path() == fx.target_dir),
         "the containing directory must not be plannable"
     );
     assert!(keep.exists(), "nothing may have been touched at proposal");

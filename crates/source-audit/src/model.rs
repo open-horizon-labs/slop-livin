@@ -219,6 +219,37 @@ pub struct Module {
     pub path_literals: Vec<(String, Site)>,
     /// `#[allow(dead_code)]` / `#[expect(dead_code)]` in production code.
     pub dead_code_allows: Vec<Site>,
+    /// A lint level lowered on one of the capability gate's lints
+    /// (`clippy::disallowed_methods`/`disallowed_types`/`disallowed_macros`,
+    /// the `clippy::style`/`clippy::all` groups that contain them,
+    /// `unsafe_code`, `warnings`): `(what, site, test)`.
+    pub lint_allows: Vec<(String, Site, bool)>,
+    /// Every `include!`/`include_str!`/`include_bytes!` in this module.
+    pub includes: Vec<Include>,
+    /// Every struct literal (`Plan { .. }`), with `Self` resolved to the
+    /// enclosing `impl`'s type.
+    pub struct_literals: Vec<StructLiteral>,
+}
+
+/// One struct-literal expression.
+#[derive(Debug, Clone)]
+pub struct StructLiteral {
+    pub segments: Vec<String>,
+    pub test: bool,
+    pub site: Site,
+    pub in_fn: Option<usize>,
+}
+
+/// One `include!`-family macro invocation.
+#[derive(Debug, Clone)]
+pub struct Include {
+    /// `include`, `include_str` or `include_bytes`.
+    pub kind: String,
+    /// The target, workspace-relative, when the argument is one string
+    /// literal; `None` for a computed path (`concat!(env!(..), ..)`).
+    pub target: Option<String>,
+    pub test: bool,
+    pub site: Site,
 }
 
 impl Module {
@@ -251,6 +282,11 @@ pub struct Workspace {
     pub orphans: Vec<String>,
     /// Files that do not parse (the rule that reads them fails loudly).
     pub parse_errors: Vec<String>,
+    /// Build scripts found in workspace crates the audits do not model
+    /// (`crates/harvest`, `crates/source-audit`), workspace-relative.
+    pub unmodelled_build_scripts: Vec<String>,
+    /// Files spliced in by `include!` (so they are not orphans).
+    pub included: HashSet<String>,
 }
 
 impl Workspace {
@@ -263,12 +299,40 @@ impl Workspace {
             let mut reached: HashSet<String> = HashSet::new();
             let root_file = krate.root_file().to_string();
             ws.load_file(krate, Vec::new(), &root_file, false, &mut reached);
+            // A build script is code Cargo compiles and *runs* on every
+            // build: it is loaded as a module of its crate (under a path
+            // segment no `mod` can spell) so every rule sees what it
+            // names.
+            for script in build_scripts(root, krate.dir()) {
+                ws.load_file(
+                    krate,
+                    vec![BUILD_SCRIPT_SEGMENT.to_string()],
+                    &script,
+                    false,
+                    &mut reached,
+                );
+            }
             let src = root.join(krate.dir()).join("src");
             for f in rust_files(&src) {
                 let rel = rel(root, &f);
-                if !reached.contains(&rel) {
+                if !reached.contains(&rel) && !ws.included.contains(&rel) {
                     ws.orphans.push(rel);
                 }
+            }
+        }
+        // The other workspace members (developer tools) are not modelled;
+        // a build script there would run unaudited on `cargo build
+        // --workspace`, so the gate rule rejects any.
+        if let Ok(rd) = std::fs::read_dir(root.join("crates")) {
+            let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            dirs.sort();
+            for d in dirs {
+                let dir = rel(root, &d);
+                if Krate::ALL.iter().any(|k| k.dir() == dir) {
+                    continue;
+                }
+                ws.unmodelled_build_scripts
+                    .extend(build_scripts(root, &dir));
             }
         }
         ws.orphans.sort();
@@ -345,6 +409,9 @@ impl Workspace {
             str_consts: Vec::new(),
             path_literals: Vec::new(),
             dead_code_allows: Vec::new(),
+            lint_allows: Vec::new(),
+            includes: Vec::new(),
+            struct_literals: Vec::new(),
         });
         // Item names first, so resolution can see later items.
         for item in items {
@@ -497,42 +564,129 @@ impl Workspace {
     }
 }
 
+/// The module path segment a build script is loaded under
+/// (`@core::(build.rs)`): not an identifier, so no `mod` reaches it and
+/// no path in the crate can name it.
+pub const BUILD_SCRIPT_SEGMENT: &str = "(build.rs)";
+
+/// The build scripts of the crate at `crate_dir` (workspace-relative):
+/// `build.rs` next to its manifest, or whatever `package.build` names.
+/// `build = false` disables it.
+pub fn build_scripts(root: &Path, crate_dir: &str) -> Vec<String> {
+    let manifest =
+        std::fs::read_to_string(root.join(crate_dir).join("Cargo.toml")).unwrap_or_default();
+    let mut explicit: Option<Option<String>> = None;
+    let mut section = String::new();
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            section = t.to_string();
+            continue;
+        }
+        if section == "[package]"
+            && let Some(v) = t.strip_prefix("build")
+            && let Some(v) = v.trim_start().strip_prefix('=')
+        {
+            let v = v.trim();
+            explicit = Some(if v == "false" {
+                None
+            } else {
+                Some(v.trim_matches('"').to_string())
+            });
+        }
+    }
+    let file = match explicit {
+        Some(None) => return Vec::new(),
+        Some(Some(f)) => f,
+        None => "build.rs".to_string(),
+    };
+    let rel_file = format!("{crate_dir}/{file}");
+    if root.join(&rel_file).is_file() {
+        vec![rel_file]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Lints the capability gate relies on, and the groups that contain them:
+/// lowering any of these outside the gate modules re-opens what the crate
+/// root denies.
+const GATE_LINTS: &[&str] = &[
+    "disallowed_methods",
+    "disallowed_types",
+    "disallowed_macros",
+    "style",
+    "all",
+    "unsafe_code",
+    "warnings",
+];
+
+/// Whether an attribute's token stream lowers a [`GATE_LINTS`] lint:
+/// `allow(..)`, `expect(..)` or `warn(..)` -- directly, or inside a
+/// `cfg_attr(.., allow(..))`.
+fn lowers_gate_lint(ts: TokenStream) -> Option<String> {
+    let toks: Vec<TokenTree> = ts.into_iter().collect();
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            TokenTree::Ident(id)
+                if matches!(id.to_string().as_str(), "allow" | "expect" | "warn") =>
+            {
+                if let Some(TokenTree::Group(g)) = toks.get(i + 1) {
+                    let mut words = HashSet::new();
+                    collect_idents(g.stream(), &mut words);
+                    if let Some(w) = GATE_LINTS.iter().find(|l| words.contains(**l)) {
+                        return Some(format!("`{id}({w})`"));
+                    }
+                }
+            }
+            TokenTree::Group(g) => {
+                if let Some(hit) = lowers_gate_lint(g.stream()) {
+                    return Some(hit);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Crates that are not in the workspace but are real first segments.
 fn is_extern_crate(name: &str) -> bool {
-    matches!(
-        name,
-        "std"
-            | "core"
-            | "alloc"
-            | "libc"
-            | "tempfile"
-            | "trash"
-            | "walkdir"
-            | "jwalk"
-            | "tokio"
-            | "parquet"
-            | "arrow_array"
-            | "arrow_schema"
-            | "serde"
-            | "serde_json"
-            | "anyhow"
-            | "blake3"
-            | "zstd"
-            | "gix"
-            | "toml"
-            | "uuid"
-            | "roxmltree"
-            | "fsevent_sys"
-            | "core_foundation"
-            | "core_foundation_sys"
-            | "futures_util"
-            | "async_trait"
-            | "ratatui"
-            | "crossterm"
-            | "clap"
-            | "unicode_width"
-            | "unicode_segmentation"
-    )
+    name.starts_with("gix_")
+        || matches!(
+            name,
+            "std"
+                | "core"
+                | "alloc"
+                | "libc"
+                | "tempfile"
+                | "trash"
+                | "walkdir"
+                | "jwalk"
+                | "tokio"
+                | "parquet"
+                | "arrow_array"
+                | "arrow_schema"
+                | "serde"
+                | "serde_json"
+                | "anyhow"
+                | "blake3"
+                | "zstd"
+                | "gix"
+                | "toml"
+                | "uuid"
+                | "roxmltree"
+                | "fsevent_sys"
+                | "core_foundation"
+                | "core_foundation_sys"
+                | "futures_util"
+                | "async_trait"
+                | "ratatui"
+                | "crossterm"
+                | "clap"
+                | "unicode_width"
+                | "unicode_segmentation"
+        )
 }
 
 fn item_name(item: &syn::Item) -> Option<String> {
@@ -562,6 +716,26 @@ fn child_dir(rel_file: &str) -> String {
     } else {
         format!("{parent}/{stem}")
     }
+}
+
+/// `a/b/../c/./d.rs` -> `a/c/d.rs`, lexically (a `..` past the start is
+/// kept, so a path leaving the workspace stays visibly outside it).
+pub fn normalize(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|s| *s != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.join("/")
 }
 
 fn parent_dir(rel_file: &str) -> String {
@@ -874,6 +1048,16 @@ impl Collector<'_> {
                     if word == "extern" {
                         self.hazard("`extern` in macro tokens", id.span());
                     }
+                    if matches!(word.as_str(), "include" | "include_str" | "include_bytes")
+                        && matches!(toks.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                    {
+                        self.hazard(
+                            format!(
+                                "`{word}!` inside macro tokens, whose target cannot be followed"
+                            ),
+                            id.span(),
+                        );
+                    }
                     // `. name (` is a method call.
                     let after_dot =
                         i > 0 && matches!(&toks[i - 1], TokenTree::Punct(p) if p.as_char() == '.');
@@ -925,6 +1109,56 @@ impl Collector<'_> {
                 TokenTree::Punct(_) => {}
             }
             i += 1;
+        }
+    }
+
+    /// An `include!`-family invocation: recorded with its resolved
+    /// target, and for `include!` the target's items are visited as part
+    /// of this module -- the compiler splices them in here.
+    fn include(&mut self, kind: &str, m: &syn::Macro) {
+        let file = self.ws.modules[self.module].file.clone();
+        let target = syn::parse2::<syn::LitStr>(m.tokens.clone())
+            .ok()
+            .map(|lit| {
+                let v = lit.value();
+                if v.starts_with('/') {
+                    v
+                } else {
+                    normalize(&format!("{}/{v}", parent_dir(&file)))
+                }
+            });
+        let inc = Include {
+            kind: kind.to_string(),
+            target: target.clone(),
+            test: self.test(),
+            site: self.site(m.path.span()),
+        };
+        self.ws.modules[self.module].includes.push(inc);
+        let (Some(target), "include") = (target, kind) else {
+            return;
+        };
+        if !self.ws.included.insert(target.clone()) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(self.ws.root.join(&target)) else {
+            return;
+        };
+        if let Ok(parsed) = parse_cached(&text) {
+            for item in &parsed.items {
+                if let syn::Item::Mod(md) = item {
+                    self.hazard(
+                        format!("`mod {}` declared inside `include!`d {target}", md.ident),
+                        md.span(),
+                    );
+                }
+                self.visit_item(item);
+            }
+        } else if let Ok(e) = syn::parse_str::<syn::Expr>(&text) {
+            self.visit_expr(&e);
+        } else {
+            self.ws
+                .parse_errors
+                .push(format!("{target}: `include!`d file does not parse"));
         }
     }
 
@@ -1317,6 +1551,23 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         syn::visit::visit_expr_call(self, call);
     }
 
+    fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {
+        let mut segments = path_segments(&e.path);
+        if segments.first().is_some_and(|s| s == "Self")
+            && let Some(owner) = &self.impl_owner
+        {
+            segments[0] = owner.clone();
+        }
+        let lit = StructLiteral {
+            segments,
+            test: self.test(),
+            site: self.site(e.path.span()),
+            in_fn: self.in_fn(),
+        };
+        self.ws.modules[self.module].struct_literals.push(lit);
+        syn::visit::visit_expr_struct(self, e);
+    }
+
     fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
         let mc = MethodCall {
             name: m.method.to_string(),
@@ -1381,6 +1632,18 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         if p.is_ident("path") {
             self.hazard("`#[path]`", a.span());
         }
+        if (p.is_ident("allow")
+            || p.is_ident("expect")
+            || p.is_ident("warn")
+            || p.is_ident("cfg_attr"))
+            && let Some(what) = lowers_gate_lint(quote::ToTokens::to_token_stream(&a.meta))
+        {
+            let site = self.site(a.span());
+            let test = self.test();
+            self.ws.modules[self.module]
+                .lint_allows
+                .push((what, site, test));
+        }
         if (p.is_ident("allow") || p.is_ident("expect"))
             && !self.test()
             && let syn::Meta::List(l) = &a.meta
@@ -1418,6 +1681,10 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         self.ws.modules[self.module].macros.push(mc);
         if matches!(name.as_str(), "asm" | "global_asm" | "naked_asm") {
             self.hazard(format!("`{name}!`"), m.span());
+        }
+        if matches!(name.as_str(), "include" | "include_str" | "include_bytes") {
+            self.include(&name, m);
+            return;
         }
         self.push_ref(path_segments(&m.path), RefKind::Code, m.path.span());
         if expr_macro(&name)

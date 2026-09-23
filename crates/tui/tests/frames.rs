@@ -1146,7 +1146,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
 #[test]
 fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     use std::process::Command;
-    use swamp_tui::actions::{MarkedUnit, WorktreeTerms, authorize, execute_plan};
+    use swamp_tui::actions::{MarkedUnit, WorktreeTerms, confirmables, execute_plan};
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         assert!(
@@ -1222,15 +1222,16 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     std::fs::write(work.join("secrets.env"), vec![b'k'; 2048]).unwrap();
     let mut u = unit(&work);
     u.warnings = vec!["secrets.env untracked 2.0KB".into()];
-    let (plan, grant) = authorize(
-        std::slice::from_ref(&u),
-        &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+    let store = swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap();
+    let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(
+        "human",
+        &store,
+        confirmables(std::slice::from_ref(&u), false),
     );
     let res = execute_plan(
         std::slice::from_ref(&u),
-        &plan,
-        &grant,
-        &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+        confirmed,
+        &store,
         &ledger,
         &trash,
         false,

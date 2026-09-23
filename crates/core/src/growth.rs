@@ -437,7 +437,7 @@ pub fn observe_and_annotate(
     protected_worktree_ids: &HashSet<String>,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    crate::fs_gate::store::create_dir_all(&dir)?;
+    crate::fs_gate::store::StoreDir::at(&dir)?.create()?;
     let mut history = ArtifactHistory::load(&dir)?;
 
     let observed = flatten(projects);
@@ -853,7 +853,7 @@ pub fn observe_and_annotate_dirs(
     since_secs: u64,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    store::create_dir_all(&dir)?;
+    store::StoreDir::at(&dir)?.create()?;
     let current_file = dirs_current_path(&dir);
 
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
@@ -1087,7 +1087,7 @@ pub fn observe_and_annotate_files(
     since_secs: u64,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    store::create_dir_all(&dir)?;
+    store::StoreDir::at(&dir)?.create()?;
     let current_file = files_current_path(&dir);
 
     let mut current: HashMap<String, StoredFileRow> = read_file_rows(&current_file)?
@@ -1248,25 +1248,35 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
 /// other's, and the visible symptom would be a unit that re-measures
 /// every pass for no stated reason.
 fn write_fsevents_state(dir: &Path, state: &FsEventsState) -> Result<()> {
-    store::create_dir_all(dir)?;
+    store::StoreDir::at(dir)?.create()?;
     let merged = FsEventsState {
         unit_root: read_fsevents_state(dir).unit_root,
         ..state.clone()
     };
-    store::write_json(store::JsonFile::FsEventsCursor { volume: dir }, &merged)
-        .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+    store::write_json(
+        store::JsonFile::FsEventsCursor {
+            volume: &store::StoreDir::at(dir)?,
+        },
+        &merged,
+    )
+    .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
 }
 
 /// The mirror of [`write_fsevents_state`]: publishes one unit root's
 /// anchor, carrying the walk's scalars through untouched.
 fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor) -> Result<()> {
-    store::create_dir_all(dir)?;
+    store::StoreDir::at(dir)?.create()?;
     let merged = FsEventsState {
         unit_root: Some(cursor.clone()),
         ..read_fsevents_state(dir)
     };
-    store::write_json(store::JsonFile::FsEventsCursor { volume: dir }, &merged)
-        .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+    store::write_json(
+        store::JsonFile::FsEventsCursor {
+            volume: &store::StoreDir::at(dir)?,
+        },
+        &merged,
+    )
+    .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
 }
 
 fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
@@ -1275,9 +1285,14 @@ fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
 }
 
 fn write_topology(dir: &Path, worktrees: &[StoredWorktree]) -> Result<()> {
-    store::create_dir_all(dir)?;
-    store::write_json(store::JsonFile::Topology { volume: dir }, worktrees)
-        .with_context(|| format!("write {}", topology_path(dir).display()))
+    store::StoreDir::at(dir)?.create()?;
+    store::write_json(
+        store::JsonFile::Topology {
+            volume: &store::StoreDir::at(dir)?,
+        },
+        worktrees,
+    )
+    .with_context(|| format!("write {}", topology_path(dir).display()))
 }
 
 fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
@@ -1288,9 +1303,14 @@ fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
 }
 
 fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
-    store::create_dir_all(dir)?;
-    store::write_json(store::JsonFile::Unowned { volume: dir }, unowned)
-        .with_context(|| format!("write {}", unowned_path(dir).display()))
+    store::StoreDir::at(dir)?.create()?;
+    store::write_json(
+        store::JsonFile::Unowned {
+            volume: &store::StoreDir::at(dir)?,
+        },
+        unowned,
+    )
+    .with_context(|| format!("write {}", unowned_path(dir).display()))
 }
 
 fn parse_artifact_kind(s: &str) -> ArtifactKind {
@@ -1775,7 +1795,7 @@ pub fn stage_tracked_with_source(
     let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let volume_id = root_scoped_volume_id(&root);
     let dir = volume_dir(swamp_dir, volume_id);
-    store::create_dir_all(&dir)?;
+    store::StoreDir::at(&dir)?.create()?;
 
     // FSEvents and persisted topology use the canonical root namespace.
     let prev_state = read_fsevents_state(&dir);
@@ -3204,7 +3224,7 @@ pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u
         return Ok(());
     }
     let dir = external_dir(swamp_dir);
-    store::create_dir_all(&dir)?;
+    store::StoreDir::at(&dir)?.create()?;
     let path = folded_path(swamp_dir);
     let wanted: std::collections::HashSet<&str> = unit_paths.iter().map(String::as_str).collect();
     let mut all: Vec<FoldedRow> = read_folded_rows(&path).unwrap_or_default();
@@ -3223,7 +3243,7 @@ pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u
 
 pub fn store_folded_rows(swamp_dir: &Path, unit_path: &str, rows: &[FoldedRow]) -> Result<()> {
     let dir = external_dir(swamp_dir);
-    store::create_dir_all(&dir)?;
+    store::StoreDir::at(&dir)?.create()?;
     let path = folded_path(swamp_dir);
     let mut all: Vec<FoldedRow> = read_folded_rows(&path)
         .unwrap_or_default()
@@ -3408,7 +3428,7 @@ pub fn observe_and_annotate_external(
     since_secs: u64,
 ) -> Result<HashMap<String, (Option<i64>, u32)>> {
     let dir = external_dir(swamp_dir);
-    crate::fs_gate::store::create_dir_all(&dir)?;
+    crate::fs_gate::store::StoreDir::at(&dir)?.create()?;
     let mut table = ExternalHistory::load(&dir)?;
 
     let mut seen_keys: HashSet<String> = HashSet::new();

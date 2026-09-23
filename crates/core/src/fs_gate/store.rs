@@ -18,39 +18,106 @@
 //! Every write is atomic (sibling temp file + `fsync` + rename + parent
 //! directory `fsync`) except [`append_line`], the ledger's append-only
 //! discipline.
+//!
+//! **Locations are types too** (re-review 5, finding 4). A file here is a
+//! fixed name inside a [`StoreDir`] -- never a caller's path -- and the
+//! three files that live outside a store (the ledger override, the
+//! observation log, the LaunchAgent plist) are resolved *here*, from the
+//! environment, or validated by name. There is no `create_dir_all(path)`,
+//! `list(path)` or `remove(path)` a caller can point anywhere.
 
 use serde::Serialize;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// A swamp state directory: every [`JsonFile`], [`TextFile`] and lock
+/// lives at a fixed name inside one.
+///
+/// Built from the resolved swamp dir ([`StoreDir::resolved`]: what the
+/// CLI and TUI use), or -- for the core entry points that take a store
+/// `&Path`, which tests hand a temp dir -- [`StoreDir::at`], which the
+/// gate audit allows only in the store modules. `at` refuses a relative
+/// path, a symlink, and anything that exists and is not a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDir(PathBuf);
+
+impl StoreDir {
+    /// `$SWAMP_DIR`, else `$HOME/.local/share/swamp`: the one resolver.
+    pub fn resolved() -> StoreDir {
+        if let Some(dir) = std::env::var_os("SWAMP_DIR") {
+            return StoreDir(PathBuf::from(dir));
+        }
+        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+        StoreDir(PathBuf::from(home).join(".local/share/swamp"))
+    }
+
+    /// A store at `dir`. Refused unless `dir` is absolute and, when
+    /// something is there, a real directory (not a symlink to one).
+    pub fn at(dir: &Path) -> io::Result<StoreDir> {
+        if !dir.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not an absolute store directory", dir.display()),
+            ));
+        }
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => Ok(StoreDir(dir.to_path_buf())),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a directory swamp can keep state in",
+                    dir.display()
+                ),
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(StoreDir(dir.to_path_buf())),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A subdirectory swamp owns (a root's history volume, `external/`):
+    /// one plain name, never a path.
+    pub fn subdir(&self, name: &str) -> io::Result<StoreDir> {
+        Ok(StoreDir(self.0.join(plain(name)?)))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Creates the directory (and its parents) if it is missing.
+    pub fn create(&self) -> io::Result<()> {
+        std::fs::create_dir_all(&self.0)
+    }
+}
+
 /// Every JSON file swamp persists. The file name is decided here.
 #[derive(Debug, Clone, Copy)]
 pub enum JsonFile<'a> {
     /// `<store>/plans/<id>.json`: one proposed plan.
-    Plan { store: &'a Path, id: &'a str },
+    Plan { store: &'a StoreDir, id: &'a str },
     /// `<store>/grants.json`: every grant a human minted.
-    Grants { store: &'a Path },
+    Grants { store: &'a StoreDir },
     /// `<store>/agent_protect.json`: the human keep list.
-    ProtectList { store: &'a Path },
+    ProtectList { store: &'a StoreDir },
     /// `<store>/scope.json`: the last resolved scope (coverage
     /// bookkeeping only).
-    Scope { store: &'a Path },
+    Scope { store: &'a StoreDir },
     /// `<store>/last_run.json`: the last scheduled observation's summary.
-    LastRun { store: &'a Path },
+    LastRun { store: &'a StoreDir },
     /// `<store>/docker_facts.json`: the Docker daemon answer, cached for
     /// its TTL.
-    DockerFacts { store: &'a Path },
+    DockerFacts { store: &'a StoreDir },
     /// `<store>/ui_state.json`: the TUI's remembered filter and view.
-    UiState { store: &'a Path },
+    UiState { store: &'a StoreDir },
     /// `<volume>/fsevents.json`: the FSEvents cursor for one root.
-    FsEventsCursor { volume: &'a Path },
+    FsEventsCursor { volume: &'a StoreDir },
     /// `<volume>/topology.json`: the worktree topology of one root.
-    Topology { volume: &'a Path },
+    Topology { volume: &'a StoreDir },
     /// `<volume>/unowned.json`: the unowned rows of one root.
-    Unowned { volume: &'a Path },
+    Unowned { volume: &'a StoreDir },
     /// `<store>/last_report-<key>.json.zst`: the last report, zstd
     /// compressed, so a `--no-observe` or TUI start never re-walks.
-    LastReport { store: &'a Path, key: &'a str },
+    LastReport { store: &'a StoreDir, key: &'a str },
 }
 
 /// How a [`JsonFile`] is encoded on disk.
@@ -75,20 +142,20 @@ impl JsonFile<'_> {
     pub fn path(&self) -> io::Result<PathBuf> {
         Ok(match *self {
             JsonFile::Plan { store, id } => {
-                store.join("plans").join(format!("{}.json", plain(id)?))
+                store.0.join("plans").join(format!("{}.json", plain(id)?))
             }
-            JsonFile::Grants { store } => store.join("grants.json"),
-            JsonFile::ProtectList { store } => store.join("agent_protect.json"),
-            JsonFile::Scope { store } => store.join("scope.json"),
-            JsonFile::LastRun { store } => store.join("last_run.json"),
-            JsonFile::DockerFacts { store } => store.join("docker_facts.json"),
-            JsonFile::UiState { store } => store.join("ui_state.json"),
-            JsonFile::FsEventsCursor { volume } => volume.join("fsevents.json"),
-            JsonFile::Topology { volume } => volume.join("topology.json"),
-            JsonFile::Unowned { volume } => volume.join("unowned.json"),
-            JsonFile::LastReport { store, key } => {
-                store.join(format!("last_report-{}.json.zst", plain(key)?))
-            }
+            JsonFile::Grants { store } => store.0.join("grants.json"),
+            JsonFile::ProtectList { store } => store.0.join("agent_protect.json"),
+            JsonFile::Scope { store } => store.0.join("scope.json"),
+            JsonFile::LastRun { store } => store.0.join("last_run.json"),
+            JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
+            JsonFile::UiState { store } => store.0.join("ui_state.json"),
+            JsonFile::FsEventsCursor { volume } => volume.0.join("fsevents.json"),
+            JsonFile::Topology { volume } => volume.0.join("topology.json"),
+            JsonFile::Unowned { volume } => volume.0.join("unowned.json"),
+            JsonFile::LastReport { store, key } => store
+                .0
+                .join(format!("last_report-{}.json.zst", plain(key)?)),
         })
     }
 
@@ -134,32 +201,31 @@ pub fn read_json_bytes(file: JsonFile<'_>) -> io::Result<Option<Vec<u8>>> {
 #[derive(Debug, Clone, Copy)]
 pub enum TextFile<'a> {
     /// `<store>/config.toml`, written only by `swamp config init`.
-    Config { store: &'a Path },
-    /// The scheduled refresh's LaunchAgent plist: `<label>.plist` in the
-    /// LaunchAgents directory (`SWAMP_LAUNCH_AGENTS_DIR` in tests).
-    LaunchAgent { plist: &'a Path },
+    Config { store: &'a StoreDir },
+    /// The scheduled refresh's LaunchAgent plist, where
+    /// [`launch_agent_plist`] resolves it.
+    LaunchAgent,
 }
 
 impl TextFile<'_> {
     pub fn path(&self) -> io::Result<PathBuf> {
         match *self {
-            TextFile::Config { store } => Ok(store.join("config.toml")),
-            TextFile::LaunchAgent { plist } => {
-                let named = plist
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == format!("{}.plist", crate::schedule::LABEL));
-                if named {
-                    Ok(plist.to_path_buf())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{} is not swamp's LaunchAgent plist", plist.display()),
-                    ))
-                }
-            }
+            TextFile::Config { store } => Ok(store.0.join("config.toml")),
+            TextFile::LaunchAgent => launch_agent_plist(),
         }
     }
+}
+
+/// `<LaunchAgents>/<label>.plist`: `$SWAMP_LAUNCH_AGENTS_DIR` (tests), else
+/// `~/Library/LaunchAgents`. The only plist swamp writes, removes or hands
+/// to `launchctl`.
+pub fn launch_agent_plist() -> io::Result<PathBuf> {
+    let dir = match std::env::var_os("SWAMP_LAUNCH_AGENTS_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
+            .join("Library/LaunchAgents"),
+    };
+    Ok(dir.join(format!("{}.plist", crate::schedule::LABEL)))
 }
 
 /// Writes `text` into `file`, atomically.
@@ -176,24 +242,48 @@ pub fn remove_text(file: TextFile<'_>) -> io::Result<()> {
 /// Every append-only log swamp keeps.
 #[derive(Debug, Clone, Copy)]
 pub enum LogFile<'a> {
-    /// The action ledger (`ledger.jsonl`, or `SWAMP_LEDGER_PATH`).
-    Ledger(&'a Path),
-    /// The scheduled observation log (`observe.log`).
+    /// The action ledger: `<store>/ledger.jsonl`.
+    Ledger(&'a StoreDir),
+    /// The action ledger where `$SWAMP_LEDGER_PATH` puts it (read here,
+    /// not handed in); `<store>/ledger.jsonl` when unset.
+    LedgerResolved(&'a StoreDir),
+    /// The scheduled observation log: a file named `observe.log`
+    /// (`schedule::log_file`), refused under any other name.
     Observations(&'a Path),
+}
+
+impl LogFile<'_> {
+    /// Where the log lives.
+    pub fn path(&self) -> io::Result<PathBuf> {
+        Ok(match *self {
+            LogFile::Ledger(store) => store.0.join("ledger.jsonl"),
+            LogFile::LedgerResolved(store) => match std::env::var_os("SWAMP_LEDGER_PATH") {
+                Some(p) => PathBuf::from(p),
+                None => store.0.join("ledger.jsonl"),
+            },
+            LogFile::Observations(path) => {
+                if path.file_name().is_none_or(|n| n != "observe.log") || !path.is_absolute() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} is not swamp's observation log", path.display()),
+                    ));
+                }
+                path.to_path_buf()
+            }
+        })
+    }
 }
 
 /// Appends one line and syncs it.
 pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
-    let path = match file {
-        LogFile::Ledger(p) | LogFile::Observations(p) => p,
-    };
+    let path = file.path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
+        .open(&path)?;
     writeln!(f, "{line}")?;
     f.sync_data()
 }
@@ -201,18 +291,18 @@ pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
 /// The single-flight observation lock, `<store>/observe.lock`.
 #[derive(Debug, Clone, Copy)]
 pub struct ObserveLock<'a> {
-    pub store: &'a Path,
+    pub store: &'a StoreDir,
 }
 
 impl ObserveLock<'_> {
     pub fn path(&self) -> PathBuf {
-        self.store.join("observe.lock")
+        self.store.0.join("observe.lock")
     }
 
     /// Creates the lock only if nothing is there (`O_EXCL`), holding
     /// `contents` (`pid<TAB>started_at`).
     pub fn create(&self, contents: &str) -> io::Result<()> {
-        std::fs::create_dir_all(self.store)?;
+        self.store.create()?;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -227,19 +317,17 @@ impl ObserveLock<'_> {
     }
 }
 
-/// Creates a directory swamp owns (a store root, a log directory).
-pub fn create_dir_all(dir: impl AsRef<Path>) -> io::Result<()> {
-    std::fs::create_dir_all(dir)
-}
-
-/// The entries of a directory swamp owns (its `plans/`, a history
-/// table's `deltas/`), one level, sorted. Empty when the directory does
-/// not exist. Not a walk and never used on a user tree.
-pub fn list_owned(dir: impl AsRef<Path>) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
+/// The plan files in `<store>/plans/`, sorted. Empty when there are none.
+/// Not a walk and never used on a user tree.
+pub fn list_plan_files(store: &StoreDir) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(store.0.join("plans")) else {
         return Vec::new();
     };
-    let mut out: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
     out.sort();
     out
 }

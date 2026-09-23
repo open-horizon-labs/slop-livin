@@ -1,7 +1,10 @@
 //! Every operation that moves, removes or rewrites data swamp does not
-//! own. Each one takes a [`RecheckProof`] (by value: spent once) and an
-//! [`Authorized`] (by reference), checks that the authorization names the
-//! proof's anchor and that the proof is fresh, and only then acts.
+//! own. Each one takes a [`RecheckProof`] (by value: spent once; or by
+//! reference for the copy that precedes a move) -- or the [`Trashed`]
+//! receipt of the move a proof licensed -- and an [`Authorized`] (by
+//! reference), checks that the authorization names the proof's anchor
+//! and that the proof is fresh, and only then acts. Every argument a
+//! subprocess gets here is built from the proof, never passed in.
 //!
 //! There is no `rename`, `remove_*` or `write` here that takes a bare
 //! path. That is the compile-time form of
@@ -40,6 +43,28 @@ fn plain_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a licensed Trash move did: the anchor it moved and where it
+/// went. The one input `git_worktree_prune` takes besides the
+/// authorization, so a prune only ever follows a move of that worktree.
+#[must_use = "a Trash move's receipt says where the unit went"]
+#[derive(Debug)]
+pub struct Trashed {
+    anchor: PathBuf,
+    dest: PathBuf,
+    linked_common: Option<PathBuf>,
+}
+
+impl Trashed {
+    /// Where the unit went.
+    pub fn path(&self) -> &Path {
+        &self.dest
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        self.dest
+    }
+}
+
 /// Moves the proof's anchor to `trash_root/dest_name` (one `rename`,
 /// same volume). Returns where it went.
 pub fn trash_move(
@@ -47,8 +72,11 @@ pub fn trash_move(
     auth: &Authorized,
     trash_root: &Path,
     dest_name: &str,
-) -> Result<PathBuf> {
+) -> Result<Trashed> {
     licensed(&proof, auth)?;
+    if proof.identity().is_none() {
+        bail!("refused: a Docker object is removed in the daemon, never moved to the Trash");
+    }
     plain_name(dest_name)?;
     std::fs::create_dir_all(trash_root).context("could not create the Trash directory")?;
     let dest = trash_root.join(dest_name);
@@ -57,7 +85,11 @@ pub fn trash_move(
     }
     std::fs::rename(proof.anchor(), &dest)
         .with_context(|| format!("rename to Trash failed for {}", proof.anchor().display()))?;
-    Ok(dest)
+    Ok(Trashed {
+        anchor: proof.anchor().to_path_buf(),
+        dest,
+        linked_common: proof.linked_common().map(Path::to_path_buf),
+    })
 }
 
 /// A recovery envelope: one directory inside the Trash that receives a
@@ -151,23 +183,35 @@ impl Envelope {
     }
 }
 
-/// Copies one compiled output out of an authorized unit into
-/// `dest_dir` before the unit is trashed (`--keep-executables`). Writes
-/// into the user's worktree, so it is a destroy-group operation: the
-/// source must lie under an authorized anchor.
+/// Copies one compiled output out of an authorized unit into the
+/// authorized worktree's `bin/` (or `bin/<sub>/`) before the unit is
+/// trashed (`--keep-executables`). Writes into the user's worktree, so it
+/// is a destroy-group operation: `from` must lie under the anchor a fresh
+/// recheck proof covers, and the destination is the one the
+/// authorization recorded -- never a directory the caller names.
 pub fn copy_preserved(
+    proof: &RecheckProof,
     auth: &Authorized,
-    anchor: &Path,
     from: &Path,
-    dest_dir: &Path,
+    sub: Option<&str>,
 ) -> Result<PathBuf> {
-    if !auth.covers(anchor) || !crate::scope::under(from, anchor) {
+    licensed(proof, auth)?;
+    if !crate::scope::under(from, proof.anchor()) || from == proof.anchor() {
         bail!(
-            "refused: {} is not inside an authorized unit",
-            from.display()
+            "refused: {} is not inside the rechecked unit {}",
+            from.display(),
+            proof.anchor().display()
         );
     }
-    std::fs::create_dir_all(dest_dir)?;
+    let Some(worktree) = &auth.target().preserve_into else {
+        bail!("refused: this authorization records no worktree to preserve executables into");
+    };
+    let mut dest_dir = worktree.join("bin");
+    if let Some(sub) = sub {
+        plain_name(sub)?;
+        dest_dir = dest_dir.join(sub);
+    }
+    std::fs::create_dir_all(&dest_dir)?;
     let name = from.file_name().context("file has a name")?;
     let to = dest_dir.join(name);
     std::fs::copy(from, &to)
@@ -176,24 +220,27 @@ pub fn copy_preserved(
 }
 
 /// `docker image rm <id>` / `docker volume rm <name>`: permanent, in the
-/// daemon, after `docker::still_removable` re-derived it. Returns the
-/// daemon's own refusal text when it declines.
-pub fn docker_remove(
-    auth: &Authorized,
-    anchor: &Path,
-    kind: &str,
-    id: &str,
-) -> std::result::Result<(), String> {
-    if !auth.covers(anchor) {
-        return Err(format!(
-            "refused: the authorization does not name {}",
-            anchor.display()
-        ));
-    }
-    if !matches!(kind, "image" | "volume") {
-        return Err(format!(
-            "refused: docker {kind} rm is not a supported removal"
-        ));
+/// daemon. The proof is the one `recheck::run_all` took by asking the
+/// daemon about exactly the removal the authorization names; the
+/// arguments are built from it here. Returns the daemon's own refusal
+/// text when it declines.
+pub fn docker_remove(proof: RecheckProof, auth: &Authorized) -> std::result::Result<(), String> {
+    licensed(&proof, auth).map_err(|e| e.to_string())?;
+    let (kind, id) = match (proof.docker(), &auth.target().docker) {
+        (Some(p), Some(a)) if p == a => match p {
+            crate::docker::Removal::Image { id } => ("image", id.clone()),
+            crate::docker::Removal::Volume { name } => ("volume", name.clone()),
+            crate::docker::Removal::Refused(why) => return Err((*why).to_string()),
+        },
+        _ => {
+            return Err(format!(
+                "refused: the recheck of {} was not a Docker recheck of the authorized object",
+                proof.anchor().display()
+            ));
+        }
+    };
+    if !crate::fs_gate::spawn::is_docker_ref(&id) {
+        return Err(format!("refused: `{id}` is not a Docker object reference"));
     }
     let args: Vec<std::ffi::OsString> = vec![kind.into(), "rm".into(), id.into()];
     let out = super::spawn::run_unchecked(
@@ -213,16 +260,24 @@ pub fn docker_remove(
     })
 }
 
-/// `git -C <repo> worktree prune`, after a linked worktree the human
-/// confirmed was moved to the Trash. Best-effort; the move already
-/// happened.
-pub fn git_worktree_prune(auth: &Authorized, anchor: &Path, repo: &Path) -> Result<()> {
-    if !auth.covers(anchor) {
+/// `git -C <repo> worktree prune`, after the linked worktree `moved`
+/// names went to the Trash. The repository is the common dir the
+/// recheck read from the worktree's own `.git` pointer, not a caller's
+/// choice. Best-effort; the move already happened.
+pub fn git_worktree_prune(moved: Trashed, auth: &Authorized) -> Result<()> {
+    if !auth.covers(&moved.anchor) {
         bail!(
             "refused: the authorization does not name {}",
-            anchor.display()
+            moved.anchor.display()
         );
     }
+    let Some(common) = &moved.linked_common else {
+        bail!(
+            "refused: {} was not rechecked as a linked worktree",
+            moved.anchor.display()
+        );
+    };
+    let repo = common.parent().unwrap_or(common);
     let args: Vec<std::ffi::OsString> = vec![
         "-C".into(),
         repo.as_os_str().to_owned(),

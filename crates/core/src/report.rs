@@ -1197,7 +1197,7 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
     slim.files_by_worktree = None;
     crate::fs_gate::store::write_json(
         crate::fs_gate::store::JsonFile::LastReport {
-            store: store_dir,
+            store: &crate::fs_gate::store::StoreDir::at(store_dir)?,
             key: &last_report_key(&report.root),
         },
         &slim,
@@ -1209,9 +1209,10 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
 /// run, TUI), without walking anything. `None` when no observation of
 /// this root has been cached yet.
 pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
+    let store = crate::fs_gate::store::StoreDir::at(store_dir).ok()?;
     let bytes =
         crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
-            store: store_dir,
+            store: &store,
             key: &last_report_key(root),
         })
         .ok()??;

@@ -10,10 +10,14 @@
 //!   swamp's own instrumentation (re-review 3, F2).
 //! * **Every run is bounded** by a timeout and returns only a
 //!   [`RunOutput`]; no `Child` or `Command` escapes.
-//! * **Mutating verbs are refused here.** `docker … rm`, `git worktree
-//!   prune` and friends are reachable only through
-//!   [`super::destroy`], which takes an
-//!   [`crate::authority::Authorized`].
+//! * **Arguments are allow-listed per program.** [`run`] accepts only
+//!   the exact argument shapes swamp's own queries use (verbs, flags and
+//!   typed operands: an absolute path, a Docker reference, a pid), so an
+//!   option smuggled in as an operand, a different verb or an extra flag
+//!   is refused before anything starts. `docker … rm` and `git worktree
+//!   prune` are not shapes at all: they are reachable only through
+//!   [`super::destroy`], which takes a [`crate::recheck::RecheckProof`]
+//!   and an [`crate::authority::Authorized`].
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -121,61 +125,210 @@ impl RunOutput {
     }
 }
 
-/// The verbs [`run`] refuses because they change state outside swamp's
-/// store: those go through [`super::destroy`] with an authorization.
-fn mutating(program: Program, args: &[OsString]) -> Option<String> {
-    let words: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let first = words.first().map(String::as_str).unwrap_or("");
-    let second = words.get(1).map(String::as_str).unwrap_or("");
-    let refused = match program {
-        Program::Docker => {
-            matches!(first, "rm" | "rmi" | "kill" | "stop" | "prune")
-                || matches!(
-                    (first, second),
-                    (
-                        "image" | "volume" | "container" | "network" | "builder" | "system",
-                        "rm" | "prune" | "remove"
-                    )
-                )
-        }
-        Program::Git => {
-            // Skip `-C <dir>` and other leading options to the subcommand.
-            let mut i = 0;
-            while i < words.len() && words[i].starts_with('-') {
-                i += if words[i] == "-C" { 2 } else { 1 };
+/// One argument slot of an allowed invocation.
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    /// Exactly this word.
+    Lit(&'static str),
+    /// An absolute path (`/…`): never an option, never relative.
+    AbsPath,
+    /// A Docker object id or name: non-empty, no leading `-`, only
+    /// `[A-Za-z0-9_.:@/-]` (image references carry `:` `@` `/`).
+    DockerRef,
+    /// One or more [`Slot::DockerRef`]s (a batched `inspect`).
+    DockerRefs,
+    /// A decimal number (a pid).
+    Number,
+    /// `gui/<uid>` (a launchd domain).
+    LaunchdDomain,
+    /// `gui/<uid>/<label>` for swamp's own label.
+    LaunchdService,
+    /// Swamp's own LaunchAgent plist, exactly
+    /// ([`super::store::launch_agent_plist`]).
+    SwampPlist,
+    /// The `-f key=value` pairs of a read-only GraphQL query: `query=`
+    /// must open with `query(` (never `mutation`), every other key is one
+    /// of the variables `github.rs` declares.
+    GraphqlFields,
+}
+
+/// Every argument shape [`run`] accepts, per program. An allow-list: an
+/// invocation that is not one of these shapes -- an extra flag, a
+/// different verb, an option smuggled in where an operand belongs
+/// (`git -c core.pager=…`, `docker --host …`) -- is refused before
+/// anything starts. Programs with no shape here (`git`) run only through
+/// [`super::destroy`], behind a recheck proof.
+fn shapes(program: Program) -> &'static [&'static [Slot]] {
+    use Slot::*;
+    match program {
+        Program::Lsof => &[&[Lit("--"), AbsPath], &[Lit("+D"), AbsPath]],
+        Program::Plutil => &[&[Lit("-convert"), Lit("xml1"), Lit("-o"), Lit("-"), AbsPath]],
+        Program::Xcrun => &[&[Lit("simctl"), Lit("list"), Lit("devices"), Lit("-j")]],
+        Program::Du => &[&[Lit("-skPx"), AbsPath]],
+        Program::Docker => &[
+            &[
+                Lit("system"),
+                Lit("df"),
+                Lit("-v"),
+                Lit("--format"),
+                Lit("json"),
+            ],
+            &[Lit("ps"), Lit("-a"), Lit("--format"), Lit("json")],
+            &[
+                Lit("image"),
+                Lit("inspect"),
+                DockerRefs,
+                Lit("--format"),
+                Lit("json"),
+            ],
+            &[
+                Lit("volume"),
+                Lit("inspect"),
+                DockerRefs,
+                Lit("--format"),
+                Lit("json"),
+            ],
+            &[Lit("inspect"), DockerRefs, Lit("--format"), Lit("json")],
+            &[Lit("image"), Lit("inspect"), DockerRef],
+            &[Lit("volume"), Lit("inspect"), DockerRef],
+        ],
+        Program::Gh => &[
+            &[Lit("auth"), Lit("status")],
+            &[Lit("api"), Lit("graphql"), GraphqlFields],
+        ],
+        Program::Git => &[],
+        Program::Df => &[&[Lit("-k"), AbsPath]],
+        Program::Id => &[&[Lit("-u")]],
+        Program::Launchctl => &[
+            &[Lit("bootstrap"), LaunchdDomain, SwampPlist],
+            &[Lit("load"), Lit("-w"), SwampPlist],
+            &[Lit("bootout"), LaunchdService],
+            &[Lit("unload"), Lit("-w"), SwampPlist],
+        ],
+        Program::Kill => &[&[Lit("-0"), Number]],
+        Program::Brew => &[&[Lit("--prefix")]],
+        Program::Defaults => &[&[
+            Lit("read"),
+            Lit("com.apple.dt.Xcode"),
+            Lit("IDECustomDerivedDataLocation"),
+        ]],
+    }
+}
+
+/// Whether `a` can be a Docker object reference (see [`Slot::DockerRef`]).
+pub(super) fn is_docker_ref(a: &str) -> bool {
+    docker_ref(a)
+}
+
+fn docker_ref(a: &str) -> bool {
+    !a.is_empty()
+        && !a.starts_with('-')
+        && a.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '@' | '/' | '-'))
+}
+
+fn digits(a: &str) -> bool {
+    !a.is_empty() && a.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The GraphQL variables `github.rs` binds: `owner`, `name`, and
+/// `branch<i>`/`ref<i>` per branch.
+fn graphql_variable(key: &str) -> bool {
+    matches!(key, "owner" | "name")
+        || ["branch", "ref"]
+            .iter()
+            .any(|p| key.strip_prefix(p).is_some_and(digits))
+}
+
+/// Whether `args` match `shape` exactly.
+fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
+    let mut i = 0;
+    for slot in shape {
+        match slot {
+            Slot::DockerRefs => {
+                let start = i;
+                while i < args.len() && docker_ref(&args[i]) {
+                    i += 1;
+                }
+                if i == start {
+                    return false;
+                }
+                continue;
             }
-            let sub = words.get(i).map(String::as_str);
-            let next = words.get(i + 1).map(String::as_str);
-            matches!(
-                sub,
-                Some(
-                    "worktree"
-                        | "gc"
-                        | "prune"
-                        | "reset"
-                        | "clean"
-                        | "checkout"
-                        | "switch"
-                        | "push"
-                        | "commit"
-                        | "rm"
-                        | "branch"
-                        | "stash"
-                )
-            ) && !matches!(next, Some("list"))
+            Slot::GraphqlFields => {
+                let mut saw_query = false;
+                while i < args.len() {
+                    if args[i] != "-f" {
+                        return false;
+                    }
+                    let Some((key, value)) = args.get(i + 1).and_then(|kv| kv.split_once('='))
+                    else {
+                        return false;
+                    };
+                    if key == "query" {
+                        if saw_query || !value.trim_start().starts_with("query(") {
+                            return false;
+                        }
+                        saw_query = true;
+                    } else if !graphql_variable(key) {
+                        return false;
+                    }
+                    i += 2;
+                }
+                if !saw_query {
+                    return false;
+                }
+                continue;
+            }
+            _ => {}
         }
-        _ => false,
-    };
-    refused.then(|| {
+        let Some(a) = args.get(i) else {
+            return false;
+        };
+        let ok = match slot {
+            Slot::Lit(w) => a == w,
+            Slot::AbsPath => a.starts_with('/'),
+            Slot::DockerRef => docker_ref(a),
+            Slot::Number => digits(a),
+            Slot::LaunchdDomain => a.strip_prefix("gui/").is_some_and(digits),
+            Slot::LaunchdService => a
+                .strip_prefix("gui/")
+                .and_then(|r| r.split_once('/'))
+                .is_some_and(|(uid, label)| digits(uid) && label == crate::schedule::LABEL),
+            Slot::SwampPlist => super::store::launch_agent_plist()
+                .is_ok_and(|p| p.as_os_str() == std::ffi::OsStr::new(a)),
+            Slot::DockerRefs | Slot::GraphqlFields => unreachable!("handled above"),
+        };
+        if !ok {
+            return false;
+        }
+        i += 1;
+    }
+    i == args.len()
+}
+
+/// `Ok` when `program args…` is one of the shapes [`shapes`] allows.
+fn permitted(program: Program, args: &[OsString]) -> Result<(), String> {
+    let words: Option<Vec<String>> = args
+        .iter()
+        .map(|a| a.to_str().map(str::to_string))
+        .collect();
+    let refuse = |words: &str| {
         format!(
-            "{} {} is a mutating verb; it runs only through fs_gate::destroy",
-            program.binary(),
-            words.join(" ")
+            "{} {words} is not an invocation swamp runs: every program has an allow-list of \
+             argument shapes (fs_gate::spawn), and mutating ones run only through \
+             fs_gate::destroy",
+            program.binary()
         )
-    })
+    };
+    let Some(words) = words else {
+        return Err(refuse("<non-UTF-8 argument>"));
+    };
+    if shapes(program).iter().any(|s| matches_shape(s, &words)) {
+        Ok(())
+    } else {
+        Err(refuse(&words.join(" ")))
+    }
 }
 
 /// Runs `program args…` with stdin closed, stdout and stderr captured to
@@ -187,14 +340,15 @@ where
     S: AsRef<OsStr>,
 {
     let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-    if let Some(why) = mutating(program, &args) {
+    if let Err(why) = permitted(program, &args) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
     }
     run_unchecked(program, &args, timeout)
 }
 
-/// [`run`] without the mutating-verb refusal: only
-/// [`super::destroy`], behind an authorization, calls this.
+/// [`run`] without the argument allow-list: only [`super::destroy`],
+/// behind a recheck proof and an authorization, calls this, with
+/// arguments it builds itself from the proof.
 pub(super) fn run_unchecked(
     program: Program,
     args: &[OsString],
@@ -257,33 +411,95 @@ mod tests {
 
     #[test]
     fn mutating_verbs_are_refused_without_spawning() {
-        let (r, counted) = crate::work_counters::measured(|| {
-            run(
+        for (program, args) in [
+            (Program::Docker, vec!["image", "rm", "x"]),
+            (Program::Docker, vec!["rmi", "x"]),
+            (Program::Git, vec!["-C", "/tmp/x", "worktree", "prune"]),
+            (Program::Git, vec!["-C", "/nonexistent", "worktree", "list"]),
+            // Re-review 5: an option parser that skipped `-C <dir>` read
+            // `-c k=v` as a flag and the next word as the subcommand.
+            (
+                Program::Git,
+                vec!["-c", "core.pager=sh", "worktree", "list"],
+            ),
+            // Programs the old deny-list never looked at.
+            (Program::Kill, vec!["-9", "1"]),
+            (Program::Kill, vec!["1"]),
+            (Program::Launchctl, vec!["remove", "com.apple.something"]),
+            (Program::Brew, vec!["uninstall", "x"]),
+            (
+                Program::Defaults,
+                vec!["write", "com.apple.dt.Xcode", "x", "y"],
+            ),
+            (Program::Plutil, vec!["-convert", "xml1", "/tmp/x.plist"]),
+            (Program::Xcrun, vec!["simctl", "erase", "all"]),
+            // Operands that are options, and relative paths.
+            (Program::Lsof, vec!["+D", "-t"]),
+            (Program::Du, vec!["-skPx", "relative"]),
+            (
                 Program::Docker,
-                ["image", "rm", "x"],
-                Duration::from_secs(5),
-            )
-        });
-        assert!(r.is_err());
-        assert_eq!(counted.subprocess_spawns, 0);
-        let (r, counted) = crate::work_counters::measured(|| {
-            run(
-                Program::Git,
-                ["-C", "/tmp/x", "worktree", "prune"],
-                Duration::from_secs(5),
-            )
-        });
-        assert!(r.is_err());
-        assert_eq!(counted.subprocess_spawns, 0);
-        assert!(
-            run(
-                Program::Git,
-                ["-C", "/nonexistent", "worktree", "list"],
-                Duration::from_secs(5)
-            )
-            .is_ok(),
-            "a read-only worktree listing is not a mutating verb"
-        );
+                vec!["--host", "tcp://x", "ps", "-a", "--format", "json"],
+            ),
+            (Program::Docker, vec!["image", "inspect", "--help"]),
+            // A GraphQL mutation through the read-only query shape.
+            (
+                Program::Gh,
+                vec!["api", "graphql", "-f", "query=mutation { x }"],
+            ),
+            (Program::Gh, vec!["api", "repos/x/y", "-X", "DELETE"]),
+        ] {
+            let (r, counted) = crate::work_counters::measured(|| {
+                run(program, args.clone(), Duration::from_secs(5))
+            });
+            assert!(r.is_err(), "{program:?} {args:?} must be refused");
+            assert_eq!(counted.subprocess_spawns, 0, "{program:?} {args:?} spawned");
+        }
+    }
+
+    #[test]
+    fn swamps_own_invocations_are_shapes() {
+        for (program, args) in [
+            (Program::Lsof, vec!["+D", "/tmp"]),
+            (Program::Lsof, vec!["--", "/tmp/x"]),
+            (
+                Program::Docker,
+                vec![
+                    "image",
+                    "inspect",
+                    "sha256:ab",
+                    "repo/x:1",
+                    "--format",
+                    "json",
+                ],
+            ),
+            (Program::Docker, vec!["volume", "inspect", "v1"]),
+            (
+                Program::Docker,
+                vec!["system", "df", "-v", "--format", "json"],
+            ),
+            (Program::Gh, vec!["auth", "status"]),
+            (
+                Program::Gh,
+                vec![
+                    "api",
+                    "graphql",
+                    "-f",
+                    "query=query($owner: String!) { x }",
+                    "-f",
+                    "owner=o",
+                    "-f",
+                    "branch0=main",
+                    "-f",
+                    "ref0=refs/heads/main",
+                ],
+            ),
+            (Program::Kill, vec!["-0", "123"]),
+            (Program::Id, vec!["-u"]),
+            (Program::Df, vec!["-k", "/"]),
+        ] {
+            let words: Vec<OsString> = args.iter().map(OsString::from).collect();
+            assert!(permitted(program, &words).is_ok(), "{program:?} {args:?}");
+        }
     }
 
     #[test]

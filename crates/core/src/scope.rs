@@ -1163,7 +1163,9 @@ fn status_label(status: &RootStatus) -> String {
 /// consulted by the growth store.
 pub fn persist_effective_scope(store_dir: &Path, scope: &EffectiveScope) -> std::io::Result<()> {
     crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::Scope { store: store_dir },
+        crate::fs_gate::store::JsonFile::Scope {
+            store: &crate::fs_gate::store::StoreDir::at(store_dir)?,
+        },
         scope,
     )
 }

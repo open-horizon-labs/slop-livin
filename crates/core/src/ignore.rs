@@ -7,7 +7,6 @@
 //! data (irrecoverable), and deleting it can never be undone with git.
 //! The tool states the fact and never turns it into a verdict.
 
-use gix::bstr::ByteSlice;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -33,98 +32,9 @@ impl TrackState {
     }
 }
 
-/// An exclude stack plus index for one checkout, reused across many
-/// lookups (building it per path would re-read every `.gitignore`).
-///
-/// The stack really is reused now: it used to be rebuilt inside every
-/// `status` call, which cost ~75µs a path and made asking about more
-/// than a handful of paths per worktree unaffordable. It is behind a
-/// `RefCell` because `at_entry` needs `&mut` while callers hold the lens
-/// by shared reference; the lens is per-worktree and used from one
-/// thread at a time.
-pub struct IgnoreLens {
-    repo: gix::Repository,
-    index: gix::index::State,
-    stack: std::cell::RefCell<Option<gix::worktree::Stack>>,
-}
-
-impl IgnoreLens {
-    /// Opens the checkout at `root`. `None` when it is not a repository.
-    pub fn open(root: &Path) -> Option<Self> {
-        let repo = gix::open(root).ok()?;
-        let snapshot = repo.index_or_empty().ok()?;
-        let index: gix::index::State = (**snapshot).clone().into();
-        Some(Self {
-            repo,
-            index,
-            stack: std::cell::RefCell::new(None),
-        })
-    }
-
-    /// Status of `rel` (relative to the checkout root) — `is_dir` matters
-    /// because gitignore rules can be directory-only.
-    pub fn status(&self, rel: &str, is_dir: bool) -> TrackState {
-        let rel_trimmed = rel
-            .trim_start_matches("./")
-            .trim_end_matches('/')
-            .trim_end_matches('.');
-        let rel_trimmed = rel_trimmed.trim_end_matches('/');
-        if rel_trimmed.is_empty() {
-            return TrackState::Tracked; // the checkout root itself
-        }
-        // Tracked wins: a path with any index entry under it is tracked,
-        // even if a broad ignore rule would also match it.
-        let bytes = rel_trimmed.as_bytes().as_bstr();
-        if self.index.entry_by_path(bytes).is_some() {
-            return TrackState::Tracked;
-        }
-        if is_dir {
-            let with_slash = format!("{rel_trimmed}/");
-            if self
-                .index
-                .prefixed_entries(with_slash.as_bytes().as_bstr())
-                .is_some_and(|e| !e.is_empty())
-            {
-                return TrackState::Tracked;
-            }
-        }
-        let mut cached = self.stack.borrow_mut();
-        if cached.is_none() {
-            let Ok(built) = self.repo.excludes(
-                &self.index,
-                None,
-                gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-            ) else {
-                return TrackState::Unknown;
-            };
-            // `detach` drops the borrow of the repository, so the stack
-            // can be owned by the lens; `at_entry` then takes the object
-            // database explicitly.
-            *cached = Some(built.detach());
-        }
-        let stack = cached.as_mut().expect("just built");
-        // A directory is ignored when everything inside it is: gix's stack
-        // answers about a directory's *contents*, so ask about a probe path
-        // inside it rather than the directory itself (a trailing slash
-        // alone returns the container's state, not the rule's effect).
-        let lookup = if is_dir {
-            format!("{rel_trimmed}/.swamp-probe")
-        } else {
-            rel_trimmed.to_string()
-        };
-        let mode = is_dir.then_some(gix::index::entry::Mode::FILE);
-        match stack.at_entry(lookup.as_bytes().as_bstr(), mode, &self.repo.objects) {
-            Ok(platform) => {
-                if platform.is_excluded() {
-                    TrackState::Ignored
-                } else {
-                    TrackState::Untracked
-                }
-            }
-            Err(_) => TrackState::Unknown,
-        }
-    }
-}
+/// The per-checkout ignore/index lens: `gix` lives in the capability
+/// gate (`fs_gate::git`), which answers only this query.
+pub use crate::fs_gate::git::IgnoreLens;
 
 /// The first few paths under `root` that git neither tracks nor ignores,
 /// with their sizes: content that exists **only here**. Removing a whole

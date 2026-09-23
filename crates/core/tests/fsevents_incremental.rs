@@ -728,13 +728,13 @@ fn switching_roots_preserves_history_and_alias_replay_namespace() {
     )
     .expect("visible linked worktree should produce a proposal");
     assert_eq!(
-        proposal.units.len(),
+        proposal.units().len(),
         1,
         "proposal must contain exactly the selected worktree"
     );
-    assert_eq!(proposal.units[0].path, canonical_linked);
-    assert_eq!(proposal.units[0].worktree_path, canonical_linked);
-    assert_eq!(proposal.units[0].verb, "remove-worktree");
+    assert_eq!(proposal.units()[0].path(), canonical_linked);
+    assert_eq!(proposal.units()[0].worktree_path(), canonical_linked);
+    assert_eq!(proposal.units()[0].verb(), "remove-worktree");
     let main = parent_checkout
         .worktrees
         .iter()

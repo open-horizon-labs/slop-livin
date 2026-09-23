@@ -26,19 +26,6 @@ use ratatui::backend::Backend;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub fn ledger_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_LEDGER_PATH") {
-        return PathBuf::from(dir);
-    }
-    let dir = if let Ok(d) = std::env::var("SWAMP_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".local/share/swamp")
-    };
-    dir.join("ledger.jsonl")
-}
-
 /// Dispatches one key event against the app state. Kept separate from
 /// the terminal event loop so it is directly unit-testable.
 pub fn handle_key(app: &mut App, code: KeyCode) {
@@ -192,12 +179,11 @@ fn resolved_scope(
     ))
 }
 
+/// The resolved swamp dir: the gate's one resolver.
 fn store_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("SWAMP_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/swamp")
+    swamp_core::fs_gate::StoreDir::resolved()
+        .path()
+        .to_path_buf()
 }
 
 pub fn run(root: &Path, no_observe: bool) -> Result<()> {

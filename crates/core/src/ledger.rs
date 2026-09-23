@@ -1,7 +1,8 @@
+use crate::fs_gate::store::{LogFile, StoreDir};
 use crate::grants::Verb;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRecord {
     pub id: String,
@@ -16,35 +17,63 @@ pub struct ActionRecord {
     pub observed_path_state: Option<String>,
     pub recorded_at: u64,
 }
+/// The append-only action ledger. Its location is a [`LogFile`]: a
+/// store's `ledger.jsonl`, or the `$SWAMP_LEDGER_PATH` override read in
+/// the gate -- never an arbitrary file a caller names.
 #[derive(Debug, Clone)]
 pub struct Ledger {
-    path: PathBuf,
+    store: StoreDir,
+    resolved: bool,
 }
 impl Ledger {
+    /// `<dir>/ledger.jsonl`. `path` must name a file called
+    /// `ledger.jsonl`: the ledger appends to nothing else.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        if let Some(p) = path.parent() {
-            crate::fs_gate::store::create_dir_all(p)?;
+        if path.file_name().is_none_or(|n| n != "ledger.jsonl") {
+            anyhow::bail!(
+                "{} is not a swamp ledger (a ledger is a store's `ledger.jsonl`)",
+                path.display()
+            );
         }
-        Ok(Self { path })
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no store directory", path.display()))?;
+        Ok(Self {
+            store: StoreDir::at(dir)?,
+            resolved: false,
+        })
+    }
+    /// The ledger for `store`, honouring `$SWAMP_LEDGER_PATH` (the TUI).
+    pub fn resolved(store: &StoreDir) -> Self {
+        Self {
+            store: store.clone(),
+            resolved: true,
+        }
+    }
+    fn file(&self) -> LogFile<'_> {
+        if self.resolved {
+            LogFile::LedgerResolved(&self.store)
+        } else {
+            LogFile::Ledger(&self.store)
+        }
     }
     pub fn append(&self, r: &ActionRecord) -> Result<()> {
-        crate::fs_gate::store::append_line(
-            crate::fs_gate::store::LogFile::Ledger(&self.path),
-            &serde_json::to_string(r)?,
-        )?;
+        crate::fs_gate::store::append_line(self.file(), &serde_json::to_string(r)?)?;
         Ok(())
     }
     pub fn all(&self) -> Result<Vec<ActionRecord>> {
-        let lines = match crate::fs_gate::read::read_owned_lines(&self.path) {
+        let lines = match crate::fs_gate::read::read_owned_lines(self.path()) {
             Ok(lines) => lines,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
         lines.iter().map(|l| Ok(serde_json::from_str(l)?)).collect()
     }
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn path(&self) -> PathBuf {
+        self.file()
+            .path()
+            .unwrap_or_else(|_| self.store.path().join("ledger.jsonl"))
     }
 }
 

@@ -12,7 +12,7 @@ pub struct Store {
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        crate::fs_gate::store::create_dir_all(&root)?;
+        crate::fs_gate::store::StoreDir::at(&root)?.create()?;
         Ok(Self { root })
     }
     fn path(&self, volume: u64) -> PathBuf {

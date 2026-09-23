@@ -391,7 +391,7 @@ fn a_held_manager_lock_in_a_units_own_directory_is_reported_as_current_use() {
     );
     let plan_unit = swamp_core::actions::unit_from_external(&unit);
     let fact = plan_unit
-        .evidence
+        .evidence()
         .iter()
         .find(|e| e.subtype == FactSubtype::Lock)
         .expect("a unit whose directory holds a manager lock must say so");
@@ -412,7 +412,7 @@ fn a_unit_with_no_manager_lock_states_what_was_looked_for() {
     let unit = external_unit("pnpm", "pnpm store", StorageCategory::Cache, tmp.path());
     let plan_unit = swamp_core::actions::unit_from_external(&unit);
     let fact = plan_unit
-        .evidence
+        .evidence()
         .iter()
         .find(|e| e.subtype == FactSubtype::Lock)
         .expect("'no lock file' is an answer that must be stated, not omitted");
@@ -447,7 +447,7 @@ fn simulator_device_directories_are_probed_and_emulator_directories_are_not() {
     );
     let probed = swamp_core::actions::unit_from_external(&simulator_unit);
     let booted: Vec<&Evidence> = probed
-        .evidence
+        .evidence()
         .iter()
         .filter(|e| e.subtype == FactSubtype::Booted)
         .collect();
@@ -455,7 +455,7 @@ fn simulator_device_directories_are_probed_and_emulator_directories_are_not() {
         booted.len(),
         1,
         "each device directory in the store is one booted-state question: {:?}",
-        probed.evidence
+        probed.evidence()
     );
     // The answer depends on the machine (a real `simctl`, or none at
     // all). What must hold everywhere is that the question was asked of
@@ -484,12 +484,12 @@ fn simulator_device_directories_are_probed_and_emulator_directories_are_not() {
     let unprobed = swamp_core::actions::unit_from_external(&emulator_unit);
     assert!(
         !unprobed
-            .evidence
+            .evidence()
             .iter()
             .any(|e| e.subtype == FactSubtype::Booted),
         "an Android AVD is not a CoreSimulator device; asking simctl about it would answer \
          about nothing: {:?}",
-        unprobed.evidence
+        unprobed.evidence()
     );
 }
 
@@ -516,7 +516,7 @@ fn maven_layout_store_carries_mavens_own_recovery_limit_and_a_cargo_cache_does_n
     );
     let plan_unit = swamp_core::actions::unit_from_external(&maven_unit);
     let fact = plan_unit
-        .evidence
+        .evidence()
         .iter()
         .find(|e| e.kind == FactKind::Recovery)
         .expect("a Maven local repository must carry its own recovery assessment");
@@ -545,12 +545,12 @@ fn maven_layout_store_carries_mavens_own_recovery_limit_and_a_cargo_cache_does_n
     );
     let cargo_plan_unit = swamp_core::actions::unit_from_external(&cargo_unit);
     assert!(
-        !cargo_plan_unit.evidence.iter().any(|e| e
+        !cargo_plan_unit.evidence().iter().any(|e| e
             .note
             .as_deref()
             .is_some_and(|n| n.contains("_remote.repositories"))),
         "Maven's ambiguity is not Cargo's: {:?}",
-        cargo_plan_unit.evidence
+        cargo_plan_unit.evidence()
     );
 }
 
@@ -569,7 +569,7 @@ fn an_installation_store_names_each_installed_version_as_locally_reinstallable()
     let unit = external_unit("pyenv", "pyenv", StorageCategory::Installation, &versions);
     let plan_unit = swamp_core::actions::unit_from_external(&unit);
     let recovery: Vec<&Evidence> = plan_unit
-        .evidence
+        .evidence()
         .iter()
         .filter(|e| e.kind == FactKind::Recovery && e.subtype == FactSubtype::LocalReinstall)
         .collect();
@@ -577,7 +577,7 @@ fn an_installation_store_names_each_installed_version_as_locally_reinstallable()
         recovery.len(),
         2,
         "each installed version is separately reinstallable: {:?}",
-        plan_unit.evidence
+        plan_unit.evidence()
     );
     let notes: Vec<String> = recovery
         .iter()
@@ -596,11 +596,11 @@ fn an_installation_store_names_each_installed_version_as_locally_reinstallable()
     let model_plan_unit = swamp_core::actions::unit_from_external(&model_unit);
     assert!(
         !model_plan_unit
-            .evidence
+            .evidence()
             .iter()
             .any(|e| e.subtype == FactSubtype::LocalReinstall),
         "no detector-declared version convention means no reinstall claim: {:?}",
-        model_plan_unit.evidence
+        model_plan_unit.evidence()
     );
 }
 
@@ -694,14 +694,14 @@ fn a_sparse_unit_separates_apparent_length_from_allocated_blocks() {
     let plan_unit = swamp_core::actions::unit_from_external(&unit);
     let find = |subtype: FactSubtype| -> u64 {
         plan_unit
-            .evidence
+            .evidence()
             .iter()
             .find(|e| e.kind == FactKind::Reclaimability && e.subtype == subtype)
             .and_then(|e| match &e.status {
                 FactStatus::Known(FactValue::Bytes(b)) => Some(*b),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("missing {subtype:?}: {:?}", plan_unit.evidence))
+            .unwrap_or_else(|| panic!("missing {subtype:?}: {:?}", plan_unit.evidence()))
     };
     let logical = find(FactSubtype::LogicalBytes);
     let on_disk = find(FactSubtype::AllocatedBytes);
@@ -723,11 +723,11 @@ fn a_sparse_unit_separates_apparent_length_from_allocated_blocks() {
     let dense_plan_unit = swamp_core::actions::unit_from_external(&dense_unit);
     assert!(
         !dense_plan_unit
-            .evidence
+            .evidence()
             .iter()
             .any(|e| e.subtype == FactSubtype::LogicalBytes),
         "a dense file has no apparent-versus-allocated gap to report: {:?}",
-        dense_plan_unit.evidence
+        dense_plan_unit.evidence()
     );
 }
 
@@ -759,8 +759,7 @@ fn a_selection_sharing_one_inode_does_not_count_those_bytes_twice() {
     let plan = swamp_core::actions::propose_external(&[unit_a, unit_b], &[], "test")
         .expect("inspection plan");
     let selection = plan
-        .selection
-        .as_ref()
+        .selection()
         .expect("a plan must carry its selection-set accounting");
     assert_eq!(selection.naive_sum_bytes, 8192, "{selection:?}");
     assert!(

@@ -140,11 +140,8 @@ fn cache_removal_preserves_auth_and_history() {
     let shell_snapshots = claude_home.join("shell-snapshots");
     let plan =
         actions::propose_agents(&units, std::slice::from_ref(&shell_snapshots), "test").unwrap();
-    assert_eq!(plan.units.len(), 1);
-    assert_eq!(
-        plan.units[0].agent_meta.as_ref().unwrap().session_members,
-        None
-    );
+    assert_eq!(plan.units().len(), 1);
+    assert_eq!(plan.units()[0].agent_meta().unwrap().session_members, None);
 
     actions::save_plan(store.path(), &plan).unwrap();
     actions::approve(store.path(), &plan.id, "human:test").unwrap();
@@ -186,8 +183,8 @@ fn selected_session_removal_preserves_other_sessions_and_shared_material() {
     let (units, _home_dummy) = units_for(&claude_home, store.path());
 
     let plan = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap();
-    assert_eq!(plan.units.len(), 1);
-    let meta = plan.units[0].agent_meta.as_ref().unwrap();
+    assert_eq!(plan.units().len(), 1);
+    let meta = plan.units()[0].agent_meta().unwrap();
     assert!(meta.session_members.is_some());
     assert_eq!(meta.session_members.as_ref().unwrap().len(), 4);
 

@@ -55,6 +55,14 @@ disallowed-methods = [
   { path = "std::io::Read::read_to_string", reason = "use crate::fs_gate::read::bounded_read" },
   { path = "std::io::Read::bytes", reason = "use crate::fs_gate::read::bounded_read" },
   { path = "std::process::Command::new", reason = "use crate::fs_gate::spawn::run" },
+  # gitoxide re-exports file removal, subprocesses, temp and lock files
+  # (`gix_fs`, `gix_command`, `gix_tempfile`, `gix_lock`): its entry
+  # points live in `fs_gate::git`, read-only.
+  { path = "gix::open", reason = "use crate::fs_gate::git" },
+  { path = "gix::open_opts", reason = "use crate::fs_gate::git" },
+  { path = "gix::discover", reason = "use crate::fs_gate::git" },
+  { path = "gix::init", reason = "use crate::fs_gate::git" },
+  { path = "gix::init_bare", reason = "use crate::fs_gate::git" },
 ]
 disallowed-types = [
   { path = "std::fs::File", reason = "no file handles outside crate::fs_gate" },
@@ -63,4 +71,6 @@ disallowed-types = [
   { path = "std::process::Child", reason = "use crate::fs_gate::spawn::run" },
   { path = "std::io::BufReader", reason = "use crate::fs_gate::read" },
   { path = "tempfile::NamedTempFile", reason = "use crate::fs_gate::store" },
+  { path = "gix::Repository", reason = "use crate::fs_gate::git" },
+  { path = "gix::ThreadSafeRepository", reason = "use crate::fs_gate::git" },
 ]

@@ -457,34 +457,35 @@ fn print_plan(plan: &swamp_core::actions::Plan) {
     println!(
         "plan {}  {} units  {}  expires in {}s",
         plan.id,
-        plan.units.len(),
+        plan.units().len(),
         swamp_core::render::human_bytes_pub(plan.planned_bytes()),
-        plan.expires_at.saturating_sub(swamp_core::entities::now())
+        plan.expires_at()
+            .saturating_sub(swamp_core::entities::now())
     );
-    for u in &plan.units {
+    for u in plan.units() {
         println!(
             "  {:<14} {:>10}  {:>+10}  {}  {}  [{}]  {}",
-            format!("{:?}", u.kind).to_lowercase(),
-            swamp_core::render::human_bytes_pub(u.bytes),
-            u.growth_bytes
+            format!("{:?}", u.kind()).to_lowercase(),
+            swamp_core::render::human_bytes_pub(u.bytes()),
+            u.growth_bytes()
                 .map(swamp_core::render::human_bytes_signed)
                 .unwrap_or_else(|| "—".into()),
-            u.project,
-            u.path.display(),
-            u.recovery,
-            u.signals.join(" · ")
+            u.project(),
+            u.path().display(),
+            u.recovery(),
+            u.signals().join(" · ")
         );
-        if let Some(t) = u.track {
+        if let Some(t) = u.track() {
             print!("    [{}]", t.label());
         }
-        if !u.warnings.is_empty() {
-            print!("  ⚠ {}", u.warnings.join(" · "));
+        if !u.warnings().is_empty() {
+            print!("  ⚠ {}", u.warnings().join(" · "));
         }
-        if u.track.is_some() || !u.warnings.is_empty() {
+        if u.track().is_some() || !u.warnings().is_empty() {
             println!();
         }
     }
-    for r in &plan.refused {
+    for r in plan.refused() {
         println!("  refused  {}  — {}", r.path.display(), r.cause);
     }
     println!(
@@ -494,12 +495,12 @@ fn print_plan(plan: &swamp_core::actions::Plan) {
 }
 
 /// `${SWAMP_DIR}`, defaulting to `~/.local/share/swamp`.
+/// The resolved swamp dir (`$SWAMP_DIR`, else `~/.local/share/swamp`):
+/// the gate's one resolver, `fs_gate::store::StoreDir::resolved`.
 fn swamp_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/swamp")
+    swamp_core::fs_gate::store::StoreDir::resolved()
+        .path()
+        .to_path_buf()
 }
 
 /// The one shared resolution every scope-aware command (#41) goes
@@ -719,30 +720,31 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
 /// `.oh/guardrails/human-only-authorization.md`.
 fn cmd_approve(plan_id: &str) -> Result<()> {
     let plan = swamp_core::actions::load_plan(&swamp_dir(), plan_id)?;
-    for u in &plan.units {
+    for u in plan.units() {
         println!(
             "  {:<16} {:>10}  {}{}",
-            u.verb,
-            swamp_core::render::human_bytes_pub(u.bytes),
-            u.path.display(),
-            if u.warnings.is_empty() {
+            u.verb(),
+            swamp_core::render::human_bytes_pub(u.bytes()),
+            u.path().display(),
+            if u.warnings().is_empty() {
                 String::new()
             } else {
-                format!("  ⚠ {}", u.warnings.join(" · "))
+                format!("  ⚠ {}", u.warnings().join(" · "))
             }
         );
     }
-    // The human typed `swamp approve <plan>`: the reviewed CLI
-    // confirmation site (`.oh/guardrails/human-only-authorization.md`).
-    let confirmed = swamp_core::authority::HumanConfirmed::cli_command("human:cli");
-    let g = swamp_core::actions::approve_confirmed(&swamp_dir(), plan_id, &confirmed)?;
+    // The human typed `swamp approve <plan>` and was shown exactly these
+    // units: the reviewed CLI confirmation site, bound to this plan's id
+    // and content digest (`.oh/guardrails/human-only-authorization.md`).
+    let confirmed = swamp_core::authority::HumanConfirmed::cli_approve("human:cli", &plan);
+    let g = swamp_core::actions::approve_confirmed(&swamp_dir(), plan_id, confirmed)?;
     println!(
         "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
         plan_id,
-        g.id,
-        swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-        g.max_units.unwrap_or(0),
-        g.expires_at
+        g.id(),
+        swamp_core::render::human_bytes_pub(g.budget_bytes().unwrap_or(0)),
+        g.max_units().unwrap_or(0),
+        g.expires_at()
     );
     println!("execute with: swamp execute {plan_id}");
     Ok(())
@@ -762,20 +764,86 @@ fn cmd_grant_add(
     let expires_secs = swamp_core::growth::parse_duration_secs(expires)
         .ok_or_else(|| anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)"))?;
     // The human typed `swamp grant add …`: the reviewed CLI confirmation
-    // site (`.oh/guardrails/human-only-authorization.md`).
-    let confirmed = swamp_core::authority::HumanConfirmed::cli_command("human:cli");
+    // site, bound to exactly these terms
+    // (`.oh/guardrails/human-only-authorization.md`).
+    let confirmed = swamp_core::authority::HumanConfirmed::cli_grant(
+        "human:cli",
+        swamp_core::authority::StandingTerms {
+            predicate: predicate.to_string(),
+            budget_bytes,
+            max_units,
+            expires_in_secs: expires_secs,
+        },
+    );
     let g = swamp_core::actions::add_standing_grant_confirmed(
         dir,
         predicate,
         budget_bytes,
         max_units,
         expires_secs,
-        &confirmed,
+        confirmed,
     )?;
     println!(
         "grant {} added: delete where {} · budget {} · expires {}",
-        g.id, g.predicate, budget, expires
+        g.id(),
+        g.predicate(),
+        budget,
+        expires
     );
+    Ok(())
+}
+
+/// `swamp protect add|remove|list`. A keep-list change is human-only
+/// (re-review 5, finding 7): this is the one reviewed site that mints the
+/// confirmation for it, bound to exactly the change the human typed, and
+/// `protect_{add,remove}_confirmed` spend it.
+fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
+    let store_dir = swamp_dir();
+    match cmd {
+        ProtectCmd::Add { path } => {
+            // Resolve a relative argument against the cwd before
+            // storing, rather than printing "protected: debug" for an
+            // entry that protects nothing (the 2026-09-22 re-review's
+            // CE5). `protect_add_confirmed` refuses a non-absolute path
+            // outright; doing the join here means `swamp protect add
+            // debug` from inside a tool home does the obvious thing and
+            // *says* which path it protected.
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(&path)
+            };
+            let confirmed = swamp_core::authority::HumanConfirmed::cli_protect(
+                "human:cli",
+                swamp_core::authority::ProtectChange::Add(resolved.clone()),
+            );
+            swamp_core::agents::protect_add_confirmed(&store_dir, &resolved, confirmed)?;
+            println!("protected: {}", resolved.display());
+        }
+        ProtectCmd::Remove { path } => {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(&path)
+            };
+            let confirmed = swamp_core::authority::HumanConfirmed::cli_protect(
+                "human:cli",
+                swamp_core::authority::ProtectChange::Remove(resolved.clone()),
+            );
+            swamp_core::agents::protect_remove_confirmed(&store_dir, &resolved, confirmed)?;
+            println!("no longer protected: {}", resolved.display());
+        }
+        ProtectCmd::List { json } => {
+            let listing = swamp_core::agents::protect_listing(&store_dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&listing)?);
+            } else if listing.is_empty() {
+                println!("no protected agent-storage paths");
+            } else {
+                println!("{listing}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1775,47 +1843,7 @@ fn main() -> Result<()> {
             );
             propose_unified(None, None, paths, None, json, false)?;
         }
-        Command::Protect { cmd } => {
-            let store_dir = swamp_dir();
-            match cmd {
-                ProtectCmd::Add { path } => {
-                    // Resolve a relative argument against the cwd before
-                    // storing, rather than printing "protected: debug"
-                    // for an entry that protects nothing (the 2026-09-22
-                    // re-review's CE5). `protect_add` refuses a
-                    // non-absolute path outright; doing the join here
-                    // means `swamp protect add debug` from inside a tool
-                    // home does the obvious thing and *says* which path
-                    // it protected.
-                    let resolved = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        std::env::current_dir()?.join(&path)
-                    };
-                    swamp_core::agents::protect_add(&store_dir, &resolved)?;
-                    println!("protected: {}", resolved.display());
-                }
-                ProtectCmd::Remove { path } => {
-                    let resolved = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        std::env::current_dir()?.join(&path)
-                    };
-                    swamp_core::agents::protect_remove(&store_dir, &resolved)?;
-                    println!("no longer protected: {}", resolved.display());
-                }
-                ProtectCmd::List { json } => {
-                    let listing = swamp_core::agents::protect_listing(&store_dir)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&listing)?);
-                    } else if listing.is_empty() {
-                        println!("no protected agent-storage paths");
-                    } else {
-                        println!("{listing}");
-                    }
-                }
-            }
-        }
+        Command::Protect { cmd } => cmd_protect(cmd)?,
         Command::Approve { plan_id } => cmd_approve(&plan_id)?,
         Command::Config { action } => {
             let dir = swamp_dir();
@@ -1840,7 +1868,9 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                     swamp_core::fs_gate::store::write_text(
-                        swamp_core::fs_gate::store::TextFile::Config { store: &dir },
+                        swamp_core::fs_gate::store::TextFile::Config {
+                            store: &swamp_core::fs_gate::store::StoreDir::resolved(),
+                        },
                         &swamp_core::growth::GrowthConfig::default().to_toml(),
                     )?;
                     println!("wrote {}", path.display());
@@ -1928,11 +1958,11 @@ fn main() -> Result<()> {
                     println!(
                         "{}  {:?}  {} units  {}  created {}  expires {}",
                         p.id,
-                        p.status,
-                        p.units.len(),
+                        p.status(),
+                        p.units().len(),
                         swamp_core::render::human_bytes_pub(p.planned_bytes()),
-                        p.created_at,
-                        p.expires_at
+                        p.created_at(),
+                        p.expires_at()
                     );
                 }
             }
@@ -1964,20 +1994,20 @@ fn main() -> Result<()> {
                         for g in gs {
                             println!(
                                 "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
-                                g.id,
-                                if g.revoked { "revoked" } else { "live" },
-                                g.plan_id
+                                g.id(),
+                                if g.revoked() { "revoked" } else { "live" },
+                                g.plan_id()
                                     .as_ref()
                                     .map(|p| format!("plan {p}"))
-                                    .unwrap_or_else(|| format!("where {}", g.predicate)),
-                                swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                                swamp_core::render::human_bytes_pub(g.spent_bytes),
-                                g.used_units,
-                                g.max_units
+                                    .unwrap_or_else(|| format!("where {}", g.predicate())),
+                                swamp_core::render::human_bytes_pub(g.budget_bytes().unwrap_or(0)),
+                                swamp_core::render::human_bytes_pub(g.spent_bytes()),
+                                g.used_units(),
+                                g.max_units()
                                     .map(|m| m.to_string())
                                     .unwrap_or_else(|| "∞".into()),
-                                g.expires_at,
-                                g.actor
+                                g.expires_at(),
+                                g.actor()
                             );
                         }
                     }

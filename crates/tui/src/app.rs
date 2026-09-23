@@ -332,8 +332,11 @@ pub struct UiState {
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
+    let Ok(store) = swamp_core::fs_gate::StoreDir::at(store) else {
+        return UiState::default();
+    };
     swamp_core::fs_gate::store::read_json_bytes(swamp_core::fs_gate::store::JsonFile::UiState {
-        store,
+        store: &store,
     })
     .ok()
     .flatten()
@@ -793,7 +796,9 @@ impl App {
     }
 
     fn persist_ui_state(&self) {
-        if let Some(store) = &self.store_dir {
+        if let Some(store) = &self.store_dir
+            && let Ok(store) = swamp_core::fs_gate::StoreDir::at(store)
+        {
             let state = UiState {
                 filter: self.filter_text.clone(),
                 sort: sort_to_str(self.sort).to_string(),
@@ -801,7 +806,7 @@ impl App {
                 keep_executables: self.keep_executables,
             };
             let _ = swamp_core::fs_gate::store::write_json(
-                swamp_core::fs_gate::store::JsonFile::UiState { store },
+                swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
                 &state,
             );
         }
@@ -1327,7 +1332,11 @@ impl App {
                 &[],
             ) {
                 Ok(plan) => {
-                    warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
+                    warnings.extend(
+                        plan.units()
+                            .iter()
+                            .flat_map(|u| u.warnings().iter().cloned()),
+                    );
                     Some(plan)
                 }
                 Err(e) => {
@@ -1358,7 +1367,11 @@ impl App {
                 "human:tui",
             ) {
                 Ok(plan) => {
-                    warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
+                    warnings.extend(
+                        plan.units()
+                            .iter()
+                            .flat_map(|u| u.warnings().iter().cloned()),
+                    );
                     Some(plan)
                 }
                 Err(e) => {
@@ -1608,10 +1621,13 @@ impl App {
     /// human authorization for this one plan. Drives plan -> grant ->
     /// execute -> ledger, then re-observes the affected worktrees only.
     pub fn confirm_delete(&mut self) {
-        self.start_delete(crate::ledger_path(), actions::trash_root());
+        self.start_delete(
+            swamp_core::fs_gate::StoreDir::resolved(),
+            actions::trash_root(),
+        );
     }
 
-    fn start_delete(&mut self, ledger_path: PathBuf, trash: PathBuf) {
+    fn start_delete(&mut self, store: swamp_core::fs_gate::StoreDir, trash: PathBuf) {
         if !self.confirm_open || self.operation.is_some() {
             return;
         }
@@ -1625,12 +1641,16 @@ impl App {
         self.pending = None;
         self.observing = None;
         // The one reviewed TUI confirmation site: this keypress, on the
-        // summary the human just read, is what authorizes these units
-        // (`.oh/guardrails/human-only-authorization.md`).
-        let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(&self.actor);
-        let (plan, grant) = actions::authorize(&units, &confirmed);
-        let total = units.len();
+        // summary the human just read, is what authorizes these units --
+        // one confirmation per listed unit, each bound to exactly what
+        // was listed (`.oh/guardrails/human-only-authorization.md`).
         let keep = self.keep_executables;
+        let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(
+            &self.actor,
+            &store,
+            actions::confirmables(&units, keep),
+        );
+        let total = units.len();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.operation = Some(Operation {
@@ -1648,21 +1668,12 @@ impl App {
         self.last_result = None;
         self.refusal = None;
         crate::worker::spawn(move || {
-            let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.send(OperationEvent::Failed(format!(
-                        "could not open ledger: {e}"
-                    )));
-                    return;
-                }
-            };
+            let ledger = swamp_core::ledger::Ledger::resolved(&store);
             let free_before = actions::free_space_bytes(&trash);
             let results = actions::execute_plan_progress(
                 &units,
-                &plan,
-                &grant,
-                &confirmed,
+                confirmed,
+                &store,
                 &ledger,
                 &trash,
                 keep,
@@ -2215,7 +2226,10 @@ mod tests {
             },
         );
         app.confirm_open = true;
-        app.start_delete(tmp.path().join("ledger.jsonl"), tmp.path().join("Trash"));
+        app.start_delete(
+            swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap(),
+            tmp.path().join("Trash"),
+        );
         assert!(app.operation.is_some());
         assert!(!app.confirm_open);
         wait_operation(&mut app);
@@ -2327,7 +2341,7 @@ mod tests {
 
         app.confirm_open = true;
         app.start_delete(
-            claude_home.path().join("ledger.jsonl"),
+            swamp_core::fs_gate::StoreDir::at(claude_home.path()).unwrap(),
             claude_home.path().join("Trash"),
         );
         wait_operation(&mut app);

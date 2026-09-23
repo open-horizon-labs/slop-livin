@@ -27,6 +27,9 @@ const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 const ALLOWED_NAMES: &[&str] = &[
     "config.toml",
     "grants.json",
+    // 32 random bytes binding plans and grants to swamp's own
+    // propose/approve paths (`fs_gate::key`); not JSON, not data.
+    "authority.key",
     "ledger.jsonl",
     "last_run.json",
     "fsevents.json",
