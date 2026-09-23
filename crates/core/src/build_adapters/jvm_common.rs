@@ -92,22 +92,6 @@ pub fn looks_like_version(segment: &str) -> bool {
     segment.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
-/// Where a JVM build tool's user home is, given the environment the
-/// caller resolved.
-///
-/// Adapters never read the environment themselves; this takes the value
-/// and applies the tool's documented default, so a fixture can inject
-/// one.
-pub fn user_home(
-    explicit: Option<&std::path::Path>,
-    home: &std::path::Path,
-    dir: &str,
-) -> std::path::PathBuf {
-    explicit
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| home.join(dir))
-}
-
 /// The conventional contents of a Gradle `build/` directory -- shared
 /// by the Gradle adapter and the Android adapter, whose module build
 /// directories are Gradle build directories with more in them (#70:

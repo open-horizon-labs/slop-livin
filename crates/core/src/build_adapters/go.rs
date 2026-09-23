@@ -68,16 +68,16 @@ impl BuildAdapter for Adapter {
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
-        if !project_root.join("go.mod").is_file() {
+        if !crate::fs_gate::is_file(project_root.join("go.mod")) {
             return Vec::new();
         }
         let goreleaser = [".goreleaser.yml", ".goreleaser.yaml"]
             .iter()
-            .any(|m| project_root.join(m).is_file());
+            .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "go",
                     path,

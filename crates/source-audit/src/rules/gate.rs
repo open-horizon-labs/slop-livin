@@ -337,9 +337,14 @@ const GROUPS: &[Group] = &[
     },
     Group {
         path: "@core::growth::ObservationOwnership::new",
-        allowed: &[(Krate::Core, &["external"]), (Krate::Core, &["agents"])],
+        allowed: &[
+            (Krate::Core, &["external"]),
+            (Krate::Core, &["agents"]),
+            (Krate::Core, &["build_stores"]),
+        ],
         why: "an ownership window is built by the discovery pass from the roots it covered \
-              completely, never by hand (history-sweeps-are-owned)",
+              completely, never by hand (history-sweeps-are-owned); build_stores owns the \
+              BuildStore key family the same way external and agents own theirs",
     },
     Group {
         path: "@core::actions::revoke_grant",

@@ -334,7 +334,7 @@ impl BuildAdapter for Adapter {
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
-        if !project_root.join("package.json").is_file() {
+        if !crate::fs_gate::is_file(project_root.join("package.json")) {
             return Vec::new();
         }
         // An ambiguous name (`build`, `out`, `.cache`) belongs to
@@ -349,11 +349,11 @@ impl BuildAdapter for Adapter {
             "settings.gradle",
         ]
         .iter()
-        .any(|m| project_root.join(m).is_file());
+        .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "node",
                     path,
@@ -384,7 +384,7 @@ impl BuildAdapter for Adapter {
         // project does not get an empty extra container.
         if KNOWN_FILES
             .iter()
-            .any(|(n, _, _)| project_root.join(n).is_file())
+            .any(|(n, _, _)| crate::fs_gate::is_file(project_root.join(n)))
         {
             out.push(BuildContainer::project(
                 "node",

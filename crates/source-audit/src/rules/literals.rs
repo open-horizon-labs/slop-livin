@@ -253,6 +253,11 @@ pub fn byte_units_only_in_the_formatter(ws: &Workspace) -> Vec<String> {
 /// `homebrew`... -- is still owned by its module alone.
 const SHARED_VOCABULARY: &[&str] = &[
     "npm", "pnpm", "go", "maven", "gradle", "mise", "pyenv", "nvm", "rustup",
+    // `pyvenv.cfg`'s own field name (`uv = <version>`), read as a property
+    // key by the build-adapter's Python environment parser -- the same
+    // string as the uv detector's id, but naming the config file's field,
+    // never the detector.
+    "uv",
 ];
 
 pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
@@ -281,6 +286,8 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
     for (mi, m) in ws.modules.iter().enumerate() {
         let registry = m.is_within(Krate::Core, &["agents", "registry"])
             || m.is_within(Krate::Core, &["agents", "matrix"])
+            || m.is_within(Krate::Core, &["build_adapters", "registry"])
+            || m.is_within(Krate::Core, &["build_adapters", "matrix"])
             || m.is_within(Krate::Core, &["locations"]) && m.path.len() == 1;
         for r in &m.refs {
             if r.test {
@@ -307,11 +314,25 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .starts_with(&owner);
+            // A build adapter's own module (`build_adapters::<x>`) may name
+            // the id constant of its same-named detector (`locations::<x>`):
+            // the same twin relationship a tool adapter has with its
+            // detector (`every_adapter_id_is_also_a_detector_id`), one
+            // family over.
+            let build_twin = m.krate == Krate::Core
+                && m.path.len() == 2
+                && m.path.first().map(String::as_str) == Some("build_adapters")
+                && m.path.last().map(String::as_str) == owner.last().copied();
             let twin = m.krate == Krate::Core
                 && ids.iter().any(|(_, o2, _)| {
                     m.path.starts_with(o2) && o2.last().map(String::as_str) == owner.last().copied()
                 });
-            if !own && !twin && !registry && !reviewed.iter().any(|p| m.is_within(Krate::Core, p)) {
+            if !own
+                && !twin
+                && !build_twin
+                && !registry
+                && !reviewed.iter().any(|p| m.is_within(Krate::Core, p))
+            {
                 problems.push(format!(
                     "{}: {} names the {family} id constant `{}`: an id is used only in its own \
                      module and the registries, so adding a {family} never means editing a \
@@ -326,6 +347,8 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
     for m in &ws.modules {
         let registry = m.is_within(Krate::Core, &["agents", "registry"])
             || m.is_within(Krate::Core, &["agents", "matrix"])
+            || m.is_within(Krate::Core, &["build_adapters", "registry"])
+            || m.is_within(Krate::Core, &["build_adapters", "matrix"])
             || m.is_within(Krate::Core, &["locations"]) && m.path.len() == 1;
         for l in &m.literals {
             if l.test {
@@ -337,12 +360,18 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
                 }
                 let own = m.krate == Krate::Core && m.path.starts_with(owner);
                 // A tool id may also be its own detector's id (the pinned
-                // equality `every_adapter_id_is_also_a_detector_id`).
+                // equality `every_adapter_id_is_also_a_detector_id`), and a
+                // build adapter's own module may equally be its same-named
+                // detector's twin (`build_adapters::<x>` / `locations::<x>`).
                 let twin = m.krate == Krate::Core
                     && ids
                         .iter()
                         .any(|(i2, o2, _)| i2 == id && m.path.starts_with(o2));
-                if !own && !twin && !registry {
+                let build_twin = m.krate == Krate::Core
+                    && m.path.len() == 2
+                    && m.path.first().map(String::as_str) == Some("build_adapters")
+                    && m.path.last().map(String::as_str) == owner.last().map(String::as_str);
+                if !own && !twin && !build_twin && !registry {
                     problems.push(format!(
                         "{}: the {family} id \"{id}\" is written in {} instead of only in \
                          `{}` and the registry: adding a {family} must never mean editing a \

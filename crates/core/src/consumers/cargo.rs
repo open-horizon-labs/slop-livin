@@ -147,7 +147,7 @@ fn project_candidates(draft: &Draft) -> Vec<(PathBuf, Vec<PathBuf>)> {
             let candidates: Vec<PathBuf> = wt
                 .artifacts
                 .iter()
-                .filter(|a| !a.kind.is_worktree_remainder() && a.path.is_dir())
+                .filter(|a| !a.kind.is_worktree_remainder() && crate::fs_gate::is_dir(&a.path))
                 .map(|a| a.path.clone())
                 .collect();
             out.push((wt.path.clone(), candidates));

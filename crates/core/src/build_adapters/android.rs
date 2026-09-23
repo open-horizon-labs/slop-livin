@@ -70,14 +70,14 @@ impl BuildAdapter for Adapter {
             "build.gradle.kts",
         ]
         .iter()
-        .any(|m| project_root.join(m).is_file());
+        .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         if !gradle {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "android",
                     path,
@@ -91,9 +91,9 @@ impl BuildAdapter for Adapter {
                 // an Android module: its manifest is where the plugin
                 // requires it.
                 "build" => {
-                    if c.parent()
-                        .is_some_and(|m| m.join("src/main/AndroidManifest.xml").is_file())
-                    {
+                    if c.parent().is_some_and(|m| {
+                        crate::fs_gate::is_file(m.join("src/main/AndroidManifest.xml"))
+                    }) {
                         claim(c.clone());
                     }
                 }
@@ -104,7 +104,7 @@ impl BuildAdapter for Adapter {
         for module_build in [project_root.join("app/build"), project_root.join("build")] {
             if module_build
                 .parent()
-                .is_some_and(|m| m.join("src/main/AndroidManifest.xml").is_file())
+                .is_some_and(|m| crate::fs_gate::is_file(m.join("src/main/AndroidManifest.xml")))
             {
                 claim(module_build);
             }

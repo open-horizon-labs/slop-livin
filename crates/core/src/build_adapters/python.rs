@@ -210,7 +210,9 @@ impl BuildAdapter for Adapter {
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
-        let marked = MARKERS.iter().any(|m| project_root.join(m).is_file());
+        let marked = MARKERS
+            .iter()
+            .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         // `build`/`dist` belong to whichever ecosystem's marker is at the
         // root when there is more than one (the catalog's own rule).
         let other = [
@@ -222,11 +224,11 @@ impl BuildAdapter for Adapter {
             "Cargo.toml",
         ]
         .iter()
-        .any(|m| project_root.join(m).is_file());
+        .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "python",
                     path,
@@ -249,7 +251,7 @@ impl BuildAdapter for Adapter {
             let name = name_of(c);
             // An environment is claimed by its own `pyvenv.cfg`, marker
             // or not: a `.venv` is a Python environment wherever it is.
-            if c.join("pyvenv.cfg").is_file() {
+            if crate::fs_gate::is_file(c.join("pyvenv.cfg")) {
                 claim(c.clone());
                 continue;
             }
@@ -259,13 +261,13 @@ impl BuildAdapter for Adapter {
         }
         for name in [".venv", "venv", "env"] {
             let p = project_root.join(name);
-            if p.join("pyvenv.cfg").is_file() {
+            if crate::fs_gate::is_file(p.join("pyvenv.cfg")) {
                 claim(p);
             }
         }
         // Loose metadata at the root (`.coverage`), claimed only when
         // present so an ordinary project gets no empty container.
-        if marked && project_root.join(".coverage").is_file() {
+        if marked && crate::fs_gate::is_file(project_root.join(".coverage")) {
             out.push(BuildContainer::project(
                 "python",
                 project_root.to_path_buf(),

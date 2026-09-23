@@ -29,6 +29,14 @@ impl BoundedCap {
     /// A project manifest or a tool's own small config (`package.json`,
     /// `Cargo.toml`, `.nvmrc`, `compose.yaml`, `.npmrc`, `settings.xml`).
     pub const MANIFEST: BoundedCap = BoundedCap(1024 * 1024);
+    /// A build-adapter manifest read *whole* (the fields an adapter wants
+    /// are scattered through it): `package.json`, `pom.xml`, a Cargo
+    /// `.fingerprint` JSON, an Android `source.properties`, a Python
+    /// `pyvenv.cfg`, an Xcode `Info.plist`. Smaller than [`Self::MANIFEST`]
+    /// on purpose: a `node_modules` tree holds one such file per installed
+    /// package, so the per-file cap stays tight even though the total read
+    /// across a big tree is not.
+    pub const BUILD_MANIFEST: BoundedCap = BoundedCap(256 * 1024);
     /// A dependency lockfile (`Cargo.lock`, `package-lock.json`,
     /// `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml`): large in
     /// big projects, still bounded. A larger one is an explicit evidence

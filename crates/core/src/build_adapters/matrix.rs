@@ -360,7 +360,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "daemon-side only: `docker buildx prune --filter id=<id>` \
                                 removes a record with its dependents; `docker builder prune` \
-                                removes every unused record matching its filters",
+                                removes every record its own filters match",
         actions: INSPECTION_ONLY,
     },
 ];

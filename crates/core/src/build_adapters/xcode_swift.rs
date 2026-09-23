@@ -76,11 +76,11 @@ impl BuildAdapter for Adapter {
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
-        let package = project_root.join("Package.swift").is_file();
+        let package = crate::fs_gate::is_file(project_root.join("Package.swift"));
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "xcode-swift",
                     path,
@@ -96,7 +96,7 @@ impl BuildAdapter for Adapter {
                 ".build"
                     if package
                         || c.parent()
-                            .is_some_and(|p| p.join("Package.swift").is_file()) =>
+                            .is_some_and(|p| crate::fs_gate::is_file(p.join("Package.swift"))) =>
                 {
                     claim(c.clone())
                 }

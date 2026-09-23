@@ -56,7 +56,7 @@ impl BuildAdapter for Adapter {
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
-        if !project_root.join("Cargo.toml").is_file() {
+        if !crate::fs_gate::is_file(project_root.join("Cargo.toml")) {
             return Vec::new();
         }
         // The configured build directories, which may be outside the
@@ -66,7 +66,7 @@ impl BuildAdapter for Adapter {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "cargo",
                     path,
@@ -326,7 +326,7 @@ fn executable_unit(
     path: &Path,
     role: ArtifactRole,
 ) -> Option<NestedArtifact> {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::fs_gate::PermissionsExt;
     let meta = ctx.stat(path)?;
     if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
         return None;
@@ -340,7 +340,7 @@ fn build_file_unit(
     meta: &crate::fs_gate::Metadata,
     role: ArtifactRole,
 ) -> NestedArtifact {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let rel = relative_path(&container.path, path);
     let (_, variant) = classify_path(&rel, false);
     let b = NestedUnitBuilder::new(container, role.clone(), path.to_path_buf())
@@ -674,7 +674,7 @@ mod tests {
         fs::write(&a, b"binary").unwrap();
         fs::hard_link(&a, debug.join("deps/app-123")).unwrap();
         let mut perms = fs::metadata(&a).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fs_gate::PermissionsExt;
         perms.set_mode(0o755);
         fs::set_permissions(&a, perms).unwrap();
         let index = folded(&[

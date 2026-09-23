@@ -150,12 +150,6 @@ impl BuildContainer {
         }
     }
 
-    /// Whether this container is answered by a daemon rather than
-    /// measured on disk.
-    pub fn is_daemon_store(&self) -> bool {
-        self.path.to_string_lossy().starts_with(DAEMON_STORE_SCHEME)
-    }
-
     /// The container's own storage id, the prefix every unit inside it
     /// hangs off. Identical to what `cargo_artifacts` used before the
     /// port, so a stored report's units keep their ids.
@@ -441,7 +435,10 @@ impl<'a> BuildCtx<'a> {
     pub fn list_checked(
         &self,
         dir: &Path,
-    ) -> (Vec<crate::locations::ShallowEntry>, crate::locations::Truncation) {
+    ) -> (
+        Vec<crate::locations::ShallowEntry>,
+        crate::locations::Truncation,
+    ) {
         let listing = crate::locations::shallow_list(dir);
         let truncation = listing.truncation;
         (listing.into_iter().collect(), truncation)
@@ -703,7 +700,7 @@ impl NestedUnitBuilder {
 
     /// One file's own metadata.
     pub fn from_file_metadata(mut self, meta: &crate::fs_gate::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
+        use crate::fs_gate::MetadataExt;
         self.unit.bytes = meta.blocks() * 512;
         self.unit.basis = AccountingBasis::Allocated;
         self.unit.logical_bytes = meta.len();

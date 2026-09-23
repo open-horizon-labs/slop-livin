@@ -20,14 +20,13 @@ use std::path::Path;
 
 use crate::fs_gate::read::BoundedCap;
 
-/// The hard ceiling on one manifest read: [`BoundedCap::MANIFEST`], the
-/// same named cap `cargo_artifacts` uses for `.cargo/config` (a build
-/// adapter is not a special case; it reads through the same gate cap
-/// every other bounded reader in core does). For scale: a
-/// `package.json` is typically 1-4 KiB, a `pom.xml` 2-30 KiB, a Cargo
-/// `.fingerprint` JSON under 1 KiB. The cap is generous for all of them
-/// and far below a lockfile, which no adapter here reads.
-pub const MAX_MANIFEST_BYTES: usize = BoundedCap::MANIFEST.bytes();
+/// The hard ceiling on one manifest read:
+/// [`BoundedCap::BUILD_MANIFEST`], read through the same gate every
+/// other bounded read in core goes through. For scale: a `package.json`
+/// is typically 1-4 KiB, a `pom.xml` 2-30 KiB, a Cargo `.fingerprint`
+/// JSON under 1 KiB. The cap is generous for all of them and far below
+/// a lockfile, which no adapter here reads.
+pub const MAX_MANIFEST_BYTES: usize = BoundedCap::BUILD_MANIFEST.bytes();
 
 /// What a bounded read produced. Truncation is a first-class outcome,
 /// not a silent prefix: a caller that gets [`Manifest::truncated`] set
@@ -54,7 +53,7 @@ pub fn read_manifest(path: &Path, cap: usize) -> Option<Manifest> {
     // The gate's own cap is the hard ceiling; a caller asking for less
     // (a test, a format known to be small) gets the read truncated to
     // its own request on top of that.
-    let read = crate::fs_gate::read::bounded_read(path, BoundedCap::MANIFEST).ok()?;
+    let read = crate::fs_gate::read::bounded_read(path, BoundedCap::BUILD_MANIFEST).ok()?;
     let mut bytes = read.bytes;
     let truncated = read.truncated || bytes.len() > cap;
     if bytes.len() > cap {

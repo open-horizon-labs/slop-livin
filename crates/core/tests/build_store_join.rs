@@ -73,11 +73,11 @@ impl Fixture {
             .iter()
             .find(|d| d.detector_id == detector)
             .and_then(|d| {
-                d.locations
+                d.locations_for_display()
                     .iter()
                     .filter(|l| l.category == category)
                     .filter_map(|l| l.path.clone())
-                    .find(|p| p.ends_with(suffix))
+                    .find(|p: &PathBuf| p.ends_with(suffix))
             })
             .unwrap_or_else(|| {
                 panic!("{detector} proposes no {category:?} location ending {suffix}")
@@ -502,6 +502,7 @@ fn both_orders_with_agent_discovery_leave_store_history_alone() {
         for at in [1_000u64, 2_000, 3_000] {
             let run_external = || {
                 swamp_core::external::observe_external(
+                    &swamp_core::report::DiscoveryPass::for_tests(),
                     &scope,
                     Some(store.path()),
                     true,
@@ -559,8 +560,17 @@ fn an_unchanged_store_replays_its_units_with_zero_listings_and_zero_reads() {
     let scope = f.scope(&["maven", "go"], &[]);
     let root = f.home.parent().unwrap().to_path_buf();
     let obs = |at: u64, cov: &EventCoverage| {
-        swamp_core::external::observe_external(&scope, Some(store.path()), true, at, 30, 3600, cov)
-            .unwrap()
+        swamp_core::external::observe_external(
+            &swamp_core::report::DiscoveryPass::for_tests(),
+            &scope,
+            Some(store.path()),
+            true,
+            at,
+            30,
+            3600,
+            cov,
+        )
+        .unwrap()
     };
     // Cold: every store walked and identified.
     let (cold, cold_work) =
@@ -640,6 +650,7 @@ fn store_units_persist_as_a_parquet_table_and_replay_across_passes() {
     let scope = f.scope(&["maven"], &[]);
     let root = f.home.parent().unwrap().to_path_buf();
     swamp_core::external::observe_external(
+        &swamp_core::report::DiscoveryPass::for_tests(),
         &scope,
         Some(store.path()),
         true,
@@ -657,6 +668,7 @@ fn store_units_persist_as_a_parquet_table_and_replay_across_passes() {
     let quiet = EventCoverage::trusted(root, Vec::new(), 1_000);
     let (o, work) = swamp_core::work_counters::measured(|| {
         swamp_core::external::observe_external(
+            &swamp_core::report::DiscoveryPass::for_tests(),
             &scope,
             Some(store.path()),
             true,

@@ -126,14 +126,14 @@ impl BuildAdapter for Adapter {
             "settings.gradle.kts",
         ]
         .iter()
-        .any(|m| project_root.join(m).is_file());
+        .any(|m| crate::fs_gate::is_file(project_root.join(m)));
         if !gradle {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut claim = |path: PathBuf| {
-            if seen.insert(path.clone()) && path.is_dir() {
+            if seen.insert(path.clone()) && crate::fs_gate::is_dir(&path) {
                 out.push(BuildContainer::project(
                     "gradle",
                     path,
