@@ -139,6 +139,19 @@ jobs:
         id: v
         run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
 
+      # swamp-core's `testing` feature is test-fixture API. Only
+      # `[dev-dependencies]` enable it, and resolver 2 never unifies those
+      # into this build; refuse a graph that says otherwise before
+      # building what ships (the test step below has it on by design).
+      - name: Release graph has no test-fixture API
+        run: |
+          set -euo pipefail
+          if cargo tree -p swamp -e normal,build,features --prefix none --locked --target x86_64-unknown-linux-gnu |
+            grep -q 'swamp-core feature "testing"'; then
+            echo 'the swamp binary would enable swamp-core/testing' >&2
+            exit 1
+          fi
+
       - name: Build (release, x86_64-unknown-linux-gnu, generic x86-64)
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
 

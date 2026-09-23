@@ -535,7 +535,7 @@ fn swamp_dir() -> PathBuf {
 /// exit via `main`'s `Result`, message on stderr): scope resolution
 /// never silently falls back to a broader default on invalid config.
 fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveScope> {
-    let store_dir = swamp_dir()?;
+    let store_dir = swamp_dir();
     let cfg = swamp_core::growth::load_config_checked(&store_dir)?;
     let env = swamp_core::locations::Environment::from_process();
     let registry = swamp_core::locations::Registry::with_builtins();
@@ -1128,7 +1128,7 @@ fn propose_unified(
     json: bool,
     external: bool,
 ) -> Result<()> {
-    let store_dir = swamp_dir()?;
+    let store_dir = swamp_dir();
     if external {
         anyhow::ensure!(
             root.is_none(),
@@ -1233,7 +1233,7 @@ fn report_json_envelope(
     agent_units: &[swamp_core::agents::AgentUnit],
     store_interiors: &[swamp_core::artifact::NestedArtifact],
 ) -> Result<serde_json::Value> {
-    let store_dir = swamp_dir()?;
+    let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
     let mut rr = r.clone();
     if let Some(f) = parsed_filter {
@@ -1379,7 +1379,7 @@ fn main() -> Result<()> {
                     );
                 }
                 if !no_observe {
-                    note_and_persist_scope(&swamp_dir()?, &scope);
+                    note_and_persist_scope(&swamp_dir(), &scope);
                 }
                 swamp_tui::run_scope(&scope, no_observe)?;
             }
@@ -1438,7 +1438,7 @@ fn main() -> Result<()> {
             // *write* of a new observation is skipped. GitHub enrichment
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
-            let store_dir = swamp_dir()?;
+            let store_dir = swamp_dir();
             let progress =
                 spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
             // An explicit root replaces the configured scope entirely and
@@ -1741,7 +1741,7 @@ fn main() -> Result<()> {
                     "--within must be a directory inside the scan root"
                 );
             }
-            let store = swamp_dir()?;
+            let store = swamp_dir();
             let start = std::time::Instant::now();
             let report = report_full_mode(
                 &root,
@@ -1924,7 +1924,7 @@ fn main() -> Result<()> {
         Command::Protect { cmd } => cmd_protect(cmd)?,
         Command::Approve { plan_id } => cmd_approve(&plan_id)?,
         Command::Config { action } => {
-            let dir = swamp_dir()?;
+            let dir = swamp_dir();
             let path = dir.join("config.toml");
             match action {
                 ConfigAction::Path => println!("{}", path.display()),
@@ -1975,9 +1975,9 @@ fn main() -> Result<()> {
             keep_executables,
         } => {
             let res = if keep_executables {
-                swamp_core::actions::execute_keeping_executables(&swamp_dir()?, &plan_id, &actor)?
+                swamp_core::actions::execute_keeping_executables(&swamp_dir(), &plan_id, &actor)?
             } else {
-                swamp_core::actions::execute(&swamp_dir()?, &plan_id, &actor)?
+                swamp_core::actions::execute(&swamp_dir(), &plan_id, &actor)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -2020,7 +2020,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Plans { json } => {
-            let plans = swamp_core::actions::list_plans(&swamp_dir()?)?;
+            let plans = swamp_core::actions::list_plans(&swamp_dir())?;
             if json {
                 let total = plans.len();
                 println!(
@@ -2046,7 +2046,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Grant { cmd } => {
-            let dir = swamp_dir()?;
+            let dir = swamp_dir();
             match cmd {
                 GrantCmd::Add {
                     predicate,
@@ -2094,7 +2094,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Observe { roots, full } => {
-            let store_dir = swamp_dir()?;
+            let store_dir = swamp_dir();
             let scope = resolve_scope(&roots)?;
             let resolved = scope.scan_paths();
             if resolved.is_empty() {
@@ -2115,7 +2115,7 @@ fn main() -> Result<()> {
             status,
             json,
         } => {
-            let store_dir = swamp_dir()?;
+            let store_dir = swamp_dir();
             let scope = resolve_scope(&roots)?;
             let (authorized, _) = scope.authorized_roots();
             let present: Vec<collect::Root> = authorized
@@ -2144,7 +2144,7 @@ fn main() -> Result<()> {
             collector,
             roots,
         } => {
-            let store_dir = swamp_dir()?;
+            let store_dir = swamp_dir();
             // No explicit roots: install `observe` with none baked into
             // the plist's argv at all (#42/#50), so every scheduled fire
             // re-resolves the configured scope itself (same code path

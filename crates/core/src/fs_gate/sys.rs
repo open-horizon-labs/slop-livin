@@ -174,3 +174,83 @@ impl RegularFile {
         Ok(RegularFile(self.0.try_clone()?))
     }
 }
+
+/// Whether `e` is `ENOSPC` -- on Linux, `inotify_add_watch` returning it
+/// means `fs.inotify.max_user_watches` is exhausted. The one named
+/// `libc::` constant a caller outside the gate (`live_watch::LiveTree`,
+/// portable over its `Kernel` trait) needs, so it does not have to name
+/// `libc` itself.
+#[cfg(unix)]
+pub fn is_enospc(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOSPC)
+}
+
+#[cfg(not(unix))]
+pub fn is_enospc(_e: &io::Error) -> bool {
+    false
+}
+
+/// This process's real uid, for a `loginctl show-user <uid>` argument
+/// (`systemd_user::linger`).
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    // SAFETY: getuid cannot fail and reads no memory.
+    unsafe { libc::getuid() }
+}
+
+/// Opens (creating if missing, and creating its parent directory) a
+/// file meant only to be `flock`ed -- `crate::continuity`'s per-root
+/// lock files. The lock itself is then a safe, non-`libc` call
+/// (`File::try_lock`/`try_lock_shared`/`unlock`, stable since the
+/// pinned toolchain) the caller makes directly on the handle this
+/// returns; only the *open* is gated.
+pub fn open_for_lock(path: &Path) -> io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+}
+
+/// Opens an existing file read-only, for a lock probe that must never
+/// create the file (`crate::continuity::collector_alive`: asking must
+/// leave no state behind). `Ok(None)` when it does not exist.
+pub fn open_for_lock_probe(path: &Path) -> io::Result<Option<std::fs::File>> {
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set by SIGINT/SIGTERM once [`install_stop_signal_handlers`] installed
+/// the handler (`crate::continuity::stop_on_signals`, the collector's
+/// clean-shutdown flag).
+#[cfg(target_os = "linux")]
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_stop_signal(_sig: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Installs `on_stop_signal` for SIGINT and SIGTERM and returns the flag
+/// it sets.
+#[cfg(target_os = "linux")]
+pub fn install_stop_signal_handlers() -> &'static std::sync::atomic::AtomicBool {
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
+    }
+    &STOP
+}

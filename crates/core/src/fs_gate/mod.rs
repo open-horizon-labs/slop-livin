@@ -43,8 +43,12 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod columns;
+pub mod continuity;
 pub mod destroy;
+pub mod fs_space;
 pub mod git;
+#[cfg(target_os = "linux")]
+pub mod inotify;
 pub mod key;
 #[cfg(target_os = "linux")]
 pub mod procfs;
@@ -52,6 +56,7 @@ pub mod read;
 pub mod spawn;
 pub mod store;
 pub mod sys;
+pub mod systemd;
 
 /// A swamp state directory (see [`store::StoreDir`]). Named here so any
 /// module can hold or pass one; building one from a caller's path

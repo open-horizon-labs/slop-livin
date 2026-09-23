@@ -133,20 +133,17 @@ pub fn paths(store: &Path, root: &Path) -> Paths {
 }
 
 pub fn read_checkpoint(p: &Paths) -> Option<Checkpoint> {
-    let text = std::fs::read_to_string(&p.checkpoint).ok()?;
+    let text = crate::fs_gate::read::read_owned_string(&p.checkpoint).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 /// Writes the checkpoint atomically (temp + rename): a reader sees the
 /// old one or the new one, never half of either.
 pub fn write_checkpoint(p: &Paths, c: &Checkpoint) -> Result<()> {
-    std::fs::create_dir_all(&p.dir)?;
     let tmp = p
         .checkpoint
         .with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(c)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &p.checkpoint)
+    crate::fs_gate::continuity::write_atomic(&p.dir, &tmp, &p.checkpoint, &serde_json::to_vec(c)?)
         .with_context(|| format!("publish {}", p.checkpoint.display()))?;
     Ok(())
 }
@@ -154,7 +151,7 @@ pub fn write_checkpoint(p: &Paths, c: &Checkpoint) -> Result<()> {
 /// This boot's id, where the kernel has one (Linux). Two checkpoints
 /// from different boots are different epochs whatever they claim.
 pub fn boot_id() -> Option<String> {
-    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+    match crate::fs_gate::read::read_owned_string("/proc/sys/kernel/random/boot_id") {
         Ok(s) => Some(s.trim().to_string()),
         Err(_) => None,
     }
@@ -164,54 +161,22 @@ pub fn boot_id() -> Option<String> {
 // Advisory locks
 // ---------------------------------------------------------------------
 
-/// An `flock` held for as long as this value lives.
-#[derive(Debug)]
-pub struct FileLock {
-    _file: std::fs::File,
-}
+/// An `flock` held for as long as this value lives. The type (and the
+/// `std::fs::File` it wraps) lives in `fs_gate::continuity`, inside the
+/// capability gate; re-exported here under its original name since this
+/// is where every caller already points.
+pub use crate::fs_gate::continuity::FileLock;
 
 /// Tries to take `path`'s lock without blocking. `Ok(None)` when another
 /// process holds it.
 pub fn try_lock(path: &Path, exclusive: bool) -> std::io::Result<Option<FileLock>> {
-    use std::os::unix::io::AsRawFd;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
-    let op = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    // SAFETY: a valid fd for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(FileLock { _file: file }));
-    }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(None)
-    } else {
-        Err(e)
-    }
+    crate::fs_gate::continuity::try_lock(path, exclusive)
 }
 
 /// Whether a collector holds this root's alive lock right now. Never
 /// creates the lock file: asking must leave no state behind.
 pub fn collector_alive(p: &Paths) -> bool {
-    use std::os::unix::io::AsRawFd;
-    let Ok(file) = std::fs::OpenOptions::new().read(true).open(&p.alive) else {
-        return false;
-    };
-    // SAFETY: a valid fd for the duration of the call. A shared lock we
-    // can take means nobody holds the exclusive one; it is released when
-    // `file` drops at the end of this function.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
-    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    crate::fs_gate::continuity::collector_alive(&p.alive)
 }
 
 /// Takes `path`'s lock, waiting up to `timeout`.
@@ -251,7 +216,7 @@ pub struct Consumption {
 /// observation re-walked.
 pub fn consume(c: &Consumption) -> Result<()> {
     let _lock = lock_wait(&c.dirty_lock, true, Duration::from_secs(10))?;
-    let text = match std::fs::read_to_string(&c.checkpoint) {
+    let text = match crate::fs_gate::read::read_owned_string(&c.checkpoint) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -286,8 +251,8 @@ pub fn sync(p: &Paths, timeout: Duration) -> Result<Option<Checkpoint>> {
     let tmp = p
         .sync
         .with_extension(format!("sync.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &token)?;
-    std::fs::rename(&tmp, &p.sync)?;
+    let dir = p.sync.parent().map(Path::to_path_buf).unwrap_or_default();
+    crate::fs_gate::continuity::write_atomic(&dir, &tmp, &p.sync, token.as_bytes())?;
     let start = Instant::now();
     loop {
         if let Some(ck) = read_checkpoint(p)
@@ -313,9 +278,11 @@ pub fn plan_from_checkpoint(
     timeout: Duration,
 ) -> FsEventsPlan {
     use std::os::unix::fs::MetadataExt;
-    let device = std::fs::metadata(&req.root).ok().map(|m| m.dev());
+    let device = crate::fs_gate::metadata_following(&req.root)
+        .ok()
+        .map(|m| m.dev());
     let refuse = |r: RefreshRefusal| FsEventsPlan::refused(r, device);
-    if !p.checkpoint.exists() && !p.alive.exists() {
+    if !crate::fs_gate::exists(&p.checkpoint) && !crate::fs_gate::exists(&p.alive) {
         return FsEventsPlan::refused(crate::fs_events::platform_refusal(), device);
     }
     if !alive {
@@ -328,7 +295,7 @@ pub fn plan_from_checkpoint(
     if ck.boot_id.as_deref() != boot {
         return refuse(RefreshRefusal::CollectorStopped);
     }
-    let here = std::fs::metadata(&req.root).ok();
+    let here = crate::fs_gate::metadata_following(&req.root).ok();
     if ck.root != req.root
         || here
             .as_ref()
@@ -427,31 +394,13 @@ impl FsEventsSource for CollectorSource {
 // The collector (Linux)
 // ---------------------------------------------------------------------
 
-/// Set by SIGINT/SIGTERM once [`stop_on_signals`] installed the handler.
-#[cfg(target_os = "linux")]
-static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_os = "linux")]
-extern "C" fn on_stop_signal(_sig: libc::c_int) {
-    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Makes SIGINT and SIGTERM stop the collector cleanly (a final flush
-/// marked `stopped_at`), and returns the flag they set.
+/// marked `stopped_at`), and returns the flag they set. The signal
+/// handler itself (`extern "C"`, `libc::signal`) lives in
+/// `fs_gate::sys`, inside the capability gate.
 #[cfg(target_os = "linux")]
 pub fn stop_on_signals() -> &'static std::sync::atomic::AtomicBool {
-    // SAFETY: the handler only stores to an atomic.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            on_stop_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            on_stop_signal as *const () as libc::sighandler_t,
-        );
-    }
-    &STOP
+    crate::fs_gate::sys::install_stop_signal_handlers()
 }
 
 /// One root the collector watches, and what it must not watch under it.
@@ -511,9 +460,9 @@ fn collect_one(
     use std::sync::atomic::Ordering;
 
     let p = paths(store, &r.root);
-    std::fs::create_dir_all(&p.dir)?;
-    let root = std::fs::canonicalize(&r.root)?;
-    let meta = std::fs::metadata(&root)?;
+    crate::fs_gate::continuity::ensure_dir(&p.dir)?;
+    let root = crate::fs_gate::canonicalize(&r.root)?;
+    let meta = crate::fs_gate::metadata_following(&root)?;
     let mut excluded = r.excluded.clone();
     excluded.push(store.to_path_buf());
     let kernel = inotify::Inotify::new().context("inotify_init1")?;
@@ -568,7 +517,7 @@ fn collect_one(
             pending_sync = true;
         }
         if pending_sync {
-            sync_token = std::fs::read_to_string(&p.sync)
+            sync_token = crate::fs_gate::read::read_owned_string(&p.sync)
                 .ok()
                 .map(|s| s.trim().to_string());
         }

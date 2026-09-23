@@ -160,8 +160,11 @@ extern "C" fn watch_callback(
     }
     if !changes.is_empty() {
         let _ = state.tx.send(super::WatchBatch {
+            root: state.root.clone(),
             changed_dirs: changes.into_iter().collect(),
             last_event_id: last_id,
+            coverage_lost: None,
+            epoch_opened_at: None,
         });
     }
 }

@@ -34,6 +34,8 @@
 //! are not interchangeable: POSIX defines `statvfs`'s counts in units of
 //! `f_frsize`, while Darwin's `statfs` counts are in units of `f_bsize`.
 
+#![allow(unsafe_code)]
+
 use std::path::Path;
 
 /// Bytes an unprivileged process can still write to the filesystem

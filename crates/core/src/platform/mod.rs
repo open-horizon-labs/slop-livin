@@ -39,7 +39,11 @@
 //! `docs/platform.md` by `crates/core/tests/platform_matrix_matches_docs.rs`,
 //! so the documented answer and the compiled one cannot drift.
 
-pub mod fs_space;
+/// Free-space measurement: the syscalls themselves live in
+/// [`crate::fs_gate::fs_space`] (the gate names `libc`, not this
+/// module); re-exported here under its original path since this is
+/// where every caller and the module doc above already point.
+pub use crate::fs_gate::fs_space;
 
 use crate::locations::Platform;
 use std::path::PathBuf;

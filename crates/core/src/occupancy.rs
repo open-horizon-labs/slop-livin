@@ -222,7 +222,7 @@ fn classify_lsof_exit(
 /// `crate::recheck::member_occupancy` (audited by
 /// `occupancy_is_tristate_at_sinks`).
 pub fn occupied(path: &Path) -> bool {
-    !probe_path(path).is_free()
+    !matches!(probe_path(path), OccupancyState::Free)
 }
 /// Structured current-use evidence for whether some process holds this
 /// unit open right now.

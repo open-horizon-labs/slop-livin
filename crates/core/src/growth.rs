@@ -1684,6 +1684,8 @@ pub fn replay_unit_roots(
                 rules_version: crate::ecosystem::RULES_VERSION,
                 unit_root: None,
             },
+            swamp_dir: Some(swamp_dir.to_path_buf()),
+            excluded: Vec::new(),
         });
         staged.push(Staged {
             root: root.clone(),

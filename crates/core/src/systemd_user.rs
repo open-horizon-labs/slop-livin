@@ -69,25 +69,26 @@ pub struct RealSystemctl;
 
 #[cfg(target_os = "linux")]
 impl RealSystemctl {
-    fn run(tool: &str, pre: &[&str], args: &[&str]) -> Result<CmdOutput> {
+    fn run(program: crate::fs_gate::spawn::Program, pre: &[&str], args: &[&str]) -> Result<CmdOutput> {
         if std::env::var("SWAMP_TEST_MODE").is_ok_and(|v| v == "1") {
-            println!("[test-mode] {tool} {} {}", pre.join(" "), args.join(" "));
+            println!(
+                "[test-mode] {} {} {}",
+                program.binary(),
+                pre.join(" "),
+                args.join(" ")
+            );
             return Ok(CmdOutput {
                 success: true,
                 ..Default::default()
             });
         }
-        crate::work_counters::record_spawn();
-        let out = std::process::Command::new(tool)
-            .args(pre)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| anyhow!("could not run {tool}: {e}"))?;
+        let all: Vec<&str> = pre.iter().chain(args.iter()).copied().collect();
+        let out = crate::fs_gate::spawn::run(program, all, std::time::Duration::from_secs(60))
+            .map_err(|e| anyhow!("could not run {}: {e}", program.binary()))?;
         Ok(CmdOutput {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            success: out.success(),
+            stdout: out.stdout_lossy(),
+            stderr: out.stderr_lossy(),
         })
     }
 }
@@ -95,10 +96,18 @@ impl RealSystemctl {
 #[cfg(target_os = "linux")]
 impl Systemctl for RealSystemctl {
     fn systemctl(&mut self, args: &[&str]) -> Result<CmdOutput> {
-        Self::run("systemctl", &["--user", "--no-pager"], args)
+        Self::run(
+            crate::fs_gate::spawn::Program::Systemctl,
+            &["--user", "--no-pager"],
+            args,
+        )
     }
     fn loginctl(&mut self, args: &[&str]) -> Result<CmdOutput> {
-        Self::run("loginctl", &["--no-pager"], args)
+        Self::run(
+            crate::fs_gate::spawn::Program::Loginctl,
+            &["--no-pager"],
+            args,
+        )
     }
     fn runtime_dir(&self) -> Option<PathBuf> {
         std::env::var_os("XDG_RUNTIME_DIR")
@@ -266,11 +275,7 @@ WantedBy=default.target\n",
 }
 
 fn is_ours(path: &Path) -> std::io::Result<Option<bool>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text.lines().next() == Some(MARKER))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    crate::fs_gate::systemd::is_ours(path)
 }
 
 /// Whether a user manager is reachable, and if not, what to do about it.
@@ -302,8 +307,7 @@ pub fn user_manager(sc: &mut dyn Systemctl) -> Result<(), String> {
 
 /// `Linger=yes|no` for this user, where `loginctl` answers.
 fn linger(sc: &mut dyn Systemctl) -> Option<bool> {
-    // SAFETY: getuid cannot fail.
-    let uid = unsafe { libc::getuid() }.to_string();
+    let uid = crate::fs_gate::sys::current_uid().to_string();
     let o = sc
         .loginctl(&["show-user", &uid, "--property=Linger", "--value"])
         .ok()?;
@@ -339,9 +343,7 @@ fn write_unit(dir: &Path, name: &str, body: &str) -> Result<()> {
             path.display()
         );
     }
-    let tmp = dir.join(format!(".{name}.swamp-tmp"));
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::fs_gate::systemd::write_unit(dir, name, body)?;
     Ok(())
 }
 
@@ -371,7 +373,7 @@ fn roll_back(sc: &mut dyn Systemctl, dir: &Path, names: &[&str]) -> Vec<String> 
         let p = dir.join(n);
         match is_ours(&p) {
             Ok(Some(true)) => {
-                if let Err(e) = std::fs::remove_file(&p) {
+                if let Err(e) = crate::fs_gate::systemd::remove_unit(&p) {
                     problems.push(format!("{}: {e}", p.display()));
                 }
             }
@@ -401,7 +403,7 @@ pub fn install(sc: &mut dyn Systemctl, dir: &Path, cfg: &Config) -> Result<Strin
     let service = render_service(cfg)?;
     let timer = render_timer(cfg);
     let collector = cfg.collector.then(|| render_collector(cfg)).transpose()?;
-    std::fs::create_dir_all(dir)?;
+    crate::fs_gate::systemd::create_unit_dir(dir)?;
     let mut written = vec![SERVICE, TIMER];
     write_unit(dir, SERVICE, &service)?;
     write_unit(dir, TIMER, &timer)?;
@@ -437,7 +439,7 @@ pub fn install(sc: &mut dyn Systemctl, dir: &Path, cfg: &Config) -> Result<Strin
     // the user's latest request is the whole state.
     if !cfg.collector && is_ours(&dir.join(COLLECTOR))? == Some(true) {
         let _ = sc.systemctl(&["disable", "--now", COLLECTOR]);
-        std::fs::remove_file(dir.join(COLLECTOR))?;
+        crate::fs_gate::systemd::remove_unit(&dir.join(COLLECTOR))?;
         let _ = sc.systemctl(&["daemon-reload"]);
     }
     let roots = if cfg.roots.is_empty() {
@@ -502,7 +504,7 @@ pub fn uninstall(sc: &mut dyn Systemctl, dir: &Path) -> Result<String> {
         let _ = sc.systemctl(&["stop", SERVICE]);
     }
     for n in &ours {
-        std::fs::remove_file(dir.join(n))?;
+        crate::fs_gate::systemd::remove_unit(&dir.join(n))?;
     }
     if reachable {
         let _ = sc.systemctl(&["daemon-reload"]);

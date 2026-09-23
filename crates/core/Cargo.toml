@@ -30,9 +30,10 @@ roxmltree = "0.21.1"
 # which is what scripts/platform-isolation.sh checks.
 [dev-dependencies]
 walkdir = "2"
+swamp-core = { path = ".", features = ["testing"] }
 
 # Linux-only and test-only: the independent freedesktop Trash reader.
-# swamp's own backend (`platform::trash`) does the move -- `trash::delete`
+# swamp's own backend (`fs_gate::destroy`) does the move -- `trash::delete`
 # copies across devices and does not say where an item went (see
 # docs/platform.md) -- and these tests list and restore swamp's items
 # through the crate, which is the evidence that a file manager following
@@ -56,9 +57,6 @@ fsevent-sys = "5.2.0"
 # builds -- debug or `--release` -- have it on by design.
 [features]
 testing = []
-
-[dev-dependencies]
-swamp-core = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

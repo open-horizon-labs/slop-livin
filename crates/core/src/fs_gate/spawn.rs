@@ -55,6 +55,14 @@ pub enum Program {
     Brew,
     /// `defaults read com.apple.dt.Xcode …` (detector query).
     Defaults,
+    /// `systemd --user`'s own manager (#83): `crate::systemd_user`'s
+    /// timer/service/collector lifecycle. `--user` is part of every
+    /// shape below, never a separate prefix a caller could vary.
+    Systemctl,
+    /// `loginctl show-user <uid> --property=Linger --value`
+    /// (`crate::systemd_user::linger`); enabling lingering is never
+    /// done by swamp.
+    Loginctl,
 }
 
 impl Program {
@@ -74,6 +82,8 @@ impl Program {
         Program::Kill,
         Program::Brew,
         Program::Defaults,
+        Program::Systemctl,
+        Program::Loginctl,
     ];
 
     /// The executable name looked up on `PATH`.
@@ -92,6 +102,8 @@ impl Program {
             Program::Kill => "kill",
             Program::Brew => "brew",
             Program::Defaults => "defaults",
+            Program::Systemctl => "systemctl",
+            Program::Loginctl => "loginctl",
         }
     }
 
@@ -150,6 +162,16 @@ enum Slot {
     /// must open with `query(` (never `mutation`), every other key is one
     /// of the variables `github.rs` declares.
     GraphqlFields,
+    /// Exactly one of swamp's own systemd unit names
+    /// (`crate::systemd_user::{SERVICE,TIMER,COLLECTOR}`).
+    SwampUnit,
+    /// One or two of [`Slot::SwampUnit`] (a batched `disable --now`).
+    SwampUnits,
+    /// `--property=<comma-separated properties>`, every property one of
+    /// the fixed set `systemd_user::show` reads.
+    ShowProperties,
+    /// This process's own uid, decimal (`systemd_user::linger`).
+    OwnUid,
 }
 
 /// Every argument shape [`run`] accepts, per program. An allow-list: an
@@ -221,6 +243,45 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             Lit("com.apple.dt.Xcode"),
             Lit("IDECustomDerivedDataLocation"),
         ]],
+        Program::Systemctl => &[
+            &[Lit("--user"), Lit("--no-pager"), Lit("show-environment")],
+            &[Lit("--user"), Lit("--no-pager"), Lit("daemon-reload")],
+            &[
+                Lit("--user"),
+                Lit("--no-pager"),
+                Lit("enable"),
+                Lit("--now"),
+                SwampUnit,
+            ],
+            &[Lit("--user"), Lit("--no-pager"), Lit("restart"), SwampUnit],
+            &[
+                Lit("--user"),
+                Lit("--no-pager"),
+                Lit("disable"),
+                Lit("--now"),
+                SwampUnits,
+            ],
+            &[
+                Lit("--user"),
+                Lit("--no-pager"),
+                Lit("stop"),
+                Lit(crate::systemd_user::SERVICE),
+            ],
+            &[
+                Lit("--user"),
+                Lit("--no-pager"),
+                Lit("show"),
+                SwampUnit,
+                ShowProperties,
+            ],
+        ],
+        Program::Loginctl => &[&[
+            Lit("--no-pager"),
+            Lit("show-user"),
+            OwnUid,
+            Lit("--property=Linger"),
+            Lit("--value"),
+        ]],
     }
 }
 
@@ -238,6 +299,34 @@ fn docker_ref(a: &str) -> bool {
 
 fn digits(a: &str) -> bool {
     !a.is_empty() && a.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Exactly one of swamp's own systemd unit names.
+fn swamp_unit(a: &str) -> bool {
+    [
+        crate::systemd_user::SERVICE,
+        crate::systemd_user::TIMER,
+        crate::systemd_user::COLLECTOR,
+    ]
+    .contains(&a)
+}
+
+/// `--property=<comma-separated properties>`, every name one
+/// `systemd_user::show` actually reads.
+fn show_properties(a: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "ActiveState",
+        "UnitFileState",
+        "LastTriggerUSec",
+        "NextElapseUSecRealtime",
+        "SubState",
+        "MainPID",
+        "NRestarts",
+    ];
+    let Some(list) = a.strip_prefix("--property=") else {
+        return false;
+    };
+    !list.is_empty() && list.split(',').all(|p| ALLOWED.contains(&p))
 }
 
 /// The GraphQL variables `github.rs` binds: `owner`, `name`, and
@@ -260,6 +349,16 @@ fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
                     i += 1;
                 }
                 if i == start {
+                    return false;
+                }
+                continue;
+            }
+            Slot::SwampUnits => {
+                let start = i;
+                while i < args.len() && swamp_unit(&args[i]) {
+                    i += 1;
+                }
+                if i == start || i - start > 2 {
                     return false;
                 }
                 continue;
@@ -306,7 +405,12 @@ fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
                 .is_some_and(|(uid, label)| digits(uid) && label == crate::schedule::LABEL),
             Slot::SwampPlist => super::store::launch_agent_plist()
                 .is_ok_and(|p| p.as_os_str() == std::ffi::OsStr::new(a)),
-            Slot::DockerRefs | Slot::GraphqlFields => unreachable!("handled above"),
+            Slot::SwampUnit => swamp_unit(a),
+            Slot::ShowProperties => show_properties(a),
+            Slot::OwnUid => digits(a) && a.parse::<u32>().ok() == Some(super::sys::current_uid()),
+            Slot::DockerRefs | Slot::GraphqlFields | Slot::SwampUnits => {
+                unreachable!("handled above")
+            }
         };
         if !ok {
             return false;
