@@ -216,7 +216,7 @@ if systemctl --user show-environment >/dev/null 2>&1; then
     say "systemd: collector service $active; timer $(systemctl --user is-active swamp-observe.timer || true)"
     systemctl --user start swamp-observe.service && say "systemd: one scheduled observation ran ($(systemctl --user show swamp-observe.service -p Result --value))" || say "systemd: the scheduled observation failed: $(journalctl --user -u swamp-observe.service -n 20 --no-pager 2>/dev/null | tail -5)"
     HOME="$realhome" "$bin" schedule --off | tee -a "$report"
-    left="$(ls "$realhome/.config/systemd/user"/swamp-* 2>/dev/null | wc -l)"
+    left="$(find "$realhome/.config/systemd/user" -maxdepth 1 -name 'swamp-*' 2>/dev/null | wc -l)"
     say "systemd: after --off, $left swamp unit file(s) remain"
     [ "$left" = 0 ]
 else
