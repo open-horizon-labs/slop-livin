@@ -141,5 +141,14 @@ unchanged 0 listings, build-output change 1, one-worktree source change
   ignored.
 - A nested PID namespace with its own `/proc` cannot be told apart from
   the host; recorded as a limit.
+- **A pre-existing, platform-neutral incremental gap** found by the
+  collector's equivalence test: in a root with *no* discovered checkout
+  (every byte unowned), an incremental observation with changed
+  directories does not re-measure them -- `walked_total` came out 24576
+  against a full walk's 36864 with a canned FSEvents plan on macOS too
+  (`growth::apply_incremental`'s changes outside every worktree go to
+  shallow discovery, not to the unowned totals). Not fixed here (growth
+  internals, both platforms); the tests use real checkouts, where the
+  incremental result equals a full walk. Follow-up for the owner.
 - Btrfs/ZFS/XFS/overlay bounds are labelled from `statfs`; no runner has
   those filesystems, so only the pure mapping is tested.

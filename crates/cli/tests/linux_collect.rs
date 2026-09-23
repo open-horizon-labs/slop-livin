@@ -102,6 +102,19 @@ fn tree(root: &Path) {
     )
     .unwrap();
     std::fs::write(root.join("other/node_modules/x/i.js"), vec![2u8; 9_000]).unwrap();
+    // Real checkouts: the incremental merge is exercised where it is
+    // used. (A root with no checkout at all -- every byte unowned -- does
+    // not re-measure changed unowned directories incrementally on either
+    // platform; that is a pre-existing gap recorded in the session note,
+    // not something a collector changes.)
+    for p in ["proj", "other"] {
+        let ok = Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(root.join(p))
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "git init {p}");
+    }
 }
 
 #[test]
