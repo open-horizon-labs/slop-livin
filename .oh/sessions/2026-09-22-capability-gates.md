@@ -176,6 +176,14 @@ compile with no errors.
 
 ## 5. Verification
 
-Recorded in the final report: fmt, workspace tests, clippy (all
-targets, and the production lib/bins build), the audit binary, and
-`scripts/check.sh` end to end with its time.
+- `SWAMP_TARGET_DIR=<shared target> scripts/check.sh` finished with exit 0
+  in 35:02 wall on macOS. It ran fmt, `cargo test --workspace`, clippy
+  `-D warnings` on all targets and on the production lib/bins, and the
+  audit binary (11/11 ok). It then reran the named runtime tests, the
+  cost test with `--test-threads=1` and the TUI refresh tests. The
+  compile-fail runner and the mutation sweep (2 tests, 545 s) came next,
+  and the grep checks last. 88 test binaries ok, 0 failed; the only
+  ignored tests are the 2 pre-existing read-only real-store comparisons.
+- `cargo test --workspace --locked` on its own took 21:59 (cold for the
+  new crate graph).
+- Commits are unsigned (`git -c commit.gpgsign=false`) and not pushed.
