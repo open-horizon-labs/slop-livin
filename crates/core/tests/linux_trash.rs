@@ -167,7 +167,7 @@ fn a_dest_name_already_in_the_trash_is_refused_not_overwritten() {
     tree(&b);
     let trash_root = fx.data.join("Trash");
 
-    trash_move(&fx.store_dir, &a, &trash_root, "target").unwrap();
+    let _ = trash_move(&fx.store_dir, &a, &trash_root, "target").unwrap();
     let err = trash_move(&fx.store_dir, &b, &trash_root, "target")
         .unwrap_err()
         .to_string();
