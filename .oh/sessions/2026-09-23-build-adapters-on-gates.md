@@ -223,10 +223,38 @@ task names the exact file and line.
   target dir): exit 0, wall 11:23:48–11:40:34 (~17 min) — fmt, clippy,
   the 11 audits, the release-graph check, the full workspace test run,
   named-targets, and the greps, all in one pass, zero failures.
-  `scripts/check-full.sh` (compile-fail cases, the mutation sweep, the
-  single-threaded cost test) was not run this session; the mutation
-  sweep alone took ~12 min on stack/22 per its own session note, so a
-  full run is a follow-up before merge, not before this report.
+  **Update, same session, after the coordinator's macOS-bash-3.2 fix
+  (`15e2447`, `"${target[@]}"` → `${target[@]+"${target[@]}"}` so an
+  empty `target` array does not trip `set -u`) landed on the branch:**
+  the coordinator's own mutation sweep run on stack/23 found four
+  broken fixtures. Two were this session's own
+  (`build_adapters_are_pluggable/{01,02}`): a multi-line `//! why:`
+  continuation broke the header parser (it stops recognizing header
+  lines at the first line that is not `//! key: value`, silently
+  splicing the rest into the fixture body as production code) --
+  collapsed to one line each, matching every other fixture. Two
+  predated this port (`discovery_owned_by_report_pipeline/04` and
+  `/06`): `04` was ported from stack/19 against
+  `external::observe_external`'s pre-token signature and never had a
+  `//! by:` line; `06` targeted `external::discover_and_measure_in`,
+  which this port renamed to `observe_external`, so its E0425
+  (function not found) masked the field-privacy violation it meant to
+  exercise. Both updated to the current signature/name and, for `04`,
+  given a `by: compile:E0451` (minting the token as a struct literal
+  from `crates/tui`, which the private field refuses) -- spot-checked
+  by splicing each into a scratch copy of its target and running
+  `cargo check` before the harness run, per the coordinator's
+  instruction not to rely on manual splicing alone.
+  `cargo test -p swamp-source-audit --locked --test mutation_sweep --
+  --ignored`: 2 passed, 0 failed, 1308 s.
+- `scripts/check-full.sh`, `SWAMP_TARGET_DIR` **unset** (the
+  coordinator's own repro condition): exit 0, wall 12:54:25–13:23:02
+  (~28:37) -- `check.sh`'s full fast tier, 58/58 compile-fail cases,
+  the mutation sweep (2/2, 1307 s), and the single-threaded cost test
+  (`spawn_oracle_covers_every_program_the_gate_can_run`,
+  `unchanged_observations_spaced_past_the_toosoon_floor`), all green.
+  73 `test result: ok` lines total, zero failures, zero `FAILED`/`error[`
+  in the log.
 
 Two real regressions were caught and fixed mid-session, not just
 theorized: a manifest-cap simplification that silently changed a
@@ -256,13 +284,15 @@ original stack/19 sequence corrected on its own once cherry-picked.
 18. Scan store and BuildKit units for verdict vocabulary
 19. Pin the store anchors a custom DerivedData and a free-form GOMODCACHE rely on
 20. *(skipped: `0ed6715`, superseded by this note)*
+21. Record the build-adapters-on-gates session; add `ids_only_in_their_module` fixtures
+22. *(coordinator, `15e2447`)* Fix check scripts on macOS bash 3.2
+23. Fix four mutation fixtures the harness rejected as broken (§5 update)
 
 ## 7. Limits, stated
 
-- `scripts/check-full.sh` (compile-fail, mutation sweep, cost test) was
-  not run this session — flagged as the immediate follow-up before
-  this stack merges, alongside the `folded_bytes_bounded_stamped` gap
-  in §4.
+- The `folded_bytes_bounded_stamped` gap in §4 (the agent-side bounded
+  fold has the same silent-undercount shape, no completeness signal)
+  remains a follow-up, spawned as a separate task.
 - The `build_twin`/registry allow-list extension in §3 is scoped to
   `ids_only_in_their_module`; it does not touch
   `adapters_do_not_reach_gates`; `build_adapters` was already fully
