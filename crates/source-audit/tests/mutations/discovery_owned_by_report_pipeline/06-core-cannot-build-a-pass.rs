@@ -8,7 +8,7 @@ fn sweep_core_pass(
 ) -> usize {
     let pass = crate::report::DiscoveryPass { _minted_by_observe_scope: () };
     let events = crate::fs_events::EventCoverage::default();
-    crate::external::discover_and_measure_in(&pass, scope, Some(store), false, 1_000, 30, 3600, &events)
-        .map(|u| u.len())
+    crate::external::observe_external(&pass, scope, Some(store), false, 1_000, 30, 3600, &events)
+        .map(|o| o.units.len())
         .unwrap_or(0)
 }
