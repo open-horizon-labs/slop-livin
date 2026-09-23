@@ -43,6 +43,13 @@ gates existed; porting it onto them changed a few specifics from what
   where swamp's state lives, unchanged on both platforms, rather than
   adding a second one. A missing `HOME` still falls back to `.` there, as
   it did before this Linux track.
+- Known, documented gaps on Linux only (each has a `TODO(linux-on-gates)`
+  at its assertion in `crates/core/tests/`, not silently masked): an
+  otherwise-fully-cached build-adapter pass sometimes re-identifies one
+  container instead of replaying it (`build_adapter_history.rs`), and a
+  deleted Cargo `target/` sometimes still shows up once as a nested
+  artifact immediately after removal (`cargo_delivery.rs`). Neither
+  reproduces on macOS; not yet root-caused.
 
 ### Token binding and gate hardening (re-review 5)
 
