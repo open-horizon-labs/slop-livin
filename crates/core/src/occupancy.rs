@@ -70,7 +70,7 @@ impl OccupancyState {
 /// counterexample); files are probed directly. `stdout` and `stderr` are
 /// captured separately so an ordinary `lsof` warning is not mistaken for
 /// an open handle, while a permission error still becomes `Unknown`.
-pub(crate) fn probe_path(path: &Path) -> OccupancyState {
+pub fn probe_path(path: &Path) -> OccupancyState {
     probe_paths(&[path])
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn probe_path(path: &Path) -> OccupancyState {
 /// procfs pass for all of them (a process table scan per anchor would
 /// multiply); on macOS it is one bounded `lsof` per anchor, as it
 /// always was. The first non-`Free` answer wins.
-pub(crate) fn probe_paths(paths: &[&Path]) -> OccupancyState {
+pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
     match crate::platform::OccupancyProbe::for_os(crate::platform::Os::current()) {
         crate::platform::OccupancyProbe::Lsof => {
             for p in paths {

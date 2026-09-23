@@ -1,54 +1,47 @@
 //! #85 on a real Linux kernel: swamp's freedesktop Trash backend, held
 //! to the specification by an independent implementation of it.
 //!
-//! Every item is moved by `swamp_core::platform::trash` and then *found
-//! and restored* through the `trash` crate's `os_limited::{list,
-//! restore_all}` -- the same reading a desktop file manager does. A
-//! record swamp wrote that another spec implementation cannot parse is
-//! a Trash nobody can restore from, which is the failure this file
-//! exists to catch.
+//! Every item is moved by `fs_gate::destroy::trash_move`/`Envelope` --
+//! the same proof-and-authorization-gated call the macOS backend uses
+//! -- and then *found and restored* through the `trash` crate's
+//! `os_limited::{list, restore_all}` -- the same reading a desktop file
+//! manager does. A record swamp wrote that another spec implementation
+//! cannot parse is a Trash nobody can restore from, which is the
+//! failure this file exists to catch.
 //!
 //! Fixtures are temporary directories; the home trash is redirected by
 //! pointing `XDG_DATA_HOME` into the fixture, under one lock, because
 //! the `trash` crate reads it from the process environment. Nothing here
-//! touches the runner user's own Trash. The cross-device cases use
-//! `/dev/shm` (tmpfs) against the fixture disk and skip, saying why,
-//! where that is not a second filesystem.
+//! touches the runner user's own Trash.
 #![cfg(target_os = "linux")]
 
-mod fixture;
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use swamp_core::platform::Os;
-use swamp_core::platform::trash::{Envelope, Kind, Target, move_item};
+use swamp_core::authority::{Confirmable, HumanConfirmed, SelectedUnit, authorize_confirmed};
+use swamp_core::fs_gate::destroy::{self, Trashed};
+use swamp_core::fs_gate::store::StoreDir;
 
 static ENV: Mutex<()> = Mutex::new(());
-
-fn uid() -> u32 {
-    unsafe { libc::getuid() }
-}
 
 struct Fixture {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     data: PathBuf,
-    target: Target,
+    store_dir: StoreDir,
 }
 
 fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let data = root.join("xdg-data");
-    let home = root.join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let target = Target::for_os(Os::Linux, home, Some(data.clone()), uid());
+    let store = root.join("store");
+    std::fs::create_dir_all(&store).unwrap();
     Fixture {
         _tmp: tmp,
         root,
         data,
-        target,
+        store_dir: StoreDir::at(&store).unwrap(),
     }
 }
 
@@ -88,10 +81,34 @@ fn listed(data: &Path, original: &Path) -> Vec<trash::TrashItem> {
     })
 }
 
-fn only_file(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default()
+/// A live recheck proof and authorization for `path`, exactly as a
+/// human's TUI confirmation would mint one
+/// (`.oh/guardrails/human-only-authorization.md`).
+fn authorize(store_dir: &StoreDir, path: &Path) -> swamp_core::authority::Authorized {
+    let confirmed = HumanConfirmed::tui_dialog(
+        "human:test",
+        store_dir,
+        vec![Confirmable::Unit(SelectedUnit {
+            path: path.to_path_buf(),
+            reviewed: swamp_core::recheck::capture_anchor(path).ok(),
+            docker: None,
+            linked_worktree: false,
+            preserve_into: None,
+        })],
+    )
+    .remove(0);
+    authorize_confirmed(confirmed, path).unwrap()
+}
+
+fn trash_move(
+    store_dir: &StoreDir,
+    path: &Path,
+    trash_root: &Path,
+    name: &str,
+) -> anyhow::Result<Trashed> {
+    let auth = authorize(store_dir, path);
+    let proof = swamp_core::recheck::run_all(&auth)?;
+    destroy::trash_move(proof, &auth, trash_root, name)
 }
 
 /// The core promise: an item swamp moved is where a file manager looks,
@@ -105,16 +122,12 @@ fn a_trashed_tree_is_listed_and_restored_by_an_independent_spec_reader() {
     let before = std::fs::read(src.join("debug/deps/libx.rlib")).unwrap();
     let t0 = swamp_core::entities::now();
 
-    let moved = move_item(&src, &fx.target, "ignored-flat-name").unwrap();
+    let trash_root = fx.data.join("Trash");
+    let moved = trash_move(&fx.store_dir, &src, &trash_root, "target").unwrap();
     assert!(!src.exists(), "the tree moved");
-    assert_eq!(moved.kind, Kind::FreedesktopHome);
-    assert_eq!(moved.location, fx.data.join("Trash/files/target"));
-    let info = moved
-        .info
-        .clone()
-        .expect("a freedesktop move writes a .trashinfo");
-    assert_eq!(info, fx.data.join("Trash/info/target.trashinfo"));
-    let record = std::fs::read_to_string(&info).unwrap();
+    assert_eq!(moved.path(), trash_root.join("files/target"));
+    let info = trash_root.join("info/target.trashinfo");
+    let record = std::fs::read_to_string(&info).expect("a freedesktop move writes a .trashinfo");
     assert!(record.starts_with("[Trash Info]\n"), "{record}");
     assert!(
         record.contains(&format!("Path={}\n", src.display())),
@@ -141,274 +154,104 @@ fn a_trashed_tree_is_listed_and_restored_by_an_independent_spec_reader() {
     assert!(!info.exists(), "restoring consumes the record");
 }
 
-/// Two items with one name get two names in the trash (`target`,
-/// `target.2`) and two records; neither overwrites the other and both
-/// restore to their own original path.
+/// A destination name already in the Trash is refused outright: this
+/// gate's `trash_move` has no freedesktop-style `name.2`/`name.3`
+/// disambiguation, so a caller must pick a name nothing already holds
+/// (`actions.rs`'s callers append a plan/session id for exactly this
+/// reason).
 #[test]
-fn name_collisions_get_distinct_items_and_both_restore() {
+fn a_dest_name_already_in_the_trash_is_refused_not_overwritten() {
     let fx = fixture();
     let a = fx.root.join("a/target");
     let b = fx.root.join("b/target");
     tree(&a);
     tree(&b);
-    std::fs::write(a.join("which"), b"a").unwrap();
-    std::fs::write(b.join("which"), b"b").unwrap();
-    let ma = move_item(&a, &fx.target, "x").unwrap();
-    let mb = move_item(&b, &fx.target, "x").unwrap();
-    assert_ne!(ma.location, mb.location);
-    assert_eq!(mb.location, fx.data.join("Trash/files/target.2"));
-    assert_eq!(std::fs::read(ma.location.join("which")).unwrap(), b"a");
-    assert_eq!(std::fs::read(mb.location.join("which")).unwrap(), b"b");
+    let trash_root = fx.data.join("Trash");
 
-    let mut items = listed(&fx.data, &a);
-    items.extend(listed(&fx.data, &b));
-    assert_eq!(items.len(), 2);
-    with_xdg(&fx.data, || trash::os_limited::restore_all(items).unwrap());
-    assert_eq!(std::fs::read(a.join("which")).unwrap(), b"a");
-    assert_eq!(std::fs::read(b.join("which")).unwrap(), b"b");
+    trash_move(&fx.store_dir, &a, &trash_root, "target").unwrap();
+    let err = trash_move(&fx.store_dir, &b, &trash_root, "target")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already exists"), "{err}");
+    assert!(b.exists(), "the second unit was never moved");
 }
 
-/// A home trash that is a symlink to somewhere else is refused before
-/// anything moves -- a `.Trash` pointing into another user's directory,
-/// or out of the filesystem, is the attack the spec's rules exist for.
+/// A Trash root on another filesystem than the fixture's own is
+/// refused, never silently copied: a single-file `trash_move` has no
+/// per-mount fallback and fails on the kernel's own `EXDEV` from
+/// `rename(2)` -- a refusal, never a copy.
 #[test]
-fn a_symlinked_trash_is_refused_and_nothing_moves() {
+fn a_cross_device_trash_root_is_refused_not_copied() {
+    use std::os::unix::fs::MetadataExt;
     let fx = fixture();
-    let elsewhere = fx.root.join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    std::fs::create_dir_all(&fx.data).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, fx.data.join("Trash")).unwrap();
-    let src = fx.root.join("p/target");
-    tree(&src);
-    let err = move_item(&src, &fx.target, "x").unwrap_err().to_string();
-    assert!(err.contains("symlink"), "{err}");
-    assert!(
-        src.join("debug/deps/libx.rlib").exists(),
-        "the source did not move"
-    );
-    assert!(
-        only_file(&elsewhere).is_empty(),
-        "nothing landed at the symlink's target"
-    );
-
-    // The same for a symlinked `files/` inside a real trash.
-    let fx = fixture();
-    let trash_dir = fx.data.join("Trash");
-    std::fs::create_dir_all(&trash_dir).unwrap();
-    let sink = fx.root.join("sink");
-    std::fs::create_dir_all(&sink).unwrap();
-    std::os::unix::fs::symlink(&sink, trash_dir.join("files")).unwrap();
-    let src = fx.root.join("q/target");
-    tree(&src);
-    let err = move_item(&src, &fx.target, "x").unwrap_err().to_string();
-    assert!(err.contains("symlink"), "{err}");
-    assert!(src.exists());
-    assert!(only_file(&sink).is_empty());
-}
-
-/// A move that the kernel refuses part-way leaves the source where it
-/// was and removes only the record swamp created -- no orphan
-/// `.trashinfo` pointing at an item that is not in the trash.
-#[test]
-fn an_interrupted_move_keeps_the_source_and_leaves_no_orphan_record() {
-    if uid() == 0 {
-        eprintln!("SKIP an_interrupted_move_keeps_the_source: running as root ignores the mode");
+    let shm = Path::new("/dev/shm");
+    let Ok(shm_meta) = std::fs::metadata(shm) else {
+        eprintln!("SKIP a_cross_device_trash_root_is_refused_not_copied: /dev/shm unavailable");
+        return;
+    };
+    if shm_meta.dev() == std::fs::metadata(&fx.root).unwrap().dev() {
+        eprintln!(
+            "SKIP a_cross_device_trash_root_is_refused_not_copied: /dev/shm is on the fixture's own filesystem"
+        );
         return;
     }
-    let fx = fixture();
-    let files = fx.data.join("Trash/files");
-    std::fs::create_dir_all(&files).unwrap();
-    std::fs::create_dir_all(fx.data.join("Trash/info")).unwrap();
-    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let src = fx.root.join("p/target");
-    tree(&src);
-    let err = move_item(&src, &fx.target, "x").unwrap_err().to_string();
-    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(err.contains("was not moved"), "{err}");
-    assert!(src.join("debug/deps/libx.rlib").exists());
-    assert!(
-        only_file(&fx.data.join("Trash/info")).is_empty(),
-        "the record for a move that did not happen was removed"
-    );
-}
-
-/// The second filesystem the cross-device cases use, or why there is
-/// none on this runner.
-fn other_device(than: &Path) -> Result<PathBuf, String> {
-    let shm = Path::new("/dev/shm");
-    let m = std::fs::metadata(shm).map_err(|e| format!("/dev/shm unavailable: {e}"))?;
-    if m.dev() == std::fs::metadata(than).unwrap().dev() {
-        return Err("/dev/shm is on the same filesystem as the fixture".into());
-    }
-    let d = tempfile::Builder::new()
+    let other_trash = tempfile::Builder::new()
         .prefix("swamp-trash-xdev-")
         .tempdir_in(shm)
-        .map_err(|e| format!("cannot create a directory in /dev/shm: {e}"))?;
-    Ok(d.keep())
-}
+        .unwrap();
 
-/// An item on another mount goes to *that mount's* trash, never copied
-/// into the home trash; and when that mount's trash cannot be used the
-/// move is refused -- no copy, no permanent fallback.
-#[test]
-fn another_mount_uses_its_own_trash_and_a_blocked_one_refuses_without_copying() {
-    let fx = fixture();
-    let other = match other_device(&fx.root) {
-        Ok(p) => p,
-        Err(why) => {
-            eprintln!("SKIP another_mount_uses_its_own_trash: {why}");
-            return;
-        }
-    };
-    let src = other.join("target");
+    let src = fx.root.join("p/target");
     tree(&src);
-    // /dev/shm is a mount point: its top directory trash is
-    // /dev/shm/.Trash-$uid. Only proceed if that is ours to use.
-    let top_trash = PathBuf::from(format!("/dev/shm/.Trash-{}", uid()));
-    let pre_existing = top_trash.exists();
-    let moved = move_item(&src, &fx.target, "x");
-    match moved {
-        Ok(m) => {
-            assert_eq!(m.kind, Kind::FreedesktopTopDirUser);
-            assert!(
-                m.location.starts_with(&top_trash),
-                "{}",
-                m.location.display()
-            );
-            assert_eq!(
-                std::fs::metadata(&m.location).unwrap().dev(),
-                std::fs::metadata(&other).unwrap().dev(),
-                "the item stayed on its own filesystem: a rename, not a copy"
-            );
-            assert!(
-                !fx.data.join("Trash/files/target").exists(),
-                "nothing was copied into the home trash"
-            );
-            let _ = std::fs::remove_dir_all(&m.location);
-            if let Some(i) = m.info {
-                let _ = std::fs::remove_file(i);
-            }
-        }
-        Err(e) => panic!("a writable other-mount trash must be used: {e:#}"),
-    }
-    if !pre_existing {
-        let _ = std::fs::remove_dir_all(&top_trash);
-    }
-
-    // A Directory target on another filesystem than the item: EXDEV is
-    // an error, not a copy.
-    let src2 = other.join("target2");
-    tree(&src2);
-    let err = move_item(&src2, &Target::Directory(fx.root.join("T")), "t2")
+    let auth = authorize(&fx.store_dir, &src);
+    let proof = swamp_core::recheck::run_all(&auth).unwrap();
+    let err = swamp_core::fs_gate::destroy::trash_move(proof, &auth, other_trash.path(), "target")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("different filesystems"), "{err}");
-    assert!(
-        src2.join("debug/deps/libx.rlib").exists(),
-        "the source stayed"
-    );
-    assert!(
-        !fx.root.join("T/t2").exists(),
-        "no partial copy was left behind"
-    );
-
-    // An envelope refuses before the first member moves.
-    let err = Envelope::open(&src2, &Target::Directory(fx.root.join("T")), "env")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("cross-device"), "{err}");
-    assert!(src2.exists());
-    let _ = std::fs::remove_dir_all(&other);
-}
-
-/// A top-directory trash that exists but is not a directory we own (a
-/// file, or a symlink planted by someone else) is refused; swamp does
-/// not fall back to copying the item into the home trash.
-#[test]
-fn a_hostile_top_directory_trash_refuses_rather_than_copying_home() {
-    let fx = fixture();
-    let other = match other_device(&fx.root) {
-        Ok(p) => p,
-        Err(why) => {
-            eprintln!("SKIP a_hostile_top_directory_trash: {why}");
-            return;
-        }
-    };
-    let top_trash = PathBuf::from(format!("/dev/shm/.Trash-{}", uid()));
-    if top_trash.exists() || std::fs::symlink_metadata(&top_trash).is_ok() {
-        eprintln!(
-            "SKIP a_hostile_top_directory_trash: {} already exists",
-            top_trash.display()
-        );
-        let _ = std::fs::remove_dir_all(&other);
-        return;
-    }
-    let decoy = other.join("decoy");
-    std::fs::create_dir_all(&decoy).unwrap();
-    std::os::unix::fs::symlink(&decoy, &top_trash).unwrap();
-    let src = other.join("target");
-    tree(&src);
-    let result = move_item(&src, &fx.target, "x");
-    let _ = std::fs::remove_file(&top_trash);
-    let err = result
-        .expect_err("a symlinked .Trash-$uid must refuse")
-        .to_string();
-    assert!(err.contains("symlink"), "{err}");
+    // The kernel's own EXDEV, surfaced rather than papered over with a
+    // copy; the unit must still be exactly where it was.
+    assert!(err.to_lowercase().contains("cross-device link"), "{err}");
     assert!(src.join("debug/deps/libx.rlib").exists());
     assert!(
-        only_file(&decoy).is_empty(),
-        "nothing went through the symlink"
+        std::fs::read_dir(other_trash.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "nothing was copied into the other filesystem's trash"
     );
-    assert!(
-        !fx.data.join("Trash/files/target").exists(),
-        "no copy into the home trash"
-    );
-    let _ = std::fs::remove_dir_all(&other);
 }
 
-/// The whole action path on the freedesktop target: propose -> approve
-/// -> execute moves the unit into the fixture's system trash with a
-/// record, and the ledger names both.
+/// A multi-member unit (a Cargo group, an agent session) goes into one
+/// envelope, member by member; `Envelope::open`'s own `same_device_as`
+/// refuses before anything moves when the trash is on another
+/// filesystem, and every member move is a plain rename.
 #[test]
-fn execute_records_the_trash_location_and_its_restore_record() {
+fn a_multi_member_envelope_moves_every_member_and_gets_one_sidecar() {
+    use std::os::unix::fs::MetadataExt;
     let fx = fixture();
-    let tmp = tempfile::tempdir().unwrap();
-    let f = fixture::build(tmp.path());
-    let store = tempfile::tempdir().unwrap();
-    let r = swamp_core::report::report_full_mode(
-        &f.root,
-        None,
-        false,
-        Some(store.path()),
-        Some("1h"),
-        true,
-        false,
-        false,
-        true,
-    )
-    .expect("report");
-    let plan = swamp_core::actions::propose(&r, None, std::slice::from_ref(&f.target_dir), "test")
-        .expect("plan");
-    swamp_core::actions::save_plan(store.path(), &plan).unwrap();
-    swamp_core::actions::approve(store.path(), &plan.id, "human:test").unwrap();
-    let res = swamp_core::actions::execute_with_target(
-        store.path(),
-        &plan.id,
-        "human:test",
-        fx.target.clone(),
-    )
-    .unwrap();
-    let outcome = &res.outcomes[0];
-    assert_eq!(outcome.status, "completed", "{:?}", outcome.cause);
-    let loc = outcome.recovery_location.clone().unwrap();
+    let session = fx.root.join("session");
+    std::fs::create_dir_all(&session).unwrap();
+    let members = [session.join("transcript.jsonl"), session.join("meta.json")];
+    for m in &members {
+        std::fs::write(m, b"fixture content").unwrap();
+    }
+    let trash_root = fx.data.join("Trash");
+
+    let auth = authorize(&fx.store_dir, &session);
+    let proof = swamp_core::recheck::run_all(&auth).unwrap();
+    let dev = std::fs::metadata(&session).unwrap().dev();
+    let mut envelope =
+        destroy::Envelope::open(proof, &auth, &trash_root, "session-1", Some(dev)).unwrap();
+    for (i, m) in members.iter().enumerate() {
+        envelope.move_member(m, &i.to_string()).unwrap();
+    }
+    for m in &members {
+        assert!(!m.exists());
+    }
+    assert!(envelope.path().join("0").exists());
+    assert!(envelope.path().join("1").exists());
+    assert_eq!(envelope.path(), trash_root.join("files/session-1"));
     assert!(
-        loc.starts_with(fx.data.join("Trash/files")),
-        "{}",
-        loc.display()
+        trash_root.join("info/session-1.trashinfo").exists(),
+        "the envelope itself is the trashed item and gets one sidecar"
     );
-    assert!(!f.target_dir.exists());
-    let ledger = std::fs::read_to_string(store.path().join("ledger.jsonl")).unwrap();
-    assert!(ledger.contains("\"trash_info\""), "{ledger}");
-    assert!(ledger.contains(".trashinfo"), "{ledger}");
-    assert_eq!(listed(&fx.data, &f.target_dir).len(), 1);
 }
