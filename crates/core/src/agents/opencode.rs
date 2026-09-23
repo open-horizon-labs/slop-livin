@@ -1006,7 +1006,6 @@ mod tests {
         assert!(auth.protected());
         assert!(
             auth.protect_reason()
-                .as_deref()
                 .unwrap_or_default()
                 .contains("authentication data"),
             "the protection reason must name what it protects: {:?}",

@@ -329,7 +329,6 @@ fn oh_my_pi_shared_blob_reference_states_are_explicit_and_never_actionable() {
     assert!(
         referenced
             .note()
-            .as_deref()
             .unwrap_or_default()
             .contains("referenced by"),
         "{:?}",
@@ -338,7 +337,6 @@ fn oh_my_pi_shared_blob_reference_states_are_explicit_and_never_actionable() {
     assert!(
         unreferenced
             .note()
-            .as_deref()
             .unwrap_or_default()
             .contains("no referencing session found"),
         "{:?}",

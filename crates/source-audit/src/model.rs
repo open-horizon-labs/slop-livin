@@ -1111,7 +1111,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             if t.unsafety.is_some() {
                 c.hazard("`unsafe trait`", t.span());
             }
-            let prev = std::mem::replace(&mut c.impl_owner, Some(t.ident.to_string()));
+            let prev = c.impl_owner.replace(t.ident.to_string());
             let prev_def = std::mem::replace(&mut c.in_trait_def, true);
             if matches!(t.vis, syn::Visibility::Public(_)) && !c.test() {
                 let site = c.site(t.ident.span());
@@ -1146,12 +1146,8 @@ impl<'ast> Visit<'ast> for Collector<'_> {
 
     fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
         self.with_attrs(&u.attrs, |c| {
-            let prefix = if u.leading_colon.is_some() {
-                Vec::new()
-            } else {
-                Vec::new()
-            };
-            c.use_tree(&u.tree, prefix, u.span());
+            // `use ::x` and `use x` start from the same (empty) prefix.
+            c.use_tree(&u.tree, Vec::new(), u.span());
         });
     }
 

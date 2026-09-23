@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(conf.category(), AgentCategory::ProtectedConfig);
         assert!(conf.protected());
         assert_eq!(
-            conf.protect_reason().as_deref(),
+            conf.protect_reason(),
             Some("home-level Aider configuration")
         );
         contract::protection_defaults_hold(&units);

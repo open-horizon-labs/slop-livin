@@ -908,7 +908,6 @@ mod tests {
         assert!(
             history
                 .protect_reason()
-                .as_deref()
                 .is_some_and(|r| r.contains("prompt history")),
             "the adapter's own protection reason must survive the builder"
         );

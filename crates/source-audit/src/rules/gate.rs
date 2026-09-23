@@ -438,7 +438,7 @@ pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
             if m.krate == Krate::Tui
                 && under(&abs, "std::thread")
                 && !m.is_within(Krate::Tui, &["worker"])
-                && !(abs == "std::thread::sleep")
+                && (abs != "std::thread::sleep")
             {
                 problems.push(format!(
                     "{}: `{}` names `std::thread` in the TUI outside `worker.rs`: work leaves the \

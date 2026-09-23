@@ -519,7 +519,7 @@ mod tests {
             assert_eq!(u.category(), AgentCategory::ProtectedConfig, "{rel}");
             assert!(u.protected(), "{rel} must be protected");
             assert_eq!(
-                u.protect_reason().as_deref(),
+                u.protect_reason(),
                 Some(*note),
                 "{rel} must keep its own stated reason"
             );
@@ -819,7 +819,6 @@ mod tests {
         assert!(db.protected());
         assert!(
             db.protect_reason()
-                .as_deref()
                 .is_some_and(|r| r.contains("never opened while writable")),
             "the adapter's own protection reason must survive the builder"
         );

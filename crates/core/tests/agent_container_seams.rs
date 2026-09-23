@@ -459,9 +459,7 @@ fn a_replayed_container_without_its_partial_makes_the_count_unknown() {
     let cold = run(1_000, EventCoverage::untrusted());
     assert!(
         cold.iter().any(|u| u.path().ends_with(&hash)
-            && u.note()
-                .as_deref()
-                .is_some_and(|n| n.contains("referenced by 1"))),
+            && u.note().is_some_and(|n| n.contains("referenced by 1"))),
         "precondition: the cold pass counts the reference"
     );
 
@@ -481,7 +479,7 @@ fn a_replayed_container_without_its_partial_makes_the_count_unknown() {
     let note = replayed
         .iter()
         .find(|u| u.path().ends_with(&hash))
-        .and_then(|u| u.note().clone())
+        .and_then(|u| u.note())
         .unwrap_or_default();
     assert!(
         note.contains("unknown"),

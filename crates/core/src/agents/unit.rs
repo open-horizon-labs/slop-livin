@@ -80,7 +80,7 @@ impl CandidateAgentUnit {
         &self.project_link
     }
     pub fn action(&self) -> AgentActionCapability {
-        self.action.clone()
+        self.action
     }
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()

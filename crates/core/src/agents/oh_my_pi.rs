@@ -1026,7 +1026,7 @@ mod tests {
             .unwrap();
         assert_eq!(config.category(), AgentCategory::ProtectedConfig);
         assert_eq!(
-            config.protect_reason().as_deref(),
+            config.protect_reason(),
             Some("main configuration"),
             "the adapter's own, more specific reason survives the builder default"
         );

@@ -1734,7 +1734,7 @@ pub fn discover_and_measure_in(
         covered_roots.push(home.clone());
         let device = device_of(&home);
         for cand in units {
-            let key = unit_key(&tool_id, cand.category(), device, &cand.path());
+            let key = unit_key(&tool_id, cand.category(), device, cand.path());
             observed.push(ObservedExternal {
                 key: key.clone(),
                 detector_id: tool_id.clone(),
@@ -1774,7 +1774,7 @@ pub fn discover_and_measure_in(
             covered_roots.push(wt_path.clone());
             let device = device_of(wt_path);
             for cand in adapter.project_local_units(wt_path, &ctx) {
-                let key = unit_key(tool_id, cand.category(), device, &cand.path());
+                let key = unit_key(tool_id, cand.category(), device, cand.path());
                 observed.push(ObservedExternal {
                     key: key.clone(),
                     detector_id: tool_id.to_string(),
@@ -1846,7 +1846,7 @@ pub fn discover_and_measure_in(
         // review's `protected_descendant_must_prevent_parent_cache_proposal`
         // counterexample -- protecting `debug/log.txt` must stop `debug/`
         // being proposed, or the protection means nothing.
-        let human_protected = protected_paths.conflict(&cand.path()).or_else(|| {
+        let human_protected = protected_paths.conflict(cand.path()).or_else(|| {
             cand.members()
                 .iter()
                 .find_map(|m| protected_paths.conflict(&m.path))
@@ -2157,9 +2157,7 @@ mod tests {
         .build();
         assert!(!u.protected());
         assert!(
-            u.protect_reason()
-                .as_deref()
-                .is_some_and(|r| r.contains("fixture")),
+            u.protect_reason().is_some_and(|r| r.contains("fixture")),
             "an unprotect must leave its reason behind"
         );
     }

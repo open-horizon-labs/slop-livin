@@ -449,7 +449,7 @@ pub fn identify_extension_globalstorage(
         return unknown_layout_residual(ext_home, ctx, "no tasks/ directory found")
             .into_iter()
             .map(|mut u| {
-                u.prefix_relative_path(&host);
+                u.prefix_relative_path(host);
                 u
             })
             .collect();

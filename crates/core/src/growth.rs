@@ -425,6 +425,7 @@ pub fn annotate_readonly(
 /// worktree ids is never tombstoned by this call even though it is
 /// absent from `projects`: absence here means "not observed", not
 /// "deleted". See `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
+#[allow(clippy::too_many_arguments)]
 pub fn observe_and_annotate(
     _stage: &crate::bus::Stage,
     swamp_dir: &Path,

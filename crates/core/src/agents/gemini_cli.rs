@@ -546,7 +546,6 @@ mod tests {
         assert_eq!(u.action(), AgentActionCapability::None);
         assert!(
             u.protect_reason()
-                .as_deref()
                 .unwrap_or_default()
                 .contains("defensive pattern match"),
             "an unconfirmed credential file says so"
