@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# The fast local tier (target: under 8 minutes on a warm target dir).
+# Every step runs once. The heavy harnesses -- the mutation sweep, the
+# compile-fail cases and the cost test -- are `scripts/check-full.sh`'s:
+# the first two are `#[ignore]`d so `cargo test --workspace` skips them,
+# and the cost test (a reviewer file, which cannot carry `#[ignore]`) is
+# skipped by name here and run once, single-threaded, there.
 set -euo pipefail
 # `SWAMP_TARGET_DIR` (optional) points every cargo run below at a shared
 # target directory -- e.g. one checkout's `target/` for several worktrees.
@@ -6,66 +12,74 @@ target=()
 if [ -n "${SWAMP_TARGET_DIR:-}" ]; then
   target=(--target-dir "$SWAMP_TARGET_DIR")
 fi
+step() { printf '\n== %s (%s)\n' "$1" "$(date +%H:%M:%S)"; }
+
+step fmt
 cargo fmt --all -- --check
-cargo test --workspace --locked "${target[@]}"
+
+# Once, over every target: `--all-targets` includes each library and
+# binary in its non-test configuration, which is where the crate roots
+# deny the capability gate's lints, so a separate `--lib --bins` pass
+# would repeat work already done.
+step clippy
 cargo clippy --workspace --all-targets --locked "${target[@]}" -- -D warnings
-# The production build on its own: the capability gate's clippy lints
-# (`disallowed_methods`/`disallowed_types`, denied at each crate root
-# outside `cfg(test)`) are about the library and binaries, and a
-# `--all-targets` run compiles them alongside test code.
-cargo clippy --workspace --lib --bins --locked "${target[@]}" -- -D warnings
+
+step audits
 cargo run -q --locked "${target[@]}" -p swamp-source-audit
 
-# Named explicitly so a rename cannot silently drop them: these are the
-# runtime halves of the 2026-09-21 review guardrails, and an AST audit
-# alone does not prove a refusal actually refuses.
-cargo test -p swamp-core --locked "${target[@]}" \
-  --test reviewer_counterexamples \
-  --test reviewer_counterexamples_123 \
-  --test reviewer_counterexamples_stack2 \
-  --test coverage_changes_are_not_storage_changes \
-  --test explicit_root_scope_exclusions \
-  --test nested_artifact_evidence_is_delivered \
-  --test upstream_citations_are_checked \
-  --test execution_rechecks \
-  --test shared_history_ownership \
-  --test store_contents_are_allowlisted \
-  --test incremental_external_and_agent_measurement \
-  --test agent_matrix_matches_docs \
-  --test agent_storage_validation \
-  --test agent_container_seams \
-  --test unit_root_event_cursors \
-  --test reviewer_counterexamples_stack3 \
-  --test reviewer_counterexamples_stack4 \
-  --test fsevents_incremental
+# The shipped build graph must not contain swamp-core's `testing`
+# feature (test-fixture API). Only `[dev-dependencies]` enable it, which
+# resolver 2 never unifies into a non-test build; this proves it for the
+# binary the release workflow packages (`crates/core/src/lib.rs`).
+step release-graph
+if cargo tree -p swamp -e normal,build,features --prefix none --locked |
+  grep -q 'swamp-core feature "testing"'; then
+  echo 'release graph: the swamp binary enables swamp-core/testing (test-fixture API)' >&2
+  exit 1
+fi
 
-# `--test-threads=1` here and nowhere else. This test measures through
-# the *process-global* work counters (`work_counters::reset` +
-# `snapshot`, which is what a whole-observation cost report needs) and
-# installs PATH shims to count subprocess spawns, so a sibling test
-# running beside it would be measured as its work. Every other test that
-# counts work uses `work_counters::measured`, whose sink is scoped to the
-# calling thread and the pools it starts, and therefore needs nothing
-# here -- including `reviewer_counterexamples_stack2`, which used to be
-# in this list because its spawn count came from a process-wide PATH
-# shim and a shared log file.
-cargo test -p swamp-core --locked "${target[@]}" \
-  --test reviewer_cost_measurement_stack3 \
-  -- --test-threads=1
-cargo test -p swamp-tui --locked "${target[@]}" --test scope_preserving_refresh \
-  --test reviewer_counterexamples_stack2_tui
+# Unit and integration tests, once. The cost test is left to
+# check-full.sh: it measures process-global counters and must run alone.
+step tests
+cargo test --workspace --locked "${target[@]}" -- \
+  --skip unchanged_observations_spaced_past_the_toosoon_floor
 
-# The capability gates' evidence, named explicitly: the compile-fail
-# case for every retired rule (built against the production API), and
-# every corpus, re-review 3 and re-review 4 mutation applied to a copy
-# of the workspace -- each must be rejected by the audit or compile
-# error its fixture names, never by a parse error or an incidental
-# failure -- plus the legitimate shapes, which must pass everything, and
-# the operator variants of both (docs/architecture.md, "Capability
-# gates").
-cargo test -p swamp-source-audit --locked "${target[@]}" --test compile_fail \
-  --test mutation_sweep
+# Named so a rename cannot silently drop them (the runtime halves of the
+# review guardrails). Test targets are discovered from these files, and
+# the run above already built and ran them; a `cargo test -p <crate>
+# --no-run` here would re-resolve features for one package and rebuild
+# half the graph for nothing. (`guardrail_metadata` separately proves
+# every guardrail's runtime tests exist, run and assert.)
+step named-targets
+for t in \
+  core/tests/reviewer_counterexamples \
+  core/tests/reviewer_counterexamples_123 \
+  core/tests/reviewer_counterexamples_stack2 \
+  core/tests/reviewer_counterexamples_stack3 \
+  core/tests/reviewer_counterexamples_stack4 \
+  core/tests/reviewer_cost_measurement_stack3 \
+  core/tests/coverage_changes_are_not_storage_changes \
+  core/tests/explicit_root_scope_exclusions \
+  core/tests/nested_artifact_evidence_is_delivered \
+  core/tests/upstream_citations_are_checked \
+  core/tests/execution_rechecks \
+  core/tests/token_binding \
+  core/tests/shared_history_ownership \
+  core/tests/store_contents_are_allowlisted \
+  core/tests/incremental_external_and_agent_measurement \
+  core/tests/agent_matrix_matches_docs \
+  core/tests/agent_storage_validation \
+  core/tests/agent_container_seams \
+  core/tests/unit_root_event_cursors \
+  core/tests/fsevents_incremental \
+  tui/tests/scope_preserving_refresh \
+  tui/tests/reviewer_counterexamples_stack2_tui \
+  source-audit/tests/compile_fail \
+  source-audit/tests/mutation_sweep; do
+  test -f "crates/$t.rs" || { echo "named test target crates/$t.rs is gone" >&2; exit 1; }
+done
 
+step greps
 # These checks intentionally fail obvious safety regressions in source
 # review: a raw recursive delete, and verdict vocabulary the tool never
 # applies to a path ("safe", "unused", "stale" are for the human to
@@ -147,3 +161,5 @@ if [ -n "$missing_spawn_counts" ]; then
 fi
 
 test -x scripts/check.sh
+test -x scripts/check-full.sh
+step done

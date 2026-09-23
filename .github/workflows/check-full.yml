@@ -1,0 +1,50 @@
+name: Check (full)
+
+# The full verification tier, `scripts/check-full.sh`: fmt, clippy, the
+# source audits, the shipped build graph, every unit and integration test
+# once, then the heavy harnesses once each (compile-fail cases, the
+# mutation sweep, the single-threaded cost test).
+#
+# macOS only on this branch. The Linux track (stack/15, stack/18) carries
+# `.github/workflows/ci.yml` with an Ubuntu 24.04 job; when this branch is
+# rebased onto it, that job should run `scripts/check-full.sh` too (and
+# with it the cost test's Linux contract, `linux_contract` in
+# `reviewer_cost_measurement_stack3.rs`), and this file can fold into it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: check-full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS arm64 (check-full)
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
+    timeout-minutes: 90
+    env:
+      # Test fixtures make git commits; never let them reach a signing
+      # agent on the runner.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        if: vars.LOCAL_MACOS_CI_ENABLED != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-full-macos-arm64
+
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh
