@@ -22,10 +22,10 @@ cargo fmt --all -- --check
 # deny the capability gate's lints, so a separate `--lib --bins` pass
 # would repeat work already done.
 step clippy
-cargo clippy --workspace --all-targets --locked "${target[@]}" -- -D warnings
+cargo clippy --workspace --all-targets --locked ${target[@]+"${target[@]}"} -- -D warnings
 
 step audits
-cargo run -q --locked "${target[@]}" -p swamp-source-audit
+cargo run -q --locked ${target[@]+"${target[@]}"} -p swamp-source-audit
 
 # The shipped build graph must not contain swamp-core's `testing`
 # feature (test-fixture API). Only `[dev-dependencies]` enable it, which
@@ -41,7 +41,7 @@ fi
 # Unit and integration tests, once. The cost test is left to
 # check-full.sh: it measures process-global counters and must run alone.
 step tests
-cargo test --workspace --locked "${target[@]}" -- \
+cargo test --workspace --locked ${target[@]+"${target[@]}"} -- \
   --skip unchanged_observations_spaced_past_the_toosoon_floor
 
 # Named so a rename cannot silently drop them (the runtime halves of the

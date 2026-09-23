@@ -17,13 +17,13 @@ step() { printf '\n== %s (%s)\n' "$1" "$(date +%H:%M:%S)"; }
 "$here/check.sh"
 
 step compile-fail
-cargo test -p swamp-source-audit --locked "${target[@]}" --test compile_fail -- --ignored
+cargo test -p swamp-source-audit --locked ${target[@]+"${target[@]}"} --test compile_fail -- --ignored
 
 step mutation-sweep
-cargo test -p swamp-source-audit --locked "${target[@]}" --test mutation_sweep -- --ignored
+cargo test -p swamp-source-audit --locked ${target[@]+"${target[@]}"} --test mutation_sweep -- --ignored
 
 step cost
-cargo test -p swamp-core --locked "${target[@]}" \
+cargo test -p swamp-core --locked ${target[@]+"${target[@]}"} \
   --test reviewer_cost_measurement_stack3 \
   -- --test-threads=1
 step done
