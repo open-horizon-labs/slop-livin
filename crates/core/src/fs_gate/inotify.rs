@@ -8,6 +8,7 @@
 
 #![allow(unsafe_code)]
 
+use crate::live_watch::{Kernel, Limits, RawEvent};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::RawFd;
