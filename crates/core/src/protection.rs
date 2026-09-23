@@ -250,9 +250,17 @@ pub fn protect_remove(swamp_dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The keep list's raw entries, for integration tests only (`testing`
+/// feature; no production build has it). The reviewers' counterexample
+/// files read the list through this name.
+#[cfg(feature = "testing")]
+pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
+    load_paths(swamp_dir)
+}
+
 /// The keep list as `swamp protect list` shows it; errors exactly as
 /// [`load_protect`] does.
-pub fn protect_list(swamp_dir: &Path) -> Result<ProtectListing> {
+pub fn protect_listing(swamp_dir: &Path) -> Result<ProtectListing> {
     Ok(ProtectListing(
         load_paths(swamp_dir)?
             .iter()

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        unsafe_code
+    )
+)]
+
 mod schedule;
 
 use anyhow::Result;
@@ -743,7 +752,10 @@ fn cmd_approve(plan_id: &str) -> Result<()> {
             }
         );
     }
-    let g = swamp_core::actions::approve(&swamp_dir(), plan_id, "human:cli")?;
+    // The human typed `swamp approve <plan>`: the reviewed CLI
+    // confirmation site (`.oh/guardrails/human-only-authorization.md`).
+    let confirmed = swamp_core::authority::HumanConfirmed::cli_command("human:cli");
+    let g = swamp_core::actions::approve_confirmed(&swamp_dir(), plan_id, &confirmed)?;
     println!(
         "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
         plan_id,
@@ -769,13 +781,16 @@ fn cmd_grant_add(
     let budget_bytes = parse_size_arg(budget)?;
     let expires_secs = swamp_core::growth::parse_duration_secs(expires)
         .ok_or_else(|| anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)"))?;
-    let g = swamp_core::actions::add_standing_grant(
+    // The human typed `swamp grant add …`: the reviewed CLI confirmation
+    // site (`.oh/guardrails/human-only-authorization.md`).
+    let confirmed = swamp_core::authority::HumanConfirmed::cli_command("human:cli");
+    let g = swamp_core::actions::add_standing_grant_confirmed(
         dir,
         predicate,
         budget_bytes,
         max_units,
         expires_secs,
-        "human:cli",
+        &confirmed,
     )?;
     println!(
         "grant {} added: delete where {} · budget {} · expires {}",
@@ -1046,13 +1061,12 @@ fn propose_unified(
         // *unknown*, and proposing against an empty keep list would
         // silently unprotect every artifact row
         // (`.oh/guardrails/protection-fails-closed.md`).
-        let protected = swamp_core::agents::protect_list(&store_dir)?;
-        let plan = swamp_core::actions::propose_checking_protection(
+        let plan = swamp_core::actions::propose_checking_store_protection(
             &r,
             parsed.as_ref(),
             &paths,
             "human:cli",
-            &protected,
+            &store_dir,
         )?;
         return save_and_print_plan(&store_dir, &plan, r.observed_at, json);
     }
@@ -1589,15 +1603,15 @@ fn main() -> Result<()> {
             json,
         } => {
             anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
-            let root = std::fs::canonicalize(root)?;
+            let root = swamp_core::fs_gate::canonicalize(root)?;
             anyhow::ensure!(
                 paths.is_empty() || (offset == 0 && within.is_none()),
                 "--path is an exact selection; do not combine it with --offset or --within"
             );
-            let within = within.map(std::fs::canonicalize).transpose()?;
+            let within = within.map(swamp_core::fs_gate::canonicalize).transpose()?;
             if let Some(within) = &within {
                 anyhow::ensure!(
-                    within.is_dir() && within.starts_with(&root),
+                    swamp_core::fs_gate::is_dir(within) && within.starts_with(&root),
                     "--within must be a directory inside the scan root"
                 );
             }
@@ -1811,15 +1825,13 @@ fn main() -> Result<()> {
                     println!("no longer protected: {}", resolved.display());
                 }
                 ProtectCmd::List { json } => {
-                    let paths = swamp_core::agents::protect_list(&store_dir)?;
+                    let listing = swamp_core::agents::protect_listing(&store_dir)?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&paths)?);
-                    } else if paths.is_empty() {
+                        println!("{}", serde_json::to_string_pretty(&listing)?);
+                    } else if listing.is_empty() {
                         println!("no protected agent-storage paths");
                     } else {
-                        for p in paths {
-                            println!("{}", p.display());
-                        }
+                        println!("{listing}");
                     }
                 }
             }
@@ -1835,7 +1847,7 @@ fn main() -> Result<()> {
                         "{}",
                         swamp_core::growth::load_config_checked(&dir)?.to_toml()
                     );
-                    if !path.exists() {
+                    if !swamp_core::fs_gate::exists(&path) {
                         eprintln!(
                             "(defaults; no file at {} — `swamp config init` writes one)",
                             path.display()
@@ -1843,12 +1855,14 @@ fn main() -> Result<()> {
                     }
                 }
                 ConfigAction::Init => {
-                    if path.exists() {
+                    if swamp_core::fs_gate::exists(&path) {
                         eprintln!("{} already exists; not overwriting", path.display());
                         std::process::exit(1);
                     }
-                    std::fs::create_dir_all(&dir)?;
-                    std::fs::write(&path, swamp_core::growth::GrowthConfig::default().to_toml())?;
+                    swamp_core::fs_gate::store::write_text(
+                        swamp_core::fs_gate::store::TextFile::Config { store: &dir },
+                        &swamp_core::growth::GrowthConfig::default().to_toml(),
+                    )?;
                     println!("wrote {}", path.display());
                 }
             }

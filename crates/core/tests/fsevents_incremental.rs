@@ -581,8 +581,13 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
                 .starts_with("last_report-")
         })
         .unwrap();
-    let blocker = cache.with_extension("tmp");
+    // The cache write publishes by renaming a sibling temp file over the
+    // cache path; a non-empty directory sitting at that path makes the
+    // rename fail, which is the failure this test needs.
+    fs::remove_file(&cache).unwrap();
+    let blocker = cache.clone();
     fs::create_dir(&blocker).unwrap();
+    fs::write(blocker.join("occupied"), b"x").unwrap();
     let source = CannedSource(incremental_plan(vec![], 77));
     let result = report_full_mode_with_source(
         &fx.root,
@@ -601,7 +606,7 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         "cache failure must propagate rather than advance replay past uncached evidence"
     );
     assert_eq!(fs::read(&sidecar).unwrap(), before);
-    fs::remove_dir(blocker).unwrap();
+    fs::remove_dir_all(blocker).unwrap();
     report_full_mode_with_source(
         &fx.root,
         None,

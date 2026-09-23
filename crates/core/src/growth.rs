@@ -1821,9 +1821,19 @@ pub fn stage_tracked_with_source(
     // first observation now takes the ordinary path below, whose replay
     // refuses with `no_stored_event_id` and whose checkpoint records the
     // current event id, so the second observation can replay.
+    //
+    // But a stored state that *does* carry a rules version and no anchor
+    // is not "no stored state" (re-review 4, C2): the pre-fix code's
+    // rules-changed branch wrote exactly that file, and so does a
+    // `--full`-only store. With the real FSEvents source the replay then
+    // refuses anyway; with the TUI's live plan (`LivePlanSource`) it did
+    // not, and the reclassification was skipped for good because the
+    // checkpoint stamps the current version. So a recorded version (any
+    // non-zero one) that differs forces the walk, anchor or not. `0` is
+    // "never recorded": a unit-root cursor file, or a first observation.
     let has_stored_state = prev_state.event_id.is_some() || prev_state.last_observed_at.is_some();
-    let rules_changed =
-        has_stored_state && prev_state.rules_version != crate::ecosystem::RULES_VERSION;
+    let rules_changed = prev_state.rules_version != crate::ecosystem::RULES_VERSION
+        && (prev_state.rules_version != 0 || has_stored_state);
     // Read once, ahead of either branch below: both a forced/rules-change
     // full walk and the ordinary incremental-or-full path need it to tell
     // "worktree confirmed gone" from "worktree access lost" (#42).
@@ -3496,10 +3506,13 @@ pub fn annotate_readonly_external(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    #[allow(unused_imports)]
+    use std::fs::{self, File};
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
         use super::*;
-    use std::fs;
         for artifact in [true, false] {
             let tmp = tempfile::tempdir()?;
             let dir = tmp.path();
@@ -3511,22 +3524,18 @@ mod tests {
             for i in 0..8 {
                 let path = next_seq_path(&delta_dir, "delta-");
                 if artifact {
-                    write_rows(
+                    StoredRow::write_for_test(
                         &path,
-                        &[StoredRow {
-                            project_id: "p".into(),
-                            worktree_id: "w".into(),
-                            kind: "BuildOutput".into(),
-                            rel_path: "target".into(),
-                            bytes: i,
-                            local_bytes: i,
-                            mtime_max: i,
-                            hardlinked: false,
-                            dedup_stale: false,
-                            present: i % 2 == 0,
-                            observed_at: i,
-                            regrowth_count: i as u32,
-                        }],
+                        &[StoredRow::for_test(
+                            "p",
+                            "w",
+                            "BuildOutput",
+                            "target",
+                            i,
+                            i % 2 == 0,
+                            i,
+                            i as u32,
+                        )],
                     )?;
                 } else {
                     write_file_rows(
@@ -3763,7 +3772,7 @@ mod tests {
             } else {
                 9
             };
-            write_parquet_batches_atomic(&out, schema, batches.iter().cloned().map(Ok), level)?;
+            crate::fs_gate::columns::write_parquet_atomic(&out, schema, batches.iter().cloned().map(Ok), level)?;
             let restored = ParquetRecordBatchReaderBuilder::try_new(File::open(&out)?)?
                 .with_batch_size(1_000_000)
                 .build()?
@@ -3947,7 +3956,7 @@ mod tests {
         .unwrap();
         assert_eq!(artifact_row(&projects).growth_bytes, None);
         let dir = volume_dir(tmp.path(), 1);
-        assert!(read_rows(&current_path(&dir)).unwrap()[0].dedup_stale);
+        assert!(read_rows(&current_path(&dir)).unwrap()[0].dedup_stale());
         let (_, totals) = history_series(&dir, 1000, 2, 2000);
         assert_eq!(totals, vec![Some(1000), None]);
         projects[0].worktrees[0].artifacts[0].dedup_stale = false;
@@ -4198,9 +4207,9 @@ mod tests {
         let current = read_rows(&current_path(&dir)).unwrap();
         let row = current
             .iter()
-            .find(|r| r.rel_path.contains("node_modules"))
+            .find(|r| r.rel_path().contains("node_modules"))
             .unwrap();
-        assert_eq!(row.rel_path, "node_modules");
-        assert!(!row.rel_path.starts_with('/'));
+        assert_eq!(row.rel_path(), "node_modules");
+        assert!(!row.rel_path().starts_with('/'));
     }
 }

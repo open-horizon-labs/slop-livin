@@ -483,7 +483,7 @@ pub fn propose(
     if units.iter().any(|u| u.cargo_group.is_some()) {
         for (i, a) in units.iter().enumerate() {
             for b in units.iter().skip(i + 1) {
-                if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                if crate::scope::overlapping(&a.path, &b.path) {
                     bail!(
                         "overlapping cleanup selections; select either parent or child, not both"
                     );
@@ -527,6 +527,37 @@ pub fn propose_checking_protection(
     proposed_by: &str,
     protected: &[PathBuf],
 ) -> Result<Plan> {
+    propose_refusing_protected(
+        report,
+        filter,
+        paths,
+        proposed_by,
+        report.store_dir.as_deref(),
+        protected,
+    )
+}
+
+/// [`propose_checking_protection`] against the protect list in
+/// `store_dir`, loaded fresh (an unreadable list refuses). What the CLI
+/// calls: it has no raw copy of the list to pass, and needs none.
+pub fn propose_checking_store_protection(
+    report: &Report,
+    filter: Option<&Filter>,
+    paths: &[PathBuf],
+    proposed_by: &str,
+    store_dir: &Path,
+) -> Result<Plan> {
+    propose_refusing_protected(report, filter, paths, proposed_by, Some(store_dir), &[])
+}
+
+fn propose_refusing_protected(
+    report: &Report,
+    filter: Option<&Filter>,
+    paths: &[PathBuf],
+    proposed_by: &str,
+    store_dir: Option<&Path>,
+    protected: &[PathBuf],
+) -> Result<Plan> {
     let mut plan = propose(report, filter, paths, proposed_by)?;
     // The caller's list is a convenience, never the authority. The PR
     // #123 review's counterexample: an unreadable `agent_protect.json`
@@ -535,7 +566,7 @@ pub fn propose_checking_protection(
     // exactly when protection state broke. When the report knows which
     // store it came from, protection is reloaded here and an error is a
     // refusal (`.oh/guardrails/protection-fails-closed.md`).
-    let live = match report.store_dir.as_deref() {
+    let live = match store_dir {
         Some(dir) => crate::protection::load_protect(dir)?,
         None => crate::protection::ProtectList::empty(),
     };
@@ -1176,7 +1207,7 @@ pub fn propose_agents(
     // versa).
     for (i, a) in plan_units.iter().enumerate() {
         for b in plan_units.iter().skip(i + 1) {
-            if a.path == b.path || a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+            if crate::scope::overlapping(&a.path, &b.path) {
                 bail!(
                     "overlapping agent-storage selections: {} and {} are nested (or identical); select either the parent or the child, not both",
                     a.path.display(),

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use swamp_core::entities::{id_for, now};
 use swamp_core::execution::Outcome;
 use swamp_core::grants::{Grant, Predicate, Verb, plan};
+use swamp_core::authority::{Authorized, HumanConfirmed};
 use swamp_core::ledger::Ledger;
 
 use crate::model::human_bytes;
@@ -71,8 +72,14 @@ pub struct WorktreeTerms {
 
 /// Human pressing Enter at the confirm summary is the authorization for
 /// this one plan (never the index, never an agent). Builds the plan and
-/// grant together since they are minted for the same keypress.
-pub fn authorize(units: &[MarkedUnit], actor: &str) -> (swamp_core::grants::Plan, Grant) {
+/// grant together since they are minted for the same keypress, from the
+/// [`HumanConfirmed`] the confirm dialog (`app.rs`, the one reviewed TUI
+/// confirmation site) minted.
+pub fn authorize(
+    units: &[MarkedUnit],
+    confirmed: &HumanConfirmed,
+) -> (swamp_core::grants::Plan, Grant) {
+    let actor = confirmed.actor();
     let plan_units = units
         .iter()
         .map(|u| swamp_core::grants::PlanUnit {
@@ -120,11 +127,12 @@ fn execute_one(
     unit: &MarkedUnit,
     _plan_unit: &swamp_core::grants::PlanUnit,
     grant: &Grant,
+    confirmed: &HumanConfirmed,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
 ) -> UnitResult {
+    let actor = confirmed.actor();
     if let Some(plan) = &unit.cargo_plan {
         let result = (|| -> Result<Outcome> {
             if !grant.created_outside_index
@@ -149,7 +157,7 @@ fn execute_one(
                 anyhow::bail!("Cargo plan already executed");
             }
             swamp_core::actions::save_plan(store, plan)?;
-            swamp_core::actions::approve(store, &plan.id, actor)?;
+            swamp_core::actions::approve_confirmed(store, &plan.id, confirmed)?;
             let result =
                 swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
             let outcome = result
@@ -196,7 +204,7 @@ fn execute_one(
                 anyhow::bail!("agent-storage plan already executed");
             }
             swamp_core::actions::save_plan(store, plan)?;
-            swamp_core::actions::approve(store, &plan.id, actor)?;
+            swamp_core::actions::approve_confirmed(store, &plan.id, confirmed)?;
             let result =
                 swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
             let outcome = result
@@ -225,10 +233,20 @@ fn execute_one(
             outcome: result.map_err(|e| e.to_string()),
         };
     }
+    // What the human confirmed: exactly this unit, under this dialog's
+    // grant. Every destructive step below borrows it.
+    let Some(auth) =
+        swamp_core::authority::authorize_confirmed(confirmed, &grant.id, &[unit.path.clone()])
+    else {
+        return UnitResult {
+            path: unit.path.clone(),
+            outcome: Err("not covered by the confirmation".into()),
+        };
+    };
     if let Some(terms) = &unit.worktree {
         return UnitResult {
             path: unit.path.clone(),
-            outcome: remove_worktree(unit, terms, grant, ledger, trash_root, actor)
+            outcome: remove_worktree(unit, terms, grant, &auth, ledger, trash_root, actor)
                 .map_err(|e| e.to_string()),
         };
     }
@@ -238,13 +256,14 @@ fn execute_one(
     if let Some(target) = &unit.docker {
         return UnitResult {
             path: unit.path.clone(),
-            outcome: remove_docker(unit, target, grant, ledger, actor).map_err(|e| e.to_string()),
+            outcome: remove_docker(unit, target, grant, &auth, ledger, actor)
+                .map_err(|e| e.to_string()),
         };
     }
     // Compiled outputs first, so a failure to copy them refuses the unit
     // before anything moves.
     let extra = if keep_executables {
-        match swamp_core::actions::preserve_executables(&unit.path, &unit.worktree_path) {
+        match swamp_core::actions::preserve_executables(&unit.path, &unit.worktree_path, &auth) {
             Ok(kept) => Some(serde_json::json!({
                 "preserved": kept.iter().map(|k| k.to.display().to_string()).collect::<Vec<_>>()
             })),
@@ -258,7 +277,7 @@ fn execute_one(
     } else {
         None
     };
-    let outcome = trash_path(unit, Verb::Delete, grant, ledger, trash_root, actor, extra)
+    let outcome = trash_path(unit, Verb::Delete, grant, &auth, ledger, trash_root, actor, extra)
         .map_err(|e| e.to_string());
     UnitResult {
         path: unit.path.clone(),
@@ -275,12 +294,12 @@ fn remove_docker(
     unit: &MarkedUnit,
     target: &swamp_core::docker::Removal,
     grant: &Grant,
+    auth: &Authorized,
     ledger: &Ledger,
     actor: &str,
 ) -> Result<Outcome> {
-    use std::time::Duration;
     swamp_core::docker::still_removable(target).map_err(|e| anyhow::anyhow!(e))?;
-    swamp_core::docker::remove(target, Duration::from_secs(30)).map_err(|e| anyhow::anyhow!(e))?;
+    swamp_core::docker::remove(target, auth, &unit.path).map_err(|e| anyhow::anyhow!(e))?;
     ledger.append(&swamp_core::ledger::ActionRecord {
         id: swamp_core::entities::new_id(),
         verb: Verb::Delete,
@@ -322,43 +341,37 @@ fn remove_docker(
 /// exists". Human confirmation authorizes removing *what was shown*; it
 /// does not authorize removing whatever happens to be at that path when
 /// the worker thread gets there.
+#[allow(clippy::too_many_arguments)]
 fn trash_path(
     unit: &MarkedUnit,
     verb: Verb,
     grant: &Grant,
+    auth: &Authorized,
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
     extra: Option<serde_json::Value>,
 ) -> Result<Outcome> {
     let path = &unit.path;
-    if std::fs::symlink_metadata(path).is_err() {
+    if swamp_core::fs_gate::symlink_metadata(path).is_err() {
         anyhow::bail!("path no longer exists");
     }
-    let fresh = swamp_core::recheck::reviewed_snapshot(path, unit.reviewed.as_ref())?;
-    let covered = swamp_core::recheck::covered_paths(&fresh);
     let store = ledger
         .path()
         .parent()
         .ok_or_else(|| anyhow::anyhow!("no store directory for the protect list"))?
         .to_path_buf();
-    swamp_core::recheck::live_protection(&store, &covered)?;
-    match swamp_core::recheck::member_occupancy(&covered) {
-        swamp_core::occupancy::OccupancyState::Free => {}
-        swamp_core::occupancy::OccupancyState::Occupied(member) => {
-            anyhow::bail!("refused: {} is open", member.display())
-        }
-        swamp_core::occupancy::OccupancyState::Unknown(reason) => {
-            anyhow::bail!(
-                "refused: could not check whether {} is in use ({reason})",
-                path.display()
-            )
-        }
-    }
+    // Identity + membership, protection loaded fresh in both directions,
+    // and tri-state occupancy of every member: all three, or no proof,
+    // and without a proof there is nothing `trash_move` will take.
+    let proof = swamp_core::recheck::run_all(&store, path, unit.reviewed.as_ref(), &[])?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-    let dest = trash_root.join(format!("{name}-{}", now()));
-    std::fs::create_dir_all(trash_root)?;
-    std::fs::rename(path, &dest)?;
+    let dest = swamp_core::fs_gate::destroy::trash_move(
+        proof,
+        auth,
+        trash_root,
+        &format!("{name}-{}", now()),
+    )?;
     let mut evidence = serde_json::json!({
         "label": unit.label,
         "bytes": unit.bytes,
@@ -402,26 +415,16 @@ fn remove_worktree(
     unit: &MarkedUnit,
     terms: &WorktreeTerms,
     grant: &Grant,
+    auth: &Authorized,
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
 ) -> Result<Outcome> {
     let path = &unit.path;
-    let gitfile = path.join(".git");
-    let common: Option<PathBuf> = if !terms.whole_checkout && gitfile.is_file() {
-        std::fs::read_to_string(&gitfile).ok().and_then(|line| {
-            let gitdir = PathBuf::from(line.trim().strip_prefix("gitdir:")?.trim());
-            let gitdir = if gitdir.is_absolute() {
-                gitdir
-            } else {
-                path.join(gitdir)
-            };
-            let c = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-            let c = PathBuf::from(c.trim());
-            Some(if c.is_absolute() { c } else { gitdir.join(c) })
-        })
-    } else {
+    let common: Option<PathBuf> = if terms.whole_checkout {
         None
+    } else {
+        swamp_core::git::linked_common_dir(path)
     };
     let verb = if terms.whole_checkout {
         Verb::Archive
@@ -440,6 +443,7 @@ fn remove_worktree(
         unit,
         verb,
         grant,
+        auth,
         ledger,
         trash_root,
         actor,
@@ -451,11 +455,11 @@ fn remove_worktree(
         })),
     )?;
     if let Some(c) = common {
-        let _ = swamp_core::spawn::command("git")
-            .arg("-C")
-            .arg(c.parent().unwrap_or(&c))
-            .args(["worktree", "prune"])
-            .output();
+        let _ = swamp_core::fs_gate::destroy::git_worktree_prune(
+            auth,
+            path,
+            c.parent().unwrap_or(&c),
+        );
     }
     Ok(outcome)
 }
@@ -467,18 +471,18 @@ pub fn execute_plan(
     units: &[MarkedUnit],
     plan: &swamp_core::grants::Plan,
     grant: &Grant,
+    confirmed: &HumanConfirmed,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
 ) -> Vec<UnitResult> {
     execute_plan_progress(
         units,
         plan,
         grant,
+        confirmed,
         ledger,
         trash_root,
-        actor,
         keep_executables,
         |_, _, _| true,
     )
@@ -490,9 +494,9 @@ pub fn execute_plan_progress(
     units: &[MarkedUnit],
     plan: &swamp_core::grants::Plan,
     grant: &Grant,
+    confirmed: &HumanConfirmed,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
     mut progress: impl FnMut(usize, &Path, Option<bool>) -> bool,
 ) -> Vec<UnitResult> {
@@ -502,7 +506,7 @@ pub fn execute_plan_progress(
     {
         for (i, a) in units.iter().enumerate() {
             for b in units.iter().skip(i + 1) {
-                if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                if swamp_core::scope::overlapping(&a.path, &b.path) {
                     return units
                         .iter()
                         .map(|u| UnitResult {
@@ -521,7 +525,7 @@ pub fn execute_plan_progress(
         if !progress(i, &u.path, None) {
             break;
         }
-        let result = execute_one(u, pu, grant, ledger, trash_root, actor, keep_executables);
+        let result = execute_one(u, pu, grant, confirmed, ledger, trash_root, keep_executables);
         let keep_going = progress(i + 1, &u.path, Some(result.outcome.is_ok()));
         results.push(result);
         if !keep_going {
@@ -546,20 +550,7 @@ pub fn trash_root() -> PathBuf {
 /// Returns `None` if `df` cannot be read (kept read-only/advisory: a
 /// missing measurement never blocks or fakes the reported result).
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = swamp_core::spawn::command("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    // macOS `df -k`: Filesystem 1024-blocks Used Available Capacity ...
-    let available_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(available_kb * 1024)
+    swamp_core::actions::free_space_bytes(path)
 }
 
 /// Human summary line for the confirm banner: `delete 3 units · 1.9 GB
@@ -726,8 +717,11 @@ mod tests {
             "[package]\nname='fixture'\nversion='0.1.0'\n",
         )
         .unwrap();
+        // A fixture `git init`, counted like every spawn (the
+        // reviewer's `every_command_new_must_record_a_spawn`).
+        swamp_core::work_counters::record_spawn();
         assert!(
-            swamp_core::spawn::command("git")
+            std::process::Command::new("git")
                 .args(["init", "-q"])
                 .arg(&root)
                 .status()
@@ -757,18 +751,18 @@ mod tests {
         let mut marked = unit(selected.to_str().unwrap(), core_plan.planned_bytes(), None);
         marked.cargo_plan = Some(core_plan);
         let units = vec![marked];
-        let (plan, mut grant) = authorize(&units, "human");
+        let (plan, mut grant) = authorize(&units, &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
         let ledger = Ledger::open(store.path().join("ledger.jsonl")).unwrap();
         let trash = store.path().join("Trash");
         grant.created_outside_index = false;
         assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
+            execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false)[0]
                 .outcome
                 .is_err()
         );
         assert!(selected.exists());
         grant.created_outside_index = true;
-        let results = execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false);
+        let results = execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
         assert!(!selected.exists());
         assert!(
@@ -779,7 +773,7 @@ mod tests {
                 .any(|r| r.outcome == "completed")
         );
         assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
+            execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false)[0]
                 .outcome
                 .is_err()
         );
@@ -806,10 +800,10 @@ mod tests {
             warnings: Vec::new(),
             worktree: None,
         };
-        let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
+        let (plan, grant) = authorize(std::slice::from_ref(&unit), &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
         let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
         let trash = workdir.path().join("Trash");
-        let results = execute_plan(&[unit], &plan, &grant, &ledger, &trash, "human", false);
+        let results = execute_plan(&[unit], &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false);
 
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
@@ -871,16 +865,16 @@ mod tests {
                 unit(path.to_str().unwrap(), 7, None)
             })
             .collect();
-        let (plan, grant) = authorize(&units, "human");
+        let (plan, grant) = authorize(&units, &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
         let ledger = Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
         let mut events = Vec::new();
         let results = execute_plan_progress(
             &units,
             &plan,
             &grant,
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
             &ledger,
             &tmp.path().join("Trash"),
-            "human",
             false,
             |done, _, outcome| {
                 events.push((done, outcome));

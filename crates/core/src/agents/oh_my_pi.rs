@@ -484,8 +484,9 @@ fn identify_blobs(
         };
         let hash = entry.name.as_str();
         let note = if any_truncated {
-            "shared content-addressed blob; reference coverage unknown this pass (at least one \
-             session's body exceeded the scan bound) -- not offered for removal"
+            "shared content-addressed blob; reference coverage unknown this pass (a session \
+             listing was cut at its cap or could not be read, the container cap was reached, or \
+             a session's body exceeded the scan bound) -- not offered for removal"
                 .to_string()
         } else {
             match referenced.get(hash) {

@@ -272,10 +272,6 @@ enum OperationEvent {
     Failed(String),
 }
 
-fn ui_state_path(store: &std::path::Path) -> PathBuf {
-    store.join("ui_state.json")
-}
-
 /// What the TUI remembers between sessions: the applied filter and the
 /// sort. Both are choices a human made about how to look at their own
 /// machine; asking again every launch is the tool forgetting on purpose.
@@ -292,10 +288,13 @@ pub struct UiState {
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
-    std::fs::read_to_string(ui_state_path(store))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    swamp_core::fs_gate::store::read_json_bytes(swamp_core::fs_gate::store::JsonFile::UiState {
+        store,
+    })
+    .ok()
+    .flatten()
+    .and_then(|t| serde_json::from_slice(&t).ok())
+    .unwrap_or_default()
 }
 
 pub fn sort_from_str(s: &str) -> Sort {
@@ -737,10 +736,10 @@ impl App {
                 reverse: self.reverse,
                 keep_executables: self.keep_executables,
             };
-            let _ = std::fs::create_dir_all(store);
-            if let Ok(text) = serde_json::to_string_pretty(&state) {
-                let _ = std::fs::write(ui_state_path(store), text);
-            }
+            let _ = swamp_core::fs_gate::store::write_json(
+                swamp_core::fs_gate::store::JsonFile::UiState { store },
+                &state,
+            );
         }
     }
 
@@ -1156,9 +1155,7 @@ impl App {
             let candidate = PathBuf::from(&unit_id.0);
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
-                    if let Some(reason) =
-                        swamp_core::agents::protection_conflict(&protected, &candidate)
-                    {
+                    if let Some(reason) = protected.conflict(&candidate) {
                         self.set_refusal(&format!(
                             "human-protected path (swamp protect): {reason}; remove protection \
                              first if this unit should be actionable"
@@ -1413,7 +1410,7 @@ impl App {
         self.operation_rx = Some(rx);
         self.refusal = None;
         self.last_result = None;
-        std::thread::spawn(move || {
+        crate::worker::spawn(move || {
             if all {
                 worker.mark_all_in_view();
             } else if let Some(row) = row {
@@ -1563,9 +1560,12 @@ impl App {
         // A report started before these moves must not resurrect deleted rows.
         self.pending = None;
         self.observing = None;
-        let (plan, grant) = actions::authorize(&units, &self.actor);
+        // The one reviewed TUI confirmation site: this keypress, on the
+        // summary the human just read, is what authorizes these units
+        // (`.oh/guardrails/human-only-authorization.md`).
+        let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(&self.actor);
+        let (plan, grant) = actions::authorize(&units, &confirmed);
         let total = units.len();
-        let actor = self.actor.clone();
         let keep = self.keep_executables;
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1583,7 +1583,7 @@ impl App {
         self.confirm_open = false;
         self.last_result = None;
         self.refusal = None;
-        std::thread::spawn(move || {
+        crate::worker::spawn(move || {
             let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1598,9 +1598,9 @@ impl App {
                 &units,
                 &plan,
                 &grant,
+                &confirmed,
                 &ledger,
                 &trash,
-                &actor,
                 keep,
                 |completed, path, outcome| {
                     let _ = tx.send(OperationEvent::Progress {
@@ -1889,9 +1889,7 @@ impl App {
             .partition(|p| p.starts_with(&root));
         self.live_changes = rest;
         let changed: Vec<PathBuf> = mine.into_iter().collect();
-        let device = std::fs::metadata(&root)
-            .ok()
-            .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+        let device = swamp_core::fs_gate::device_of(&root);
         let plan = swamp_core::fs_events::FsEventsPlan::from_live(
             changed,
             self.live_last_event_id,
@@ -1908,8 +1906,10 @@ impl App {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let source = swamp_core::fs_events::testing::CannedSource(plan);
+        crate::worker::spawn(move || {
+            // The watcher's own changes, as a replay plan: a production
+            // source (`fs_events::LivePlanSource`), not a test double.
+            let source = swamp_core::fs_events::LivePlanSource::new(plan);
             // `ObservationParts::WALK_ONLY`, and `None` for both unit
             // vectors.
             //
@@ -1978,7 +1978,7 @@ impl App {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::worker::spawn(move || {
             // The same scope-aware entry point startup uses, with the
             // same exclusions and external pruning, and returning the
             // external/agent units from that same pass so the agent view

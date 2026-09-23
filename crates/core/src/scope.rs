@@ -820,6 +820,14 @@ pub fn under(candidate: &Path, ancestor: &Path) -> bool {
     candidate == ancestor || candidate.starts_with(ancestor)
 }
 
+/// Whether two selected paths overlap (one is, or lies beneath, the
+/// other): the "parent and child selected together" refusal the sinks
+/// apply before anything moves. Containment logic lives here and in
+/// `protection`, never in a sink module.
+pub fn overlapping(a: &Path, b: &Path) -> bool {
+    under(a, b) || under(b, a)
+}
+
 fn is_excluded(path: &Path, excludes: &[PathBuf]) -> Option<PathBuf> {
     excludes
         .iter()

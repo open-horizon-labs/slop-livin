@@ -3,6 +3,15 @@
 //! `swamp_core::report_with` `Report` the CLI uses; no second
 //! data path.
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        unsafe_code
+    )
+)]
+
 pub mod actions;
 pub mod app;
 pub mod filter;
@@ -10,6 +19,7 @@ pub mod model;
 pub mod picker;
 pub mod ui;
 pub mod units;
+pub mod worker;
 
 use anyhow::Result;
 use app::{App, ViewKind};
@@ -156,10 +166,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
 /// week of growth that was never observed.
 fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
     let now = swamp_core::entities::now();
-    let dev = std::fs::metadata(root).ok().map(|m| {
-        use std::os::unix::fs::MetadataExt;
-        m.dev()
-    })?;
+    let dev = swamp_core::fs_gate::device_of(root)?;
     let dir = store.join(dev.to_string());
     swamp_core::growth::history_span_secs(&dir, now)
 }
@@ -199,7 +206,7 @@ fn store_dir() -> PathBuf {
 
 pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     let store = store_dir();
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = swamp_core::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // The authorized scope for this invocation, resolved once with the
     // explicit root the user named. Every observation below -- the
     // startup walk, the background refresh, later live refreshes --
@@ -224,7 +231,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             a.scope = scope.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             let (scope2, store2) = (scope.clone(), store.clone());
-            std::thread::spawn(move || {
+            crate::worker::spawn(move || {
                 let Some(scope2) = scope2 else {
                     let _ = tx.send(Ok(app::RefreshedObservation {
                         per_root: Vec::new(),

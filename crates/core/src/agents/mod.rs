@@ -1736,8 +1736,10 @@ pub fn worktree_root_containing(path: &Path) -> Option<PathBuf> {
 
 // Human keep/protect intent lives in `crate::protection`; re-exported
 // here, where every caller has always found it.
+#[cfg(feature = "testing")]
+pub use crate::protection::protect_list;
 pub use crate::protection::{
-    ProtectList, ProtectListing, load_protect, protect_add, protect_list, protect_path,
+    ProtectList, ProtectListing, load_protect, protect_add, protect_listing, protect_path,
     protect_remove,
 };
 

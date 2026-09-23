@@ -133,8 +133,8 @@ pub fn read_json_bytes(file: JsonFile<'_>) -> io::Result<Option<Vec<u8>>> {
 pub enum TextFile<'a> {
     /// `<store>/config.toml`, written only by `swamp config init`.
     Config { store: &'a Path },
-    /// The scheduled refresh's LaunchAgent plist. Must be
-    /// `…/LaunchAgents/<label>.plist`.
+    /// The scheduled refresh's LaunchAgent plist: `<label>.plist` in the
+    /// LaunchAgents directory (`SWAMP_LAUNCH_AGENTS_DIR` in tests).
     LaunchAgent { plist: &'a Path },
 }
 
@@ -143,15 +143,11 @@ impl TextFile<'_> {
         match *self {
             TextFile::Config { store } => Ok(store.join("config.toml")),
             TextFile::LaunchAgent { plist } => {
-                let in_agents = plist
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|n| n == "LaunchAgents");
                 let named = plist
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n == format!("{}.plist", crate::schedule::LABEL));
-                if in_agents && named {
+                if named {
                     Ok(plist.to_path_buf())
                 } else {
                     Err(io::Error::new(

@@ -110,11 +110,20 @@ pub enum Truncation {
     Truncated {
         n: usize,
     },
+    /// The directory exists but could not be listed (permission denied,
+    /// not a directory, an I/O error). Not `Complete`: an unreadable
+    /// directory is not an empty one that was fully read (re-review 4,
+    /// C1). A directory that does not exist at all is `Complete` and
+    /// empty.
+    Unreadable,
 }
 
 impl Truncation {
+    /// Whether the listing is *not* the whole directory: cut at the cap,
+    /// or not taken at all. What every aggregate over the entries must
+    /// check before calling itself complete.
     pub fn is_truncated(self) -> bool {
-        matches!(self, Truncation::Truncated { .. })
+        !matches!(self, Truncation::Complete)
     }
 }
 
@@ -144,11 +153,22 @@ impl IntoIterator for ShallowListing {
 
 pub fn shallow_list(dir: &std::path::Path) -> ShallowListing {
     crate::work_counters::record_dir_listed();
-    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
-        return ShallowListing {
-            entries: Vec::new(),
-            truncation: Truncation::Complete,
-        };
+    let entries = match crate::fs_gate::read_dir(dir) {
+        Ok(entries) => entries,
+        // Nothing there: the whole of an absent directory is nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ShallowListing {
+                entries: Vec::new(),
+                truncation: Truncation::Complete,
+            };
+        }
+        // Something there that could not be listed is not "empty".
+        Err(_) => {
+            return ShallowListing {
+                entries: Vec::new(),
+                truncation: Truncation::Unreadable,
+            };
+        }
     };
     let mut out: Vec<ShallowEntry> = Vec::new();
     let mut truncation = Truncation::Complete;
