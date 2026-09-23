@@ -7,7 +7,12 @@ audit: sinks_have_no_path_predicates
 compile_fail:
   - protect_list_has_only_conflict
   - protect_list_has_no_default
+  - protect_changes_are_human_only
+  - protect_listing_is_display_only
 runtime_tests:
+  - crates/core/tests/token_binding.rs::a_protect_confirmation_names_one_change
+  - crates/core/tests/token_binding.rs::protection_is_read_from_the_authorizations_store
+  - protection_comes_from_the_confirmations_store_not_the_ledger_directory
   - crates/core/tests/reviewer_counterexamples.rs::protected_descendant_must_prevent_parent_cache_proposal
   - crates/core/tests/execution_rechecks.rs
   - crates/core/tests/evidence_action_recheck.rs::ordinary_unit_containing_protected_descendant_is_refused_at_proposal
@@ -54,11 +59,13 @@ Mechanism: type, gate audit, runtime test.
 
 **Type.** `protection::ProtectList` is opaque: its only query is `conflict(candidate)` (both directions), and a corrupt or unreadable protect file is an error, never an empty list -- the type has no `Default`, so `.unwrap_or_default()` on it does not compile.
 
-**Gate audit.** `sinks_have_no_path_predicates`: the execution sinks call no path containment method (`starts_with`, `strip_prefix`, `ancestors`) of their own, so a second, one-directional protection predicate cannot be written there.
+**Type (re-review 5, finding 7).** A keep-list change is human-only: `protect_add_confirmed`/`protect_remove_confirmed` spend a `HumanConfirmed::cli_protect` bound to exactly that change (minted only in the CLI's `cmd_protect`). The production listing, `ProtectListing`, is display-only (`Display`/`Serialize`, `len`, `is_empty`): no entries, no iterator, no containment query; the raw path list exists only under the `testing` feature. Protection at the sink is read from the store the `Authorized` token carries (the plan's store, or the TUI confirmation's resolved store) -- never from the ledger's directory, which is where the TUI used to look.
+
+**Gate audit.** `sinks_have_no_path_predicates`: the execution sinks call no path containment method (`starts_with`, `strip_prefix`, `ancestors`) of their own, so a second, one-directional protection predicate cannot be written there. `HumanConfirmed::cli_protect` is pinned to `cmd_protect`.
 
 Retired 2026-09-22: the `protection_fails_closed` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `protect_list_has_only_conflict`, `protect_list_has_no_default`.
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `protect_list_has_only_conflict`, `protect_list_has_no_default`, `protect_changes_are_human_only`, `protect_listing_is_display_only`.
 
 ## Runtime tests that complete it
 

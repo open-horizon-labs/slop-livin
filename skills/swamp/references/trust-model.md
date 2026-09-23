@@ -22,18 +22,25 @@ authorizing its own cleanup" -- the honest answer is "the agent is
 instructed not to, and the CLI call sites that can are few and
 reviewed, but nothing stops a shell from calling them directly."
 
-Concretely, only two call sites in the whole workspace are allowed to
-reach `swamp_core::actions::approve` / `add_standing_grant` /
-`revoke_grant`, and this is enforced by an AST-based source audit
-(`human_only_authorization` in `crates/source-audit`), not by a
-runtime check:
+Concretely, authorization is minted only through a `HumanConfirmed`
+token, and each of its constructors is allowed in exactly one function
+(enforced by the `gate_paths_only_inside_gates` source audit and by
+types, not by a runtime identity check):
 
-- The CLI's `cmd_approve`, `cmd_grant_add`, `cmd_grant_revoke`
-  functions (`crates/cli/src/main.rs`) -- reached by the
-  `swamp approve`/`swamp grant add`/`swamp grant revoke` subcommands.
-- The TUI's confirmed-execution path (`execute_one` in
-  `crates/tui/src/actions.rs`), reached only after the TUI's own
-  confirm-prompt UI flow.
+- The CLI's `cmd_approve` (binds the plan it just printed: its id and
+  content digest), `cmd_grant_add` (binds the typed terms) and
+  `cmd_protect` (binds one keep-list change), in
+  `crates/cli/src/main.rs`; `cmd_grant_revoke` is the one place
+  `revoke_grant` is called.
+- The TUI's `start_delete` (`crates/tui/src/app.rs`), reached only by
+  Enter on the confirm summary, which mints one confirmation per listed
+  unit; `execute_one` (`crates/tui/src/actions.rs`) spends each.
+
+A confirmation is spent once and refused for anything but what it
+names, and stored plans and grants carry a binding under the store's
+`authority.key`, so a hand-edited or copied plan or grant file is
+refused. None of this changes the point of this section: a shell that
+runs `swamp approve` reaches `cmd_approve` like a human does.
 
 That audit guarantees *which reviewed code path* mints or revokes
 authorization -- it says nothing about who or what process invokes

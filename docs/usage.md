@@ -570,6 +570,8 @@ swamp execute <plan-id> --keep-executables
 
 Proposing does not remove anything. Plans expire after 30 minutes and are single-use. Execution returns per-unit results; inspect refusals and failures as well as successful units.
 
+An approval covers the plan exactly as `swamp approve` printed it: the grant records the plan's content digest, and execution refuses a plan whose units changed since. Plans and grants are stored with a binding under the store's `authority.key`; a plan or grant file that was edited by hand, copied from another store, or written by an older swamp is refused by name (propose again, or re-add the standing grant). A `grants.json` with one such record refuses every execution until the record is removed.
+
 The plan's `created_at` is its review time. A unit's `observed_at` can be older when incremental replay reused an unchanged measurement; it is not restamped to pretend the data was remeasured.
 
 For repeated work, a human can create and revoke a bounded standing grant:

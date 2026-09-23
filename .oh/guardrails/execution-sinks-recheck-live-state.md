@@ -9,7 +9,14 @@ compile_fail:
   - recheck_proof_is_minted_only_by_run_all
   - recheck_proof_is_not_clone
   - recheck_proof_is_spent_once
+  - recheck_inputs_come_from_the_authorization
+  - capture_is_private_to_the_propose_path
+  - destructive_verbs_need_a_proof
+  - trash_receipt_is_minted_by_the_move
 runtime_tests:
+  - crates/core/tests/token_binding.rs::a_sidecar_member_replaced_after_review_refuses_the_session_removal
+  - crates/core/tests/token_binding.rs::destructive_verbs_refuse_what_the_proof_does_not_cover
+  - crates/core/tests/token_binding.rs::a_plan_and_grant_copied_into_another_store_do_not_load
   - crates/core/tests/reviewer_counterexamples.rs
   - crates/core/tests/execution_rechecks.rs
   - crates/core/src/recheck.rs
@@ -39,7 +46,7 @@ keeps a fourth sink from being written without it.
 
 Mechanism: type, gate audit, clippy, runtime test.
 
-**Type.** Every destructive operation (`fs_gate::destroy::{trash_move, Envelope}`, Docker removal, worktree prune) takes a `RecheckProof`, which only `recheck::run_all` mints (snapshot + live protection both directions + member occupancy, fail closed), which is not `Clone`, is consumed by the call, and is refused when older than `MAX_PROOF_AGE` or when it does not cover the path -- plus an `Authorized` token.
+**Type.** Every destructive operation (`fs_gate::destroy::{trash_move, Envelope, docker_remove}`, the `--keep-executables` copy) takes a `RecheckProof`, which only `recheck::run_all` mints (snapshot + live protection both directions + member occupancy, fail closed), which is not `Clone`, is consumed by the call (borrowed by the copy that precedes the move), and is refused when older than `MAX_PROOF_AGE` or when it does not cover the path -- plus an `Authorized` token. `git worktree prune` takes the `Trashed` receipt of the licensed move it follows. **`run_all` takes only the `Authorized` token** (re-review 5, finding 3): the anchor, the reviewed identity, each sidecar member with the identity recorded at proposal, the store protection is read from, and a Docker object's removal all come from the plan or confirmation, never from the sink; a store with no authority key refuses. `recheck::capture`/`reviewed_snapshot` are crate-private (the TUI's mark-time `capture_anchor` is pinned by the gate audit). Arguments of `docker rm`, the copy's destination and the prune's repository are built from the proof and the authorization, never passed in.
 
 **Gate audit.** `std::fs` removal and rename, `trash` and `libc` exist only in the gate; `fs_gate::destroy` and `recheck::run_all` may be named only by the execution sinks.
 
@@ -47,7 +54,7 @@ Mechanism: type, gate audit, clippy, runtime test.
 
 Retired 2026-09-22: the `execution_sinks_recheck_live_state` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `trash_move_needs_a_recheck_proof`, `recheck_proof_is_minted_only_by_run_all`, `recheck_proof_is_not_clone`, `recheck_proof_is_spent_once`.
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `trash_move_needs_a_recheck_proof`, `recheck_proof_is_minted_only_by_run_all`, `recheck_proof_is_not_clone`, `recheck_proof_is_spent_once`, and (re-review 5) `recheck_inputs_come_from_the_authorization`, `capture_is_private_to_the_propose_path`, `destructive_verbs_need_a_proof`, `trash_receipt_is_minted_by_the_move`.
 
 ## Runtime tests that complete it
 

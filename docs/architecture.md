@@ -311,7 +311,12 @@ resurrection as regrowth. Coverage changes are not storage changes.
 
 ### The recheck model at destructive sinks
 
-`crate::recheck` is the one live-state recheck every sink shares:
+`crate::recheck` is the one live-state recheck every sink shares.
+`run_all(&Authorized)` runs all three below and is the only way to get
+the `RecheckProof` a destructive call needs; every input it checks --
+the anchor, the reviewed identity, each sidecar member's identity
+recorded at proposal, the store whose protect list applies -- comes from
+the authorization, never from the sink:
 
 - `reviewed_snapshot(path, reviewed)` recomputes the anchor's `(device,
   inode)` and its membership and refuses on any drift. Membership is
@@ -1112,30 +1117,50 @@ which of the three below holds it.
 
 `crates/core/src/fs_gate/` is the only module in `crates/{core,cli,tui}`
 that names `std::fs`, `std::os::unix::fs`, unbounded `std::io` reads,
-`OpenOptions`, `std::process`, `libc`, `trash`, `tempfile`, `parquet` or
-`zstd` (the FSEvents FFI in `fs_events/macos.rs` is the one other gate
-module). It exposes narrowly typed capabilities, one submodule each:
+`OpenOptions`, `std::process`, `libc`, `trash`, `tempfile`, `parquet`,
+`zstd`, `gix` or any `gix_*` crate (the FSEvents FFI in
+`fs_events/macos.rs` is the one other gate module). It exposes narrowly
+typed capabilities, one submodule each:
 
 | capability | what the type requires |
 |---|---|
 | `fs_gate::read::bounded_read(path, BoundedCap)` | a named cap; the only read of user content |
-| `fs_gate::store::write_json(JsonFile, ..)`, `write_text(TextFile, ..)`, `append_line(LogFile, ..)` | a variant of the enum that *is* the allow-list of swamp's own files; the atomic writer is private |
+| `fs_gate::store::write_json(JsonFile, ..)`, `write_text(TextFile, ..)`, `append_line(LogFile, ..)` | a variant of the enum that *is* the allow-list of swamp's own files, each a fixed name inside a typed `StoreDir`; the ledger, observation log and LaunchAgent plist are resolved or name-checked in the gate; the atomic writer is private |
+| `fs_gate::key::authority_key(&StoreDir)` | the store's 32-byte key that binds plans and grants (`actions`, `authority`, `recheck` only) |
 | `fs_gate::columns::write_parquet_atomic(.., zstd_level)` | a zstd level; no codec parameter |
-| `fs_gate::spawn::run(Program, ..)` | a `Program` variant; counts the spawn, returns a finished `RunOutput`, refuses mutating verbs |
-| `fs_gate::destroy::{trash_move, Envelope, docker_remove, git_worktree_prune}` | a `RecheckProof` **and** an `Authorized` |
+| `fs_gate::spawn::run(Program, ..)` | a `Program` variant **and** one of that program's allow-listed argument shapes; counts the spawn, returns a finished `RunOutput` |
+| `fs_gate::git::{Repo, IgnoreLens}` | read-only gitoxide queries (HEAD, status, upstream, lock, ignore rules); no index, ref, lock or temp-file write |
+| `fs_gate::destroy::{trash_move, Envelope, docker_remove, copy_preserved}` | a `RecheckProof` **and** an `Authorized`; arguments (Docker id, copy destination) come from them |
+| `fs_gate::destroy::git_worktree_prune` | the `Trashed` receipt of the licensed move it follows, **and** an `Authorized` |
 | `fs_gate::symlink_metadata` / `metadata_following` | the caller says which; there is no plain `metadata` |
 
 The tokens are minted in exactly one place each, with private fields:
 
-- `recheck::RecheckProof` -- only `recheck::run_all` (reviewed snapshot,
-  live protection in both directions, member occupancy; fail closed). Not
-  `Clone`, `#[must_use]`, consumed by the destructive call, refused when
-  older than `MAX_PROOF_AGE` or when it does not cover the path.
-- `authority::Authorized` -- only `authorize` (a live grant a human
-  minted, within its budget) or `authorize_confirmed` (a
-  `HumanConfirmed`). `authority::HumanConfirmed` -- only
-  `cli_command`/`tui_dialog`; `approve_confirmed` and
-  `add_standing_grant_confirmed` require one.
+- `recheck::RecheckProof` -- only `recheck::run_all(&Authorized)`
+  (reviewed snapshot, each sidecar member's recorded identity, live
+  protection in both directions from the authorization's store, member
+  occupancy; for a Docker object, the daemon asked about exactly the
+  authorized removal; fail closed). Every input comes from the token,
+  none from the sink. Not `Clone`, `#[must_use]`, consumed by the
+  destructive call, refused when older than `MAX_PROOF_AGE` or when it
+  does not cover the path.
+- `authority::Authorized` -- only `authorize` (crate-private: a stored
+  grant, verified, covering the unit of a verified plan whose content
+  digest the grant recorded, within its budget) or `authorize_confirmed`
+  (one TUI confirmation, for the one path it names). It carries the
+  anchor, reviewed identity, sidecar member identities, store, Docker
+  removal, linked-worktree flag and preserve destination -- what the
+  human saw, copied from the plan or the confirmation.
+- `authority::HumanConfirmed` -- only `cli_approve(actor, &plan)`,
+  `cli_grant(actor, terms)`, `cli_protect(actor, change)` and
+  `tui_dialog(actor, store, items)`, each binding a **subject** (a
+  plan's id and content digest, standing-grant terms, one keep-list
+  change, one TUI unit). Spent by value (`approve_confirmed`,
+  `add_standing_grant_confirmed`, `protect_{add,remove}_confirmed`,
+  `authorize_confirmed`), refused when the subject or site is not
+  exactly what the consumer does.
+- `fs_gate::destroy::Trashed` -- only `trash_move`: the receipt `git
+  worktree prune` needs.
 - `bus::Stage` -- only `EventBus::run`; the walk and every pipeline stage
   take one, and `EventBus::new`/`register` are private to the registrar.
 - `report::DiscoveryPass` -- only `observe_scope`; external and agent
@@ -1151,17 +1176,59 @@ The tokens are minted in exactly one place each, with private fields:
   reason is one.
 
 Opaque types close the rest: `protection::ProtectList` answers only
-`conflict(candidate)`; `OccupancyState` is `#[must_use]` with no boolean
+`conflict(candidate)`, and `ProtectListing` (what `swamp protect list`
+prints) is display-only; `OccupancyState` is `#[must_use]` with no boolean
 view; `CandidateAgentUnit`'s deciding fields are private to its builder;
 `DetectorSummary`'s raw candidates are private to `scope`.
 
+### Provenance: what makes a plan or grant authorization
+
+Re-review 5 (2026-09-23) found the tokens sound and their *inputs* not:
+`authorize` accepted any `Plan`, `PlanUnit` and `Grant`, all three
+`pub`-field `Deserialize` structs, so a hand-built or hand-edited grant
+was as good as one a human minted; an approval covered a plan *id*,
+whatever the file under that id later held; and `run_all` rechecked a
+store, path, identity and member list the caller chose. Now:
+
+- **Records are bound.** `Plan` and `Grant` have fields private to
+  `actions` and are not `Deserialize`. On disk each record carries a
+  keyed blake3 MAC under the store's authority key
+  (`<store>/authority.key`, 32 random bytes, mode 0600, created on first
+  use). `load_plan` and `list_grants` -- the only code that builds one
+  from bytes -- recompute it and refuse an edited, copied or hand-written
+  record; one bad grant refuses the whole grants file (fail closed, as a
+  corrupt protect list does). A plan copied into another store does not
+  load there, so an execution always reads protection from the store its
+  plan and grant came from.
+- **Approvals bind content.** `Plan::content_digest` covers the id, root,
+  times, proposer and every unit (canonical JSON). `cli_approve` binds it
+  when the plan is shown; `approve_confirmed` refuses unless the stored
+  plan still has it; the one-shot grant records it; `authorize` refuses a
+  plan that no longer has it. Re-saving different content under an
+  approved id (the one public field, `Plan::id`, kept for the reviewers'
+  suites) is therefore not covered.
+- **Sidecars are reviewed.** A plan unit records the identity of every
+  member outside its anchor (a session's companion files, a Cargo
+  group's `.d`/`.dSYM`); `run_all` compares each one exactly as it does
+  the anchor. `recheck::capture` is crate-private.
+- **Limit, stated.** The key is readable by the user swamp runs as. A
+  process with that user's filesystem access that reimplements the MAC
+  can forge a record. The binding rules out every path that does not go
+  through swamp's own code: a hand edit, a JSON writer, a file from
+  another store, a helper that builds a record.
+
 Test-only entry points (`fs_events::testing`, `DiscoveryPass::for_tests`,
-`Stage::for_tests`, the string-actor `approve`, `From<&str> for Reason`)
-exist only under swamp-core's `testing` feature. The feature is enabled
-by the workspace's own dev-dependencies and by nothing a release builds;
-`lib.rs` refuses to compile a release build with it
-(`compile_error!`), and the gate audit rejects any non-dev dependency
-that enables it.
+`Stage::for_tests`, the string-actor `approve`/`add_standing_grant`,
+`protect_add`/`protect_remove`/`protect_list`, `recheck::capture` and
+`reviewed_snapshot`, `Plan::with_times_for_tests`, `From<&str> for
+Reason`) exist only under swamp-core's `testing` feature. The feature is
+enabled by the workspace's own dev-dependencies and by nothing a release
+builds: the gate audit rejects any non-dev dependency that enables it,
+and `scripts/check.sh` and the release workflow refuse a `swamp` build
+graph (`cargo tree -p swamp -e normal,build,features`) that contains it.
+Test builds have it on by design, `cargo test --release` included (the
+`compile_error!` that used to guard release builds also fired there, so
+the release workflow's own test step could not compile).
 
 Clippy is the type-resolved half of the path rules:
 `crates/{core,cli,tui}/clippy.toml` disallow the `std::fs`, `Path` I/O
@@ -1197,7 +1264,17 @@ resolved through `use` (globs, renames, `pub use`), `crate`/`super`/
   hold it, and `DiscoveryPass::begin`/`Stage::mint` only in their one
   function each; the TUI names only the scope-aware report entry points;
   no `unsafe` or `extern` outside the gate; no production dependency
-  enabling `testing`.
+  enabling `testing`. Since re-review 5 it also: loads every product
+  crate's build script as a module of its crate (and rejects one in a
+  crate it does not model); follows `include!` targets into the including
+  module and rejects a computed target or one outside the crate's
+  `src/`; rejects `#[allow]`/`#[expect]`/`#[warn]` of a gate lint
+  (`disallowed_methods`/`types`/`macros`, the `style`/`all` groups,
+  `unsafe_code`, `warnings`) outside the gate and the TUI's `worker`;
+  pins each `HumanConfirmed` constructor, `authorize` and
+  `authorize_confirmed` to one function by resolved path; and pins the
+  struct literals of `Plan`, `PlanUnit`, `Grant`, `Authorized`,
+  `HumanConfirmed`, `RecheckProof` and `Trashed` to their constructors.
 - `adapters_do_not_reach_gates` -- agent adapters reach I/O only through
   `IdentifyCtx`; never the environment (nor a path built from an absolute
   literal), detectors, actions or another tool's adapter; never print or
@@ -1247,6 +1324,27 @@ child module, macro wrap, constant hoisting, fn-item binding, a doc
 line mentioning `cfg(test)`) derive variants of every seed, and a
 variant must be rejected by one of its seed's own kinds -- or, for a
 legitimate seed, stay accepted.
+
+**Two tiers.** `scripts/check.sh` is the fast local tier (fmt, clippy
+over all targets once, the audits, the shipped build graph, every unit
+and integration test once). `scripts/check-full.sh` runs it and then the
+heavy harnesses, each exactly once: the compile-fail cases and the
+mutation sweep (both `#[ignore]`d, so `cargo test --workspace` does not
+run them, and run here with `--ignored`) and the single-threaded cost
+test. CI runs the full tier (`.github/workflows/check-full.yml`).
+
+**Trusted base.** What a reviewer must read, because no type or rule
+above holds it: `crates/core/src/fs_gate/` (all of it, `git` and `key`
+included), `fs_events/macos.rs`, the TUI's `worker.rs`, the constructor
+functions the audit pins (`actions::{propose, propose_external,
+propose_agents, unit_from_row, unit_from_external, unit_from_agent,
+plan_from_record, approve_confirmed, add_standing_grant_confirmed,
+list_grants, execute_with_trash_opts}`, `authority::{mint, authorize,
+authorize_confirmed}`, `recheck::run_all`, `destroy::trash_move`), the
+four confirmation handlers (`cmd_approve`, `cmd_grant_add`,
+`cmd_protect`, `start_delete`), and the audit and its clippy
+configuration themselves. Everything else is held by the compiler, the
+audit or a runtime test.
 
 **Limits.** Inside `growth`, the history module, the directory and file
 tables' Parquet writers are `pub(super)`: their current-plus-delta

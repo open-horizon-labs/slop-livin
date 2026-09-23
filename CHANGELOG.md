@@ -4,6 +4,60 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Token binding and gate hardening (re-review 5)
+
+- **Plans and grants are bound to swamp's own code.** Each stored plan
+  and grant carries a keyed blake3 binding under the store's new
+  `authority.key` (32 random bytes, mode 0600). An edited, copied or
+  hand-written plan or grant file is refused by name; one bad grant
+  refuses the whole grants file until it is removed. `Plan` and `Grant`
+  are no longer `Deserialize` and their fields are private (read
+  accessors: `plan.units()`, `unit.path()`, `grant.budget_bytes()`, ...).
+  Plans and grants written by earlier versions carry no binding and are
+  refused: propose and approve again (plans live 30 minutes; re-add
+  standing grants with `swamp grant add`).
+- **An approval covers what was shown.** `swamp approve` binds the plan's
+  id and content digest; the one-shot grant records the digest and the
+  confirmation it spent, and execution refuses a plan whose content no
+  longer matches. Standing-grant confirmations bind their terms.
+- **Confirmations are single-use and name their subject.**
+  `HumanConfirmed::cli_approve`, `cli_grant`, `cli_protect` and
+  `tui_dialog` replace `cli_command`/`tui_dialog(actor)`; each is minted
+  only in its handler (`cmd_approve`, `cmd_grant_add`, `cmd_protect`, the
+  TUI's `start_delete`) and spent by value. The TUI mints one per marked
+  unit.
+- **The live recheck takes its inputs from the authorization.**
+  `recheck::run_all(&Authorized)`: the anchor, reviewed identity, the
+  store protection is read from, and every sidecar member's identity
+  (now recorded at proposal and compared at the sink) come from the plan
+  or confirmation. The TUI no longer reads protection from the ledger's
+  directory (`SWAMP_LEDGER_PATH` pointed it elsewhere).
+- **`swamp protect add|remove` is human-only** (`protect_*_confirmed`);
+  the production listing is display-only.
+- **Gate pass-throughs closed.** Store files take a typed `StoreDir` and a
+  fixed name; the ledger appends only to a `ledger.jsonl`, the plist and
+  log locations are resolved in the gate. `spawn::run` is a per-program
+  allow-list of argument shapes (a GraphQL mutation, `git -c`, `docker
+  --host`, `kill -9` are refused without spawning). `docker rm`, the
+  `--keep-executables` copy and `git worktree prune` take a recheck proof
+  (or the receipt of the move one licensed) and build their arguments
+  from it.
+- **gitoxide is inside the gate** (`fs_gate::git`, read-only queries);
+  `gix` and every `gix_*` crate are gate paths for the audit and clippy.
+- **The audit sees hidden code.** It loads build scripts, follows
+  `include!` targets (rejecting a computed one or one outside `src/`),
+  rejects a lowered gate lint outside the gate, and pins token and
+  record struct literals to their constructors.
+- **Release test build.** The `testing` feature's `compile_error!` fired
+  for `cargo test --release`, which the release workflow runs; it is
+  replaced by a check of the shipped build graph (`cargo tree -p swamp -e
+  normal,build,features`) in `scripts/check.sh` and the release workflow.
+- **Two check tiers.** `scripts/check.sh` is the fast tier (every step
+  once); `scripts/check-full.sh` adds the compile-fail cases, the
+  mutation sweep (both now `#[ignore]`d in `cargo test --workspace`) and
+  the single-threaded cost test, each once. New macOS CI job:
+  `.github/workflows/check-full.yml`.
+
 ### Capability gates
 
 - Guardrail semantics moved from source audits into types.
