@@ -4,6 +4,45 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Capability gates
+
+- Guardrail semantics moved from source audits into types.
+  `crates/core/src/fs_gate/` is the only code in core, cli and tui that
+  touches the filesystem or starts a process. Clippy's
+  `disallowed_methods`/`disallowed_types` and the gate audit enforce
+  this. Destructive operations take a `RecheckProof` (minted only by
+  `recheck::run_all`, not `Clone`, consumed, time-limited) and an
+  `Authorized` token (minted only by `authority::authorize` or a human
+  confirmation). Spawns name a `Program` variant and are always counted.
+  Content reads take a named `BoundedCap`. JSON goes only to a `JsonFile`
+  variant.
+- More invariants are now tokens with private constructors: `bus::Stage`,
+  `report::DiscoveryPass`, `attribution::Classified`,
+  `PermittedDetectors`, the history store's `Owned` claim, and
+  `evidence::Reason`. Every `FactStatus` reason is now a `Reason`, which
+  cannot be blank. `ProtectList` is opaque (`conflict` only), and
+  `OccupancyState` has no boolean view.
+- Test-only entry points (`fs_events::testing`, string-actor approval,
+  `From<&str> for Reason`) moved behind swamp-core's `testing` feature,
+  which release builds refuse. The TUI live refresh replays a real
+  `LivePlanSource`.
+- The 45 semantic audits are retired. Eleven exact rules remain
+  (`cargo run -p swamp-source-audit --list`), running on the module tree
+  the compiler builds: orphan files, `#[path]`, `unsafe` and `extern`
+  outside the gate are rejected. Each retired rule has a trybuild
+  compile-fail case in `crates/core/tests/compile_fail/`. Each guardrail's
+  Detection section names its mechanism.
+- `crates/source-audit/tests/mutation_sweep.rs` replaces the corpus and
+  operator harnesses. Each fixture passes only if the kind it names
+  rejects it: an audit, or a compile error inside the mutation's own
+  lines. Parse errors never count. Accept fixtures must pass everything.
+- Fixed: `shallow_list` on an unreadable directory reports `Unreadable`,
+  not an empty complete listing (C1). An older rules version with no
+  stored anchor now takes a full walk instead of an incremental one (C2).
+  The TUI merges per-root reports on its observation workers, not its
+  event thread. The spawn oracle in the cost test now shims every
+  `Program` (`git`, `gh`, `df`, `id`, `launchctl`, ...).
+
 ### Audit rule redesign
 
 - Every source audit is now a rule over a whole-program model

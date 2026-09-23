@@ -1,4 +1,5 @@
 //! target: crates/core/src/agents/aider.rs
+//! by: compile:private-fields-literal
 //! why: sweep slip -- `use super::CandidateAgentUnit as Unit; Unit { protected: false, .. }`
 use super::CandidateAgentUnit as Unit;
 pub fn sweep_unit_literal(path: std::path::PathBuf) -> Unit {

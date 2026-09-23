@@ -1555,17 +1555,12 @@ pub use crate::protection::{
 // depends on. `crate::occupancy::probe_path` is the existing seam.
 // ---------------------------------------------------------------------
 
-/// Fail-closed: anything but [`crate::occupancy::OccupancyState::Free`]
-/// is active. **Never a sink's gate** -- it collapses `Unknown` into
-/// `Occupied` and cannot say why; sinks use
-/// `crate::recheck::member_occupancy` (audited by
-/// `occupancy_is_tristate_at_sinks`).
-pub fn is_active(path: &Path) -> bool {
-    !matches!(
-        crate::occupancy::probe_path(path),
-        crate::occupancy::OccupancyState::Free
-    )
-}
+/// The boolean occupancy view, for test fixtures only (`testing`
+/// feature): it collapses `Unknown` into `Occupied` and cannot say why,
+/// so no production code may have it -- sinks take occupancy only
+/// through `recheck::run_all`.
+#[cfg(any(test, feature = "testing"))]
+pub use crate::occupancy::is_active;
 
 // ---------------------------------------------------------------------
 // Discovery orchestration

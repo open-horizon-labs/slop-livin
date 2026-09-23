@@ -3,8 +3,7 @@ id: tui-refresh-preserves-scope
 severity: hard
 statement: "Every TUI observation -- startup, background refresh, live watch, post-action re-observe -- goes through the scope-aware report path. Excluded subtrees and pruned external locations stay absent on refresh. External/agent unit vectors are refreshed only from an observation that covered the whole scope; a refresh narrowed to one root asks for no unit parts and leaves those vectors alone."
 outcome: coverage-aware-storage-history
-audit: none
-audit_none_reason: "2026-09-22: which report entry point the TUI calls is checked by the runtime tests, which drive every refresh path against a scoped store"
+audit: gate_paths_only_inside_gates
 compile_fail:
   - fs_events_testing_is_not_in_production
 runtime_tests:
@@ -32,7 +31,9 @@ render.
 
 ## Detection
 
-Mechanism: type, runtime test.
+Mechanism: type, gate audit, runtime test.
+
+**Gate audit.** `gate_paths_only_inside_gates`: the TUI may name only `report::observe_scope`, `load_last_report` and `merge_reports` among the report module's functions; a scopeless entry point (`report_full_mode`, `report_scope_with_parts`, a new `report_quick(root)`) named from the TUI is rejected.
 
 **Runtime test.** The refresh tests start each TUI observation (startup, background, live) against a scope with an excluded subtree and a pruned external location and assert they stay absent, and that a one-root live refresh leaves the unit vectors alone.
 

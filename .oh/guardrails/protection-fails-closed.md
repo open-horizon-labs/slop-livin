@@ -6,6 +6,7 @@ outcome: decision-relevant-storage-evidence
 audit: sinks_have_no_path_predicates
 compile_fail:
   - protect_list_has_only_conflict
+  - protect_list_has_no_default
 runtime_tests:
   - crates/core/tests/reviewer_counterexamples.rs::protected_descendant_must_prevent_parent_cache_proposal
   - crates/core/tests/execution_rechecks.rs
@@ -51,13 +52,13 @@ any name.
 
 Mechanism: type, gate audit, runtime test.
 
-**Type.** `protection::ProtectList` is opaque: its only query is `conflict(candidate)` (both directions), and a corrupt or unreadable protect file is an error, never an empty list.
+**Type.** `protection::ProtectList` is opaque: its only query is `conflict(candidate)` (both directions), and a corrupt or unreadable protect file is an error, never an empty list -- the type has no `Default`, so `.unwrap_or_default()` on it does not compile.
 
 **Gate audit.** `sinks_have_no_path_predicates`: the execution sinks call no path containment method (`starts_with`, `strip_prefix`, `ancestors`) of their own, so a second, one-directional protection predicate cannot be written there.
 
 Retired 2026-09-22: the `protection_fails_closed` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `protect_list_has_only_conflict`.
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `protect_list_has_only_conflict`, `protect_list_has_no_default`.
 
 ## Runtime tests that complete it
 

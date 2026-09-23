@@ -1,4 +1,5 @@
 //! target: crates/core/src/growth.rs
+//! by: compile:E0616
 //! why: the ownership guard is earlier in the body but not the condition of the write
 pub fn sweep_guard_elsewhere(
     ownership: &ObservationOwnership,

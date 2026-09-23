@@ -1,4 +1,5 @@
 //! target: crates/core/src/agents/gemini_cli.rs
+//! by: compile:private-fields-literal
 //! why: the original forbidden shape must still be rejected
 pub fn sweep_plain_literal(path: std::path::PathBuf) -> super::CandidateAgentUnit {
     super::CandidateAgentUnit {

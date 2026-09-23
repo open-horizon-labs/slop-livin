@@ -4,7 +4,7 @@ error[E0624]: associated function `begin` is private
   |     let _b = DiscoveryPass::begin();
   |                             ^^^^^ private associated function
   |
- ::: $WORKSPACE/crates/core/src/report.rs
+ ::: $WORKSPACE/crates/core/src/report/pass.rs
   |
-  |     fn begin() -> DiscoveryPass {
-  |     --------------------------- private associated function defined here
+  |     pub(super) fn begin() -> DiscoveryPass {
+  |     -------------------------------------- private associated function defined here

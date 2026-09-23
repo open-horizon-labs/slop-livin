@@ -24,6 +24,7 @@ tempfile.workspace = true
 # enables `testing` through its self dev-dependency).
 swamp-core = { path = "../core" }
 trybuild = "1"
+serde_json.workspace = true
 
 [lints]
 workspace = true

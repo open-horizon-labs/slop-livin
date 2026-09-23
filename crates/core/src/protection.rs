@@ -177,9 +177,9 @@ fn load_paths(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
 /// empty keep list -- the ordinary "nothing protected yet" case. A file
 /// that exists but cannot be read or parsed is **not**: protection state
 /// is then *unknown*, and every caller must fail closed rather than
-/// proceed as if nothing were protected. Returning `Result` (and the
-/// `protection_fails_closed` audit forbidding `.unwrap_or_default()` and
-/// friends on it) is what makes that structural instead of a convention.
+/// proceed as if nothing were protected. Returning `Result` -- with no
+/// `Default` for `ProtectList`, so `.unwrap_or_default()` does not
+/// compile -- is what makes that structural instead of a convention.
 pub fn load_protect(swamp_dir: &Path) -> Result<ProtectList> {
     Ok(ProtectList {
         paths: load_paths(swamp_dir)?,

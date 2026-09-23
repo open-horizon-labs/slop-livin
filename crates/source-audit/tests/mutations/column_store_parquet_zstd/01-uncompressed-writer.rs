@@ -1,4 +1,5 @@
 //! target: crates/core/src/store.rs
+//! by: audit:gate_paths_only_inside_gates
 //! why: a Parquet writer that declares no compression -- the column store's size claim quietly stops holding
 pub fn sweep_write_uncompressed(
     path: &std::path::Path,

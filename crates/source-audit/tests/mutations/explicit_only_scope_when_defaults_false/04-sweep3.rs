@@ -1,5 +1,6 @@
 //! target: crates/core/src/scope.rs
 //! mode: append
+//! by: audit:gate_paths_only_inside_gates, compile:clippy::disallowed_methods
 //! why: re-review 3 sweep -- a second scope resolver that infers detectors without asking `detectors_permitted` (blind spot: the guard is required only in functions named exactly `resolve_effective_scope`)
 /// Sweep: explicit-only scope, resolved by a second entry point.
 pub fn resolve_effective_scope_for_root(

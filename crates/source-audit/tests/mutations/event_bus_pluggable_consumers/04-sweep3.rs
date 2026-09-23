@@ -1,5 +1,6 @@
 //! target: crates/core/src/consumers/mod.rs
 //! mode: append
+//! by: compile:E0050
 //! why: re-review 3 sweep -- a consumer defined in consumers/mod.rs: it names the bus, registers at run time and is never in with_builtins (blind spot: `consumer_files` filters out `/mod.rs`, so the whole umbrella is blind to a consumer that lives there)
 /// Sweep: a consumer the bus audits cannot see.
 #[derive(Default)]

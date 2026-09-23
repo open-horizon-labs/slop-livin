@@ -1,5 +1,7 @@
 //! target: crates/core/src/report.rs
-//! why: the history stage written straight from the report path, bypassing the consumer that owns it
-pub fn sweep_direct_history(dir: &std::path::Path) {
-    let _ = crate::growth::observe_and_annotate_dirs(dir, &[], 1_000, 30);
+//! by: compile:E0061
+//! ported: 2026-09-22 -- the history writers now take the `bus::Stage` too; everything else as the real signature
+//! why: a history write from report assembly, off the bus
+fn sweep_direct_history(dir: &std::path::Path, rows: &mut [crate::report::DirRollup]) {
+    let _ = crate::growth::observe_and_annotate_dirs(dir, 1, rows, 1_000, 30, 3600);
 }

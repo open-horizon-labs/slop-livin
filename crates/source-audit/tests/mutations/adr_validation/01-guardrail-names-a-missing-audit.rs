@@ -1,5 +1,6 @@
 //! target: .oh/guardrails/no-second-traversal-on-report-path.md
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: a guardrail whose `audit:` names nothing that exists -- the guardrail reads as watched and is not
 ---
 id: no-second-traversal-on-report-path

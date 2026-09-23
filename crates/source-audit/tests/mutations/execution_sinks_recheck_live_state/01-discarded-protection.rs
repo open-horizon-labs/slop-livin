@@ -1,4 +1,5 @@
 //! target: crates/core/src/actions.rs
+//! by: audit:gate_paths_only_inside_gates, compile:E0603
 //! why: sweep slip -- `let _ = recheck::live_protection(..)` keeps the call and throws the answer away
 pub fn execute_sweep_mutation_a(dir: &std::path::Path, path: &std::path::Path) -> anyhow::Result<()> {
     let _ = crate::recheck::reviewed_snapshot(path, None);

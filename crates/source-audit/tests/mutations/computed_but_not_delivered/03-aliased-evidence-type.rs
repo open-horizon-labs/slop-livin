@@ -1,4 +1,5 @@
 //! target: crates/core/src/agents/mod.rs
+//! by: audit:no_unreferenced_public_items
 //! why: alias/rename variant -- the field's declared type is renamed, so a "type mentions Evidence" needle would miss it
 use crate::evidence::Evidence as SweepFact;
 

@@ -560,38 +560,27 @@ pub fn render_kinds(report: &Report) -> String {
 /// with the literal human command to remove it. Never executed by this
 /// tool -- the text is printed for a person to run themselves.
 pub fn render_worktrees(report: &Report, filter: &crate::filter::Filter) -> String {
-    use crate::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
+    use crate::github::{GithubFacts, MergeComplete, PrStatus, TriState};
     let mut out = String::new();
     let mut shown = 0usize;
     let empty_pr = PrStatus::Unknown;
     for project in &report.projects {
         for wt in &project.worktrees {
-            let (pr, verdict, merge_complete_terms, merged) = match (&wt.github, &wt.merge_complete)
-            {
+            let (pr, verdict, merge_complete_terms) = match (&wt.github, &wt.merge_complete) {
                 (
-                    Some(GithubFacts {
-                        pull_request,
-                        merged,
-                        ..
-                    }),
+                    Some(GithubFacts { pull_request, .. }),
                     Some(MergeComplete { verdict, terms }),
-                ) => (pull_request, *verdict, Some(terms.clone()), merged),
-                (
-                    Some(GithubFacts {
-                        pull_request,
-                        merged,
-                        ..
-                    }),
-                    None,
-                ) => (pull_request, TriState::Unknown, None, merged),
-                (None, _) => (&empty_pr, TriState::Unknown, None, &MergedStatus::Unknown),
+                ) => (pull_request, *verdict, Some(terms.clone())),
+                (Some(GithubFacts { pull_request, .. }), None) => {
+                    (pull_request, TriState::Unknown, None)
+                }
+                (None, _) => (&empty_pr, TriState::Unknown, None),
             };
 
             let facts = crate::filter::WorktreeFacts {
                 merge_complete: verdict == TriState::Yes,
                 idle_secs: wt.idle_secs,
                 pr,
-                merged,
             };
             if !filter.matches_worktree(project, wt, &facts) {
                 continue;

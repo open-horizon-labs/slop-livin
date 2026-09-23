@@ -273,7 +273,7 @@ fn shallow_parallel_measurement_counts_allocations_without_following_links_or_ch
 /// pruned directory is never entered, so nothing under it is ever
 /// discovered as a worktree. Excluded, not partially observed -- the
 /// coverage region for it is `Excluded`, never `Missing`/`Partial`.
-pub fn discover_parallel_excluding(
+fn discover_parallel_excluding(
     root: &Path,
     excluded: &[PathBuf],
 ) -> Result<Vec<DiscoveredWorktree>> {
@@ -556,32 +556,10 @@ pub struct DirStamp {
     pub ctime_ns: i64,
 }
 
-/// Parallel equivalent of `attribution::attribute`: same classification
-/// table, same nearest-containing-worktree attribution (by longest path
-/// prefix over the full `worktrees` list, computed once up front —
-/// unlike discovery, attribution never changes what worktrees exist
-/// while it runs), same hardlink dedup, same one-`Source`-row-per-worktree
-/// fold at the end.
-pub fn attribute_parallel(
-    root: &Path,
-    worktrees: &[(&Path, &str)],
-    observed_at: u64,
-    large_file_min_bytes: u64,
-) -> AttributionResult {
-    attribute_parallel_carrying(
-        root,
-        worktrees,
-        observed_at,
-        large_file_min_bytes,
-        HashMap::new(),
-        &[],
-    )
-}
-
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
 /// `AttrShared::carry`) and a set of subtrees to prune (#42), for the
 /// full-walk and incremental paths respectively.
-pub fn attribute_parallel_carrying(
+fn attribute_parallel_carrying(
     root: &Path,
     worktrees: &[(&Path, &str)],
     observed_at: u64,
@@ -1211,6 +1189,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 /// walk) is an accepted, documented trade for not having to carry the
 /// whole tree's inode set forward between observations.
 pub fn attribute_one_worktree(
+    _stage: &crate::bus::Stage,
     worktree_root: &Path,
     all_worktrees: &[(&Path, &str)],
     observed_at: u64,

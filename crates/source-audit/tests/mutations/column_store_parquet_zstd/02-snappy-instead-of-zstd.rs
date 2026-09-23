@@ -1,4 +1,5 @@
 //! target: crates/core/src/growth.rs
+//! by: audit:gate_paths_only_inside_gates
 //! why: a second writer choosing a different codec, so "parquet + zstd" becomes true of only some tables
 pub fn sweep_write_snappy(
     path: &std::path::Path,

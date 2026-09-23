@@ -448,25 +448,9 @@ enum GrantCmd {
 }
 
 fn parse_size_arg(s: &str) -> Result<u64> {
-    let t = s.trim().to_uppercase();
-    let (num, mult) = if let Some(n) = t.strip_suffix("TB") {
-        (n, 1_000_000_000_000u64)
-    } else if let Some(n) = t.strip_suffix("GB") {
-        (n, 1_000_000_000)
-    } else if let Some(n) = t.strip_suffix("MB") {
-        (n, 1_000_000)
-    } else if let Some(n) = t.strip_suffix("KB") {
-        (n, 1_000)
-    } else if let Some(n) = t.strip_suffix('B') {
-        (n, 1)
-    } else {
-        (t.as_str(), 1)
-    };
-    let v: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    Ok((v * mult as f64) as u64)
+    // The one size parser (`filter::parse_size`): decimal and binary
+    // units, the same base the formatter prints in.
+    swamp_core::filter::parse_size(s).ok_or_else(|| anyhow::anyhow!("bad size {s:?}"))
 }
 
 fn print_plan(plan: &swamp_core::actions::Plan) {

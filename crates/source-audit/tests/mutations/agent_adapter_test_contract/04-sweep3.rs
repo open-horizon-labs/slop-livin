@@ -1,5 +1,6 @@
 //! target: crates/core/src/agents/mod.rs
 //! mode: append
+//! by: audit:guardrail_metadata
 //! why: re-review 3 sweep -- a new adapter with none of the five required tests -- their names appear only in a doc comment (blind spot: `defines_running_test` is a raw text search for `fn <name>(`, so a comment, a string or a doc line satisfies the contract)
 pub mod sweep_tool;
 //! file: crates/core/src/agents/sweep_tool.rs

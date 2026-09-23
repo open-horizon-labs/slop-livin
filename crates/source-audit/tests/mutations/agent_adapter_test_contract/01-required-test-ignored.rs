@@ -1,5 +1,6 @@
 //! target: crates/core/src/agents/aider.rs
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: sweep slip -- a required test that is `#[ignore]`d still resolves by name, so the contract reads as met and nothing runs
 pub const AIDER_TOOL_ID: &str = "aider";
 

@@ -1,4 +1,5 @@
 //! target: crates/core/src/report.rs
+//! by: audit:no_unreferenced_public_items
 //! why: populated, but `skip_serializing_if` hides it and no delivery file reads it -- computed and not delivered
 #[derive(serde::Serialize)]
 pub struct SweepHiddenEvidenceRow {

@@ -1,5 +1,6 @@
 //! target: docs/ADRs/001-event-bus-report-pipeline.md
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: an ADR naming a cargo test that no source file defines -- a validation reference that executes nothing
 ---
 id: 001-event-bus-report-pipeline

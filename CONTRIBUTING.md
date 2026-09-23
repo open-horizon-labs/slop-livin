@@ -13,7 +13,8 @@ Use a recent stable Rust toolchain on macOS. The release workflow builds Apple s
 | `crates/core/src/ecosystem.rs` | Project markers and artifact classification |
 | `crates/core/src/actions.rs`, `execution.rs` | Plans, authorization, execution, and recovery records |
 | `crates/cli/`, `crates/tui/` | User and agent interfaces (the CLI's `--json` output plus `skills/swamp/` is the supported agent interface; see #104) |
-| `crates/source-audit/` | Source checks for selected design constraints |
+| `crates/core/src/fs_gate/` | The capability gate: the only code that touches the filesystem or starts a process ([architecture](docs/architecture.md#capability-gates)) |
+| `crates/source-audit/` | Exact path-reference audits, the compile-fail runner and the mutation sweep |
 | `crates/harvest/`, `vendor/` | Artifact-name research against vendored upstream lists |
 | `skills/swamp/` | The installable agent skill: `SKILL.md` plus lazily loaded `references/*.md` |
 
@@ -23,7 +24,9 @@ Use a recent stable Rust toolchain on macOS. The release workflow builds Apple s
 scripts/check.sh
 ```
 
-The script runs formatting checks, workspace tests, Clippy, source audits, and checks for selected destructive shortcuts and output vocabulary. Plain `cargo build` does not run all these checks.
+The script runs formatting checks, workspace tests, Clippy (all targets, then the production build on its own, where the capability gate's lints apply), source audits, the compile-fail cases and the mutation sweep, and checks for selected destructive shortcuts and output vocabulary. Plain `cargo build` does not run all these checks. `SWAMP_TARGET_DIR=<dir>` points every cargo run in it at a shared target directory.
+
+New filesystem or process access goes through `crates/core/src/fs_gate/`; outside it, `std::fs`, `std::process` and friends do not pass Clippy or the audit. A compile-fail case's expected output is regenerated with `TRYBUILD=overwrite cargo test -p swamp-source-audit --test compile_fail` after an intended API change (the snapshots are rustc-version sensitive).
 
 For a focused change, run the relevant tests first. Examples:
 

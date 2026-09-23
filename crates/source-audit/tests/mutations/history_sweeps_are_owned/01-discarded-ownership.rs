@@ -1,4 +1,5 @@
 //! target: crates/core/src/growth.rs
+//! by: compile:E0616
 //! why: sweep slip -- `let _owned = ownership.owns(key);` then an unguarded tombstone
 pub fn sweep_unowned_tombstone(
     ownership: &ObservationOwnership,

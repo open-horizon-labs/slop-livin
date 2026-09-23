@@ -1143,11 +1143,7 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
     // as "nothing open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`).
     let mut paths: Vec<PathBuf> = vec![u.path.clone()];
     paths.extend(u.members.iter().map(|m| m.path.clone()));
-    match crate::recheck::member_occupancy(&paths) {
-        crate::occupancy::OccupancyState::Free => {}
-        other => return other.refusal(),
-    }
-    None
+    crate::recheck::occupancy_refusal(&paths)
 }
 
 /// Builds a real, actionable plan from selected `AgentUnit`s (#101).

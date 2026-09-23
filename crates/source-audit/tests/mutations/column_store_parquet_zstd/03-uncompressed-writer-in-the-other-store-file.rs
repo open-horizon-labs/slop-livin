@@ -1,4 +1,5 @@
 //! target: crates/core/src/store.rs
+//! by: audit:gate_paths_only_inside_gates
 //! why: the same omission in the other half of the store, where a single-file audit would not look
 pub fn sweep_write_plain_rows(
     path: &std::path::Path,

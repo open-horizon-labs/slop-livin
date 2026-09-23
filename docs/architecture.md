@@ -245,9 +245,10 @@ out of scope* (excluded, disabled detector, outside an explicit command
 root) from *in scope but not observable* (missing, unreadable). Only the
 second is a coverage gap.
 
-`external::discover_and_measure` and `agents::discover_and_measure`
-consume that. Neither reads `scope.detectors`; the
-`discovery_consumes_effective_scope` audit forbids it. The 2026-09-21
+`external::discover_and_measure_in` and `agents::discover_and_measure_in`
+consume that. Neither can read raw detector output: `DetectorSummary`'s
+candidate locations are private to `scope`
+([capability gates](#capability-gates)). The 2026-09-21
 review found both of them iterating raw `Resolved` detector candidates,
 which is detector *output*: an exclusion, a disabled detector and
 explicit-root replacement could not reach them, so excluding a tool home
@@ -768,9 +769,10 @@ one two chunks above already established:
   | Aider's bespoke per-repo path | `AdapterCapabilities::project_local_units` |
   | `pi.rs` falling back to Oh My Pi's header shape | neutral `pi_family` mechanics; each adapter passes only its own tool's layouts |
 
-  Four audits keep it that way: no adapter names another adapter, no
-  central tool-id match outside the registry, every adapter registered
-  exactly once, and the registry's ids equal the matrix's ids
+  What keeps it that way: no adapter names another adapter
+  (`adapters_do_not_reach_gates`), no tool-id literal outside its own
+  module and the registries (`ids_only_in_their_module`), and the
+  registry's ids equal the matrix's ids (`agent_matrix_matches_docs.rs`)
   ([agent-adapters-are-pluggable](../.oh/guardrails/agent-adapters-are-pluggable.md)).
 
 - **An adapter sees only its `IdentifyCtx`.** Listings come from
@@ -778,10 +780,11 @@ one two chunks above already established:
   capped, symlink-refusing level via `locations::shallow_list`); byte
   totals from `ctx.folded_bytes`; content **only** from
   `ctx.read_header`/`ctx.derived`, capped at `MAX_HEADER_BYTES`. No
-  adapter calls `read_dir`, `read_to_string`, `std::env`, `actions::`,
-  or `println!` -- each is a separate audit rather than a convention,
-  because the privacy contract is worth more than fifteen careful
-  authors.
+  adapter names `read_dir`, `std::fs`, `std::env`, `actions::` or
+  `println!`: `std::fs` is a gate path anywhere outside `fs_gate`, and
+  `adapters_do_not_reach_gates` confines adapters to their `IdentifyCtx`
+  -- an audit rather than a convention, because the privacy contract is
+  worth more than fifteen careful authors.
 
 - **Units are built by a constructor, not a literal.**
   `agents::AgentUnitBuilder::new(tool, category, path)` applies
@@ -1094,72 +1097,167 @@ To add a fact source, implement a consumer and register it before dispatch. If i
 
 To add artifact recognition, update the ecosystem rules and fixtures. Classification changes must invalidate old observations through the rules version. An upstream ignore entry is research input; inspect what a directory can contain before classifying it.
 
-## Source audits
+## Capability gates
 
-Every technical guardrail in `.oh/guardrails/` names an audit in
-`crates/source-audit` (`cargo run -p swamp-source-audit`, `--list` for
-the names). The audits are rules over one whole-program model, not
-searches of chosen files:
+Swamp's guardrails used to be enforced by forty-five source audits over
+a `syn` call-graph model. Four review rounds showed that such a model,
+without type resolution, cannot be made mutation-proof: fn pointers,
+UFCS, generics, macros, `cfg`, glob imports and orphan files each hid a
+call from it. The guardrail semantics now live in the type system, and
+what is left for the audit is exact path-reference rules. Each guardrail
+file's `## Detection` section starts with a `Mechanism:` line naming
+which of the three below holds it.
 
-- **The program model** (`src/program.rs`) parses every file under
-  `crates/{core,cli,tui}/src` once. Every definition -- free function,
-  `impl` method, trait default -- is its own record with its module
-  path, `impl` type, resolved calls (including calls written inside
-  macro arguments, with the macro's honour context), value references,
-  assignments, match arms, bindings and struct literals. Item-level
-  constants, statics, type aliases, struct fields and enum variants are
-  records too. Calls resolve through `crate`/`super`/`Self`, `pub use`
-  re-exports (followed to what they name, including a standard-library
-  function re-exported by a local module), `Type::f`, and the receiver
-  type where the code states it (`self`, a parameter, a field, a typed
-  or constructed local); otherwise a method call is possibly every
-  method of that name and arity. The model is rebuilt only when a file
-  changes, so the forty-five audits over one tree share it.
-- **Derived sets, not lists.** Destructive, mutating, traversing,
-  reading-unbounded, emitting, environment-reading and spawning are
-  closures over the call graph of capability predicates on the standard
-  library and the dependencies (`std::fs::rename`, `OpenOptions` opened
-  for writing, `read_dir`, `io::read_to_string`, `panic!` with a
-  formatted message). Regions are derived from structure: adapters are
-  the modules under `agents/`/`build_adapters/` (shared family modules
-  included); consumers are the implementors of `bus::Consumer`; the
-  report path is whatever runs `bus::run_report`; a child module belongs
-  to its parent's region.
-- **Behaviour, not names.** A required call must be honoured (its answer
-  reaches `?`, a `match` or a condition; `let _ =` and a
-  `vec![..]`-wrapped discard do not count); a guard must be the
-  *condition* of the write it guards; a removal's subject must be the
-  path the rechecks were about; a value flows through bindings and the
-  collections it is pushed into.
-- **Declared anchors.** What a guardrail is about is named once and
-  checked to exist: the one protection predicate, the three rechecks, the
-  measured folding entry points, and the bounded primitives, each with
-  the cap constant that earns its exemption -- a primitive that stops
-  naming or stopping on its cap, or does anything beyond its one bounded
-  operation, loses it.
+### What the compiler enforces
 
-Evidence that an audit rejects anything:
+`crates/core/src/fs_gate/` is the only module in `crates/{core,cli,tui}`
+that names `std::fs`, `std::os::unix::fs`, unbounded `std::io` reads,
+`OpenOptions`, `std::process`, `libc`, `trash`, `tempfile`, `parquet` or
+`zstd` (the FSEvents FFI in `fs_events/macos.rs` is the one other gate
+module). It exposes narrowly typed capabilities, one submodule each:
 
-- `tests/mutation_corpus.rs` applies every fixture under
-  `tests/mutations/<audit>/` (including all 45 re-review 3 sweep
-  mutations) to a copy of the real workspace and requires the audit to
-  reject it; every audit has at least three.
-- `tests/mutation_operators.rs` derives variants of every fixture
-  mechanically -- alias, re-export shim, same-file helper, child module,
-  macro wrap, constant hoisting, injection into an exempt bounded
-  primitive, discard of a legitimate shape's answer -- and requires the
-  same verdict. Operators change how a harmful thing is written, never
-  what it does.
-- `tests/reviewer_mutation_sweep_stack3.rs` is the independent
-  reviewer's one-mutation-per-audit sweep.
+| capability | what the type requires |
+|---|---|
+| `fs_gate::read::bounded_read(path, BoundedCap)` | a named cap; the only read of user content |
+| `fs_gate::store::write_json(JsonFile, ..)`, `write_text(TextFile, ..)`, `append_line(LogFile, ..)` | a variant of the enum that *is* the allow-list of swamp's own files; the atomic writer is private |
+| `fs_gate::columns::write_parquet_atomic(.., zstd_level)` | a zstd level; no codec parameter |
+| `fs_gate::spawn::run(Program, ..)` | a `Program` variant; counts the spawn, returns a finished `RunOutput`, refuses mutating verbs |
+| `fs_gate::destroy::{trash_move, Envelope, docker_remove, git_worktree_prune}` | a `RecheckProof` **and** an `Authorized` |
+| `fs_gate::symlink_metadata` / `metadata_following` | the caller says which; there is no plain `metadata` |
 
-**Limits.** Resolution is lexical: trait-object dispatch resolves to
-every implementor, a function pointer stored in a struct is followed
-only where its path is written, and a `proc_macro` that generates calls
-is invisible. Where a guardrail is `severity: hard`, the runtime tests
-named in its guardrail file cover what the model cannot see. Every
-subprocess is built by `swamp_core::spawn::command`, which counts it,
-so the spawn counters the cost tests read are structural.
+The tokens are minted in exactly one place each, with private fields:
+
+- `recheck::RecheckProof` -- only `recheck::run_all` (reviewed snapshot,
+  live protection in both directions, member occupancy; fail closed). Not
+  `Clone`, `#[must_use]`, consumed by the destructive call, refused when
+  older than `MAX_PROOF_AGE` or when it does not cover the path.
+- `authority::Authorized` -- only `authorize` (a live grant a human
+  minted, within its budget) or `authorize_confirmed` (a
+  `HumanConfirmed`). `authority::HumanConfirmed` -- only
+  `cli_command`/`tui_dialog`; `approve_confirmed` and
+  `add_standing_grant_confirmed` require one.
+- `bus::Stage` -- only `EventBus::run`; the walk and every pipeline stage
+  take one, and `EventBus::new`/`register` are private to the registrar.
+- `report::DiscoveryPass` -- only `observe_scope`; external and agent
+  discovery take one.
+- `attribution::Classified` -- only classification; a folded walk job
+  carries it.
+- `locations::permitted::PermittedDetectors` -- only `from_config`;
+  `Registry::resolve` takes it.
+- `growth::columns::Owned` -- only an ownership's `claim(key)`; the only
+  tombstone writers take it, and stored rows have private fields.
+- `evidence::Reason` -- only `reason!` (a literal checked non-blank at
+  compile time), `Reason::fixed` or `Reason::carried`; every `FactStatus`
+  reason is one.
+
+Opaque types close the rest: `protection::ProtectList` answers only
+`conflict(candidate)`; `OccupancyState` is `#[must_use]` with no boolean
+view; `CandidateAgentUnit`'s deciding fields are private to its builder;
+`DetectorSummary`'s raw candidates are private to `scope`.
+
+Test-only entry points (`fs_events::testing`, `DiscoveryPass::for_tests`,
+`Stage::for_tests`, the string-actor `approve`, `From<&str> for Reason`)
+exist only under swamp-core's `testing` feature. The feature is enabled
+by the workspace's own dev-dependencies and by nothing a release builds;
+`lib.rs` refuses to compile a release build with it
+(`compile_error!`), and the gate audit rejects any non-dev dependency
+that enables it.
+
+Clippy is the type-resolved half of the path rules:
+`crates/{core,cli,tui}/clippy.toml` disallow the `std::fs`, `Path` I/O
+and `std::process::Command` methods and types, and each crate root
+denies those lints (and `unsafe_code`) outside `cfg(test)`; the gate
+modules allow them.
+
+Every retired rule has a `trybuild` compile-fail case in
+`crates/core/tests/compile_fail/` showing the tempting shortcut no
+longer compiles -- a move without a proof, a forged token, a cloned
+proof, a second protection predicate, a boolean occupancy, a blank
+reason, an unregistered consumer, a codec choice, a string program.
+`crates/source-audit/tests/compile_fail.rs` runs them against the
+production API (without the `testing` feature).
+
+### What the audit enforces
+
+`cargo run -p swamp-source-audit` (`--list` for the names). The model
+(`crates/source-audit/src/model.rs`) is the module tree the compiler
+builds: files reached from each crate root by `mod` declarations (an
+orphan `.rs` file is rejected; so is `#[path]`), `cfg` evaluated as
+attributes (doc comments are not attributes; `cfg(any())` code is
+absent, `cfg(test)` code is test code), and every path reference
+resolved through `use` (globs, renames, `pub use`), `crate`/`super`/
+`self`, UFCS, consts and statics, struct fields and macro bodies
+(`macro_rules!` token streams are scanned). The rules are exact:
+
+- `gate_paths_only_inside_gates` -- the gated paths above appear only in
+  gate modules (as a `Path` method named as a path, too); each gate group
+  (`read_dir`, `store`, `columns`, `destroy`, `sys`, each `Program`
+  variant, the token mint sites, `OccupancyState`, a new
+  `ObservationOwnership`, `revoke_grant`) only in the modules allowed to
+  hold it, and `DiscoveryPass::begin`/`Stage::mint` only in their one
+  function each; the TUI names only the scope-aware report entry points;
+  no `unsafe` or `extern` outside the gate; no production dependency
+  enabling `testing`.
+- `adapters_do_not_reach_gates` -- agent adapters reach I/O only through
+  `IdentifyCtx`; never the environment (nor a path built from an absolute
+  literal), detectors, actions or another tool's adapter; never print or
+  panic.
+- `sinks_have_no_path_predicates` -- the execution sinks hold no path
+  containment logic of their own (protection is `ProtectList::conflict`).
+- `json_writes_allowlisted` -- no serializer outside the gate's store.
+- `bus_static_registration` -- no consumer names another, or the
+  `EventBus`; nothing outside the consumers and the bus names a path into
+  one.
+- `tui_event_thread_has_no_gate_calls` -- from `event_loop` (and every
+  implicitly called trait impl), over non-worker edges, nothing reaches a
+  blocking gate capability; a call through a non-path callee rejects.
+- `no_unreferenced_public_items`, `no_verdict_literals`,
+  `byte_units_only_in_the_formatter`, `ids_only_in_their_module` -- token
+  rules over the whole workspace (`#[allow(dead_code)]` in production is
+  rejected; a unit table outside render.rs is a second formatter; an id
+  *constant* named outside its module is the same central dispatch as its
+  literal).
+- `guardrail_metadata` -- every hard guardrail names a registered audit,
+  or says `audit: none` with a dated reason and compile-fail cases or
+  runtime tests that exist, compile, run (not ignored in any spelling)
+  and assert; every Detection section names its mechanism; every adapter
+  carries its five contract tests.
+
+### What the runtime tests cover
+
+Behaviour no type or path rule can state: that a replay re-walks only
+the changed subtrees and matches a full walk
+(`fsevents_incremental.rs`); that refresh paths keep the scope
+(`scope_preserving_refresh.rs`); the recheck refusals themselves
+(`execution_rechecks.rs`, the reviewers' counterexample files); the cost
+contracts (`reviewer_cost_measurement_stack3.rs`, whose PATH-shim spawn
+oracle shims every `Program` the gate can run). Guardrail frontmatter
+lists them under `runtime_tests:`.
+
+### Evidence
+
+`crates/source-audit/tests/mutation_sweep.rs` applies every fixture
+under `crates/source-audit/tests/mutations/` -- the original corpus,
+re-review 3's and re-review 4's sweep mutations, and the legitimate
+shapes -- to a copy of the workspace and records what rejected each:
+a parse error (never counted), a named audit, or a compile error with a
+span inside the mutation's own lines. Each fixture names the kinds that
+count for it (`//! by:`). Operators (alias, re-export shim, helper,
+child module, macro wrap, constant hoisting, fn-item binding, a doc
+line mentioning `cfg(test)`) derive variants of every seed, and a
+variant must be rejected by one of its seed's own kinds -- or, for a
+legitimate seed, stay accepted.
+
+**Limits.** Inside `growth`, the history module, the directory and file
+tables' Parquet writers are `pub(super)`: their current-plus-delta
+discipline is held by `report_growth.rs` and `dirs_and_files.rs`, not by
+a type (the artifact and external tables go through `ArtifactHistory` /
+`ExternalHistory`). Orderings and data flow -- replay before walk, which
+subtrees a replay re-walks -- are runtime tests. The gate itself is the trusted base: code inside
+`crates/core/src/fs_gate/` may do anything, and a change there is what
+review must read. The event-thread rule follows methods by name, so it
+is conservative (it may flag a same-named method), and a call through a
+function pointer on the event thread is rejected rather than followed.
 
 ## Limits of the current implementation
 

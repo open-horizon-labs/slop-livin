@@ -1,5 +1,6 @@
 //! target: crates/core/src/agents/aider.rs
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: alias/rename variant -- the privacy test renamed, so the name resolves nowhere and the adapter still looks compliant to a reader
 pub const AIDER_TOOL_ID: &str = "aider";
 

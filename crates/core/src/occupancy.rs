@@ -353,6 +353,14 @@ fn find_simulator_state(json_text: &str, udid: &str) -> Option<String> {
     None
 }
 
+/// Fail-closed boolean view (anything but `Free` is active), for test
+/// fixtures only: production code has no boolean occupancy
+/// (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`).
+#[cfg(any(test, feature = "testing"))]
+pub fn is_active(path: &Path) -> bool {
+    !matches!(probe_path(path), OccupancyState::Free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2252,32 +2252,6 @@ impl ObservationParts {
 /// there is nowhere else to run a second pass from
 /// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
 #[allow(clippy::too_many_arguments)]
-/// The right to run one observation's unit discovery. Minted only here,
-/// in [`observe_scope`] (the field is private to this module), and
-/// required by `external::discover_and_measure_in` and
-/// `agents::discover_and_measure_in`: the report pipeline owns discovery,
-/// and nothing else can run a second pass over the shared history table
-/// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
-#[derive(Debug)]
-pub struct DiscoveryPass {
-    _minted_by_observe_scope: (),
-}
-
-impl DiscoveryPass {
-    fn begin() -> DiscoveryPass {
-        DiscoveryPass {
-            _minted_by_observe_scope: (),
-        }
-    }
-
-    /// A pass for tests that drive discovery directly (`testing` feature
-    /// or this crate's unit tests only).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn for_tests() -> DiscoveryPass {
-        DiscoveryPass::begin()
-    }
-}
-
 pub fn observe_scope(
     scope: &crate::scope::EffectiveScope,
     want: ObservationParts,
@@ -2348,7 +2322,7 @@ pub fn observe_scope(
     events.merge(unit_replay.coverage.clone());
     let observed_at = merged.observed_at;
     let mut merged = merged;
-    let pass = DiscoveryPass::begin();
+    let pass = pass::DiscoveryPass::begin();
     let mut external_ok = true;
     let mut external_units = if want.external {
         let measured = crate::external::discover_and_measure_in(
@@ -2634,3 +2608,6 @@ fn merge_summary_into(acc: &mut Summary, add: &Summary) {
         }
     }
 }
+
+mod pass;
+pub use pass::DiscoveryPass;

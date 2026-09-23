@@ -18,6 +18,7 @@ fn nested_growth_uses_same_key_for_write_and_annotation() {
         }]))
         .unwrap();
     swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
         tmp.path(),
         1,
         &mut projects,
@@ -29,6 +30,7 @@ fn nested_growth_uses_same_key_for_write_and_annotation() {
     .unwrap();
     projects[0].worktrees[0].artifacts[0].bytes = 8192;
     swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
         tmp.path(),
         1,
         &mut projects,

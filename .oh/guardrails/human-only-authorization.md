@@ -32,7 +32,7 @@ Mechanism: type, gate audit, runtime test.
 
 **Type.** Approving a plan (`actions::approve_confirmed`) and minting a standing grant (`add_standing_grant_confirmed`) take a `&HumanConfirmed`; destructive calls take an `Authorized` from `authority::authorize` (a live grant) or `authorize_confirmed` (a TUI confirmation). Neither token has a public constructor besides these.
 
-**Gate audit.** `gate_paths_only_inside_gates` pins the mint sites: `HumanConfirmed::cli_command` only in the CLI, `HumanConfirmed::tui_dialog` only in the TUI's `app` (its confirm dialog), `authorize` only in `actions`, `authorize_confirmed` only in the TUI sink.
+**Gate audit.** `gate_paths_only_inside_gates` pins the mint sites: `HumanConfirmed::cli_command` only in the CLI, `HumanConfirmed::tui_dialog` only in the TUI's `app` (its confirm dialog), `authorize` only in `actions`, `authorize_confirmed` only in the TUI sink, and `actions::revoke_grant` only in the CLI.
 
 Retired 2026-09-22: the `human_only_authorization` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

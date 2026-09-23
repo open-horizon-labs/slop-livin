@@ -426,6 +426,7 @@ pub fn annotate_readonly(
 /// absent from `projects`: absence here means "not observed", not
 /// "deleted". See `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 pub fn observe_and_annotate(
+    _stage: &crate::bus::Stage,
     swamp_dir: &Path,
     volume_id: u64,
     projects: &mut [ProjectRow],
@@ -842,6 +843,7 @@ pub fn annotate_readonly_dirs(
 /// no-change row appends no delta, matching the artifact store's
 /// contract.
 pub fn observe_and_annotate_dirs(
+    _stage: &crate::bus::Stage,
     swamp_dir: &Path,
     volume_id: u64,
     dirs: &mut [crate::report::DirRollup],
@@ -1075,6 +1077,7 @@ pub fn annotate_readonly_files(
 
 /// Same shape as [`observe_and_annotate_dirs`], for large-file rows.
 pub fn observe_and_annotate_files(
+    _stage: &crate::bus::Stage,
     swamp_dir: &Path,
     volume_id: u64,
     files: &mut [crate::report::FileRow],
@@ -1949,6 +1952,7 @@ pub fn stage_tracked_with_source(
                     )?
                 } else {
                     apply_incremental(
+                        stage,
                         topo,
                         &relevant_changed_dirs,
                         observed_at,
@@ -2574,6 +2578,7 @@ fn relist_source_dirs(
 /// FSEvents implicated, carrying every other row forward from the store
 /// unchanged (see [`reconstruct_attribution`]).
 fn apply_incremental(
+    stage: &crate::bus::Stage,
     prev: &[StoredWorktree],
     changed_dirs: &[PathBuf],
     observed_at: u64,
@@ -2998,6 +3003,7 @@ fn apply_incremental(
             .unwrap_or_default();
         let carried_rels: Vec<String> = carry.keys().map(|p| rel_path_string(root, p)).collect();
         let fresh = crate::walk::attribute_one_worktree(
+            stage,
             root,
             &all_worktree_refs,
             observed_at,
@@ -3935,6 +3941,7 @@ mod tests {
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1000)];
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut projects,
@@ -3946,6 +3953,7 @@ mod tests {
         .unwrap();
         projects[0].worktrees[0].artifacts[0].dedup_stale = true;
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut projects,
@@ -3963,6 +3971,7 @@ mod tests {
         projects[0].worktrees[0].artifacts[0].dedup_stale = false;
         projects[0].worktrees[0].artifacts[0].bytes = 2000;
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut projects,
@@ -3987,6 +3996,7 @@ mod tests {
         let root = PathBuf::from("/repo");
         let mut projects = vec![one_artifact_project(&root, 1_000_000)];
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut projects,
@@ -4006,10 +4016,30 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut first = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut first,
+            1_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         let mut second = vec![one_artifact_project(&root, 4_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut second,
+            2_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(artifact_row(&second).growth_bytes, Some(3_000_000));
     }
@@ -4020,7 +4050,17 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut first = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut first, 1_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut first,
+            1_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
         let dir = volume_dir(tmp.path(), 1);
         let after_first = list_delta_files(&dir).len();
         assert_eq!(
@@ -4030,7 +4070,17 @@ mod tests {
         );
 
         let mut second = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut second, 2_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut second,
+            2_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
         let after_second = list_delta_files(&dir).len();
         assert_eq!(
             after_second, after_first,
@@ -4046,6 +4096,7 @@ mod tests {
 
         let mut present = vec![one_artifact_project(&root, 1_000_000)];
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut present,
@@ -4074,11 +4125,22 @@ mod tests {
                 idle_secs: None,
             }],
         }];
-        observe_and_annotate(tmp.path(), 1, &mut absent, 2_000, 30, 3600, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut absent,
+            2_000,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         // target/ recreated.
         let mut recreated = vec![one_artifact_project(&root, 500_000)];
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut recreated,
@@ -4109,14 +4171,44 @@ mod tests {
         let original_bytes = 1_000_000;
 
         let mut obs1 = vec![one_artifact_project(&root, original_bytes)];
-        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 5_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs1,
+            1_000,
+            30,
+            5_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         let mut obs2 = vec![one_artifact_project(&root, original_bytes + 200_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 5_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs2,
+            2_000,
+            30,
+            5_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         // Shrunk back to exactly the original size.
         let mut obs3 = vec![one_artifact_project(&root, original_bytes)];
-        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 5_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs3,
+            3_000,
+            30,
+            5_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             artifact_row(&obs3).growth_bytes,
@@ -4136,16 +4228,46 @@ mod tests {
         let root = PathBuf::from("/repo");
 
         let mut obs1 = vec![one_artifact_project(&root, 1_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs1, 1_000, 30, 2_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs1,
+            1_000,
+            30,
+            2_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         let mut obs2 = vec![one_artifact_project(&root, 2_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs2, 2_000, 30, 2_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs2,
+            2_000,
+            30,
+            2_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         // since_secs=2_000 at observed_at=3_000 targets time 1_000 --
         // exactly obs1's timestamp -- so the baseline must be obs1's
         // 1_000_000 bytes, not 0.
         let mut obs3 = vec![one_artifact_project(&root, 5_000_000)];
-        observe_and_annotate(tmp.path(), 1, &mut obs3, 3_000, 30, 2_000, &HashSet::new()).unwrap();
+        observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            tmp.path(),
+            1,
+            &mut obs3,
+            3_000,
+            30,
+            2_000,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             artifact_row(&obs3).growth_bytes,
@@ -4163,6 +4285,7 @@ mod tests {
         for i in 0..(COMPACTION_THRESHOLD as u64 + 5) {
             let mut obs = vec![one_artifact_project(&root, 1_000 + i)];
             observe_and_annotate(
+                &crate::bus::Stage::for_tests(),
                 tmp.path(),
                 1,
                 &mut obs,
@@ -4194,6 +4317,7 @@ mod tests {
         let root = PathBuf::from("/some/absolute/worktree/root");
         let mut projects = vec![one_artifact_project(&root, 42)];
         observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
             tmp.path(),
             1,
             &mut projects,

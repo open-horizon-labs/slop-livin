@@ -32,7 +32,7 @@ toolchain_installation_recovery}`.
 
 Mechanism: gate audit, runtime test.
 
-**Gate audit.** `no_unreferenced_public_items`: every public function and type in the workspace crates is named somewhere (a path, a method call, a serde attribute, an inline format capture). A trait impl does not make what it calls live.
+**Gate audit.** `no_unreferenced_public_items`: every public function and type in the workspace crates is named somewhere (a path, a method call, a serde attribute, an inline format capture). A trait impl does not make what it calls live, and `#[allow(dead_code)]` in production code is rejected outright (it hides the dead caller that would make a dead API look used).
 
 Retired 2026-09-22: the `no_dead_public_evidence_api` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

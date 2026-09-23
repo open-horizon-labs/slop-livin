@@ -22,7 +22,7 @@ impl Consumer for GrowthConsumer {
         &self,
         event: &Event,
         ctx: &Ctx<'_>,
-        _stage: &crate::bus::Stage,
+        stage: &crate::bus::Stage,
     ) -> Result<Vec<Event>> {
         let Event::CargoAnnotated(draft) = event else {
             return Ok(vec![]);
@@ -50,6 +50,7 @@ impl Consumer for GrowthConsumer {
                 let protected_worktree_ids: std::collections::HashSet<String> =
                     d.protected_worktree_ids.iter().cloned().collect();
                 crate::growth::observe_and_annotate(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.projects,
@@ -63,6 +64,7 @@ impl Consumer for GrowthConsumer {
                 }
                 let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_dirs(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.dirs,
@@ -79,6 +81,7 @@ impl Consumer for GrowthConsumer {
                 }
                 let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_files(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.files,

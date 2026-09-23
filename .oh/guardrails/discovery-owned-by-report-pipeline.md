@@ -3,8 +3,7 @@ id: discovery-owned-by-report-pipeline
 severity: hard
 statement: "One observation owns discovery. Outside tests, only report.rs::observe_scope may run external::discover_and_measure or agents::discover_and_measure, and it must run both; CLI and TUI take their units from that observation."
 outcome: coverage-aware-storage-history
-audit: none
-audit_none_reason: "2026-09-22: the property is a type: discovery takes a `report::DiscoveryPass` that only `observe_scope` mints"
+audit: gate_paths_only_inside_gates
 compile_fail:
   - discovery_pass_is_minted_by_observe_scope
   - discovery_pass_has_no_public_constructor
@@ -26,9 +25,11 @@ safe; a single pass makes the question not arise.
 
 ## Detection
 
-Mechanism: type, runtime test.
+Mechanism: type, gate audit, runtime test.
 
-**Type.** `external::discover_and_measure_in` and `agents::discover_and_measure_in` take a `&report::DiscoveryPass`; its field and `begin` are private to `report`, which mints one in `observe_scope`. The test constructor exists only under the `testing` feature.
+**Type.** `external::discover_and_measure_in` and `agents::discover_and_measure_in` take a `&report::DiscoveryPass`; its field and `begin` are private to `report`, which mints one in `observe_scope`. The token lives in its own module (`report::pass`), so even the rest of `report` cannot build one as a literal; the test constructor exists only under the `testing` feature.
+
+**Gate audit.** `gate_paths_only_inside_gates` pins `DiscoveryPass::begin` to one call site, `report::observe_scope`.
 
 Retired 2026-09-22: the `discovery_owned_by_report_pipeline` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

@@ -1,5 +1,6 @@
 //! target: crates/core/src/growth.rs
 //! mode: append
+//! by: audit:gate_paths_only_inside_gates, compile:clippy::disallowed_methods
 //! why: re-review 3 sweep -- the incremental path delegates a full walk to a helper one function away (blind spot: the forbidden tokens are looked for only in `apply_incremental`'s own body; the callee is never followed)
 /// Sweep: keeps the required names, does the forbidden thing next door.
 pub mod sweep_incremental {

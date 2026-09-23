@@ -1,4 +1,5 @@
 //! target: crates/core/src/growth.rs
+//! by: audit:gate_paths_only_inside_gates
 //! why: the column widened to a timestamp, which is the same store growth the Int32-minutes decision exists to prevent
 pub mod sweep_widened_column {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};

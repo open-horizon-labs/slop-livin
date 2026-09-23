@@ -1,4 +1,5 @@
 //! target: crates/core/src/actions.rs
+//! by: audit:gate_paths_only_inside_gates, compile:E0603
 //! why: sweep slip -- only the FIRST destructive call's prefix was inspected, so a second one after the rechecks was free
 pub fn execute_sweep_mutation_c(
     path: &std::path::Path,

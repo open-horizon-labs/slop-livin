@@ -3,7 +3,7 @@ id: agent-adapters-are-pluggable
 severity: hard
 statement: "Agent-tool adapters are independent and statically registered, exactly as location detectors already are. No adapter names another adapter; no central match over tool-id constants decides behaviour; every adapter module is registered exactly once; the registry's tool ids and the support matrix's tool ids are the same set."
 outcome: disk-growth-by-project
-audit: ids_only_in_their_module
+audit: ids_only_in_their_module, adapters_do_not_reach_gates
 runtime_tests:
   - crates/core/tests/agent_matrix_matches_docs.rs
 ---
@@ -30,7 +30,7 @@ static registry. Adapters follow.
 
 Mechanism: gate audit, runtime test.
 
-**Gate audit.** `ids_only_in_their_module`: a tool id literal (the value of an adapter's `*_TOOL_ID`) appears only in that adapter's module and the registries, never in a central `match`, if-chain or table -- compared as the exact literal, wherever it is written (the CLI included).
+**Gate audit.** `ids_only_in_their_module`: a tool id literal (the value of an adapter's `*_TOOL_ID`) appears only in that adapter's module and the registries, never in a central `match`, if-chain or table -- compared as the exact literal, wherever it is written (the CLI included), and no module names another adapter's `*_TOOL_ID` constant. `adapters_do_not_reach_gates`: no tool adapter names another tool adapter's module (shared mechanics live in a family module that declares no tool id).
 
 Retired 2026-09-22: the `agent_adapters_are_pluggable` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

@@ -1,5 +1,6 @@
 //! target: crates/core/src/growth.rs
 //! mode: append
+//! by: audit:gate_paths_only_inside_gates, compile:clippy::disallowed_methods
 //! why: re-review 3 sweep -- a staged replay that runs a full tree walk before consulting FSEvents, spelled `discover_and_attribute` (blind spot: the ordering rule greps statements for the literal token `full_walk`; any other spelling of a full traversal is invisible)
 /// Sweep: walks everything, then replays.
 pub mod sweep_stage {

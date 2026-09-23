@@ -24,7 +24,7 @@ can be added in one place.
 
 Mechanism: gate audit, runtime test.
 
-**Gate audit.** `ids_only_in_their_module`: a detector id literal (the value of a `*_DETECTOR_ID`) appears only in its detector module and the registry -- in a `match`, a comparison or an item-level table alike. The ids that are also an ecosystem's everyday name (`npm`, `go`, `maven`, ...) are a reviewed list in the rule.
+**Gate audit.** `ids_only_in_their_module`: a detector id literal (the value of a `*_DETECTOR_ID`) appears only in its detector module and the registry -- in a `match`, a comparison or an item-level table alike -- and the same for a *path* to another module's `*_DETECTOR_ID` constant (reviewed exceptions: `scope`, which interprets detector output, and `locations::permitted`). The ids that are also an ecosystem's everyday name (`npm`, `go`, `maven`, ...) are a reviewed list in the rule.
 
 Retired 2026-09-22: the `detector_ids_only_in_registry` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

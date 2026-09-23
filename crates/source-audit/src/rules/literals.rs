@@ -206,14 +206,30 @@ fn renders_size(lit: &str) -> Option<&'static str> {
     None
 }
 
+/// Modules that *parse* sizes written with units (Docker's CLI output,
+/// the filter and budget flags). Reviewed: they read units, never render
+/// them.
+const UNIT_PARSERS: &[&[&str]] = &[&["docker"], &["filter"]];
+
 pub fn byte_units_only_in_the_formatter(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
     for m in &ws.modules {
         if m.is_within(Krate::Core, &["render"]) {
             continue;
         }
+        let parser = UNIT_PARSERS.iter().any(|p| m.is_within(Krate::Core, p));
         for l in &m.literals {
             if l.test {
+                continue;
+            }
+            // A bare unit label (a unit table, a label chosen at run time)
+            // is a formatter's vocabulary.
+            if !parser && (UNITS.contains(&l.value.as_str()) || l.value == "kB") {
+                problems.push(format!(
+                    "{}: the unit label \"{}\" outside render.rs (and the reviewed unit parsers): \
+                     a table of byte units is a second formatter (one-byte-formatter)",
+                    l.site, l.value
+                ));
                 continue;
             }
             if let Some(u) = renders_size(&l.value) {
@@ -257,6 +273,53 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
                 || (family == "detector" && name.ends_with("_DETECTOR_ID"));
             if is_id {
                 ids.push((value.clone(), m.path.clone(), family));
+            }
+        }
+    }
+    // Id constants, by name: a path to another module's `*_TOOL_ID` is
+    // the same central dispatch as its literal.
+    for (mi, m) in ws.modules.iter().enumerate() {
+        let registry = m.is_within(Krate::Core, &["agents", "registry"])
+            || m.is_within(Krate::Core, &["agents", "matrix"])
+            || m.is_within(Krate::Core, &["locations"]) && m.path.len() == 1;
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments);
+            let Some(last) = abs.last() else { continue };
+            let (family, reviewed): (&str, &[&[&str]]) = if last.ends_with("_TOOL_ID") {
+                ("tool", &[])
+            } else if last.ends_with("_DETECTOR_ID") {
+                // Reviewed wiring that names detector ids by constant: scope
+                // interpretation and the permitted-detector set.
+                ("detector", &[&["scope"], &["locations", "permitted"]])
+            } else {
+                continue;
+            };
+            if abs.len() < 4 || abs[0] != "@core" {
+                continue;
+            }
+            let owner: Vec<&str> = abs[1..abs.len() - 1].iter().map(String::as_str).collect();
+            let own = m.krate == Krate::Core
+                && m.path
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .starts_with(&owner);
+            let twin = m.krate == Krate::Core
+                && ids.iter().any(|(_, o2, _)| {
+                    m.path.starts_with(o2) && o2.last().map(String::as_str) == owner.last().copied()
+                });
+            if !own && !twin && !registry && !reviewed.iter().any(|p| m.is_within(Krate::Core, p)) {
+                problems.push(format!(
+                    "{}: {} names the {family} id constant `{}`: an id is used only in its own \
+                     module and the registries, so adding a {family} never means editing a \
+                     central list or chain",
+                    r.site,
+                    m.display(),
+                    r.segments.join("::")
+                ));
             }
         }
     }

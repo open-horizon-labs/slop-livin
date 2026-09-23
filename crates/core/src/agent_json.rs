@@ -13,7 +13,7 @@
 
 use crate::entities::now;
 use crate::filter::{Filter, Predicate, WorktreeFacts};
-use crate::github::{GithubFacts, MergeComplete, MergedStatus, PrStatus, TriState};
+use crate::github::{GithubFacts, MergeComplete, PrStatus, TriState};
 use crate::growth::{DEFAULT_SINCE, history_span_for_root, load_config, parse_duration_secs};
 use crate::render::{kind_label, reason_label};
 use crate::report::{ArtifactKind, ArtifactRow, Report, UnownedReason};
@@ -109,7 +109,6 @@ pub fn apply_filter_to_report(r: &mut Report, f: &Filter) {
                     .as_ref()
                     .is_some_and(|m| m.verdict == TriState::Yes);
                 let unknown = PrStatus::Unknown;
-                let none = MergedStatus::Unknown;
                 let facts = WorktreeFacts {
                     merge_complete,
                     idle_secs: wt.idle_secs,
@@ -118,7 +117,6 @@ pub fn apply_filter_to_report(r: &mut Report, f: &Filter) {
                         .as_ref()
                         .map(|g| &g.pull_request)
                         .unwrap_or(&unknown),
-                    merged: wt.github.as_ref().map(|g| &g.merged).unwrap_or(&none),
                 };
                 Filter {
                     predicates: f
@@ -485,31 +483,20 @@ pub fn list_worktrees_payload(r: &Report, filter: &Filter, only_project: Option<
         }
         for wt in &project.worktrees {
             let empty_pr = PrStatus::Unknown;
-            let (pr, verdict, merge_complete_terms, merged) = match (&wt.github, &wt.merge_complete)
-            {
+            let (pr, verdict, merge_complete_terms) = match (&wt.github, &wt.merge_complete) {
                 (
-                    Some(GithubFacts {
-                        pull_request,
-                        merged,
-                        ..
-                    }),
+                    Some(GithubFacts { pull_request, .. }),
                     Some(MergeComplete { verdict, terms }),
-                ) => (pull_request, *verdict, Some(terms.clone()), merged),
-                (
-                    Some(GithubFacts {
-                        pull_request,
-                        merged,
-                        ..
-                    }),
-                    None,
-                ) => (pull_request, TriState::Unknown, None, merged),
-                (None, _) => (&empty_pr, TriState::Unknown, None, &MergedStatus::Unknown),
+                ) => (pull_request, *verdict, Some(terms.clone())),
+                (Some(GithubFacts { pull_request, .. }), None) => {
+                    (pull_request, TriState::Unknown, None)
+                }
+                (None, _) => (&empty_pr, TriState::Unknown, None),
             };
             let facts = WorktreeFacts {
                 merge_complete: verdict == TriState::Yes,
                 idle_secs: wt.idle_secs,
                 pr,
-                merged,
             };
             if !filter.matches_worktree(project, wt, &facts) {
                 continue;

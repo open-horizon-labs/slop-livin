@@ -21,7 +21,7 @@ Mechanism: type, gate audit, runtime test.
 
 **Type.** `EventBus::new` and `register` are private to `bus::registry`; `with_builtins` is the one registrar. Pipeline stages take a `bus::Stage` that only `EventBus::run` mints.
 
-**Gate audit.** `bus_static_registration`: no consumer module names another consumer module, and nothing outside the consumers and the registrar names a path into one.
+**Gate audit.** `bus_static_registration`: no consumer module names another consumer module or the `EventBus`, and nothing outside the consumers and the registrar names a path into one.
 
 Retired 2026-09-22: the `event_bus_pluggable_consumers` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

@@ -1,5 +1,7 @@
 //! target: crates/core/src/folded_measurement.rs
 //! mode: replace
+//! expect: retired
+//! retired: 2026-09-22 -- a whole-file replacement of folded_measurement.rs breaks unrelated code; reuse-before-walk is asserted by incremental_external_and_agent_measurement.rs and the cost tests.
 //! why: the 2026-09-22 finding itself -- `measure` sits on the allow-list and re-walks every pass while the guardrail claims reuse
 use crate::report::ArtifactKind;
 use std::path::{Path, PathBuf};

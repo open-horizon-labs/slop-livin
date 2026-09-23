@@ -1,4 +1,5 @@
 //! target: crates/core/src/external.rs
+//! by: audit:no_unreferenced_public_items
 //! why: the guardrail's own defect shape -- a pub evidence field on a delivered surface type that is only ever an empty default
 pub struct SweepNestedSummary {
     pub path: std::path::PathBuf,

@@ -8,6 +8,7 @@ audit_none_reason: "2026-09-22: the property is a type: every field that decides
 compile_fail:
   - agent_units_are_built_by_the_builder
   - agent_units_protection_not_via_a_binding
+  - unprotect_needs_a_reason
 runtime_tests:
   - crates/core/tests/agent_refusal_matrix.rs
 ---
@@ -28,11 +29,11 @@ inverts the default: forgetting to think about it yields the safe answer.
 
 Mechanism: type, runtime test.
 
-**Type.** `CandidateAgentUnit`'s fields are private to `agents::unit` (only `path` and `note`, which decide nothing, are public); `AgentUnitBuilder` sets protected-by-default and is the only constructor. Assigning `protected`, directly or through a `&mut` binding, does not compile anywhere else.
+**Type.** `CandidateAgentUnit`'s fields are private to `agents::unit` (only `path` and `note`, which decide nothing, are public); `AgentUnitBuilder` sets protected-by-default and is the only constructor. Assigning `protected`, directly or through a `&mut` binding, does not compile anywhere else, and `unprotect_with_reason` takes an `evidence::Reason`, so the lift always says why.
 
 Retired 2026-09-22: the `agent_units_built_through_builder` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `agent_units_are_built_by_the_builder`, `agent_units_protection_not_via_a_binding`.
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `agent_units_are_built_by_the_builder`, `agent_units_protection_not_via_a_binding`, `unprotect_needs_a_reason`.
 
 ## Runtime tests that complete it
 

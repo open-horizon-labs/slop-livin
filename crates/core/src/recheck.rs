@@ -578,6 +578,18 @@ pub(crate) fn live_protection(store_dir: &Path, paths: &[PathBuf]) -> Result<()>
     Ok(())
 }
 
+/// Proposal-time occupancy, as a refusal: `None` only when every member
+/// probed `Free`. The same tri-state, descendant-aware probe the sink's
+/// [`run_all`] takes; an unanswerable probe is a refusal, never "nothing
+/// open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`). The
+/// `OccupancyState` itself never leaves this module and `occupancy`.
+pub(crate) fn occupancy_refusal(paths: &[PathBuf]) -> Option<String> {
+    match member_occupancy(paths) {
+        OccupancyState::Free => None,
+        other => other.refusal(),
+    }
+}
+
 /// Probes every member of a reviewed unit, not just its anchor. Returns
 /// the first non-[`OccupancyState::Free`] answer; `Unknown` is a refusal
 /// at every sink, never a silent pass
@@ -586,7 +598,7 @@ pub(crate) fn live_protection(store_dir: &Path, paths: &[PathBuf]) -> Result<()>
 /// A directory member is probed with `lsof +D`, which covers everything
 /// beneath it, so a bounded set of top-level probes still answers for the
 /// whole tree.
-pub(crate) fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
+fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
     // Probing every member of a 100k-entry cache would be its own denial
     // of service; `lsof +D` on the anchor already covers descendants, so
     // probe the anchor plus any member that is not beneath it.

@@ -1,5 +1,6 @@
 //! target: crates/core/src/agents/aider.rs
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: one of the five things every adapter proves about itself simply removed
 pub const AIDER_TOOL_ID: &str = "aider";
 

@@ -2692,6 +2692,7 @@ version = "0.6.3"
 dependencies = [
  "proc-macro2",
  "quote",
+ "serde_json",
  "swamp-core",
  "syn 2.0.119",
  "tempfile",

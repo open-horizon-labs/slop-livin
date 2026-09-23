@@ -115,6 +115,10 @@ pub struct Ref {
     /// Inside the arguments of a `worker::spawn(..)` call: work the TUI
     /// hands off its event thread.
     pub in_worker: bool,
+    /// Inside an `impl` of the very type this path's last segment names
+    /// (`impl Consumer for X`, `X::new()` inside `impl X`): a type naming
+    /// itself does not make it used.
+    pub own_impl: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +214,11 @@ pub struct Module {
     pub pub_items: Vec<(String, Site)>,
     /// Module-level `const NAME: &str = "value";` items.
     pub str_consts: Vec<(String, String, Site)>,
+    /// Absolute or home-relative path literals turned into a path
+    /// (`PathBuf::from("/Users/..")`, `Path::new("~/.x")`), production only.
+    pub path_literals: Vec<(String, Site)>,
+    /// `#[allow(dead_code)]` / `#[expect(dead_code)]` in production code.
+    pub dead_code_allows: Vec<Site>,
 }
 
 impl Module {
@@ -284,7 +293,7 @@ impl Workspace {
                 return;
             }
         };
-        let file = match syn::parse_file(&text) {
+        let file = match parse_cached(&text) {
             Ok(f) => f,
             Err(e) => {
                 self.parse_errors.push(format!("{rel_file}: {e}"));
@@ -334,6 +343,8 @@ impl Workspace {
             serialized: Vec::new(),
             pub_items: Vec::new(),
             str_consts: Vec::new(),
+            path_literals: Vec::new(),
+            dead_code_allows: Vec::new(),
         });
         // Item names first, so resolution can see later items.
         for item in items {
@@ -352,6 +363,7 @@ impl Workspace {
                 in_trait_def: false,
                 impl_trait: None,
                 worker_depth: 0,
+                spawn_aliases: HashSet::new(),
             };
             for a in inner_attrs {
                 c.visit_attribute(a);
@@ -721,6 +733,9 @@ struct Collector<'w> {
     in_trait_def: bool,
     impl_trait: Option<String>,
     worker_depth: usize,
+    /// Locals bound to `worker::spawn` itself (`let go = worker::spawn;`):
+    /// calling one is the same hand-off.
+    spawn_aliases: HashSet<String>,
 }
 
 impl Collector<'_> {
@@ -744,12 +759,17 @@ impl Collector<'_> {
             return;
         }
         let r = Ref {
-            segments,
             kind,
             test: self.test(),
             site: self.site(span),
             in_fn: self.in_fn(),
             in_worker: self.worker_depth > 0,
+            own_impl: self.impl_owner.is_some()
+                && !self.in_trait_def
+                && segments
+                    .iter()
+                    .any(|s| s == "Self" || Some(s) == self.impl_owner.as_ref()),
+            segments,
         };
         self.ws.modules[self.module].refs.push(r);
     }
@@ -1215,7 +1235,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
 
     fn visit_stmt(&mut self, s: &'ast syn::Stmt) {
         match s {
-            syn::Stmt::Local(l) => self.with_attrs(&l.attrs, |c| syn::visit::visit_local(c, l)),
+            syn::Stmt::Local(l) => self.with_attrs(&l.attrs, |c| c.visit_local(l)),
             syn::Stmt::Macro(m) => self.with_attrs(&m.attrs, |c| c.visit_macro(&m.mac)),
             syn::Stmt::Item(i) => self.visit_item(i),
             syn::Stmt::Expr(e, _) => self.visit_expr(e),
@@ -1251,6 +1271,30 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         while let syn::Expr::Paren(p) = callee {
             callee = &p.expr;
         }
+        if let syn::Expr::Path(p) = callee
+            && !self.test()
+        {
+            let segs: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            let n = segs.len();
+            let path_ctor = n >= 2
+                && matches!(segs[n - 2].as_str(), "PathBuf" | "Path")
+                && matches!(segs[n - 1].as_str(), "from" | "new");
+            if path_ctor
+                && let Some(syn::Expr::Lit(l)) = call.args.first()
+                && let syn::Lit::Str(v) = &l.lit
+                && (v.value().starts_with('/') || v.value().starts_with("~/"))
+            {
+                let site = self.site(l.span());
+                self.ws.modules[self.module]
+                    .path_literals
+                    .push((v.value(), site));
+            }
+        }
         let opaque = !matches!(callee, syn::Expr::Path(_) | syn::Expr::Closure(_));
         if opaque
             && self.worker_depth == 0
@@ -1261,8 +1305,10 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         }
         // `worker::spawn(job)`: the TUI's one way off the event thread.
         let spawn = matches!(callee, syn::Expr::Path(p)
-            if p.path.segments.last().is_some_and(|s| s.ident == "spawn")
-                && p.path.segments.iter().any(|s| s.ident == "worker"));
+            if (p.path.segments.last().is_some_and(|s| s.ident == "spawn")
+                && p.path.segments.iter().any(|s| s.ident == "worker"))
+                || (p.path.segments.len() == 1
+                    && self.spawn_aliases.contains(&p.path.segments[0].ident.to_string())));
         if spawn {
             self.visit_expr(&call.func);
             self.worker_depth += 1;
@@ -1304,6 +1350,18 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         self.visit_type(&q.ty);
     }
 
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if let syn::Pat::Ident(id) = &l.pat
+            && let Some(init) = &l.init
+            && let syn::Expr::Path(p) = &*init.expr
+            && p.path.segments.last().is_some_and(|s| s.ident == "spawn")
+            && p.path.segments.iter().any(|s| s.ident == "worker")
+        {
+            self.spawn_aliases.insert(id.ident.to_string());
+        }
+        syn::visit::visit_local(self, l);
+    }
+
     fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
         let lit = Literal {
             value: l.value(),
@@ -1326,6 +1384,17 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         }
         if p.is_ident("path") {
             self.hazard("`#[path]`", a.span());
+        }
+        if (p.is_ident("allow") || p.is_ident("expect"))
+            && !self.test()
+            && let syn::Meta::List(l) = &a.meta
+            && l.tokens
+                .clone()
+                .into_iter()
+                .any(|t| t.to_string() == "dead_code")
+        {
+            let site = self.site(a.span());
+            self.ws.modules[self.module].dead_code_allows.push(site);
         }
         // Every other attribute's tokens are names and strings too:
         // `#[serde(rename = "safe_to_delete")]` delivers that string, and
@@ -1362,6 +1431,25 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         {
             for e in &args {
                 self.visit_expr(e);
+            }
+            // `concat!("can", " be deleted")` delivers one string: record
+            // the joined text too, so a phrase split across arguments is
+            // still the phrase.
+            if name == "concat" {
+                let mut joined = String::new();
+                for e in &args {
+                    if let syn::Expr::Lit(l) = e
+                        && let syn::Lit::Str(s) = &l.lit
+                    {
+                        joined.push_str(&s.value());
+                    }
+                }
+                let lit = Literal {
+                    value: joined,
+                    test: self.test(),
+                    site: self.site(m.path.span()),
+                };
+                self.ws.modules[self.module].literals.push(lit);
             }
             return;
         }
@@ -1497,7 +1585,7 @@ fn collect_test_file(
     let Ok(text) = std::fs::read_to_string(file) else {
         return;
     };
-    let parsed = match syn::parse_file(&text) {
+    let parsed = match parse_cached(&text) {
         Ok(p) => p,
         Err(e) => {
             errors.push(format!("{}: {e}", rel(root, file)));
@@ -1623,6 +1711,41 @@ pub fn methods_by_name(ws: &Workspace) -> HashMap<String, Vec<usize>> {
     out
 }
 
+thread_local! {
+    static PARSED: std::cell::RefCell<HashMap<String, Result<std::rc::Rc<syn::File>, String>>> =
+        std::cell::RefCell::new(HashMap::new());
+    static IDENTS: std::cell::RefCell<HashMap<String, std::rc::Rc<HashSet<String>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// `syn::parse_file`, memoized by the file's text. The mutation harness
+/// loads the workspace once per mutation, and all but one or two files
+/// are unchanged between loads; re-parsing them is most of the cost, and
+/// every parse also grows proc-macro2's span source map for good.
+pub fn parse_cached(text: &str) -> Result<std::rc::Rc<syn::File>, String> {
+    if let Some(hit) = PARSED.with(|c| c.borrow().get(text).cloned()) {
+        return hit;
+    }
+    let parsed = syn::parse_file(text)
+        .map(std::rc::Rc::new)
+        .map_err(|e| e.to_string());
+    PARSED.with(|c| c.borrow_mut().insert(text.to_string(), parsed.clone()));
+    parsed
+}
+
+fn idents_cached(text: &str) -> std::rc::Rc<HashSet<String>> {
+    if let Some(hit) = IDENTS.with(|c| c.borrow().get(text).cloned()) {
+        return hit;
+    }
+    let mut set = HashSet::new();
+    if let Ok(ts) = text.parse::<TokenStream>() {
+        collect_idents(ts, &mut set);
+    }
+    let set = std::rc::Rc::new(set);
+    IDENTS.with(|c| c.borrow_mut().insert(text.to_string(), set.clone()));
+    set
+}
+
 /// Every identifier in the workspace's integration test files
 /// (`crates/*/tests/**.rs`), token-level: what a test names keeps a
 /// public item referenced.
@@ -1633,13 +1756,17 @@ pub fn test_identifiers(root: &Path) -> HashSet<String> {
     };
     for c in crates.flatten() {
         for f in rust_files(&c.path().join("tests")) {
+            // Mutation fixtures and compile-fail cases are data, not code
+            // Cargo builds: what they name is not thereby used.
+            if f.components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some("mutations" | "compile_fail")))
+            {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&f) else {
                 continue;
             };
-            let Ok(ts) = text.parse::<TokenStream>() else {
-                continue;
-            };
-            collect_idents(ts, &mut out);
+            out.extend(idents_cached(&text).iter().cloned());
         }
     }
     out

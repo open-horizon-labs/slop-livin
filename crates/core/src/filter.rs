@@ -24,7 +24,7 @@
 //! Sizes: `500MB`, `1.5GB` are decimal (×1000, matching the formatter);
 //! `500MiB`, `1.5GiB` are binary (×1024); a bare number is bytes.
 
-use crate::github::{MergedStatus, PrStatus};
+use crate::github::PrStatus;
 use crate::growth::parse_duration_secs;
 use crate::report::{ArtifactKind, ArtifactRow, ProjectRow, WorktreeRow};
 use anyhow::{Result, anyhow};
@@ -76,8 +76,6 @@ pub struct WorktreeFacts<'a> {
     pub merge_complete: bool,
     pub idle_secs: Option<u64>,
     pub pr: &'a PrStatus,
-    #[allow(dead_code)]
-    pub merged: &'a MergedStatus,
 }
 
 /// `500MB` / `1.5GB` decimal (×1000, the same base the formatter prints

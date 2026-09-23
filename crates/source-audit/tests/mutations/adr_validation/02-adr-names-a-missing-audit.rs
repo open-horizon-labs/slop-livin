@@ -1,5 +1,6 @@
 //! target: docs/ADRs/001-event-bus-report-pipeline.md
 //! mode: replace
+//! by: audit:guardrail_metadata
 //! why: an ADR claiming an audit validates it, where no such audit is registered
 ---
 id: 001-event-bus-report-pipeline

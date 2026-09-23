@@ -323,7 +323,8 @@ impl AgentUnitBuilder {
 
     /// Lifts a category's default protection. Deliberately noisy: a
     /// reason is required and the audit records every use.
-    pub fn unprotect_with_reason(mut self, reason: &str) -> Self {
+    pub fn unprotect_with_reason(mut self, reason: impl Into<crate::evidence::Reason>) -> Self {
+        let reason: crate::evidence::Reason = reason.into();
         self.unit.protected = false;
         self.unit.protect_reason = Some(format!("default protection lifted: {reason}"));
         self

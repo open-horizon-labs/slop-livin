@@ -21,7 +21,7 @@ real tool home.
 
 Mechanism: gate audit, runtime test.
 
-**Gate audit.** `adapters_do_not_reach_gates`: an adapter module (`agents::*` except the registry, matrix, unit and bounded-I/O plumbing) may not name `std::env`, `dirs`, `home`, the detectors, the actions or the gate; its only I/O is the `IdentifyCtx` it is handed. `gate_paths_only_inside_gates` rejects `libc` (so `getpwuid`) anywhere outside the gate.
+**Gate audit.** `adapters_do_not_reach_gates`: an adapter module (`agents::*` except the registry, matrix, unit and bounded-I/O plumbing) may not name `std::env`, `dirs`, `home`, the detectors, the actions or the gate; its only I/O is the `IdentifyCtx` it is handed. `gate_paths_only_inside_gates` rejects `libc` (so `getpwuid`) anywhere outside the gate, and an adapter building a path from an absolute or `~/` literal (`PathBuf::from("/Users/..")`) is rejected too.
 
 Retired 2026-09-22: the `agent_adapters_are_environment_free` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 

@@ -276,11 +276,60 @@ const GROUPS: &[Group] = &[
         why: "a recheck proof is taken only by an execution sink",
     },
     Group {
+        path: "@core::occupancy::OccupancyState",
+        allowed: &[(Krate::Core, &["occupancy"]), (Krate::Core, &["recheck"])],
+        why: "an occupancy answer is consumed only by the recheck, where `Unknown` refuses; \
+              everywhere else it is a refusal string or evidence (occupancy-is-tristate-at-sinks)",
+    },
+    Group {
+        path: "@core::growth::ObservationOwnership::new",
+        allowed: &[(Krate::Core, &["external"]), (Krate::Core, &["agents"])],
+        why: "an ownership window is built by the discovery pass from the roots it covered \
+              completely, never by hand (history-sweeps-are-owned)",
+    },
+    Group {
+        path: "@core::actions::revoke_grant",
+        allowed: &[(Krate::Cli, &[])],
+        why: "grant state changes only through the reviewed CLI command (human-only-authorization)",
+    },
+    Group {
         path: "@core::evidence::Reason::__from_checked_format",
         allowed: &[(Krate::Core, &["evidence"])],
         why: "only the `reason!` macro, which checks the template is not blank, may build a \
               formatted reason this way",
     },
+];
+
+/// Token constructors whose module is large enough to hold a second,
+/// unreviewed caller: each may be called only from the named functions.
+type MintSite = (Krate, &'static [&'static str], &'static str);
+const MINT_SITES: &[(&str, &[MintSite], &str)] = &[
+    (
+        "@core::report::pass::DiscoveryPass::begin",
+        &[
+            (Krate::Core, &["report"], "observe_scope"),
+            (Krate::Core, &["report", "pass"], "for_tests"),
+        ],
+        "a discovery pass is minted only by `report::observe_scope` \
+         (discovery-owned-by-report-pipeline)",
+    ),
+    (
+        "@core::bus::registry::Stage::mint",
+        &[
+            (Krate::Core, &["bus", "registry"], "run"),
+            (Krate::Core, &["bus", "registry"], "for_tests"),
+        ],
+        "a pipeline stage token is minted only by `EventBus::run` \
+         (event-bus-pluggable-consumers)",
+    ),
+];
+
+/// The report functions the TUI may name: the scope-aware observation,
+/// loading a stored report back, and the pure merge of per-root reports.
+const TUI_REPORT_API: &[&str] = &[
+    "@core::report::observe_scope",
+    "@core::report::load_last_report",
+    "@core::report::merge_reports",
 ];
 
 fn allowed(m: &Module, list: &[(Krate, &[&str])]) -> bool {
@@ -305,6 +354,11 @@ const PATH_IO_METHODS: &[&str] = &[
     "read_link",
     "try_exists",
 ];
+
+/// `Path` methods that stat (and, but for `symlink_metadata`, follow):
+/// as *methods* they are clippy's (`disallowed_methods`, type-resolved);
+/// as paths the audit sees them too.
+const PATH_STAT_METHODS: &[&str] = &["metadata", "exists", "is_dir", "is_file", "is_symlink"];
 
 pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
@@ -341,6 +395,23 @@ pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
                 continue;
             }
             let abs = ws.resolve(mi, &r.segments).join("::");
+            // `Path::read_dir` / `<Path>::metadata` as a path (UFCS, or a
+            // method passed as a value): the same filesystem access as the
+            // method call.
+            if !gate
+                && (abs.starts_with("std::path::Path::") || abs.starts_with("std::path::PathBuf::"))
+                && abs
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|l| PATH_IO_METHODS.contains(&l) || PATH_STAT_METHODS.contains(&l))
+            {
+                problems.push(format!(
+                    "{}: `{}` outside the capability gate: filesystem access goes through \
+                     crates/core/src/fs_gate",
+                    r.site,
+                    r.segments.join("::")
+                ));
+            }
             if !gate && let Some(g) = names_gated(&abs) {
                 problems.push(format!(
                     "{}: `{}` names `{g}`{} outside the capability gate (crates/core/src/fs_gate)",
@@ -376,6 +447,47 @@ pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
                     r.site,
                     r.segments.join("::")
                 ));
+            }
+            if m.krate == Krate::Tui
+                && under(&abs, "@core::report")
+                && abs.split("::").count() == 3
+                && abs
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_lowercase()))
+                && !TUI_REPORT_API.iter().any(|a| under(&abs, a))
+            {
+                problems.push(format!(
+                    "{}: the TUI names `{}`: every TUI observation goes through the scope-aware \
+                     `report::observe_scope` (or loads a stored report back); a report entry \
+                     point that takes a bare root drops the scope's exclusions \
+                     (tui-refresh-preserves-scope)",
+                    r.site,
+                    r.segments.join("::")
+                ));
+            }
+            for (mint, sites, why) in MINT_SITES {
+                // By resolved path, and by the last two segments whatever
+                // they resolve to (a glob import, a re-export): the
+                // conservative reading.
+                let tail: Vec<&str> = mint.rsplit("::").take(2).collect();
+                let n = r.segments.len();
+                let by_name =
+                    n >= 2 && r.segments[n - 1] == tail[0] && r.segments[n - 2] == tail[1];
+                if under(&abs, mint) || by_name {
+                    let f = r.in_fn.map(|f| ws.fns[f].name.as_str()).unwrap_or("");
+                    let ok = sites
+                        .iter()
+                        .any(|(k, p, name)| m.krate == *k && m.path == *p && f == *name);
+                    if !ok {
+                        problems.push(format!(
+                            "{}: `{}` is called in {}::{f}: {why}",
+                            r.site,
+                            r.segments.join("::"),
+                            m.display()
+                        ));
+                    }
+                }
             }
             if gate {
                 continue;
@@ -521,17 +633,46 @@ const ADAPTER_DENIED_METHODS: &[&str] = &[
     "into_parts",
 ];
 
+/// The tool adapters (a module under `agents` declaring a `*_TOOL_ID`),
+/// by their module path, e.g. `@core::agents::cline`.
+fn tool_adapters(ws: &Workspace) -> Vec<String> {
+    ws.modules
+        .iter()
+        .filter(|m| is_adapter(m) && !m.test)
+        .filter(|m| m.str_consts.iter().any(|(n, _, _)| n.ends_with("_TOOL_ID")))
+        .map(|m| m.abs().join("::"))
+        .collect()
+}
+
 pub fn adapters_do_not_reach_gates(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
+    let tools = tool_adapters(ws);
     for (mi, m) in ws.modules.iter().enumerate() {
         if !is_adapter(m) {
             continue;
         }
+        let own = m.abs().join("::");
         for r in &m.refs {
             if r.test {
                 continue;
             }
             let abs = ws.resolve(mi, &r.segments).join("::");
+            // One tool's adapter never names another's: shared mechanics
+            // live in a family module that declares no tool id
+            // (agent-adapters-are-pluggable).
+            if let Some(other) = tools
+                .iter()
+                .find(|t| **t != own && !under(&own, t) && under(&abs, t))
+            {
+                problems.push(format!(
+                    "{}: adapter {} names `{}`, inside another tool's adapter ({}): shared \
+                     mechanics belong in a family module (agent-adapters-are-pluggable)",
+                    r.site,
+                    m.display(),
+                    r.segments.join("::"),
+                    other.trim_start_matches("@core::")
+                ));
+            }
             if ADAPTER_GATE_TYPES.iter().any(|t| under(&abs, t)) {
                 continue;
             }
@@ -557,6 +698,27 @@ pub fn adapters_do_not_reach_gates(ws: &Workspace) -> Vec<String> {
                     r.segments.join("::")
                 ));
             }
+        }
+        for l in &m.literals {
+            let v = l.value.as_str();
+            if !l.test
+                && !v.contains(char::is_whitespace)
+                && (v.starts_with("/Users/") || v.starts_with("/home/") || v.starts_with("~/"))
+            {
+                problems.push(format!(
+                    "{}: adapter {} holds the home path \"{v}\" as a literal: adapters take every \
+                     path from the context they are handed (agent-adapters-are-environment-free)",
+                    l.site,
+                    m.display()
+                ));
+            }
+        }
+        for (lit, site) in &m.path_literals {
+            problems.push(format!(
+                "{site}: adapter {} builds the path \"{lit}\" from a literal: adapters take every \
+                 path from the context they are handed (agent-adapters-are-environment-free)",
+                m.display()
+            ));
         }
         for c in &m.methods {
             if c.test {
@@ -714,6 +876,32 @@ pub fn bus_static_registration(ws: &Workspace) -> Vec<String> {
                         r.site
                     ));
                 }
+                // A stage knows its events, not the bus that runs it.
+                if abs.len() >= 3 && abs[0] == "@core" && abs[1] == "bus" && abs[2] == "EventBus" {
+                    problems.push(format!(
+                        "{}: consumer `{own}` names the `EventBus` (`{}`): a stage receives events \
+                         and emits events; registration and dispatch are the bus's \
+                         (event-bus-pluggable-consumers)",
+                        r.site,
+                        r.segments.join("::")
+                    ));
+                }
+            } else if !m.is_within(Krate::Core, &["bus"])
+                && !m.is_within(Krate::Core, &["consumers"])
+                && abs.len() >= 3
+                && abs[0] == "@core"
+                && abs[1] == "consumers"
+                && consumers.contains(&abs[2])
+            {
+                problems.push(format!(
+                    "{}: {} names consumer `{}` (`{}`): outside the consumers and the bus's \
+                     registrar nothing reaches into a stage; a new fact source is a registered \
+                     consumer (extractors-are-pluggable)",
+                    r.site,
+                    m.display(),
+                    abs[2],
+                    r.segments.join("::")
+                ));
             }
         }
     }
@@ -945,9 +1133,13 @@ pub fn no_unreferenced_public_items(ws: &Workspace) -> Vec<String> {
     let mut named: HashSet<String> = HashSet::new();
     for m in &ws.modules {
         for r in &m.refs {
-            if let Some(l) = r.segments.last() {
-                named.insert(l.clone());
+            if r.own_impl {
+                // Its own impl blocks name a type (and `Self::f` its
+                // methods) without using it.
+                continue;
             }
+            // Every segment: `Type::f` names `Type` as well as `f`.
+            named.extend(r.segments.iter().cloned());
         }
         for c in &m.methods {
             named.insert(c.name.clone());
@@ -971,6 +1163,15 @@ pub fn no_unreferenced_public_items(ws: &Workspace) -> Vec<String> {
     }
     for id in crate::model::test_identifiers(&ws.root) {
         named.insert(id);
+    }
+    for m in &ws.modules {
+        for site in &m.dead_code_allows {
+            problems.push(format!(
+                "{site}: `#[allow(dead_code)]` in production code: it hides dead code from rustc, \
+                 and a caller it keeps \"alive\" makes dead public API look used \
+                 (no-dead-public-evidence-api)"
+            ));
+        }
     }
     for (name, site, what) in public_definitions(ws) {
         if !named.contains(&name) {
