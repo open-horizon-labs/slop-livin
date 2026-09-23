@@ -578,6 +578,12 @@ impl EventCoverage {
 /// every root would make a write under `~/.cargo` read as a change under
 /// `~/.claude` -- the cross-talk this function exists to prevent. Roots
 /// are compared as canonical paths, the namespace FSEvents reports in.
+///
+/// Its only production caller is `fs_events::macos`
+/// (`target_os = "macos"`-gated); on Linux only the portable unit test
+/// below calls it, which the lib target (built without `cfg(test)`)
+/// does not see.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn partition_changes(roots: &[PathBuf], changes: &[PathBuf]) -> Vec<Vec<PathBuf>> {
     roots
         .iter()
