@@ -547,6 +547,7 @@ fn a_node_unit_gets_nested_history_on_the_existing_key_family() {
     let mut projects: Vec<swamp_core::report::ProjectRow> =
         serde_json::from_value(row(4096)).unwrap();
     swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
         store.path(),
         1,
         &mut projects,
@@ -563,6 +564,7 @@ fn a_node_unit_gets_nested_history_on_the_existing_key_family() {
 
     projects[0].worktrees[0].artifacts[0].bytes = 12_288;
     swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
         store.path(),
         1,
         &mut projects,
@@ -581,6 +583,7 @@ fn a_node_unit_gets_nested_history_on_the_existing_key_family() {
     // Coverage is not storage: re-observing the same bytes, however the
     // unit is classified, is not a delta.
     swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
         store.path(),
         1,
         &mut projects,
