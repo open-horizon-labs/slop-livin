@@ -507,20 +507,7 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 /// exact figure rather than inventing uncertainty.
 #[cfg(target_os = "macos")]
 fn copy_on_write_volume(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    unsafe {
-        let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
-        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
-            return false;
-        }
-        let sf = buf.assume_init();
-        std::ffi::CStr::from_ptr(sf.f_fstypename.as_ptr())
-            .to_bytes()
-            .eq_ignore_ascii_case(b"apfs")
-    }
+    crate::fs_gate::sys::volume_info(path).is_ok_and(|v| v.is_apfs())
 }
 
 /// No copy-on-write extent sharing is claimed on a platform where this
@@ -631,7 +618,7 @@ pub fn attach_decision_evidence(report: &mut Report) {
                         ]
                         .iter()
                         .map(|name| wt_path.join(name))
-                        .find(|p| p.exists());
+                        .find(|p| crate::fs_gate::exists(p));
                         Some(crate::recovery::dependency_tree_recovery(
                             lockfile.as_deref(),
                         ))
@@ -1093,13 +1080,13 @@ pub(crate) fn report_full_mode_scoped_tracked(
     // alias and the next uses its canonical spelling: FSEvents is canonical,
     // while a caller-form topology would otherwise make incremental replay
     // compare different path namespaces.
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // Exclusion patterns were resolved against the pre-canonicalization
     // root; canonicalize them the same way so a symlinked root's pruned
     // subtrees still match what the walker actually sees.
     let pruned_subtrees: Vec<PathBuf> = pruned_subtrees
         .iter()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .map(|p| crate::fs_gate::canonicalize(p).unwrap_or_else(|_| p.clone()))
         .collect();
     // The pipeline is consumers on the event bus (ADR 001); this function
     // only translates its arguments into the run context.
@@ -1189,12 +1176,9 @@ pub fn annotate_tracking(
     }
 }
 
-fn last_report_path(store_dir: &Path, root: &Path) -> PathBuf {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    store_dir.join(format!(
-        "last_report-{}.json.zst",
-        &crate::entities::id_for(&root.display().to_string())[..16]
-    ))
+fn last_report_key(root: &Path) -> String {
+    let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    crate::entities::id_for(&root.display().to_string())[..16].to_string()
 }
 
 /// (worktree_id, rel_path) of every folded artifact row, for
@@ -1236,22 +1220,16 @@ pub(crate) fn dir_inside_artifact(
 }
 
 pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
-    std::fs::create_dir_all(store_dir)?;
-    let path = last_report_path(store_dir, &report.root);
-    let tmp = path.with_extension("tmp");
     let mut slim = report.clone();
     slim.dirs_by_worktree = None;
     slim.files_by_worktree = None;
-    let file = std::fs::File::create(&tmp)?;
-    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
-    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, encoder);
-    serde_json::to_writer(&mut writer, &slim)?;
-    writer
-        .into_inner()
-        .map_err(|e| e.into_error())?
-        .finish()?
-        .sync_all()?;
-    std::fs::rename(&tmp, &path)?;
+    crate::fs_gate::store::write_json(
+        crate::fs_gate::store::JsonFile::LastReport {
+            store: store_dir,
+            key: &last_report_key(&report.root),
+        },
+        &slim,
+    )?;
     Ok(())
 }
 
@@ -1259,8 +1237,11 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
 /// run, TUI), without walking anything. `None` when no observation of
 /// this root has been cached yet.
 pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
-    let file = std::fs::File::open(last_report_path(store_dir, root)).ok()?;
-    let bytes = zstd::stream::decode_all(file).ok()?;
+    let bytes = crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
+        store: store_dir,
+        key: &last_report_key(root),
+    })
+    .ok()??;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -2112,7 +2093,7 @@ pub fn report_scope_with_parts_covered(
                 // presence/readability check right before walking so a
                 // root that lost access in between is never silently
                 // walked as if it were empty.
-                match std::fs::read_dir(path) {
+                match crate::fs_gate::read_dir(path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         coverage.push(RootCoverage::missing(path.clone()));
                         continue;
@@ -2173,7 +2154,7 @@ pub fn report_scope_with_parts_covered(
                             // through a symlinked alias would otherwise
                             // never match it.
                             let canonical =
-                                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                                crate::fs_gate::canonicalize(path).unwrap_or_else(|_| path.clone());
                             events.trust(canonical, changed, since);
                         }
                         r
@@ -2663,12 +2644,6 @@ fn scope_cache_key(scope: &crate::scope::EffectiveScope) -> String {
     crate::entities::id_for(&paths.join("\u{1}"))[..16].to_string()
 }
 
-fn last_scope_report_path(store_dir: &Path, scope: &crate::scope::EffectiveScope) -> PathBuf {
-    store_dir.join(format!(
-        "last_report-scope-{}.json.zst",
-        scope_cache_key(scope)
-    ))
-}
 
 /// Persists the merged multi-root report from [`report_scope`], the same
 /// way [`write_last_report`] does for a single root, so a cached
@@ -2678,22 +2653,16 @@ pub fn write_last_scope_report(
     scope: &crate::scope::EffectiveScope,
     report: &Report,
 ) -> Result<()> {
-    std::fs::create_dir_all(store_dir)?;
-    let path = last_scope_report_path(store_dir, scope);
-    let tmp = path.with_extension("tmp");
     let mut slim = report.clone();
     slim.dirs_by_worktree = None;
     slim.files_by_worktree = None;
-    let file = std::fs::File::create(&tmp)?;
-    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
-    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, encoder);
-    serde_json::to_writer(&mut writer, &slim)?;
-    writer
-        .into_inner()
-        .map_err(|e| e.into_error())?
-        .finish()?
-        .sync_all()?;
-    std::fs::rename(&tmp, &path)?;
+    crate::fs_gate::store::write_json(
+        crate::fs_gate::store::JsonFile::LastReport {
+            store: store_dir,
+            key: &format!("scope-{}", scope_cache_key(scope)),
+        },
+        &slim,
+    )?;
     Ok(())
 }
 
@@ -2705,7 +2674,10 @@ pub fn load_last_scope_report(
     store_dir: &Path,
     scope: &crate::scope::EffectiveScope,
 ) -> Option<Report> {
-    let file = std::fs::File::open(last_scope_report_path(store_dir, scope)).ok()?;
-    let bytes = zstd::stream::decode_all(file).ok()?;
+    let bytes = crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
+        store: store_dir,
+        key: &format!("scope-{}", scope_cache_key(scope)),
+    })
+    .ok()??;
     serde_json::from_slice(&bytes).ok()
 }

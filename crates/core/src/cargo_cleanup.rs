@@ -4,15 +4,8 @@
 use crate::artifact::{ArtifactRole, NestedArtifact};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::Read,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt},
-    },
-    path::{Path, PathBuf},
-};
+use crate::fs_gate::{self as fs, MetadataExt, sys::RegularFile};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -378,15 +371,8 @@ pub fn candidate(unit: &NestedArtifact) -> bool {
     }
 }
 
-fn regular(path: &Path) -> Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        bail!("not a regular file: {}", path.display());
-    }
-    Ok(file)
+fn regular(path: &Path) -> Result<RegularFile> {
+    Ok(RegularFile::open_nofollow(path)?)
 }
 
 fn snapshot(path: &Path) -> Result<Member> {
@@ -443,15 +429,7 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
     }
     let mut file = regular(path)?;
     let before = file.metadata()?;
-    let mut hash = blake3::Hasher::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buf[..n]);
-    }
+    let digest = file.digest()?;
     let after = file.metadata()?;
     if (
         before.len(),
@@ -475,27 +453,12 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         nlink: before.nlink(),
         hardlink_members: u64::from(before.nlink() > 1),
         bytes: before.blocks() * 512,
-        digest: hash.finalize().to_hex().to_string(),
+        digest,
     })
 }
 
 fn local_filesystem(path: &Path) -> Result<()> {
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::statfs(c.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let stat = unsafe { stat.assume_init() };
-    #[cfg(target_os = "macos")]
-    let local = stat.f_flags & libc::MNT_LOCAL as u32 != 0;
-    #[cfg(target_os = "linux")]
-    let local = matches!(
-        stat.f_type as u64,
-        0xef53 | 0x9123683e | 0x58465342 | 0x01021994
-    );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let local = false;
-    if !local {
+    if !fs::sys::volume_info(path)?.is_local() {
         bail!(
             "Cargo cleanup requires a supported local filesystem; network/unknown mounts are inspection-only"
         );
@@ -521,7 +484,7 @@ fn locks(profile: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-struct HeldLocks(Vec<fs::File>);
+struct HeldLocks(Vec<RegularFile>);
 
 impl Drop for HeldLocks {
     fn drop(&mut self) {
@@ -558,7 +521,7 @@ fn acquire(paths: &[PathBuf]) -> Result<HeldLocks> {
 fn explicit_unlock_releases_even_with_a_duplicated_description() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(".cargo-lock");
-    fs::write(&path, b"").unwrap();
+    std::fs::write(&path, b"").unwrap();
     let held = acquire(std::slice::from_ref(&path)).unwrap();
     let duplicate = held.0[0].try_clone().unwrap();
     assert!(
@@ -643,11 +606,11 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     let mut paths = vec![selected.clone()];
     let dep = selected.with_extension("d");
-    if !directory_group && dep != selected && dep.exists() {
+    if !directory_group && dep != selected && fs::exists(&dep) {
         paths.push(dep);
     }
     let dsym = selected.with_extension("dSYM");
-    if !directory_group && dsym.exists() {
+    if !directory_group && fs::exists(&dsym) {
         paths.push(dsym);
     }
     let members: Vec<_> = paths.iter().map(|p| snapshot(p)).collect::<Result<_>>()?;
@@ -676,6 +639,7 @@ pub(crate) fn move_reviewed(
     group: &CargoGroup,
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
     trash: &Path,
+    auth: &crate::authority::Authorized,
 ) -> Result<PathBuf> {
     if locks(&group.profile)? != group.lock_paths {
         bail!("Cargo lock set changed; propose again");
@@ -694,10 +658,10 @@ pub(crate) fn move_reviewed(
     }
     let mut expected = vec![group.selected.clone()];
     let dep = group.selected.with_extension("d");
-    if !is_dir && dep.exists() && dep != group.selected {
+    if !is_dir && fs::exists(&dep) && dep != group.selected {
         expected.push(dep);
     }
-    if !is_dir && group.selected.with_extension("dSYM").exists() {
+    if !is_dir && fs::exists(group.selected.with_extension("dSYM")) {
         expected.push(group.selected.with_extension("dSYM"));
     }
     if expected
@@ -725,49 +689,34 @@ pub(crate) fn move_reviewed(
     // both directions, which it never was before; and occupancy is
     // tri-state over every member, so a probe that could not run refuses
     // instead of reading as "nothing open".
-    let mut covered: Vec<PathBuf> = group.members.iter().map(|m| m.path.clone()).collect();
-    let fresh = crate::recheck::reviewed_snapshot(&group.selected, reviewed)?;
-    covered.extend(crate::recheck::covered_paths(&fresh));
-    crate::recheck::live_protection(store_dir, &covered)?;
-    match crate::recheck::member_occupancy(&covered) {
-        crate::occupancy::OccupancyState::Free => {}
-        other => bail!(
-            "{}",
-            other
-                .refusal()
-                .unwrap_or_else(|| "occupancy refused this group".to_string())
-        ),
-    }
-    fs::create_dir_all(trash)?;
-    if fs::metadata(trash)?.dev() != group.members[0].device {
-        bail!("cross-device Trash unsupported; no permanent fallback");
-    }
-    let dest = trash.join(format!("swamp-cargo-{}", crate::entities::new_id()));
-    fs::create_dir(&dest)?;
-    fs::write(dest.join("restore.json"), serde_json::to_vec_pretty(group)?)?;
-    fs::File::open(dest.join("restore.json"))?.sync_all()?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let members: Vec<PathBuf> = group.members.iter().map(|m| m.path.clone()).collect();
+    let proof = crate::recheck::run_all(store_dir, &group.selected, reviewed, &members)?;
+    let mut envelope = fs::destroy::Envelope::open(
+        proof,
+        auth,
+        trash,
+        &format!("swamp-cargo-{}", crate::entities::new_id()),
+        Some(group.members[0].device),
+    )?;
+    envelope.write_manifest(group)?;
     for (i, member) in group.members.iter().enumerate() {
-        let to = dest.join(format!(
+        let name = format!(
             "{i}-{}",
-            member.path.file_name().unwrap().to_string_lossy()
-        ));
-        if let Err(e) = fs::rename(&member.path, &to) {
-            let mut failures = Vec::new();
-            for (from, to) in moved.iter().rev() {
-                if from.exists() {
-                    failures.push(format!("{} reappeared", from.display()));
-                } else if let Err(e) = fs::rename(to, from) {
-                    failures.push(e.to_string());
-                }
-            }
+            member
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "member".to_string())
+        );
+        if let Err(e) = envelope.move_member(&member.path, &name) {
+            let failures = envelope.roll_back();
             bail!(
                 "Cargo move failed: {e}; recovery manifest {}; rollback errors: {:?}",
-                dest.display(),
+                envelope.path().display(),
                 failures
             );
         }
-        moved.push((member.path.clone(), to));
     }
+    let dest = envelope.path().to_path_buf();
     Ok(dest)
 }

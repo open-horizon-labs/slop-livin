@@ -961,6 +961,30 @@ impl<'a> IdentifyCtx<'a> {
         self.observed_at
     }
 
+    /// One `lstat(2)` of `path` (never follows a symlink). Adapters stat
+    /// through their context, never through `fs_gate` directly
+    /// (`adapters_do_not_reach_gates`).
+    pub fn stat(&self, path: &Path) -> std::io::Result<crate::fs_gate::Metadata> {
+        crate::fs_gate::symlink_metadata(path)
+    }
+
+    /// Whether `path` is a directory (following a symlink, as
+    /// `Path::is_dir` does).
+    pub fn is_dir(&self, path: &Path) -> bool {
+        crate::fs_gate::is_dir(path)
+    }
+
+    /// Whether `path` is a regular file (following a symlink, as
+    /// `Path::is_file` does).
+    pub fn is_file(&self, path: &Path) -> bool {
+        crate::fs_gate::is_file(path)
+    }
+
+    /// Whether anything exists at `path` (following a symlink).
+    pub fn exists(&self, path: &Path) -> bool {
+        crate::fs_gate::exists(path)
+    }
+
     /// One bounded, single-level, symlink-refusing listing. Sorted, so
     /// identification output does not depend on directory order.
     pub fn list(&self, dir: &Path) -> Vec<Entry> {
@@ -1066,7 +1090,7 @@ impl<'a> IdentifyCtx<'a> {
         max_bytes: usize,
         derive: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        let Ok(meta) = fs::symlink_metadata(path) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
             return None;
         };
         let fingerprint = crate::assoc_store::fingerprint_string(&file_fingerprint(&meta));
@@ -1610,7 +1634,7 @@ pub(crate) fn device_of(path: &Path) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).map(|m| m.dev()).unwrap_or(0)
+        crate::fs_gate::metadata_following(path).map(|m| m.dev()).unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -1659,12 +1683,12 @@ pub(crate) fn resolve_declared_path(
         };
     };
     let path = PathBuf::from(&declared);
-    if !path.exists() {
+    if !crate::fs_gate::exists(&path) {
         return ProjectLinkState::Missing { path };
     }
     for ancestor in path.ancestors() {
         let git_path = ancestor.join(".git");
-        let Ok(git_meta) = fs::symlink_metadata(&git_path) else {
+        let Ok(git_meta) = crate::fs_gate::symlink_metadata(&git_path) else {
             continue;
         };
         if git_meta.is_dir() {
@@ -1710,225 +1734,12 @@ pub fn worktree_root_containing(path: &Path) -> Option<PathBuf> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Human keep/protect intent (#100's `swamp protect add/list/remove`):
-// a small JSON sidecar, deliberately decoupled from the growth store,
-// mirroring `external.rs`'s consumer-association sidecar. Survives
-// refresh; blocks actions; never inferred from observation.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ProtectFile {
-    /// Canonical absolute paths a human explicitly asked to keep.
-    paths: Vec<String>,
-}
-
-pub fn protect_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("agent_protect.json")
-}
-
-/// The single entry point for protection state
-/// (`.oh/guardrails/protection-fails-closed.md`). An absent file is an
-/// empty keep list -- the ordinary "nothing protected yet" case. A file
-/// that exists but cannot be read or parsed is **not**: protection state
-/// is then *unknown*, and every caller must fail closed rather than
-/// proceed as if nothing were protected. Returning `Result` (and the
-/// `protection_fails_closed` audit forbidding `.unwrap_or_default()` and
-/// friends on it) is what makes that structural instead of a convention.
-pub fn load_protect(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
-    let path = protect_path(swamp_dir);
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let f: ProtectFile = serde_json::from_str(&text).map_err(|e| {
-                anyhow::anyhow!(
-                    "protection state unknown: {} is malformed ({e}). Every action is refused \
-                     until it is repaired or removed; `swamp protect list` shows this same error.",
-                    path.display()
-                )
-            })?;
-            for p in &f.paths {
-                if p.trim().is_empty() {
-                    anyhow::bail!(
-                        "protection state unknown: {} contains an empty path entry. Every action \
-                         is refused until it is repaired or removed.",
-                        path.display()
-                    );
-                }
-            }
-            Ok(f.paths.into_iter().map(PathBuf::from).collect())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(anyhow::anyhow!(
-            "protection state unknown: {} could not be read ({e}). Every action is refused \
-             until it can be read again.",
-            path.display()
-        )),
-    }
-}
-
-/// Writes `bytes` to `path` through a temp file in the same directory
-/// plus a rename, so a reader never sees a half-written file and a
-/// crash mid-write never turns protection state into an empty list.
-/// Used by every writer of a small control file under the store.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("control"),
-        std::process::id()
-    ));
-    fs::write(&tmp, bytes)?;
-    // Durability before the rename: a rename that wins the race with an
-    // unflushed write would publish an empty protect list.
-    if let Ok(f) = fs::File::open(&tmp) {
-        let _ = f.sync_all();
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => {
-            // Durability of the *rename*, not only of the bytes. Without
-            // an fsync on the parent directory a crash can lose the
-            // directory entry the rename created, leaving the old
-            // contents (or nothing) where protection state should be --
-            // and protection state is exactly the file where that
-            // matters (the 2026-09-22 re-review's P3). Best-effort: a
-            // filesystem that refuses to sync a directory handle must
-            // not fail the write that already succeeded.
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e.into())
-        }
-    }
-}
-
-fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
-    fs::create_dir_all(swamp_dir)?;
-    let f = ProtectFile {
-        paths: paths.iter().map(|p| p.display().to_string()).collect(),
-    };
-    write_atomic(
-        &protect_path(swamp_dir),
-        serde_json::to_string_pretty(&f)?.as_bytes(),
-    )
-}
-
-/// Adds `path` to the human keep list. Stored verbatim, and **refused
-/// unless it is absolute**.
-///
-/// Verbatim, because `AgentUnit.path`/`AgentMember.path` are built as
-/// `home.join(relative)` and both sides of every comparison are brought
-/// into one spelling by `scope::comparable` at comparison time, not by
-/// rewriting what the human typed.
-///
-/// Absolute, because a relative entry protects nothing. The 2026-09-22
-/// re-review's CE5: `swamp protect add debug` returned `Ok`, `swamp
-/// protect list` showed `debug`, and the very next
-/// propose/approve/execute moved `<home>/debug`.
-/// `protection_conflict` compares against absolute unit paths in both
-/// directions and a relative entry matches neither, so the protection
-/// layer -- which refuses every action on a corrupt protect file --
-/// accepted, confirmed, and then did not protect. The existing "used
-/// verbatim, never canonicalized" rationale is about *symlink*
-/// mismatch; it never justified accepting a path that cannot be
-/// enforced.
-///
-/// Idempotent; a not-yet-observed path can still be protected in
-/// advance.
-pub fn protect_add(swamp_dir: &Path, path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("refused: an empty path protects nothing");
-    }
-    if !path.is_absolute() {
-        anyhow::bail!(
-            "refused: `{}` is not an absolute path, and a relative entry protects nothing \
-             (protection is compared against absolute unit paths in both directions). Pass the \
-             full path, e.g. `$PWD/{}`.",
-            path.display(),
-            path.display()
-        );
-    }
-    let mut paths = load_protect(swamp_dir)?;
-    if !paths.iter().any(|p| p == path) {
-        paths.push(path.to_path_buf());
-        save_protect(swamp_dir, &paths)?;
-    }
-    Ok(())
-}
-
-pub fn protect_remove(swamp_dir: &Path, path: &Path) -> Result<()> {
-    let mut paths = load_protect(swamp_dir)?;
-    let before = paths.len();
-    paths.retain(|p| p != path);
-    if paths.len() != before {
-        save_protect(swamp_dir, &paths)?;
-    }
-    Ok(())
-}
-
-pub fn protect_list(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
-    load_protect(swamp_dir)
-}
-
-/// The reason human keep/protect intent blocks `candidate`, or `None`.
-///
-/// **The only** protection predicate in the crate. There used to be a
-/// second, `is_human_protected`, which returned a bare `bool` by
-/// delegating here -- and that was how a one-directional mutation
-/// survived: the audit inspected this function, while
-/// `actions::propose_checking_protection` called the boolean wrapper,
-/// and no test proposed an ordinary directory *containing* a protected
-/// descendant. One predicate, everywhere, so there is nothing to
-/// inspect the wrong one of
-/// (`.oh/guardrails/protection-fails-closed.md`).
-///
-/// It covers `candidate` in **both** directions:
-///
-/// * `candidate` is the protected path or lies beneath it -- the
-///   original, obvious direction; and
-/// * a protected path lies beneath `candidate` -- the direction the
-///   2026-09-21 review's `protected_descendant_must_prevent_parent_cache_proposal`
-///   counterexample falsified. Protecting `debug/log.txt` and then
-///   removing `debug/` destroys exactly what the human asked to keep, so
-///   a unit *containing* a protected path is protected too.
-///
-/// The returned string carries which direction matched, so a refusal can
-/// say *why*. A one-directional check is a guardrail violation the
-/// `protection_fails_closed` audit rejects.
-pub fn protection_conflict(protected: &[PathBuf], candidate: &Path) -> Option<String> {
-    // One spelling for both sides. `external::discover_and_measure`
-    // canonicalizes every candidate and `agents::discover_and_measure`
-    // does not, so the same home comes back as `/var/folders/.../claude`
-    // from one pass and `/private/var/folders/.../claude` from the
-    // other. Compared literally, a single `protect` entry covered one
-    // family and not the other (the 2026-09-22 re-review's P2); through
-    // `scope::comparable` it covers both.
-    let cand = crate::scope::comparable(candidate);
-    for p in protected {
-        let prot = crate::scope::comparable(p);
-        if cand == prot {
-            return Some(format!("{} is kept by `swamp protect`", p.display()));
-        }
-        if cand.starts_with(&prot) {
-            return Some(format!(
-                "{} is beneath the human-protected path {}",
-                candidate.display(),
-                p.display()
-            ));
-        }
-        if prot.starts_with(&cand) {
-            return Some(format!("contains human-protected path {}", p.display()));
-        }
-    }
-    None
-}
+// Human keep/protect intent lives in `crate::protection`; re-exported
+// here, where every caller has always found it.
+pub use crate::protection::{
+    ProtectList, ProtectListing, load_protect, protect_add, protect_list, protect_path,
+    protect_remove,
+};
 
 // ---------------------------------------------------------------------
 // Active-session check (#92's acceptance): occupancy is checked only at
@@ -2041,12 +1852,12 @@ pub fn discover_and_measure(
     // than fail the whole report, every unit is marked protected with
     // that reason, so identification still works and nothing is
     // proposable (`.oh/guardrails/protection-fails-closed.md`).
-    let (protected_paths, protection_unknown): (Vec<PathBuf>, Option<String>) = match swamp_dir {
+    let (protected_paths, protection_unknown): (ProtectList, Option<String>) = match swamp_dir {
         Some(dir) => match load_protect(dir) {
             Ok(p) => (p, None),
-            Err(e) => (Vec::new(), Some(e.to_string())),
+            Err(e) => (ProtectList::empty(), Some(e.to_string())),
         },
-        None => (Vec::new(), None),
+        None => (ProtectList::empty(), None),
     };
 
     let mut candidates_by_key: HashMap<String, (String, PathBuf, CandidateAgentUnit, u64)> =
@@ -2217,10 +2028,10 @@ pub fn discover_and_measure(
         // review's `protected_descendant_must_prevent_parent_cache_proposal`
         // counterexample -- protecting `debug/log.txt` must stop `debug/`
         // being proposed, or the protection means nothing.
-        let human_protected = protection_conflict(&protected_paths, &cand.path).or_else(|| {
+        let human_protected = protected_paths.conflict(&cand.path).or_else(|| {
             cand.members
                 .iter()
-                .find_map(|m| protection_conflict(&protected_paths, &m.path))
+                .find_map(|m| protected_paths.conflict(&m.path))
         });
         let (protected, protect_reason) = if let Some(why) = &protection_unknown {
             (true, Some(format!("protection state unknown: {why}")))
@@ -2768,7 +2579,7 @@ mod tests {
         protect_add(dir.path(), &target).unwrap();
         let listed = protect_list(dir.path()).unwrap();
         assert_eq!(listed.len(), 1);
-        assert!(protection_conflict(&listed, &target).is_some());
+        assert!(load_protect(dir.path()).unwrap().conflict(&target).is_some());
         // Idempotent add.
         protect_add(dir.path(), &target).unwrap();
         assert_eq!(protect_list(dir.path()).unwrap().len(), 1);
@@ -2782,9 +2593,9 @@ mod tests {
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         protect_add(dir.path(), &home).unwrap();
-        let reloaded = protect_list(dir.path()).unwrap();
+        let reloaded = load_protect(dir.path()).unwrap();
         let nested = home.join("projects/x/session.jsonl");
-        assert!(protection_conflict(&reloaded, &nested).is_some());
+        assert!(reloaded.conflict(&nested).is_some());
     }
 
     #[test]

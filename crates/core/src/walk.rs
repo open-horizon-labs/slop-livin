@@ -177,7 +177,7 @@ pub(crate) struct DirectoryMeasurement {
 /// metadata reads in wide compiler-output directories. At most 256 entries per
 /// worker are materialized; no per-file measurements survive the call.
 pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasurement> {
-    let entries = Mutex::new(fs::read_dir(path)?);
+    let entries = Mutex::new(crate::fs_gate::read_dir(path)?);
     crate::work_counters::record_dir_listed();
     let result = Mutex::new(DirectoryMeasurement::default());
     let error = Mutex::new(None);
@@ -212,7 +212,7 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
                         .push(entry.file_name().to_string_lossy().into_owned());
                 } else if ft.is_file() {
                     crate::work_counters::record_files_statted(1);
-                    let m = match fs::symlink_metadata(entry.path()) {
+                    let m = match crate::fs_gate::symlink_metadata(entry.path()) {
                         Ok(m) => m,
                         Err(e) => {
                             *error.lock().unwrap() = Some(e);
@@ -284,10 +284,10 @@ pub fn discover_parallel_excluding(
     root: &Path,
     excluded: &[PathBuf],
 ) -> Result<Vec<DiscoveredWorktree>> {
-    if !root.exists() {
+    if !crate::fs_gate::exists(root) {
         return Ok(Vec::new());
     }
-    let device = fs::symlink_metadata(root)
+    let device = crate::fs_gate::symlink_metadata(root)
         .with_context(|| format!("stat {}", root.display()))?
         .dev();
 
@@ -313,7 +313,7 @@ fn discover_one(
         return;
     }
     crate::work_counters::record_files_statted(1);
-    let Ok(meta) = fs::symlink_metadata(dir) else {
+    let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return;
     };
     if meta.dev() != device || meta.file_type().is_symlink() || !meta.is_dir() {
@@ -322,7 +322,7 @@ fn discover_one(
 
     let git_path = dir.join(".git");
     crate::work_counters::record_files_statted(1);
-    if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
+    if let Ok(git_meta) = crate::fs_gate::symlink_metadata(&git_path) {
         let dw = if git_meta.is_dir() {
             classify_main_checkout(dir, &git_path)
         } else if git_meta.is_file() {
@@ -335,7 +335,7 @@ fn discover_one(
         }
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
         return;
     };
     crate::work_counters::record_dir_listed();
@@ -730,7 +730,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         return;
     }
     crate::work_counters::record_files_statted(1);
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Ok(meta) = crate::fs_gate::symlink_metadata(&path) else {
         return;
     };
     if meta.file_type().is_symlink() {
@@ -744,7 +744,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         return;
     }
 
-    let entries = match fs::read_dir(&path) {
+    let entries = match crate::fs_gate::read_dir(&path) {
         Ok(e) => {
             crate::work_counters::record_dir_listed();
             e
@@ -786,7 +786,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         if ft.is_symlink() {
             dir_symlink_count += 1;
             crate::work_counters::record_files_statted(1);
-            if let Ok(smeta) = fs::symlink_metadata(&child_path) {
+            if let Ok(smeta) = crate::fs_gate::symlink_metadata(&child_path) {
                 dir_mtime_max = dir_mtime_max.max(smeta.mtime());
             }
             continue;
@@ -917,7 +917,7 @@ fn record_file_typed(
     shared: &AttrShared,
 ) -> Option<(i64, Option<u64>)> {
     crate::work_counters::record_files_statted(1);
-    let meta = fs::symlink_metadata(path).ok()?;
+    let meta = crate::fs_gate::symlink_metadata(path).ok()?;
     Some(record_file(path, &meta, known, shared))
 }
 
@@ -1006,7 +1006,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
         finish_size_job(group, shared);
         return;
     }
-    let Ok(entries) = fs::read_dir(&path) else {
+    let Ok(entries) = crate::fs_gate::read_dir(&path) else {
         finish_size_job(group, shared);
         return;
     };
@@ -1017,7 +1017,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
     crate::work_counters::record_files_statted(1);
-    let own_meta = fs::symlink_metadata(&path);
+    let own_meta = crate::fs_gate::symlink_metadata(&path);
     if shared.stamp_dirs
         && let Ok(m) = own_meta.as_ref()
     {
@@ -1043,7 +1043,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             });
         } else if ft.is_file() {
             crate::work_counters::record_files_statted(1);
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
                 continue;
             };
             if meta.file_type().is_symlink() || !meta.is_file() {
@@ -1385,7 +1385,7 @@ pub fn resize_artifact_stamped(
 /// per incremental observation and found nothing new.
 pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
     crate::work_counters::record_files_statted(1);
-    let Ok(meta) = fs::symlink_metadata(dir) else {
+    let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return Vec::new();
     };
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -1403,14 +1403,14 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
     // exactly one level of them, without recursing further.
     while let Some(child) = pool.try_pop() {
         crate::work_counters::record_files_statted(2);
-        let Ok(cm) = fs::symlink_metadata(&child) else {
+        let Ok(cm) = crate::fs_gate::symlink_metadata(&child) else {
             continue;
         };
         if cm.file_type().is_symlink() || !cm.is_dir() || cm.dev() != device {
             continue;
         }
         let git_path = child.join(".git");
-        if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
+        if let Ok(git_meta) = crate::fs_gate::symlink_metadata(&git_path) {
             let dw = if git_meta.is_dir() {
                 classify_main_checkout(&child, &git_path)
             } else if git_meta.is_file() {

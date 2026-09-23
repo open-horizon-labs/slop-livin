@@ -18,10 +18,7 @@
 //! piece of detail, never the whole report.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
-use std::sync::mpsc;
 use std::time::Duration;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -522,34 +519,23 @@ pub enum Removal {
     Refused(&'static str),
 }
 
-/// Runs a removal. Returns the daemon's own refusal text when it declines
-/// (an image still referenced by a container, a volume still mounted),
-/// because that reason is the fact the human needs.
-pub fn remove(target: &Removal, timeout: Duration) -> Result<(), String> {
-    let args: Vec<&str> = match target {
-        Removal::Image { id } => vec!["image", "rm", id.as_str()],
-        Removal::Volume { name } => vec!["volume", "rm", name.as_str()],
+/// Runs a removal, permanently, in the daemon. Returns the daemon's own
+/// refusal text when it declines (an image still referenced by a
+/// container, a volume still mounted), because that reason is the fact
+/// the human needs. Takes the [`crate::authority::Authorized`] naming the
+/// unit's `anchor`: `docker … rm` is reachable only through
+/// [`crate::fs_gate::destroy::docker_remove`].
+pub fn remove(
+    target: &Removal,
+    auth: &crate::authority::Authorized,
+    anchor: &Path,
+) -> Result<(), String> {
+    let (kind, id) = match target {
+        Removal::Image { id } => ("image", id.as_str()),
+        Removal::Volume { name } => ("volume", name.as_str()),
         Removal::Refused(why) => return Err((*why).to_string()),
     };
-    let out = crate::spawn::command("docker")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("docker: {e}"))?
-        .wait_with_output()
-        .map_err(|e| format!("docker: {e}"))?;
-    let _ = timeout;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if err.is_empty() {
-        "docker refused the removal without saying why".to_string()
-    } else {
-        err
-    })
+    crate::fs_gate::destroy::docker_remove(auth, anchor, kind, id)
 }
 
 /// Is this object still present, and still unused? Re-derived at the sink
@@ -560,14 +546,13 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
         Removal::Volume { name } => ("volume", name.as_str()),
         Removal::Refused(why) => return Err((*why).to_string()),
     };
-    let out = crate::spawn::command("docker")
-        .args([kind, "inspect", id])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("docker: {e}"))?;
-    if out.status.success() {
+    let out = crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Docker,
+        [kind, "inspect", id],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("docker: {e}"))?;
+    if out.success() {
         Ok(())
     } else {
         Err("object is no longer present".to_string())
@@ -575,45 +560,15 @@ pub fn still_removable(target: &Removal) -> Result<(), String> {
 }
 
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
-    let mut child = crate::spawn::command("docker")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
         .map_err(|e| format!("docker: unavailable ({e})"))?;
-
-    let (tx, rx) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
-            let _ = tx.send(buf);
-        });
-    }
-
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    let Some(status) = status else {
+    if out.timed_out {
         return Err("docker: unavailable (timed out)".to_string());
-    };
-    if !status.success() {
+    }
+    if !out.success() {
         return Err("docker: unavailable (daemon not responding)".to_string());
     }
-    let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let stdout = out.stdout_lossy();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
         return Ok(v);
     }
@@ -672,11 +627,11 @@ pub fn load_cached(
     };
     let cache = dir.join("docker_facts.json");
     if !fresh
-        && let Ok(meta) = std::fs::metadata(&cache)
+        && let Ok(meta) = crate::fs_gate::symlink_metadata(&cache)
         && let Ok(age) = meta
             .modified()
             .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-        && let Ok(text) = std::fs::read_to_string(&cache)
+        && let Ok(text) = crate::fs_gate::read::read_owned_string(&cache)
         && let Ok(facts) = serde_json::from_str::<DockerFacts>(&text)
     {
         let ttl = if facts.unavailable.is_none() {
@@ -691,15 +646,16 @@ pub fn load_cached(
     let facts = load_live();
     // The unavailable answer is cached too. Caching only success meant
     // an unreachable daemon was re-probed on every pass forever.
-    if let Ok(text) = serde_json::to_string(&facts) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(&cache, text);
-    }
+    let _ = crate::fs_gate::store::write_json(
+        crate::fs_gate::store::JsonFile::DockerFacts { store: dir },
+        &facts,
+    );
     facts
 }
 
 fn load_from_file(path: &Path) -> DockerFacts {
-    let text = match std::fs::read_to_string(path) {
+    // A facts file the caller named explicitly (`--docker-facts`, tests).
+    let text = match crate::fs_gate::read::read_owned_string(path) {
         Ok(t) => t,
         Err(e) => {
             return DockerFacts {

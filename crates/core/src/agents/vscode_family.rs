@@ -64,7 +64,6 @@ use super::{
     AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState, mtime_secs,
     resolve_declared_path,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_FOLD_ENTRIES: usize = 200_000;
@@ -206,8 +205,9 @@ fn vscdb_unit(
     relative_path: String,
     project_link: ProjectLinkState,
     note: &str,
+    ctx: &IdentifyCtx,
 ) -> Option<CandidateAgentUnit> {
-    let meta = fs::symlink_metadata(&path).ok()?;
+    let meta = ctx.stat(&path).ok()?;
     if !meta.is_file() {
         return None;
     }
@@ -220,7 +220,7 @@ fn vscdb_unit(
     let mut mtime_max = mtime_secs(&meta);
     for ext in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{ext}", path.display()));
-        if let Ok(sm) = fs::symlink_metadata(&sidecar)
+        if let Ok(sm) = ctx.stat(&sidecar)
             && sm.is_file()
         {
             bytes += sm.len();
@@ -262,14 +262,14 @@ pub fn identify_editor_profile(
     ctx: &IdentifyCtx,
     shape: ProfileShape,
 ) -> Vec<CandidateAgentUnit> {
-    if !profile_root.is_dir() {
+    if !ctx.is_dir(profile_root) {
         return Vec::new();
     }
     let user = profile_root.join("User");
     if !PROFILE_MARKERS
         .iter()
-        .any(|rel| profile_root.join(rel).exists())
-        || !user.is_dir()
+        .any(|rel| ctx.exists(&profile_root.join(rel)))
+        || !ctx.is_dir(&user)
     {
         return unknown_layout_residual(profile_root, ctx, "no User/ directory found");
     }
@@ -281,6 +281,7 @@ pub fn identify_editor_profile(
         "User/globalStorage/state.vscdb".to_string(),
         ProjectLinkState::NotApplicable,
         "shared chat/composer content for every project this editor has opened",
+        ctx,
     ) {
         units.push(u);
     }
@@ -288,7 +289,7 @@ pub fn identify_editor_profile(
     identify_workspace_storage(&user, ctx, shape, &mut units);
 
     let history = user.join("History");
-    if history.is_dir() {
+    if ctx.is_dir(&history) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&history, MAX_FOLD_ENTRIES);
         units.push(
             AgentUnitBuilder::new("vscode-family", AgentCategory::Caches, history)
@@ -313,7 +314,7 @@ pub fn identify_editor_profile(
         ("logs", AgentCategory::Logs),
     ] {
         let path = profile_root.join(rel);
-        if !path.is_dir() {
+        if !ctx.is_dir(&path) {
             continue;
         }
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -354,6 +355,7 @@ fn identify_workspace_storage(
             format!("{relative_path}/state.vscdb"),
             project_link,
             note,
+            ctx,
         ) {
             out.push(u);
         }
@@ -362,7 +364,7 @@ fn identify_workspace_storage(
 
 fn workspace_json_link(ws_dir: &Path, ctx: &IdentifyCtx) -> ProjectLinkState {
     let path = ws_dir.join("workspace.json");
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Ok(meta) = ctx.stat(&path) else {
         return ProjectLinkState::Unresolved {
             reason: "no workspace.json found in this workspaceStorage directory".to_string(),
         };
@@ -438,12 +440,12 @@ pub fn identify_extension_globalstorage(
     ctx: &IdentifyCtx,
     link_source: TaskLinkSource,
 ) -> Vec<CandidateAgentUnit> {
-    if !ext_home.is_dir() {
+    if !ctx.is_dir(ext_home) {
         return Vec::new();
     }
     let host = host_label(ext_home);
     let tasks = ext_home.join("tasks");
-    if !tasks.is_dir() {
+    if !ctx.is_dir(&tasks) {
         return unknown_layout_residual(ext_home, ctx, "no tasks/ directory found")
             .into_iter()
             .map(|mut u| {
@@ -542,7 +544,7 @@ fn task_link(task_dir: &Path, ctx: &IdentifyCtx, source: TaskLinkSource) -> Proj
         }
     };
     let path = task_dir.join(file);
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Ok(meta) = ctx.stat(&path) else {
         return ProjectLinkState::Unresolved {
             reason: format!("no {file} found in this task directory"),
         };
@@ -628,6 +630,7 @@ pub const EXTENSION_CAPABILITIES: AdapterCapabilities = AdapterCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::IdentificationCache;
     use std::time::{Duration, SystemTime};
 

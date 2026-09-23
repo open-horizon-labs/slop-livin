@@ -37,7 +37,7 @@ impl AgentAdapter for Adapter {
 /// The whole directory is one folded, actionable Logs-category unit,
 /// same recovery contract as any other tool's log directory.
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.exists() {
+    if !ctx.exists(home) {
         return Vec::new();
     }
     // A freshly created, still-empty log directory is not yet worth a

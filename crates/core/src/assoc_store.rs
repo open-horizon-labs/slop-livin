@@ -26,9 +26,7 @@
 use anyhow::{Context, Result};
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,19 +74,15 @@ impl KeyedTable {
 
     /// Every row as `(key, fingerprint, observed_at, values)`.
     fn read(&self) -> Result<Vec<StoredRow>> {
-        if !self.path.exists() {
+        let Some(reader) = crate::fs_gate::columns::open_parquet(&self.path).with_context(|| {
+            format!(
+                "read {} (delete it to re-derive this cache)",
+                self.path.display()
+            )
+        })?
+        else {
             return Ok(Vec::new());
-        }
-        let file =
-            File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .and_then(|b| b.build())
-            .with_context(|| {
-                format!(
-                    "read {} (delete it to re-derive this cache)",
-                    self.path.display()
-                )
-            })?;
+        };
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch?;
@@ -142,7 +136,7 @@ impl KeyedTable {
             columns.push(Arc::new(StringArray::from(vals)));
         }
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        crate::growth::write_parquet_batches_atomic(
+        crate::fs_gate::columns::write_parquet_atomic(
             &self.path,
             schema,
             std::iter::once(Ok(batch)),

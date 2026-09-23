@@ -87,7 +87,7 @@ impl Detector for CondaDetector {
         });
 
         let condarc_path = env.home.join(".condarc");
-        if let Ok(text) = std::fs::read_to_string(&condarc_path) {
+        if let Ok(text) = crate::fs_gate::read::bounded_string(&condarc_path, crate::fs_gate::read::BoundedCap::MANIFEST) {
             for dir in read_condarc_list(&text, "envs_dirs") {
                 out.push(ProposedLocation {
                     detector_id: CONDA_DETECTOR_ID.to_string(),

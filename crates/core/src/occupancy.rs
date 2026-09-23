@@ -15,7 +15,7 @@
 use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue, Freshness};
 use std::{
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Short-lived: a process/lock/container state observed now says nothing
@@ -35,6 +35,7 @@ const OCCUPANCY_TIMEOUT: Duration = Duration::from_secs(10);
 /// open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`). Every
 /// destructive sink matches on this and refuses on `Unknown`; nothing
 /// that moves user data may consume the boolean [`occupied`] instead.
+#[must_use = "an occupancy answer that is not matched on is a recheck that did not happen"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OccupancyState {
     /// The probe ran to completion and found no open handle.
@@ -48,13 +49,6 @@ pub enum OccupancyState {
 }
 
 impl OccupancyState {
-    /// True only for [`OccupancyState::Free`]: the one state in which a
-    /// destructive action may proceed.
-    #[cfg(test)]
-    pub fn is_free(&self) -> bool {
-        matches!(self, Self::Free)
-    }
-
     /// A one-line refusal cause for a sink's outcome/ledger record.
     pub fn refusal(&self) -> Option<String> {
         match self {
@@ -78,10 +72,8 @@ impl OccupancyState {
 /// counterexample); files are probed directly. `stdout` and `stderr` are
 /// captured separately so an ordinary `lsof` warning is not mistaken for
 /// an open handle, while a permission error still becomes `Unknown`.
-pub fn probe_path(path: &Path) -> OccupancyState {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let is_dir = match std::fs::symlink_metadata(path) {
+pub(crate) fn probe_path(path: &Path) -> OccupancyState {
+    let is_dir = match crate::fs_gate::symlink_metadata(path) {
         Ok(m) => m.is_dir() && !m.file_type().is_symlink(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Nothing there to hold open. The caller's own identity
@@ -90,57 +82,23 @@ pub fn probe_path(path: &Path) -> OccupancyState {
         }
         Err(e) => return OccupancyState::Unknown(format!("cannot stat {}: {e}", path.display())),
     };
-
-    let mut cmd = crate::spawn::command("lsof");
-    if is_dir {
-        cmd.arg("+D").arg(path);
-    } else {
-        cmd.arg("--").arg(path);
+    let flag = if is_dir { "+D" } else { "--" };
+    let out = match crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Lsof,
+        [std::ffi::OsStr::new(flag), path.as_os_str()],
+        OCCUPANCY_TIMEOUT,
+    ) {
+        Ok(out) => out,
+        Err(e) => return OccupancyState::Unknown(format!("lsof could not be started: {e}")),
+    };
+    if out.timed_out {
+        return OccupancyState::Unknown(format!(
+            "lsof did not answer within {}s for {}",
+            OCCUPANCY_TIMEOUT.as_secs(),
+            path.display()
+        ));
     }
-    let (Ok(out_file), Ok(err_file)) = (tempfile::tempfile(), tempfile::tempfile()) else {
-        return OccupancyState::Unknown("could not create a buffer for the lsof probe".into());
-    };
-    let (Ok(stdout), Ok(stderr)) = (out_file.try_clone(), err_file.try_clone()) else {
-        return OccupancyState::Unknown("could not redirect the lsof probe".into());
-    };
-    let Ok(mut child) = cmd.stdout(stdout).stderr(stderr).spawn() else {
-        return OccupancyState::Unknown("lsof could not be started".into());
-    };
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < OCCUPANCY_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return OccupancyState::Unknown(format!(
-                    "lsof did not answer within {}s for {}",
-                    OCCUPANCY_TIMEOUT.as_secs(),
-                    path.display()
-                ));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return OccupancyState::Unknown(format!("lsof probe failed: {e}"));
-            }
-        }
-    };
-    let read_all = |mut f: std::fs::File| -> String {
-        let mut s = String::new();
-        let _ = f.seek(SeekFrom::Start(0));
-        let _ = f.read_to_string(&mut s);
-        s
-    };
-    classify_lsof_exit(
-        status.code(),
-        &read_all(out_file),
-        &read_all(err_file),
-        path,
-    )
+    classify_lsof_exit(out.code, &out.stdout_lossy(), &out.stderr_lossy(), path)
 }
 
 /// Pure classification of a completed `lsof` run, factored out so the
@@ -279,23 +237,7 @@ pub fn docker_running_container_evidence(containers: &[crate::docker::ContainerR
 /// means another process currently holds it. Never writes to the file;
 /// never blocks.
 fn probe_flock(lock_path: &Path) -> std::io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    let file = std::fs::OpenOptions::new().read(true).open(lock_path)?;
-    let fd = file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        unsafe {
-            libc::flock(fd, libc::LOCK_UN);
-        }
-        Ok(true)
-    } else {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(false)
-        } else {
-            Err(err)
-        }
-    }
+    crate::fs_gate::sys::flock_is_free(lock_path)
 }
 
 /// Manager lock-file evidence (Cargo's `.package-cache`, a Gradle daemon
@@ -309,7 +251,7 @@ pub fn manager_lock_evidence(tool: impl Into<String>, lock_path: &Path) -> Evide
         tool: tool.clone(),
         path: lock_path.display().to_string(),
     };
-    if !lock_path.exists() {
+    if !crate::fs_gate::exists(lock_path) {
         return Evidence::unknown(
             FactKind::CurrentUse,
             FactSubtype::Lock,
@@ -446,7 +388,7 @@ mod tests {
         // between refusing and deleting.
         let state = probe(Some(1), "", "lsof: WARNING: Permission denied");
         assert!(matches!(state, OccupancyState::Unknown(_)), "{state:?}");
-        assert!(!state.is_free());
+        assert!(!matches!(state, OccupancyState::Free));
         assert!(state.refusal().is_some());
     }
 
@@ -458,10 +400,10 @@ mod tests {
 
     #[test]
     fn a_free_probe_is_the_only_state_that_permits_an_action() {
-        assert!(OccupancyState::Free.is_free());
+        assert!(matches!(OccupancyState::Free, OccupancyState::Free));
         assert!(OccupancyState::Free.refusal().is_none());
-        assert!(!OccupancyState::Occupied(PathBuf::from("/x")).is_free());
-        assert!(!OccupancyState::Unknown("nope".into()).is_free());
+        assert!(!matches!(OccupancyState::Occupied(PathBuf::from("/x")), OccupancyState::Free));
+        assert!(!matches!(OccupancyState::Unknown("nope".into()), OccupancyState::Free));
     }
 
     #[test]

@@ -12,8 +12,7 @@
 //! any destructive command (there are none in this tool).
 
 use anyhow::{Context, Result, bail};
-use std::fs;
-use std::io::Write as _;
+use crate::fs_gate::{self, read::read_owned_string, store};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,22 +89,24 @@ fn run_launchctl(args: &[&str]) -> Result<bool> {
         println!("[test-mode] launchctl {}", args.join(" "));
         return Ok(true);
     }
-    let status = crate::spawn::command("launchctl")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("spawn launchctl")?;
-    Ok(status.success())
+    let out = fs_gate::spawn::run(
+        fs_gate::spawn::Program::Launchctl,
+        args,
+        std::time::Duration::from_secs(30),
+    )
+    .context("spawn launchctl")?;
+    Ok(out.success())
 }
 
 fn domain() -> String {
     let uid = std::env::var("SWAMP_UID").ok().unwrap_or_else(|| {
-        crate::spawn::command("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
+        fs_gate::spawn::run(
+            fs_gate::spawn::Program::Id,
+            ["-u"],
+            std::time::Duration::from_secs(5),
+        )
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "0".to_string())
     });
@@ -214,20 +215,21 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     let exe = current_exe()?;
     let plist = plist_path();
     let log = log_file();
-    fs::create_dir_all(log_dir()).context("create log dir")?;
+    store::create_dir_all(log_dir()).context("create log dir")?;
     if let Some(parent) = plist.parent() {
-        fs::create_dir_all(parent).context("create LaunchAgents dir")?;
+        store::create_dir_all(parent).context("create LaunchAgents dir")?;
     }
 
     // Installing over an existing agent replaces it: unload first so
     // launchd never holds two generations of the same label.
-    if plist.exists() {
+    if fs_gate::exists(&plist) {
         unload_plist(&plist);
     }
 
     let swamp_dir_env = std::env::var("SWAMP_DIR").ok();
     let body = render_plist(&exe, roots, seconds, &log, swamp_dir_env.as_deref());
-    fs::write(&plist, body).with_context(|| format!("write {}", plist.display()))?;
+    store::write_text(store::TextFile::LaunchAgent { plist: &plist }, &body)
+        .with_context(|| format!("write {}", plist.display()))?;
 
     load_plist(&plist)?;
 
@@ -252,12 +254,13 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
 /// `swamp schedule --off`.
 pub fn uninstall() -> Result<String> {
     let plist = plist_path();
-    if !plist.exists() {
+    if !fs_gate::exists(&plist) {
         unload_plist(&plist);
         return Ok("No scheduled observation is installed\n".to_string());
     }
     unload_plist(&plist);
-    fs::remove_file(&plist).with_context(|| format!("remove {}", plist.display()))?;
+    store::remove_text(store::TextFile::LaunchAgent { plist: &plist })
+        .with_context(|| format!("remove {}", plist.display()))?;
     Ok(format!("Removed the scheduled observation ({LABEL})\n"))
 }
 
@@ -364,20 +367,16 @@ impl RunOutcome {
 /// Appends one line to the observation log.
 pub fn append_log(path: &Path, outcome: &RunOutcome) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        store::create_dir_all(parent)?;
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    store::append_line(store::LogFile::Observations(path), &outcome.to_log_line())
         .with_context(|| format!("open {}", path.display()))?;
-    writeln!(file, "{}", outcome.to_log_line())?;
     Ok(())
 }
 
 /// Reads the last well-formed line of the observation log.
 pub fn last_log_outcome(path: &Path) -> Option<RunOutcome> {
-    let text = fs::read_to_string(path).ok()?;
+    let text = read_owned_string(path).ok()?;
     text.lines().rev().find_map(RunOutcome::from_log_line)
 }
 
@@ -388,14 +387,13 @@ fn last_run_path(store_dir: &Path) -> PathBuf {
 /// Persists the most recent run's summary alongside the growth store, so
 /// the report header can read it without parsing the log.
 pub fn write_last_run(store_dir: &Path, outcome: &RunOutcome) -> Result<()> {
-    fs::create_dir_all(store_dir)?;
     let path = last_run_path(store_dir);
-    let json = serde_json::to_string(outcome)?;
-    fs::write(&path, json).with_context(|| format!("write {}", path.display()))
+    store::write_json(store::JsonFile::LastRun { store: store_dir }, outcome)
+        .with_context(|| format!("write {}", path.display()))
 }
 
 pub fn read_last_run(store_dir: &Path) -> Option<RunOutcome> {
-    let text = fs::read_to_string(last_run_path(store_dir)).ok()?;
+    let text = read_owned_string(last_run_path(store_dir)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -428,7 +426,7 @@ fn format_ago(now: u64, then: u64) -> String {
 /// right after `observed_at=...`. `suggested_root` is used only in the
 /// "no schedule" suggestion text.
 pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String {
-    if !plist_path().exists() {
+    if !fs_gate::exists(plist_path()) {
         return format!(
             "no schedule (swamp schedule --every 30m {})",
             suggested_root.display()
@@ -458,13 +456,13 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
 /// state, interval, roots, last run, and the next expected run.
 pub fn status(store_dir: &Path) -> Result<String> {
     let plist = plist_path();
-    if !plist.exists() {
+    if !fs_gate::exists(&plist) {
         return Ok(
             "Scheduled observation: not installed\n  Enable it with: swamp schedule --every 30m <root>\n"
                 .to_string(),
         );
     }
-    let text = fs::read_to_string(&plist).with_context(|| format!("read {}", plist.display()))?;
+    let text = read_owned_string(&plist).with_context(|| format!("read {}", plist.display()))?;
     let seconds = installed_interval(&text);
     let roots = installed_roots(&text);
     let mut out = String::new();
@@ -517,27 +515,27 @@ pub fn status(store_dir: &Path) -> Result<String> {
 /// holding `pid<TAB>started_at`; not `flock` because the loser needs to
 /// print a friendly message rather than block.
 pub struct LockGuard {
-    path: PathBuf,
+    store: PathBuf,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = store::ObserveLock { store: &self.store }.remove();
     }
 }
 
 fn lock_path(store_dir: &Path) -> PathBuf {
-    store_dir.join("observe.lock")
+    store::ObserveLock { store: store_dir }.path()
 }
 
 fn pid_alive(pid: u32) -> bool {
-    crate::spawn::command("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    fs_gate::spawn::run(
+        fs_gate::spawn::Program::Kill,
+        ["-0", &pid.to_string()],
+        std::time::Duration::from_secs(5),
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 /// Result of trying to take the single-flight observation lock.
@@ -549,23 +547,20 @@ pub enum LockOutcome {
 /// Attempts to take the lock. A stale lock (owner pid no longer alive) is
 /// reclaimed automatically.
 pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
-    fs::create_dir_all(store_dir)?;
+    store::create_dir_all(store_dir)?;
     let path = lock_path(store_dir);
 
     loop {
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                let pid = std::process::id();
-                let since = crate::entities::now();
-                writeln!(file, "{pid}\t{since}")?;
-                return Ok(LockOutcome::Acquired(LockGuard { path }));
+        let pid = std::process::id();
+        let since = crate::entities::now();
+        match (store::ObserveLock { store: store_dir }).create(&format!("{pid}\t{since}\n")) {
+            Ok(()) => {
+                return Ok(LockOutcome::Acquired(LockGuard {
+                    store: store_dir.to_path_buf(),
+                }));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let contents = fs::read_to_string(&path).unwrap_or_default();
+                let contents = read_owned_string(&path).unwrap_or_default();
                 let mut parts = contents.trim().splitn(2, '\t');
                 let pid: Option<u32> = parts.next().and_then(|p| p.parse().ok());
                 let since: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -576,7 +571,7 @@ pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
                     _ => {
                         // Stale lock: owner is gone or unparsable. Reclaim
                         // and retry once.
-                        let _ = fs::remove_file(&path); // SAFE: our own stale lock file, owner pid confirmed dead
+                        let _ = store::ObserveLock { store: store_dir }.remove(); // our own stale lock, owner pid confirmed dead
                         continue;
                     }
                 }
@@ -597,6 +592,7 @@ pub fn timestamp_display(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_and_formats_intervals() {

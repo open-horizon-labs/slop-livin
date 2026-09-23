@@ -93,14 +93,14 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
+    if !FORMAT_MARKERS.iter().any(|rel| ctx.exists(&home.join(rel))) {
         return unknown_format_residual(home, ctx);
     }
     let mut units = Vec::new();
-    identify_protected(home, &mut units);
+    identify_protected(home, ctx, &mut units);
     identify_sessions(home, ctx, &mut units);
     identify_index(home, ctx, &mut units);
     identify_dev_data(home, ctx, &mut units);
@@ -134,10 +134,10 @@ fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgent
     ]
 }
 
-fn identify_protected(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for rel in ["config.yaml", "config.json"] {
         let path = home.join(rel);
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
+        if let Ok(meta) = ctx.stat(&path)
             && meta.is_file()
         {
             out.push(
@@ -243,7 +243,7 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
             continue; // handled by identify_index
         }
         let path = base.join(&entry.name);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        let Ok(meta) = ctx.stat(&path) else {
             continue;
         };
         let (bytes, mtime, truncated) = if entry.is_dir {
@@ -287,7 +287,7 @@ fn identify_index(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUn
     let sessions = home.join("sessions");
     for name in SESSION_INDEX_NAMES {
         let path = sessions.join(name);
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
+        if let Ok(meta) = ctx.stat(&path)
             && meta.is_file()
         {
             out.push(
@@ -306,7 +306,7 @@ fn identify_index(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUn
         }
     }
     let index_dir = home.join("index");
-    if index_dir.is_dir() {
+    if ctx.is_dir(&index_dir) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&index_dir, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(CONTINUE_TOOL_ID, AgentCategory::Caches, index_dir)
@@ -328,7 +328,7 @@ fn identify_index(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUn
 
 fn identify_dev_data(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let path = home.join("dev_data");
-    if !path.is_dir() {
+    if !ctx.is_dir(&path) {
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);

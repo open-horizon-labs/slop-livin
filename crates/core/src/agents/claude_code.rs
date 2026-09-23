@@ -56,7 +56,6 @@ use super::{
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CLAUDE_CODE_TOOL_ID: &str = "claude-code";
@@ -156,7 +155,7 @@ fn identify_unmatched_todos(
     let todos_dir = home.join("todos");
     // `is_dir` rather than a listing, so a home without the legacy
     // directory pays nothing at all.
-    if !todos_dir.is_dir() {
+    if !ctx.is_dir(&todos_dir) {
         return;
     }
     let mut bytes = 0u64;
@@ -171,7 +170,7 @@ fn identify_unmatched_todos(
             let (b, m, _t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
             (b, m)
         } else {
-            match fs::symlink_metadata(&path) {
+            match ctx.stat(&path) {
                 Ok(meta) => (meta.len(), super::mtime_secs(&meta)),
                 Err(_) => continue,
             }
@@ -296,7 +295,7 @@ fn identify_one_project(
                 continue;
             };
             let session_id = session_id.to_string();
-            let Ok(meta) = fs::symlink_metadata(&jsonl) else {
+            let Ok(meta) = ctx.stat(&jsonl) else {
                 continue;
             };
             let file_mtime = meta
@@ -323,7 +322,7 @@ fn identify_one_project(
             }
 
             let fh_dir = home.join("file-history").join(&session_id);
-            if fh_dir.is_dir() {
+            if ctx.is_dir(&fh_dir) {
                 let (bytes, mtime, _truncated) = ctx.folded_bytes(&fh_dir, MAX_FOLD_ENTRIES);
                 mtime_max = mtime_max.max(mtime);
                 members.push(AgentMember {
@@ -335,7 +334,7 @@ fn identify_one_project(
 
             for dir_name in ["image-cache", "uploads"] {
                 let d = home.join(dir_name).join(&session_id);
-                if d.is_dir() {
+                if ctx.is_dir(&d) {
                     let (bytes, mtime, _truncated) = ctx.folded_bytes(&d, MAX_FOLD_ENTRIES);
                     mtime_max = mtime_max.max(mtime);
                     members.push(AgentMember {
@@ -351,7 +350,7 @@ fn identify_one_project(
                     continue;
                 };
                 if name.starts_with(session_id.as_str()) {
-                    let Ok(m) = fs::symlink_metadata(todo) else {
+                    let Ok(m) = ctx.stat(todo) else {
                         continue;
                     };
                     let t = m
@@ -728,7 +727,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
         if let Some(first) = entry.rel.split('/').next() {
             seen_top_level.insert(first.to_string());
         }
-        if !path.exists() {
+        if !ctx.exists(&path) {
             continue;
         }
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -810,6 +809,7 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::ProjectLinkState;
     use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};

@@ -65,7 +65,6 @@ use super::{
     mtime_secs, resolve_declared_path,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const OPENCODE_TOOL_ID: &str = "opencode";
@@ -95,21 +94,21 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    let has_db = home.join("opencode.db").is_file();
-    let has_storage = home.join("storage").is_dir();
-    let has_snapshot = home.join("snapshot").is_dir();
-    let has_auth = home.join("auth.json").is_file();
-    let has_log = home.join("log").is_dir();
+    let has_db = ctx.is_file(&home.join("opencode.db"));
+    let has_storage = ctx.is_dir(&home.join("storage"));
+    let has_snapshot = ctx.is_dir(&home.join("snapshot"));
+    let has_auth = ctx.is_file(&home.join("auth.json"));
+    let has_log = ctx.is_dir(&home.join("log"));
     if !(has_db || has_storage || has_snapshot || has_auth || has_log) {
         return unknown_version_residual(home, ctx);
     }
 
     let mut units = Vec::new();
     if has_db {
-        identify_sqlite_store(home, &mut units);
+        identify_sqlite_store(home, ctx, &mut units);
     }
     let projects = load_project_worktrees(home, ctx);
     let mut claimed_session_ids: HashSet<String> = HashSet::new();
@@ -215,9 +214,9 @@ fn project_link_for(
 // SQLite-backed layout (current releases).
 // ---------------------------------------------------------------------
 
-fn identify_sqlite_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_sqlite_store(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let db = home.join("opencode.db");
-    let Ok(meta) = fs::symlink_metadata(&db) else {
+    let Ok(meta) = ctx.stat(&db) else {
         return;
     };
     if !meta.is_file() {
@@ -232,7 +231,7 @@ fn identify_sqlite_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
     let mut mtime_max = mtime_secs(&meta);
     for ext in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{ext}", db.display()));
-        if let Ok(sm) = fs::symlink_metadata(&sidecar)
+        if let Ok(sm) = ctx.stat(&sidecar)
             && sm.is_file()
         {
             bytes += sm.len();
@@ -317,7 +316,7 @@ fn identify_one_project_dir(
             else {
                 continue;
             };
-            let Ok(meta) = fs::symlink_metadata(&path) else {
+            let Ok(meta) = ctx.stat(&path) else {
                 continue;
             };
             let mut members = vec![AgentMember {
@@ -347,7 +346,7 @@ fn identify_one_project_dir(
             // it. A session acquiring its first message directory has to
             // be a change to this container.
             ctx.watch(&message_dir);
-            if message_dir.is_dir() {
+            if ctx.is_dir(&message_dir) {
                 let (b, m, _t) = ctx.folded_bytes(&message_dir, MAX_FOLD_ENTRIES);
                 bytes += b;
                 mtime_max = mtime_max.max(m);
@@ -363,7 +362,7 @@ fn identify_one_project_dir(
                 diff_base.join(&session_id),
             ] {
                 ctx.watch(&diff);
-                let Ok(meta) = fs::symlink_metadata(&diff) else {
+                let Ok(meta) = ctx.stat(&diff) else {
                     continue;
                 };
                 let (b, m) = if meta.is_dir() {
@@ -431,7 +430,7 @@ fn identify_storage_auxiliary(
                 let (b, m, _t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
                 (b, m)
             } else {
-                match fs::symlink_metadata(&path) {
+                match ctx.stat(&path) {
                     Ok(meta) if meta.is_file() => (meta.len(), mtime_secs(&meta)),
                     _ => continue,
                 }
@@ -457,7 +456,7 @@ fn identify_storage_auxiliary(
         }
     }
     let part = home.join("storage").join("part");
-    if part.is_dir() {
+    if ctx.is_dir(&part) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&part, MAX_FOLD_ENTRIES);
         let mut builder = AgentUnitBuilder::new(
             OPENCODE_TOOL_ID,
@@ -530,7 +529,7 @@ fn identify_static_categories(
     out: &mut Vec<CandidateAgentUnit>,
 ) {
     let auth = home.join("auth.json");
-    if let Ok(meta) = fs::symlink_metadata(&auth)
+    if let Ok(meta) = ctx.stat(&auth)
         && meta.is_file()
     {
         out.push(
@@ -548,7 +547,7 @@ fn identify_static_categories(
     }
 
     let log = home.join("log");
-    if log.is_dir() {
+    if ctx.is_dir(&log) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&log, MAX_FOLD_ENTRIES);
         let mut builder = AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Logs, log)
             .relative_path("log")
@@ -614,6 +613,7 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, LinkSource, bounded_io, contract};
     use std::time::{Duration, SystemTime};
 

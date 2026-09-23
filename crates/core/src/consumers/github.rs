@@ -45,7 +45,7 @@ impl Consumer for GithubConsumer {
                         notes: Vec::new(),
                     }]);
                 };
-                let volume_id = std::fs::metadata(&ctx.root)
+                let volume_id = crate::fs_gate::metadata_following(&ctx.root)
                     .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
                     .unwrap_or(0);
                 // Only worktrees whose remote resolves to a github.com owner/repo.

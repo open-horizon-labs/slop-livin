@@ -160,26 +160,24 @@ pub fn find_mount_options<'a>(text: &'a str, path: &Path) -> Option<&'a str> {
 
 #[cfg(target_os = "macos")]
 pub fn atime_reliability(path: &Path) -> AtimeReliability {
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return AtimeReliability::Undetermined("path contains a NUL byte"),
-    };
-    unsafe {
-        let mut buf: MaybeUninit<libc::statfs> = MaybeUninit::uninit();
-        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
-            return AtimeReliability::Undetermined("statfs failed (permission or missing path)");
+    match crate::fs_gate::sys::volume_info(path) {
+        Ok(info) => atime_reliability_from_macos_flags(info.flags as u32),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            AtimeReliability::Undetermined("path contains a NUL byte")
         }
-        let sf = buf.assume_init();
-        atime_reliability_from_macos_flags(sf.f_flags)
+        Err(_) => AtimeReliability::Undetermined("statfs failed (permission or missing path)"),
     }
 }
 
 #[cfg(target_os = "linux")]
 pub fn atime_reliability(path: &Path) -> AtimeReliability {
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    match std::fs::read_to_string("/proc/mounts") {
+    let canon = crate::fs_gate::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match crate::fs_gate::read::bounded_read(
+        "/proc/mounts",
+        crate::fs_gate::read::BoundedCap::SYSTEM_TABLE,
+    )
+    .map(|b| b.lossy())
+    {
         Ok(text) => match find_mount_options(&text, &canon) {
             Some(opts) => atime_reliability_from_mount_options(opts),
             None => AtimeReliability::Undetermined("no matching entry in /proc/mounts"),
@@ -217,7 +215,7 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
             observed_at,
             reason,
         ),
-        AtimeReliability::Reliable => match std::fs::metadata(path) {
+        AtimeReliability::Reliable => match crate::fs_gate::metadata_following(path) {
             Ok(meta) => {
                 use std::os::unix::fs::MetadataExt;
                 let atime = meta.atime();

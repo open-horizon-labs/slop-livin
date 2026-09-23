@@ -32,7 +32,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// A declared consumer of an external unit: which project/tool refers to
@@ -144,7 +143,7 @@ fn device_of(path: &Path) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).map(|m| m.dev()).unwrap_or(0)
+        crate::fs_gate::metadata_following(path).map(|m| m.dev()).unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -226,7 +225,7 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
         .map(|u| {
             // One spelling, so a subtraction written in either form
             // matches what the measurement pass canonicalized.
-            fs::canonicalize(&u.path).unwrap_or(u.path)
+            crate::fs_gate::canonicalize(&u.path).unwrap_or(u.path)
         })
         .collect();
     let candidates = roots
@@ -283,7 +282,7 @@ pub fn discover_and_measure(
     {
         let mut seen: HashSet<(StorageCategory, PathBuf)> = HashSet::new();
         for c in candidates {
-            let canonical = fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+            let canonical = crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
             if !seen.insert((c.category, canonical.clone())) {
                 continue;
             }
@@ -672,6 +671,7 @@ mod consumer_sidecar_tests {
     //! Moved from `tests/external_units.rs` when the sidecar writers
     //! became test-only: the same two #43 adversarial tests.
     use super::*;
+    use std::fs;
     use crate::locations::{Environment, Platform, Registry, StorageCategory};
     use crate::scope::{ScanConfig, resolve_effective_scope};
     use std::collections::HashMap;

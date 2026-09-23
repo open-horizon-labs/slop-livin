@@ -127,7 +127,7 @@ const MARKED_ARTIFACT_KINDS: &[(&str, ArtifactKind, &[&str])] = &[
 ];
 
 fn has_marker(parent: &Path, markers: &[&str]) -> bool {
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    let Ok(entries) = crate::fs_gate::read_dir(parent) else {
         return false;
     };
     let names: Vec<String> = entries
@@ -179,14 +179,16 @@ pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
     let tag = dir.join("CACHEDIR.TAG");
     // `symlink_metadata`: the spec requires a regular file, and a symlink
     // here would also be a path out of the tree we are sizing.
-    let meta = fs::symlink_metadata(&tag).ok()?;
+    let meta = crate::fs_gate::symlink_metadata(&tag).ok()?;
     if !meta.is_file() || meta.len() < SIGNATURE.len() as u64 {
         return None;
     }
-    let mut head = [0u8; 43];
-    let mut file = fs::File::open(&tag).ok()?;
-    std::io::Read::read_exact(&mut file, &mut head).ok()?;
-    (head == SIGNATURE).then_some(ArtifactKind::Cache)
+    let head = crate::fs_gate::read::bounded_read(
+        &tag,
+        crate::fs_gate::read::BoundedCap::header_at_most(SIGNATURE.len()),
+    )
+    .ok()?;
+    (head.bytes == SIGNATURE).then_some(ArtifactKind::Cache)
 }
 
 /// Basenames that, when found *outside* every checkout/worktree, are a
@@ -288,11 +290,11 @@ impl<'a> Ctx<'a> {
     /// further.
     fn size_as_unit(&mut self, path: &Path) -> u64 {
         let mut total = 0u64;
-        let Ok(entries) = fs::read_dir(path) else {
+        let Ok(entries) = crate::fs_gate::read_dir(path) else {
             return total;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
                 continue;
             };
             if meta.file_type().is_symlink() {
@@ -431,7 +433,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn walk(&mut self, path: &Path) {
-        let Ok(meta) = fs::symlink_metadata(path) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
             return;
         };
         if meta.file_type().is_symlink() {
@@ -454,7 +456,7 @@ impl<'a> Ctx<'a> {
             return;
         }
 
-        let entries = match fs::read_dir(path) {
+        let entries = match crate::fs_gate::read_dir(path) {
             Ok(e) => e,
             Err(_) => {
                 self.record_permission_denied(path);
@@ -549,15 +551,18 @@ pub fn apply_to_worktree(row: &mut WorktreeRow, result: &mut AttributionResult) 
 /// Runs `du -skPx <root>` and returns bytes (KiB * 1024), or `None` if
 /// the command is unavailable or fails.
 pub fn du_total(root: &Path) -> Option<u64> {
-    let out = crate::spawn::command("du")
-        .arg("-skPx")
-        .arg(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // `du` over a whole root is slow by nature; the bound is a hang
+    // guard, not a cost budget (`--verify-du` is an explicit opt-in).
+    let out = crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Du,
+        [std::ffi::OsStr::new("-skPx"), root.as_os_str()],
+        std::time::Duration::from_secs(3600),
+    )
+    .ok()?;
+    if !out.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = out.stdout_lossy();
     let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
     Some(kib * 1024)
 }

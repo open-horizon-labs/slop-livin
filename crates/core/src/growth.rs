@@ -31,22 +31,15 @@ use crate::report::{
     ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedRow,
 };
 use anyhow::{Context, Result};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
-};
-use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{WriterProperties, WriterVersion};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+
+mod columns;
+pub use columns::FoldedRow;
+use columns::*;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SINCE: &str = "24h";
@@ -67,7 +60,7 @@ fn should_compact(files: &[PathBuf]) -> bool {
         && files
             .iter()
             .try_fold(0u64, |n, p| {
-                fs::symlink_metadata(p).map(|m| n.saturating_add(m.len()))
+                crate::fs_gate::symlink_metadata(p).map(|m| n.saturating_add(m.len()))
             })
             .is_ok_and(|bytes| bytes <= 128 * 1024)
 }
@@ -173,7 +166,7 @@ impl From<RawConfig> for GrowthConfig {
 /// keys and tolerates a malformed file the same way it always has.
 pub fn load_config_checked(swamp_dir: &Path) -> Result<GrowthConfig> {
     let path = swamp_dir.join("config.toml");
-    let text = match fs::read_to_string(&path) {
+    let text = match read_owned_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GrowthConfig::default()),
         Err(e) => return Err(e).context(format!("reading {}", path.display())),
@@ -225,217 +218,6 @@ fn row_key(project_id: &str, worktree_id: &str, kind: &str, rel_path: &str) -> S
     format!("{project_id}\u{1}{worktree_id}\u{1}{kind}\u{1}{rel_path}")
 }
 
-/// One stored row. Used both for `current.parquet` (where `bytes`/
-/// `present` are the latest known value) and for delta files (where they
-/// are the *previous* value, before the observation at `observed_at`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredRow {
-    project_id: String,
-    worktree_id: String,
-    kind: String,
-    rel_path: String,
-    bytes: u64,
-    local_bytes: u64,
-    /// Newest file mtime inside the unit; 0 when unknown (older stores).
-    mtime_max: u64,
-    /// Whether the unit contains hardlinked files. Missing in a store
-    /// written before this column existed, where it reads `true`: the
-    /// conservative answer: unique totals need reconciliation after changes.
-    hardlinked: bool,
-    dedup_stale: bool,
-    present: bool,
-    observed_at: u64,
-    regrowth_count: u32,
-}
-
-fn schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("project_id", DataType::Utf8, false),
-        Field::new("worktree_id", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("rel_path", DataType::Utf8, false),
-        Field::new("bytes", DataType::UInt64, false),
-        Field::new("present", DataType::Boolean, false),
-        Field::new("observed_at", DataType::UInt64, false),
-        Field::new("regrowth_count", DataType::UInt32, false),
-        Field::new("local_bytes", DataType::UInt64, false),
-        Field::new("mtime_max", DataType::UInt64, false),
-        Field::new("hardlinked", DataType::Boolean, false),
-        Field::new("dedup_stale", DataType::Boolean, false),
-    ]))
-}
-
-/// Writes a Parquet file so an interrupted write can never leave a
-/// corrupt one behind: the rows go to a sibling temp file, which is
-/// renamed over `path` only after the writer closed cleanly. A process
-/// killed mid-write (this happened: a SIGKILL during `observe` left a
-/// `current.parquet` whose footer never landed, and every later run died
-/// reading it) loses the new observation, never the store.
-/// The one place this crate builds a Parquet writer, so "every
-/// observation is zstd-compressed" is structural rather than a habit:
-/// callers choose a level, never a codec.
-fn write_parquet_atomic(
-    path: &Path,
-    schema: Arc<Schema>,
-    batch: &RecordBatch,
-    zstd_level: i32,
-) -> Result<()> {
-    write_parquet_batches_atomic(path, schema, std::iter::once(Ok(batch.clone())), zstd_level)
-}
-
-/// Atomic columnar writer for history batches.
-pub(crate) fn write_parquet_batches_atomic(
-    path: &Path,
-    schema: Arc<Schema>,
-    batches: impl IntoIterator<Item = Result<RecordBatch>>,
-    zstd_level: i32,
-) -> Result<()> {
-    let properties = default_zstd_properties(zstd_level);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // Unique even for concurrent writes within the same process/second.
-    // RAII removes a failed partial stream; readers retain the prior file.
-    let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
-    {
-        let file = tmp.reopen()?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-        for batch in batches {
-            writer.write(&batch?)?;
-            writer.flush()?;
-        }
-        // `close` writes the footer and the trailing magic; until it
-        // returns the file is not a Parquet file at all.
-        writer.close()?;
-    }
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("publish {}", path.display()))?;
-    Ok(())
-}
-
-fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
-    let schema = schema();
-    let project_ids: Vec<&str> = rows.iter().map(|r| r.project_id.as_str()).collect();
-    let worktree_ids: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
-    let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
-    let rel_paths: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
-    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
-    let present: Vec<bool> = rows.iter().map(|r| r.present).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-    let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
-    let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
-    let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
-    let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(project_ids)) as ArrayRef,
-            Arc::new(StringArray::from(worktree_ids)),
-            Arc::new(StringArray::from(kinds)),
-            Arc::new(StringArray::from(rel_paths)),
-            Arc::new(UInt64Array::from(bytes)),
-            Arc::new(BooleanArray::from(present)),
-            Arc::new(UInt64Array::from(observed_at)),
-            Arc::new(UInt32Array::from(regrowth)),
-            Arc::new(UInt64Array::from(local_bytes)),
-            Arc::new(UInt64Array::from(mtime_max)),
-            Arc::new(BooleanArray::from(hardlinked)),
-            Arc::new(BooleanArray::from(
-                rows.iter().map(|r| r.dedup_stale).collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
-}
-
-fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .with_context(|| {
-            format!(
-                "read {} (delete it to rebuild this store from a full walk)",
-                path.display()
-            )
-        })?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let project_id = downcast_str(&batch, "project_id")?;
-        let worktree_id = downcast_str(&batch, "worktree_id")?;
-        let kind = downcast_str(&batch, "kind")?;
-        let rel_path = downcast_str(&batch, "rel_path")?;
-        let bytes = downcast_u64(&batch, "bytes")?;
-        let present = downcast_bool(&batch, "present")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        let regrowth = downcast_u32(&batch, "regrowth_count")?;
-        // Stores written before #29 have no local_bytes column: fall back
-        // to `bytes` so incremental deltas degrade to the old behavior.
-        let local_bytes = downcast_u64(&batch, "local_bytes").ok();
-        // Likewise stores written before artifact age was recorded.
-        let mtime_max = downcast_u64(&batch, "mtime_max").ok();
-        let hardlinked = downcast_bool(&batch, "hardlinked").ok();
-        let dedup_stale = downcast_bool(&batch, "dedup_stale").ok();
-        for i in 0..batch.num_rows() {
-            rows.push(StoredRow {
-                project_id: project_id.value(i).to_string(),
-                worktree_id: worktree_id.value(i).to_string(),
-                kind: kind.value(i).to_string(),
-                rel_path: rel_path.value(i).to_string(),
-                bytes: bytes.value(i),
-                local_bytes: local_bytes
-                    .as_ref()
-                    .map(|c| c.value(i))
-                    .unwrap_or_else(|| bytes.value(i)),
-                mtime_max: mtime_max.as_ref().map(|c| c.value(i)).unwrap_or(0),
-                hardlinked: hardlinked.as_ref().map(|c| c.value(i)).unwrap_or(true),
-                dedup_stale: dedup_stale.as_ref().map(|c| c.value(i)).unwrap_or(false),
-                present: present.value(i),
-                observed_at: observed_at.value(i),
-                regrowth_count: regrowth.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-fn downcast_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .with_context(|| format!("column {name} is not Utf8"))
-}
-fn downcast_u64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-        .with_context(|| format!("column {name} is not UInt64"))
-}
-fn downcast_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-        .with_context(|| format!("column {name} is not UInt32"))
-}
-fn downcast_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .with_context(|| format!("column {name} is not Int64"))
-}
-fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
-        .with_context(|| format!("column {name} is not Boolean"))
-}
-
 fn volume_dir(swamp_dir: &Path, volume_id: u64) -> PathBuf {
     swamp_dir.join(volume_id.to_string())
 }
@@ -448,8 +230,8 @@ fn volume_dir(swamp_dir: &Path, volume_id: u64) -> PathBuf {
 /// sibling roots independent.  Hashing keeps the existing compact directory
 /// layout and avoids putting user paths into the store name.
 pub fn root_scoped_volume_id(root: &Path) -> u64 {
-    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let device = fs::metadata(&canonical)
+    let canonical = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let device = crate::fs_gate::metadata_following(&canonical)
         .map(|m| m.dev())
         .unwrap_or_default();
     let mut hasher = blake3::Hasher::new();
@@ -579,7 +361,7 @@ pub fn annotate_readonly(
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = current_path(&dir);
-    if !current_file.exists() {
+    if !crate::fs_gate::exists(&current_file) {
         // Store has never been observed for this volume; nothing to
         // annotate from.
         return Ok(());
@@ -589,7 +371,7 @@ pub fn annotate_readonly(
         .iter()
         .map(|r| {
             (
-                row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path),
+                row_key(r.project_id(), r.worktree_id(), r.kind(), r.rel_path()),
                 r,
             )
         })
@@ -621,7 +403,7 @@ pub fn annotate_readonly(
                     .flatten();
                 artifact.regrowth_count = current_by_key
                     .get(&key)
-                    .map(|r| r.regrowth_count)
+                    .map(|r| r.regrowth_count())
                     .unwrap_or(0);
             }
         }
@@ -653,142 +435,27 @@ pub fn observe_and_annotate(
     protected_worktree_ids: &HashSet<String>,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    fs::create_dir_all(&dir)?;
-    let current_file = current_path(&dir);
-
-    let mut current: HashMap<String, StoredRow> = read_rows(&current_file)?
-        .into_iter()
-        .map(|r| {
-            (
-                row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path),
-                r,
-            )
-        })
-        .collect();
+    crate::fs_gate::store::create_dir_all(&dir)?;
+    let mut history = ArtifactHistory::load(&dir)?;
 
     let observed = flatten(projects);
-    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut current_changed = false;
-    let mut delta_rows: Vec<StoredRow> = Vec::new();
-
+    let mut seen_keys: HashSet<String> = HashSet::new();
     for obs in &observed {
         seen_keys.insert(obs.key.clone());
-        match current.get_mut(&obs.key) {
-            Some(prev) => {
-                // Whether the unit holds hardlinked files is a property
-                // of the walk, not of its byte total: refresh it even
-                // when the bytes did not move, or a row first recorded
-                // under the conservative default would keep that default
-                // forever and never regain the fast path.
-                if prev.hardlinked != obs.hardlinked
-                    || prev.dedup_stale != obs.dedup_stale
-                    || prev.mtime_max != obs.mtime_max
-                    || prev.local_bytes != obs.local_bytes
-                {
-                    current_changed = true;
-                }
-                let changed =
-                    prev.bytes != obs.bytes || !prev.present || prev.dedup_stale != obs.dedup_stale;
-                if changed {
-                    current_changed = true;
-                    let regrowth_count = if !prev.present {
-                        prev.regrowth_count + 1
-                    } else {
-                        prev.regrowth_count
-                    };
-                    // The delta's timestamp must be when this *old* value
-                    // was itself last confirmed (`prev.observed_at`), not
-                    // this observation's timestamp. Tagging it with the
-                    // current observation instead collides with the new
-                    // `current` row's own timestamp (both would read as
-                    // "true at the same instant"), which makes the two
-                    // conflicting values tie in `growth_since`'s
-                    // nearest-timestamp lookup and lets an arbitrary one
-                    // win.
-                    delta_rows.push(StoredRow {
-                        project_id: prev.project_id.clone(),
-                        worktree_id: prev.worktree_id.clone(),
-                        kind: prev.kind.clone(),
-                        rel_path: prev.rel_path.clone(),
-                        bytes: prev.bytes,
-                        local_bytes: prev.local_bytes,
-                        mtime_max: prev.mtime_max,
-                        hardlinked: prev.hardlinked,
-                        dedup_stale: prev.dedup_stale,
-                        present: prev.present,
-                        observed_at: prev.observed_at,
-                        regrowth_count: prev.regrowth_count,
-                    });
-                    prev.bytes = obs.bytes;
-                    prev.local_bytes = obs.local_bytes;
-                    prev.present = true;
-                    prev.observed_at = observed_at;
-                    prev.regrowth_count = regrowth_count;
-                }
-                prev.dedup_stale = obs.dedup_stale;
-                prev.hardlinked = obs.hardlinked;
-                prev.mtime_max = obs.mtime_max;
-                prev.local_bytes = obs.local_bytes;
-            }
-            None => {
-                // Newly discovered row: there is no prior observation to
-                // diff against, so this is not a "change" the delta log
-                // needs to record -- it is simply the first known value.
-                // Writing a synthetic "previously absent" delta here would
-                // plant a fabricated (bytes=0, present=false) history
-                // point at this observation's timestamp, which can tie
-                // with (or beat) a real historical value once the row
-                // later changes, corrupting `growth_since` lookups.
-                current_changed = true;
-                current.insert(
-                    obs.key.clone(),
-                    StoredRow {
-                        project_id: obs.project_id.clone(),
-                        worktree_id: obs.worktree_id.clone(),
-                        kind: obs.kind.clone(),
-                        rel_path: obs.rel_path.clone(),
-                        bytes: obs.bytes,
-                        local_bytes: obs.local_bytes,
-                        mtime_max: obs.mtime_max,
-                        hardlinked: obs.hardlinked,
-                        dedup_stale: obs.dedup_stale,
-                        present: true,
-                        observed_at,
-                        regrowth_count: 0,
-                    },
-                );
-            }
-        }
+        history.observe(obs, observed_at);
     }
 
     // Rows present before, absent now: tombstone them (kept in the
     // store so a later reappearance counts as regrowth), but never
     // emitted as report rows in this issue. A row whose worktree could
-    // not be confirmed this pass (#42) is left untouched instead: its
-    // absence from `seen_keys` reflects lost access, not deletion.
-    for (key, row) in current.iter_mut() {
-        if row.present
-            && !seen_keys.contains(key)
-            && !protected_worktree_ids.contains(&row.worktree_id)
-        {
-            delta_rows.push(StoredRow {
-                project_id: row.project_id.clone(),
-                worktree_id: row.worktree_id.clone(),
-                kind: row.kind.clone(),
-                rel_path: row.rel_path.clone(),
-                bytes: row.bytes,
-                local_bytes: row.local_bytes,
-                mtime_max: row.mtime_max,
-                hardlinked: row.hardlinked,
-                dedup_stale: row.dedup_stale,
-                present: row.present,
-                observed_at: row.observed_at,
-                regrowth_count: row.regrowth_count,
-            });
-            row.present = false;
-            current_changed = true;
-            row.bytes = 0;
-            row.observed_at = observed_at;
+    // not be confirmed this pass (#42) is not claimable: its absence
+    // from `seen_keys` reflects lost access, not deletion.
+    let ownership = ArtifactOwnership {
+        unconfirmed_worktrees: protected_worktree_ids,
+    };
+    for key in history.unseen_present(&seen_keys) {
+        if let Some(owned) = ownership.claim(&history, &key) {
+            history.tombstone(owned, observed_at);
         }
     }
 
@@ -813,32 +480,16 @@ pub fn observe_and_annotate(
                     &kind,
                     &rel_path.display().to_string(),
                 );
-                let history = history_index.get(&key).cloned().unwrap_or_default();
+                let past = history_index.get(&key).cloned().unwrap_or_default();
                 artifact.growth_bytes = (!artifact.dedup_stale)
-                    .then(|| growth_since(&history, artifact.bytes, target_time))
+                    .then(|| growth_since(&past, artifact.bytes, target_time))
                     .flatten();
-                artifact.regrowth_count = current.get(&key).map(|r| r.regrowth_count).unwrap_or(0);
+                artifact.regrowth_count = history.row(&key).map(|r| r.regrowth_count()).unwrap_or(0);
             }
         }
     }
 
-    if !delta_rows.is_empty() {
-        let delta_path = next_delta_path(&dir);
-        write_rows(&delta_path, &delta_rows)?;
-    }
-
-    let mut current_rows: Vec<StoredRow> = current.into_values().collect();
-    current_rows.sort_by(|a, b| {
-        (&a.project_id, &a.worktree_id, &a.kind, &a.rel_path).cmp(&(
-            &b.project_id,
-            &b.worktree_id,
-            &b.kind,
-            &b.rel_path,
-        ))
-    });
-    if current_changed {
-        write_rows(&current_file, &current_rows)?;
-    }
+    history.commit()?;
 
     compact_if_needed(&dir, retention_days, observed_at)?;
 
@@ -861,28 +512,28 @@ fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<Hist
     for row in read_rows(&current_path(dir))? {
         index
             .entry(row_key(
-                &row.project_id,
-                &row.worktree_id,
-                &row.kind,
-                &row.rel_path,
+                row.project_id(),
+                row.worktree_id(),
+                row.kind(),
+                row.rel_path(),
             ))
             .or_default()
-            .push((row.observed_at, row.bytes, !row.present || !row.dedup_stale));
+            .push((row.observed_at(), row.bytes(), !row.present() || !row.dedup_stale()));
     }
     for delta_path in list_delta_files(dir) {
         for row in read_rows(&delta_path)? {
-            if row.observed_at < horizon {
+            if row.observed_at() < horizon {
                 continue;
             }
             index
                 .entry(row_key(
-                    &row.project_id,
-                    &row.worktree_id,
-                    &row.kind,
-                    &row.rel_path,
+                    row.project_id(),
+                    row.worktree_id(),
+                    row.kind(),
+                    row.rel_path(),
                 ))
                 .or_default()
-                .push((row.observed_at, row.bytes, !row.present || !row.dedup_stale));
+                .push((row.observed_at(), row.bytes(), !row.present() || !row.dedup_stale()));
         }
     }
     for values in index.values_mut() {
@@ -913,39 +564,7 @@ fn compact_if_needed(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     }
     let retention_secs = retention_days.saturating_mul(86400);
     let horizon = now.saturating_sub(retention_secs);
-
-    let mut merged: Vec<StoredRow> = Vec::new();
-    for path in &files {
-        for row in read_rows(path)? {
-            if row.observed_at >= horizon {
-                merged.push(row);
-            }
-        }
-    }
-    if !merged.is_empty() {
-        merged.sort_by(|a, b| {
-            (
-                &a.project_id,
-                &a.worktree_id,
-                &a.kind,
-                &a.rel_path,
-                a.observed_at,
-            )
-                .cmp(&(
-                    &b.project_id,
-                    &b.worktree_id,
-                    &b.kind,
-                    &b.rel_path,
-                    b.observed_at,
-                ))
-        });
-        write_rows(&next_delta_path(dir), &merged)?;
-    }
-    // Publish the completed replacement before retiring any source file.
-    for path in &files {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    }
-    Ok(())
+    compact_artifact_deltas(dir, &files, horizon)
 }
 
 /// Prunes delta files that fall entirely outside the retention window,
@@ -963,7 +582,7 @@ pub fn history_span_secs(dir: &Path, now: u64) -> Option<u64> {
     let mut oldest: Option<u64> = None;
     let mut consider = |rows: Vec<StoredRow>| {
         for r in rows {
-            oldest = Some(oldest.map_or(r.observed_at, |o: u64| o.min(r.observed_at)));
+            oldest = Some(oldest.map_or(r.observed_at(), |o: u64| o.min(r.observed_at())));
         }
     };
     if let Ok(rows) = read_rows(&current_path(dir)) {
@@ -1001,15 +620,15 @@ pub fn history_series(
     let mut points: HashMap<String, Vec<(u64, Option<u64>)>> = HashMap::new();
     let mut push = |rows: Vec<StoredRow>| {
         for r in rows {
-            let key = row_key(&r.project_id, &r.worktree_id, &r.kind, &r.rel_path);
-            let bytes = if !r.present {
+            let key = row_key(r.project_id(), r.worktree_id(), r.kind(), r.rel_path());
+            let bytes = if !r.present() {
                 Some(0)
-            } else if r.dedup_stale {
+            } else if r.dedup_stale() {
                 None
             } else {
-                Some(r.bytes)
+                Some(r.bytes())
             };
-            points.entry(key).or_default().push((r.observed_at, bytes));
+            points.entry(key).or_default().push((r.observed_at(), bytes));
         }
     };
     for f in list_delta_files(dir) {
@@ -1074,8 +693,8 @@ pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
     let horizon = now.saturating_sub(retention_secs);
     for path in list_delta_files(dir) {
         let rows = read_rows(&path)?;
-        if rows.iter().all(|r| r.observed_at < horizon) {
-            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        if rows.iter().all(|r| r.observed_at() < horizon) {
+            crate::fs_gate::columns::retire(&path)?;
         }
     }
     Ok(())
@@ -1097,14 +716,14 @@ const DIR_BASE_ZSTD_LEVEL: i32 = 9;
 const DIR_DELTA_ZSTD_LEVEL: i32 = 3;
 
 fn list_files_in(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
         return Vec::new();
     };
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
-        .filter(|p| p.is_file())
+        .filter(|p| crate::fs_gate::is_file(p))
         .collect();
     files.sort();
     files
@@ -1126,30 +745,7 @@ fn next_seq_path(dir: &Path, prefix: &str) -> PathBuf {
     dir.join(format!("{prefix}{next_seq:012}.parquet"))
 }
 
-fn default_zstd_properties(level: i32) -> WriterProperties {
-    let level = ZstdLevel::try_new(level).unwrap_or_default();
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(level))
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .build()
-}
-
 // --- dirs.parquet ---
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredDirRow {
-    worktree_id: String,
-    rel_path: String,
-    parent_rel_path: Option<String>,
-    allocated_total: u64,
-    own_allocated: u64,
-    file_count: u32,
-    entry_count: u32,
-    symlink_count: u32,
-    mod_time_min: i32,
-    complete: bool,
-    observed_at: u64,
-}
 
 fn dir_row_key(worktree_id: &str, rel_path: &str) -> String {
     format!("{worktree_id}\u{1}{rel_path}")
@@ -1160,112 +756,6 @@ fn dirs_current_path(dir: &Path) -> PathBuf {
 }
 fn dirs_deltas_dir(dir: &Path) -> PathBuf {
     dir.join("dirs_deltas")
-}
-
-fn dirs_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("worktree_id", DataType::Utf8, false),
-        Field::new("rel_path", DataType::Utf8, false),
-        Field::new("parent_rel_path", DataType::Utf8, true),
-        Field::new("allocated_total", DataType::UInt64, false),
-        Field::new("own_allocated", DataType::UInt64, false),
-        Field::new("file_count", DataType::UInt32, false),
-        Field::new("entry_count", DataType::UInt32, false),
-        Field::new("symlink_count", DataType::UInt32, false),
-        Field::new("mod_time_min", DataType::Int32, false),
-        Field::new("complete", DataType::Boolean, false),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-fn write_dir_rows(path: &Path, rows: &[StoredDirRow], zstd_level: i32) -> Result<()> {
-    let schema = dirs_schema();
-    let worktree_ids: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
-    let rel_paths: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
-    let parent_rel_paths: Vec<Option<&str>> =
-        rows.iter().map(|r| r.parent_rel_path.as_deref()).collect();
-    let allocated_total: Vec<u64> = rows.iter().map(|r| r.allocated_total).collect();
-    let own_allocated: Vec<u64> = rows.iter().map(|r| r.own_allocated).collect();
-    let file_count: Vec<u32> = rows.iter().map(|r| r.file_count).collect();
-    let entry_count: Vec<u32> = rows.iter().map(|r| r.entry_count).collect();
-    let symlink_count: Vec<u32> = rows.iter().map(|r| r.symlink_count).collect();
-    let mod_time_min: Vec<i32> = rows.iter().map(|r| r.mod_time_min).collect();
-    let complete: Vec<bool> = rows.iter().map(|r| r.complete).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(worktree_ids)) as ArrayRef,
-            Arc::new(StringArray::from(rel_paths)),
-            Arc::new(StringArray::from(parent_rel_paths)),
-            Arc::new(UInt64Array::from(allocated_total)),
-            Arc::new(UInt64Array::from(own_allocated)),
-            Arc::new(UInt32Array::from(file_count)),
-            Arc::new(UInt32Array::from(entry_count)),
-            Arc::new(UInt32Array::from(symlink_count)),
-            Arc::new(Int32Array::from(mod_time_min)),
-            Arc::new(BooleanArray::from(complete)),
-            Arc::new(UInt64Array::from(observed_at)),
-        ],
-    )?;
-    write_parquet_atomic(path, schema, &batch, zstd_level)
-}
-
-fn read_dir_rows(path: &Path) -> Result<Vec<StoredDirRow>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .with_context(|| {
-            format!(
-                "read {} (delete it to rebuild this store from a full walk)",
-                path.display()
-            )
-        })?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let worktree_id = downcast_str(&batch, "worktree_id")?;
-        let rel_path = downcast_str(&batch, "rel_path")?;
-        let parent_rel_path = batch
-            .column_by_name("parent_rel_path")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .context("column parent_rel_path is not Utf8")?;
-        let allocated_total = downcast_u64(&batch, "allocated_total")?;
-        let own_allocated = downcast_u64(&batch, "own_allocated")?;
-        let file_count = downcast_u32(&batch, "file_count")?;
-        let entry_count = downcast_u32(&batch, "entry_count")?;
-        let symlink_count = downcast_u32(&batch, "symlink_count")?;
-        let mod_time_min = batch
-            .column_by_name("mod_time_min")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .context("column mod_time_min is not Int32")?;
-        let complete = downcast_bool(&batch, "complete")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredDirRow {
-                worktree_id: worktree_id.value(i).to_string(),
-                rel_path: rel_path.value(i).to_string(),
-                parent_rel_path: if parent_rel_path.is_null(i) {
-                    None
-                } else {
-                    Some(parent_rel_path.value(i).to_string())
-                },
-                allocated_total: allocated_total.value(i),
-                own_allocated: own_allocated.value(i),
-                file_count: file_count.value(i),
-                entry_count: entry_count.value(i),
-                symlink_count: symlink_count.value(i),
-                mod_time_min: mod_time_min.value(i),
-                complete: complete.value(i),
-                observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
 }
 
 /// Builds a `key -> [(observed_at, value)]` index over every dir row's
@@ -1328,7 +818,7 @@ pub fn annotate_readonly_dirs(
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = dirs_current_path(&dir);
-    if !current_file.exists() {
+    if !crate::fs_gate::exists(&current_file) {
         return Ok(());
     }
     let current: HashMap<String, StoredDirRow> = read_dir_rows(&current_file)?
@@ -1360,7 +850,7 @@ pub fn observe_and_annotate_dirs(
     since_secs: u64,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    fs::create_dir_all(&dir)?;
+    store::create_dir_all(&dir)?;
     let current_file = dirs_current_path(&dir);
 
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
@@ -1501,21 +991,12 @@ fn compact_dir_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> Re
         )?;
     }
     for path in &files {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        crate::fs_gate::columns::retire(path)?;
     }
     Ok(())
 }
 
 // --- files.parquet ---
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredFileRow {
-    worktree_id: String,
-    rel_path: String,
-    allocated: u64,
-    mod_time_min: i32,
-    observed_at: u64,
-}
 
 fn file_row_key(worktree_id: &str, rel_path: &str) -> String {
     format!("{worktree_id}\u{1}{rel_path}")
@@ -1526,74 +1007,6 @@ fn files_current_path(dir: &Path) -> PathBuf {
 }
 fn files_deltas_dir(dir: &Path) -> PathBuf {
     dir.join("files_deltas")
-}
-
-fn files_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("worktree_id", DataType::Utf8, false),
-        Field::new("rel_path", DataType::Utf8, false),
-        Field::new("allocated", DataType::UInt64, false),
-        Field::new("mod_time_min", DataType::Int32, false),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-fn write_file_rows(path: &Path, rows: &[StoredFileRow], zstd_level: i32) -> Result<()> {
-    let schema = files_schema();
-    let worktree_ids: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
-    let rel_paths: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
-    let allocated: Vec<u64> = rows.iter().map(|r| r.allocated).collect();
-    let mod_time_min: Vec<i32> = rows.iter().map(|r| r.mod_time_min).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(worktree_ids)) as ArrayRef,
-            Arc::new(StringArray::from(rel_paths)),
-            Arc::new(UInt64Array::from(allocated)),
-            Arc::new(Int32Array::from(mod_time_min)),
-            Arc::new(UInt64Array::from(observed_at)),
-        ],
-    )?;
-    write_parquet_atomic(path, schema, &batch, zstd_level)
-}
-
-fn read_file_rows(path: &Path) -> Result<Vec<StoredFileRow>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .with_context(|| {
-            format!(
-                "read {} (delete it to rebuild this store from a full walk)",
-                path.display()
-            )
-        })?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let worktree_id = downcast_str(&batch, "worktree_id")?;
-        let rel_path = downcast_str(&batch, "rel_path")?;
-        let allocated = downcast_u64(&batch, "allocated")?;
-        let mod_time_min = batch
-            .column_by_name("mod_time_min")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .context("column mod_time_min is not Int32")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredFileRow {
-                worktree_id: worktree_id.value(i).to_string(),
-                rel_path: rel_path.value(i).to_string(),
-                allocated: allocated.value(i),
-                mod_time_min: mod_time_min.value(i),
-                observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
 }
 
 /// Same one-pass approach as [`build_dir_history_index`], for file rows.
@@ -1642,7 +1055,7 @@ pub fn annotate_readonly_files(
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = files_current_path(&dir);
-    if !current_file.exists() {
+    if !crate::fs_gate::exists(&current_file) {
         return Ok(());
     }
     let current: HashMap<String, StoredFileRow> = read_file_rows(&current_file)?
@@ -1670,7 +1083,7 @@ pub fn observe_and_annotate_files(
     since_secs: u64,
 ) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
-    fs::create_dir_all(&dir)?;
+    store::create_dir_all(&dir)?;
     let current_file = files_current_path(&dir);
 
     let mut current: HashMap<String, StoredFileRow> = read_file_rows(&current_file)?
@@ -1764,7 +1177,7 @@ fn compact_file_deltas_if_needed(dir: &Path, retention_days: u64, now: u64) -> R
         )?;
     }
     for path in &files {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        crate::fs_gate::columns::retire(path)?;
     }
     Ok(())
 }
@@ -1815,7 +1228,7 @@ fn unowned_path(dir: &Path) -> PathBuf {
 }
 
 fn read_fsevents_state(dir: &Path) -> FsEventsState {
-    fs::read_to_string(fsevents_state_path(dir))
+    read_owned_string(fsevents_state_path(dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -1831,48 +1244,48 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
 /// other's, and the visible symptom would be a unit that re-measures
 /// every pass for no stated reason.
 fn write_fsevents_state(dir: &Path, state: &FsEventsState) -> Result<()> {
-    fs::create_dir_all(dir)?;
+    store::create_dir_all(dir)?;
     let merged = FsEventsState {
         unit_root: read_fsevents_state(dir).unit_root,
         ..state.clone()
     };
-    fs::write(fsevents_state_path(dir), serde_json::to_string(&merged)?)
+    store::write_json(store::JsonFile::FsEventsCursor { volume: dir }, &merged)
         .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
 }
 
 /// The mirror of [`write_fsevents_state`]: publishes one unit root's
 /// anchor, carrying the walk's scalars through untouched.
 fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor) -> Result<()> {
-    fs::create_dir_all(dir)?;
+    store::create_dir_all(dir)?;
     let merged = FsEventsState {
         unit_root: Some(cursor.clone()),
         ..read_fsevents_state(dir)
     };
-    fs::write(fsevents_state_path(dir), serde_json::to_string(&merged)?)
+    store::write_json(store::JsonFile::FsEventsCursor { volume: dir }, &merged)
         .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
 }
 
 fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
-    let text = fs::read_to_string(topology_path(dir)).ok()?;
+    let text = read_owned_string(topology_path(dir)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 fn write_topology(dir: &Path, worktrees: &[StoredWorktree]) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    fs::write(topology_path(dir), serde_json::to_string(worktrees)?)
+    store::create_dir_all(dir)?;
+    store::write_json(store::JsonFile::Topology { volume: dir }, worktrees)
         .with_context(|| format!("write {}", topology_path(dir).display()))
 }
 
 fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
-    fs::read_to_string(unowned_path(dir))
+    read_owned_string(unowned_path(dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
 fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    fs::write(unowned_path(dir), serde_json::to_string(unowned)?)
+    store::create_dir_all(dir)?;
+    store::write_json(store::JsonFile::Unowned { volume: dir }, unowned)
         .with_context(|| format!("write {}", unowned_path(dir).display()))
 }
 
@@ -1915,27 +1328,27 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
     let is_docker_kind = |k: &str| matches!(k, "DockerImage" | "DockerBuildCache" | "DockerVolume");
     for row in current_rows
         .iter()
-        .filter(|r| r.present && !is_docker_kind(&r.kind) && !r.kind.starts_with("Nested:"))
+        .filter(|r| r.present() && !is_docker_kind(r.kind()) && !r.kind().starts_with("Nested:"))
     {
-        attributed_total += row.bytes;
+        attributed_total += row.bytes();
         artifacts_by_worktree
-            .entry(row.worktree_id.clone())
+            .entry(row.worktree_id().to_string())
             .or_default()
             .push(ArtifactRow {
-                kind: parse_artifact_kind(&row.kind),
-                path: PathBuf::from(&row.rel_path),
-                bytes: row.bytes,
-                mtime_max: row.mtime_max,
+                kind: parse_artifact_kind(row.kind()),
+                path: PathBuf::from(&row.rel_path()),
+                bytes: row.bytes(),
+                mtime_max: row.mtime_max(),
                 ecosystem: None,
-                hardlinked: row.hardlinked,
-                dedup_stale: row.dedup_stale,
-                local_bytes: row.local_bytes,
+                hardlinked: row.hardlinked(),
+                dedup_stale: row.dedup_stale(),
+                local_bytes: row.local_bytes(),
                 allocated_bytes: None,
                 allocated_growth_bytes: None,
                 track: None,
                 growth_bytes: None,
-                regrowth_count: row.regrowth_count,
-                observed_at: row.observed_at,
+                regrowth_count: row.regrowth_count(),
+                observed_at: row.observed_at(),
                 confidence: Confidence::High,
                 source: Source::new("filesystem.walk"),
                 note: None,
@@ -2242,7 +1655,7 @@ pub fn replay_unit_roots(
     let mut staged: Vec<Staged> = Vec::new();
     let mut requests: Vec<FsEventsRequest> = Vec::new();
     for root in roots {
-        let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let canonical = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.clone());
         let dir = volume_dir(swamp_dir, root_scoped_volume_id(&canonical));
         let prev = read_fsevents_state(&dir).unit_root.unwrap_or_default();
         // A root that is not on disk has no units, nothing to replay and
@@ -2253,7 +1666,7 @@ pub fn replay_unit_roots(
         // scope legitimately contains such paths -- a Cargo home
         // contributes `registry/index` and `git/db` whether or not they
         // have ever been populated.
-        let Some(device) = fs::metadata(&canonical).map(|m| m.dev()).ok() else {
+        let Some(device) = crate::fs_gate::metadata_following(&canonical).map(|m| m.dev()).ok() else {
             continue;
         };
         let device_mismatch = prev.device.is_some_and(|stored| stored != device);
@@ -2376,10 +1789,10 @@ pub fn stage_tracked_with_source(
 ) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
     // This public lower-level entry point must be safe for direct callers;
     // never persist alias-form topology into a canonical root scope.
-    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let volume_id = root_scoped_volume_id(&root);
     let dir = volume_dir(swamp_dir, volume_id);
-    fs::create_dir_all(&dir)?;
+    store::create_dir_all(&dir)?;
 
     // FSEvents and persisted topology use the canonical root namespace.
     let prev_state = read_fsevents_state(&dir);
@@ -2806,7 +2219,7 @@ fn compute_unconfirmed_worktrees(
     let discovered_paths: HashSet<&Path> = discovered.iter().map(|d| d.path.as_path()).collect();
     prev.iter()
         .filter(|pw| !discovered_paths.contains(pw.path.as_path()))
-        .filter(|pw| match fs::symlink_metadata(&pw.path) {
+        .filter(|pw| match crate::fs_gate::symlink_metadata(&pw.path) {
             // Gone entirely: real deletion, tombstoning is correct.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             // Existed, could not be statted for some other reason (also
@@ -2818,7 +2231,7 @@ fn compute_unconfirmed_worktrees(
             // `discovered` means it is no longer a git worktree (e.g.
             // `.git` was removed) -- a real change, not a coverage gap.
             // If it cannot be listed, access was lost, not the worktree.
-            Ok(_) => fs::read_dir(&pw.path).is_err(),
+            Ok(_) => crate::fs_gate::read_dir(&pw.path).is_err(),
         })
         .map(|pw| pw.worktree_id.clone())
         .collect()
@@ -2861,7 +2274,7 @@ fn resize_interior(
     changed_rels.dedup();
     for rel_c in &changed_rels {
         let abs = wt_root.join(rel_c);
-        let Ok(meta) = fs::symlink_metadata(&abs) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(&abs) else {
             // Gone: its whole subtree with it.
             dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, rel_c)));
             continue;
@@ -3007,7 +2420,7 @@ fn relist_source_dirs(
         let known = dirs
             .iter()
             .any(|d| d.worktree_id == worktree_id && &d.rel_path == rel_c);
-        let Ok(meta) = fs::symlink_metadata(&abs) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(&abs) else {
             if rel_c.is_empty() {
                 return None; // the worktree itself is gone; handled by the caller.
             }
@@ -3027,7 +2440,7 @@ fn relist_source_dirs(
         if !known {
             return None;
         }
-        let Ok(entries) = fs::read_dir(&abs) else {
+        let Ok(entries) = crate::fs_gate::read_dir(&abs) else {
             continue;
         };
         let mut own: u64 = 0;
@@ -3052,7 +2465,7 @@ fn relist_source_dirs(
                 ndirs += 1;
                 on_disk_subdirs.push(child_rel);
             } else if ft.is_file() {
-                let Ok(fm) = fs::symlink_metadata(e.path()) else {
+                let Ok(fm) = crate::fs_gate::symlink_metadata(e.path()) else {
                     continue;
                 };
                 if fm.file_type().is_symlink() || !fm.is_file() {
@@ -3245,7 +2658,7 @@ fn apply_incremental(
             // an already-known worktree's tree is a nested checkout; the
             // worktree-level rewalk below re-sizes but does not itself
             // run project discovery, so scan explicitly too.
-            if changed != &wt.path && changed.join(".git").exists() {
+            if changed != &wt.path && crate::fs_gate::exists(changed.join(".git")) {
                 discovery_scan_roots.push(changed.clone());
                 worktrees_to_rewalk.insert(wt.worktree_id.clone());
             }
@@ -3382,7 +2795,7 @@ fn apply_incremental(
     // simply not carried into this result, which tombstones them the next
     // time `growth::observe_and_annotate*` runs (a present row this
     // observation no longer emits is marked absent automatically).
-    discovered.retain(|dw| dw.path.exists());
+    discovered.retain(|dw| crate::fs_gate::exists(&dw.path));
     let discovered_ids: HashSet<String> = discovered
         .iter()
         .map(|dw| crate::entities::id_for(&dw.path.display().to_string()))
@@ -3403,7 +2816,7 @@ fn apply_incremental(
         if worktrees_to_rewalk.contains(worktree_id) {
             continue; // superseded by the full worktree rewalk below.
         }
-        if !root_path.exists() {
+        if !crate::fs_gate::exists(root_path) {
             // The artifact directory itself was removed: drop the row
             // entirely rather than leaving a phantom zero-byte entry a
             // full walk would never have produced. A later change that
@@ -3720,19 +3133,6 @@ fn apply_incremental(
 // unit's device need not match any scan root's device.
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoredExternalRow {
-    pub(crate) detector_id: String,
-    pub(crate) category: String,
-    pub(crate) device: u64,
-    pub(crate) path: String,
-    pub(crate) bytes: u64,
-    pub(crate) hardlinked: bool,
-    pub(crate) present: bool,
-    pub(crate) observed_at: u64,
-    pub(crate) regrowth_count: u32,
-}
-
 pub(crate) fn external_row_key(
     detector_id: &str,
     category: &str,
@@ -3752,201 +3152,12 @@ fn external_deltas_dir(dir: &Path) -> PathBuf {
     dir.join("deltas")
 }
 
-fn external_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("detector_id", DataType::Utf8, false),
-        Field::new("category", DataType::Utf8, false),
-        Field::new("device", DataType::UInt64, false),
-        Field::new("path", DataType::Utf8, false),
-        Field::new("bytes", DataType::UInt64, false),
-        Field::new("hardlinked", DataType::Boolean, false),
-        Field::new("present", DataType::Boolean, false),
-        Field::new("observed_at", DataType::UInt64, false),
-        Field::new("regrowth_count", DataType::UInt32, false),
-    ]))
-}
-
-fn write_external_rows(path: &Path, rows: &[StoredExternalRow]) -> Result<()> {
-    let schema = external_schema();
-    let detector_ids: Vec<&str> = rows.iter().map(|r| r.detector_id.as_str()).collect();
-    let categories: Vec<&str> = rows.iter().map(|r| r.category.as_str()).collect();
-    let devices: Vec<u64> = rows.iter().map(|r| r.device).collect();
-    let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
-    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
-    let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
-    let present: Vec<bool> = rows.iter().map(|r| r.present).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-    let regrowth: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(detector_ids)) as ArrayRef,
-            Arc::new(StringArray::from(categories)),
-            Arc::new(UInt64Array::from(devices)),
-            Arc::new(StringArray::from(paths)),
-            Arc::new(UInt64Array::from(bytes)),
-            Arc::new(BooleanArray::from(hardlinked)),
-            Arc::new(BooleanArray::from(present)),
-            Arc::new(UInt64Array::from(observed_at)),
-            Arc::new(UInt32Array::from(regrowth)),
-        ],
-    )?;
-    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
-}
-
-fn read_external_rows(path: &Path) -> Result<Vec<StoredExternalRow>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .with_context(|| {
-            format!(
-                "read {} (delete it to rebuild this store from a full walk)",
-                path.display()
-            )
-        })?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let detector_id = downcast_str(&batch, "detector_id")?;
-        let category = downcast_str(&batch, "category")?;
-        let device = downcast_u64(&batch, "device")?;
-        let path_col = downcast_str(&batch, "path")?;
-        let bytes = downcast_u64(&batch, "bytes")?;
-        let hardlinked = downcast_bool(&batch, "hardlinked")?;
-        let present = downcast_bool(&batch, "present")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        let regrowth = downcast_u32(&batch, "regrowth_count")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredExternalRow {
-                detector_id: detector_id.value(i).to_string(),
-                category: category.value(i).to_string(),
-                device: device.value(i),
-                path: path_col.value(i).to_string(),
-                bytes: bytes.value(i),
-                hardlinked: hardlinked.value(i),
-                present: present.value(i),
-                observed_at: observed_at.value(i),
-                regrowth_count: regrowth.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
 // ---------------------------------------------------------------------
 // external/folded.parquet -- the measurement the next pass may reuse
 // ---------------------------------------------------------------------
 
-/// One row per directory a unit's folded measurement listed, plus one
-/// root row (`rel_dir == ""`) carrying the measurement itself.
-///
-/// This is a *measurement cache*, not history: it never feeds growth,
-/// tombstones or regrowth, and deleting it only costs one full
-/// re-measurement. It is per **directory**, never per file -- the
-/// handoff forbids a per-file persistent inventory, and a directory's
-/// own `mtime`/`ctime` already move when an entry inside it is created,
-/// removed or renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FoldedRow {
-    pub unit_path: String,
-    pub rel_dir: String,
-    pub mtime_ns: i64,
-    pub ctime_ns: i64,
-    /// Root row only: the folded byte total, whether any member was
-    /// hardlinked, the newest member mtime, when it was measured, and a
-    /// digest of the exclusion list it was measured under.
-    pub bytes: u64,
-    pub hardlinked: bool,
-    pub mtime_max: u64,
-    pub observed_at: u64,
-    pub exclusions: String,
-}
-
 fn folded_path(swamp_dir: &Path) -> PathBuf {
     external_dir(swamp_dir).join("folded.parquet")
-}
-
-fn folded_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("unit_path", DataType::Utf8, false),
-        Field::new("rel_dir", DataType::Utf8, false),
-        Field::new("mtime_ns", DataType::Int64, false),
-        Field::new("ctime_ns", DataType::Int64, false),
-        Field::new("bytes", DataType::UInt64, false),
-        Field::new("hardlinked", DataType::Boolean, false),
-        Field::new("mtime_max", DataType::UInt64, false),
-        Field::new("observed_at", DataType::UInt64, false),
-        Field::new("exclusions", DataType::Utf8, false),
-    ]))
-}
-
-fn write_folded_rows(path: &Path, rows: &[FoldedRow]) -> Result<()> {
-    let schema = folded_schema();
-    let unit_path: Vec<&str> = rows.iter().map(|r| r.unit_path.as_str()).collect();
-    let rel_dir: Vec<&str> = rows.iter().map(|r| r.rel_dir.as_str()).collect();
-    let mtime_ns: Vec<i64> = rows.iter().map(|r| r.mtime_ns).collect();
-    let ctime_ns: Vec<i64> = rows.iter().map(|r| r.ctime_ns).collect();
-    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
-    let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
-    let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-    let exclusions: Vec<&str> = rows.iter().map(|r| r.exclusions.as_str()).collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(unit_path)) as ArrayRef,
-            Arc::new(StringArray::from(rel_dir)),
-            Arc::new(Int64Array::from(mtime_ns)),
-            Arc::new(Int64Array::from(ctime_ns)),
-            Arc::new(UInt64Array::from(bytes)),
-            Arc::new(BooleanArray::from(hardlinked)),
-            Arc::new(UInt64Array::from(mtime_max)),
-            Arc::new(UInt64Array::from(observed_at)),
-            Arc::new(StringArray::from(exclusions)),
-        ],
-    )?;
-    write_parquet_atomic(path, schema, &batch, ARTIFACT_ZSTD_LEVEL)
-}
-
-fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .with_context(|| format!("read {}", path.display()))?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let unit_path = downcast_str(&batch, "unit_path")?;
-        let rel_dir = downcast_str(&batch, "rel_dir")?;
-        let mtime_ns = downcast_i64(&batch, "mtime_ns")?;
-        let ctime_ns = downcast_i64(&batch, "ctime_ns")?;
-        let bytes = downcast_u64(&batch, "bytes")?;
-        let hardlinked = downcast_bool(&batch, "hardlinked")?;
-        let mtime_max = downcast_u64(&batch, "mtime_max")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        let exclusions = downcast_str(&batch, "exclusions")?;
-        for i in 0..batch.num_rows() {
-            rows.push(FoldedRow {
-                unit_path: unit_path.value(i).to_string(),
-                rel_dir: rel_dir.value(i).to_string(),
-                mtime_ns: mtime_ns.value(i),
-                ctime_ns: ctime_ns.value(i),
-                bytes: bytes.value(i),
-                hardlinked: hardlinked.value(i),
-                mtime_max: mtime_max.value(i),
-                observed_at: observed_at.value(i),
-                exclusions: exclusions.value(i).to_string(),
-            });
-        }
-    }
-    Ok(rows)
 }
 
 /// Every stored folded row for `unit_path`, root row first. Empty when
@@ -3980,7 +3191,7 @@ pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u
         return Ok(());
     }
     let dir = external_dir(swamp_dir);
-    fs::create_dir_all(&dir)?;
+    store::create_dir_all(&dir)?;
     let path = folded_path(swamp_dir);
     let wanted: std::collections::HashSet<&str> = unit_paths.iter().map(String::as_str).collect();
     let mut all: Vec<FoldedRow> = read_folded_rows(&path).unwrap_or_default();
@@ -3999,7 +3210,7 @@ pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u
 
 pub fn store_folded_rows(swamp_dir: &Path, unit_path: &str, rows: &[FoldedRow]) -> Result<()> {
     let dir = external_dir(swamp_dir);
-    fs::create_dir_all(&dir)?;
+    store::create_dir_all(&dir)?;
     let path = folded_path(swamp_dir);
     let mut all: Vec<FoldedRow> = read_folded_rows(&path)
         .unwrap_or_default()
@@ -4137,28 +3348,28 @@ fn external_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<H
     for row in read_external_rows(&external_current_path(dir))? {
         index
             .entry(external_row_key(
-                &row.detector_id,
-                &row.category,
-                row.device,
-                &row.path,
+                row.detector_id(),
+                row.category(),
+                row.device(),
+                row.path(),
             ))
             .or_default()
-            .push((row.observed_at, row.bytes, true));
+            .push((row.observed_at(), row.bytes(), true));
     }
     for delta_path in list_files_in(&external_deltas_dir(dir)) {
         for row in read_external_rows(&delta_path)? {
-            if row.observed_at < horizon {
+            if row.observed_at() < horizon {
                 continue;
             }
             index
                 .entry(external_row_key(
-                    &row.detector_id,
-                    &row.category,
-                    row.device,
-                    &row.path,
+                    row.detector_id(),
+                    row.category(),
+                    row.device(),
+                    row.path(),
                 ))
                 .or_default()
-                .push((row.observed_at, row.bytes, true));
+                .push((row.observed_at(), row.bytes(), true));
         }
     }
     for values in index.values_mut() {
@@ -4184,81 +3395,26 @@ pub fn observe_and_annotate_external(
     since_secs: u64,
 ) -> Result<HashMap<String, (Option<i64>, u32)>> {
     let dir = external_dir(swamp_dir);
-    fs::create_dir_all(&dir)?;
-    let current_file = external_current_path(&dir);
-
-    let mut current: HashMap<String, StoredExternalRow> = read_external_rows(&current_file)?
-        .into_iter()
-        .map(|r| {
-            (
-                external_row_key(&r.detector_id, &r.category, r.device, &r.path),
-                r,
-            )
-        })
-        .collect();
+    crate::fs_gate::store::create_dir_all(&dir)?;
+    let mut table = ExternalHistory::load(&dir)?;
 
     let mut seen_keys: HashSet<String> = HashSet::new();
-    let mut current_changed = false;
-    let mut delta_rows: Vec<StoredExternalRow> = Vec::new();
-
     for obs in observed {
         seen_keys.insert(obs.key.clone());
-        match current.get_mut(&obs.key) {
-            Some(prev) => {
-                let changed = prev.bytes != obs.bytes || !prev.present;
-                if changed {
-                    current_changed = true;
-                    let regrowth_count = if !prev.present {
-                        prev.regrowth_count + 1
-                    } else {
-                        prev.regrowth_count
-                    };
-                    delta_rows.push(prev.clone());
-                    prev.bytes = obs.bytes;
-                    prev.present = true;
-                    prev.observed_at = observed_at;
-                    prev.regrowth_count = regrowth_count;
-                }
-                if prev.hardlinked != obs.hardlinked {
-                    current_changed = true;
-                }
-                prev.hardlinked = obs.hardlinked;
-            }
-            None => {
-                current_changed = true;
-                current.insert(
-                    obs.key.clone(),
-                    StoredExternalRow {
-                        detector_id: obs.detector_id.clone(),
-                        category: obs.category.clone(),
-                        device: obs.device,
-                        path: obs.path.clone(),
-                        bytes: obs.bytes,
-                        hardlinked: obs.hardlinked,
-                        present: true,
-                        observed_at,
-                        regrowth_count: 0,
-                    },
-                );
-            }
-        }
+        table.observe(obs, observed_at);
     }
 
-    // The owned sweep. `ownership.owns` is the whole guard: a key from
+    // The owned sweep. `ownership.claim` is the whole guard: a key from
     // the other family, or one outside the regions this pass actually
-    // covered, is left exactly as it is -- never tombstoned, so never
-    // resurrected as invented regrowth on the next pass.
-    for (key, row) in current.iter_mut() {
-        if row.present
-            && !seen_keys.contains(key)
-            && !protected_keys.contains(key)
-            && ownership.owns(key)
-        {
-            delta_rows.push(row.clone());
-            row.present = false;
-            row.bytes = 0;
-            row.observed_at = observed_at;
-            current_changed = true;
+    // covered, yields no claim and is left exactly as it is -- never
+    // tombstoned, so never resurrected as invented regrowth on the next
+    // pass. `protected_keys` (unconfirmed this pass) are not candidates.
+    for key in table.unseen_present(&seen_keys) {
+        if protected_keys.contains(&key) {
+            continue;
+        }
+        if let Some(owned) = ownership.claim(&key) {
+            table.tombstone(owned, observed_at);
         }
     }
 
@@ -4268,49 +3424,17 @@ pub fn observe_and_annotate_external(
     for obs in observed {
         let history = history_index.get(&obs.key).cloned().unwrap_or_default();
         let growth = growth_since(&history, obs.bytes, target_time);
-        let regrowth = current.get(&obs.key).map(|r| r.regrowth_count).unwrap_or(0);
+        let regrowth = table.row(&obs.key).map(|r| r.regrowth_count()).unwrap_or(0);
         annotations.insert(obs.key.clone(), (growth, regrowth));
     }
 
-    if !delta_rows.is_empty() {
-        let seq_path = next_seq_path(&external_deltas_dir(&dir), "delta-");
-        write_external_rows(&seq_path, &delta_rows)?;
-    }
-
-    let mut current_rows: Vec<StoredExternalRow> = current.into_values().collect();
-    current_rows.sort_by(|a, b| {
-        (&a.detector_id, &a.category, a.device, &a.path).cmp(&(
-            &b.detector_id,
-            &b.category,
-            b.device,
-            &b.path,
-        ))
-    });
-    if current_changed {
-        write_external_rows(&current_file, &current_rows)?;
-    }
+    table.commit()?;
 
     let files = list_files_in(&external_deltas_dir(&dir));
     if should_compact(&files) {
         let retention_secs = retention_days.saturating_mul(86400);
         let horizon = observed_at.saturating_sub(retention_secs);
-        let mut merged: Vec<StoredExternalRow> = Vec::new();
-        for path in &files {
-            for row in read_external_rows(path)? {
-                if row.observed_at >= horizon {
-                    merged.push(row);
-                }
-            }
-        }
-        if !merged.is_empty() {
-            write_external_rows(
-                &next_seq_path(&external_deltas_dir(&dir), "delta-"),
-                &merged,
-            )?;
-        }
-        for path in &files {
-            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-        }
+        compact_external_deltas(&dir, &files, horizon)?;
     }
 
     Ok(annotations)
@@ -4323,12 +3447,12 @@ pub fn observe_and_annotate_external(
 pub fn peek_external_current(swamp_dir: &Path, key: &str) -> Result<Option<(u64, u32)>> {
     let dir = external_dir(swamp_dir);
     let current_file = external_current_path(&dir);
-    if !current_file.exists() {
+    if !crate::fs_gate::exists(&current_file) {
         return Ok(None);
     }
     for row in read_external_rows(&current_file)? {
-        if external_row_key(&row.detector_id, &row.category, row.device, &row.path) == key {
-            return Ok(Some((row.bytes, row.regrowth_count)));
+        if external_row_key(row.detector_id(), row.category(), row.device(), row.path()) == key {
+            return Ok(Some((row.bytes(), row.regrowth_count())));
         }
     }
     Ok(None)
@@ -4345,14 +3469,14 @@ pub fn annotate_readonly_external(
 ) -> Result<HashMap<String, (Option<i64>, u32)>> {
     let dir = external_dir(swamp_dir);
     let current_file = external_current_path(&dir);
-    if !current_file.exists() {
+    if !crate::fs_gate::exists(&current_file) {
         return Ok(HashMap::new());
     }
     let current: HashMap<String, StoredExternalRow> = read_external_rows(&current_file)?
         .into_iter()
         .map(|r| {
             (
-                external_row_key(&r.detector_id, &r.category, r.device, &r.path),
+                external_row_key(r.detector_id(), r.category(), r.device(), r.path()),
                 r,
             )
         })
@@ -4362,9 +3486,9 @@ pub fn annotate_readonly_external(
     let mut out = HashMap::new();
     for key in keys {
         let history = history_index.get(key).cloned().unwrap_or_default();
-        let bytes_now = current.get(key).map(|r| r.bytes).unwrap_or(0);
+        let bytes_now = current.get(key).map(|r| r.bytes()).unwrap_or(0);
         let growth = growth_since(&history, bytes_now, target_time);
-        let regrowth = current.get(key).map(|r| r.regrowth_count).unwrap_or(0);
+        let regrowth = current.get(key).map(|r| r.regrowth_count()).unwrap_or(0);
         out.insert(key.clone(), (growth, regrowth));
     }
     Ok(out)
@@ -4375,6 +3499,7 @@ mod tests {
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
         use super::*;
+    use std::fs;
         for artifact in [true, false] {
             let tmp = tempfile::tempdir()?;
             let dir = tmp.path();

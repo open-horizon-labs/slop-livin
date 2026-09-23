@@ -42,6 +42,14 @@ cloned_ref_to_slice_refs = "allow"
 # Re-review 3's reviewer_counterexamples_stack3.rs builds a fixture line
 # with `format!` and no arguments; the same reasoning as above applies.
 useless_format = "allow"
+# The capability gate's type-resolved half (`crates/*/clippy.toml`) is
+# denied by each product crate root for its non-test build
+# (`#![cfg_attr(not(test), deny(clippy::disallowed_methods, ...))]`).
+# Integration tests build disposable fixtures with `std::fs` and
+# `std::process` directly, so the workspace default is `allow`: the deny
+# lives at the crate roots, where it covers exactly the shipped code.
+disallowed_methods = "allow"
+disallowed_types = "allow"
 
 [profile.release]
 opt-level = 3

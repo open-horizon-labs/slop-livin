@@ -28,7 +28,6 @@ use super::{
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
     mtime_secs,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const COPILOT_CLI_TOOL_ID: &str = "github-copilot-cli";
@@ -99,17 +98,17 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
+    if !FORMAT_MARKERS.iter().any(|rel| ctx.exists(&home.join(rel))) {
         return unknown_format_residual(home, ctx);
     }
     let mut units = Vec::new();
     identify_protected(home, ctx, &mut units);
     identify_session_state(home, ctx, &mut units);
     identify_command_history(home, ctx, &mut units);
-    identify_session_store(home, &mut units);
+    identify_session_store(home, ctx, &mut units);
     identify_logs(home, ctx, &mut units);
     identify_ide_state(home, ctx, &mut units);
     identify_residual(home, ctx, &mut units);
@@ -145,7 +144,7 @@ fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgent
 fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for (rel, note) in PROTECTED_CONFIG_FILES {
         let path = home.join(rel);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(meta) = ctx.stat(&path) else {
             continue;
         };
         if !meta.is_file() {
@@ -155,7 +154,7 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
     }
     for (rel, note) in PROTECTED_CONFIG_DIRS {
         let path = home.join(rel);
-        if !path.is_dir() {
+        if !ctx.is_dir(&path) {
             continue;
         }
         let (bytes, mtime, _t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -227,7 +226,7 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
         let (bytes, mtime, truncated) = if entry.is_dir {
             ctx.folded_bytes(&path, MAX_FOLD_ENTRIES)
         } else {
-            let Ok(meta) = fs::symlink_metadata(&path) else {
+            let Ok(meta) = ctx.stat(&path) else {
                 continue;
             };
             (meta.len(), mtime_secs(&meta), false)
@@ -271,7 +270,7 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
 
 fn identify_command_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let path = home.join("command-history-state");
-    if !path.is_dir() {
+    if !ctx.is_dir(&path) {
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -291,9 +290,9 @@ fn identify_command_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candid
     );
 }
 
-fn identify_session_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_session_store(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let db = home.join("session-store.db");
-    let Ok(meta) = fs::symlink_metadata(&db) else {
+    let Ok(meta) = ctx.stat(&db) else {
         return;
     };
     if !meta.is_file() {
@@ -308,7 +307,7 @@ fn identify_session_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
     let mut mtime_max = mtime_secs(&meta);
     for ext in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{ext}", db.display()));
-        if let Ok(sm) = fs::symlink_metadata(&sidecar)
+        if let Ok(sm) = ctx.stat(&sidecar)
             && sm.is_file()
         {
             bytes += sm.len();
@@ -337,7 +336,7 @@ fn identify_session_store(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
 
 fn identify_logs(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let path = home.join("logs");
-    if !path.is_dir() {
+    if !ctx.is_dir(&path) {
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -359,7 +358,7 @@ fn identify_logs(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUni
 /// adapter has no documented way to tell which entries are safely idle.
 fn identify_ide_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let path = home.join("ide");
-    if !path.is_dir() {
+    if !ctx.is_dir(&path) {
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -441,6 +440,7 @@ fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};
 

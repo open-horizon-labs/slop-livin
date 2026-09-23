@@ -518,7 +518,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
 ];
 
 fn dir_names(root: &Path) -> Vec<String> {
-    std::fs::read_dir(root)
+    crate::fs_gate::read_dir(root)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -669,7 +669,7 @@ pub fn manifest_name(root: &Path) -> Option<String> {
                 }
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
+            let Ok(text) = crate::fs_gate::read::bounded_string(root.join(&file_name), crate::fs_gate::read::BoundedCap::MANIFEST) else {
                 continue;
             };
             if let Some(n) = extract_name(&text, field) {

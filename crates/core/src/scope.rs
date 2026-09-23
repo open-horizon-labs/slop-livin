@@ -24,7 +24,6 @@ use crate::locations::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -762,7 +761,7 @@ fn normalize_path(home: &Path, p: &Path) -> PathBuf {
 /// a symlinked root, matching how the walker will open it) but never
 /// follows anything found *inside* the directory.
 fn stat_root(path: &Path) -> RootStatus {
-    match fs::metadata(path) {
+    match crate::fs_gate::metadata_following(path) {
         Ok(_) => RootStatus::Present,
         Err(e) if e.kind() == ErrorKind::NotFound => RootStatus::Missing,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => RootStatus::Unreadable {
@@ -789,7 +788,7 @@ fn stat_root(path: &Path) -> RootStatus {
 /// re-review's P2).
 pub fn comparable(path: &Path) -> PathBuf {
     let normalized = lexically_normalize(path);
-    if let Ok(c) = fs::canonicalize(&normalized) {
+    if let Ok(c) = crate::fs_gate::canonicalize(&normalized) {
         return c;
     }
     // A path that does not exist yet still has to land in the same
@@ -804,7 +803,7 @@ pub fn comparable(path: &Path) -> PathBuf {
             break;
         };
         tail.push(name.to_os_string());
-        if let Ok(c) = fs::canonicalize(parent) {
+        if let Ok(c) = crate::fs_gate::canonicalize(parent) {
             let mut out = c;
             for seg in tail.iter().rev() {
                 out.push(seg);
@@ -1153,13 +1152,14 @@ fn status_label(status: &RootStatus) -> String {
 /// This file is coverage bookkeeping only -- never byte history, never
 /// consulted by the growth store.
 pub fn persist_effective_scope(store_dir: &Path, scope: &EffectiveScope) -> std::io::Result<()> {
-    fs::create_dir_all(store_dir)?;
-    let json = serde_json::to_string_pretty(scope).unwrap_or_default();
-    fs::write(store_dir.join("scope.json"), json)
+    crate::fs_gate::store::write_json(
+        crate::fs_gate::store::JsonFile::Scope { store: store_dir },
+        scope,
+    )
 }
 
 pub fn load_last_effective_scope(store_dir: &Path) -> Option<EffectiveScope> {
-    let text = fs::read_to_string(store_dir.join("scope.json")).ok()?;
+    let text = crate::fs_gate::read::read_owned_string(store_dir.join("scope.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 

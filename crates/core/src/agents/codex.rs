@@ -59,7 +59,6 @@ use super::{
     mtime_secs,
 };
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CODEX_TOOL_ID: &str = "codex";
@@ -122,7 +121,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         &mut units,
         &mut containers_used,
     );
-    identify_sqlite_stores(home, &mut units);
+    identify_sqlite_stores(home, ctx, &mut units);
     identify_static_categories(home, ctx, &mut units);
     units
 }
@@ -154,7 +153,7 @@ fn session_unit(
     archived: bool,
     ctx: &IdentifyCtx,
 ) -> Option<CandidateAgentUnit> {
-    let meta = fs::symlink_metadata(&jsonl).ok()?;
+    let meta = ctx.stat(&jsonl).ok()?;
     let bytes = meta.len();
     let mtime = mtime_secs(&meta);
     // `project_link_declared`, not `project_link`: the declared path is
@@ -344,10 +343,10 @@ const SQLITE_STORES: &[SqliteStore] = &[
     },
 ];
 
-fn identify_sqlite_stores(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_sqlite_stores(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for store in SQLITE_STORES {
         let path = home.join(store.filename);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(meta) = ctx.stat(&path) else {
             continue;
         };
         if !meta.is_file() {
@@ -362,7 +361,7 @@ fn identify_sqlite_stores(home: &Path, out: &mut Vec<CandidateAgentUnit>) {
         let mut mtime_max = mtime_secs(&meta);
         for sidecar_ext in ["-wal", "-shm"] {
             let sidecar = PathBuf::from(format!("{}{sidecar_ext}", path.display()));
-            if let Ok(sm) = fs::symlink_metadata(&sidecar)
+            if let Ok(sm) = ctx.stat(&sidecar)
                 && sm.is_file()
             {
                 bytes += sm.len();
@@ -452,7 +451,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     for entry in STATIC_ENTRIES {
         seen_top_level.insert(entry.rel.to_string());
         let path = home.join(entry.rel);
-        if !path.exists() {
+        if !ctx.exists(&path) {
             continue;
         }
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -526,6 +525,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, bounded_io, contract};
     use std::time::{Duration, SystemTime};
 

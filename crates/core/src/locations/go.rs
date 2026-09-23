@@ -91,7 +91,7 @@ impl Detector for GoDetector {
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
-        let goenv: HashMap<String, String> = std::fs::read_to_string(goenv_path(env))
+        let goenv: HashMap<String, String> = crate::fs_gate::read::bounded_string(goenv_path(env), crate::fs_gate::read::BoundedCap::MANIFEST)
             .ok()
             .map(|t| read_goenv(&t))
             .unwrap_or_default();

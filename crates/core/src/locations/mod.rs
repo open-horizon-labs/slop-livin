@@ -66,7 +66,7 @@ pub mod xcode;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -144,7 +144,7 @@ impl IntoIterator for ShallowListing {
 
 pub fn shallow_list(dir: &std::path::Path) -> ShallowListing {
     crate::work_counters::record_dir_listed();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
         return ShallowListing {
             entries: Vec::new(),
             truncation: Truncation::Complete,
@@ -349,38 +349,20 @@ impl CommandRunner for SystemCommandRunner {
                 "refusing to run non-allow-listed command: {program} {args:?}"
             ));
         }
-        let mut child = crate::spawn::command(program)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .spawn()
+        let Some(bin) = crate::fs_gate::spawn::Program::named(program) else {
+            return Err(format!(
+                "refusing to run {program}: not a program swamp may run"
+            ));
+        };
+        let out = crate::fs_gate::spawn::run(bin, args, timeout)
             .map_err(|e| format!("{program} {args:?}: spawn failed: {e}"))?;
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    use std::io::Read;
-                    let mut out = String::new();
-                    if let Some(mut stdout) = child.stdout.take() {
-                        let _ = stdout.read_to_string(&mut out);
-                    }
-                    return Ok(CommandOutcome {
-                        stdout: out.trim().to_string(),
-                        success: status.success(),
-                    });
-                }
-                Ok(None) => {
-                    if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(format!("{program} {args:?}: timed out after {timeout:?}"));
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => return Err(format!("{program} {args:?}: wait failed: {e}")),
-            }
+        if out.timed_out {
+            return Err(format!("{program} {args:?}: timed out after {timeout:?}"));
         }
+        Ok(CommandOutcome {
+            stdout: out.stdout_lossy().trim().to_string(),
+            success: out.success(),
+        })
     }
 }
 

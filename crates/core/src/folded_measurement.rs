@@ -45,12 +45,12 @@ pub enum UnitAccess {
 /// The listing is the only directory read in the external/agent
 /// measurement path, and it exists to tell "unreadable" from "empty".
 pub fn access(path: &Path) -> UnitAccess {
-    match std::fs::symlink_metadata(path) {
+    match crate::fs_gate::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => UnitAccess::Absent,
         Err(e) => UnitAccess::Unreadable(e.to_string()),
         Ok(meta) if meta.is_dir() => {
             crate::work_counters::record_dir_listed();
-            match std::fs::read_dir(path) {
+            match crate::fs_gate::read_dir(path) {
                 Ok(_) => UnitAccess::Measurable,
                 // `stat` succeeds (reaching the path itself needs only
                 // the *parent's* execute bit) while the directory's own
@@ -307,7 +307,7 @@ pub fn folded_bytes_bounded_stamped(
     path: &Path,
     max_entries: usize,
 ) -> (u64, u64, bool, Vec<crate::walk::DirStamp>) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
         return (0, 0, false, Vec::new());
     };
     if meta.is_file() {
@@ -324,7 +324,7 @@ pub fn folded_bytes_bounded_stamped(
     let mut stamps: Vec<crate::walk::DirStamp> = Vec::new();
     while let Some((dir, dir_meta)) = stack.pop() {
         crate::work_counters::record_dir_listed();
-        let Ok(rd) = std::fs::read_dir(&dir) else {
+        let Ok(rd) = crate::fs_gate::read_dir(&dir) else {
             continue;
         };
         let (mtime_ns, ctime_ns) = stamp_ns(&dir_meta);

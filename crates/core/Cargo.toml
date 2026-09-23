@@ -27,5 +27,17 @@ core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
 fsevent-sys = "5.2.0"
 
+# Test-fixture API (`fs_events::testing`, the `&str`-actor spellings of
+# `actions::approve`/`add_standing_grant`). Enabled only through
+# `[dev-dependencies]` below and in the other crates' dev-dependencies,
+# so no production build graph contains it; the gate audit rejects a
+# `[dependencies]` entry that enables it, and `lib.rs` refuses to build
+# it in a release profile.
+[features]
+testing = []
+
+[dev-dependencies]
+swamp-core = { path = ".", features = ["testing"] }
+
 [lints]
 workspace = true

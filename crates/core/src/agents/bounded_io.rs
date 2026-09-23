@@ -15,8 +15,6 @@
 //! cost, so they have to be both small and counted
 //! (`crate::work_counters`, which the incremental-measurement tests read).
 
-use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 /// The hard ceiling on one header read. A session header is a single
@@ -30,13 +28,10 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// line after a fixed-width slot. Nothing here reads to the end of a
 /// file, and nothing returns a handle a caller could read further from.
 pub fn read_header(path: &Path, max_bytes: usize) -> Option<String> {
-    let cap = max_bytes.min(MAX_HEADER_BYTES);
-    let mut file = fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; cap];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
-    crate::work_counters::record_header_bytes(n as u64);
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    let cap = crate::fs_gate::read::BoundedCap::header_at_most(max_bytes.min(MAX_HEADER_BYTES));
+    crate::fs_gate::read::bounded_read_header(path, cap)
+        .ok()
+        .map(|b| b.lossy())
 }
 
 /// The first line of `path`'s header, which is what most adapters
@@ -49,6 +44,7 @@ pub fn read_header_line(path: &Path, max_bytes: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn a_read_never_exceeds_the_hard_cap() {

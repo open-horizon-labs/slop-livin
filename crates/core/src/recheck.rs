@@ -30,11 +30,100 @@
 //! metadata fingerprint for large ones. Nothing in this module ever
 //! reads a file's contents.
 
+use crate::fs_gate::{self as fs, Metadata};
 use crate::occupancy::OccupancyState;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a [`RecheckProof`] stays spendable. A proof is evidence about
+/// the filesystem *now*; one carried across a long pause (a preserved
+/// executables copy, a slow sibling unit) is evidence about the past.
+pub const MAX_PROOF_AGE: Duration = Duration::from_secs(120);
+
+/// Evidence that all three live rechecks passed for one unit, just now:
+/// identity + membership vs the plan ([`reviewed_snapshot`]), protection
+/// loaded fresh in both directions ([`live_protection`]), and every
+/// member's occupancy `Free` ([`member_occupancy`]).
+///
+/// Constructible only by [`run_all`] (the fields are private to this
+/// module; there is no `Default`, `Clone`, `Deserialize` or other
+/// constructor), and consumed by the destructive operation it licenses
+/// ([`crate::fs_gate::destroy::trash_move`],
+/// [`crate::fs_gate::destroy::Envelope::open`]). A sink that skips a
+/// recheck therefore does not compile: it has no proof to hand over.
+/// That replaces the `execution_sinks_recheck_live_state`,
+/// `occupancy_is_tristate_at_sinks` and `protection_fails_closed` call
+/// graph audits (`crates/core/tests/compile_fail/`).
+#[must_use = "a recheck proof licenses exactly one destructive operation; hand it to fs_gate::destroy"]
+#[derive(Debug)]
+pub struct RecheckProof {
+    anchor: PathBuf,
+    identity: ReviewedIdentity,
+    covered: Vec<PathBuf>,
+    taken_at: Instant,
+}
+
+impl RecheckProof {
+    /// The unit the proof is about.
+    pub fn anchor(&self) -> &Path {
+        &self.anchor
+    }
+
+    /// The identity the recheck observed (equal to the reviewed one).
+    pub fn identity(&self) -> &ReviewedIdentity {
+        &self.identity
+    }
+
+    /// Every path the proof covers: the anchor, each exactly-recorded
+    /// member, and any extra members the caller asked to be checked.
+    pub fn covers(&self, path: &Path) -> bool {
+        self.covered.iter().any(|p| p == path)
+    }
+
+    /// Whether the proof is still spendable ([`MAX_PROOF_AGE`]).
+    pub fn is_fresh(&self) -> bool {
+        self.taken_at.elapsed() <= MAX_PROOF_AGE
+    }
+}
+
+/// All three rechecks, in order, failing closed: the only constructor of
+/// a [`RecheckProof`].
+///
+/// `extra_members` are paths the caller re-derived itself (a session's
+/// current member files, a Cargo group's companions); they are protection-
+/// and occupancy-checked with the snapshot's own members.
+pub fn run_all(
+    store_dir: &Path,
+    path: &Path,
+    reviewed: Option<&ReviewedIdentity>,
+    extra_members: &[PathBuf],
+) -> Result<RecheckProof> {
+    let identity = reviewed_snapshot(path, reviewed)?;
+    let mut covered = covered_paths(&identity);
+    for m in extra_members {
+        if !covered.contains(m) {
+            covered.push(m.clone());
+        }
+    }
+    live_protection(store_dir, &covered)?;
+    match member_occupancy(&covered) {
+        OccupancyState::Free => {}
+        other => bail!(
+            "{}",
+            other
+                .refusal()
+                .unwrap_or_else(|| "occupancy refused this unit".to_string())
+        ),
+    }
+    Ok(RecheckProof {
+        anchor: path.to_path_buf(),
+        identity,
+        covered,
+        taken_at: Instant::now(),
+    })
+}
 
 /// Member sets at or below this size are recorded exactly (one entry per
 /// member path with its `(size, mtime, inode)`); larger ones fall back to
@@ -146,7 +235,7 @@ pub struct ReviewedIdentity {
 
 /// Modification time in **nanoseconds**. Second granularity is what let
 /// a same-second rewrite spend an approval; see [`ReviewedMember`].
-fn mtime_ns_of(meta: &fs::Metadata) -> u64 {
+fn mtime_ns_of(meta: &Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -157,26 +246,26 @@ fn mtime_ns_of(meta: &fs::Metadata) -> u64 {
 /// Inode change time in nanoseconds, which moves on a rename-over even
 /// when the content's own mtime is preserved.
 #[cfg(unix)]
-fn ctime_ns_of(meta: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
+fn ctime_ns_of(meta: &Metadata) -> u64 {
+    use crate::fs_gate::MetadataExt;
     (meta.ctime() as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(meta.ctime_nsec() as u64)
 }
 
 #[cfg(not(unix))]
-fn ctime_ns_of(_meta: &fs::Metadata) -> u64 {
+fn ctime_ns_of(_meta: &Metadata) -> u64 {
     0
 }
 
 #[cfg(unix)]
-fn ids_of(meta: &fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
+fn ids_of(meta: &Metadata) -> (u64, u64) {
+    use crate::fs_gate::MetadataExt;
     (meta.dev(), meta.ino())
 }
 
 #[cfg(not(unix))]
-fn ids_of(_meta: &fs::Metadata) -> (u64, u64) {
+fn ids_of(_meta: &Metadata) -> (u64, u64) {
     (0, 0)
 }
 
@@ -463,7 +552,7 @@ pub fn reviewed_snapshot(
 /// Every path a reviewed identity covers: the anchor plus each member.
 /// What [`member_occupancy`] probes and what [`live_protection`] tests
 /// for a protected descendant.
-pub fn covered_paths(identity: &ReviewedIdentity) -> Vec<PathBuf> {
+pub(crate) fn covered_paths(identity: &ReviewedIdentity) -> Vec<PathBuf> {
     let mut out = vec![identity.path.clone()];
     if let ReviewedMembership::Exact { members } = &identity.membership {
         out.extend(members.iter().map(|m| m.path.clone()));
@@ -479,10 +568,10 @@ pub fn covered_paths(identity: &ReviewedIdentity) -> Vec<PathBuf> {
 /// `agents::load_protect` returns an error and this function propagates
 /// it, so every action refuses until the file is repaired
 /// (`.oh/guardrails/protection-fails-closed.md`).
-pub fn live_protection(store_dir: &Path, paths: &[PathBuf]) -> Result<()> {
-    let protected = crate::agents::load_protect(store_dir)?;
+pub(crate) fn live_protection(store_dir: &Path, paths: &[PathBuf]) -> Result<()> {
+    let protected = crate::protection::load_protect(store_dir)?;
     for candidate in paths {
-        if let Some(reason) = crate::agents::protection_conflict(&protected, candidate) {
+        if let Some(reason) = protected.conflict(candidate) {
             bail!("refused: {reason}");
         }
     }
@@ -497,7 +586,7 @@ pub fn live_protection(store_dir: &Path, paths: &[PathBuf]) -> Result<()> {
 /// A directory member is probed with `lsof +D`, which covers everything
 /// beneath it, so a bounded set of top-level probes still answers for the
 /// whole tree.
-pub fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
+pub(crate) fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
     // Probing every member of a 100k-entry cache would be its own denial
     // of service; `lsof +D` on the anchor already covers descendants, so
     // probe the anchor plus any member that is not beneath it.
@@ -517,9 +606,40 @@ pub fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
     OccupancyState::Free
 }
 
+/// Newest mtime anywhere under `path` (files and directories), bounded by
+/// `max_entries` so a pathological tree cannot stall the sink; returns
+/// `None` when the bound is hit (treated as "could not re-observe").
+/// A sink-time re-derivation of a selected unit, like [`capture`].
+pub(crate) fn newest_mtime(path: &Path, max_entries: usize) -> Option<u64> {
+    let mut newest = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(p) = stack.pop() {
+        let meta = fs::symlink_metadata(&p).ok()?;
+        let m = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        newest = newest.max(m);
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            for e in fs::read_dir(&p).ok()?.flatten() {
+                seen += 1;
+                if seen > max_entries {
+                    return None;
+                }
+                stack.push(e.path());
+            }
+        }
+    }
+    Some(newest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write(p: &Path, b: &[u8]) {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -621,7 +741,7 @@ mod tests {
         let _open = fs::File::open(dir.join("log.txt")).unwrap();
         let state = member_occupancy(std::slice::from_ref(&dir));
         assert!(
-            !state.is_free(),
+            !matches!(state, OccupancyState::Free),
             "an open descendant must make the parent unit non-free, got {state:?}"
         );
     }

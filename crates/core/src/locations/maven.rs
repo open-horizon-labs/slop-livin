@@ -78,7 +78,7 @@ impl Detector for MavenDetector {
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let settings_path = env.home.join(".m2/settings.xml");
-        let (path, provenance) = match std::fs::read_to_string(&settings_path)
+        let (path, provenance) = match crate::fs_gate::read::bounded_string(&settings_path, crate::fs_gate::read::BoundedCap::MANIFEST)
             .ok()
             .as_deref()
             .and_then(read_local_repository)

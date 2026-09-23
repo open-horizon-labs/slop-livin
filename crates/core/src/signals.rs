@@ -211,7 +211,7 @@ fn newest_mtime_secs(dir: &Path) -> Option<u64> {
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&d) else {
+        let Ok(entries) = crate::fs_gate::read_dir(&d) else {
             continue;
         };
         for entry in entries.flatten() {

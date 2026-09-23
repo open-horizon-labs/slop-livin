@@ -2656,6 +2656,7 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "swamp-core",
  "tempfile",
  "tokio",
  "toml",

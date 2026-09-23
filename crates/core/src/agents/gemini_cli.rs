@@ -48,7 +48,6 @@ use super::{
     mtime_secs,
 };
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 
 pub const GEMINI_CLI_TOOL_ID: &str = "gemini-cli";
@@ -100,10 +99,10 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
+    if !FORMAT_MARKERS.iter().any(|rel| ctx.exists(&home.join(rel))) {
         return unknown_version_residual(home, ctx);
     }
     let mut units = Vec::new();
@@ -157,7 +156,7 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
         ("trustedFolders.json", "trusted-folder decisions"),
     ] {
         let path = home.join(rel);
-        if let Ok(meta) = fs::symlink_metadata(&path)
+        if let Ok(meta) = ctx.stat(&path)
             && meta.is_file()
         {
             out.push(
@@ -181,7 +180,7 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
             continue;
         }
         let path = home.join(&entry.name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(meta) = ctx.stat(&path) else {
             continue;
         };
         let reason = if confirmed {
@@ -205,7 +204,7 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
         );
     }
     let extensions = home.join("extensions");
-    if extensions.is_dir() {
+    if ctx.is_dir(&extensions) {
         let (bytes, mtime, _t) = ctx.folded_bytes(&extensions, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Plugins, extensions)
@@ -227,7 +226,7 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
     // dead code that reported nothing, found by the 2026-09-22
     // re-review fetching the file the row already cited.
     let bin = home.join("tmp").join("bin");
-    if bin.is_dir() {
+    if ctx.is_dir(&bin) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&bin, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Caches, bin)
@@ -264,7 +263,7 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
         let mut seen: HashSet<&str> = HashSet::new();
 
         let shell_history = project_dir.join("shell_history");
-        if let Ok(meta) = fs::symlink_metadata(&shell_history)
+        if let Ok(meta) = ctx.stat(&shell_history)
             && meta.is_file()
         {
             seen.insert("shell_history");
@@ -283,7 +282,7 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
         }
 
         let checkpoints = project_dir.join("checkpoints");
-        if checkpoints.is_dir() {
+        if ctx.is_dir(&checkpoints) {
             seen.insert("checkpoints");
             let (bytes, mtime, truncated) = ctx.folded_bytes(&checkpoints, MAX_FOLD_ENTRIES);
             out.push(
@@ -307,11 +306,11 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
         }
 
         let chats = project_dir.join("chats");
-        if chats.is_dir() {
+        if ctx.is_dir(&chats) {
             seen.insert("chats");
             for name in ctx.file_names(&chats) {
                 let path = chats.join(&name);
-                let Ok(meta) = fs::symlink_metadata(&path) else {
+                let Ok(meta) = ctx.stat(&path) else {
                     continue;
                 };
                 out.push(
@@ -460,6 +459,7 @@ fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, contract};
     use std::time::{Duration, SystemTime};
 

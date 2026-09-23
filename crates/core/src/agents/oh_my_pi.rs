@@ -69,7 +69,6 @@ use super::{
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs, pi_family,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const OH_MY_PI_TOOL_ID: &str = "oh-my-pi";
@@ -129,10 +128,10 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    if !has_format_markers(home) {
+    if !has_format_markers(home, ctx) {
         return unknown_format_residual(home, ctx);
     }
     let mut units = Vec::new();
@@ -206,10 +205,10 @@ fn fold_refs(into: &mut BlobReferences, facts: Option<&[String]>) {
     }
 }
 
-fn has_format_markers(home: &Path) -> bool {
+fn has_format_markers(home: &Path, ctx: &IdentifyCtx) -> bool {
     ["config.yml", "config.yaml", "agent.db", "sessions", "blobs"]
         .iter()
-        .any(|rel| home.join(rel).exists())
+        .any(|rel| ctx.exists(&home.join(rel)))
 }
 
 fn unknown_format_residual(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
@@ -332,7 +331,7 @@ fn session_units(
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut any_truncated = false;
     for jsonl in files {
-        let Ok(meta) = fs::symlink_metadata(&jsonl) else {
+        let Ok(meta) = ctx.stat(&jsonl) else {
             // Coverage for this session is unknown, which makes every
             // blob count unknown -- never silently complete.
             any_truncated = true;
@@ -480,7 +479,7 @@ fn identify_blobs(
             continue;
         }
         let path = base.join(&entry.name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(meta) = ctx.stat(&path) else {
             continue;
         };
         let hash = entry.name.as_str();
@@ -529,7 +528,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
         ("models.yml", "custom model definitions"),
     ] {
         let path = home.join(rel);
-        if !path.exists() {
+        if !ctx.exists(&path) {
             continue;
         }
         let (bytes, mtime, _truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
@@ -546,7 +545,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     }
 
     let db = home.join("agent.db");
-    if let Ok(meta) = fs::symlink_metadata(&db)
+    if let Ok(meta) = ctx.stat(&db)
         && meta.is_file()
     {
         // The SQLite family is folded into one unit with its sidecars as
@@ -561,7 +560,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
         let mut mtime_max = mtime_secs(&meta);
         for ext in ["-wal", "-shm"] {
             let sidecar = PathBuf::from(format!("{}{ext}", db.display()));
-            if let Ok(sm) = fs::symlink_metadata(&sidecar)
+            if let Ok(sm) = ctx.stat(&sidecar)
                 && sm.is_file()
             {
                 bytes += sm.len();
@@ -588,7 +587,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     }
 
     let terminal = home.join("terminal-sessions");
-    if terminal.is_dir() {
+    if ctx.is_dir(&terminal) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&terminal, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(OH_MY_PI_TOOL_ID, AgentCategory::Logs, terminal)
@@ -655,6 +654,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, ProjectLinkState, contract};
     use std::time::{Duration, SystemTime};
 

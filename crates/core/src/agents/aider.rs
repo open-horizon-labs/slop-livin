@@ -26,7 +26,6 @@ use super::{
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs,
     resolve_declared_path,
 };
-use std::fs;
 use std::path::Path;
 
 pub const AIDER_TOOL_ID: &str = "aider";
@@ -65,14 +64,14 @@ impl AgentAdapter for Adapter {
 // ---------------------------------------------------------------------
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
     let mut units = Vec::new();
 
     let caches = home.join("caches");
-    let caches_existed = caches.exists();
-    if caches.is_dir() {
+    let caches_existed = ctx.exists(&caches);
+    if ctx.is_dir(&caches) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&caches, MAX_FOLD_ENTRIES);
         units.push(
             AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, caches)
@@ -91,7 +90,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     }
 
     let conf = home.join(".aider.conf.yml");
-    if let Ok(meta) = fs::symlink_metadata(&conf)
+    if let Ok(meta) = ctx.stat(&conf)
         && meta.is_file()
     {
         units.push(
@@ -105,7 +104,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         );
     }
 
-    if !caches_existed && !home.join(".aider.conf.yml").exists() {
+    if !caches_existed && !ctx.exists(&home.join(".aider.conf.yml")) {
         // A genuinely empty/unrelated ~/.aider is not "unsupported
         // version" the way an ambiguous ~/.omp or ~/.opencode-shaped
         // directory would be -- Aider has no other documented top-level
@@ -140,7 +139,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
 /// recursive search -- these files live exactly at the git root per
 /// `aider/args.py`/`repomap.py`).
 pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !worktree_root.is_dir() {
+    if !ctx.is_dir(worktree_root) {
         return Vec::new();
     }
     let project_link = resolve_declared_path(
@@ -160,7 +159,7 @@ pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<Candi
         ),
     ] {
         let path = worktree_root.join(rel);
-        if let Ok(meta) = fs::symlink_metadata(&path)
+        if let Ok(meta) = ctx.stat(&path)
             && meta.is_file()
         {
             units.push(
@@ -212,6 +211,7 @@ pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<Candi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, LinkSource, ProjectLinkState, contract};
     use std::time::{Duration, SystemTime};
 

@@ -41,7 +41,6 @@ use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, mtime_secs, pi_family,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const PI_TOOL_ID: &str = "pi";
@@ -88,10 +87,10 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    if !home.is_dir() {
+    if !ctx.is_dir(home) {
         return Vec::new();
     }
-    if !FORMAT_MARKERS.iter().any(|rel| home.join(rel).exists()) {
+    if !FORMAT_MARKERS.iter().any(|rel| ctx.exists(&home.join(rel))) {
         return unknown_format_residual(home, ctx);
     }
     let mut units = Vec::new();
@@ -157,7 +156,7 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
 fn session_units(home: &Path, files: Vec<PathBuf>, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let mut out = Vec::new();
     for jsonl in files {
-        let Ok(meta) = fs::symlink_metadata(&jsonl) else {
+        let Ok(meta) = ctx.stat(&jsonl) else {
             continue;
         };
         let bytes = meta.len();
@@ -232,7 +231,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
         ("models.json", "custom model/provider definitions"),
     ] {
         let path = home.join(rel);
-        if let Ok(meta) = fs::symlink_metadata(&path)
+        if let Ok(meta) = ctx.stat(&path)
             && meta.is_file()
         {
             out.push(
@@ -248,7 +247,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     }
 
     let npm = home.join("npm");
-    if npm.is_dir() {
+    if ctx.is_dir(&npm) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&npm, MAX_FOLD_ENTRIES);
         out.push(
             AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Caches, npm)
@@ -307,6 +306,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::agents::{IdentificationCache, ProjectLinkState, bounded_io, contract};
     use std::time::{Duration, SystemTime};
 

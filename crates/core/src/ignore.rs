@@ -148,7 +148,7 @@ pub fn untracked_content(
         if found.len() >= limit || seen > max_entries {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = crate::fs_gate::read_dir(&dir) else {
             continue;
         };
         for e in entries.flatten() {
@@ -157,7 +157,7 @@ pub fn untracked_content(
                 break;
             }
             let path = e.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let Ok(meta) = crate::fs_gate::symlink_metadata(&path) else {
                 continue;
             };
             if meta.file_type().is_symlink() {

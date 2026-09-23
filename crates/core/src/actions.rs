@@ -21,10 +21,10 @@ use crate::ledger::{ActionRecord, Ledger};
 use crate::report::{ArtifactKind, ArtifactRow, ProjectRow, Report, WorktreeRow};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use crate::authority::{Authorized, HumanConfirmed};
+use crate::fs_gate::{self, Metadata, MetadataExt, read::read_owned_string, store};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 /// Plans expire 30 minutes after proposal: long enough for a human to
 /// read and approve, short enough that the facts they rest on are recent.
@@ -195,28 +195,22 @@ fn plan_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 pub fn save_plan(dir: &Path, plan: &Plan) -> Result<()> {
-    fs::create_dir_all(plans_dir(dir))?;
-    let tmp = plan_path(dir, &plan.id).with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(plan)?)?;
-    fs::rename(&tmp, plan_path(dir, &plan.id))?;
+    store::write_json(store::JsonFile::Plan { store: dir, id: &plan.id }, plan)?;
     Ok(())
 }
 
 pub fn load_plan(dir: &Path, id: &str) -> Result<Plan> {
     let p = plan_path(dir, id);
     let text =
-        fs::read_to_string(&p).with_context(|| format!("no plan {id} under {}", p.display()))?;
+        read_owned_string(&p).with_context(|| format!("no plan {id} under {}", p.display()))?;
     Ok(serde_json::from_str(&text)?)
 }
 
 pub fn list_plans(dir: &Path) -> Result<Vec<Plan>> {
     let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(plans_dir(dir)) else {
-        return Ok(out);
-    };
-    for e in rd.flatten() {
-        if e.path().extension().is_some_and(|x| x == "json")
-            && let Ok(text) = fs::read_to_string(e.path())
+    for path in store::list_owned(plans_dir(dir)) {
+        if path.extension().is_some_and(|x| x == "json")
+            && let Ok(text) = read_owned_string(&path)
             && let Ok(p) = serde_json::from_str::<Plan>(&text)
         {
             out.push(p);
@@ -541,16 +535,11 @@ pub fn propose_checking_protection(
     // exactly when protection state broke. When the report knows which
     // store it came from, protection is reloaded here and an error is a
     // refusal (`.oh/guardrails/protection-fails-closed.md`).
-    let live: Vec<PathBuf> = match report.store_dir.as_deref() {
-        Some(dir) => crate::agents::load_protect(dir)?,
-        None => Vec::new(),
+    let live = match report.store_dir.as_deref() {
+        Some(dir) => crate::protection::load_protect(dir)?,
+        None => crate::protection::ProtectList::empty(),
     };
-    let mut protected: Vec<PathBuf> = protected.to_vec();
-    for p in live {
-        if !protected.contains(&p) {
-            protected.push(p);
-        }
-    }
+    let protected = live.including(protected);
     if protected.is_empty() {
         return Ok(plan);
     }
@@ -558,7 +547,7 @@ pub fn propose_checking_protection(
     for u in plan.units {
         // Both directions, as everywhere else: a unit beneath a
         // protected path, and a unit that *contains* one.
-        if crate::agents::protection_conflict(&protected, &u.path).is_some() {
+        if protected.conflict(&u.path).is_some() {
             plan.refused.push(Refused {
                 path: u.path.clone(),
                 cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
@@ -929,23 +918,22 @@ fn external_recovery_facts(unit: &crate::external::ExternalUnit) -> Vec<crate::e
 fn sparse_byte_accounting_facts(
     unit: &crate::external::ExternalUnit,
 ) -> Vec<crate::evidence::Evidence> {
-    use std::os::unix::fs::MetadataExt;
     let mut logical = 0u64;
     let mut allocated = 0u64;
-    let mut add = |meta: &fs::Metadata| {
+    let mut add = |meta: &Metadata| {
         if meta.is_file() {
             logical = logical.saturating_add(meta.len());
             allocated = allocated.saturating_add(meta.blocks().saturating_mul(512));
         }
     };
-    match fs::symlink_metadata(&unit.path) {
+    match fs_gate::symlink_metadata(&unit.path) {
         Ok(meta) if meta.is_file() => add(&meta),
         Ok(meta) if meta.is_dir() => {
             for entry in crate::locations::shallow_list(&unit.path) {
                 if entry.is_dir {
                     continue;
                 }
-                if let Ok(m) = fs::symlink_metadata(unit.path.join(&entry.name)) {
+                if let Ok(m) = fs_gate::symlink_metadata(unit.path.join(&entry.name)) {
                     add(&m);
                 }
             }
@@ -1315,29 +1303,19 @@ fn execute_agent_cache_trash(
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
     trash: &Path,
     at: u64,
+    auth: &Authorized,
 ) -> Result<(PathBuf, u64)> {
-    let fresh = crate::recheck::reviewed_snapshot(path, reviewed)?;
-    if !fresh.is_dir {
+    let proof = crate::recheck::run_all(store_dir, path, reviewed, &[])?;
+    if !proof.identity().is_dir {
         bail!("path is no longer a directory (or is a symlink)");
-    }
-    let covered = crate::recheck::covered_paths(&fresh);
-    crate::recheck::live_protection(store_dir, &covered)?;
-    match crate::recheck::member_occupancy(&covered) {
-        crate::occupancy::OccupancyState::Free => {}
-        other => bail!(
-            "{}",
-            other
-                .refusal()
-                .unwrap_or_else(|| "occupancy refused this unit".to_string())
-        ),
     }
     let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
     let basename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("agent-cache");
-    let dest = trash.join(format!("agent-cache-{basename}-{at}"));
-    fs::rename(path, &dest).context("rename to Trash failed")?;
+    let dest =
+        fs_gate::destroy::trash_move(proof, auth, trash, &format!("agent-cache-{basename}-{at}"))?;
     Ok((dest, bytes))
 }
 
@@ -1369,10 +1347,11 @@ struct RestoreManifest {
     members: Vec<RestoreManifestMember>,
 }
 
-fn write_restore_manifest(envelope: &Path, manifest: &RestoreManifest) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(manifest)?;
-    fs::write(envelope.join("restore.json"), bytes).context("writing restore.json")?;
-    Ok(())
+fn write_restore_manifest(
+    envelope: &fs_gate::destroy::Envelope,
+    manifest: &RestoreManifest,
+) -> Result<()> {
+    envelope.write_manifest(manifest)
 }
 
 /// Returned when a session removal fails *after* the Trash envelope was
@@ -1409,6 +1388,7 @@ impl std::error::Error for PartialAgentRemoval {}
 /// missing, a new member the plan did not know about, or membership
 /// that no longer matches at all (the session was already removed,
 /// re-created, or reclassified since the plan was proposed).
+#[allow(clippy::too_many_arguments)]
 fn execute_agent_session_removal(
     store_dir: &Path,
     meta: &AgentPlanMeta,
@@ -1417,6 +1397,7 @@ fn execute_agent_session_removal(
     reviewed: Option<&crate::recheck::ReviewedIdentity>,
     trash: &Path,
     at: u64,
+    auth: &Authorized,
 ) -> Result<(PathBuf, u64)> {
     // One registry dispatch, never a second fourteen-arm tool-id match:
     // this used to be its own copy of `agents::identify_for_tool`'s
@@ -1455,19 +1436,7 @@ fn execute_agent_session_removal(
     // catches the anchor being replaced, a protect entry added after
     // approval in either direction, and anything holding a member open
     // -- including an unanswerable occupancy probe, which refuses.
-    let fresh_identity = crate::recheck::reviewed_snapshot(session_path, reviewed)?;
-    let mut covered = crate::recheck::covered_paths(&fresh_identity);
-    covered.extend(current_members.iter().cloned());
-    crate::recheck::live_protection(store_dir, &covered)?;
-    match crate::recheck::member_occupancy(&covered) {
-        crate::occupancy::OccupancyState::Free => {}
-        other => bail!(
-            "{}",
-            other
-                .refusal()
-                .unwrap_or_else(|| "occupancy refused this unit".to_string())
-        ),
-    }
+    let proof = crate::recheck::run_all(store_dir, session_path, reviewed, &current_members)?;
 
     // Pre-flight: stat every member *before* moving any of them, so the
     // common failure (a member vanished between proposal and execution)
@@ -1477,7 +1446,7 @@ fn execute_agent_session_removal(
     // most likely partial-failure cause outright.
     let mut sized_members: Vec<(PathBuf, u64, bool)> = Vec::with_capacity(current_members.len());
     for member in &current_members {
-        let member_meta = fs::symlink_metadata(member)
+        let member_meta = fs_gate::symlink_metadata(member)
             .with_context(|| format!("member no longer exists: {}", member.display()))?;
         let is_dir = member_meta.is_dir();
         let bytes = if is_dir {
@@ -1492,8 +1461,13 @@ fn execute_agent_session_removal(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("session");
-    let envelope = trash.join(format!("agent-session-{slug}-{at}"));
-    fs::create_dir_all(&envelope).context("could not create Trash envelope")?;
+    let mut envelope = fs_gate::destroy::Envelope::open(
+        proof,
+        auth,
+        trash,
+        &format!("agent-session-{slug}-{at}"),
+        None,
+    )?;
 
     let mut manifest = RestoreManifest {
         tool_id: meta.tool_id.clone(),
@@ -1521,21 +1495,20 @@ fn execute_agent_session_removal(
             .and_then(|n| n.to_str())
             .unwrap_or("member");
         let dest_name = format!("{i}-{name}");
-        let dest = envelope.join(&dest_name);
-        if let Err(e) = fs::rename(member, &dest).with_context(|| {
+        if let Err(e) = envelope.move_member(member, &dest_name).with_context(|| {
             format!(
                 "rename to Trash failed for {} ({} of {} members already moved into {})",
                 member.display(),
                 i,
                 sized_members.len(),
-                envelope.display()
+                envelope.path().display()
             )
         }) {
             // Best-effort: leave the manifest reflecting exactly what
             // moved before this failure, never silently stale.
             let _ = write_restore_manifest(&envelope, &manifest);
             return Err(PartialAgentRemoval {
-                envelope,
+                envelope: envelope.path().to_path_buf(),
                 moved_bytes,
                 source: e,
             }
@@ -1549,7 +1522,7 @@ fn execute_agent_session_removal(
         // members 0..=i having actually moved.
         write_restore_manifest(&envelope, &manifest)?;
     }
-    Ok((envelope, moved_bytes))
+    Ok((envelope.path().to_path_buf(), moved_bytes))
 }
 
 /// A whole worktree (linked → `remove-worktree`) or checkout (→ `archive`)
@@ -1669,6 +1642,12 @@ impl Grant {
     }
 }
 
+/// Whether `g` is live at `at` and its predicate covers `unit` of `plan`:
+/// the grant half of [`crate::authority::authorize`].
+pub(crate) fn grant_is_live_and_covers(g: &Grant, plan: &Plan, unit: &PlanUnit, at: u64) -> bool {
+    g.live(at) && grant_covers(g, plan, unit)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct GrantFile {
     grants: Vec<Grant>,
@@ -1679,24 +1658,22 @@ fn grants_path(dir: &Path) -> PathBuf {
 }
 
 pub fn list_grants(dir: &Path) -> Result<Vec<Grant>> {
-    let p = grants_path(dir);
-    if !p.exists() {
-        return Ok(vec![]);
-    }
-    let f: GrantFile = serde_json::from_str(&fs::read_to_string(p)?)?;
+    let text = match read_owned_string(grants_path(dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    let f: GrantFile = serde_json::from_str(&text)?;
     Ok(f.grants)
 }
 
 fn write_grants(dir: &Path, grants: &[Grant]) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let tmp = grants_path(dir).with_extension("json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(&GrantFile {
+    store::write_json(
+        store::JsonFile::Grants { store: dir },
+        &GrantFile {
             grants: grants.to_vec(),
-        })?,
+        },
     )?;
-    fs::rename(&tmp, grants_path(dir))?;
     Ok(())
 }
 
@@ -1732,14 +1709,20 @@ pub fn validate_grant_predicate(expr: &str) -> Result<Filter> {
 
 /// Human-at-CLI: a standing grant. `expires_in_secs` and `budget_bytes`
 /// are required so a grant can neither live forever nor be unbounded.
-pub fn add_standing_grant(
+///
+/// Takes the [`HumanConfirmed`] the CLI's `grant add` handler minted: a
+/// caller that does not hold one (a keystroke handler, an agent path, a
+/// convenience wrapper) does not compile
+/// (`.oh/guardrails/human-only-authorization.md`).
+pub fn add_standing_grant_confirmed(
     dir: &Path,
     predicate: &str,
     budget_bytes: u64,
     max_units: Option<u32>,
     expires_in_secs: u64,
-    actor: &str,
+    confirmed: &HumanConfirmed,
 ) -> Result<Grant> {
+    let actor = confirmed.actor();
     validate_grant_predicate(predicate)?;
     if budget_bytes == 0 {
         bail!("--budget is required and must be > 0");
@@ -1767,9 +1750,41 @@ pub fn add_standing_grant(
     Ok(g)
 }
 
-/// Human-at-CLI: approve one plan. The grant is scoped to that plan id and
-/// expires with the plan.
+/// The test-fixture spelling of [`add_standing_grant_confirmed`], for
+/// integration tests only: exists only with the `testing` feature, which
+/// no production build enables (`crates/core/Cargo.toml`).
+#[cfg(feature = "testing")]
+pub fn add_standing_grant(
+    dir: &Path,
+    predicate: &str,
+    budget_bytes: u64,
+    max_units: Option<u32>,
+    expires_in_secs: u64,
+    actor: &str,
+) -> Result<Grant> {
+    add_standing_grant_confirmed(
+        dir,
+        predicate,
+        budget_bytes,
+        max_units,
+        expires_in_secs,
+        &HumanConfirmed::cli_command(actor),
+    )
+}
+
+/// The test-fixture spelling of [`approve_confirmed`]; `testing` only,
+/// like [`add_standing_grant`]. The reviewers' counterexample files call
+/// it by this name.
+#[cfg(feature = "testing")]
 pub fn approve(dir: &Path, plan_id: &str, actor: &str) -> Result<Grant> {
+    approve_confirmed(dir, plan_id, &HumanConfirmed::cli_command(actor))
+}
+
+/// Human-at-CLI (or the TUI's confirm dialog): approve one plan. The
+/// grant is scoped to that plan id and expires with the plan. Takes the
+/// [`HumanConfirmed`] the confirmation site minted.
+pub fn approve_confirmed(dir: &Path, plan_id: &str, confirmed: &HumanConfirmed) -> Result<Grant> {
+    let actor = confirmed.actor();
     let plan = load_plan(dir, plan_id)?;
     if plan.is_expired(now()) {
         bail!(
@@ -1840,7 +1855,7 @@ fn grant_covers(g: &Grant, plan: &Plan, unit: &PlanUnit) -> bool {
         }
         // Age is re-derived at the sink (`newest_mtime`), not trusted from
         // the plan: the grant covers the unit only if it is still that old.
-        Predicate::AgeGreaterThan(secs) => newest_mtime(&unit.path, 2_000_000)
+        Predicate::AgeGreaterThan(secs) => crate::recheck::newest_mtime(&unit.path, 2_000_000)
             .is_some_and(|m| crate::entities::now().saturating_sub(m) > *secs),
         Predicate::Growth { .. } | Predicate::Pr(_) => false,
     })
@@ -1909,35 +1924,6 @@ pub struct ExecuteResult {
     pub actor: String,
 }
 
-/// Newest mtime anywhere under `path` (files and directories), bounded by
-/// `max_entries` so a pathological tree cannot stall the sink; returns
-/// `None` when the bound is hit (treated as "could not re-observe").
-fn newest_mtime(path: &Path, max_entries: usize) -> Option<u64> {
-    let mut newest = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    let mut seen = 0usize;
-    while let Some(p) = stack.pop() {
-        let meta = fs::symlink_metadata(&p).ok()?;
-        let m = meta
-            .modified()
-            .ok()?
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        newest = newest.max(m);
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            for e in fs::read_dir(&p).ok()?.flatten() {
-                seen += 1;
-                if seen > max_entries {
-                    return None;
-                }
-                stack.push(e.path());
-            }
-        }
-    }
-    Some(newest)
-}
-
 pub fn trash_root() -> PathBuf {
     if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
         return PathBuf::from(dir);
@@ -1947,15 +1933,16 @@ pub fn trash_root() -> PathBuf {
 }
 
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = crate::spawn::command("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let out = crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Df,
+        [std::ffi::OsStr::new("-k"), path.as_os_str()],
+        std::time::Duration::from_secs(10),
+    )
+    .ok()?;
+    if !out.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = out.stdout_lossy();
     let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
     let available_kb: u64 = fields.get(3)?.parse().ok()?;
     Some(available_kb * 1024)
@@ -1982,102 +1969,7 @@ pub fn execute_keeping_executables(
     execute_with_trash_opts(dir, plan_id, actor, &trash_root(), true)
 }
 
-/// A file preserved by `preserve_executables`: where it was, where it went.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Preserved {
-    pub from: PathBuf,
-    pub to: PathBuf,
-}
-
-fn is_executable_file(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.is_file() && meta.permissions().mode() & 0o111 != 0
-}
-
-fn copy_into(from: &Path, dest_dir: &Path, out: &mut Vec<Preserved>) -> Result<()> {
-    fs::create_dir_all(dest_dir)?;
-    let name = from.file_name().context("file has a name")?;
-    let to = dest_dir.join(name);
-    fs::copy(from, &to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
-    out.push(Preserved {
-        from: from.to_path_buf(),
-        to,
-    });
-    Ok(())
-}
-
-/// Copies the compiled outputs a build directory holds to
-/// `<worktree>/bin/` before the directory is trashed, the way
-/// clean-dev-dirs' `--keep-executables` does:
-///
-/// - Rust `target/`: executables (mode +x, not `.d`/`.rlib`/`.rmeta`/
-///   `.dylib`/`.so`/`.a`/`.pdb`) directly in `target/release/` and
-///   `target/debug/` go to `bin/release/` and `bin/debug/`.
-/// - Python `dist/`: `*.whl` (and `*.tar.gz`) go to `bin/`; `build/`:
-///   `*.so`/`*.pyd` anywhere inside go to `bin/`.
-/// - Everything else (dependency trees, caches, other build outputs) is a
-///   no-op: nothing in them is an output worth keeping.
-///
-/// Returns what was copied. An empty list is a valid answer, never an error.
-pub fn preserve_executables(unit_path: &Path, worktree: &Path) -> Result<Vec<Preserved>> {
-    let mut out = Vec::new();
-    let base = unit_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let bin = worktree.join("bin");
-    const SKIP_EXT: &[&str] = &["d", "rlib", "rmeta", "a", "so", "dylib", "dll", "pdb"];
-    match base {
-        "target" => {
-            for profile in ["release", "debug"] {
-                let dir = unit_path.join(profile);
-                let Ok(rd) = fs::read_dir(&dir) else { continue };
-                for e in rd.flatten() {
-                    let Ok(meta) = e.metadata() else { continue };
-                    let p = e.path();
-                    let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-                    if is_executable_file(&meta) && !SKIP_EXT.contains(&ext) {
-                        copy_into(&p, &bin.join(profile), &mut out)?;
-                    }
-                }
-            }
-        }
-        "dist" => {
-            let Ok(rd) = fs::read_dir(unit_path) else {
-                return Ok(out);
-            };
-            for e in rd.flatten() {
-                let p = e.path();
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.ends_with(".whl") || name.ends_with(".tar.gz") {
-                    copy_into(&p, &bin, &mut out)?;
-                }
-            }
-        }
-        "build" => {
-            let mut stack = vec![unit_path.to_path_buf()];
-            let mut seen = 0usize;
-            while let Some(d) = stack.pop() {
-                let Ok(rd) = fs::read_dir(&d) else { continue };
-                for e in rd.flatten() {
-                    seen += 1;
-                    if seen > 200_000 {
-                        return Ok(out);
-                    }
-                    let p = e.path();
-                    let Ok(ft) = e.file_type() else { continue };
-                    if ft.is_dir() {
-                        stack.push(p);
-                    } else if ft.is_file() {
-                        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-                        if ext == "so" || ext == "pyd" {
-                            copy_into(&p, &bin, &mut out)?;
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(out)
-}
+pub use crate::preserve::{Preserved, preserve_executables};
 
 /// `execute` with an explicit Trash root (tests; never process-global state).
 pub fn execute_with_trash(
@@ -2142,7 +2034,6 @@ pub fn execute_with_trash_opts(
     }
 
     let ledger = Ledger::open(ledger_path(dir))?;
-    fs::create_dir_all(trash)?;
     let free_before = free_space_bytes(&plan.root);
     let mut outcomes = Vec::new();
     let mut trashed = 0u64;
@@ -2199,6 +2090,16 @@ pub fn execute_with_trash_opts(
             outcomes.push(outcome);
             continue;
         }
+        // The value every destructive step below borrows: this grant,
+        // live, covering this unit, within budget. Minted only here.
+        let Some(auth) = crate::authority::authorize(&plan, unit, g, spent, used, at) else {
+            outcome.cause = Some(format!(
+                "no live grant covers this unit; `{}`",
+                approve_command(plan_id)
+            ));
+            outcomes.push(outcome);
+            continue;
+        };
         // Agent-storage action (#101): occupancy, reference and identity
         // are all rechecked fresh here, never trusted from the plan.
         if let Some(meta) = &unit.agent_meta {
@@ -2211,10 +2112,16 @@ pub fn execute_with_trash_opts(
                     unit.reviewed.as_ref(),
                     trash,
                     at,
+                    &auth,
                 ),
-                None => {
-                    execute_agent_cache_trash(dir, &unit.path, unit.reviewed.as_ref(), trash, at)
-                }
+                None => execute_agent_cache_trash(
+                    dir,
+                    &unit.path,
+                    unit.reviewed.as_ref(),
+                    trash,
+                    at,
+                    &auth,
+                ),
             };
             match agent_result {
                 Ok((dest, moved_bytes)) => {
@@ -2277,7 +2184,7 @@ pub fn execute_with_trash_opts(
                 outcomes.push(outcome);
                 continue;
             }
-            match crate::docker::remove(&target, std::time::Duration::from_secs(30)) {
+            match crate::docker::remove(&target, &auth, &unit.path) {
                 Ok(()) => {
                     outcome.status = "completed".into();
                     removed_permanently += unit.bytes;
@@ -2338,7 +2245,13 @@ pub fn execute_with_trash_opts(
                 observed_path_state: Some("preflight".into()),
                 recorded_at: at,
             })?;
-            match crate::cargo_cleanup::move_reviewed(dir, group, unit.reviewed.as_ref(), trash) {
+            match crate::cargo_cleanup::move_reviewed(
+                dir,
+                group,
+                unit.reviewed.as_ref(),
+                trash,
+                &auth,
+            ) {
                 Ok(dest) => {
                     outcome.status = "completed".into();
                     outcome.recovery_location = Some(dest);
@@ -2359,7 +2272,7 @@ pub fn execute_with_trash_opts(
             outcomes.push(outcome);
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(&unit.path) else {
+        let Ok(meta) = fs_gate::symlink_metadata(&unit.path) else {
             outcome.cause = Some("path no longer exists".into());
             outcomes.push(outcome);
             continue;
@@ -2379,23 +2292,11 @@ pub fn execute_with_trash_opts(
         // is a directory. Both are whole-tree units and need `git worktree
         // prune` afterwards for the linked case.
         let linked_common: Option<PathBuf> = if unit.verb == "remove-worktree" {
-            fs::read_to_string(unit.path.join(".git"))
-                .ok()
-                .and_then(|line| {
-                    let gitdir = PathBuf::from(line.trim().strip_prefix("gitdir:")?.trim());
-                    let gitdir = if gitdir.is_absolute() {
-                        gitdir
-                    } else {
-                        unit.path.join(gitdir)
-                    };
-                    let c = fs::read_to_string(gitdir.join("commondir")).ok()?;
-                    let c = PathBuf::from(c.trim());
-                    Some(if c.is_absolute() { c } else { gitdir.join(c) })
-                })
+            crate::git::linked_common_dir(&unit.path)
         } else {
             None
         };
-        match newest_mtime(&unit.path, 2_000_000) {
+        match crate::recheck::newest_mtime(&unit.path, 2_000_000) {
             None => {
                 outcome.cause = Some("could not re-observe the tree before acting".into());
                 outcomes.push(outcome);
@@ -2442,31 +2343,16 @@ pub fn execute_with_trash_opts(
         // replacing a fail-closed one. And human keep/protect intent was
         // enforced at proposal only, so `swamp protect` added after
         // approval did not stop an ordinary artifact row being moved.
-        let reviewed_now =
-            match crate::recheck::reviewed_snapshot(&unit.path, unit.reviewed.as_ref()) {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    outcome.cause = Some(e.to_string());
-                    outcomes.push(outcome);
-                    continue;
-                }
-            };
-        let covered = crate::recheck::covered_paths(&reviewed_now);
-        if let Err(e) = crate::recheck::live_protection(dir, &covered) {
-            outcome.cause = Some(e.to_string());
-            outcomes.push(outcome);
-            continue;
-        }
-        match crate::recheck::member_occupancy(&covered) {
-            crate::occupancy::OccupancyState::Free => {}
-            other => {
-                outcome.cause = other.refusal();
+        let proof = match crate::recheck::run_all(dir, &unit.path, unit.reviewed.as_ref(), &[]) {
+            Ok(proof) => proof,
+            Err(e) => {
+                outcome.cause = Some(e.to_string());
                 outcomes.push(outcome);
                 continue;
             }
-        }
+        };
         if keep_executables && unit.verb == "delete" {
-            match preserve_executables(&unit.path, &unit.worktree_path) {
+            match preserve_executables(&unit.path, &unit.worktree_path, &auth) {
                 Ok(kept) => outcome.preserved = kept.into_iter().map(|k| k.to).collect(),
                 Err(e) => {
                     outcome.status = "failed".into();
@@ -2476,24 +2362,19 @@ pub fn execute_with_trash_opts(
                 }
             }
         }
-        let dest = trash.join(format!(
-            "{}-{}-{}",
-            basename,
-            unit.project.replace('/', "_"),
-            at
-        ));
-        match fs::rename(&unit.path, &dest) {
-            Ok(()) => {
+        let dest_name = format!("{}-{}-{}", basename, unit.project.replace('/', "_"), at);
+        match fs_gate::destroy::trash_move(proof, &auth, trash, &dest_name) {
+            Ok(dest) => {
                 outcome.status = "completed".into();
-                outcome.recovery_location = Some(dest.clone());
+                outcome.recovery_location = Some(dest);
                 trashed += unit.bytes;
                 spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
                 if let Some(c) = &linked_common {
-                    let _ = crate::spawn::command("git")
-                        .arg("-C")
-                        .arg(c.parent().unwrap_or(c))
-                        .args(["worktree", "prune"])
-                        .output();
+                    let _ = fs_gate::destroy::git_worktree_prune(
+                        &auth,
+                        &unit.path,
+                        c.parent().unwrap_or(c),
+                    );
                 }
             }
             Err(e) => {
@@ -2721,6 +2602,7 @@ mod agent_partial_removal_tests {
             reviewed.as_ref(),
             trash.path(),
             at,
+            &crate::authority::for_tests(std::slice::from_ref(&session_path)),
         )
         .expect_err("the last member's rename was deliberately blocked");
         let partial = err

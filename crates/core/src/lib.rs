@@ -2,6 +2,25 @@
 //!
 //! The index is evidence. Grants are authorization. The sink is the final
 //! authority and must re-observe every predicate before changing the filesystem.
+//!
+//! Filesystem access, subprocesses and `unsafe` live only in [`fs_gate`]
+//! (and the FSEvents FFI under `fs_events`); the denies below make that a
+//! compile error everywhere else in the shipped library. See
+//! `docs/architecture.md`, "Capability gates".
+
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        unsafe_code
+    )
+)]
+
+#[cfg(all(feature = "testing", not(debug_assertions)))]
+compile_error!(
+    "swamp-core's `testing` feature is test-fixture API; no release build may enable it"
+);
 
 pub mod actions;
 pub mod activity;
@@ -10,6 +29,7 @@ pub mod agents;
 pub mod artifact;
 pub mod assoc_store;
 pub mod attribution;
+pub mod authority;
 pub mod bus;
 pub mod cargo_artifacts;
 pub mod cargo_cleanup;
@@ -28,6 +48,7 @@ pub mod extractor;
 pub mod filter;
 pub mod folded_measurement;
 pub mod fs_events;
+pub mod fs_gate;
 pub mod git;
 pub mod github;
 pub mod grants;
@@ -40,13 +61,14 @@ pub mod occupancy;
 pub mod recheck;
 pub mod reclaimability;
 pub mod recovery;
+pub mod preserve;
+pub mod protection;
 pub mod render;
 pub mod report;
 pub mod scan;
 pub mod schedule;
 pub mod scope;
 pub mod signals;
-pub mod spawn;
 pub mod store;
 pub mod toolchain_declarations;
 pub mod tree;

@@ -53,19 +53,26 @@ fn html_unescape(s: &str) -> String {
 /// `Err`, never a silent `None` indistinguishable from "no workspace
 /// recorded".
 pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, String> {
-    let output = crate::spawn::command("plutil")
-        .args(["-convert", "xml1", "-o", "-"])
-        .arg(info_plist_path)
-        .output()
-        .map_err(|e| format!("plutil could not be started: {e}"))?;
-    if !output.status.success() {
+    let output = crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Plutil,
+        [
+            std::ffi::OsStr::new("-convert"),
+            std::ffi::OsStr::new("xml1"),
+            std::ffi::OsStr::new("-o"),
+            std::ffi::OsStr::new("-"),
+            info_plist_path.as_os_str(),
+        ],
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| format!("plutil could not be started: {e}"))?;
+    if !output.success() {
         return Err(format!(
             "plutil failed to convert {}: {}",
             info_plist_path.display(),
-            String::from_utf8_lossy(&output.stderr)
+            output.stderr_lossy()
         ));
     }
-    let xml = String::from_utf8_lossy(&output.stdout);
+    let xml = output.stdout_lossy();
     Ok(parse_workspace_path_from_plist_xml(&xml))
 }
 
@@ -436,7 +443,7 @@ pub fn cargo_registry_entry_exists(registry_src: &Path, name: &str, version: &st
     // probe each -- never a walk into the registry's contents.
     crate::locations::shallow_dir_names(registry_src)
         .into_iter()
-        .any(|idx| registry_src.join(idx).join(&want).exists())
+        .any(|idx| crate::fs_gate::exists(registry_src.join(idx).join(&want)))
 }
 
 /// Go module cache `<GOMODCACHE>/<escaped-module>@<version>`.
@@ -447,7 +454,7 @@ pub fn go_module_cache_entry_exists(gomodcache: &Path, module: &str, version: &s
         go_module_escape(module),
         go_module_escape(version)
     ));
-    candidate.exists()
+    crate::fs_gate::exists(&candidate)
 }
 
 /// Gradle `modules-2/files-2.1/<group>/<artifact>/<version>` under the
@@ -461,12 +468,12 @@ pub fn gradle_cache_entry_exists(
     let Some((group, artifact)) = group_artifact.split_once(':') else {
         return false;
     };
-    gradle_caches
+    let entry = gradle_caches
         .join("modules-2/files-2.1")
         .join(group)
         .join(artifact)
-        .join(version)
-        .exists()
+        .join(version);
+    crate::fs_gate::exists(&entry)
 }
 
 /// Maven local repository `<group/path>/<artifact>/<version>` under the
@@ -476,11 +483,11 @@ pub fn maven_repo_entry_exists(repo_root: &Path, group_artifact: &str, version: 
     let Some((group, artifact)) = group_artifact.split_once(':') else {
         return false;
     };
-    repo_root
+    let entry = repo_root
         .join(group.replace('.', "/"))
         .join(artifact)
-        .join(version)
-        .exists()
+        .join(version);
+    crate::fs_gate::exists(&entry)
 }
 
 /// An unparseable lockfile is a named evidence gap, never a silent

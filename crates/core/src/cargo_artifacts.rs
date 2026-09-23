@@ -12,7 +12,6 @@ use crate::artifact::{
 use crate::entities::Confidence;
 use crate::report::{ArtifactKind, ProjectRow};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -59,7 +58,7 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
     while let Some(dir) = cursor {
         for name in ["config", "config.toml"] {
             let p = dir.join(".cargo").join(name);
-            if p.is_file() {
+            if crate::fs_gate::is_file(&p) {
                 config = Some(p);
                 break;
             }
@@ -73,7 +72,7 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
 
     let config_values = config
         .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|p| crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::MANIFEST).ok())
         .map(|text| parse_build_paths(&text));
     if let Some((target, build)) = config_values {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
@@ -207,7 +206,7 @@ pub fn inspect_target_incremental(
             copy_tree(path, old, children, out);
             return;
         }
-        let meta = match fs::symlink_metadata(path) {
+        let meta = match crate::fs_gate::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 limits.push(format!("{}: {e}", path.display()));
@@ -271,7 +270,7 @@ pub fn inspect_target_incremental(
         }
         out.push(u);
         if meta.is_dir() {
-            match fs::read_dir(path) {
+            match crate::fs_gate::read_dir(path) {
                 Err(e) => limits.push(format!("{}: {e}", path.display())),
                 Ok(entries) => {
                     let mut paths = Vec::new();
@@ -401,7 +400,7 @@ pub(crate) fn folded_units(
     // Temporary metadata nodes feed the shared parser, but are never retained.
     // Ordinary compiler outputs in deps are not listed or statted here.
     for dir in fingerprints {
-        for entry in fs::read_dir(dir)? {
+        for entry in crate::fs_gate::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -439,7 +438,7 @@ pub(crate) fn folded_units(
         }
     }
     for dir in examples {
-        for entry in fs::read_dir(dir)? {
+        for entry in crate::fs_gate::read_dir(dir)? {
             if let Some(u) = folded_executable(root, &scope, &entry?.path())? {
                 units.push(u);
             }
@@ -449,7 +448,7 @@ pub(crate) fn folded_units(
     // executables and library products, but leave metadata and internal files
     // folded. This is shallow even when the target contains millions of files.
     for dir in profiles {
-        for entry in fs::read_dir(dir)? {
+        for entry in crate::fs_gate::read_dir(dir)? {
             let path = entry?.path();
             let library = matches!(
                 path.extension().and_then(|e| e.to_str()),
@@ -521,7 +520,7 @@ fn folded_output(
     path: &Path,
     executable_required: bool,
 ) -> anyhow::Result<Option<NestedArtifact>> {
-    let m = match fs::symlink_metadata(path) {
+    let m = match crate::fs_gate::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -550,7 +549,7 @@ pub(crate) fn reviewed_role(
     selected: &Path,
     fingerprints: &[PathBuf],
 ) -> anyhow::Result<(ArtifactRole, bool)> {
-    let meta = fs::symlink_metadata(selected)?;
+    let meta = crate::fs_gate::symlink_metadata(selected)?;
     let scope = NestedArtifact::storage_id(root, "");
     let mut units = vec![folded_node(root, &scope, selected, meta.is_dir(), 0)];
     for path in fingerprints {
@@ -626,7 +625,7 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
         let Some(profile) = dir.parent().and_then(Path::parent) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(&u.path) else {
+        let Ok(text) = crate::fs_gate::read::bounded_string(&u.path, crate::fs_gate::read::BoundedCap::MANIFEST) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -919,12 +918,12 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     for project in projects {
         for wt in &project.worktrees {
             let layout = layout_for(&wt.path);
-            let cargo_present = wt.path.join("Cargo.toml").is_file();
+            let cargo_present = crate::fs_gate::is_file(wt.path.join("Cargo.toml"));
             if !cargo_present && !project.ecosystems.iter().any(|t| t == "rs") {
                 continue;
             }
             for row in &wt.artifacts {
-                if row.kind != ArtifactKind::BuildOutput || !row.path.is_dir() {
+                if row.kind != ArtifactKind::BuildOutput || !crate::fs_gate::is_dir(&row.path) {
                     continue;
                 }
                 let matches_layout = layout.target_dir.as_ref().is_some_and(|p| p == &row.path)
@@ -933,7 +932,7 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
                 if !matches_layout {
                     continue;
                 }
-                let canonical = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+                let canonical = crate::fs_gate::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
                 if seen.insert(canonical) {
                     out.push((row.path.clone(), wt.path.clone()));
                 }
@@ -946,6 +945,7 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::tempdir;
 

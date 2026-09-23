@@ -92,7 +92,7 @@ impl Detector for PnpmDetector {
         }
 
         let npmrc = env.home.join(".npmrc");
-        if let Ok(text) = std::fs::read_to_string(&npmrc)
+        if let Ok(text) = crate::fs_gate::read::bounded_string(&npmrc, crate::fs_gate::read::BoundedCap::MANIFEST)
             && let Some(dir) = read_npmrc_field(&text, "store-dir")
         {
             return vec![ProposedLocation {

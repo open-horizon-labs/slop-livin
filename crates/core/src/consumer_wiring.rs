@@ -119,7 +119,7 @@ fn fingerprint(root: &Path, names: &[&str]) -> Vec<(String, u64)> {
     let mut out: Vec<(String, u64)> = names
         .iter()
         .filter_map(|name| {
-            fs::metadata(root.join(name))
+            crate::fs_gate::metadata_following(root.join(name))
                 .ok()
                 .map(|m| (name.to_string(), mtime_secs(&m)))
         })
@@ -147,7 +147,7 @@ type CacheMap = HashMap<String, crate::assoc_store::CachedRows>;
 // ---------------------------------------------------------------------
 
 fn read_declarations(root: &Path) -> Vec<ToolVersionDeclaration> {
-    let read = |name: &str| fs::read_to_string(root.join(name)).ok();
+    let read = |name: &str| crate::fs_gate::read::bounded_string(root.join(name), crate::fs_gate::read::BoundedCap::LOCKFILE).ok();
     let tool_versions = read(".tool-versions");
     let mise_toml = read(".mise.toml").or_else(|| read("mise.toml"));
     let python_version = read(".python-version");
@@ -237,7 +237,7 @@ fn declaration_from_row(row: &[String]) -> Option<ToolVersionDeclaration> {
 fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
-    if let Ok(text) = fs::read_to_string(root.join("Cargo.lock")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("Cargo.lock"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         match external_associations::parse_cargo_lock(&text) {
             Ok(ids) => out.extend(ids.into_iter().map(|i| CachedIdentity {
                 ecosystem: i.ecosystem.to_string(),
@@ -247,7 +247,7 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
             Err(e) => errors.push(("cargo".to_string(), e)),
         }
     }
-    if let Ok(text) = fs::read_to_string(root.join("package-lock.json")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("package-lock.json"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         match external_associations::parse_package_lock_json(&text) {
             Ok(ids) => out.extend(ids.into_iter().map(|i| CachedIdentity {
                 ecosystem: i.ecosystem.to_string(),
@@ -257,7 +257,7 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
             Err(e) => errors.push(("npm".to_string(), e)),
         }
     }
-    if let Ok(text) = fs::read_to_string(root.join("pnpm-lock.yaml")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("pnpm-lock.yaml"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         out.extend(
             external_associations::parse_pnpm_lock_yaml(&text)
                 .into_iter()
@@ -268,7 +268,7 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = fs::read_to_string(root.join("go.sum")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("go.sum"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         out.extend(
             external_associations::parse_go_sum(&text)
                 .into_iter()
@@ -279,7 +279,7 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = fs::read_to_string(root.join("gradle.lockfile")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("gradle.lockfile"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         out.extend(
             external_associations::parse_gradle_lockfile(&text)
                 .into_iter()
@@ -290,7 +290,7 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = fs::read_to_string(root.join("pom.xml")) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("pom.xml"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
         match external_associations::parse_pom_xml_with_gaps(&text) {
             Ok((ids, gaps)) => {
                 out.extend(ids.into_iter().map(|i| CachedIdentity {
@@ -401,7 +401,7 @@ fn add_per_tool(
     for (i, u) in units.iter().enumerate() {
         if u.detector_id == detector_id && u.category == StorageCategory::Installation {
             let tool_dir = u.path.join(tool);
-            if tool_dir.is_dir() {
+            if crate::fs_gate::is_dir(&tool_dir) {
                 out.extend(readdir_names(&tool_dir).into_iter().map(|n| (n, i)));
             }
         }
@@ -963,7 +963,7 @@ fn attach_global_default(
         return;
     };
     let settings_path = units[local_state_idx].path.join(global_default.file_name);
-    let Some(text) = fs::read_to_string(&settings_path).ok() else {
+    let Some(text) = crate::fs_gate::read::bounded_string(&settings_path, crate::fs_gate::read::BoundedCap::LOCKFILE).ok() else {
         return;
     };
     let declared = match global_default.format {
@@ -1052,7 +1052,7 @@ fn attach_workspace_index(
     let derived_data_path = units[idx].path.clone();
     for subfolder in external_associations::list_derived_data_subfolders(&derived_data_path) {
         let info_plist = subfolder.join("info.plist");
-        let Ok(meta) = fs::symlink_metadata(&info_plist) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(&info_plist) else {
             continue;
         };
         if !meta.is_file() {

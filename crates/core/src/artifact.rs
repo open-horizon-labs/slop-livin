@@ -141,7 +141,7 @@ pub struct NestedArtifact {
 impl NestedArtifact {
     pub fn storage_id(root: &Path, relative: &str) -> String {
         use std::os::unix::ffi::OsStrExt;
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut hash = blake3::Hasher::new();
         hash.update(b"nested-storage:v2\0");
         hash.update(root.as_os_str().as_bytes());

@@ -1,11 +1,7 @@
 use crate::grants::Verb;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRecord {
     pub id: String,
@@ -28,27 +24,26 @@ impl Ledger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(p) = path.parent() {
-            fs::create_dir_all(p)?;
+            crate::fs_gate::store::create_dir_all(p)?;
         }
         Ok(Self { path })
     }
     pub fn append(&self, r: &ActionRecord) -> Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        writeln!(f, "{}", serde_json::to_string(r)?)?;
-        f.sync_data()?;
+        crate::fs_gate::store::append_line(
+            crate::fs_gate::store::LogFile::Ledger(&self.path),
+            &serde_json::to_string(r)?,
+        )?;
         Ok(())
     }
     pub fn all(&self) -> Result<Vec<ActionRecord>> {
-        if !self.path.exists() {
-            return Ok(vec![]);
-        }
-        let f = fs::File::open(&self.path)?;
-        BufReader::new(f)
-            .lines()
-            .map(|l| Ok(serde_json::from_str(&l?)?))
+        let lines = match crate::fs_gate::read::read_owned_lines(&self.path) {
+            Ok(lines) => lines,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        lines
+            .iter()
+            .map(|l| Ok(serde_json::from_str(l)?))
             .collect()
     }
     pub fn path(&self) -> &Path {
