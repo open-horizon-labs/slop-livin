@@ -13,10 +13,16 @@
     deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
 )]
 
-#[cfg(all(feature = "testing", not(debug_assertions)))]
-compile_error!(
-    "swamp-core's `testing` feature is test-fixture API; no release build may enable it"
-);
+// The `testing` feature (test-fixture API) is kept out of shipped builds
+// by the dependency graph, not by a `compile_error!`: every workspace
+// crate enables it only under `[dev-dependencies]`, which Cargo's
+// resolver 2 never unifies into a non-test build. A `compile_error!` on
+// `all(feature = "testing", not(debug_assertions))` also fired for
+// `cargo test --release` -- the release workflow's own test step -- where
+// the feature is on by design (re-review 5, item 8). What holds it now:
+// the gate audit rejects a `[dependencies]` entry that enables it, and
+// `scripts/check.sh` and the release workflow refuse a `swamp` build
+// graph (`cargo tree -e normal,build,features`) that contains it.
 
 pub mod actions;
 pub mod activity;

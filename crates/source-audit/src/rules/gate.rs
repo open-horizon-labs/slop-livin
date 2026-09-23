@@ -283,6 +283,24 @@ const GROUPS: &[Group] = &[
         why: "liveness of the observation lock holder",
     },
     Group {
+        path: "@core::fs_gate::spawn::Program::Xcrun",
+        allowed: &[],
+        why: "xcrun runs only as an allow-listed detector command (`Program::named` in \
+              `locations`)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Brew",
+        allowed: &[],
+        why: "brew runs only as an allow-listed detector command (`Program::named` in \
+              `locations`)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Defaults",
+        allowed: &[],
+        why: "defaults runs only as an allow-listed detector command (`Program::named` in \
+              `locations`)",
+    },
+    Group {
         path: "@core::recheck::capture_anchor",
         allowed: &[
             (Krate::Core, &["actions"]),
@@ -524,7 +542,13 @@ pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
             }
             let abs = ws.resolve(mi, &lit.segments).join("::");
             for (ty, sites, why) in LITERAL_SITES {
-                if abs != *ty {
+                // By resolved path, and -- when resolution gave up (a glob
+                // import such as a child module's `use super::*`) -- by the
+                // type's name: the conservative reading, as for mint sites.
+                let name = ty.rsplit("::").next().unwrap_or(ty);
+                let by_name =
+                    abs.starts_with('?') && lit.segments.last().is_some_and(|s| s == name);
+                if abs != *ty && !by_name {
                     continue;
                 }
                 let f = lit.in_fn.map(|f| ws.fns[f].name.as_str()).unwrap_or("");

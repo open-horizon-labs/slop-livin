@@ -771,6 +771,67 @@ mod tests {
         assert_eq!(records[0].actor, "human");
     }
 
+    /// Re-review 5, finding 3: the TUI used to read the protect list from
+    /// the *ledger's* directory, so `SWAMP_LEDGER_PATH` pointing anywhere
+    /// else made every `swamp protect` entry invisible at the sink. The
+    /// store now travels with the confirmation; a protected unit stays
+    /// where it is whichever directory the ledger is in.
+    #[test]
+    fn protection_comes_from_the_confirmations_store_not_the_ledger_directory() {
+        let workdir = tempdir().unwrap();
+        let target = workdir.path().join("node_modules");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker"), b"keep").unwrap();
+        let store = tempdir().unwrap();
+        swamp_core::agents::protect_add(store.path(), &target).unwrap();
+        let elsewhere = tempdir().unwrap();
+        let ledger = Ledger::open(elsewhere.path().join("ledger.jsonl")).unwrap();
+        let unit = unit(target.to_str().unwrap(), 4, None);
+        let store_dir = StoreDir::at(store.path()).unwrap();
+        let confirmed = HumanConfirmed::tui_dialog(
+            "human",
+            &store_dir,
+            confirmables(std::slice::from_ref(&unit), false),
+        );
+        let trash = workdir.path().join("Trash");
+        let results = execute_plan(&[unit], confirmed, &store_dir, &ledger, &trash, false);
+        assert!(results[0].outcome.is_err(), "{:?}", results[0].outcome);
+        assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"keep");
+        assert!(!trash.exists() || std::fs::read_dir(&trash).unwrap().count() == 0);
+    }
+
+    /// One confirmation per unit, in order: a batch whose confirmations do
+    /// not line up with its units runs nothing.
+    #[test]
+    fn a_batch_with_the_wrong_number_of_confirmations_runs_nothing() {
+        let workdir = tempdir().unwrap();
+        let a = workdir.path().join("a");
+        let b = workdir.path().join("b");
+        for p in [&a, &b] {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("data"), b"x").unwrap();
+        }
+        let units = vec![
+            unit(a.to_str().unwrap(), 1, None),
+            unit(b.to_str().unwrap(), 1, None),
+        ];
+        let store = StoreDir::at(workdir.path()).unwrap();
+        // Confirmed only the first unit.
+        let confirmed =
+            HumanConfirmed::tui_dialog("human", &store, confirmables(&units[..1], false));
+        let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
+        let results = execute_plan(
+            &units,
+            confirmed,
+            &store,
+            &ledger,
+            &workdir.path().join("T"),
+            false,
+        );
+        assert!(results.iter().all(|r| r.outcome.is_err()));
+        assert!(a.join("data").exists() && b.join("data").exists());
+    }
+
     #[test]
     fn confirm_summary_names_units_and_states_their_warnings() {
         let clean = MarkedUnit {

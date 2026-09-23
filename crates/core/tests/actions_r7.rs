@@ -193,7 +193,7 @@ fn approve_then_execute_trashes_records_ledger_and_is_single_use() {
     save_plan(store.path(), &plan).unwrap();
 
     let g = approve(store.path(), &plan.id, "human:test").unwrap();
-    assert_eq!(g.plan_id().as_deref(), Some(plan.id.as_str()));
+    assert_eq!(g.plan_id(), Some(plan.id.as_str()));
 
     let res = execute_with_trash(store.path(), &plan.id, "agent:test", &trash).unwrap();
     assert_eq!(res.state, "executed", "{res:?}");
