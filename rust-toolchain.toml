@@ -1,0 +1,10 @@
+# Pinned, deliberately (owner decision, 2026-09-22). CI runs clippy with
+# `-D warnings`; against a floating `stable` that fails on a day nobody
+# changed the code, because a new release adds lints. 1.98.1 is the
+# version both CI jobs were last green on. Bump it in its own commit,
+# with the lint fixes the new version asks for, never as a side effect.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+profile = "minimal"

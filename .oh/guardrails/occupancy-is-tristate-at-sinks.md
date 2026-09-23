@@ -1,7 +1,7 @@
 ---
 id: occupancy-is-tristate-at-sinks
 severity: hard
-statement: "A sink never consumes a boolean occupancy answer. Occupancy is OccupancyState::{Free, Occupied(path), Unknown(reason)}; a probe that could not run, timed out, or was denied permission is Unknown, and Unknown refuses. Directories are probed with lsof +D so every member is covered, not just the anchor."
+statement: "A sink never consumes a boolean occupancy answer. Occupancy is OccupancyState::{Free, Occupied(path), Unknown(reason)}; a probe that could not run, timed out, or was denied permission is Unknown, and Unknown refuses. Directories are probed so every member is covered, not just the anchor: lsof +D on macOS, a procfs scan of every open file, cwd and mapping on Linux (#86)."
 outcome: decision-relevant-storage-evidence
 audit: gate_paths_only_inside_gates
 compile_fail:

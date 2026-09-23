@@ -3,6 +3,7 @@
     deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
 )]
 
+mod collect;
 mod schedule;
 
 use anyhow::Result;
@@ -273,6 +274,21 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Linux: watch the scope's roots with inotify until stopped and keep
+    /// a bounded change list, so a later `observe`/`report` can walk only
+    /// what changed (#82). Opt-in, user-owned, foreground; refuses on
+    /// macOS, where FSEvents already keeps the history.
+    Collect {
+        /// Defaults to every present root in the configured scope.
+        roots: Vec<PathBuf>,
+        /// Print each root's checkpoint and whether its collector is
+        /// running, then exit. Reads only.
+        #[arg(long)]
+        status: bool,
+        /// With --status: the CLI's JSON contract instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install, report on, or remove the opt-in per-user LaunchAgent that
     /// runs `observe` on a fixed interval (#31).
     Schedule {
@@ -283,6 +299,11 @@ enum Command {
         /// Remove the schedule.
         #[arg(long)]
         off: bool,
+        /// Linux: also install the optional `swamp collect` user service,
+        /// which keeps a live change list between scheduled runs so they
+        /// can walk only what changed. Refused on macOS (not needed).
+        #[arg(long)]
+        collector: bool,
         roots: Vec<PathBuf>,
     },
     /// Propose cleanup: the one entry point for artifact/Cargo-group/
@@ -494,9 +515,12 @@ fn print_plan(plan: &swamp_core::actions::Plan) {
     );
 }
 
-/// `${SWAMP_DIR}`, defaulting to `~/.local/share/swamp`.
 /// The resolved swamp dir (`$SWAMP_DIR`, else `~/.local/share/swamp`):
-/// the gate's one resolver, `fs_gate::store::StoreDir::resolved`.
+/// the gate's one resolver, `fs_gate::store::StoreDir::resolved`. Same on
+/// Linux and macOS; ported from the Linux track's XDG-aware
+/// `platform::data_dir` deliberately narrowed back to this one resolver
+/// so there remains exactly one place that decides where swamp's state
+/// lives (see the port session note).
 fn swamp_dir() -> PathBuf {
     swamp_core::fs_gate::store::StoreDir::resolved()
         .path()
@@ -511,7 +535,7 @@ fn swamp_dir() -> PathBuf {
 /// exit via `main`'s `Result`, message on stderr): scope resolution
 /// never silently falls back to a broader default on invalid config.
 fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveScope> {
-    let store_dir = swamp_dir();
+    let store_dir = swamp_dir()?;
     let cfg = swamp_core::growth::load_config_checked(&store_dir)?;
     let env = swamp_core::locations::Environment::from_process();
     let registry = swamp_core::locations::Registry::with_builtins();
@@ -628,7 +652,12 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "catalog {} · defaults={} · disabled=[{}] · {}",
+        "platform {} · catalog {} · defaults={} · disabled=[{}] · {}",
+        // The same fact `--json` carries in `platform`: whose conventions
+        // produced these roots. Without it, a scope printed on one OS and
+        // read on the other is a list of missing paths with no
+        // explanation.
+        swamp_core::platform::Os::from(scope.platform).as_str(),
         scope.catalog_version,
         scope.defaults_enabled,
         scope.disabled_detectors.join(", "),
@@ -698,6 +727,31 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".to_string());
             let _ = writeln!(out, "  {:<12} {:<10} {}", d.detector_id, status, path);
+        }
+    }
+    // "Not applicable" is its own answer, distinct from "found nothing"
+    // and from "could not tell" (#84). Omitting these would leave a
+    // Linux user wondering whether Xcode detection failed rather than
+    // knowing it does not apply.
+    if !scope.not_applicable_detectors.is_empty() {
+        let _ = writeln!(
+            out,
+            "not applicable on this platform (not failures, and not absences):"
+        );
+        for d in &scope.not_applicable_detectors {
+            let applies: Vec<&str> = d
+                .applies_to
+                .iter()
+                .map(|p| swamp_core::platform::Os::from(*p).as_str())
+                .collect();
+            let _ = writeln!(
+                out,
+                "  {:<12} {:<10} {} (applies to: {})",
+                d.detector_id,
+                "n/a",
+                d.name,
+                applies.join(", ")
+            );
         }
     }
     out
@@ -1074,7 +1128,7 @@ fn propose_unified(
     json: bool,
     external: bool,
 ) -> Result<()> {
-    let store_dir = swamp_dir();
+    let store_dir = swamp_dir()?;
     if external {
         anyhow::ensure!(
             root.is_none(),
@@ -1179,7 +1233,7 @@ fn report_json_envelope(
     agent_units: &[swamp_core::agents::AgentUnit],
     store_interiors: &[swamp_core::artifact::NestedArtifact],
 ) -> Result<serde_json::Value> {
-    let store_dir = swamp_dir();
+    let store_dir = swamp_dir()?;
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
     let mut rr = r.clone();
     if let Some(f) = parsed_filter {
@@ -1325,7 +1379,7 @@ fn main() -> Result<()> {
                     );
                 }
                 if !no_observe {
-                    note_and_persist_scope(&swamp_dir(), &scope);
+                    note_and_persist_scope(&swamp_dir()?, &scope);
                 }
                 swamp_tui::run_scope(&scope, no_observe)?;
             }
@@ -1384,7 +1438,7 @@ fn main() -> Result<()> {
             // *write* of a new observation is skipped. GitHub enrichment
             // is a separate opt-in (`--enrich`): plain `report` never
             // shells out to `gh`, regardless of `--no-observe`.
-            let store_dir = swamp_dir();
+            let store_dir = swamp_dir()?;
             let progress =
                 spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
             // An explicit root replaces the configured scope entirely and
@@ -1687,7 +1741,7 @@ fn main() -> Result<()> {
                     "--within must be a directory inside the scan root"
                 );
             }
-            let store = swamp_dir();
+            let store = swamp_dir()?;
             let start = std::time::Instant::now();
             let report = report_full_mode(
                 &root,
@@ -1870,7 +1924,7 @@ fn main() -> Result<()> {
         Command::Protect { cmd } => cmd_protect(cmd)?,
         Command::Approve { plan_id } => cmd_approve(&plan_id)?,
         Command::Config { action } => {
-            let dir = swamp_dir();
+            let dir = swamp_dir()?;
             let path = dir.join("config.toml");
             match action {
                 ConfigAction::Path => println!("{}", path.display()),
@@ -1921,9 +1975,9 @@ fn main() -> Result<()> {
             keep_executables,
         } => {
             let res = if keep_executables {
-                swamp_core::actions::execute_keeping_executables(&swamp_dir(), &plan_id, &actor)?
+                swamp_core::actions::execute_keeping_executables(&swamp_dir()?, &plan_id, &actor)?
             } else {
-                swamp_core::actions::execute(&swamp_dir(), &plan_id, &actor)?
+                swamp_core::actions::execute(&swamp_dir()?, &plan_id, &actor)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -1966,7 +2020,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Plans { json } => {
-            let plans = swamp_core::actions::list_plans(&swamp_dir())?;
+            let plans = swamp_core::actions::list_plans(&swamp_dir()?)?;
             if json {
                 let total = plans.len();
                 println!(
@@ -1992,7 +2046,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Grant { cmd } => {
-            let dir = swamp_dir();
+            let dir = swamp_dir()?;
             match cmd {
                 GrantCmd::Add {
                     predicate,
@@ -2040,7 +2094,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Observe { roots, full } => {
-            let store_dir = swamp_dir();
+            let store_dir = swamp_dir()?;
             let scope = resolve_scope(&roots)?;
             let resolved = scope.scan_paths();
             if resolved.is_empty() {
@@ -2056,8 +2110,41 @@ fn main() -> Result<()> {
             note_and_persist_scope(&store_dir, &scope);
             schedule::cmd_observe(store_dir, resolved, full)?;
         }
-        Command::Schedule { every, off, roots } => {
-            let store_dir = swamp_dir();
+        Command::Collect {
+            roots,
+            status,
+            json,
+        } => {
+            let store_dir = swamp_dir()?;
+            let scope = resolve_scope(&roots)?;
+            let (authorized, _) = scope.authorized_roots();
+            let present: Vec<collect::Root> = authorized
+                .into_iter()
+                .filter(|r| r.nested_in.is_none() && r.path.is_dir())
+                .map(|r| collect::Root {
+                    excluded: r.pruned_subtrees.clone(),
+                    path: std::fs::canonicalize(&r.path).unwrap_or(r.path),
+                })
+                .collect();
+            if present.is_empty() {
+                anyhow::bail!(
+                    "no present root to collect for -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            if status {
+                let roots = present.into_iter().map(|r| r.path).collect();
+                collect::cmd_collect_status(store_dir, roots, json)?;
+            } else {
+                collect::cmd_collect(store_dir, present)?;
+            }
+        }
+        Command::Schedule {
+            every,
+            off,
+            collector,
+            roots,
+        } => {
+            let store_dir = swamp_dir()?;
             // No explicit roots: install `observe` with none baked into
             // the plist's argv at all (#42/#50), so every scheduled fire
             // re-resolves the configured scope itself (same code path
@@ -2079,7 +2166,7 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            schedule::cmd_schedule(store_dir, every, off, roots)?;
+            schedule::cmd_schedule(store_dir, every, off, collector, roots)?;
         }
     }
     Ok(())
@@ -2173,7 +2260,7 @@ fn render_dirs(
                         .collect()
                 })
                 .unwrap_or_default();
-            file_rows.sort_by(|a, b| b.growth_bytes.cmp(&a.growth_bytes));
+            file_rows.sort_by_key(|a| std::cmp::Reverse(a.growth_bytes));
             for f in file_rows {
                 let _ = writeln!(
                     out,

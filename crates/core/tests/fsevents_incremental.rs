@@ -61,6 +61,7 @@ impl FsEventsSource for RefusingSource {
             current_event_id: 999,
             device: Some(1),
             live: false,
+            consume: None,
         }
     }
 }
@@ -80,6 +81,7 @@ fn incremental_plan(changed: Vec<PathBuf>, event_id: u64) -> FsEventsPlan {
         current_event_id: event_id,
         device: Some(1),
         live: false,
+        consume: None,
     }
 }
 
@@ -457,6 +459,7 @@ fn every_refusal_reason_falls_back_to_a_full_walk() {
         RefreshRefusal::HelperInconclusive,
         RefreshRefusal::TooManyChanges,
         RefreshRefusal::UnsupportedPlatform,
+        RefreshRefusal::NoPersistedChangeHistory,
     ] {
         let store = tempfile::tempdir().expect("tmp store");
 

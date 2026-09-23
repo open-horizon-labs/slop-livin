@@ -47,6 +47,7 @@ Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-aud
 | `scope.rs` | `persist_effective_scope` | resolved-scope snapshot for the next run's coverage diff |
 | `agents/mod.rs` | `save_protect` | human keep/protect list, written atomically |
 | `cargo_cleanup.rs` | `move_reviewed` | Trash envelope recovery manifest for one reviewed Cargo group |
+| `continuity.rs` | `write_checkpoint` | a Linux collector's checkpoint (#82): epoch, coverage and a dirty list bounded by `live_watch::DIRTY_BOUND` -- one small control file per watched root, never an inventory |
 
 ## Runtime tests that complete it
 

@@ -35,6 +35,19 @@ The same model supports questions at different levels:
 
 History begins with the first observation. Swamp records sizes and metadata; it does not back up file contents or identify the process that wrote them.
 
+## Platforms
+
+macOS on Apple silicon (`aarch64-apple-darwin`) and Linux on x86_64
+(`x86_64-unknown-linux-gnu`, validated on Ubuntu 24.04). CI builds and runs the
+whole test suite natively on both on every push.
+
+On Linux, a release archive is published alongside the macOS one (glibc,
+generic x86-64, built on Ubuntu 24.04). Linux has no persisted change history,
+so an observation there walks fully unless a live watch -- the TUI, or the
+opt-in `swamp collect` -- has been running since the last one; scheduling uses
+`systemd --user`, and Trash is the freedesktop one your file manager shows. The
+[platform guide](docs/platform.md) has the whole table and the reasons.
+
 ## Install
 
 On Apple silicon macOS, install with [Homebrew](https://brew.sh):
@@ -45,6 +58,16 @@ swamp --version
 ```
 
 Update with `brew upgrade swamp`. See the [installation guide](docs/usage.md#installing-a-release) if you previously installed manually.
+
+On Linux x86_64, install the release archive after checking its checksum:
+
+```bash
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
+```
 
 ### Build from source
 
@@ -75,7 +98,7 @@ To collect history while the UI is closed:
 swamp schedule --every 15m ~/src
 ```
 
-This installs a per-user LaunchAgent that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
+This installs a per-user LaunchAgent (macOS) or `systemd --user` timer (Linux; add `--collector` to keep a live change list between runs) that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
 
 Every root above is explicit. Omit it and `report`/`observe`/`ui`/`schedule` resolve swamp's **effective scope** instead: built-in roots (`~/src`, `~/Library/Developer`, `~/Library/Caches`), plus detected developer-tool locations (Cargo, rustup, Homebrew, and more), plus anything you add or exclude in `config.toml`. Run `swamp scope` to see exactly what's in scope, why, and what's missing or excluded -- see [Scope and coverage](docs/usage.md#scope-and-coverage).
 
@@ -102,7 +125,9 @@ Install the skill at `skills/swamp/` into your agent client's skills directory (
 
 ## How updates stay small
 
-After the initial walk, swamp uses macOS FSEvents to find changed directories and reuses the stored measurements elsewhere. It retains directory detail inside grouped artifacts so a small change can often be measured without walking the whole artifact again. Hardlinks and incomplete event history require broader walks.
+After the initial walk, swamp asks the platform what changed and reuses the stored measurements elsewhere. It retains directory detail inside grouped artifacts so a small change can often be measured without walking the whole artifact again. Hardlinks and incomplete event history require broader walks.
+
+On macOS that question is answered by FSEvents, which replays a log the kernel kept while swamp was not running. Linux has no equivalent: inotify reports only what happens while a watch is open, so an observation there walks fully and reports `reason=no_persisted_change_history` rather than treating an unwatched period as a quiet one. [#81](https://github.com/open-horizon-labs/swamp/issues/81) adds a live watcher, which narrows that gap for a running swamp and does not close it. See [Platforms](docs/platform.md).
 
 The history store uses zstd-compressed Parquet, directory summaries, selected large-file rows, and reverse deltas containing previous values. These choices reduce repeated traversal and history storage. Actual work depends on the changed directories, hardlinks, and enrichment caches; the repository does not establish a general latency or storage-size guarantee.
 
@@ -111,6 +136,7 @@ The [architecture guide](docs/architecture.md) explains observation, history, en
 ## Documentation
 
 - [Usage](docs/usage.md): installation, keys, commands, filters, configuration, the agent interface, and recovery.
+- [Platforms](docs/platform.md): supported targets, what each platform can and cannot do, where swamp keeps its files on each, and the library reuse decisions behind that.
 - [Architecture](docs/architecture.md): data flow, incremental updates, storage, and implementation limits.
 - [Contributing](CONTRIBUTING.md): code map, checks, and documentation maintenance.
 - [Changelog](CHANGELOG.md): behavior introduced in each release.

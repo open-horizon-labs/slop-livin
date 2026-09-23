@@ -53,19 +53,37 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
 /// #41: `observe` with no explicit root resolves the configured scope
 /// (shared with `report`/`ui`/`schedule` through
 /// `swamp_core::scope::resolve_effective_scope`) instead of requiring an
-/// explicit root. Disables every non-builtin detector so this test's
-/// outcome depends only on the fixture `HOME`'s layout, never on
-/// whatever happens to exist at `/opt/homebrew`, `/usr/local`, or a real
-/// `~/.cargo` on the machine running the test.
+/// explicit root.
+///
+/// Every non-builtin detector is disabled -- enumerated from the
+/// registry, not listed by hand -- so the outcome depends only on the
+/// fixture `HOME`'s layout. The hand-written list this used to carry
+/// (`cargo-home`, `rustup`, `homebrew`) named the three detectors that
+/// happened to fire on a Mac. On a GitHub Linux runner the ones that
+/// fired instead were nvm (`NVM_DIR=/home/runner/.nvm`, an absolute
+/// path no fixture `HOME` redirects) and Android
+/// (`ANDROID_SDK_ROOT=/usr/local/lib/android/sdk`): the test walked
+/// 2.6 GB of the runner's real SDK for 143 seconds and then failed an
+/// assertion that had nothing to do with either. A detector list kept
+/// in step with the registry by hand is a list that is wrong on the
+/// next machine.
 #[test]
 fn observe_with_no_roots_uses_the_configured_default_scope() {
     let home = tempfile::tempdir().expect("home");
     std::fs::create_dir_all(home.path().join("src")).unwrap();
     std::fs::write(home.path().join("src/hello.txt"), b"hi").unwrap();
     let store = tempfile::tempdir().expect("store");
+    let disabled = swamp_core::locations::Registry::with_builtins()
+        .detectors()
+        .iter()
+        .map(|d| d.id().to_string())
+        .filter(|id| id != swamp_core::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID)
+        .map(|id| format!("{id:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         store.path().join("config.toml"),
-        "[scan]\ndisabled_detectors = [\"cargo-home\", \"rustup\", \"homebrew\"]\n",
+        format!("[scan]\ndisabled_detectors = [{disabled}]\n"),
     )
     .unwrap();
 
@@ -73,6 +91,13 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
         .arg("observe")
         .env("SWAMP_DIR", store.path())
         .env("HOME", home.path())
+        // The Linux built-in defaults include `$XDG_CACHE_HOME`, which
+        // an inherited environment would point at the *real* user's
+        // cache -- a second real root, walked, in a test about the
+        // fixture home. Redirecting it into the fixture (where it does
+        // not exist, so it resolves Missing) keeps the test about what
+        // it says it is about, on both platforms.
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe with no roots");
@@ -81,6 +106,11 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
         output.status.success(),
         "observe with no roots should resolve the configured default scope: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("/usr/") && !stderr.contains("/opt/"),
+        "a scope resolved from a fixture HOME must not reach system paths: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

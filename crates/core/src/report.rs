@@ -503,18 +503,42 @@ pub fn report(root: &Path, docker_facts: Option<&Path>) -> Result<Report> {
 ///
 /// One `statfs` per row, the same bounded per-unit read
 /// `activity::access_time_evidence` already makes; never a per-file
-/// pass. A failed `statfs` answers `false`, which keeps the existing
+/// pass. A failed `statfs` answers `None`, which keeps the existing
 /// exact figure rather than inventing uncertainty.
+/// Every read is `fs_gate::sys::volume_info`'s one `statfs(2)`; there is
+/// no raw `libc::statfs` here (`.oh/architecture.md`, "Capability
+/// gates" -- `libc` may be named only inside `fs_gate`).
 #[cfg(target_os = "macos")]
-fn copy_on_write_volume(path: &Path) -> bool {
-    crate::fs_gate::sys::volume_info(path).is_ok_and(|v| v.is_apfs())
+fn shared_extent_filesystem(path: &Path) -> Option<&'static str> {
+    crate::fs_gate::sys::volume_info(path)
+        .ok()
+        .filter(|v| v.is_apfs())
+        .map(|_| "APFS")
+}
+
+/// Linux: the filesystems whose allocated blocks are not the space
+/// removing a file returns (owner decision (c), 2026-09-22). Btrfs,
+/// bcachefs and XFS share extents through reflinks and snapshots; Btrfs,
+/// bcachefs and ZFS compress and deduplicate below the file; overlayfs
+/// reports a merged view over layers the unit does not own. On each, a
+/// sum of `st_blocks * 512` is an **upper bound** on what a removal
+/// frees, and is labelled as one. ext4 and tmpfs share nothing and keep
+/// the exact figure.
+///
+/// `statfs(2)`'s `f_type` magic numbers are from `linux/magic.h` (ZFS's
+/// from OpenZFS, which is out of tree). A failed `statfs` answers
+/// `None`, as on macOS.
+#[cfg(target_os = "linux")]
+fn shared_extent_filesystem(path: &Path) -> Option<&'static str> {
+    let f_type = crate::fs_gate::sys::volume_info(path).ok()?.type_magic;
+    crate::reclaimability::shared_extent_filesystem_for_magic(f_type)
 }
 
 /// No copy-on-write extent sharing is claimed on a platform where this
 /// pass has no bounded way to establish it; the exact figure stands.
-#[cfg(not(target_os = "macos"))]
-fn copy_on_write_volume(_path: &Path) -> bool {
-    false
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn shared_extent_filesystem(_path: &Path) -> Option<&'static str> {
+    None
 }
 
 /// Populates every `ArtifactRow.evidence` (#53) from facts this report
@@ -584,12 +608,13 @@ pub fn attach_decision_evidence(report: &mut Report) {
                 } else {
                     let acc = if a.hardlinked || a.dedup_stale {
                         crate::reclaimability::hardlink_unresolved_bound(a.bytes)
-                    } else if copy_on_write_volume(&a.path) {
-                        // On APFS an extent can be retained by a clone or
-                        // a (Time Machine local) snapshot this pass never
-                        // queried, so the allocated bytes are a ceiling on
-                        // what removal frees, not the amount.
-                        crate::reclaimability::apfs_clone_or_snapshot_bound(a.bytes)
+                    } else if let Some(fs) = shared_extent_filesystem(&a.path) {
+                        // On APFS (and Btrfs, ZFS, XFS, bcachefs,
+                        // overlayfs) an extent can be retained by a clone,
+                        // a snapshot, a reflink or a lower layer this pass
+                        // never queried, so the allocated bytes are a
+                        // ceiling on what removal frees, not the amount.
+                        crate::reclaimability::shared_extent_bound(a.bytes, fs)
                     } else {
                         crate::reclaimability::exclusive_allocation(a.bytes)
                     };
@@ -1348,17 +1373,20 @@ pub(crate) fn aggregate_dir_totals(
     }
 }
 
-/// `${SWAMP_DIR}` (or `~/.local/share/swamp`): the same
-/// resolution the CLI uses on its own, duplicated here only as a
-/// fallback for GitHub enrichment's cache when no `store_dir` was
-/// supplied (see the call site in `report_with`).
+/// `${SWAMP_DIR}`, or the platform's per-user data directory.
+///
+/// Reached through [`crate::platform::data_dir`] rather than repeated
+/// here: two spellings of the store path is how an enrichment cache
+/// ends up somewhere the store is not, and the Linux answer honours
+/// `$XDG_DATA_HOME` while the macOS one does not.
+///
+/// A fallback only for GitHub enrichment's cache when no `store_dir`
+/// was supplied (see the call site in `report_with`). `None` when there
+/// is no home to derive one from: enrichment then runs uncached, which
+/// is slower and correct, rather than caching into the current
+/// directory.
 pub(crate) fn default_github_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("SWAMP_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".local/share/swamp"))
+    crate::platform::data_dir().ok()
 }
 
 /// Renders a `PrStatus` for the `pull_request` signal row and the

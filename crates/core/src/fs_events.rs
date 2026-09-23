@@ -60,6 +60,47 @@ pub enum RefreshRefusal {
     /// platform (non-macOS). Always refuses; there is no fallback stream
     /// to try.
     UnsupportedPlatform,
+    /// This platform's kernel keeps no persisted change history to
+    /// replay from. Linux: inotify reports only what happens while a
+    /// watch is open, so a period with no running watch is a gap, not a
+    /// quiet period. Distinct from [`RefreshRefusal::UnsupportedPlatform`]
+    /// (which says a backend is missing) because this one says the
+    /// backend cannot exist: no amount of implementation work makes a
+    /// Linux kernel able to answer "what changed while you were not
+    /// running". #81 adds the live watch, which narrows the gap to the
+    /// time before the watch opened; it does not remove it.
+    NoPersistedChangeHistory,
+    /// Linux live watch: the kernel's inotify queue overflowed
+    /// (`IN_Q_OVERFLOW`) and dropped events. Nothing since the watch's
+    /// epoch opened can be vouched for.
+    WatchQueueOverflow,
+    /// Linux live watch: `inotify_add_watch` ran out of watches
+    /// (`fs.inotify.max_user_watches`), so part of the root is unwatched.
+    WatchLimitReached,
+    /// Linux live watch: a directory under the root could not be watched
+    /// or listed.
+    WatchPermissionGap,
+    /// Linux live watch: a watched filesystem was unmounted.
+    WatchedFilesystemUnmounted,
+    /// Linux live watch: the kernel removed a watch swamp did not ask it
+    /// to remove.
+    WatchRemoved,
+    /// Linux: a live watch (TUI or `swamp collect`) is running, but the
+    /// stored observation of this root predates its epoch -- the gap
+    /// between the two is not covered by anything.
+    LiveWatchGap,
+    /// Linux: a collector checkpoint exists for this root, but its
+    /// collector is not running (it exited, was killed, or the machine
+    /// rebooted), so the checkpoint says nothing about what happened
+    /// since.
+    CollectorStopped,
+    /// Linux: the collector did not confirm it had drained its event
+    /// queue in time, so its checkpoint might miss a change that has
+    /// already happened.
+    CollectorUnresponsive,
+    /// Linux: the running collector's scope (root identity or
+    /// exclusions) is not the scope this observation walks.
+    ScopeChanged,
 }
 
 impl RefreshRefusal {
@@ -75,6 +116,91 @@ impl RefreshRefusal {
             RefreshRefusal::TooManyChanges => "too_many_changes",
             RefreshRefusal::TooSoon => "too_soon",
             RefreshRefusal::UnsupportedPlatform => "unsupported_platform",
+            RefreshRefusal::NoPersistedChangeHistory => "no_persisted_change_history",
+            RefreshRefusal::WatchQueueOverflow => "watch_queue_overflow",
+            RefreshRefusal::WatchLimitReached => "watch_limit_reached",
+            RefreshRefusal::WatchPermissionGap => "watch_permission_gap",
+            RefreshRefusal::WatchedFilesystemUnmounted => "watched_filesystem_unmounted",
+            RefreshRefusal::WatchRemoved => "watch_removed",
+            RefreshRefusal::LiveWatchGap => "live_watch_gap",
+            RefreshRefusal::CollectorStopped => "collector_stopped",
+            RefreshRefusal::CollectorUnresponsive => "collector_unresponsive",
+            RefreshRefusal::ScopeChanged => "scope_changed",
+        }
+    }
+
+    /// Every variant, for the tests that hold the vocabulary to the
+    /// docs.
+    pub const ALL: &'static [RefreshRefusal] = &[
+        RefreshRefusal::NoStoredEventId,
+        RefreshRefusal::EventIdFromFuture,
+        RefreshRefusal::RootMismatch,
+        RefreshRefusal::FseventsdUnavailable,
+        RefreshRefusal::HelperInconclusive,
+        RefreshRefusal::TooManyChanges,
+        RefreshRefusal::TooSoon,
+        RefreshRefusal::UnsupportedPlatform,
+        RefreshRefusal::NoPersistedChangeHistory,
+        RefreshRefusal::WatchQueueOverflow,
+        RefreshRefusal::WatchLimitReached,
+        RefreshRefusal::WatchPermissionGap,
+        RefreshRefusal::WatchedFilesystemUnmounted,
+        RefreshRefusal::WatchRemoved,
+        RefreshRefusal::LiveWatchGap,
+        RefreshRefusal::CollectorStopped,
+        RefreshRefusal::CollectorUnresponsive,
+        RefreshRefusal::ScopeChanged,
+    ];
+
+    /// The sentence a coverage note or `--json` explanation carries
+    /// beside the code. A reason code tells a script what happened; this
+    /// tells a person why a Linux run walks fully every time and that it
+    /// is the platform, not a misconfiguration.
+    pub fn explanation(self) -> Option<&'static str> {
+        match self {
+            RefreshRefusal::NoPersistedChangeHistory => {
+                crate::platform::ContinuitySource::LiveWatchEpochOnly.no_history_reason()
+            }
+            RefreshRefusal::WatchQueueOverflow => Some(
+                "the kernel's inotify queue overflowed and dropped events, so the watch cannot \
+                 say what changed; a full walk re-establishes the baseline and a new watch epoch \
+                 starts from it",
+            ),
+            RefreshRefusal::WatchLimitReached => Some(
+                "part of the root has no inotify watch because fs.inotify.max_user_watches was \
+                 reached; raise it (sysctl, as root) or narrow the scope. Until then every \
+                 observation of this root walks fully",
+            ),
+            RefreshRefusal::WatchPermissionGap => Some(
+                "a directory under the root could not be watched or listed, so changes there \
+                 are invisible to the watch; every observation of this root walks fully",
+            ),
+            RefreshRefusal::WatchedFilesystemUnmounted => {
+                Some("a watched filesystem was unmounted; the watch no longer covers it")
+            }
+            RefreshRefusal::WatchRemoved => Some(
+                "the kernel removed a watch swamp did not ask it to remove, so part of the root \
+                 went unwatched",
+            ),
+            RefreshRefusal::LiveWatchGap => Some(
+                "a live watch is running, but the last observation of this root happened before \
+                 it started; the time in between is covered by nothing, so this walk is full \
+                 and the next one can use the watch",
+            ),
+            RefreshRefusal::CollectorStopped => Some(
+                "the collector that kept this root's change list is not running (it exited, was \
+                 stopped, or the machine restarted), so its list says nothing about what changed \
+                 since; `swamp collect` (or `swamp schedule --collector`) starts one",
+            ),
+            RefreshRefusal::CollectorUnresponsive => Some(
+                "the collector did not confirm it had read every pending event in time, so its \
+                 change list might be missing one that already happened",
+            ),
+            RefreshRefusal::ScopeChanged => Some(
+                "the running collector watches a different scope (root identity or exclusions) \
+                 than this observation walks; restart it with the current scope",
+            ),
+            _ => None,
         }
     }
 }
@@ -142,6 +268,12 @@ pub struct FsEventsRequest {
     /// it asked about.
     pub root: PathBuf,
     pub since: FsEventsState,
+    /// The store this observation writes to. A live-watch source finds a
+    /// collector's checkpoint there; FSEvents ignores it.
+    pub swamp_dir: Option<PathBuf>,
+    /// What this observation excludes under `root`. A live-watch source
+    /// refuses when its own watch excludes something this walks.
+    pub excluded: Vec<PathBuf>,
 }
 
 /// The verdict: either a complete, incremental account of what changed,
@@ -170,6 +302,10 @@ pub struct FsEventsPlan {
     /// persisted log, so the replay-lag floor (`TooSoon`) does not apply:
     /// a live event is the change, not a query that might predate it.
     pub live: bool,
+    /// Linux collector: which dirty-list entries this plan's walk covers.
+    /// Applied only after the observation's history is written
+    /// (`growth::ObservationCheckpoint::commit`). `None` everywhere else.
+    pub consume: Option<crate::continuity::Consumption>,
 }
 
 impl FsEventsPlan {
@@ -186,6 +322,23 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: true,
+            consume: None,
+        }
+    }
+
+    /// A refusal a live consumer builds itself: the watch lost coverage,
+    /// the collector stopped, or the stored observation predates the
+    /// watch's epoch. The walk is full, and `reason` is what the coverage
+    /// note names.
+    ///
+    /// Marked `live`: the replay-lag floor ([`RefreshRefusal::TooSoon`])
+    /// protects a replay of a *persisted* log that may lag a write, and
+    /// no persisted log was consulted here, so it must not replace the
+    /// actual reason with `too_soon`.
+    pub fn refused(reason: RefreshRefusal, device: Option<u64>) -> Self {
+        Self {
+            live: true,
+            ..Self::refuse(reason, 0, device)
         }
     }
 
@@ -197,9 +350,17 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: false,
+            consume: None,
         }
     }
 
+    /// The successful counterpart of [`FsEventsPlan::refuse`], built
+    /// only by a backend that actually replayed something. Target-gated
+    /// because on a platform with no replay backend there is no caller
+    /// and no way to reach it -- and an unreachable constructor for
+    /// "incremental: true" is exactly the thing a Linux build should
+    /// not contain.
+    #[cfg(target_os = "macos")]
     fn ok(changed_dirs: Vec<PathBuf>, current_event_id: u64, device: Option<u64>) -> Self {
         Self {
             incremental: true,
@@ -208,6 +369,7 @@ impl FsEventsPlan {
             current_event_id,
             device,
             live: false,
+            consume: None,
         }
     }
 
@@ -436,18 +598,36 @@ pub fn platform_source() -> Box<dyn FsEventsSource> {
     {
         Box::new(macos::MacOsFsEventsSource)
     }
+    // Linux: a running collector's checkpoint when there is one and it
+    // can vouch for the gap; the platform's own refusal otherwise
+    // (`crate::continuity`).
     #[cfg(not(target_os = "macos"))]
     {
-        Box::new(UnsupportedPlatformSource)
+        Box::new(crate::continuity::CollectorSource)
     }
 }
 
-/// One delivery from a live [`watch`]: the directories FSEvents reported
-/// (each with its parent, within the root) and the newest event id seen.
-#[derive(Debug, Clone)]
+/// One delivery from a live [`watch`]: the directories the platform's
+/// watcher reported (each with its parent, within the root) and the
+/// newest event id (FSEvents) or sequence number (inotify) seen.
+#[derive(Debug, Clone, Default)]
 pub struct WatchBatch {
+    /// The root the watch is on (the key a consumer with several roots
+    /// needs for a batch that names no path: an epoch opening, a loss).
+    pub root: PathBuf,
     pub changed_dirs: Vec<PathBuf>,
     pub last_event_id: u64,
+    /// The watch stopped being able to vouch for its root (Linux: queue
+    /// overflow, watch limit, permissions, unmount, a removed watch).
+    /// The consumer must walk the root fully, with this reason, and must
+    /// not treat `changed_dirs` as the whole change. Always `None` from
+    /// FSEvents, whose own "rescan" flags are reported as the root.
+    pub coverage_lost: Option<(RefreshRefusal, String)>,
+    /// Linux: when this watch's epoch opened. A root whose stored
+    /// observation predates it is not covered by the watch and needs one
+    /// full walk before live batches can be applied incrementally.
+    /// `None` from FSEvents, whose replay covers the gap itself.
+    pub epoch_opened_at: Option<u64>,
 }
 
 /// A running live stream. Dropping it, or calling `stop`, ends the
@@ -532,6 +712,19 @@ pub fn watch_start_budget() -> std::time::Duration {
 }
 
 impl Watcher {
+    /// A watcher whose thread was started elsewhere in this crate (the
+    /// Linux inotify watch, `live_watch::spawn_watch`).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_parts(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
     pub fn stop(mut self) {
         self.signal_stop();
         if let Some(t) = self.thread.take() {
@@ -562,7 +755,28 @@ impl Drop for Watcher {
 /// [`watch_pending`] and collect readiness afterwards instead, so the
 /// per-stream `fseventsd` latencies overlap rather than add up.
 pub fn watch(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Option<Watcher> {
-    watch_pending(root, tx)?.ready(watch_start_budget())
+    watch_excluding(root, Vec::new(), tx)
+}
+
+/// [`watch`], never reporting a change under `exclude` -- swamp's own
+/// store, so writing an observation's results cannot trigger the next
+/// live refresh. On macOS the exclusion is not needed (the stream is
+/// unchanged: `watch_pending(..).ready(..)`); on Linux the watcher
+/// registers directories itself and simply does not register those.
+pub fn watch_excluding(
+    root: &Path,
+    exclude: Vec<PathBuf>,
+    tx: std::sync::mpsc::Sender<WatchBatch>,
+) -> Option<Watcher> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = exclude;
+        watch_pending(root, tx)?.ready(watch_start_budget())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::live_watch::spawn_watch(root, exclude, tx)
+    }
 }
 
 /// Spawns `root`'s stream thread and returns immediately; the caller
@@ -588,11 +802,29 @@ pub type WatchFactory = fn(&Path, std::sync::mpsc::Sender<WatchBatch>) -> Option
 
 /// The non-macOS fallback: always refuses, naming the platform as the
 /// cause, never a bug in the replay itself.
+///
+/// The refusal it gives is the one the platform's continuity source
+/// justifies, not a generic "unsupported": on Linux there is no
+/// persisted kernel change history to replay from
+/// ([`RefreshRefusal::NoPersistedChangeHistory`]), which is a different
+/// statement from "nobody has written the backend yet" and leads to a
+/// different answer for the user.
 pub struct UnsupportedPlatformSource;
 
 impl FsEventsSource for UnsupportedPlatformSource {
     fn replay(&self, _request: &FsEventsRequest) -> FsEventsPlan {
-        FsEventsPlan::refuse(RefreshRefusal::UnsupportedPlatform, 0, None)
+        FsEventsPlan::refuse(platform_refusal(), 0, None)
+    }
+}
+
+/// Why *this* build cannot replay history. Derived from the platform's
+/// continuity source rather than from the target triple, so a future
+/// backend changes one table instead of every refusal site.
+pub fn platform_refusal() -> RefreshRefusal {
+    if crate::platform::ContinuitySource::for_os(crate::platform::Os::current()).replays_history() {
+        RefreshRefusal::UnsupportedPlatform
+    } else {
+        RefreshRefusal::NoPersistedChangeHistory
     }
 }
 
@@ -603,6 +835,7 @@ impl FsEventsSource for UnsupportedPlatformSource {
 /// `docs/fsevents-helper.md`'s "every path contributes itself and its
 /// parent"); adding both costs one extra listing on re-walk and closes
 /// both a creation and a deletion.
+#[cfg(target_os = "macos")]
 fn add_with_parent(changes: &mut std::collections::HashSet<PathBuf>, root: &Path, path: &Path) {
     for candidate in [
         Some(path.to_path_buf()),
@@ -699,6 +932,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::time::Duration;
 
     #[cfg(target_os = "macos")]
@@ -731,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_platform_source_always_refuses() {
+    fn a_platform_without_a_backend_always_refuses_and_names_which_kind() {
         let source = UnsupportedPlatformSource;
         let plan = source.replay(&FsEventsRequest {
             root: PathBuf::from("/tmp"),
@@ -742,12 +976,54 @@ mod tests {
                 rules_version: 0,
                 unit_root: None,
             },
+            swamp_dir: None,
+            excluded: Vec::new(),
         });
         assert!(!plan.incremental);
-        assert_eq!(plan.refusal, Some(RefreshRefusal::UnsupportedPlatform));
-        assert_eq!(plan.reason_str(), "unsupported_platform");
+        assert!(
+            plan.changed_dirs.is_empty(),
+            "a refusal never carries a change list"
+        );
+        // Which refusal depends on *why* there is no replay. A build on
+        // a kernel that keeps no change history says so; only a target
+        // with no backend written for it says "unsupported".
+        assert_eq!(plan.refusal, Some(platform_refusal()));
+        assert_eq!(plan.reason_str(), platform_refusal().as_str());
     }
 
+    /// The distinction that must not collapse: "no backend yet" invites
+    /// someone to write one; "the kernel keeps no history" is a fact
+    /// about Linux that #81's watcher narrows but does not remove. A
+    /// build that reported the first where the second is true would
+    /// promise a Linux user an incremental refresh that can never come.
+    #[test]
+    fn a_kernel_without_persisted_history_says_so_rather_than_unsupported() {
+        assert_eq!(
+            RefreshRefusal::NoPersistedChangeHistory.as_str(),
+            "no_persisted_change_history"
+        );
+        let why = RefreshRefusal::NoPersistedChangeHistory
+            .explanation()
+            .expect("this refusal must explain itself in words");
+        assert!(why.contains("inotify"), "{why}");
+        assert!(
+            RefreshRefusal::UnsupportedPlatform.explanation().is_none(),
+            "only the platform-history refusal carries that explanation"
+        );
+
+        // And the mapping is derived from the continuity source, not
+        // from a hand-written per-target list.
+        let expected = if crate::platform::ContinuitySource::for_os(crate::platform::Os::current())
+            .replays_history()
+        {
+            RefreshRefusal::UnsupportedPlatform
+        } else {
+            RefreshRefusal::NoPersistedChangeHistory
+        };
+        assert_eq!(platform_refusal(), expected);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn add_with_parent_stays_within_root() {
         let root = Path::new("/root");
@@ -854,6 +1130,10 @@ mod tests {
             (RefreshRefusal::TooManyChanges, "too_many_changes"),
             (RefreshRefusal::TooSoon, "too_soon"),
             (RefreshRefusal::UnsupportedPlatform, "unsupported_platform"),
+            (
+                RefreshRefusal::NoPersistedChangeHistory,
+                "no_persisted_change_history",
+            ),
         ] {
             assert_eq!(reason.as_str(), expected);
         }

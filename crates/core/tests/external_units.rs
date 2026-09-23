@@ -342,11 +342,18 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         &registry,
         1,
     );
-    let (authorized, _) = deny_list_scope.authorized_roots();
+    // Asserted against the roots the scope *considered*, not the ones it
+    // authorized. `authorized_roots` drops a candidate whose path is not
+    // present, so the original form of this assertion held only on a
+    // machine that happened to have CoreSimulator installed: it passed on
+    // a Mac and failed on a Linux runner, for a reason that has nothing
+    // to do with what it is testing. What a deny-list leaves in scope is
+    // a property of the scope, not of the machine running the test.
     assert!(
-        authorized
-            .iter()
-            .any(|r| r.detector_id.as_deref() == Some("core-simulator")),
+        deny_list_scope.roots.iter().any(|r| r.reasons.iter().any(
+            |reason| matches!(reason, swamp_core::scope::RootReason::Detector { detector_id, .. }
+                if detector_id == "core-simulator")
+        )),
         "if this ever stops being true, the allow-list fixtures in this file can be relaxed -- \
          until then they must stay allow-lists"
     );

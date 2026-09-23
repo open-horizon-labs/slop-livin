@@ -83,7 +83,7 @@ The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take
 
 The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals. A cached report can appear while an observation runs in the background; the first run needs an observation before it can display data.
 
-Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live FSEvents watch batches changes after 400 ms of quiet. The header can display a history sparkline; body rows use change bars.
+Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live watch -- FSEvents on macOS, inotify on Linux -- batches changes after 400 ms of quiet. On Linux the first live refresh of each root after the watch opens is one full walk (the time before the watch is covered by nothing), a watch that loses coverage (queue overflow, unmount, a removed watch) makes the next refresh a full walk naming why, and a watch limit or an unreadable directory turns live refresh off for that root with the reason in the status line; the background refresh still covers it. The header can display a history sparkline; body rows use change bars.
 
 ### External and Agents rows, and a scope-coverage header clause
 

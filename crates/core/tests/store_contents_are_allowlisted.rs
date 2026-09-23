@@ -65,6 +65,13 @@ fn allowed(rel: &Path) -> bool {
     if name.starts_with("last_report-") && name.ends_with(".json.zst") {
         return true;
     }
+    // A Linux collector's checkpoint and an observation's sync request
+    // for it (#82): one small control file per watched root.
+    if rel.components().any(|c| c.as_os_str() == "continuity")
+        && (name.ends_with(".json") || name.ends_with(".sync"))
+    {
+        return true;
+    }
     // Lock files and the store's own bookkeeping markers.
     if name.ends_with(".lock") || name == "VERSION" {
         return true;

@@ -65,8 +65,96 @@ impl Trashed {
     }
 }
 
-/// Moves the proof's anchor to `trash_root/dest_name` (one `rename`,
-/// same volume). Returns where it went.
+/// `trash_root/dest_name` on macOS (a plain rename target: `~/.Trash`);
+/// on Linux, the freedesktop Trash spec's `files/` subdirectory, so
+/// `write_trashinfo_sidecar` can find `info/` beside it.
+fn items_dir(trash_root: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        trash_root.join("files")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        trash_root.to_path_buf()
+    }
+}
+
+/// Linux only: the freedesktop Trash spec's per-item metadata
+/// (`$trash/info/<name>.trashinfo`, next to `$trash/files/<name>`
+/// [`items_dir`] just moved into). Best-effort -- a trash manager that
+/// cannot find this sidecar still sees the file under `files/`, so a
+/// failure here does not undo an already-licensed move.
+#[cfg(target_os = "linux")]
+fn write_trashinfo_sidecar(trash_root: &Path, dest_name: &str, original: &Path) -> Result<()> {
+    let info_dir = trash_root.join("info");
+    std::fs::create_dir_all(&info_dir)?;
+    let info_path = info_dir.join(format!("{dest_name}.trashinfo"));
+    if std::fs::symlink_metadata(&info_path).is_ok() {
+        // A previous attempt in the same second already wrote one for
+        // this exact dest_name; leave it rather than clobbering it.
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let content = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        trashinfo_percent_encode(&original.to_string_lossy()),
+        trashinfo_iso8601(now)
+    );
+    std::fs::write(&info_path, content)?;
+    Ok(())
+}
+
+/// Percent-encodes the bytes the freedesktop Trash spec reserves in a
+/// `Path=` value (`%`, control bytes, and the ones that would break a
+/// desktop-entry-style key file: `\n`, `\r`, `\t`). Anything ASCII
+/// printable and not one of those passes through, which keeps ordinary
+/// Unix paths readable while still round-tripping exactly.
+#[cfg(target_os = "linux")]
+fn trashinfo_percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'%' | b'\n' | b'\r' | b'\t' | 0..=0x1f | 0x7f => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// A UTC timestamp in the spec's `YYYY-MM-DDThh:mm:ss` form (no
+/// timezone offset field -- callers, including the reference
+/// implementation, read a bare local time). Computed from the Unix
+/// epoch with plain civil-calendar arithmetic (Howard Hinnant's
+/// `days_from_civil`, doubly reviewed and public domain) rather than a
+/// new dependency for one timestamp.
+#[cfg(target_os = "linux")]
+fn trashinfo_iso8601(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let rem = (unix_secs % 86_400) as i64;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}")
+}
+
+/// Moves the proof's anchor to the Trash (one `rename`, same volume):
+/// `trash_root/dest_name` on macOS; on Linux, `trash_root/files/dest_name`
+/// with a `trash_root/info/dest_name.trashinfo` sidecar (the freedesktop
+/// Trash spec), so a desktop file manager's own Trash view finds it.
+/// Returns where the moved item went.
 pub fn trash_move(
     proof: RecheckProof,
     auth: &Authorized,
@@ -78,15 +166,23 @@ pub fn trash_move(
         bail!("refused: a Docker object is removed in the daemon, never moved to the Trash");
     }
     plain_name(dest_name)?;
-    std::fs::create_dir_all(trash_root).context("could not create the Trash directory")?;
-    let dest = trash_root.join(dest_name);
+    let items = items_dir(trash_root);
+    std::fs::create_dir_all(&items).context("could not create the Trash directory")?;
+    let dest = items.join(dest_name);
     if std::fs::symlink_metadata(&dest).is_ok() {
         bail!("refused: {} already exists in the Trash", dest.display());
     }
-    std::fs::rename(proof.anchor(), &dest)
-        .with_context(|| format!("rename to Trash failed for {}", proof.anchor().display()))?;
+    let anchor = proof.anchor().to_path_buf();
+    std::fs::rename(&anchor, &dest)
+        .with_context(|| format!("rename to Trash failed for {}", anchor.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort: the move already happened and is licensed; a
+        // sidecar that could not be written does not undo it.
+        let _ = write_trashinfo_sidecar(trash_root, dest_name, &anchor);
+    }
     Ok(Trashed {
-        anchor: proof.anchor().to_path_buf(),
+        anchor,
         dest,
         linked_common: proof.linked_common().map(Path::to_path_buf),
     })
@@ -127,8 +223,18 @@ impl Envelope {
                 bail!("cross-device Trash unsupported; no permanent fallback");
             }
         }
-        let dir = trash_root.join(name);
+        let items = items_dir(trash_root);
+        std::fs::create_dir_all(&items).context("could not create the Trash directory")?;
+        let dir = items.join(name);
         std::fs::create_dir_all(&dir).context("could not create Trash envelope")?;
+        #[cfg(target_os = "linux")]
+        {
+            // The envelope directory itself is the trashed item, from
+            // the multi-member unit's own anchor (the session path, the
+            // Cargo group's selected member) -- one sidecar for the
+            // envelope, not one per moved member.
+            let _ = write_trashinfo_sidecar(trash_root, name, proof.anchor());
+        }
         Ok(Envelope {
             dir,
             proof,
@@ -286,4 +392,29 @@ pub fn git_worktree_prune(moved: Trashed, auth: &Authorized) -> Result<()> {
     ];
     super::spawn::run_unchecked(super::spawn::Program::Git, &args, Duration::from_secs(60))?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_trashinfo_tests {
+    use super::*;
+
+    #[test]
+    fn percent_encodes_only_the_reserved_bytes() {
+        assert_eq!(trashinfo_percent_encode("/home/me/build dir"), "/home/me/build dir");
+        assert_eq!(trashinfo_percent_encode("100%"), "100%25");
+        assert_eq!(trashinfo_percent_encode("a\nb\tc\r"), "a%0Ab%09c%0D");
+    }
+
+    #[test]
+    fn iso8601_matches_the_spec_shape() {
+        // 2024-01-02T03:04:05Z
+        let secs = 1_704_164_645u64;
+        assert_eq!(trashinfo_iso8601(secs), "2024-01-02T03:04:05");
+    }
+
+    #[test]
+    fn items_dir_nests_under_files() {
+        let root = Path::new("/tmp/Trash");
+        assert_eq!(items_dir(root), root.join("files"));
+    }
 }

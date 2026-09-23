@@ -2444,12 +2444,34 @@ pub struct ExecuteResult {
     pub actor: String,
 }
 
+/// The Trash root `fs_gate::destroy::trash_move`/`Envelope::open` write
+/// into: `~/.Trash` on macOS (a rename target directly); on Linux, the
+/// freedesktop home trash (`$XDG_DATA_HOME/Trash`, defaulting to
+/// `~/.local/share/Trash`), inside which the gate itself lays out
+/// `files/` and `info/` (see `fs_gate::destroy::items_dir`). Always
+/// overridable via `SWAMP_TRASH_DIR` (tests; never process-global
+/// state).
 pub fn trash_root() -> PathBuf {
     if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
         return PathBuf::from(dir);
     }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg).join("Trash");
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".Trash")
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from(home).join(".local/share/Trash")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PathBuf::from(home).join(".Trash")
+    }
 }
 
 pub fn free_space_bytes(path: &Path) -> Option<u64> {

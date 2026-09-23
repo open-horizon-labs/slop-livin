@@ -34,8 +34,44 @@ pub fn plist_path() -> PathBuf {
     store::launch_agent_plist().unwrap_or_else(|_| PathBuf::from(format!("{LABEL}.plist")))
 }
 
+/// Where a scheduled `observe` writes its log.
+///
+/// `~/Library/Logs/swamp` on macOS, where Console.app looks. On Linux
+/// the XDG base directory spec's *state* directory --
+/// `$XDG_STATE_HOME/swamp`, default `~/.local/state/swamp` -- which is
+/// what that spec's state category is for ("logs, history, recently
+/// used files"), rather than data (`$XDG_DATA_HOME`, where the growth
+/// store lives) or cache. A relative `$XDG_STATE_HOME` is ignored, as
+/// the spec requires. `SWAMP_LOG_DIR` still overrides both.
 pub fn log_dir() -> PathBuf {
-    env_dir("SWAMP_LOG_DIR", home().join("Library/Logs/swamp"))
+    env_dir("SWAMP_LOG_DIR", default_log_dir())
+}
+
+fn default_log_dir() -> PathBuf {
+    match crate::platform::Os::current() {
+        crate::platform::Os::MacOs => home().join("Library/Logs/swamp"),
+        crate::platform::Os::Linux => xdg_dir("XDG_STATE_HOME", ".local/state").join("swamp"),
+    }
+}
+
+/// An XDG base directory, honouring the spec's rule that a relative
+/// value "should be considered invalid and ignored".
+fn xdg_dir(var: &str, fallback_rel: &str) -> PathBuf {
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        _ => home().join(fallback_rel),
+    }
+}
+
+/// Whether this build can install an unattended periodic observation,
+/// and -- when it cannot -- the sentence that says so.
+///
+/// One answer shared by `install`, `uninstall` and `status`. A platform
+/// with no scheduler must refuse: writing a LaunchAgent plist into a
+/// `~/Library/LaunchAgents` no daemon reads would report success for a
+/// job that will never run, which is worse than having no scheduler.
+pub fn scheduling() -> crate::platform::Scheduling {
+    crate::platform::Scheduling::for_os(crate::platform::Os::current())
 }
 
 pub fn log_file() -> PathBuf {
@@ -71,13 +107,16 @@ pub fn format_interval(seconds: u64) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn test_mode() -> bool {
     std::env::var("SWAMP_TEST_MODE").is_ok_and(|v| v == "1")
 }
 
 /// `launchctl` indirection. Under `SWAMP_TEST_MODE=1` every call is a
 /// no-op that prints what it would have run, so no test suite can ever
-/// register a real job on the machine running it.
+/// register a real job on the machine running it. Compiled on macOS
+/// only: a Linux build contains no path that could run `launchctl`.
+#[cfg(target_os = "macos")]
 fn run_launchctl(args: &[&str]) -> Result<bool> {
     if test_mode() {
         println!("[test-mode] launchctl {}", args.join(" "));
@@ -92,6 +131,7 @@ fn run_launchctl(args: &[&str]) -> Result<bool> {
     Ok(out.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     let uid = std::env::var("SWAMP_UID").ok().unwrap_or_else(|| {
         fs_gate::spawn::run(
@@ -107,6 +147,7 @@ fn domain() -> String {
     format!("gui/{uid}")
 }
 
+#[cfg(target_os = "macos")]
 fn load_plist(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     if run_launchctl(&["bootstrap", &domain(), &path_str])? {
@@ -117,6 +158,7 @@ fn load_plist(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn unload_plist(path: &Path) {
     let path_str = path.to_string_lossy().to_string();
     let service = format!("{}/{LABEL}", domain());
@@ -196,15 +238,42 @@ fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("resolve current executable")
 }
 
-/// `swamp schedule --every <interval> <root>...`. `roots` empty (#42/#50)
-/// installs `observe` with no positional roots at all: every scheduled
-/// fire re-resolves the configured scope fresh (see `Command::Observe`'s
-/// `roots.is_empty()` path), rather than replaying whatever roots were
-/// present at install time. Passing explicit roots still freezes exactly
-/// those, same as before -- an explicit root list has always replaced
-/// the configured scope for one invocation, and that includes a
-/// scheduled one.
-pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
+/// `swamp schedule --every <interval> [--collector] <root>...`. `roots`
+/// empty (#42/#50) installs `observe` with no positional roots at all:
+/// every scheduled fire re-resolves the configured scope fresh (see
+/// `Command::Observe`'s `roots.is_empty()` path), rather than replaying
+/// whatever roots were present at install time. Passing explicit roots
+/// still freezes exactly those, same as before -- an explicit root list
+/// has always replaced the configured scope for one invocation, and that
+/// includes a scheduled one.
+///
+/// Which backend installs it is this build's [`scheduling`] answer, and
+/// nothing else: a LaunchAgent on macOS, `systemd --user` units on
+/// Linux. `collector` asks for the Linux live-watch collector as well;
+/// macOS refuses it, because FSEvents already keeps the history a
+/// collector would.
+pub fn install(interval_raw: &str, roots: &[PathBuf], collector: bool) -> Result<String> {
+    match scheduling() {
+        // Before anything is parsed, created or written: a platform with
+        // no scheduling backend refuses and leaves no state behind.
+        crate::platform::Scheduling::Unavailable { .. } => {
+            let refusal = scheduling().refusal().unwrap_or_default();
+            bail!("{refusal}");
+        }
+        crate::platform::Scheduling::LaunchdUserAgent => {
+            if collector {
+                bail!(
+                    "--collector is for platforms without persisted change history; macOS has                      one (FSEvents), so a scheduled observation replays it and needs no resident                      process. Nothing has been installed."
+                );
+            }
+            install_launchd(interval_raw, roots)
+        }
+        crate::platform::Scheduling::SystemdUser => install_systemd(interval_raw, roots, collector),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     let seconds = parse_interval(interval_raw)?;
     let exe = current_exe()?;
     let plist = plist_path();
@@ -241,8 +310,48 @@ pub fn install(interval_raw: &str, roots: &[PathBuf]) -> Result<String> {
     ))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn install_launchd(_interval_raw: &str, _roots: &[PathBuf]) -> Result<String> {
+    bail!("the launchd backend is not compiled into this build; nothing has been installed")
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd(interval_raw: &str, roots: &[PathBuf], collector: bool) -> Result<String> {
+    let seconds = parse_interval(interval_raw)?;
+    let cfg = crate::systemd_user::Config {
+        exe: current_exe()?,
+        interval_secs: seconds,
+        roots: roots.to_vec(),
+        swamp_dir: std::env::var("SWAMP_DIR").ok(),
+        collector,
+    };
+    crate::systemd_user::install(
+        &mut crate::systemd_user::RealSystemctl,
+        &crate::systemd_user::unit_dir()?,
+        &cfg,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_systemd(_interval_raw: &str, _roots: &[PathBuf], _collector: bool) -> Result<String> {
+    bail!("the systemd backend is not compiled into this build; nothing has been installed")
+}
+
 /// `swamp schedule --off`.
 pub fn uninstall() -> Result<String> {
+    match scheduling() {
+        // Nothing could have been installed, so there is nothing to
+        // remove and no scheduler to call.
+        crate::platform::Scheduling::Unavailable { reason, planned } => Ok(format!(
+            "Scheduled observation is not available on this platform: {reason}.\n  Planned in {planned}.\n  Nothing was installed, so nothing was removed.\n"
+        )),
+        crate::platform::Scheduling::LaunchdUserAgent => uninstall_launchd(),
+        crate::platform::Scheduling::SystemdUser => uninstall_systemd(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd() -> Result<String> {
     let plist = plist_path();
     if !fs_gate::exists(&plist) {
         unload_plist(&plist);
@@ -252,6 +361,24 @@ pub fn uninstall() -> Result<String> {
     store::remove_text(store::TextFile::LaunchAgent)
         .with_context(|| format!("remove {}", plist.display()))?;
     Ok(format!("Removed the scheduled observation ({LABEL})\n"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_launchd() -> Result<String> {
+    bail!("the launchd backend is not compiled into this build")
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd() -> Result<String> {
+    crate::systemd_user::uninstall(
+        &mut crate::systemd_user::RealSystemctl,
+        &crate::systemd_user::unit_dir()?,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uninstall_systemd() -> Result<String> {
+    bail!("the systemd backend is not compiled into this build")
 }
 
 /// Reads `StartInterval` back out of the installed plist with a tiny
@@ -418,7 +545,18 @@ fn format_ago(now: u64, then: u64) -> String {
 /// right after `observed_at=...`. `suggested_root` is used only in the
 /// "no schedule" suggestion text.
 pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String {
-    if !fs_gate::exists(plist_path()) {
+    let installed = match scheduling() {
+        // Never suggest `swamp schedule --every ...` on a platform where
+        // that command refuses. A header that advertises a command the
+        // tool will not run is worse than one that says nothing.
+        crate::platform::Scheduling::Unavailable { .. } => {
+            return "no schedule (not available on this platform; run `swamp observe` from your own timer)"
+                .to_string();
+        }
+        crate::platform::Scheduling::LaunchdUserAgent => fs_gate::exists(plist_path()),
+        crate::platform::Scheduling::SystemdUser => crate::systemd_user::timer_installed(),
+    };
+    if !installed {
         return format!(
             "no schedule (swamp schedule --every 30m {})",
             suggested_root.display()
@@ -447,6 +585,19 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
 /// `swamp schedule` with no arguments: report installed/loaded
 /// state, interval, roots, last run, and the next expected run.
 pub fn status(store_dir: &Path) -> Result<String> {
+    match scheduling() {
+        crate::platform::Scheduling::Unavailable { reason, planned } => {
+            // On a platform that cannot install one, reporting "not
+            // installed / enable it with ..." would advertise a command
+            // that refuses.
+            let _ = store_dir;
+            return Ok(format!(
+                "Scheduled observation: not available on this platform\n  Reason:  {reason}\n  Planned: {planned}\n  Until then: run `swamp observe` from your own timer.\n"
+            ));
+        }
+        crate::platform::Scheduling::SystemdUser => return status_systemd(store_dir),
+        crate::platform::Scheduling::LaunchdUserAgent => {}
+    }
     let plist = plist_path();
     if !fs_gate::exists(&plist) {
         return Ok(
@@ -500,6 +651,31 @@ pub fn status(store_dir: &Path) -> Result<String> {
         None => out.push_str("  Last run: none recorded yet\n"),
     }
     Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn status_systemd(store_dir: &Path) -> Result<String> {
+    let mut out = crate::systemd_user::status(
+        &mut crate::systemd_user::RealSystemctl,
+        &crate::systemd_user::unit_dir()?,
+    )?;
+    match read_last_run(store_dir).or_else(|| last_log_outcome(&log_file())) {
+        Some(run) => out.push_str(&format!(
+            "  Last run: {} ({}, mode {}, {} projects, {:.1} s)\n",
+            format_ago(crate::entities::now(), run.observed_at),
+            run.outcome,
+            run.mode,
+            run.projects,
+            run.wall_ms as f64 / 1000.0
+        )),
+        None => out.push_str("  Last run: none recorded yet\n"),
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn status_systemd(_store_dir: &Path) -> Result<String> {
+    bail!("the systemd backend is not compiled into this build")
 }
 
 /// A single-flight lock so a scheduled run and a manual `observe` cannot
@@ -672,8 +848,11 @@ mod tests {
     // test mode) to point launchd/plist/log paths at a temp dir instead
     // of the real machine. Serialized so parallel `cargo test` threads
     // never observe each other's env var.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The crate-wide lock, not a module-local one: `platform`'s tests
+    // unset `HOME`, which `home()` reads (see `crate::TEST_ENV_LOCK`).
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn header_line_reports_no_schedule_when_plist_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -691,6 +870,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn off_removes_plist_and_issues_bootout_in_test_mode() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -713,6 +897,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn off_with_no_plist_still_reports_no_schedule() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -729,6 +918,11 @@ mod tests {
         }
     }
 
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn status_parses_a_fixture_log_and_installed_plist() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -778,6 +972,11 @@ mod tests {
     /// resolving the scope once at install time and freezing the result
     /// into the plist, which would silently stop tracking a later config
     /// edit until `schedule --every` was run again.
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_with_no_roots_freezes_nothing_and_status_says_so() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -789,7 +988,7 @@ mod tests {
             std::env::set_var("SWAMP_TEST_MODE", "1");
         }
 
-        let message = install("30m", &[]).unwrap();
+        let message = install("30m", &[], false).unwrap();
         assert!(message.contains("resolved fresh on every run"), "{message}");
 
         let plist_text = fs::read_to_string(plist_path()).unwrap();
@@ -826,6 +1025,11 @@ mod tests {
 
     /// An explicit root list must still be frozen into the plist exactly
     /// as before -- only the *no-roots* case changed behavior.
+    /// launchd-shaped: it asserts the contents of a plist and the
+    /// `launchctl` calls around it. Gated rather than deleted -- the
+    /// contract it pins is real on the platform that has it, and the
+    /// platform that does not gets its own assertions below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_with_explicit_roots_still_freezes_them() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -837,7 +1041,7 @@ mod tests {
             std::env::set_var("SWAMP_TEST_MODE", "1");
         }
 
-        install("30m", &[PathBuf::from("/Users/test/src")]).unwrap();
+        install("30m", &[PathBuf::from("/Users/test/src")], false).unwrap();
         let plist_text = fs::read_to_string(plist_path()).unwrap();
         assert_eq!(
             installed_roots(&plist_text),
@@ -849,6 +1053,179 @@ mod tests {
             std::env::remove_var("SWAMP_LOG_DIR");
             std::env::remove_var("SWAMP_TEST_MODE");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // The platform that has no scheduler
+    // ---------------------------------------------------------------
+
+    /// Linux with no reachable user manager (no `$XDG_RUNTIME_DIR`: a
+    /// container, cron, a non-login shell): `install` refuses, says what
+    /// to do instead, and leaves nothing behind -- no unit, no log
+    /// directory, and never a LaunchAgent. The tempting shortcut is to
+    /// write the units anyway and report success for a timer that no
+    /// manager will ever run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_without_a_user_manager_refuses_and_writes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_LOG_DIR", logs.path());
+            std::env::set_var("SWAMP_SYSTEMD_UNIT_DIR", units.path().join("user"));
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        let err = install("30m", &[], false).expect_err("no user manager: install must refuse");
+        let message = format!("{err}");
+        assert!(message.contains("no systemd user manager"), "{message}");
+        assert!(
+            message.contains("cron"),
+            "the refusal says what to do instead: {message}"
+        );
+        assert!(
+            !units.path().join("user").exists(),
+            "a refused install created the unit dir"
+        );
+        assert!(std::fs::read_dir(agents.path()).unwrap().next().is_none());
+        assert!(std::fs::read_dir(logs.path()).unwrap().next().is_none());
+        assert!(
+            !plist_path().exists(),
+            "a Linux build never writes a LaunchAgent"
+        );
+
+        unsafe {
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::remove_var("SWAMP_SYSTEMD_UNIT_DIR");
+            if let Some(v) = saved {
+                std::env::set_var("XDG_RUNTIME_DIR", v);
+            }
+        }
+    }
+
+    /// With a user manager (test mode answers for it), the real entry
+    /// point writes swamp's units into the user unit directory and
+    /// nothing into a LaunchAgents directory; `--off` removes them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_and_off_through_the_real_entry_points_use_systemd_units_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let units = tempfile::tempdir().unwrap();
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
+            std::env::set_var("SWAMP_SYSTEMD_UNIT_DIR", units.path());
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+            std::env::set_var("SWAMP_TEST_MODE", "1");
+        }
+        let text = install("1h", &[PathBuf::from("/home/dev/src")], true).unwrap();
+        assert!(text.contains("every 1h"), "{text}");
+        for n in [
+            crate::systemd_user::SERVICE,
+            crate::systemd_user::TIMER,
+            crate::systemd_user::COLLECTOR,
+        ] {
+            assert!(units.path().join(n).exists(), "{n} written");
+        }
+        assert!(std::fs::read_dir(agents.path()).unwrap().next().is_none());
+        let off = uninstall().unwrap();
+        assert!(off.contains("Removed"), "{off}");
+        assert!(std::fs::read_dir(units.path()).unwrap().next().is_none());
+        unsafe {
+            std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
+            std::env::remove_var("SWAMP_SYSTEMD_UNIT_DIR");
+            std::env::remove_var("SWAMP_TEST_MODE");
+            match saved {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+    }
+
+    /// macOS refuses the Linux-only collector rather than installing a
+    /// resident process FSEvents makes unnecessary.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_a_collector() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let err = install("1h", &[], true).expect_err("macOS needs no collector");
+        assert!(format!("{err}").contains("FSEvents"), "{err}");
+    }
+
+    /// Portable across both: whatever the platform, the log directory is
+    /// derived from the platform's own convention and `SWAMP_LOG_DIR`
+    /// overrides it. Neither platform's convention may appear in the
+    /// other's build.
+    #[test]
+    fn the_log_directory_follows_this_platforms_convention_and_the_override_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+        }
+        let derived = log_dir();
+        let text = derived.display().to_string();
+        match crate::platform::Os::current() {
+            crate::platform::Os::MacOs => {
+                assert!(text.contains("Library/Logs/swamp"), "{text}");
+                assert!(
+                    !text.contains(".local/state"),
+                    "an XDG state path on macOS: {text}"
+                );
+            }
+            crate::platform::Os::Linux => {
+                assert!(text.ends_with("swamp"), "{text}");
+                assert!(
+                    !text.contains("Library/Logs"),
+                    "a macOS log path on Linux: {text}"
+                );
+                assert!(
+                    text.contains(".local/state") || std::env::var_os("XDG_STATE_HOME").is_some(),
+                    "Linux logs belong under $XDG_STATE_HOME, not data or cache: {text}"
+                );
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SWAMP_LOG_DIR", tmp.path());
+        }
+        assert_eq!(log_dir(), tmp.path());
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+        }
+    }
+
+    /// A relative `$XDG_STATE_HOME` is invalid per the XDG base
+    /// directory spec and must be ignored, not joined to whatever
+    /// directory the process happens to be in.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_relative_xdg_state_home_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::set_var("XDG_STATE_HOME", "relative/state");
+        }
+        let derived = log_dir();
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        assert!(
+            derived.is_absolute(),
+            "a relative XDG_STATE_HOME produced a relative log directory: {}",
+            derived.display()
+        );
+        assert!(
+            derived.display().to_string().contains(".local/state/swamp"),
+            "{}",
+            derived.display()
+        );
     }
 
     #[test]

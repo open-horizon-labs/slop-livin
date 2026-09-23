@@ -46,6 +46,8 @@ pub mod columns;
 pub mod destroy;
 pub mod git;
 pub mod key;
+#[cfg(target_os = "linux")]
+pub mod procfs;
 pub mod read;
 pub mod spawn;
 pub mod store;

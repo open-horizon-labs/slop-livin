@@ -149,16 +149,25 @@ pub fn cmd_schedule(
     store_dir: PathBuf,
     every: Option<String>,
     off: bool,
+    collector: bool,
     roots: Vec<PathBuf>,
 ) -> Result<()> {
+    // Each call is bound before it is printed rather than written inside
+    // `print!`: the source audit's call graph does not see through macro
+    // tokens, and `platform_capabilities_gate_their_backends` walks from
+    // here to prove every write is behind the platform's scheduling check.
+    // A call hidden in a macro argument is a path that rule cannot follow.
     if off {
-        print!("{}", schedule::uninstall()?);
+        let message = schedule::uninstall()?;
+        print!("{message}");
         return Ok(());
     }
     if let Some(interval) = every {
-        print!("{}", schedule::install(&interval, &roots)?);
+        let message = schedule::install(&interval, &roots, collector)?;
+        print!("{message}");
         return Ok(());
     }
-    print!("{}", schedule::status(&store_dir)?);
+    let message = schedule::status(&store_dir)?;
+    print!("{message}");
     Ok(())
 }

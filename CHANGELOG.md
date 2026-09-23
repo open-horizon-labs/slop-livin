@@ -313,6 +313,102 @@ What is inside a build container, for four ecosystems instead of one.
   `docs/architecture.md`, `docs/usage.md`, and a new
   `skills/swamp/references/build-artifacts.md`.
 
+### Linux x86_64
+
+- **Linux release archives.** Each release now publishes
+  `swamp-<version>-x86_64-unknown-linux-gnu.tar.gz` and
+  `swamp-x86_64-unknown-linux-gnu.tar.gz` (binary, README, `skills/swamp/`)
+  with SHA-256 checksums, built on Ubuntu 24.04 for a generic x86-64 CPU and
+  tested in the release profile there; the archive is also smoke-tested on the
+  newest hosted Ubuntu. Publication waits for both targets and that test-only
+  job, so a release is never half-built. The same packaging and smoke scripts
+  run in CI on every push. No MCP artifact exists for either target.
+- **A live watcher on Linux.** The TUI refreshes live on Linux through inotify,
+  used directly: every directory is watched before it is listed, and every way
+  the watch can lose track -- queue overflow, the watch limit, an unreadable
+  directory, an unmount, a removed watch, too many changes -- makes the next
+  refresh a full walk that names it, never an empty change list. swamp's own
+  store is never watched.
+- **`swamp collect`: optional continuity between runs on Linux.** A
+  user-started collector keeps a bounded change list per root; `observe` and
+  `report` walk only what changed while it runs, and walk fully -- saying why
+  -- when it is not running, after a reboot, after a lost event, when its scope
+  differs, or when the last observation predates it. The list is consumed only
+  after the observation's history is written, and one writer per root at a
+  time (TUI, CLI, scheduled) holds an observation lock. macOS refuses it: it
+  does not need one.
+- **`swamp schedule` on Linux uses `systemd --user`.** A timer and oneshot
+  service, and with `--collector` the collector as a service; absolute binary
+  path, systemd-quoted arguments, bounded retries, journal logs, only
+  swamp-marked units ever replaced or removed, a failed start rolled back.
+  Lingering is reported and never enabled; with no user manager it refuses and
+  writes nothing.
+- **Linux Trash is the freedesktop one.** Every recoverable action now moves
+  through one backend: on Linux into `~/.local/share/Trash` (or the mount's own
+  `.Trash-$uid`) with a `.trashinfo` restore record a file manager reads, by
+  rename only -- a move that would be a copy is refused, never performed, and
+  never replaced by a deletion. A symlinked or foreign-owned trash directory
+  refuses. The ledger records the location and the record. macOS is unchanged.
+  The `trash` crate was evaluated for the move and not used: its `delete`
+  copies and deletes across devices and does not say where an item went.
+- **Linux occupancy reads `/proc`, not `lsof`.** Cwd, root, executable, open
+  files and mapped files of every process running with your credentials; an
+  unreadable process of yours, another PID namespace's `/proc`, or a timeout is
+  unknown, which refuses the action. Processes the kernel does not let you read
+  -- another user's, a more privileged one, a non-dumpable one -- are outside
+  the answer, as they are for `lsof`. Found on the way: the macOS `lsof` probe
+  read a capture it could not read back as "nothing open"; it is now unknown.
+- **Shared-extent filesystems are labelled.** On Btrfs, ZFS, XFS, bcachefs and
+  overlayfs a row's reclaimable bytes are an upper bound naming the
+  filesystem, as APFS's already were.
+- **The toolchain is pinned** (`rust-toolchain.toml`, 1.98.1), so `-D warnings`
+  stops failing on days nobody changed the code.
+
+- **Swamp builds, runs and is tested on Linux x86_64.** CI runs the whole
+  workspace suite natively on Ubuntu 24.04 and on macOS arm64 on every push,
+  and checks on each that the build carries only its own platform's backend --
+  once through the resolved dependency graph and once through the built
+  binary's linkage and symbol table.
+- **A capability a platform does not have is refused and named, never
+  approximated.** Before this work `swamp schedule` on Linux wrote a
+  LaunchAgent plist into a `~/Library/LaunchAgents` no daemon reads and
+  reported success; it now uses `systemd --user` (below), and refuses and
+  writes nothing where no user manager is reachable. An
+  observation on Linux reports `mode=full reason=no_persisted_change_history`
+  rather than `unsupported_platform`: the first says this kernel keeps no
+  change history to replay, which #81's watcher narrows and cannot remove; the
+  second would have said someone forgot to write a backend.
+- **Linux-native locations.** Default scan roots are `~/src` and
+  `$XDG_CACHE_HOME` (`~/.cache`); the growth store honours `$XDG_DATA_HOME`;
+  the scheduled-run log goes to `$XDG_STATE_HOME/swamp`; the trash directory
+  follows the freedesktop specification, including the rule that an item on
+  another mount belongs in that mount's own `.Trash-$uid` rather than a
+  cross-device copy into the home trash. macOS paths are unchanged, including
+  the growth store's, so no existing install's history moves. `swamp scope`
+  now reports which platform's conventions produced its roots, and lists the
+  detectors that do not apply to this platform (`not_applicable_detectors`)
+  instead of omitting them.
+- **A missing `HOME` is an error, not the current directory.** With no `HOME`
+  and no `SWAMP_DIR`, swamp used to write its growth store into whatever
+  directory it was run from -- where the next run from somewhere else would
+  not find it, and every project would look like it had vanished.
+- **Free space is read from the kernel, not parsed out of `df`.** The old code
+  read `df -k`'s fourth whitespace-separated field, which is a macOS column
+  layout: GNU coreutils prints a different header and wraps a long device row,
+  so that field can be the capacity percentage. macOS now uses `statfs` and
+  Linux `statvfs`; macOS's POSIX `statvfs` has 32-bit block counts, which
+  overflow on a volume above 16 TB. One fewer subprocess per call, too.
+- **The platform invariants are audited, not just tested.** A new source audit,
+  `platform_capabilities_gate_their_backends`, derives the capability queries
+  and the scheduling feature from the code itself and requires every path from
+  `swamp schedule` to a write to pass an honoured capability check first, with
+  ten rejection fixtures in the mutation corpus.
+- **Documented**: [docs/platform.md](docs/platform.md) carries the supported
+  targets, the capability table (checked against the code in both directions),
+  where each platform's files live, the traversal limits on overlay, network,
+  Btrfs and ZFS filesystems, and the reuse assessment behind `trash`, `notify`,
+  `walkdir`, `jwalk` and clean-dev-dirs.
+
 ### Repairs after review 2, part 4
 
 What "unchanged" is allowed to mean.

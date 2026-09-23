@@ -117,6 +117,53 @@ pub fn apfs_clone_or_snapshot_bound(allocated_bytes: u64) -> ByteAccounting {
     }
 }
 
+/// The bound for a unit on a filesystem that can share or compress
+/// extents below the file, naming the filesystem. APFS keeps its
+/// original wording ([`apfs_clone_or_snapshot_bound`]) byte for byte;
+/// the Linux filesystems get the same shape with their own mechanism
+/// named, because "clone or snapshot" is not why a Btrfs total or an
+/// overlayfs total overstates.
+pub fn shared_extent_bound(allocated_bytes: u64, filesystem: &str) -> ByteAccounting {
+    if filesystem == "APFS" {
+        return apfs_clone_or_snapshot_bound(allocated_bytes);
+    }
+    let mechanism = match filesystem {
+        "overlayfs" => {
+            "this is a merged view: a file the upper layer did not modify is allocated in a \
+             lower layer this unit does not own"
+        }
+        "ZFS" => "blocks can be compressed, deduplicated or held by a snapshot",
+        "XFS" => "extents can be shared by a reflinked copy elsewhere",
+        _ => "extents can be shared by a reflink or a snapshot, or stored compressed",
+    };
+    ByteAccounting {
+        logical_bytes: None,
+        allocated_bytes,
+        estimated_reclaimable: EstimatedReclaimable::Bounded {
+            min: 0,
+            max: allocated_bytes,
+            reason: format!(
+                "{filesystem}: {mechanism}, and this pass does not query that; allocated bytes \
+                 are an upper bound on what removing this copy frees, not the amount"
+            ),
+        },
+    }
+}
+
+/// `statfs(2)` `f_type` -> the filesystem name [`shared_extent_bound`]
+/// uses, for the filesystems whose allocation overstates what a removal
+/// frees. Pure so both platforms' tests can hold the table.
+pub fn shared_extent_filesystem_for_magic(f_type: u64) -> Option<&'static str> {
+    match f_type {
+        0x9123_683E => Some("Btrfs"),
+        0x2FC1_2FC1 => Some("ZFS"),
+        0x5846_5342 => Some("XFS"),
+        0xCA45_1A4E => Some("bcachefs"),
+        0x794C_7630 => Some("overlayfs"),
+        _ => None,
+    }
+}
+
 /// A unit flagged `hardlinked` (`ArtifactRow::hardlinked`/
 /// `ExternalUnit::hardlinked`'s conservative default) whose exact shared
 /// inode set has not been reconciled this pass (`dedup_stale`): bounded
@@ -548,6 +595,37 @@ mod tests {
             ev.status,
             crate::evidence::FactStatus::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn linux_shared_extent_filesystems_are_bounded_and_named() {
+        assert_eq!(
+            shared_extent_filesystem_for_magic(0x9123_683E),
+            Some("Btrfs")
+        );
+        assert_eq!(
+            shared_extent_filesystem_for_magic(0x794C_7630),
+            Some("overlayfs")
+        );
+        // ext4 and tmpfs share nothing: the exact figure stands.
+        assert_eq!(shared_extent_filesystem_for_magic(0xEF53), None);
+        assert_eq!(shared_extent_filesystem_for_magic(0x0102_1994), None);
+        for fs in ["Btrfs", "ZFS", "XFS", "bcachefs", "overlayfs"] {
+            let acc = shared_extent_bound(4096, fs);
+            match acc.estimated_reclaimable {
+                EstimatedReclaimable::Bounded { min, max, reason } => {
+                    assert_eq!((min, max), (0, 4096));
+                    assert!(reason.starts_with(fs), "{reason}");
+                    assert!(reason.contains("upper bound"), "{reason}");
+                }
+                other => panic!("{fs} must be a bound, not {other:?}"),
+            }
+        }
+        // APFS keeps its original wording exactly.
+        assert_eq!(
+            format!("{:?}", shared_extent_bound(10, "APFS")),
+            format!("{:?}", apfs_clone_or_snapshot_bound(10))
+        );
     }
 
     #[test]
