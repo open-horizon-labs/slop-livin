@@ -161,7 +161,7 @@ pub fn copy_preserved(
     from: &Path,
     dest_dir: &Path,
 ) -> Result<PathBuf> {
-    if !auth.covers(anchor) || !from.starts_with(anchor) {
+    if !auth.covers(anchor) || !crate::scope::under(from, anchor) {
         bail!(
             "refused: {} is not inside an authorized unit",
             from.display()
@@ -191,7 +191,9 @@ pub fn docker_remove(
         ));
     }
     if !matches!(kind, "image" | "volume") {
-        return Err(format!("refused: docker {kind} rm is not a supported removal"));
+        return Err(format!(
+            "refused: docker {kind} rm is not a supported removal"
+        ));
     }
     let args: Vec<std::ffi::OsString> = vec![kind.into(), "rm".into(), id.into()];
     let out = super::spawn::run_unchecked(

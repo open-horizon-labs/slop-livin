@@ -525,8 +525,8 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, bounded_io, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -567,14 +567,14 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions && u.path == jsonl)
+            .find(|u| u.category() == AgentCategory::Sessions && u.path == jsonl)
             .expect("session identified");
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Linked { .. }
         ));
-        assert_eq!(session.action, AgentActionCapability::SessionRemoval);
-        assert_eq!(session.members.len(), 1);
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
+        assert_eq!(session.members().len(), 1);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "prompt content leaked");
     }
@@ -605,9 +605,9 @@ mod tests {
             let units = run(home.path());
             let session = units.iter().find(|u| u.path == jsonl).unwrap();
             assert!(
-                matches!(session.project_link, ProjectLinkState::Linked { .. }),
+                matches!(session.project_link(), ProjectLinkState::Linked { .. }),
                 "shape {i} ({header}) must still resolve: {:?}",
-                session.project_link
+                session.project_link()
             );
         }
     }
@@ -634,7 +634,7 @@ mod tests {
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -649,17 +649,17 @@ mod tests {
         let units = run(home);
         let db = units
             .iter()
-            .find(|u| u.relative_path == "state_5.sqlite")
+            .find(|u| u.relative_path() == "state_5.sqlite")
             .expect("db unit present");
-        assert!(db.protected);
-        assert_eq!(db.action, AgentActionCapability::None);
-        assert_eq!(db.members.len(), 3, "db + wal + shm folded together");
+        assert!(db.protected());
+        assert_eq!(db.action(), AgentActionCapability::None);
+        assert_eq!(db.members().len(), 3, "db + wal + shm folded together");
         assert_eq!(
-            db.bytes,
+            db.bytes(),
             "sqlite-bytes".len() as u64 + "wal-bytes".len() as u64 + "shm-bytes".len() as u64
         );
         assert!(
-            db.members
+            db.members()
                 .iter()
                 .all(|m| m.kind == AgentMemberKind::Database),
             "every member of a SQLite store stays a Database member"
@@ -696,17 +696,17 @@ mod tests {
         for name in expected {
             let db = units
                 .iter()
-                .find(|u| u.relative_path == name)
+                .find(|u| u.relative_path() == name)
                 .unwrap_or_else(|| panic!("{name} must be identified as its own store"));
-            assert!(db.protected, "{name} must be protected");
-            assert_eq!(db.action, AgentActionCapability::None, "{name}");
+            assert!(db.protected(), "{name} must be protected");
+            assert_eq!(db.action(), AgentActionCapability::None, "{name}");
             assert_eq!(
-                db.members.len(),
+                db.members().len(),
                 3,
                 "{name}: db + wal + shm folded together"
             );
             assert!(
-                db.members
+                db.members()
                     .iter()
                     .all(|m| m.kind == AgentMemberKind::Database),
                 "{name}"
@@ -716,11 +716,11 @@ mod tests {
         // where an unmodelled store would otherwise have shown up.
         let residual = units
             .iter()
-            .find(|u| u.category == AgentCategory::Unclassified);
+            .find(|u| u.category() == AgentCategory::Unclassified);
         assert!(
             residual.is_none(),
             "every runtime database must have its own unit: {:?}",
-            residual.map(|u| u.relative_path.clone())
+            residual.map(|u| u.relative_path().to_string())
         );
     }
 
@@ -732,9 +732,9 @@ mod tests {
         touch(&home.join("config.toml"), b"[redacted]");
         let units = run(home);
         for rel in ["auth.json", "config.toml"] {
-            let u = units.iter().find(|u| u.relative_path == rel).unwrap();
-            assert!(u.protected, "{rel} must be protected");
-            assert_eq!(u.action, AgentActionCapability::None);
+            let u = units.iter().find(|u| u.relative_path() == rel).unwrap();
+            assert!(u.protected(), "{rel} must be protected");
+            assert_eq!(u.action(), AgentActionCapability::None);
         }
     }
 
@@ -744,9 +744,9 @@ mod tests {
         let home = home.path();
         touch(&home.join("log").join("codex.log"), b"debug line");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "log").unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        let u = units.iter().find(|u| u.relative_path() == "log").unwrap();
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod tests {
         let units = run(home);
         let residual = units
             .iter()
-            .find(|u| u.relative_path == "(unclassified residual)")
+            .find(|u| u.relative_path() == "(unclassified residual)")
             .expect("residual present");
         assert!(
             residual
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -813,10 +813,10 @@ mod tests {
         assert!(!units.is_empty(), "an unrecognized layout must still speak");
         let residual = units
             .iter()
-            .find(|u| u.relative_path == "(unclassified residual)")
+            .find(|u| u.relative_path() == "(unclassified residual)")
             .expect("an explicit residual row, not silence");
-        assert_eq!(residual.category, AgentCategory::Unclassified);
-        assert_eq!(residual.action, AgentActionCapability::None);
+        assert_eq!(residual.category(), AgentCategory::Unclassified);
+        assert_eq!(residual.action(), AgentActionCapability::None);
         let note = residual.note.as_deref().unwrap_or_default();
         assert!(
             note.contains("no specific rule")
@@ -825,7 +825,7 @@ mod tests {
             "the residual must name what it could not classify: {note}"
         );
         assert!(
-            matches!(residual.project_link, ProjectLinkState::NotApplicable),
+            matches!(residual.project_link(), ProjectLinkState::NotApplicable),
             "an unclassified residual is tool-wide, never linked to a project"
         );
     }
@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             sessions
         );
@@ -902,12 +902,12 @@ mod tests {
         // still protects on its own judgment keep saying why.
         let history = units
             .iter()
-            .find(|u| u.relative_path == "history.jsonl")
+            .find(|u| u.relative_path() == "history.jsonl")
             .expect("history.jsonl identified");
-        assert!(history.protected);
+        assert!(history.protected());
         assert!(
             history
-                .protect_reason
+                .protect_reason()
                 .as_deref()
                 .is_some_and(|r| r.contains("prompt history")),
             "the adapter's own protection reason must survive the builder"
@@ -933,7 +933,7 @@ mod tests {
         touch(&guessed, b"not a json header at all\n");
         let units = run(home);
         let a = units.iter().find(|u| u.path == declared).unwrap();
-        match &a.project_link {
+        match &a.project_link() {
             ProjectLinkState::Linked { source, .. } => {
                 assert_eq!(*source, crate::agents::LinkSource::Declared)
             }
@@ -941,9 +941,9 @@ mod tests {
         }
         let b = units.iter().find(|u| u.path == guessed).unwrap();
         assert!(
-            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(b.project_link(), ProjectLinkState::Unresolved { .. }),
             "a basename is not evidence: {:?}",
-            b.project_link
+            b.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "guessable-project-name");
     }

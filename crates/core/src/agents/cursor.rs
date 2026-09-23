@@ -75,10 +75,10 @@ mod tests {
         let units = run(root);
         let u = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("global db identified");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         let units = run(root);
         let u = units
             .iter()
-            .find(|u| u.relative_path.contains("workspaceStorage"))
+            .find(|u| u.relative_path().contains("workspaceStorage"))
             .expect("workspace db identified");
         assert!(
             u.note
@@ -115,7 +115,7 @@ mod tests {
         touch(&root.join("unrelated.txt"), b"hello");
         let units = run(root);
         assert_eq!(units.len(), 1, "an unrecognized profile must still surface");
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert_eq!(units[0].relative_path(), "(unsupported layout version)");
         assert!(
             units[0]
                 .note
@@ -217,23 +217,24 @@ mod tests {
         let units = run(root);
         let declared = units
             .iter()
-            .find(|u| u.relative_path.contains("/w1/"))
+            .find(|u| u.relative_path().contains("/w1/"))
             .expect("declared workspace identified");
-        let crate::agents::ProjectLinkState::Linked { source, .. } = &declared.project_link else {
-            panic!("expected Linked, got {:?}", declared.project_link);
+        let crate::agents::ProjectLinkState::Linked { source, .. } = &declared.project_link()
+        else {
+            panic!("expected Linked, got {:?}", declared.project_link());
         };
         assert_eq!(*source, crate::agents::LinkSource::Declared);
         let guessed = units
             .iter()
-            .find(|u| u.relative_path.contains("basename-only-repo"))
+            .find(|u| u.relative_path().contains("basename-only-repo"))
             .expect("named workspace identified");
         assert!(
             matches!(
-                guessed.project_link,
+                guessed.project_link(),
                 crate::agents::ProjectLinkState::Unresolved { .. }
             ),
             "{:?}",
-            guessed.project_link
+            guessed.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "basename-only-repo");
     }

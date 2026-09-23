@@ -850,34 +850,6 @@ pub fn report_with_dirs(
     )
 }
 
-/// Same as [`report_with`], with an explicit `enrich` flag: when `true`
-/// (`report --enrich`), GitHub facts are refreshed live (same
-/// concurrent, coalesced `observe_all` path `swamp observe` uses)
-/// before being read back. When `false` (the default for every other
-/// caller, including `report_with`), GitHub facts come **only** from
-/// `enrich.parquet` -- this call never shells out to `gh`. See the
-/// module doc on `github.rs` for why report and observe are split.
-pub fn report_with_enrich(
-    root: &Path,
-    docker_facts: Option<&Path>,
-    verify_du: bool,
-    store_dir: Option<&Path>,
-    since_override: Option<&str>,
-    observe: bool,
-    enrich: bool,
-) -> Result<Report> {
-    report_full(
-        root,
-        docker_facts,
-        verify_du,
-        store_dir,
-        since_override,
-        observe,
-        false,
-        enrich,
-    )
-}
-
 /// The actual implementation behind [`report_with`], [`report_with_observe`],
 /// [`report_with_dirs`], and [`report_with_enrich`]: `observe` controls
 /// whether this call persists a new observation into the growth store or
@@ -1237,11 +1209,12 @@ pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()>
 /// run, TUI), without walking anything. `None` when no observation of
 /// this root has been cached yet.
 pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
-    let bytes = crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
-        store: store_dir,
-        key: &last_report_key(root),
-    })
-    .ok()??;
+    let bytes =
+        crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
+            store: store_dir,
+            key: &last_report_key(root),
+        })
+        .ok()??;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -2093,7 +2066,7 @@ pub fn report_scope_with_parts_covered(
                 // presence/readability check right before walking so a
                 // root that lost access in between is never silently
                 // walked as if it were empty.
-                match crate::fs_gate::read_dir(path) {
+                match crate::fs_gate::probe_listable(path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         coverage.push(RootCoverage::missing(path.clone()));
                         continue;
@@ -2279,6 +2252,32 @@ impl ObservationParts {
 /// there is nowhere else to run a second pass from
 /// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
 #[allow(clippy::too_many_arguments)]
+/// The right to run one observation's unit discovery. Minted only here,
+/// in [`observe_scope`] (the field is private to this module), and
+/// required by `external::discover_and_measure_in` and
+/// `agents::discover_and_measure_in`: the report pipeline owns discovery,
+/// and nothing else can run a second pass over the shared history table
+/// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
+#[derive(Debug)]
+pub struct DiscoveryPass {
+    _minted_by_observe_scope: (),
+}
+
+impl DiscoveryPass {
+    fn begin() -> DiscoveryPass {
+        DiscoveryPass {
+            _minted_by_observe_scope: (),
+        }
+    }
+
+    /// A pass for tests that drive discovery directly (`testing` feature
+    /// or this crate's unit tests only).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_tests() -> DiscoveryPass {
+        DiscoveryPass::begin()
+    }
+}
+
 pub fn observe_scope(
     scope: &crate::scope::EffectiveScope,
     want: ObservationParts,
@@ -2349,9 +2348,11 @@ pub fn observe_scope(
     events.merge(unit_replay.coverage.clone());
     let observed_at = merged.observed_at;
     let mut merged = merged;
+    let pass = DiscoveryPass::begin();
     let mut external_ok = true;
     let mut external_units = if want.external {
-        let measured = crate::external::discover_and_measure(
+        let measured = crate::external::discover_and_measure_in(
+            &pass,
             scope,
             store_dir,
             observe,
@@ -2378,7 +2379,8 @@ pub fn observe_scope(
         .collect();
     let mut agents_ok = true;
     let agent_units = if want.agents {
-        let measured = crate::agents::discover_and_measure(
+        let measured = crate::agents::discover_and_measure_in(
+            &pass,
             scope,
             &project_worktrees,
             store_dir,
@@ -2601,8 +2603,8 @@ pub fn merge_reports(
     // Re-attach from the persisted current-state tables: the
     // declaration/lockfile caches make an unchanged worktree a table
     // lookup, not a re-read. A merge has no external units to join, so
-    // only the project side runs: nothing here reaches a subprocess, and
-    // the TUI calls this on its event thread.
+    // only the project side runs: nothing here reaches a subprocess. The
+    // TUI calls this on its observation workers, never its event thread.
     if let Some(dir) = merged.store_dir.clone() {
         crate::consumer_wiring::attach_project_associations(&mut merged, Some(&dir));
     }
@@ -2631,53 +2633,4 @@ fn merge_summary_into(acc: &mut Summary, add: &Summary) {
             e.growth_bytes = Some(e.growth_bytes.unwrap_or(0) + g);
         }
     }
-}
-
-fn scope_cache_key(scope: &crate::scope::EffectiveScope) -> String {
-    let mut paths: Vec<String> = scope
-        .roots
-        .iter()
-        .filter(|r| matches!(r.status, crate::scope::RootStatus::Present))
-        .map(|r| r.path.display().to_string())
-        .collect();
-    paths.sort();
-    crate::entities::id_for(&paths.join("\u{1}"))[..16].to_string()
-}
-
-
-/// Persists the merged multi-root report from [`report_scope`], the same
-/// way [`write_last_report`] does for a single root, so a cached
-/// `--no-observe`/TUI-startup read never has to re-walk.
-pub fn write_last_scope_report(
-    store_dir: &Path,
-    scope: &crate::scope::EffectiveScope,
-    report: &Report,
-) -> Result<()> {
-    let mut slim = report.clone();
-    slim.dirs_by_worktree = None;
-    slim.files_by_worktree = None;
-    crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::LastReport {
-            store: store_dir,
-            key: &format!("scope-{}", scope_cache_key(scope)),
-        },
-        &slim,
-    )?;
-    Ok(())
-}
-
-/// The last merged multi-root report cached by [`write_last_scope_report`]
-/// for exactly this set of present roots. `None` on any mismatch (first
-/// run, or the scope's present-root set changed since the last cache
-/// write) -- never a stale report for a different scope.
-pub fn load_last_scope_report(
-    store_dir: &Path,
-    scope: &crate::scope::EffectiveScope,
-) -> Option<Report> {
-    let bytes = crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
-        store: store_dir,
-        key: &format!("scope-{}", scope_cache_key(scope)),
-    })
-    .ok()??;
-    serde_json::from_slice(&bytes).ok()
 }

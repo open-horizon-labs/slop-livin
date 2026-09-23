@@ -32,6 +32,158 @@
 //!   silently rewriting historical attribution.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+/// Why a fact is `Unknown` or `Unavailable`. Never blank
+/// (`.oh/guardrails/activity-and-consumer-evidence-have-limits.md`):
+/// "not observed" with nothing saying why is the absence the contract
+/// exists to rule out.
+///
+/// Made three ways, none of which accepts an arbitrary string:
+///
+/// * [`reason!`](crate::reason) with a literal (or a format string and
+///   its arguments) -- checked non-blank **at compile time**;
+/// * [`Reason::fixed`] for a `&'static str` held in a table or an enum;
+/// * [`Reason::carried`] for a reason another fact already computed.
+///
+/// The last two check at run time and substitute an explicit
+/// "not recorded" text for a blank one (and fail a debug build). There is
+/// no `From<String>` and, outside the `testing` feature, no
+/// `From<&str>`: `Evidence::unknown(.., String::from(""))` or a blank
+/// `const` passed straight in does not compile, and neither does a
+/// [`FactStatus::Unknown`] literal built with a plain string -- its
+/// `reason` field is a `Reason` too.
+///
+/// Serialized as its text; deserializing a blank text yields the same
+/// explicit "not recorded" text a blank runtime reason does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reason(Cow<'static, str>);
+
+impl Serialize for Reason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Reason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Reason, D::Error> {
+        let text = String::deserialize(d)?;
+        Ok(if reason_is_blank(&text) {
+            Reason(Cow::Borrowed(NOT_RECORDED))
+        } else {
+            Reason(Cow::Owned(text))
+        })
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for Reason {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Reason {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Reason {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+const NOT_RECORDED: &str = "the reason for this was not recorded (a swamp bug: every Unknown or Unavailable fact must say why)";
+
+/// Whether `s` is empty or only whitespace, in a `const` context.
+#[doc(hidden)]
+pub const fn reason_is_blank(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_whitespace() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl Reason {
+    /// The `reason!` macro's constructor for a formatted reason whose
+    /// template was checked non-blank at compile time.
+    #[doc(hidden)]
+    pub fn __from_checked_format(s: String) -> Reason {
+        // The template was non-blank; its arguments can still format to
+        // nothing (`reason!("{}", x)` with an empty `x`).
+        if reason_is_blank(&s) {
+            return Reason(Cow::Borrowed(NOT_RECORDED));
+        }
+        Reason(Cow::Owned(s))
+    }
+
+    /// A reason held in a table or enum (`&'static str`), checked at run
+    /// time.
+    pub fn fixed(s: &'static str) -> Reason {
+        debug_assert!(!reason_is_blank(s), "blank evidence reason");
+        if reason_is_blank(s) {
+            return Reason(Cow::Borrowed(NOT_RECORDED));
+        }
+        Reason(Cow::Borrowed(s))
+    }
+
+    /// A reason another fact already computed (a refusal text, an
+    /// estimate's own reason), checked at run time.
+    pub fn carried(s: impl Into<String>) -> Reason {
+        let s = s.into();
+        debug_assert!(!reason_is_blank(&s), "blank evidence reason");
+        if reason_is_blank(&s) {
+            return Reason(Cow::Borrowed(NOT_RECORDED));
+        }
+        Reason(Cow::Owned(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<Reason> for String {
+    fn from(r: Reason) -> String {
+        r.0.into_owned()
+    }
+}
+
+/// Test fixtures pass plain literals (`testing` feature only, which no
+/// production build enables).
+#[cfg(any(test, feature = "testing"))]
+impl From<&'static str> for Reason {
+    fn from(s: &'static str) -> Reason {
+        Reason::fixed(s)
+    }
+}
+
+/// A [`Reason`], checked non-blank at compile time:
+/// `reason!("no lock file present")`, or
+/// `reason!("could not stat path: {e}")` / `reason!("{} matches none", x)`.
+#[macro_export]
+macro_rules! reason {
+    ($fmt:literal $(, $($arg:tt)*)?) => {{
+        const _: () = assert!(
+            !$crate::evidence::reason_is_blank($fmt),
+            "an evidence reason must say why the fact is not known"
+        );
+        $crate::evidence::Reason::__from_checked_format(format!($fmt $(, $($arg)*)?))
+    }};
+}
 
 /// The five decision-evidence domains this contract distinguishes.
 /// Corresponds to #54 (Activity), #56/#57 (Consumer), #55 (CurrentUse),
@@ -147,19 +299,19 @@ pub enum FactStatus {
     /// (empty/absent data, out of scanned scope). Never displayed or
     /// treated as "unused"/"safe".
     Unknown {
-        reason: String,
+        reason: Reason,
     },
     /// The source itself could not be consulted this pass (permission
     /// denied, daemon unreachable, query timed out). Distinct from
     /// `Unknown`: here the *source* failed, not just the answer.
     Unavailable {
-        reason: String,
+        reason: Reason,
     },
     /// Two or more sources disagree; every candidate is kept rather than
     /// silently picking one.
     Conflicting {
         candidates: Vec<FactValue>,
-        reason: String,
+        reason: Reason,
     },
 }
 
@@ -257,7 +409,7 @@ impl Evidence {
         subtype: FactSubtype,
         source: EvidenceSource,
         observed_at: u64,
-        reason: impl Into<String>,
+        reason: impl Into<Reason>,
     ) -> Self {
         Self {
             kind,
@@ -278,7 +430,7 @@ impl Evidence {
         subtype: FactSubtype,
         source: EvidenceSource,
         observed_at: u64,
-        reason: impl Into<String>,
+        reason: impl Into<Reason>,
     ) -> Self {
         Self {
             kind,
@@ -300,7 +452,7 @@ impl Evidence {
         candidates: Vec<FactValue>,
         source: EvidenceSource,
         observed_at: u64,
-        reason: impl Into<String>,
+        reason: impl Into<Reason>,
     ) -> Self {
         Self {
             kind,

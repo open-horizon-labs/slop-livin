@@ -118,12 +118,6 @@ pub fn bounded_read_header(path: impl AsRef<Path>, cap: BoundedCap) -> io::Resul
     Ok(read)
 }
 
-/// A whole file that swamp itself wrote (store state). Only the store
-/// modules may name this.
-pub fn read_owned(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
-}
-
 /// [`read_owned`], as UTF-8.
 pub fn read_owned_string(path: impl AsRef<Path>) -> io::Result<String> {
     std::fs::read_to_string(path)

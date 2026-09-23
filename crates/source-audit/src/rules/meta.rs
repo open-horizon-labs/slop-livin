@@ -1,25 +1,28 @@
-//! Guardrail and ADR metadata, checked as data.
+//! Guardrail, ADR and test-contract metadata, checked as data
+//! (`guardrail_metadata`).
 //!
-//! Re-review 3: a new `severity: hard` guardrail with no `audit:` field
-//! passed, because the rule only checked that a *present* `audit:`
-//! resolved. That is how `coverage-changes-are-not-storage-changes.md`
-//! went unwatched into re-review 2's CE4. Now:
-//!
-//! * a hard guardrail names a registered audit, or says `audit: none`
-//!   with a dated `audit_none_reason:` and the `runtime_tests:` that
-//!   watch it instead, each of which must exist;
-//! * a guardrail's `## Detection` section names at least one mutation
-//!   corpus fixture of its audit (`<audit>/<fixture>`), so the prose says
-//!   which rejected shape the claim rests on;
-//! * an ADR's `audits:` resolve and its `cargo_tests:` are parsed
-//!   `#[test]` functions, not text a comment could satisfy.
+//! * A hard guardrail names a registered audit, or says `audit: none`
+//!   with a dated `audit_none_reason:` and at least one `compile_fail:`
+//!   case or `runtime_tests:` entry that watches it instead. Every
+//!   `compile_fail:` case exists (`crates/core/tests/compile_fail/<case>.rs`
+//!   with its expected `.stderr`); every runtime test is a `#[test]` in a
+//!   file Cargo actually builds (a top-level `crates/*/tests/*.rs` target
+//!   or a module one declares, or the crate's own module tree), is not
+//!   ignored in any spelling (`#[ignore]`, `#[cfg_attr(.., ignore)]`),
+//!   and invokes an assertion macro (a *macro invocation*, not the
+//!   substring `assert` in a local's name).
+//! * Every guardrail's `## Detection` section says how it is detected on
+//!   a `Mechanism:` line: `type`, `gate audit`, `clippy` and/or `runtime
+//!   test`.
+//! * An ADR's `validate.audits` resolve and its `cargo_tests` are
+//!   running, asserting tests.
+//! * Every agent adapter module proves the same five things about itself
+//!   as running, asserting tests in its own file
+//!   (`.oh/guardrails/agent-adapter-test-contract.md`).
 
-use super::verdict;
-use crate::audits::AUDITS;
-use quote::ToTokens;
-use std::collections::HashSet;
+use super::{Rule, verdict};
+use crate::model::{TestFn, Workspace, compiled_tests};
 use std::path::Path;
-use syn::visit::Visit;
 
 fn frontmatter(text: &str) -> Vec<String> {
     let mut lines = text.lines();
@@ -53,7 +56,7 @@ fn list(front: &[String], key: &str) -> Vec<String> {
         }
         if on {
             match t.strip_prefix("- ") {
-                Some(item) => out.push(item.trim().to_string()),
+                Some(item) => out.push(item.trim().trim_matches('"').to_string()),
                 None => on = false,
             }
         }
@@ -61,17 +64,18 @@ fn list(front: &[String], key: &str) -> Vec<String> {
     out
 }
 
-/// The text of the `## Detection` section.
-fn detection(text: &str) -> String {
+fn section(text: &str, name: &str) -> Option<String> {
     let mut out = String::new();
     let mut on = false;
+    let mut found = false;
     for l in text.lines() {
         if l.starts_with("## ") {
             on = l
                 .trim_start_matches('#')
                 .trim()
                 .to_ascii_lowercase()
-                .starts_with("detection");
+                .starts_with(name);
+            found |= on;
             continue;
         }
         if on {
@@ -79,100 +83,7 @@ fn detection(text: &str) -> String {
             out.push('\n');
         }
     }
-    out
-}
-
-/// `(name, ignored, asserts)` for every `#[test]` function in a file.
-fn test_fns(file: &syn::File) -> Vec<(String, bool, bool)> {
-    struct V(Vec<(String, bool, bool)>);
-    impl<'ast> Visit<'ast> for V {
-        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
-            if f.attrs.iter().any(|a| a.path().is_ident("test")) {
-                let body = f.block.to_token_stream().to_string();
-                let asserts = [
-                    "assert",
-                    "panic !",
-                    "unwrap_err",
-                    "expect_err",
-                    "contract ::",
-                ]
-                .iter()
-                .any(|a| body.contains(a));
-                self.0.push((
-                    f.sig.ident.to_string(),
-                    f.attrs.iter().any(|a| a.path().is_ident("ignore")),
-                    asserts,
-                ));
-            }
-            syn::visit::visit_item_fn(self, f);
-        }
-    }
-    let mut v = V(Vec::new());
-    v.visit_file(file);
-    v.0
-}
-
-/// Every running, asserting `#[test]` in the workspace's crates, sources
-/// and integration tests alike.
-fn all_tests(root: &Path) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Ok(rd) = std::fs::read_dir(root.join("crates")) else {
-        return out;
-    };
-    for krate in rd.flatten() {
-        let name = krate.file_name().to_string_lossy().into_owned();
-        for sub in ["src", "tests"] {
-            for rel in crate::resolve::rust_files_recursive(root, &format!("crates/{name}/{sub}")) {
-                let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
-                    continue;
-                };
-                let Ok(ast) = crate::ast::parse_cached(&rel, &text) else {
-                    continue;
-                };
-                for (n, ignored, asserts) in test_fns(&ast) {
-                    if !ignored && asserts {
-                        out.insert(n);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Whether `rel` defines a running, asserting `#[test] fn name`.
-pub fn integration_test_exists(root: &Path, rel: &str, name: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
-        return false;
-    };
-    let Ok(ast) = crate::ast::parse_cached(rel, &text) else {
-        return false;
-    };
-    test_fns(&ast)
-        .iter()
-        .any(|(n, ignored, asserts)| n == name && !ignored && *asserts)
-}
-
-/// Every fixture id (`<audit>/<stem>`) in the mutation corpus.
-fn fixture_ids(root: &Path) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let dir = root.join("crates/source-audit/tests/mutations");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for a in rd.flatten() {
-        if !a.path().is_dir() {
-            continue;
-        }
-        let audit = a.file_name().to_string_lossy().into_owned();
-        for f in std::fs::read_dir(a.path()).into_iter().flatten().flatten() {
-            let n = f.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = n.strip_suffix(".rs") {
-                out.insert(format!("{audit}/{stem}"));
-            }
-        }
-    }
-    out
+    found.then_some(out)
 }
 
 fn dated(s: &str) -> bool {
@@ -187,87 +98,144 @@ fn dated(s: &str) -> bool {
     })
 }
 
-pub fn adr_validation(root: &Path) -> Result<(), String> {
-    let names: Vec<&str> = AUDITS.iter().map(|(n, _)| *n).collect();
-    let mut problems = Vec::new();
-    let tests = all_tests(root);
-    let fixtures = fixture_ids(root);
-    let gdir = root.join(".oh/guardrails");
-    let mut seen = 0;
-    let mut entries: Vec<_> = std::fs::read_dir(&gdir)
-        .map_err(|e| format!("read .oh/guardrails: {e}"))?
-        .flatten()
+const ASSERTING_MACROS: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "assert_matches",
+    "debug_assert",
+    "panic",
+];
+
+/// Whether a test asserts something: an assertion macro invocation, or a
+/// call into a shared `contract` helper (which asserts).
+pub fn asserts(t: &TestFn) -> bool {
+    t.macros
+        .iter()
+        .any(|m| ASSERTING_MACROS.contains(&m.as_str()))
+        || t.calls
+            .iter()
+            .any(|c| c.split("::").any(|s| s == "contract"))
+}
+
+/// The running, asserting test a spec names: `file.rs::name`, a bare
+/// `name`, or a whole test file (`crates/x/tests/y.rs`), which needs at
+/// least one running, asserting test of its own.
+fn running<'a>(tests: &'a [TestFn], spec: &str) -> Option<&'a TestFn> {
+    if spec.ends_with(".rs") {
+        return tests
+            .iter()
+            .find(|t| t.file == spec && !t.ignored && asserts(t));
+    }
+    let (file, name) = match spec.split_once(".rs::") {
+        Some((f, n)) => (Some(format!("{f}.rs")), n.rsplit("::").next().unwrap_or(n)),
+        None => (None, spec.rsplit("::").next().unwrap_or(spec)),
+    };
+    tests.iter().find(|t| {
+        t.name == name && !t.ignored && asserts(t) && file.as_ref().is_none_or(|f| &t.file == f)
+    })
+}
+
+const MECHANISMS: &[&str] = &["type", "gate audit", "clippy", "runtime test"];
+
+/// The five facts every agent adapter proves about itself.
+pub const REQUIRED_ADAPTER_TESTS: &[&str] = &[
+    "unknown_format_is_explicit_not_empty",
+    "canary_content_never_appears_in_output",
+    "identification_reads_no_more_than_header_cap",
+    "protected_categories_default_protected",
+    "project_link_is_declared_or_unresolved_never_basename_guess",
+];
+
+pub fn guardrail_metadata(ws: &Workspace) -> Vec<String> {
+    let root = &ws.root;
+    let names = crate::audits::names();
+    let (tests, test_errors) = compiled_tests(root);
+    let mut problems: Vec<String> = test_errors
+        .into_iter()
+        .map(|e| format!("a test file does not parse: {e}"))
         .collect();
+    let gdir = root.join(".oh/guardrails");
+    let mut entries: Vec<_> = match std::fs::read_dir(&gdir) {
+        Ok(rd) => rd.flatten().collect(),
+        Err(e) => return vec![format!("read .oh/guardrails: {e}")],
+    };
     entries.sort_by_key(|e| e.path());
+    let mut seen = 0;
     for e in entries {
         if e.path().extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
         let rel = format!(".oh/guardrails/{}", e.file_name().to_string_lossy());
-        let text = std::fs::read_to_string(e.path()).map_err(|e| e.to_string())?;
+        let Ok(text) = std::fs::read_to_string(e.path()) else {
+            problems.push(format!("{rel}: unreadable"));
+            continue;
+        };
         seen += 1;
         let front = frontmatter(&text);
         let severity = value(&front, "severity").unwrap_or_default();
+        let compile_fail = list(&front, "compile_fail");
+        let runtime = list(&front, "runtime_tests");
+        for case in &compile_fail {
+            let rs = root.join(format!("crates/core/tests/compile_fail/{case}.rs"));
+            let stderr = root.join(format!("crates/core/tests/compile_fail/{case}.stderr"));
+            if !rs.is_file() || !stderr.is_file() {
+                problems.push(format!(
+                    "{rel}: compile_fail case `{case}` has no crates/core/tests/compile_fail/{case}.rs \
+                     and .stderr pair"
+                ));
+            }
+        }
+        for t in &runtime {
+            if running(&tests, t).is_none() {
+                problems.push(format!(
+                    "{rel}: runtime test `{t}` is not a #[test] Cargo builds, runs (not ignored in \
+                     any spelling) and that invokes an assertion"
+                ));
+            }
+        }
         match value(&front, "audit").as_deref() {
             None if severity == "hard" => problems.push(format!(
-                "{rel}: `severity: hard` with no `audit:` -- a hard guardrail names the audit that \
-                 watches it, or says `audit: none` with a dated reason and the runtime tests that \
-                 watch it instead"
+                "{rel}: `severity: hard` with no `audit:` -- name the registered audit that \
+                 watches it, or say `audit: none` with a dated reason and the compile_fail cases \
+                 or runtime tests that watch it instead"
             )),
             None => {}
             Some("none") => {
                 let reason = value(&front, "audit_none_reason").unwrap_or_default();
-                let runtime = list(&front, "runtime_tests");
-                if severity == "hard" && (!dated(&reason) || runtime.is_empty()) {
+                if severity == "hard"
+                    && (!dated(&reason) || (runtime.is_empty() && compile_fail.is_empty()))
+                {
                     problems.push(format!(
-                        "{rel}: `audit: none` on a hard guardrail needs a dated `audit_none_reason:` \
-                         and a non-empty `runtime_tests:` list"
+                        "{rel}: `audit: none` on a hard guardrail needs a dated \
+                         `audit_none_reason:` and a non-empty `compile_fail:` or `runtime_tests:` \
+                         list"
                     ));
                 }
-                for t in runtime {
-                    // `path/to/test.rs` (a test file with at least one
-                    // running, asserting test) or `path/to/test.rs::name`.
-                    let (file, name) = match t.split_once(".rs::") {
-                        Some((f, n)) => (format!("{f}.rs"), Some(n.to_string())),
-                        None if t.ends_with(".rs") => (t.clone(), None),
-                        None => (
-                            String::new(),
-                            Some(t.rsplit("::").next().unwrap_or(&t).to_string()),
-                        ),
-                    };
-                    let ok = match (&file, &name) {
-                        (f, Some(n)) if !f.is_empty() => integration_test_exists(root, f, n),
-                        (f, None) => std::fs::read_to_string(root.join(f))
-                            .ok()
-                            .and_then(|text| crate::ast::parse_cached(f, &text).ok())
-                            .is_some_and(|ast| {
-                                test_fns(&ast)
-                                    .iter()
-                                    .any(|(_, ig, asserts)| !ig && *asserts)
-                            }),
-                        (_, Some(n)) => tests.contains(n),
-                    };
-                    if !ok {
+            }
+            Some(a) => {
+                for one in a.split(',').map(str::trim) {
+                    if !names.contains(&one) {
                         problems.push(format!(
-                            "{rel}: runtime test `{t}` is not a running, asserting #[test]"
+                            "{rel}: names audit `{one}`, which is not registered"
                         ));
                     }
                 }
             }
-            Some(a) => {
-                if !names.contains(&a) {
-                    problems.push(format!("{rel}: names audit `{a}`, which is not registered"));
-                } else {
-                    let det = detection(&text);
-                    let named = fixtures
-                        .iter()
-                        .any(|id| id.starts_with(&format!("{a}/")) && det.contains(id.as_str()));
-                    if !named {
-                        problems.push(format!(
-                            "{rel}: its Detection section names no mutation-corpus fixture of \
-                             `{a}` (write one as `{a}/<fixture>`)"
-                        ));
-                    }
+        }
+        match section(&text, "detection") {
+            None => problems.push(format!("{rel}: no `## Detection` section")),
+            Some(det) => {
+                let line = det
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("Mechanism:"))
+                    .map(str::to_ascii_lowercase);
+                match line {
+                    Some(l) if MECHANISMS.iter().any(|m| l.contains(m)) => {}
+                    _ => problems.push(format!(
+                        "{rel}: its Detection section has no `Mechanism:` line naming one of \
+                         {MECHANISMS:?}"
+                    )),
                 }
             }
         }
@@ -275,33 +243,73 @@ pub fn adr_validation(root: &Path) -> Result<(), String> {
     if seen == 0 {
         problems.push(".oh/guardrails is empty".into());
     }
-    let adr_dir = root.join("docs/ADRs");
-    for e in std::fs::read_dir(&adr_dir)
-        .map_err(|e| format!("read docs/ADRs: {e}"))?
-        .flatten()
-    {
-        if e.path().extension().and_then(|x| x.to_str()) != Some("md") {
-            continue;
-        }
-        let text = std::fs::read_to_string(e.path()).map_err(|e| e.to_string())?;
-        let front = frontmatter(&text);
-        let rel = format!("docs/ADRs/{}", e.file_name().to_string_lossy());
-        for a in list(&front, "audits") {
-            if !names.contains(&a.as_str()) {
-                problems.push(format!("{rel}: names audit `{a}`, which is not registered"));
+    // ADRs.
+    if let Ok(rd) = std::fs::read_dir(root.join("docs/ADRs")) {
+        let mut adrs: Vec<_> = rd.flatten().collect();
+        adrs.sort_by_key(|e| e.path());
+        for e in adrs {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
             }
-        }
-        for t in list(&front, "cargo_tests") {
-            let fn_name = t.rsplit("::").next().unwrap_or(&t).to_string();
-            if !tests.contains(&fn_name) {
-                problems.push(format!(
-                    "{rel}: names test `{t}`, which is not a running, asserting #[test]"
-                ));
+            let rel = format!("docs/ADRs/{}", e.file_name().to_string_lossy());
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            let front = frontmatter(&text);
+            for a in list(&front, "audits") {
+                if !names.contains(&a.as_str()) {
+                    problems.push(format!("{rel}: names audit `{a}`, which is not registered"));
+                }
+            }
+            for t in list(&front, "cargo_tests") {
+                if running(&tests, &t).is_none() {
+                    problems.push(format!(
+                        "{rel}: names test `{t}`, which is not a running, asserting #[test]"
+                    ));
+                }
             }
         }
     }
+    // Adapter test contracts.
+    for m in &ws.modules {
+        if !crate::rules::gate::is_adapter(m) || m.test {
+            continue;
+        }
+        if !m.str_consts.iter().any(|(n, _, _)| n.ends_with("_TOOL_ID")) {
+            continue;
+        }
+        let missing: Vec<&str> = REQUIRED_ADAPTER_TESTS
+            .iter()
+            .copied()
+            .filter(|name| {
+                !tests
+                    .iter()
+                    .any(|t| t.file == m.file && t.name == *name && !t.ignored && asserts(t))
+            })
+            .collect();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "{}: adapter {} is missing running, asserting contract tests: {}",
+                m.file,
+                m.display(),
+                missing.join(", ")
+            ));
+        }
+    }
+    problems
+}
+
+pub fn guardrail_metadata_at(root: &Path) -> Result<(), String> {
+    let ws = Workspace::load(root);
     verdict(
-        "guardrail and ADR metadata resolve to real audits, fixtures and tests",
-        problems,
+        "guardrail, ADR and contract-test metadata resolve to real audits, compile-fail cases \
+         and running tests",
+        guardrail_metadata(&ws),
     )
 }
+
+pub const RULES: &[Rule] = &[("guardrail_metadata", |ws| {
+    verdict(
+        "guardrail, ADR and contract-test metadata resolve to real audits, compile-fail cases and \
+         running tests",
+        guardrail_metadata(ws),
+    )
+})];

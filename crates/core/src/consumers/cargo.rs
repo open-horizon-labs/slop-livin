@@ -19,7 +19,12 @@ impl Consumer for CargoConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::RootObserved, EventKind::RowsAssembled]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         if let Event::RootObserved { changed_paths, .. } = event {
             *self.changed.lock().unwrap() = changed_paths.clone();
             return Ok(vec![]);

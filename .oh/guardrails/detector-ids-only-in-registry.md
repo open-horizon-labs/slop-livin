@@ -3,7 +3,9 @@ id: detector-ids-only-in-registry
 severity: hard
 statement: "Detector identity lives in locations/ (and the scope layer that consumes it). Consumers -- association wiring, recovery hints, reports, CLI, TUI -- match on capabilities the detector declares (Detector::manager_conventions(), Detector::recovery_hint()), never on detector id constants or id string literals."
 outcome: coverage-aware-storage-history
-audit: detector_ids_only_in_registry
+audit: ids_only_in_their_module
+runtime_tests:
+  - crates/core/tests/external_units.rs
 ---
 
 ## Rationale
@@ -20,11 +22,11 @@ can be added in one place.
 
 ## Detection
 
-Detector ids are derived: the constants a `Detector::id()` returns, with their values. Outside the detector implementations' modules, the trait's module and the scope interpreters, no function or item names a detector-id constant, and no function dispatches on two or more detector-id values (match arms or `==` comparisons). The `Detector` trait declares `manager_conventions()`.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `detector_ids_only_in_registry/01-wiring-matches-a-detector-id`, `detector_ids_only_in_registry/02-cli-matches-a-detector-id`, `detector_ids_only_in_registry/03-tui-matches-a-detector-id`, `detector_ids_only_in_registry/04-sweep3`.
+**Gate audit.** `ids_only_in_their_module`: a detector id literal (the value of a `*_DETECTOR_ID`) appears only in its detector module and the registry -- in a `match`, a comparison or an item-level table alike. The ids that are also an ecosystem's everyday name (`npm`, `go`, `maven`, ...) are a reviewed list in the rule.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `detector_ids_only_in_registry` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## Runtime tests that complete it
 

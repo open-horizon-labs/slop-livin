@@ -3,7 +3,9 @@ id: agent-adapters-do-not-reach-detectors
 severity: hard
 statement: "Adapters reference nothing under crate::locations except neutral vocabulary types (StorageCategory, Platform, Provenance). Detector ids and home resolution live in locations/."
 outcome: coverage-aware-storage-history
-audit: agent_adapters_do_not_reach_detectors
+audit: adapters_do_not_reach_gates
+runtime_tests:
+  - crates/core/tests/agent_matrix_matches_docs.rs
 ---
 
 ## Rationale
@@ -19,11 +21,11 @@ told the answer.
 
 ## Detection
 
-No adapter function's signature or body, and no adapter item-level declaration (const, static, type alias, field), names a path into `locations::` other than the shared vocabulary -- derived as the `locations` data types that the shared agent model's own fields carry -- and the bounded lister. A detector module, a detector id, the `Detector` trait, `Environment` and `Registry` are detector identity.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_do_not_reach_detectors/01-adapter-reads-detector-ids`, `agent_adapters_do_not_reach_detectors/02-adapter-names-a-detector-type`, `agent_adapters_do_not_reach_detectors/03-aliased-locations-reach`, `agent_adapters_do_not_reach_detectors/04-sweep3`.
+**Gate audit.** `adapters_do_not_reach_gates`: no adapter names `locations` (resolved through `use`, renames and glob imports), so neither a detector nor a detector id constant is reachable from one.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `agent_adapters_do_not_reach_detectors` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## Runtime tests that complete it
 

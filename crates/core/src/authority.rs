@@ -61,10 +61,6 @@ impl HumanConfirmed {
         }
     }
 
-    pub fn site(&self) -> ConfirmationSite {
-        self.site
-    }
-
     pub fn actor(&self) -> &str {
         &self.actor
     }

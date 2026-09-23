@@ -1,5 +1,5 @@
 use crate::entities::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::{path::PathBuf, sync::Arc};
@@ -60,15 +60,6 @@ impl Store {
             crate::fs_gate::columns::DEFAULT_ZSTD_LEVEL,
         )
     }
-    pub fn read_observation(&self, volume: u64) -> Result<Vec<Artifact>> {
-        let path = self.path(volume);
-        if !crate::fs_gate::columns::has_parquet_footer(&path)
-            .with_context(|| format!("read {}", path.display()))?
-        {
-            anyhow::bail!("store is not a Parquet file")
-        }
-        Ok(Vec::new())
-    }
     pub fn volume_path(&self, volume: u64) -> PathBuf {
         self.path(volume)
     }
@@ -77,8 +68,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::scan::{ScanOptions, observation};
+    use std::fs;
     use tempfile::tempdir;
     #[test]
     fn writes_real_parquet() {

@@ -867,6 +867,7 @@ fn the_walk_and_the_unit_cursor_share_one_file_without_erasing_each_other() {
     // deliberately re-stamps nothing but the rules version.
     for (at, id) in [(2_000u64, 20u64), (3_000, 30)] {
         swamp_core::growth::observe_tracked_with_source(
+            &swamp_core::bus::Stage::for_tests(),
             fx.store.path(),
             &fx.claude,
             at,

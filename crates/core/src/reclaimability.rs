@@ -74,14 +74,14 @@ fn reclaimable_evidence(estimate: &EstimatedReclaimable, source: EvidenceSource)
             vec![FactValue::Bytes(*min), FactValue::Bytes(*max)],
             source,
             now(),
-            reason.clone(),
+            crate::evidence::Reason::carried(reason.clone()),
         ),
         EstimatedReclaimable::Unknown { reason } => Evidence::unknown(
             FactKind::Reclaimability,
             FactSubtype::EstimatedReclaimable,
             source,
             now(),
-            reason.clone(),
+            crate::evidence::Reason::carried(reason.clone()),
         ),
     }
 }
@@ -225,9 +225,9 @@ impl DockerByteAccounting {
                         detail: "docker system df object accounting".into(),
                     },
                     now(),
-                    "removing this object frees an unknown amount of host backing store: layers \
+                    crate::reason!("removing this object frees an unknown amount of host backing store: layers \
                      may be shared with other images, and the VM disk image does not shrink on \
-                     its own",
+                     its own"),
                 )
                 .with_note(
                     "the host disk-image allocation was not measured this pass, so no filesystem \
@@ -352,7 +352,7 @@ pub fn observed_free_space_change(free_before: Option<u64>, free_after: Option<u
             FactSubtype::ObservedFreed,
             EvidenceSource::Statvfs,
             observed_at,
-            "free space was not measured on both sides of this action",
+            crate::reason!("free space was not measured on both sides of this action"),
         ),
     }
 }

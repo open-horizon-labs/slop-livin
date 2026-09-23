@@ -3,7 +3,14 @@ id: tui-refresh-preserves-scope
 severity: hard
 statement: "Every TUI observation -- startup, background refresh, live watch, post-action re-observe -- goes through the scope-aware report path. Excluded subtrees and pruned external locations stay absent on refresh. External/agent unit vectors are refreshed only from an observation that covered the whole scope; a refresh narrowed to one root asks for no unit parts and leaves those vectors alone."
 outcome: coverage-aware-storage-history
-audit: tui_refresh_preserves_scope
+audit: none
+audit_none_reason: "2026-09-22: which report entry point the TUI calls is checked by the runtime tests, which drive every refresh path against a scoped store"
+compile_fail:
+  - fs_events_testing_is_not_in_production
+runtime_tests:
+  - crates/tui/tests/scope_preserving_refresh.rs
+  - crates/tui/tests/reviewer_counterexamples_stack2_tui.rs
+  - crates/tui/tests/reviewer_counterexamples_stack2_tui.rs::a_live_refresh_of_one_root_must_not_empty_the_agent_view
 ---
 
 ## Rationale
@@ -25,11 +32,15 @@ render.
 
 ## Detection
 
-No TUI function calls a public function of the report module (derived: the modules that run the bus, with child modules) that takes a bare root and no scope, unless it only loads a stored report back; a call into the report module that resolves to nothing fails.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `tui_refresh_preserves_scope/01-scopeless-report-with`, `tui_refresh_preserves_scope/02-scopeless-full-mode`, `tui_refresh_preserves_scope/03-scopeless-single-root`, `tui_refresh_preserves_scope/04-sweep3`.
+**Runtime test.** The refresh tests start each TUI observation (startup, background, live) against a scope with an excluded subtree and a pruned external location and assert they stay absent, and that a one-root live refresh leaves the unit vectors alone.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Type.** The live refresh replays a real `LivePlanSource`; the canned source is `testing`-only.
+
+Retired 2026-09-22: the `tui_refresh_preserves_scope` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `fs_events_testing_is_not_in_production`.
 
 ## Runtime tests that complete it
 

@@ -5,11 +5,7 @@
 
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::disallowed_methods,
-        clippy::disallowed_types,
-        unsafe_code
-    )
+    deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
 )]
 
 pub mod actions;
@@ -231,13 +227,16 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             a.scope = scope.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             let (scope2, store2) = (scope.clone(), store.clone());
+            let (roots, cache) = (a.roots.clone(), a.reports_by_root.clone());
             crate::worker::spawn(move || {
                 let Some(scope2) = scope2 else {
-                    let _ = tx.send(Ok(app::RefreshedObservation {
-                        per_root: Vec::new(),
-                        external_units: None,
-                        agent_units: None,
-                    }));
+                    let _ = tx.send(Ok(app::RefreshedObservation::merged_on_worker(
+                        &roots,
+                        cache,
+                        Vec::new(),
+                        None,
+                        None,
+                    )));
                     return;
                 };
                 // include_dirs: the Source row expands into its own
@@ -259,10 +258,14 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                     30,
                     24 * 3600,
                 )
-                .map(|o| app::RefreshedObservation {
-                    per_root: o.per_root.into_iter().collect(),
-                    external_units: Some(o.external_units),
-                    agent_units: Some(o.agent_units),
+                .map(|o| {
+                    app::RefreshedObservation::merged_on_worker(
+                        &roots,
+                        cache,
+                        o.per_root.into_iter().collect(),
+                        Some(o.external_units),
+                        Some(o.agent_units),
+                    )
                 });
                 let _ = tx.send(res);
             });
@@ -493,20 +496,12 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             app.observing = None;
             match res {
                 Ok(fresh) => {
-                    // Each pair replaces exactly its own root's entry
-                    // (#51): a live/background refresh of one or more
-                    // roots never touches any other root's rows.
-                    for (root, r) in fresh.per_root {
-                        app.replace_report_for_root(root, r);
-                    }
-                    // External and agent units come from the same pass,
-                    // so the agent view is never older than the header.
-                    if let Some(units) = fresh.external_units {
-                        app.set_external_units(units);
-                    }
-                    if let Some(units) = fresh.agent_units {
-                        app.set_agent_units(units);
-                    }
+                    // Each re-observed root replaced exactly its own
+                    // entry (#51) on the worker, which also merged: a
+                    // live/background refresh of one or more roots never
+                    // touches any other root's rows, and the event thread
+                    // only installs what the worker prepared.
+                    app.install_refreshed(fresh);
                     app.observed_label = "just now".into();
                 }
                 Err(e) => app.status = Some(format!("observation failed: {e}")),

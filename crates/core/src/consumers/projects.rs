@@ -20,7 +20,12 @@ impl Consumer for ProjectsConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::RootObserved]
     }
-    async fn on_event(&self, event: &Event, _ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        _ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::RootObserved {
             discovered,
             attribution,

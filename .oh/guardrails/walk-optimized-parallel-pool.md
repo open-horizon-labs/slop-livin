@@ -3,7 +3,10 @@ id: walk-optimized-parallel-pool
 severity: soft
 statement: "The full walk runs on the work-stealing pool with folded units sized as parallel Size jobs; no serial walk on the report path."
 outcome: disk-growth-by-project
-audit: walk_optimized_parallel_pool
+audit: none
+audit_none_reason: "2026-09-22: the serial `attribution::attribute` is test-only code (`#[cfg(test)]`), so production has no serial walk to call; the pool tests measure the parallel one"
+runtime_tests:
+  - crates/core/src/walk.rs::tests::pool_drains_under_cpu_contention
 ---
 
 ## Rationale
@@ -11,9 +14,8 @@ audit: walk_optimized_parallel_pool
 
 ## Detection
 
-`walk::discover_and_attribute` reaches the function that drains the worker pool, and the serial `attribution::attribute` has no production caller.
+Mechanism: runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `walk_optimized_parallel_pool/01-serial-walk-on-report-path`, `walk_optimized_parallel_pool/02-serial-walk-in-a-consumer`, `walk_optimized_parallel_pool/03-aliased-serial-walk`, `walk_optimized_parallel_pool/04-sweep3`.
+**Runtime test.** The pool test drains the work-stealing pool under CPU contention; the serial `attribute` exists only under `#[cfg(test)]`, so no production code can reach it.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
-
+Retired 2026-09-22: the `walk_optimized_parallel_pool` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.

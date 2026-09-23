@@ -3,7 +3,13 @@ id: agent-units-built-through-builder
 severity: hard
 statement: "Adapters build units through AgentUnitBuilder::new(tool, category, path), whose constructor applies the protected-by-default categories (credentials, configuration, skills, automation definitions, databases). Lifting a default protection requires an explicit reason."
 outcome: decision-relevant-storage-evidence
-audit: agent_units_built_through_builder
+audit: none
+audit_none_reason: "2026-09-22: the property is a type: every field that decides protection or action capability is private to `agents::unit`, so no source audit is needed"
+compile_fail:
+  - agent_units_are_built_by_the_builder
+  - agent_units_protection_not_via_a_binding
+runtime_tests:
+  - crates/core/tests/agent_refusal_matrix.rs
 ---
 
 ## Rationale
@@ -20,11 +26,13 @@ inverts the default: forgetting to think about it yields the safe answer.
 
 ## Detection
 
-No adapter function builds a `CandidateAgentUnit`/`AgentUnit` struct literal (resolved path; literals inside macro arguments count), writes a field the builder decides from the category (derived: the fields `AgentUnitBuilder` initializes from values it derives from `category`), or calls `unprotect_with_reason` with an argument that evaluates empty.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_units_built_through_builder/01-aliased-struct-literal`, `agent_units_built_through_builder/02-plain-struct-literal`, `agent_units_built_through_builder/03-unprotect-without-reason`, `agent_units_built_through_builder/04-sweep3`.
+**Type.** `CandidateAgentUnit`'s fields are private to `agents::unit` (only `path` and `note`, which decide nothing, are public); `AgentUnitBuilder` sets protected-by-default and is the only constructor. Assigning `protected`, directly or through a `&mut` binding, does not compile anywhere else.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `agent_units_built_through_builder` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `agent_units_are_built_by_the_builder`, `agent_units_protection_not_via_a_binding`.
 
 ## Runtime tests that complete it
 

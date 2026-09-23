@@ -41,10 +41,7 @@ impl Ledger {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        lines
-            .iter()
-            .map(|l| Ok(serde_json::from_str(l)?))
-            .collect()
+        lines.iter().map(|l| Ok(serde_json::from_str(l)?)).collect()
     }
     pub fn path(&self) -> &Path {
         &self.path

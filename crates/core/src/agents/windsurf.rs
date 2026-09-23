@@ -91,10 +91,10 @@ mod tests {
         let units = run(root);
         let u = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("global db identified");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     // --- the five contract tests ---------------------------------------
@@ -107,7 +107,7 @@ mod tests {
         fs::write(root.join("unrelated.txt"), b"hello").unwrap();
         let units = run(root);
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert_eq!(units[0].relative_path(), "(unsupported layout version)");
         assert!(
             units[0]
                 .note
@@ -188,10 +188,10 @@ mod tests {
         let units = run(root);
         let declared = units
             .iter()
-            .find(|u| u.relative_path.contains("/w1/"))
+            .find(|u| u.relative_path().contains("/w1/"))
             .expect("declared workspace identified");
         assert!(matches!(
-            declared.project_link,
+            declared.project_link(),
             crate::agents::ProjectLinkState::Linked {
                 source: crate::agents::LinkSource::Declared,
                 ..
@@ -199,15 +199,15 @@ mod tests {
         ));
         let guessed = units
             .iter()
-            .find(|u| u.relative_path.contains("basename-only-repo"))
+            .find(|u| u.relative_path().contains("basename-only-repo"))
             .expect("named workspace identified");
         assert!(
             matches!(
-                guessed.project_link,
+                guessed.project_link(),
                 crate::agents::ProjectLinkState::Unresolved { .. }
             ),
             "{:?}",
-            guessed.project_link
+            guessed.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "basename-only-repo");
     }

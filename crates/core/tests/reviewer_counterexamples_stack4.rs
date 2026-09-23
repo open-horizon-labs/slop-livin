@@ -179,7 +179,11 @@ fn a_stored_rules_version_without_an_anchor_still_forces_the_rules_walk() {
 
     let dir = swamp_core::growth::volume_store_dir(store.path(), &root);
     let state = dir.join("fsevents.json");
-    assert!(state.exists(), "the first observation anchors at {}", state.display());
+    assert!(
+        state.exists(),
+        "the first observation anchors at {}",
+        state.display()
+    );
     let older = swamp_core::ecosystem::RULES_VERSION - 1;
     fs::write(
         &state,
@@ -300,6 +304,10 @@ fn every_citation_symbol_is_on_a_line_the_refetch_verifies() {
             }
         }
     }
-    assert!(blocks.len() >= 40, "parsed {} citation blocks", blocks.len());
+    assert!(
+        blocks.len() >= 40,
+        "parsed {} citation blocks",
+        blocks.len()
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

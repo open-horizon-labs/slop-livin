@@ -74,12 +74,13 @@ impl KeyedTable {
 
     /// Every row as `(key, fingerprint, observed_at, values)`.
     fn read(&self) -> Result<Vec<StoredRow>> {
-        let Some(reader) = crate::fs_gate::columns::open_parquet(&self.path).with_context(|| {
-            format!(
-                "read {} (delete it to re-derive this cache)",
-                self.path.display()
-            )
-        })?
+        let Some(reader) =
+            crate::fs_gate::columns::open_parquet(&self.path).with_context(|| {
+                format!(
+                    "read {} (delete it to re-derive this cache)",
+                    self.path.display()
+                )
+            })?
         else {
             return Ok(Vec::new());
         };

@@ -14,10 +14,16 @@ path = "src/main.rs"
 [dependencies]
 syn = { workspace = true, features = ["visit-mut"] }
 quote = "1"
-proc-macro2 = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# The compile_fail cases (`crates/core/tests/compile_fail/`) build against
+# swamp-core *without* its `testing` feature -- the production API -- so
+# they run from this crate, not swamp-core's own test harness (which
+# enables `testing` through its self dev-dependency).
+swamp-core = { path = "../core" }
+trybuild = "1"
 
 [lints]
 workspace = true

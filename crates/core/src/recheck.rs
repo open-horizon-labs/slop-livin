@@ -592,7 +592,7 @@ pub(crate) fn member_occupancy(paths: &[PathBuf]) -> OccupancyState {
     // probe the anchor plus any member that is not beneath it.
     let mut probed: Vec<&PathBuf> = Vec::new();
     for p in paths {
-        if probed.iter().any(|q| p.starts_with(q)) {
+        if probed.iter().any(|q| crate::scope::under(p, q)) {
             continue;
         }
         probed.push(p);

@@ -8,6 +8,7 @@ audit_none_reason: "2026-09-22: the claim is about upstream files and vendored e
 runtime_tests:
   - crates/core/tests/upstream_citations_are_checked.rs
   - crates/core/tests/agent_matrix_matches_docs.rs::no_prose_paragraph_asserts_doubt_a_supported_row_has_resolved
+  - crates/core/tests/agent_matrix_matches_docs.rs
 ---
 
 ## Rationale
@@ -43,6 +44,8 @@ claim rests on -- the claim was true; the citation did not establish it.
 A length check on a provenance string is not provenance.
 
 ## Detection
+
+Mechanism: runtime test.
 
 `audit: none`, deliberately, and this is the honest label rather than a
 missing one: the property is about the *content of an upstream file*,

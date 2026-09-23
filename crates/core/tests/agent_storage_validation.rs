@@ -199,15 +199,15 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
         let units = result.expect("an empty transcript must never panic identification");
         let unit = units
             .iter()
-            .find(|u| u.path == jsonl)
+            .find(|u| u.path() == jsonl)
             .expect("the empty session is still identified as a unit");
         assert!(
             matches!(
-                unit.project_link,
+                unit.project_link(),
                 swamp_core::agents::ProjectLinkState::Unresolved { .. }
             ),
             "{:?}",
-            unit.project_link
+            unit.project_link()
         );
     }
     // Codex: a header line that is not valid JSON at all.
@@ -221,15 +221,15 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
             identify_with!(swamp_core::agents::codex::identify, home.path())
         });
         let units = result.expect("invalid JSON header must never panic identification");
-        let unit = units.iter().find(|u| u.path == jsonl);
+        let unit = units.iter().find(|u| u.path() == jsonl);
         if let Some(unit) = unit {
             assert!(
                 matches!(
-                    unit.project_link,
+                    unit.project_link(),
                     swamp_core::agents::ProjectLinkState::Unresolved { .. }
                 ),
                 "{:?}",
-                unit.project_link
+                unit.project_link()
             );
         }
     }
@@ -279,7 +279,7 @@ fn unrecognized_or_unknown_schema_units_are_never_actionable() {
         );
         for u in &units {
             assert_eq!(
-                u.action,
+                u.action(),
                 AgentActionCapability::None,
                 "an unrecognized-schema unit must never carry a destructive action capability: {u:?}"
             );
@@ -318,31 +318,31 @@ fn oh_my_pi_shared_blob_reference_states_are_explicit_and_never_actionable() {
     let units = identify_with!(swamp_core::agents::oh_my_pi::identify, home);
     let referenced = units
         .iter()
-        .find(|u| u.path.ends_with(&referenced_hash))
+        .find(|u| u.path().ends_with(&referenced_hash))
         .expect("referenced blob identified");
     let unreferenced = units
         .iter()
-        .find(|u| u.path.ends_with(&unreferenced_hash))
+        .find(|u| u.path().ends_with(&unreferenced_hash))
         .expect("unreferenced blob identified");
-    assert_eq!(referenced.action, AgentActionCapability::None);
-    assert_eq!(unreferenced.action, AgentActionCapability::None);
+    assert_eq!(referenced.action(), AgentActionCapability::None);
+    assert_eq!(unreferenced.action(), AgentActionCapability::None);
     assert!(
         referenced
-            .note
+            .note()
             .as_deref()
             .unwrap_or_default()
             .contains("referenced by"),
         "{:?}",
-        referenced.note
+        referenced.note()
     );
     assert!(
         unreferenced
-            .note
+            .note()
             .as_deref()
             .unwrap_or_default()
             .contains("no referencing session found"),
         "{:?}",
-        unreferenced.note
+        unreferenced.note()
     );
 }
 
@@ -713,14 +713,14 @@ fn relinking_a_session_to_a_different_project_leaves_bytes_and_growth_history_un
     // never spent against a cached derivation.
     let rechecked = swamp_core::agents::reidentify_for_tool("claude-code", &claude_home, 2_000)
         .expect("the claude-code adapter must be registered");
-    let rechecked_unit = rechecked.iter().find(|u| u.path == jsonl).unwrap();
+    let rechecked_unit = rechecked.iter().find(|u| u.path() == jsonl).unwrap();
     assert!(
         matches!(
-            &rechecked_unit.project_link,
+            &rechecked_unit.project_link(),
             swamp_core::agents::ProjectLinkState::Linked { project_name, .. } if project_name == "proj-bbbb"
         ),
         "a fresh re-identification must see the moved attribution: {:?}",
-        rechecked_unit.project_link
+        rechecked_unit.project_link()
     );
 
     // The ordinary report path, under the event coverage an ordinary

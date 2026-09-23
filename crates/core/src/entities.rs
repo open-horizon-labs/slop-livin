@@ -99,20 +99,6 @@ pub struct Observation {
     pub coverage_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeTruth {
-    pub attributed_bytes: u64,
-    pub reported_bytes: u64,
-    pub residuals: Vec<Residual>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Residual {
-    pub cause: String,
-    pub bytes: Option<u64>,
-    pub explained: bool,
-}
-
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -1,0 +1,15 @@
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+  --> $WORKSPACE/crates/core/tests/compile_fail/trash_move_needs_a_recheck_proof.rs
+   |
+   |     let _ = trash_move(auth, Path::new("/tmp/trash"), "debug");
+   |             ^^^^^^^^^^ ---- argument #1 of type `RecheckProof` is missing
+   |
+note: function defined here
+  --> $WORKSPACE/crates/core/src/fs_gate/destroy.rs
+   |
+   | pub fn trash_move(
+   |        ^^^^^^^^^^
+help: provide the argument
+   |
+10 |     let _ = trash_move(/* RecheckProof */, auth, Path::new("/tmp/trash"), "debug");
+   |                        +++++++++++++++++++

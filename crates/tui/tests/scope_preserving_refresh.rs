@@ -129,9 +129,8 @@ fn an_excluded_subtree_stays_absent_after_a_background_refresh() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the refresh worker answered")
         .expect("the refresh succeeded");
-    for (root, r) in fresh.per_root {
-        app.replace_report_for_root(root, r);
-    }
+    // Exactly what the event loop does with a finished observation.
+    app.install_refreshed(fresh);
 
     let after = all_paths(&app.report);
     assert!(

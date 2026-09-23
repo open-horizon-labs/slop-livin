@@ -440,8 +440,8 @@ fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, bounded_io, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -466,7 +466,7 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unknown format)");
+        assert_eq!(units[0].relative_path(), "(unknown format)");
     }
 
     #[test]
@@ -477,10 +477,10 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "config.json")
+            .find(|u| u.relative_path() == "config.json")
             .unwrap();
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -492,9 +492,9 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "mcp-secrets")
+            .find(|u| u.relative_path() == "mcp-secrets")
             .unwrap();
-        assert!(u.protected);
+        assert!(u.protected());
     }
 
     #[test]
@@ -514,12 +514,12 @@ mod tests {
         for (rel, note) in PROTECTED_CONFIG_DIRS.iter().chain(PROTECTED_CONFIG_FILES) {
             let u = units
                 .iter()
-                .find(|u| u.relative_path == *rel)
+                .find(|u| u.relative_path() == *rel)
                 .unwrap_or_else(|| panic!("{rel} must still be identified"));
-            assert_eq!(u.category, AgentCategory::ProtectedConfig, "{rel}");
-            assert!(u.protected, "{rel} must be protected");
+            assert_eq!(u.category(), AgentCategory::ProtectedConfig, "{rel}");
+            assert!(u.protected(), "{rel} must be protected");
             assert_eq!(
-                u.protect_reason.as_deref(),
+                u.protect_reason().as_deref(),
                 Some(*note),
                 "{rel} must keep its own stated reason"
             );
@@ -527,7 +527,7 @@ mod tests {
         assert!(
             !units
                 .iter()
-                .any(|u| u.relative_path == "(unclassified residual)"),
+                .any(|u| u.relative_path() == "(unclassified residual)"),
             "every documented entry has a rule, so nothing falls through"
         );
     }
@@ -563,12 +563,12 @@ mod tests {
         let units = run(home);
         let s = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions && u.relative_path.contains("s1"))
+            .find(|u| u.category() == AgentCategory::Sessions && u.relative_path().contains("s1"))
             .expect("session unit present");
-        let ProjectLinkState::Unresolved { reason } = &s.project_link else {
+        let ProjectLinkState::Unresolved { reason } = &s.project_link() else {
             panic!(
                 "an undocumented field must not produce a link: {:?}",
-                s.project_link
+                s.project_link()
             );
         };
         assert!(
@@ -576,14 +576,14 @@ mod tests {
             "the reason must say the schema is undocumented: {reason}"
         );
         assert_eq!(
-            s.action,
+            s.action(),
             AgentActionCapability::None,
             "no selective action on a session whose project this tool cannot name"
         );
         // The bytes are still identified and measured -- the directory
         // layout is confirmed; only the claim about what is inside is
         // withdrawn.
-        assert!(s.bytes > 0, "the session's bytes must still be reported");
+        assert!(s.bytes() > 0, "the session's bytes must still be reported");
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -597,10 +597,10 @@ mod tests {
         let units = run(home);
         let s = units
             .iter()
-            .find(|u| u.relative_path.contains("s2"))
+            .find(|u| u.relative_path().contains("s2"))
             .unwrap();
         assert!(matches!(
-            s.project_link,
+            s.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -617,10 +617,10 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "command-history-state")
+            .find(|u| u.relative_path() == "command-history-state")
             .unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -632,11 +632,11 @@ mod tests {
         let units = run(home);
         let db = units
             .iter()
-            .find(|u| u.relative_path == "session-store.db")
+            .find(|u| u.relative_path() == "session-store.db")
             .unwrap();
-        assert!(db.protected);
-        assert_eq!(db.action, AgentActionCapability::None);
-        assert_eq!(db.members.len(), 2);
+        assert!(db.protected());
+        assert_eq!(db.action(), AgentActionCapability::None);
+        assert_eq!(db.members().len(), 2);
     }
 
     #[test]
@@ -646,8 +646,8 @@ mod tests {
         touch(&home.join("settings.json"), b"{}");
         touch(&home.join("ide/lock.json"), b"{}");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "ide").unwrap();
-        assert_eq!(u.action, AgentActionCapability::None);
+        let u = units.iter().find(|u| u.relative_path() == "ide").unwrap();
+        assert_eq!(u.action(), AgentActionCapability::None);
         assert!(
             u.note
                 .as_deref()
@@ -662,8 +662,8 @@ mod tests {
         let home = home.path();
         touch(&home.join("logs/session.log"), b"debug");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "logs").unwrap();
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        let u = units.iter().find(|u| u.relative_path() == "logs").unwrap();
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -704,9 +704,9 @@ mod tests {
         fs::create_dir_all(dir.path().join("some-other-tool")).unwrap();
         let units = run(dir.path());
         assert_eq!(units.len(), 1, "an unrecognized home must still speak");
-        assert_eq!(units[0].relative_path, "(unknown format)");
-        assert_eq!(units[0].category, AgentCategory::Unclassified);
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unknown format)");
+        assert_eq!(units[0].category(), AgentCategory::Unclassified);
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         let note = units[0].note.as_deref().unwrap_or_default();
         assert!(
             note.contains("no GitHub Copilot CLI content markers found")
@@ -714,7 +714,7 @@ mod tests {
             "the row must say what was looked for and what was not done: {note}"
         );
         assert!(
-            matches!(units[0].project_link, ProjectLinkState::NotApplicable),
+            matches!(units[0].project_link(), ProjectLinkState::NotApplicable),
             "an unknown-format home is not a project linkage question"
         );
     }
@@ -741,9 +741,9 @@ mod tests {
         );
         let units = run(home);
         assert!(
-            units
-                .iter()
-                .any(|u| u.category == AgentCategory::Sessions && u.relative_path.contains("s1")),
+            units.iter().any(
+                |u| u.category() == AgentCategory::Sessions && u.relative_path().contains("s1")
+            ),
             "session identified"
         );
         contract::no_content_leak(&units, canary);
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             sessions
         );
@@ -814,11 +814,11 @@ mod tests {
         contract::protection_defaults_hold(&units);
         let db = units
             .iter()
-            .find(|u| u.relative_path == "session-store.db")
+            .find(|u| u.relative_path() == "session-store.db")
             .expect("the SQLite store is identified");
-        assert!(db.protected);
+        assert!(db.protected());
         assert!(
-            db.protect_reason
+            db.protect_reason()
                 .as_deref()
                 .is_some_and(|r| r.contains("never opened while writable")),
             "the adapter's own protection reason must survive the builder"
@@ -850,21 +850,21 @@ mod tests {
         let units = run(home);
         let a = units
             .iter()
-            .find(|u| u.relative_path.contains("declared"))
+            .find(|u| u.relative_path().contains("declared"))
             .unwrap();
         assert!(
-            matches!(a.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(a.project_link(), ProjectLinkState::Unresolved { .. }),
             "an undocumented field must never become a link: {:?}",
-            a.project_link
+            a.project_link()
         );
         let b = units
             .iter()
-            .find(|u| u.relative_path.contains("looks-like-a-project"))
+            .find(|u| u.relative_path().contains("looks-like-a-project"))
             .unwrap();
         assert!(
-            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(b.project_link(), ProjectLinkState::Unresolved { .. }),
             "a directory name must never become a link: {:?}",
-            b.project_link
+            b.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "looks-like-a-project");
     }

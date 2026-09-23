@@ -283,7 +283,7 @@ fn identify_file_tree_sessions(
             identify_one_project_dir(home, &project_dir, &project_link, ctx)
         });
         for unit in &units {
-            if let Some(stem) = unit.path.file_stem().and_then(|s| s.to_str()) {
+            if let Some(stem) = unit.path().file_stem().and_then(|s| s.to_str()) {
                 // Derived from the replayed units, not from a variable
                 // the closure mutated: a container that is replayed must
                 // claim exactly what it claimed when it was identified,
@@ -613,8 +613,8 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, LinkSource, bounded_io, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -659,14 +659,14 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Linked { .. }
         ));
-        assert_eq!(session.action, AgentActionCapability::SessionRemoval);
-        assert_eq!(session.members.len(), 2, "transcript + message companion");
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
+        assert_eq!(session.members().len(), 2, "transcript + message companion");
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -706,28 +706,29 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
         assert!(
-            session.members.iter().any(|m| m
+            session.members().iter().any(|m| m
                 .path
                 .to_string_lossy()
                 .ends_with("storage/session_diff/s1.json")),
             "the diff file must be a member of its session: {:?}",
-            session.members
+            session.members()
         );
         assert!(
-            session.bytes >= 4096,
+            session.bytes() >= 4096,
             "the diff's bytes must be in the session's total, not merely named: {}",
-            session.bytes
+            session.bytes()
         );
 
         let residual = units
             .iter()
-            .find(|u| u.relative_path == "storage/session_diff (unlinked)")
+            .find(|u| u.relative_path() == "storage/session_diff (unlinked)")
             .expect("an unclaimed diff file must still be reported");
         assert_eq!(
-            residual.bytes, 2048,
+            residual.bytes(),
+            2048,
             "exactly the orphan's bytes, and only once"
         );
     }
@@ -744,15 +745,16 @@ mod tests {
         let units = run(home);
         let db = units
             .iter()
-            .find(|u| u.relative_path == "opencode.db")
+            .find(|u| u.relative_path() == "opencode.db")
             .expect("db unit present");
-        assert!(db.protected);
-        assert_eq!(db.action, AgentActionCapability::None);
-        assert_eq!(db.members.len(), 2);
+        assert!(db.protected());
+        assert_eq!(db.action(), AgentActionCapability::None);
+        assert_eq!(db.members().len(), 2);
         assert!(
             units
                 .iter()
-                .all(|u| u.category != AgentCategory::Sessions || u.relative_path == "opencode.db"),
+                .all(|u| u.category() != AgentCategory::Sessions
+                    || u.relative_path() == "opencode.db"),
             "no separate file-tree session unit once DB-backed"
         );
     }
@@ -765,10 +767,10 @@ mod tests {
         let units = run(home);
         let part = units
             .iter()
-            .find(|u| u.relative_path == "storage/part")
+            .find(|u| u.relative_path() == "storage/part")
             .unwrap();
-        assert!(part.protected);
-        assert_eq!(part.action, AgentActionCapability::None);
+        assert!(part.protected());
+        assert_eq!(part.action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -785,10 +787,13 @@ mod tests {
         let units = run(home);
         let snap = units
             .iter()
-            .find(|u| u.category == AgentCategory::Checkpoints)
+            .find(|u| u.category() == AgentCategory::Checkpoints)
             .expect("snapshot identified");
-        assert_eq!(snap.action, AgentActionCapability::None);
-        assert!(matches!(snap.project_link, ProjectLinkState::Linked { .. }));
+        assert_eq!(snap.action(), AgentActionCapability::None);
+        assert!(matches!(
+            snap.project_link(),
+            ProjectLinkState::Linked { .. }
+        ));
     }
 
     #[test]
@@ -799,10 +804,10 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "auth.json")
+            .find(|u| u.relative_path() == "auth.json")
             .unwrap();
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -811,9 +816,9 @@ mod tests {
         let home = home.path();
         touch(&home.join("log").join("app.log"), b"debug line");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "log").unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        let u = units.iter().find(|u| u.relative_path() == "log").unwrap();
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -842,7 +847,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -894,15 +899,15 @@ mod tests {
         touch(&dir.path().join("future-layout/db.sqlite3"), b"nope");
         let units = run(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
-        assert_eq!(units[0].category, AgentCategory::Unclassified);
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unsupported layout version)");
+        assert_eq!(units[0].category(), AgentCategory::Unclassified);
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         let note = units[0].note.as_deref().unwrap_or_default();
         assert!(
             note.contains("unsupported or future layout version"),
             "the unit must say why it is unclassified: {note}"
         );
-        assert!(units[0].bytes > 0, "an unknown layout is still measured");
+        assert!(units[0].bytes() > 0, "an unknown layout is still measured");
     }
 
     #[test]
@@ -965,7 +970,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             25
         );
@@ -995,17 +1000,17 @@ mod tests {
         let units = run(home);
         let auth = units
             .iter()
-            .find(|u| u.relative_path == "auth.json")
+            .find(|u| u.relative_path() == "auth.json")
             .expect("auth.json identified");
-        assert_eq!(auth.category, AgentCategory::ProtectedConfig);
-        assert!(auth.protected);
+        assert_eq!(auth.category(), AgentCategory::ProtectedConfig);
+        assert!(auth.protected());
         assert!(
-            auth.protect_reason
+            auth.protect_reason()
                 .as_deref()
                 .unwrap_or_default()
                 .contains("authentication data"),
             "the protection reason must name what it protects: {:?}",
-            auth.protect_reason
+            auth.protect_reason()
         );
         contract::protection_defaults_hold(&units);
     }
@@ -1026,9 +1031,9 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
-        match &session.project_link {
+        match &session.project_link() {
             ProjectLinkState::Linked { source, .. } => assert_eq!(*source, LinkSource::Declared),
             other => panic!("a declared worktree must link: {other:?}"),
         }
@@ -1045,9 +1050,9 @@ mod tests {
         let bare_units = run(&oc);
         let session = bare_units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
-        match &session.project_link {
+        match &session.project_link() {
             ProjectLinkState::Unresolved { reason } => assert!(
                 reason.contains("no storage/project/p1.json found"),
                 "{reason}"

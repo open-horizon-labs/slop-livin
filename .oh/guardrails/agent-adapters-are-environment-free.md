@@ -3,7 +3,9 @@ id: agent-adapters-are-environment-free
 severity: hard
 statement: "An adapter knows only the home it is handed. It never reads the process environment, never resolves a home directory, and hardcodes no user path."
 outcome: coverage-aware-storage-history
-audit: agent_adapters_are_environment_free
+audit: adapters_do_not_reach_gates, gate_paths_only_inside_gates
+runtime_tests:
+  - crates/core/tests/agent_storage_validation.rs
 ---
 
 ## Rationale
@@ -17,11 +19,11 @@ real tool home.
 
 ## Detection
 
-No adapter function is in the derived environment-reading set (any function that transitively calls `std::env::*`, `dirs::*`, `home::*` or a `home_dir`), and no adapter function or item-level declaration holds a hardcoded home (`"HOME"`, `/Users/`, `/home/`). Adapters include the shared family modules (`vscode_family`, `pi_family`, `bounded_io`).
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_environment_free/01-aliased-env-var`, `agent_adapters_are_environment_free/02-plain-env-var`, `agent_adapters_are_environment_free/03-hardcoded-home-literal`, `agent_adapters_are_environment_free/04-sweep3`.
+**Gate audit.** `adapters_do_not_reach_gates`: an adapter module (`agents::*` except the registry, matrix, unit and bounded-I/O plumbing) may not name `std::env`, `dirs`, `home`, the detectors, the actions or the gate; its only I/O is the `IdentifyCtx` it is handed. `gate_paths_only_inside_gates` rejects `libc` (so `getpwuid`) anywhere outside the gate.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `agent_adapters_are_environment_free` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## Runtime tests that complete it
 

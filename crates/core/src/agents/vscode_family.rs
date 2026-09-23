@@ -449,7 +449,7 @@ pub fn identify_extension_globalstorage(
         return unknown_layout_residual(ext_home, ctx, "no tasks/ directory found")
             .into_iter()
             .map(|mut u| {
-                u.relative_path = format!("{host}/{}", u.relative_path);
+                u.prefix_relative_path(&host);
                 u
             })
             .collect();
@@ -630,8 +630,8 @@ pub const EXTENSION_CAPABILITIES: AdapterCapabilities = AdapterCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::IdentificationCache;
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     /// Roo Code's confirmed per-task linkage file.
@@ -677,7 +677,7 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = profile(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
+        assert_eq!(units[0].relative_path(), "(unsupported layout version)");
     }
 
     #[test]
@@ -689,11 +689,11 @@ mod tests {
         let units = profile(root);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "User/globalStorage/state.vscdb")
+            .find(|u| u.relative_path() == "User/globalStorage/state.vscdb")
             .expect("global db identified");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
-        assert_eq!(u.members.len(), 2);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
+        assert_eq!(u.members().len(), 2);
     }
 
     #[test]
@@ -713,10 +713,10 @@ mod tests {
         let units = profile(root);
         let u = units
             .iter()
-            .find(|u| u.relative_path.contains("workspaceStorage"))
+            .find(|u| u.relative_path().contains("workspaceStorage"))
             .expect("workspace db identified");
-        assert!(u.protected);
-        assert!(matches!(u.project_link, ProjectLinkState::Linked { .. }));
+        assert!(u.protected());
+        assert!(matches!(u.project_link(), ProjectLinkState::Linked { .. }));
     }
 
     #[test]
@@ -735,7 +735,7 @@ mod tests {
         let units = identify_editor_profile(root, &IdentifyCtx::new(1, &cache), OBSERVED_PROFILE);
         let u = units
             .iter()
-            .find(|u| u.relative_path.contains("workspaceStorage"))
+            .find(|u| u.relative_path().contains("workspaceStorage"))
             .expect("workspace db identified");
         assert!(
             u.note
@@ -756,14 +756,14 @@ mod tests {
         let units = profile(root);
         let history = units
             .iter()
-            .find(|u| u.relative_path == "User/History")
+            .find(|u| u.relative_path() == "User/History")
             .unwrap();
-        assert_eq!(history.action, AgentActionCapability::CacheOrLogTrash);
+        assert_eq!(history.action(), AgentActionCapability::CacheOrLogTrash);
         let cache = units
             .iter()
-            .find(|u| u.relative_path == "CachedExtensionVSIXs")
+            .find(|u| u.relative_path() == "CachedExtensionVSIXs")
             .unwrap();
-        assert_eq!(cache.action, AgentActionCapability::CacheOrLogTrash);
+        assert_eq!(cache.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(
             units[0]
-                .relative_path
+                .relative_path()
                 .ends_with("(unsupported layout version)")
         );
     }
@@ -834,11 +834,11 @@ mod tests {
         let units = ext(&ext_home, ROO);
         let u = units
             .iter()
-            .find(|u| u.relative_path.contains("t1"))
+            .find(|u| u.relative_path().contains("t1"))
             .unwrap();
-        assert!(u.relative_path.starts_with("Cursor/tasks/"));
-        assert!(matches!(u.project_link, ProjectLinkState::Linked { .. }));
-        assert_eq!(u.action, AgentActionCapability::SessionRemoval);
+        assert!(u.relative_path().starts_with("Cursor/tasks/"));
+        assert!(matches!(u.project_link(), ProjectLinkState::Linked { .. }));
+        assert_eq!(u.action(), AgentActionCapability::SessionRemoval);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -860,7 +860,7 @@ mod tests {
         );
         let units = ext(&ext_home, ROO);
         assert!(matches!(
-            units[0].project_link,
+            units[0].project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -873,8 +873,8 @@ mod tests {
             .join("Library/Application Support/Code/User/globalStorage/some.ext");
         touch(&ext_home.join("tasks/t1/ui_messages.json"), b"[]");
         let units = ext(&ext_home, ELSEWHERE);
-        let ProjectLinkState::Unresolved { reason } = &units[0].project_link else {
-            panic!("expected Unresolved, got {:?}", units[0].project_link);
+        let ProjectLinkState::Unresolved { reason } = &units[0].project_link() else {
+            panic!("expected Unresolved, got {:?}", units[0].project_link());
         };
         assert!(reason.contains("state.vscdb"), "{reason}");
     }
@@ -911,19 +911,19 @@ mod tests {
         let units = ext(&ext_home, source);
         let first = units
             .iter()
-            .find(|u| u.relative_path.ends_with("tasks/first"))
+            .find(|u| u.relative_path().ends_with("tasks/first"))
             .unwrap();
         assert!(
-            matches!(&first.project_link, ProjectLinkState::Linked { .. }),
+            matches!(&first.project_link(), ProjectLinkState::Linked { .. }),
             "an entry inside the window must still resolve: {:?}",
-            first.project_link
+            first.project_link()
         );
         let last = units
             .iter()
-            .find(|u| u.relative_path.ends_with("tasks/last"))
+            .find(|u| u.relative_path().ends_with("tasks/last"))
             .unwrap();
-        let ProjectLinkState::Unresolved { reason } = &last.project_link else {
-            panic!("expected Unresolved, got {:?}", last.project_link);
+        let ProjectLinkState::Unresolved { reason } = &last.project_link() else {
+            panic!("expected Unresolved, got {:?}", last.project_link());
         };
         assert!(
             reason.contains("bounded read"),
@@ -941,10 +941,10 @@ mod tests {
         let units = ext(&ext_home, ROO);
         let u = units
             .iter()
-            .find(|u| u.relative_path.contains("t2"))
+            .find(|u| u.relative_path().contains("t2"))
             .unwrap();
         assert!(matches!(
-            u.project_link,
+            u.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(
             second
                 .iter()
-                .all(|u| matches!(u.project_link, ProjectLinkState::Linked { .. })),
+                .all(|u| matches!(u.project_link(), ProjectLinkState::Linked { .. })),
             "the cached answer must be the same answer"
         );
     }

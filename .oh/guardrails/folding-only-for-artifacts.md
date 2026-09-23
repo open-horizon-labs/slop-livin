@@ -3,7 +3,12 @@ id: folding-only-for-artifacts
 severity: hard
 statement: "The walk folds a directory into one sized unit only when it classifies as an artifact; every other directory is descended and gets its own rollup row."
 outcome: disk-growth-by-project
-audit: folding_only_for_artifacts
+audit: none
+audit_none_reason: "2026-09-22: the property is a type: a folded (sized) walk job carries the `attribution::Classified` witness that only classification mints"
+compile_fail:
+  - classified_is_minted_by_classify
+runtime_tests:
+  - crates/core/tests/dirs_and_files.rs::no_dir_rollup_rows_exist_under_folded_artifact_directories
 ---
 
 ## Rationale
@@ -11,9 +16,10 @@ Folding is what keeps the walk affordable (a node_modules is one stat-tree, one 
 
 ## Detection
 
-Every `AttrJob::Size` construction and every `record_artifact` call anywhere must sit under an `if let .. = classify_at(..)` guard, except in the measured folding entry points listed by resolved path (`walk::process_size`, `walk::resize_artifact_stamped`), each of which must be defined beside `AttrJob`. A fold or record written inside a macro argument fails. `classify_at` ends in a table lookup or `None`; the classifiers invent no kind.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `folding_only_for_artifacts/01-fold-without-classify`, `folding_only_for_artifacts/02-fold-under-a-different-guard`, `folding_only_for_artifacts/03-serial-walk-records-without-classify`, `folding_only_for_artifacts/04-sweep3`.
+**Type.** `walk::AttrJob::Size` has a `classified: attribution::Classified` field; `Classified`'s field is private to `attribution`, where `classified_at` returns one only when `classify_at` found an artifact kind (and `Classified::stored` for a kind the store recorded at first classification). A fold of an unclassified directory has no witness to pass.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `folding_only_for_artifacts` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `classified_is_minted_by_classify`.

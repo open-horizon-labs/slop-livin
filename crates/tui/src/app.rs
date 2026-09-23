@@ -96,6 +96,13 @@ impl ViewKind {
 /// report was live, because only startup ever refreshed those vectors.
 pub struct RefreshedObservation {
     pub per_root: Vec<(PathBuf, Report)>,
+    /// Every root's latest report (the cache the worker was handed, with
+    /// `per_root` folded in) and their merge, computed **on the worker**:
+    /// the merge re-attaches consumer associations from the store's
+    /// declaration caches, which is I/O the event thread must not do
+    /// (`tui_event_thread_has_no_gate_calls`). `None` when nothing was
+    /// re-observed.
+    pub merged: Option<MergedReports>,
     /// `None` when this refresh did not re-derive units (nothing should
     /// clear them); `Some` replaces them wholesale.
     pub external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
@@ -103,6 +110,43 @@ pub struct RefreshedObservation {
 }
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
+
+/// A merged multi-root report and the per-root cache it came from.
+pub struct MergedReports {
+    pub by_root: std::collections::HashMap<PathBuf, Report>,
+    pub report: Report,
+}
+
+impl RefreshedObservation {
+    /// Builds the result a worker sends: folds `per_root` into `cache`
+    /// (the app's per-root cache when the worker started -- only one
+    /// observation is ever pending, so nothing else changed it) and
+    /// merges. Called on worker threads only.
+    pub fn merged_on_worker(
+        roots: &[PathBuf],
+        mut cache: std::collections::HashMap<PathBuf, Report>,
+        per_root: Vec<(PathBuf, Report)>,
+        external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
+        agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+    ) -> Self {
+        let merged = (!per_root.is_empty()).then(|| {
+            for (root, r) in &per_root {
+                cache.insert(root.clone(), r.clone());
+            }
+            let report = swamp_core::report::merge_reports(roots, &cache);
+            MergedReports {
+                by_root: cache,
+                report,
+            }
+        });
+        RefreshedObservation {
+            per_root,
+            merged,
+            external_units,
+            agent_units,
+        }
+    }
+}
 
 pub struct App {
     pub operation: Option<Operation>,
@@ -513,11 +557,31 @@ impl App {
     /// cached entry -- a refresh of one root can never erase, stale-mark,
     /// or duplicate another root's data, because that data is never
     /// touched, only re-read from `reports_by_root`.
+    #[cfg(test)]
     pub fn replace_report_for_root(&mut self, root: PathBuf, report: Report) {
         let anchor = self.selected_row_key();
         self.reports_by_root.insert(root, report);
         self.report = swamp_core::report::merge_reports(&self.roots, &self.reports_by_root);
         self.restore_selection(anchor);
+    }
+
+    /// Installs a worker's result (what the event loop does with every
+    /// finished observation): the merged report and per-root cache the
+    /// worker already computed, and the unit vectors from the same pass.
+    /// No I/O: everything was prepared off the event thread.
+    pub fn install_refreshed(&mut self, fresh: RefreshedObservation) {
+        if let Some(m) = fresh.merged {
+            self.reports_by_root = m.by_root;
+            self.replace_report(m.report);
+        }
+        // External and agent units come from the same pass, so the agent
+        // view is never older than the header.
+        if let Some(units) = fresh.external_units {
+            self.set_external_units(units);
+        }
+        if let Some(units) = fresh.agent_units {
+            self.set_agent_units(units);
+        }
     }
 
     /// Identity of the selected row: its unit path when it has one
@@ -1905,6 +1969,7 @@ impl App {
             );
             return;
         };
+        let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         crate::worker::spawn(move || {
             // The watcher's own changes, as a replay plan: a production
@@ -1944,10 +2009,14 @@ impl App {
                 30,
                 24 * 3600,
             )
-            .map(|o| RefreshedObservation {
-                per_root: o.per_root.into_iter().collect(),
-                external_units: None,
-                agent_units: None,
+            .map(|o| {
+                RefreshedObservation::merged_on_worker(
+                    &roots,
+                    cache,
+                    o.per_root.into_iter().collect(),
+                    None,
+                    None,
+                )
             });
             let _ = tx.send(res);
         });
@@ -1977,6 +2046,7 @@ impl App {
                 Some("refresh skipped: no resolved scope for this session; reopen swamp ui".into());
             return;
         };
+        let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         crate::worker::spawn(move || {
             // The same scope-aware entry point startup uses, with the
@@ -1999,10 +2069,14 @@ impl App {
                 30,
                 24 * 3600,
             )
-            .map(|o| RefreshedObservation {
-                per_root: o.per_root.into_iter().collect(),
-                external_units: Some(o.external_units),
-                agent_units: Some(o.agent_units),
+            .map(|o| {
+                RefreshedObservation::merged_on_worker(
+                    &roots,
+                    cache,
+                    o.per_root.into_iter().collect(),
+                    Some(o.external_units),
+                    Some(o.agent_units),
+                )
             });
             let _ = tx.send(res);
         });

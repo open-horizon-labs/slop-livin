@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+ --> $WORKSPACE/crates/core/tests/compile_fail/launch_agent_is_a_named_text_file.rs
+  |
+  |     let _ = store::write_text(Path::new("/tmp/LaunchAgents/other.plist"), "<plist/>");
+  |             ----------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `TextFile<'_>`, found `&Path`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> $WORKSPACE/crates/core/src/fs_gate/store.rs
+  |
+  | pub fn write_text(file: TextFile<'_>, text: &str) -> io::Result<()> {
+  |        ^^^^^^^^^^
+help: try wrapping the expression in a variant of `TextFile`
+  |
+8 |     let _ = store::write_text(swamp_core::fs_gate::store::TextFile::Config { store: Path::new("/tmp/LaunchAgents/other.plist") }, "<plist/>");
+  |                               +++++++++++++++++++++++++++++++++++++++++++++++++++++                                            +
+8 |     let _ = store::write_text(swamp_core::fs_gate::store::TextFile::LaunchAgent { plist: Path::new("/tmp/LaunchAgents/other.plist") }, "<plist/>");
+  |                               ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++                                            +

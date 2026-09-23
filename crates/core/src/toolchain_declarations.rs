@@ -179,7 +179,7 @@ fn declaration_evidence(decl: &ToolVersionDeclaration, m: &VersionMatch) -> Evid
             FactSubtype::DeclaredConsumer,
             source,
             now(),
-            format!(
+            crate::reason!(
                 "'{}' is an alias/range; no single measured installation uniquely resolves it",
                 decl.version_spec
             ),
@@ -189,7 +189,7 @@ fn declaration_evidence(decl: &ToolVersionDeclaration, m: &VersionMatch) -> Evid
             FactSubtype::DeclaredConsumer,
             source,
             now(),
-            format!(
+            crate::reason!(
                 "declared version '{}' matches no measured installation in scanned scope",
                 decl.version_spec
             ),
@@ -200,7 +200,7 @@ fn declaration_evidence(decl: &ToolVersionDeclaration, m: &VersionMatch) -> Evid
             candidates.iter().cloned().map(FactValue::Text).collect(),
             source,
             now(),
-            format!(
+            crate::reason!(
                 "'{}' matches more than one measured installation",
                 decl.version_spec
             ),

@@ -13,10 +13,7 @@
 //! provenance and freshness rather than a bare bool.
 
 use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue, Freshness};
-use std::{
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 /// Short-lived: a process/lock/container state observed now says nothing
 /// about five minutes from now. Existing action boundaries (plan
@@ -175,7 +172,7 @@ pub fn open_file_evidence(path: &Path) -> Evidence {
             FactSubtype::OpenFile,
             source,
             observed_at,
-            reason,
+            crate::evidence::Reason::carried(reason),
         ),
     }
 }
@@ -195,7 +192,7 @@ pub fn docker_running_container_evidence(containers: &[crate::docker::ContainerR
                 detail: "no container references collected for this object".into(),
             },
             observed_at,
-            "no container reference recorded this pass",
+            crate::reason!("no container reference recorded this pass"),
         );
     }
     let running: Vec<String> = containers
@@ -257,7 +254,7 @@ pub fn manager_lock_evidence(tool: impl Into<String>, lock_path: &Path) -> Evide
             FactSubtype::Lock,
             source,
             observed_at,
-            "no lock file present",
+            crate::reason!("no lock file present"),
         );
     }
     match probe_flock(lock_path) {
@@ -274,7 +271,7 @@ pub fn manager_lock_evidence(tool: impl Into<String>, lock_path: &Path) -> Evide
             FactSubtype::Lock,
             source,
             observed_at,
-            format!("could not probe lock: {e}"),
+            crate::reason!("could not probe lock: {e}"),
         ),
     }
 }
@@ -314,7 +311,7 @@ pub fn simulator_booted_evidence(udid: &str, env: &crate::locations::Environment
                 FactSubtype::Booted,
                 source,
                 observed_at,
-                "udid not found in simctl device list",
+                crate::reason!("udid not found in simctl device list"),
             ),
         },
         Ok(_) => Evidence::unavailable(
@@ -322,14 +319,14 @@ pub fn simulator_booted_evidence(udid: &str, env: &crate::locations::Environment
             FactSubtype::Booted,
             source,
             observed_at,
-            "simctl query did not succeed",
+            crate::reason!("simctl query did not succeed"),
         ),
         Err(reason) => Evidence::unavailable(
             FactKind::CurrentUse,
             FactSubtype::Booted,
             source,
             observed_at,
-            reason,
+            crate::evidence::Reason::carried(reason),
         ),
     }
 }
@@ -402,8 +399,14 @@ mod tests {
     fn a_free_probe_is_the_only_state_that_permits_an_action() {
         assert!(matches!(OccupancyState::Free, OccupancyState::Free));
         assert!(OccupancyState::Free.refusal().is_none());
-        assert!(!matches!(OccupancyState::Occupied(PathBuf::from("/x")), OccupancyState::Free));
-        assert!(!matches!(OccupancyState::Unknown("nope".into()), OccupancyState::Free));
+        assert!(!matches!(
+            OccupancyState::Occupied(PathBuf::from("/x")),
+            OccupancyState::Free
+        ));
+        assert!(!matches!(
+            OccupancyState::Unknown("nope".into()),
+            OccupancyState::Free
+        ));
     }
 
     #[test]

@@ -16,13 +16,13 @@
 //! - a plan is single-use and expires; a grant expires and has a byte budget;
 //! - the tool never speaks in the verdict register: refusals name a fact.
 
+use crate::authority::{Authorized, HumanConfirmed};
 use crate::filter::{Filter, Predicate};
+use crate::fs_gate::{self, Metadata, MetadataExt, read::read_owned_string, store};
 use crate::ledger::{ActionRecord, Ledger};
 use crate::report::{ArtifactKind, ArtifactRow, ProjectRow, Report, WorktreeRow};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use crate::authority::{Authorized, HumanConfirmed};
-use crate::fs_gate::{self, Metadata, MetadataExt, read::read_owned_string, store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -195,7 +195,13 @@ fn plan_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 pub fn save_plan(dir: &Path, plan: &Plan) -> Result<()> {
-    store::write_json(store::JsonFile::Plan { store: dir, id: &plan.id }, plan)?;
+    store::write_json(
+        store::JsonFile::Plan {
+            store: dir,
+            id: &plan.id,
+        },
+        plan,
+    )?;
     Ok(())
 }
 
@@ -305,8 +311,7 @@ fn warnings_for(wt: &WorktreeRow, a: &ArtifactRow, whole: Option<&ProjectRow>) -
                 w.push("no remote to restore from".into());
             }
             for (path, bytes) in crate::ignore::untracked_content(&wt.path, 3, 100_000) {
-                let rel = path
-                    .strip_prefix(&wt.path)
+                let rel = crate::scope::relative_to(&path, &wt.path)
                     .unwrap_or(&path)
                     .display()
                     .to_string();
@@ -402,7 +407,10 @@ pub fn propose(
                         // on the container (`target/`); the selection is
                         // this exact group path.
                         unit.reviewed = crate::recheck::capture_anchor(p).ok();
-                        unit.rel_path = p.strip_prefix(&wt.path).unwrap_or(p).display().to_string();
+                        unit.rel_path = crate::scope::relative_to(p, &wt.path)
+                            .unwrap_or(p)
+                            .display()
+                            .to_string();
                         unit.bytes = group.members.iter().map(|m| m.bytes).sum();
                         unit.dedup_stale = false; // selected members were freshly measured
                         unit.growth_bytes = nested.growth_bytes;
@@ -831,7 +839,7 @@ fn simulator_booted_facts(unit: &crate::external::ExternalUnit) -> Vec<crate::ev
                 tool: "xcrun simctl list devices -j".into(),
             },
             crate::entities::now(),
-            format!(
+            crate::reason!(
                 "{} device directories in this store; the first {SIMULATOR_DEVICE_PROBE_CAP} were \
                  read this pass and the rest were not asked about",
                 udids.len()
@@ -989,11 +997,9 @@ fn sparse_byte_accounting_facts(
 }
 
 fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> PlanUnit {
-    let rel = a
-        .path
-        .strip_prefix(&wt.path)
+    let rel = crate::scope::relative_to(&a.path, &wt.path)
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| a.path.display().to_string());
+        .unwrap_or_else(|| a.path.display().to_string());
     PlanUnit {
         cargo_group: None,
         path: a.path.clone(),
@@ -1448,10 +1454,10 @@ fn execute_agent_session_removal(
     )?;
     let current = fresh
         .iter()
-        .find(|c| c.path == session_path)
+        .find(|c| c.path() == session_path)
         .ok_or_else(|| anyhow!("session no longer identifiable at this path; propose again"))?;
     let mut current_members: Vec<PathBuf> =
-        current.members.iter().map(|m| m.path.clone()).collect();
+        current.members().iter().map(|m| m.path.clone()).collect();
     let mut planned: Vec<PathBuf> = planned_members.to_vec();
     current_members.sort();
     planned.sort();
@@ -2577,7 +2583,7 @@ mod agent_partial_removal_tests {
             .iter()
             .find(|c| c.path == session_path)
             .expect("session identified");
-        let mut members: Vec<PathBuf> = current.members.iter().map(|m| m.path.clone()).collect();
+        let mut members: Vec<PathBuf> = current.members().iter().map(|m| m.path.clone()).collect();
         members.sort();
         assert!(
             members.len() >= 2,

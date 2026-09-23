@@ -1,7 +1,7 @@
 use crate::entities::*;
+use crate::fs_gate::MetadataExt;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use crate::fs_gate::MetadataExt;
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -19,7 +19,8 @@ impl ScanOptions {
         self.roots
             .iter()
             .map(|root| {
-                crate::fs_gate::canonicalize(root).with_context(|| format!("canonicalize {}", root.display()))
+                crate::fs_gate::canonicalize(root)
+                    .with_context(|| format!("canonicalize {}", root.display()))
             })
             .collect()
     }
@@ -208,7 +209,10 @@ pub fn observation(options: &ScanOptions) -> Result<Observation> {
         })
         .collect();
     Ok(Observation {
-        volume_id: crate::fs_gate::metadata_following(options.roots.first().context("at least one root")?)?.dev(),
+        volume_id: crate::fs_gate::metadata_following(
+            options.roots.first().context("at least one root")?,
+        )?
+        .dev(),
         roots,
         artifacts,
         projects,

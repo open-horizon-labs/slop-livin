@@ -26,6 +26,7 @@
 
 use crate::entities::Confidence;
 use crate::fs_events::{FsEventsRequest, FsEventsState};
+use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use crate::git::DiscoveredWorktree;
 use crate::report::{
     ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedRow,
@@ -33,7 +34,6 @@ use crate::report::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -484,7 +484,8 @@ pub fn observe_and_annotate(
                 artifact.growth_bytes = (!artifact.dedup_stale)
                     .then(|| growth_since(&past, artifact.bytes, target_time))
                     .flatten();
-                artifact.regrowth_count = history.row(&key).map(|r| r.regrowth_count()).unwrap_or(0);
+                artifact.regrowth_count =
+                    history.row(&key).map(|r| r.regrowth_count()).unwrap_or(0);
             }
         }
     }
@@ -518,7 +519,11 @@ fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<Hist
                 row.rel_path(),
             ))
             .or_default()
-            .push((row.observed_at(), row.bytes(), !row.present() || !row.dedup_stale()));
+            .push((
+                row.observed_at(),
+                row.bytes(),
+                !row.present() || !row.dedup_stale(),
+            ));
     }
     for delta_path in list_delta_files(dir) {
         for row in read_rows(&delta_path)? {
@@ -533,7 +538,11 @@ fn build_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<Hist
                     row.rel_path(),
                 ))
                 .or_default()
-                .push((row.observed_at(), row.bytes(), !row.present() || !row.dedup_stale()));
+                .push((
+                    row.observed_at(),
+                    row.bytes(),
+                    !row.present() || !row.dedup_stale(),
+                ));
         }
     }
     for values in index.values_mut() {
@@ -628,7 +637,10 @@ pub fn history_series(
             } else {
                 Some(r.bytes())
             };
-            points.entry(key).or_default().push((r.observed_at(), bytes));
+            points
+                .entry(key)
+                .or_default()
+                .push((r.observed_at(), bytes));
         }
     };
     for f in list_delta_files(dir) {
@@ -686,18 +698,6 @@ pub fn volume_store_dir(swamp_dir: &Path, root: &Path) -> PathBuf {
 
 pub fn history_span_for_root(store: &Path, root: &Path, now: u64) -> Option<u64> {
     history_span_secs(&store.join(root_scoped_volume_id(root).to_string()), now)
-}
-
-pub fn prune_expired(dir: &Path, retention_days: u64, now: u64) -> Result<()> {
-    let retention_secs = retention_days.saturating_mul(86400);
-    let horizon = now.saturating_sub(retention_secs);
-    for path in list_delta_files(dir) {
-        let rows = read_rows(&path)?;
-        if rows.iter().all(|r| r.observed_at() < horizon) {
-            crate::fs_gate::columns::retire(&path)?;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1472,33 +1472,6 @@ fn min_interval_secs() -> u64 {
         .unwrap_or(3)
 }
 
-/// Entry point for `report::report_full`: replaces a plain call to
-/// `walk::discover_and_attribute` with one that tries FSEvents first and
-/// falls back to a full walk on any refusal, `force_full`, or a missing
-/// store. Always re-anchors the stored FSEvents id/topology/unowned
-/// snapshot before returning, on both the incremental and full paths, so
-/// the next call has a baseline to replay from regardless of which path
-/// this one took.
-pub fn observe_tracked(
-    swamp_dir: &Path,
-    root: &Path,
-    observed_at: u64,
-    large_file_min_bytes: u64,
-    force_full: bool,
-    observe: bool,
-) -> Result<TrackedWalk> {
-    observe_tracked_with_source(
-        swamp_dir,
-        root,
-        observed_at,
-        large_file_min_bytes,
-        force_full,
-        observe,
-        crate::fs_events::platform_source().as_ref(),
-        &[],
-    )
-}
-
 /// Same as [`observe_tracked`], with the [`crate::fs_events::FsEventsSource`]
 /// supplied explicitly rather than resolved via [`crate::fs_events::platform_source`].
 /// This is the seam integration tests use to exercise every refusal
@@ -1517,6 +1490,7 @@ pub fn observe_tracked(
 /// [`stage_tracked_with_source`] and commit only after their downstream writes.
 #[allow(clippy::too_many_arguments)]
 pub fn observe_tracked_with_source(
+    stage: &crate::bus::Stage,
     swamp_dir: &Path,
     root: &Path,
     observed_at: u64,
@@ -1527,6 +1501,7 @@ pub fn observe_tracked_with_source(
     excluded: &[PathBuf],
 ) -> Result<TrackedWalk> {
     let (walk, checkpoint) = stage_tracked_with_source(
+        stage,
         swamp_dir,
         root,
         observed_at,
@@ -1666,7 +1641,10 @@ pub fn replay_unit_roots(
         // scope legitimately contains such paths -- a Cargo home
         // contributes `registry/index` and `git/db` whether or not they
         // have ever been populated.
-        let Some(device) = crate::fs_gate::metadata_following(&canonical).map(|m| m.dev()).ok() else {
+        let Some(device) = crate::fs_gate::metadata_following(&canonical)
+            .map(|m| m.dev())
+            .ok()
+        else {
             continue;
         };
         let device_mismatch = prev.device.is_some_and(|stored| stored != device);
@@ -1778,6 +1756,7 @@ impl ObservationCheckpoint {
 
 #[allow(clippy::too_many_arguments)]
 pub fn stage_tracked_with_source(
+    stage: &crate::bus::Stage,
     swamp_dir: &Path,
     root: &Path,
     observed_at: u64,
@@ -1844,7 +1823,14 @@ pub fn stage_tracked_with_source(
         } else {
             "full_rules_changed"
         };
-        let mut result = full_walk(&root, observed_at, large_file_min_bytes, reason, excluded)?;
+        let mut result = full_walk(
+            stage,
+            &root,
+            observed_at,
+            large_file_min_bytes,
+            reason,
+            excluded,
+        )?;
         result.unconfirmed_worktree_ids =
             compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
         let checkpoint = observe.then(|| ObservationCheckpoint {
@@ -1917,6 +1903,7 @@ pub fn stage_tracked_with_source(
 
     let mut result = if too_soon && !plan.live {
         full_walk(
+            stage,
             &root,
             observed_at,
             large_file_min_bytes,
@@ -1925,6 +1912,7 @@ pub fn stage_tracked_with_source(
         )?
     } else if !plan.incremental {
         full_walk(
+            stage,
             &root,
             observed_at,
             large_file_min_bytes,
@@ -1934,6 +1922,7 @@ pub fn stage_tracked_with_source(
     } else {
         match prev_topology {
             None => full_walk(
+                stage,
                 &root,
                 observed_at,
                 large_file_min_bytes,
@@ -1951,6 +1940,7 @@ pub fn stage_tracked_with_source(
                     > TOO_MANY_CHANGES_FRACTION * known_dirs as f64
                 {
                     full_walk(
+                        stage,
                         &root,
                         observed_at,
                         large_file_min_bytes,
@@ -2189,14 +2179,20 @@ fn split_remainder(
 }
 
 fn full_walk(
+    stage: &crate::bus::Stage,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
     reason: &'static str,
     excluded: &[PathBuf],
 ) -> Result<TrackedWalk> {
-    let (discovered, mut attribution) =
-        crate::walk::discover_and_attribute(root, observed_at, large_file_min_bytes, excluded)?;
+    let (discovered, mut attribution) = crate::walk::discover_and_attribute(
+        stage,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        excluded,
+    )?;
     split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,
@@ -2241,7 +2237,7 @@ fn compute_unconfirmed_worktrees(
             // `discovered` means it is no longer a git worktree (e.g.
             // `.git` was removed) -- a real change, not a coverage gap.
             // If it cannot be listed, access was lost, not the worktree.
-            Ok(_) => crate::fs_gate::read_dir(&pw.path).is_err(),
+            Ok(_) => crate::fs_gate::probe_listable(&pw.path).is_err(),
         })
         .map(|pw| pw.worktree_id.clone())
         .collect()
@@ -2272,7 +2268,7 @@ fn resize_interior(
     changed: &[PathBuf],
     dirs: &mut Vec<DirRollup>,
 ) -> Option<(u64, u64, bool)> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let mut mtime_max: u64 = 0;
     let mut saw_hardlink = false;
     let mut changed_rels: Vec<String> = changed
@@ -2413,7 +2409,7 @@ fn relist_source_dirs(
     files: &mut Vec<crate::report::FileRow>,
     large_file_min_bytes: u64,
 ) -> Option<(u64, HashSet<String>)> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let mut removed_artifacts: HashSet<String> = HashSet::new();
     let mut rels: Vec<String> = changed
         .iter()
@@ -3772,7 +3768,12 @@ mod tests {
             } else {
                 9
             };
-            crate::fs_gate::columns::write_parquet_atomic(&out, schema, batches.iter().cloned().map(Ok), level)?;
+            crate::fs_gate::columns::write_parquet_atomic(
+                &out,
+                schema,
+                batches.iter().cloned().map(Ok),
+                level,
+            )?;
             let restored = ParquetRecordBatchReaderBuilder::try_new(File::open(&out)?)?
                 .with_batch_size(1_000_000)
                 .build()?

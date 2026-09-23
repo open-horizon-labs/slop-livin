@@ -3,7 +3,12 @@ id: scheduled-refresh-launchagent
 severity: hard
 statement: "A scheduled observation exists as an opt-in per-user LaunchAgent so a previous observation is there without a human running anything."
 outcome: disk-growth-by-project
-audit: scheduled_refresh_launchagent
+audit: gate_paths_only_inside_gates
+compile_fail:
+  - launch_agent_is_a_named_text_file
+runtime_tests:
+  - crates/core/src/schedule.rs::tests::plist_golden_content
+  - crates/core/src/schedule.rs::tests::off_removes_plist_and_issues_bootout_in_test_mode
 ---
 
 ## Rationale
@@ -11,9 +16,12 @@ Growth needs a baseline. Without a schedule the first question a user asks has n
 
 ## Detection
 
-The CLI has `Command::Schedule`. In the scheduler (derived: the module that writes the LaunchAgent plist, with child modules), every subprocess spawn must be reachable from the CLI's `main` -- what schedules is what runs -- and a `launchctl` spawn must be.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `scheduled_refresh_launchagent/01-no-schedule-subcommand`, `scheduled_refresh_launchagent/02-cron-instead-of-launchd`, `scheduled_refresh_launchagent/03-schedule-variant-renamed-away`, `scheduled_refresh_launchagent/04-sweep3`.
+**Type.** The plist is written only as `TextFile::LaunchAgent` (validated to `<label>.plist`).
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `Program::Launchctl` may be named only in `schedule`.
 
+Retired 2026-09-22: the `scheduled_refresh_launchagent` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `launch_agent_is_a_named_text_file`.

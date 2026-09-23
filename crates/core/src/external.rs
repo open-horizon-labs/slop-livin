@@ -142,8 +142,10 @@ fn category_str(c: StorageCategory) -> &'static str {
 fn device_of(path: &Path) -> u64 {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        crate::fs_gate::metadata_following(path).map(|m| m.dev()).unwrap_or(0)
+        use crate::fs_gate::MetadataExt;
+        crate::fs_gate::metadata_following(path)
+            .map(|m| m.dev())
+            .unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -248,7 +250,35 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "testing")]
 pub fn discover_and_measure(
+    scope: &EffectiveScope,
+    swamp_dir: Option<&Path>,
+    observe: bool,
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
+) -> Result<Vec<ExternalUnit>> {
+    discover_and_measure_in(
+        &crate::report::DiscoveryPass::for_tests(),
+        scope,
+        swamp_dir,
+        observe,
+        observed_at,
+        retention_days,
+        since_secs,
+        coverage,
+    )
+}
+
+/// External-unit discovery for one observation. Takes the
+/// [`crate::report::DiscoveryPass`] only `report::observe_scope` mints
+/// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`); the
+/// `testing`-feature `discover_and_measure` is the fixture spelling.
+#[allow(clippy::too_many_arguments)]
+pub fn discover_and_measure_in(
+    _pass: &crate::report::DiscoveryPass,
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
     observe: bool,
@@ -282,7 +312,8 @@ pub fn discover_and_measure(
     {
         let mut seen: HashSet<(StorageCategory, PathBuf)> = HashSet::new();
         for c in candidates {
-            let canonical = crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
+            let canonical =
+                crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
             if !seen.insert((c.category, canonical.clone())) {
                 continue;
             }
@@ -671,10 +702,10 @@ mod consumer_sidecar_tests {
     //! Moved from `tests/external_units.rs` when the sidecar writers
     //! became test-only: the same two #43 adversarial tests.
     use super::*;
-    use std::fs;
     use crate::locations::{Environment, Platform, Registry, StorageCategory};
     use crate::scope::{ScanConfig, resolve_effective_scope};
     use std::collections::HashMap;
+    use std::fs;
 
     fn fixture_env(home: &std::path::Path, extra: &[(&str, &str)]) -> Environment {
         let mut env: HashMap<String, String> = HashMap::new();

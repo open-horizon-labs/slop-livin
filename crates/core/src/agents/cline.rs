@@ -145,8 +145,8 @@ mod tests {
         );
         let units = run(&ext_home);
         assert_eq!(units.len(), 1);
-        assert!(units[0].relative_path.starts_with("VS Code/tasks/"));
-        assert_eq!(units[0].action, AgentActionCapability::SessionRemoval);
+        assert!(units[0].relative_path().starts_with("VS Code/tasks/"));
+        assert_eq!(units[0].action(), AgentActionCapability::SessionRemoval);
     }
 
     #[test]
@@ -169,10 +169,10 @@ mod tests {
         assert_eq!(units.len(), 1, "an unrecognized layout must still surface");
         assert!(
             units[0]
-                .relative_path
+                .relative_path()
                 .ends_with("(unsupported layout version)"),
             "{}",
-            units[0].relative_path
+            units[0].relative_path()
         );
         assert!(
             units[0]
@@ -260,8 +260,8 @@ mod tests {
             format!("{{\"workspace\":\"{}\"}}", repo.display()).as_bytes(),
         );
         let units = run(&ext_home);
-        let ProjectLinkState::Unresolved { reason } = &units[0].project_link else {
-            panic!("expected Unresolved, got {:?}", units[0].project_link);
+        let ProjectLinkState::Unresolved { reason } = &units[0].project_link() else {
+            panic!("expected Unresolved, got {:?}", units[0].project_link());
         };
         assert!(
             reason.contains("cwdOnTaskInitialization") && reason.contains("state/taskHistory.json"),
@@ -301,21 +301,21 @@ mod tests {
         let units = run(&ext_home);
         let linked = units
             .iter()
-            .find(|u| u.relative_path.ends_with("tasks/t-linked"))
+            .find(|u| u.relative_path().ends_with("tasks/t-linked"))
             .unwrap();
         assert!(
-            matches!(&linked.project_link, ProjectLinkState::Linked { .. }),
+            matches!(&linked.project_link(), ProjectLinkState::Linked { .. }),
             "a task whose history entry declares a cwd must link: {:?}",
-            linked.project_link
+            linked.project_link()
         );
         // The optional field really is optional upstream; absent is
         // `Unresolved`, never a guess from the task id.
         let absent = units
             .iter()
-            .find(|u| u.relative_path.ends_with("tasks/t-absent"))
+            .find(|u| u.relative_path().ends_with("tasks/t-absent"))
             .unwrap();
         assert!(matches!(
-            &absent.project_link,
+            &absent.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
         // And the prompt text that sits in the same file next to the

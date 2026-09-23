@@ -3,7 +3,9 @@ id: computed-but-not-delivered
 severity: soft
 statement: "A fact is done only when it is wired from extraction through the schema to rendering and seen in real output; a populated struct field nobody renders is a defect."
 outcome: disk-growth-by-project
-audit: computed_but_not_delivered
+audit: no_unreferenced_public_items
+runtime_tests:
+  - crates/core/tests/nested_artifact_evidence_is_delivered.rs
 ---
 
 ## Rationale
@@ -24,11 +26,11 @@ violates.
 
 ## Detection
 
-Delivered surfaces are derived: the modules defining the types reachable, through field types, from what `bus::run_report` and `report::observe_scope` return, and their child modules; every public struct in one of them that is serialized or carries an evidence-vocabulary field. A public field whose every struct-literal initializer (including inside macros) is empty and that nothing mutates is written only as a default; a `skip_serializing_if` field must be read somewhere.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `computed_but_not_delivered/01-empty-default-only`, `computed_but_not_delivered/02-populated-but-hidden-and-unread`, `computed_but_not_delivered/03-aliased-evidence-type`, `computed_but_not_delivered/04-sweep3`.
+**Gate audit.** `no_unreferenced_public_items`: a public function or type nothing in the workspace names (production or test) fails. What is computed but only ever empty is caught by the delivery tests below, not by a source rule.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `computed_but_not_delivered` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## Runtime tests that complete it
 

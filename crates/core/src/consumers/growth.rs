@@ -18,7 +18,12 @@ impl Consumer for GrowthConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::CargoAnnotated]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::CargoAnnotated(draft) = event else {
             return Ok(vec![]);
         };

@@ -3,7 +3,12 @@ id: reverse-delta-current-plus-deltas
 severity: hard
 statement: "The store holds one current-state file plus a reverse-delta log; an observation rewrites current and appends the previous values of changed rows as a delta, for artifacts, directories and files alike."
 outcome: disk-growth-by-project
-audit: reverse_delta_current_plus_deltas
+audit: none
+audit_none_reason: "2026-09-22: the property is a type: history rows are written only through `ArtifactHistory`/`ExternalHistory` in a module private to `growth`"
+compile_fail:
+  - history_rows_are_private_to_the_store
+runtime_tests:
+  - crates/core/tests/report_growth.rs
 ---
 
 ## Rationale
@@ -11,9 +16,10 @@ Reverse deltas make the latest state a single read and history a replay backward
 
 ## Detection
 
-A history writer is derived: a function that computes a current-table path and is in the destructive set. It must honour a call to a delta-path helper. Every `observe_and_annotate*` reaches both a current-table and a delta-path helper.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `reverse_delta_current_plus_deltas/01-no-delta-append`, `reverse_delta_current_plus_deltas/02-delta-only-no-current`, `reverse_delta_current_plus_deltas/03-files-history-loses-both`, `reverse_delta_current_plus_deltas/04-sweep3`.
+**Type.** `growth::columns` is private to `growth`; `ArtifactHistory` and `ExternalHistory` load `current.parquet`, accumulate the reverse delta and `commit` both -- there is no other writer of history rows.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `reverse_delta_current_plus_deltas` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `history_rows_are_private_to_the_store`.

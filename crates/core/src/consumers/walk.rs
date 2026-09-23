@@ -19,7 +19,12 @@ impl Consumer for WalkConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::RootRequested, EventKind::ReportCached]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         if matches!(event, Event::ReportCached) {
             if let Some(checkpoint) = self.checkpoint.lock().unwrap().take() {
                 checkpoint.commit()?;
@@ -33,6 +38,7 @@ impl Consumer for WalkConsumer {
         let mut unconfirmed_worktree_ids: Vec<String> = Vec::new();
         let (discovered, attribution) = if let Some(dir) = &ctx.store_dir {
             let (tracked, checkpoint) = crate::growth::stage_tracked_with_source(
+                stage,
                 dir,
                 &ctx.root,
                 ctx.observed_at,
@@ -65,6 +71,7 @@ impl Consumer for WalkConsumer {
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
             crate::walk::discover_and_attribute(
+                stage,
                 &ctx.root,
                 ctx.observed_at,
                 ctx.large_file_min_bytes,

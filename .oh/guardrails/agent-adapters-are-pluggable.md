@@ -3,7 +3,9 @@ id: agent-adapters-are-pluggable
 severity: hard
 statement: "Agent-tool adapters are independent and statically registered, exactly as location detectors already are. No adapter names another adapter; no central match over tool-id constants decides behaviour; every adapter module is registered exactly once; the registry's tool ids and the support matrix's tool ids are the same set."
 outcome: disk-growth-by-project
-audit: agent_adapters_are_pluggable
+audit: ids_only_in_their_module
+runtime_tests:
+  - crates/core/tests/agent_matrix_matches_docs.rs
 ---
 
 ## Rationale
@@ -26,11 +28,11 @@ static registry. Adapters follow.
 
 ## Detection
 
-The tool modules are derived. No tool module (or a child module of one) reaches another by resolved call, value reference, re-export, item-level path or written path; nothing outside the registry and the catalog matches on a tool id (a `match` arm naming one, or two ids named in one function), by constant or by the value it holds; the registry names each tool module's `Adapter` exactly once; the catalog exposes tool ids.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_pluggable/01-adapter-names-another-adapter`, `agent_adapters_are_pluggable/02-central-tool-id-match`, `agent_adapters_are_pluggable/03-duplicate-registration`, `agent_adapters_are_pluggable/04-sweep3`.
+**Gate audit.** `ids_only_in_their_module`: a tool id literal (the value of an adapter's `*_TOOL_ID`) appears only in that adapter's module and the registries, never in a central `match`, if-chain or table -- compared as the exact literal, wherever it is written (the CLI included).
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `agent_adapters_are_pluggable` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## What replaced the matches
 

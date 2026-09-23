@@ -211,8 +211,8 @@ pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<Candi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, LinkSource, ProjectLinkState, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -246,9 +246,12 @@ mod tests {
         );
         touch(&home.join("caches/versioncheck"), b"");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "caches").unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        let u = units
+            .iter()
+            .find(|u| u.relative_path() == "caches")
+            .unwrap();
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -259,9 +262,9 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == ".aider.conf.yml")
+            .find(|u| u.relative_path() == ".aider.conf.yml")
             .unwrap();
-        assert!(u.protected);
+        assert!(u.protected());
     }
 
     #[test]
@@ -279,7 +282,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .all(|u| u.relative_path != ".aider.chat.history.md"),
+                .all(|u| u.relative_path() != ".aider.chat.history.md"),
             "home-level identify must not pick up per-repo files"
         );
     }
@@ -298,9 +301,9 @@ mod tests {
         let units = run_repo(repo);
         assert_eq!(units.len(), 2);
         for u in &units {
-            assert_eq!(u.category, AgentCategory::Sessions);
-            assert_eq!(u.action, AgentActionCapability::SessionRemoval);
-            assert!(matches!(u.project_link, ProjectLinkState::Linked { .. }));
+            assert_eq!(u.category(), AgentCategory::Sessions);
+            assert_eq!(u.action(), AgentActionCapability::SessionRemoval);
+            assert!(matches!(u.project_link(), ProjectLinkState::Linked { .. }));
         }
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "chat content leaked");
@@ -315,10 +318,10 @@ mod tests {
         let units = run_repo(repo);
         let u = units
             .iter()
-            .find(|u| u.relative_path == ".aider.tags.cache.v3")
+            .find(|u| u.relative_path() == ".aider.tags.cache.v3")
             .expect("tags cache identified");
-        assert_eq!(u.category, AgentCategory::Caches);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        assert_eq!(u.category(), AgentCategory::Caches);
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -334,7 +337,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .any(|u| u.relative_path == ".aider.tags.cache.v9"),
+                .any(|u| u.relative_path() == ".aider.tags.cache.v9"),
             "a future tags-cache version must still be identified: {units:?}"
         );
     }
@@ -381,9 +384,9 @@ mod tests {
         touch(&home.join("something-unrecognized.bin"), b"\x00\x01");
         let units = run(home);
         assert_eq!(units.len(), 1, "unrecognized content must still surface");
-        assert_eq!(units[0].relative_path, "(unclassified residual)");
-        assert_eq!(units[0].category, AgentCategory::Unclassified);
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unclassified residual)");
+        assert_eq!(units[0].category(), AgentCategory::Unclassified);
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         let note = units[0].note.as_deref().unwrap_or_default();
         assert!(
             note.contains("no recognized Aider home markers"),
@@ -459,12 +462,12 @@ mod tests {
         let units = run(home);
         let conf = units
             .iter()
-            .find(|u| u.relative_path == ".aider.conf.yml")
+            .find(|u| u.relative_path() == ".aider.conf.yml")
             .expect("home config identified");
-        assert_eq!(conf.category, AgentCategory::ProtectedConfig);
-        assert!(conf.protected);
+        assert_eq!(conf.category(), AgentCategory::ProtectedConfig);
+        assert!(conf.protected());
         assert_eq!(
-            conf.protect_reason.as_deref(),
+            conf.protect_reason().as_deref(),
             Some("home-level Aider configuration")
         );
         contract::protection_defaults_hold(&units);
@@ -481,7 +484,7 @@ mod tests {
         touch(&declared.join(".aider.input.history"), b"+++ /help\n");
         let linked = run_repo(&declared);
         assert_eq!(linked.len(), 1);
-        match &linked[0].project_link {
+        match &linked[0].project_link() {
             ProjectLinkState::Linked { source, .. } => assert_eq!(*source, LinkSource::Declared),
             other => panic!("a resolved worktree root must link: {other:?}"),
         }
@@ -500,7 +503,7 @@ mod tests {
         assert!(
             home_units
                 .iter()
-                .all(|u| matches!(u.project_link, ProjectLinkState::NotApplicable)),
+                .all(|u| matches!(u.project_link(), ProjectLinkState::NotApplicable)),
             "home-level units are tool-wide: {home_units:?}"
         );
         contract::linkage_is_declared_or_explicit(&home_units, "looks-like-my-project");

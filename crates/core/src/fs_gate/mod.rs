@@ -34,7 +34,7 @@
 //!   there is no `Command` outside this module and no way to run a
 //!   program that is not a variant. Every run is counted.
 //! * **Content reads are bounded** ([`read::bounded_read`]) except for
-//!   swamp's own state files ([`read::read_owned`]), which only the
+//!   swamp's own state files ([`read::read_owned_string`]), which only the
 //!   store modules may name (the audit's per-group allow-list).
 //!
 //! Each submodule is one capability group; the audit's allow-list says
@@ -96,11 +96,6 @@ pub fn is_file(path: impl AsRef<Path>) -> bool {
     path.as_ref().is_file()
 }
 
-/// Whether `path` itself is a directory, **not** following a symlink.
-pub fn is_real_dir(path: impl AsRef<Path>) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-}
-
 /// Whether `path` itself is a regular file, **not** following a symlink.
 pub fn is_real_file(path: impl AsRef<Path>) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
@@ -129,6 +124,14 @@ pub fn device_of(_path: impl AsRef<Path>) -> Option<u64> {
 // ---------------------------------------------------------------------
 // list: one directory level per call
 // ---------------------------------------------------------------------
+
+/// Whether `path` can be opened for listing right now, without reading
+/// a single entry: the "is this root still readable" probe a scope root
+/// gets just before it is walked. `Err` carries the reason (missing,
+/// permission denied).
+pub fn probe_listable(path: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::read_dir(path).map(|_| ())
+}
 
 /// One directory level. The walker, the reviewed-unit snapshot and the
 /// capped `shallow_list` are the only modules the audit allows to name

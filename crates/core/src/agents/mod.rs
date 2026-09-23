@@ -58,12 +58,12 @@ pub mod roo_code;
 pub mod vscode_family;
 pub mod windsurf;
 
+use crate::fs_gate as fs;
 use crate::growth::{ObservedExternal, annotate_readonly_external, observe_and_annotate_external};
 use crate::scope::EffectiveScope;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------
@@ -364,29 +364,6 @@ pub struct AgentUnit {
     pub evidence: Vec<crate::evidence::Evidence>,
 }
 
-/// What an adapter (`claude_code::identify`) produces before growth
-/// history and human-protect intent are layered on by
-/// [`discover_and_measure`]. Never serialized on its own; exists so an
-/// adapter never has to fabricate `growth_bytes`/`regrowth_count`.
-#[derive(Debug)]
-pub struct CandidateAgentUnit {
-    pub category: AgentCategory,
-    pub relative_path: String,
-    pub path: PathBuf,
-    pub members: Vec<AgentMember>,
-    pub bytes: u64,
-    pub mtime_max: u64,
-    pub protected: bool,
-    pub protect_reason: Option<String>,
-    pub project_link: ProjectLinkState,
-    pub action: AgentActionCapability,
-    pub note: Option<String>,
-    /// How `project_link` was arrived at, so container-level reuse can
-    /// tell a fact that lives inside the container from one that does
-    /// not. See [`LinkBasis`].
-    pub link_basis: LinkBasis,
-}
-
 /// Where a unit's [`ProjectLinkState`] came from.
 ///
 /// Container-level reuse ([`IdentifyCtx::container`]) replays a
@@ -543,7 +520,7 @@ fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
     ];
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use crate::fs_gate::MetadataExt;
         parts.push((
             "ctime_ns".to_string(),
             (meta.ctime() as u64)
@@ -945,10 +922,13 @@ impl<'a> IdentifyCtx<'a> {
                         declared,
                         additional,
                         missing_reason,
-                    } = &u.link_basis
+                    } = u.link_basis().clone()
                     {
-                        u.project_link =
-                            store.resolve_memoised(declared, additional, missing_reason);
+                        u.set_resolved_link(store.resolve_memoised(
+                            &declared,
+                            &additional,
+                            &missing_reason,
+                        ));
                     }
                     u
                 })
@@ -1121,21 +1101,6 @@ impl<'a> IdentifyCtx<'a> {
         }
         value
     }
-
-    /// The first line of a derived header value's source, the shape most
-    /// adapters actually parse.
-    pub fn derived_line(
-        &self,
-        adapter_id: &str,
-        kind: &str,
-        path: &Path,
-        max_bytes: usize,
-        derive: &dyn Fn(&str) -> Option<String>,
-    ) -> Option<String> {
-        self.derived(adapter_id, kind, path, max_bytes, &|text| {
-            derive(text.lines().next().unwrap_or(""))
-        })
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1262,47 +1227,48 @@ fn encode_container(
         }
     }
     for unit in units {
-        let (link_kind, link_declared, link_reason) = match (&unit.link_basis, &unit.project_link) {
-            (
-                LinkBasis::Declared {
-                    declared,
-                    additional,
-                    missing_reason,
-                },
-                _,
-            ) => (
-                "declared",
-                encode_declared(declared, additional),
-                missing_reason.clone(),
-            ),
-            (LinkBasis::Fixed, ProjectLinkState::NotApplicable) => {
-                ("not-applicable", String::new(), String::new())
-            }
-            (LinkBasis::Fixed, ProjectLinkState::Unresolved { reason }) => {
-                ("unresolved", String::new(), reason.clone())
-            }
-            // Linked/Missing/NotAProject/Moved/Remote/Shared with no
-            // declared path to re-resolve: replaying it could report a
-            // project that has since been deleted or moved. Do not store
-            // the container.
-            (LinkBasis::Fixed, _) => return None,
-        };
+        let (link_kind, link_declared, link_reason) =
+            match (&unit.link_basis(), &unit.project_link()) {
+                (
+                    LinkBasis::Declared {
+                        declared,
+                        additional,
+                        missing_reason,
+                    },
+                    _,
+                ) => (
+                    "declared",
+                    encode_declared(declared, additional),
+                    missing_reason.clone(),
+                ),
+                (LinkBasis::Fixed, ProjectLinkState::NotApplicable) => {
+                    ("not-applicable", String::new(), String::new())
+                }
+                (LinkBasis::Fixed, ProjectLinkState::Unresolved { reason }) => {
+                    ("unresolved", String::new(), reason.clone())
+                }
+                // Linked/Missing/NotAProject/Moved/Remote/Shared with no
+                // declared path to re-resolve: replaying it could report a
+                // project that has since been deleted or moved. Do not store
+                // the container.
+                (LinkBasis::Fixed, _) => return None,
+            };
         let mut row = blank();
         row[0] = "unit".to_string();
-        row[1] = unit.path.display().to_string();
-        row[2] = unit.category.label().to_string();
-        row[3] = unit.relative_path.clone();
-        row[4] = unit.bytes.to_string();
-        row[5] = unit.mtime_max.to_string();
-        row[6] = unit.action.label().to_string();
-        row[7] = encode_opt(&unit.note);
-        row[8] = if unit.protected { "1" } else { "0" }.to_string();
-        row[9] = encode_opt(&unit.protect_reason);
+        row[1] = unit.path().display().to_string();
+        row[2] = unit.category().label().to_string();
+        row[3] = unit.relative_path().to_string();
+        row[4] = unit.bytes().to_string();
+        row[5] = unit.mtime_max().to_string();
+        row[6] = unit.action().label().to_string();
+        row[7] = encode_opt(&unit.note().map(str::to_string));
+        row[8] = if unit.protected() { "1" } else { "0" }.to_string();
+        row[9] = encode_opt(&unit.protect_reason().map(str::to_string));
         row[10] = link_kind.to_string();
         row[11] = link_declared;
         row[12] = link_reason;
         rows.push(row);
-        for member in &unit.members {
+        for member in unit.members() {
             let mut row = blank();
             row[0] = "member".to_string();
             row[1] = member.path.display().to_string();
@@ -1356,24 +1322,23 @@ fn decode_container(
                     ),
                     _ => return None,
                 };
-                units.push(CandidateAgentUnit {
+                units.push(CandidateAgentUnit::replayed(
                     category,
-                    relative_path: col(row, 3).to_string(),
-                    path: PathBuf::from(col(row, 1)),
-                    members: Vec::new(),
-                    bytes: col(row, 4).parse().ok()?,
-                    mtime_max: col(row, 5).parse().ok()?,
-                    protected: col(row, 8) == "1",
-                    protect_reason: decode_opt(col(row, 9)),
+                    col(row, 3).to_string(),
+                    PathBuf::from(col(row, 1)),
+                    col(row, 4).parse().ok()?,
+                    col(row, 5).parse().ok()?,
+                    col(row, 8) == "1",
+                    decode_opt(col(row, 9)),
                     project_link,
                     action,
-                    note: decode_opt(col(row, 7)),
+                    decode_opt(col(row, 7)),
                     link_basis,
-                });
+                ));
             }
             "member" => {
                 let kind = AgentMemberKind::from_label(col(row, 2))?;
-                units.last_mut()?.members.push(AgentMember {
+                units.last_mut()?.push_replayed_member(AgentMember {
                     path: PathBuf::from(col(row, 1)),
                     bytes: col(row, 4).parse().ok()?,
                     kind,
@@ -1448,161 +1413,6 @@ pub trait AgentAdapter: Send + Sync {
     }
 }
 
-// ---------------------------------------------------------------------
-// AgentUnitBuilder: protected-by-default is a constructor, not a habit
-// ---------------------------------------------------------------------
-
-/// The only way an adapter builds a unit
-/// (`.oh/guardrails/agent-units-built-through-builder.md`).
-///
-/// A `CandidateAgentUnit { .. }` literal has to spell out `protected`
-/// and `protect_reason`, which means a new adapter can silently ship a
-/// credentials file with `protected: false` and nothing notices. The
-/// constructor applies [`AgentCategory::default_protected`] instead, and
-/// lifting it requires [`AgentUnitBuilder::unprotect_with_reason`] --
-/// visible in review, and in the diff.
-pub struct AgentUnitBuilder {
-    unit: CandidateAgentUnit,
-}
-
-impl AgentUnitBuilder {
-    pub fn new(_tool_id: &str, category: AgentCategory, path: PathBuf) -> Self {
-        let (protected, protect_reason) = if category.default_protected() {
-            (
-                true,
-                Some(format!(
-                    "{} is protected by default (credentials/config/skills/automation)",
-                    category.label()
-                )),
-            )
-        } else {
-            (false, None)
-        };
-        let relative_path = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        Self {
-            unit: CandidateAgentUnit {
-                category,
-                relative_path,
-                path,
-                members: Vec::new(),
-                bytes: 0,
-                mtime_max: 0,
-                protected,
-                protect_reason,
-                project_link: ProjectLinkState::NotApplicable,
-                action: AgentActionCapability::None,
-                note: None,
-                link_basis: LinkBasis::Fixed,
-            },
-        }
-    }
-
-    /// Sets `relative_path` from this unit's path relative to `home`,
-    /// forward-slashed.
-    pub fn relative_to(mut self, home: &Path) -> Self {
-        self.unit.relative_path = relative_to(home, &self.unit.path);
-        self
-    }
-
-    pub fn relative_path(mut self, rel: impl Into<String>) -> Self {
-        self.unit.relative_path = rel.into();
-        self
-    }
-
-    pub fn bytes(mut self, bytes: u64) -> Self {
-        self.unit.bytes = bytes;
-        self
-    }
-
-    pub fn mtime_max(mut self, mtime: u64) -> Self {
-        self.unit.mtime_max = mtime;
-        self
-    }
-
-    /// Sets the member list and derives `bytes` from it.
-    pub fn members(mut self, members: Vec<AgentMember>) -> Self {
-        self.unit.bytes = members.iter().map(|m| m.bytes).sum();
-        self.unit.members = members;
-        self
-    }
-
-    /// Sets the member list without touching an explicitly set byte
-    /// total (a folded category unit whose members are a subset).
-    pub fn members_keep_bytes(mut self, members: Vec<AgentMember>) -> Self {
-        self.unit.members = members;
-        self
-    }
-
-    pub fn project_link(mut self, link: ProjectLinkState) -> Self {
-        self.unit.project_link = link;
-        self.unit.link_basis = LinkBasis::Fixed;
-        self
-    }
-
-    /// Resolves a path the tool itself declared, and records that this
-    /// is where the link came from, so a reused container re-resolves it
-    /// live instead of replaying a state that may since have gone stale
-    /// ([`LinkBasis`]). The only form of linkage a container may be
-    /// reused around.
-    pub fn project_link_declared(self, declared: Option<String>, missing_reason: &str) -> Self {
-        self.project_link_declared_workspace(declared, Vec::new(), missing_reason)
-    }
-
-    /// [`Self::project_link_declared`] for a unit that declares several
-    /// workspace roots. The resolved state widens to
-    /// [`ProjectLinkState::Shared`] when they resolve to different
-    /// projects, and every declared path is stored so a replayed
-    /// container re-resolves all of them rather than replaying a
-    /// widening that may since have stopped being true.
-    pub fn project_link_declared_workspace(
-        mut self,
-        declared: Option<String>,
-        additional: Vec<String>,
-        missing_reason: &str,
-    ) -> Self {
-        self.unit.project_link = resolve_declared_workspace(&declared, &additional, missing_reason);
-        self.unit.link_basis = LinkBasis::Declared {
-            declared,
-            additional,
-            missing_reason: missing_reason.to_string(),
-        };
-        self
-    }
-
-    pub fn action(mut self, action: AgentActionCapability) -> Self {
-        self.unit.action = action;
-        self
-    }
-
-    pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.unit.note = Some(note.into());
-        self
-    }
-
-    /// Protects this unit for a stated reason, on top of whatever its
-    /// category already implies.
-    pub fn protect(mut self, reason: impl Into<String>) -> Self {
-        self.unit.protected = true;
-        self.unit.protect_reason = Some(reason.into());
-        self
-    }
-
-    /// Lifts a category's default protection. Deliberately noisy: a
-    /// reason is required and the audit records every use.
-    pub fn unprotect_with_reason(mut self, reason: &str) -> Self {
-        self.unit.protected = false;
-        self.unit.protect_reason = Some(format!("default protection lifted: {reason}"));
-        self
-    }
-
-    pub fn build(self) -> CandidateAgentUnit {
-        self.unit
-    }
-}
-
 /// `path` relative to `home`, forward-slashed; the whole path if it is
 /// not beneath `home`.
 pub fn relative_to(home: &Path, path: &Path) -> String {
@@ -1633,8 +1443,10 @@ fn unit_key(tool_id: &str, category: AgentCategory, device: u64, path: &Path) ->
 pub(crate) fn device_of(path: &Path) -> u64 {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        crate::fs_gate::metadata_following(path).map(|m| m.dev()).unwrap_or(0)
+        use crate::fs_gate::MetadataExt;
+        crate::fs_gate::metadata_following(path)
+            .map(|m| m.dev())
+            .unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -1721,18 +1533,8 @@ pub(crate) fn resolve_declared_path(
     ProjectLinkState::NotAProject { path }
 }
 
-/// The worktree root containing `path`, if any -- reuses
-/// `resolve_declared_path`'s own upward `.git` search. Lets a caller
-/// that only has one exact target path (`swamp propose-agents --path`,
-/// which does not compute a full `Report`) still supply
-/// `discover_and_measure`'s `project_worktrees` for Aider's per-repo
-/// units, without a whole-scope walk.
-pub fn worktree_root_containing(path: &Path) -> Option<PathBuf> {
-    match resolve_declared_path(Some(path.display().to_string()), "") {
-        ProjectLinkState::Linked { project_path, .. } => Some(project_path),
-        _ => None,
-    }
-}
+mod unit;
+pub use unit::{AgentUnitBuilder, CandidateAgentUnit};
 
 // Human keep/protect intent lives in `crate::protection`; re-exported
 // here, where every caller has always found it.
@@ -1838,8 +1640,42 @@ fn tool_name_for(tool_id: &str, scope: &EffectiveScope) -> String {
 /// annotation of existing history; `observe: true` => persist this
 /// pass). Never walks a tool home not resolved by the detector registry,
 /// and never reads past what each adapter's own bounded contract allows.
+/// The test-fixture spelling of [`discover_and_measure_in`] (`testing`
+/// feature only; the reviewers' counterexample files call it by this
+/// name). Production discovery runs only inside the report pipeline,
+/// which holds the [`crate::report::DiscoveryPass`].
+#[cfg(feature = "testing")]
 #[allow(clippy::too_many_arguments)]
 pub fn discover_and_measure(
+    scope: &EffectiveScope,
+    project_worktrees: &[PathBuf],
+    swamp_dir: Option<&Path>,
+    observe: bool,
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
+) -> Result<Vec<AgentUnit>> {
+    discover_and_measure_in(
+        &crate::report::DiscoveryPass::for_tests(),
+        scope,
+        project_worktrees,
+        swamp_dir,
+        observe,
+        observed_at,
+        retention_days,
+        since_secs,
+        coverage,
+    )
+}
+
+/// Agent-storage discovery for one observation. Takes the
+/// [`crate::report::DiscoveryPass`] only `report::observe_scope` mints,
+/// so a second pass over the shared history table cannot be written
+/// anywhere else (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
+#[allow(clippy::too_many_arguments)]
+pub fn discover_and_measure_in(
+    _pass: &crate::report::DiscoveryPass,
     scope: &EffectiveScope,
     project_worktrees: &[PathBuf],
     swamp_dir: Option<&Path>,
@@ -1903,14 +1739,14 @@ pub fn discover_and_measure(
         covered_roots.push(home.clone());
         let device = device_of(&home);
         for cand in units {
-            let key = unit_key(&tool_id, cand.category, device, &cand.path);
+            let key = unit_key(&tool_id, cand.category(), device, &cand.path());
             observed.push(ObservedExternal {
                 key: key.clone(),
                 detector_id: tool_id.clone(),
-                category: cand.category.key_str(),
+                category: cand.category().key_str(),
                 device,
-                path: cand.path.display().to_string(),
-                bytes: cand.bytes,
+                path: cand.path().display().to_string(),
+                bytes: cand.bytes(),
                 hardlinked: true,
             });
             candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
@@ -1943,14 +1779,14 @@ pub fn discover_and_measure(
             covered_roots.push(wt_path.clone());
             let device = device_of(wt_path);
             for cand in adapter.project_local_units(wt_path, &ctx) {
-                let key = unit_key(tool_id, cand.category, device, &cand.path);
+                let key = unit_key(tool_id, cand.category(), device, &cand.path());
                 observed.push(ObservedExternal {
                     key: key.clone(),
                     detector_id: tool_id.to_string(),
-                    category: cand.category.key_str(),
+                    category: cand.category().key_str(),
                     device,
-                    path: cand.path.display().to_string(),
-                    bytes: cand.bytes,
+                    path: cand.path().display().to_string(),
+                    bytes: cand.bytes(),
                     hardlinked: true,
                 });
                 candidates_by_key.insert(key, (tool_name.clone(), wt_path.clone(), cand, device));
@@ -2006,45 +1842,30 @@ pub fn discover_and_measure(
         // could not verify. One place, so it cannot be forgotten in an
         // adapter (`docs/agent-storage.md`'s support matrix).
         if matrix::support_for(&tool_id) == Some(matrix::SupportLevel::Unverified) {
-            cand.action = AgentActionCapability::None;
-            if !matches!(cand.project_link, ProjectLinkState::NotApplicable) {
-                cand.project_link = ProjectLinkState::Unresolved {
-                    reason: format!(
-                        "{tool_name}'s storage layout is not confirmed against its own source or \
-                         documentation (support level: unverified), so a project link would rest \
-                         on an unverified layout"
-                    ),
-                };
-            }
-            let why = "support level: unverified -- this tool's layout could not be confirmed \
-                       against its own source or documentation, so no action is offered";
-            cand.note = Some(match cand.note.take() {
-                Some(n) => format!("{n}; {why}"),
-                None => why.to_string(),
-            });
+            cand.withdraw_for_unverified_layout(&tool_name);
         }
         let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
-        let default_protected = cand.category.default_protected();
+        let default_protected = cand.category().default_protected();
         // Both directions (`protection_conflict`): a unit beneath a
         // protected path, *and* a unit containing one. The latter is the
         // review's `protected_descendant_must_prevent_parent_cache_proposal`
         // counterexample -- protecting `debug/log.txt` must stop `debug/`
         // being proposed, or the protection means nothing.
-        let human_protected = protected_paths.conflict(&cand.path).or_else(|| {
-            cand.members
+        let human_protected = protected_paths.conflict(&cand.path()).or_else(|| {
+            cand.members()
                 .iter()
                 .find_map(|m| protected_paths.conflict(&m.path))
         });
         let (protected, protect_reason) = if let Some(why) = &protection_unknown {
             (true, Some(format!("protection state unknown: {why}")))
-        } else if cand.protected {
-            (true, cand.protect_reason.clone())
+        } else if cand.protected() {
+            (true, cand.protect_reason().map(str::to_string))
         } else if default_protected {
             (
                 true,
                 Some(format!(
                     "{} is protected by default (credentials/config/skills/automation)",
-                    cand.category.label()
+                    cand.category().label()
                 )),
             )
         } else if let Some(reason) = human_protected {
@@ -2056,29 +1877,30 @@ pub fn discover_and_measure(
         // `mtime_max` while folding this unit's members; turn it into
         // the shared contract's fact rather than a second stat pass.
         let evidence = vec![crate::activity::modification_evidence(
-            cand.mtime_max,
+            cand.mtime_max(),
             observed_at,
         )];
+        let parts = cand.into_parts();
         units.push(AgentUnit {
-            id: unit_id(&tool_id, cand.category, &cand.relative_path),
+            id: unit_id(&tool_id, parts.category, &parts.relative_path),
             tool_id,
             tool_name,
             tool_home,
-            category: cand.category,
-            relative_path: cand.relative_path,
-            path: cand.path,
-            members: cand.members,
-            bytes: cand.bytes,
+            category: parts.category,
+            relative_path: parts.relative_path,
+            path: parts.path,
+            members: parts.members,
+            bytes: parts.bytes,
             hardlinked: true,
             growth_bytes,
             regrowth_count,
             observed_at,
-            mtime_max: cand.mtime_max,
+            mtime_max: parts.mtime_max,
             protected,
             protect_reason,
-            project_link: cand.project_link,
-            action: cand.action,
-            note: cand.note,
+            project_link: parts.project_link,
+            action: parts.action,
+            note: parts.note,
             evidence,
         });
     }
@@ -2150,26 +1972,26 @@ pub(crate) mod contract {
     pub fn protection_defaults_hold(units: &[CandidateAgentUnit]) {
         let mut checked = 0usize;
         for u in units {
-            if u.category.default_protected() {
+            if u.category().default_protected() {
                 checked += 1;
                 assert!(
-                    u.protected,
+                    u.protected(),
                     "{} is in the default-protected category {} and arrived unprotected",
-                    u.relative_path,
-                    u.category.label()
+                    u.relative_path(),
+                    u.category().label()
                 );
                 assert!(
-                    u.protect_reason.is_some(),
+                    u.protect_reason().is_some(),
                     "{} is protected with no stated reason",
-                    u.relative_path
+                    u.relative_path()
                 );
             }
-            if u.protected {
+            if u.protected() {
                 assert_ne!(
-                    u.action,
+                    u.action(),
                     AgentActionCapability::SessionRemoval,
                     "{} is protected yet offers session removal",
-                    u.relative_path
+                    u.relative_path()
                 );
             }
         }
@@ -2194,23 +2016,23 @@ pub(crate) mod contract {
     ) {
         for u in units {
             assert!(
-                !u.category.default_protected(),
+                !u.category().default_protected(),
                 "{} is in the default-protected category {}, so this adapter does have one and \
                  should use `protection_defaults_hold`",
-                u.relative_path,
-                u.category.label()
+                u.relative_path(),
+                u.category().label()
             );
-            if u.protected {
+            if u.protected() {
                 assert!(
-                    u.protect_reason.is_some(),
+                    u.protect_reason().is_some(),
                     "{} is protected with no stated reason",
-                    u.relative_path
+                    u.relative_path()
                 );
                 assert_ne!(
-                    u.action,
+                    u.action(),
                     AgentActionCapability::SessionRemoval,
                     "{} is protected yet offers session removal",
-                    u.relative_path
+                    u.relative_path()
                 );
             }
         }
@@ -2237,21 +2059,21 @@ pub(crate) mod contract {
                 tool_id: "t".into(),
                 tool_name: "t".into(),
                 tool_home: PathBuf::from("/"),
-                category: u.category,
+                category: u.category(),
                 id: "id".into(),
-                relative_path: u.relative_path.clone(),
+                relative_path: u.relative_path().to_string(),
                 path: u.path.clone(),
-                members: u.members.clone(),
-                bytes: u.bytes,
+                members: u.members().to_vec(),
+                bytes: u.bytes(),
                 hardlinked: true,
                 growth_bytes: None,
                 regrowth_count: 0,
                 observed_at: 0,
-                mtime_max: u.mtime_max,
-                protected: u.protected,
-                protect_reason: u.protect_reason.clone(),
-                project_link: u.project_link.clone(),
-                action: u.action,
+                mtime_max: u.mtime_max(),
+                protected: u.protected(),
+                protect_reason: u.protect_reason().map(str::to_string),
+                project_link: u.project_link().clone(),
+                action: u.action(),
                 note: u.note.clone(),
                 evidence: Vec::new(),
             })
@@ -2267,29 +2089,29 @@ pub(crate) mod contract {
     /// means the adapter guessed from a basename.
     pub fn linkage_is_declared_or_explicit(units: &[CandidateAgentUnit], forbidden: &str) {
         for u in units {
-            match &u.project_link {
+            match &u.project_link() {
                 ProjectLinkState::Linked { source, .. } => {
                     assert_eq!(
                         *source,
                         LinkSource::Declared,
                         "{} claims a link from something other than declared metadata",
-                        u.relative_path
+                        u.relative_path()
                     );
                 }
                 ProjectLinkState::Unresolved { reason } => {
                     assert!(
                         !reason.trim().is_empty(),
                         "{} is Unresolved with no stated reason",
-                        u.relative_path
+                        u.relative_path()
                     );
                 }
                 _ => {}
             }
-            let rendered = format!("{:?}", u.project_link);
+            let rendered = format!("{:?}", u.project_link());
             assert!(
                 !rendered.contains(forbidden),
                 "{} resolved a project from the basename {forbidden:?}: {rendered}",
-                u.relative_path
+                u.relative_path()
             );
         }
     }
@@ -2322,11 +2144,11 @@ mod tests {
             PathBuf::from("/home/.credentials.json"),
         )
         .build();
-        assert!(u.protected);
-        assert!(u.protect_reason.is_some());
+        assert!(u.protected());
+        assert!(u.protect_reason().is_some());
         let c =
             AgentUnitBuilder::new("t", AgentCategory::Caches, PathBuf::from("/home/cache")).build();
-        assert!(!c.protected);
+        assert!(!c.protected());
     }
 
     #[test]
@@ -2338,9 +2160,9 @@ mod tests {
         )
         .unprotect_with_reason("fixture")
         .build();
-        assert!(!u.protected);
+        assert!(!u.protected());
         assert!(
-            u.protect_reason
+            u.protect_reason()
                 .as_deref()
                 .is_some_and(|r| r.contains("fixture")),
             "an unprotect must leave its reason behind"
@@ -2581,7 +2403,12 @@ mod tests {
         protect_add(dir.path(), &target).unwrap();
         let listed = protect_list(dir.path()).unwrap();
         assert_eq!(listed.len(), 1);
-        assert!(load_protect(dir.path()).unwrap().conflict(&target).is_some());
+        assert!(
+            load_protect(dir.path())
+                .unwrap()
+                .conflict(&target)
+                .is_some()
+        );
         // Idempotent add.
         protect_add(dir.path(), &target).unwrap();
         assert_eq!(protect_list(dir.path()).unwrap().len(), 1);

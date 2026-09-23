@@ -3,7 +3,14 @@ id: fsevents-before-full-walk
 severity: hard
 statement: "An observation asks FSEvents what changed before it walks anything; a full walk happens only when the replay refuses, the store has no anchor, --full is passed, or the classification rules version changed."
 outcome: disk-growth-by-project
-audit: fsevents_before_full_walk
+audit: none
+audit_none_reason: "2026-09-22: ordering inside `stage_tracked_with_source` is control flow no path-reference rule can check; the runtime tests assert it, and the canned replay source that could bypass it is out of production"
+compile_fail:
+  - fs_events_testing_is_not_in_production
+  - bus_stage_is_minted_by_the_bus
+runtime_tests:
+  - crates/core/tests/fsevents_incremental.rs
+  - crates/core/tests/unit_root_event_cursors.rs
 ---
 
 ## Rationale
@@ -11,9 +18,12 @@ The whole point of persisting an event id is that the next observation is a repl
 
 ## Detection
 
-Every `observe_tracked_with_source` delegates, honoured, to `stage_tracked_with_source` and reaches no walk except through it. In every `stage_tracked_with_source`, no call before the first FSEvents `replay*` reaches the derived traversal set unless it is under the `force_full` condition.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `fsevents_before_full_walk/01-force-full-always`, `fsevents_before_full_walk/02-aliased-full-walk`, `fsevents_before_full_walk/03-no-cursor-check`, `fsevents_before_full_walk/04-sweep3`.
+**Runtime test.** `fsevents_incremental.rs` asserts that an unchanged tree is answered from the replay without a walk, that every refusal reason (and an older rules version, even with no stored event id) falls back to a full walk, and that `--full` forces one.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Type.** The canned replay source exists only under the `testing` feature, so the TUI's live refresh replays a real plan (`fs_events::LivePlanSource`); walks take a `bus::Stage`.
 
+Retired 2026-09-22: the `fsevents_before_full_walk` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `fs_events_testing_is_not_in_production`, `bus_stage_is_minted_by_the_bus`.

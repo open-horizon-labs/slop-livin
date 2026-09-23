@@ -19,16 +19,18 @@
 //! collapse that distinction; the two are kept as independent parallel
 //! passes here to preserve it exactly.
 
-use crate::attribution::{AttributionResult, allocated_bytes, classify_at, is_shared_cache_name};
+use crate::attribution::{
+    AttributionResult, Classified, allocated_bytes, classified_at, is_shared_cache_name,
+};
 use crate::entities::{Confidence, id_for};
+use crate::fs_gate as fs;
+use crate::fs_gate::MetadataExt;
 use crate::git::{DiscoveredWorktree, classify_git_file, classify_main_checkout};
 use crate::report::{
     ArtifactKind, ArtifactRow, DirRollup, FileRow, Source, UnownedReason, UnownedRow,
 };
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -246,17 +248,17 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
 fn shallow_parallel_measurement_counts_allocations_without_following_links_or_children() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("measured");
-    fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     let mut expected = 0;
     for i in 0..513 {
         let path = root.join(format!("{i}.o"));
-        fs::write(&path, vec![1u8; 4096]).unwrap();
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
         expected += fs::symlink_metadata(path).unwrap().blocks() * 512;
     }
-    fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
+    std::fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
     expected += fs::symlink_metadata(root.join("0.o")).unwrap().blocks() * 512;
-    fs::create_dir(root.join("child")).unwrap();
-    fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
+    std::fs::create_dir(root.join("child")).unwrap();
+    std::fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
     std::os::unix::fs::symlink(root.join("child"), root.join("symlink")).unwrap();
     let measured = measure_directory(&root).unwrap();
     assert_eq!(measured.allocated, expected);
@@ -264,15 +266,6 @@ fn shallow_parallel_measurement_counts_allocations_without_following_links_or_ch
     assert_eq!(measured.children, vec!["child"]);
     assert_eq!(measured.symlinks, 1);
     assert!(measured.hardlinked);
-}
-
-/// Parallel equivalent of `git::discover`: same stop conditions
-/// (`STOP_DIRS` plus `.git`), same per-directory `.git` identity
-/// resolution, same device/symlink guards. Order of the returned rows is
-/// unspecified (workers race), which is fine: callers group by
-/// `project_id`/`worktree_id`, not position.
-pub fn discover_parallel(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
-    discover_parallel_excluding(root, &[])
 }
 
 /// Same as [`discover_parallel`], pruning any subtree at or under a path
@@ -461,10 +454,12 @@ enum AttrJob {
     /// An unclassified directory: recurse, classifying each child by
     /// name and either sizing it as a unit or walking further.
     Walk(PathBuf),
-    /// A directory inside an already-classified artifact subtree.
+    /// A directory inside an already-classified artifact subtree. The
+    /// [`Classified`] is the proof it is one.
     Size {
         path: PathBuf,
         group: Arc<SizeGroup>,
+        classified: Classified,
     },
 }
 
@@ -648,7 +643,11 @@ fn attribute_parallel_inner(
 
     pool.drain(worker_count(), |job| match job {
         AttrJob::Walk(path) => process_walk(path, &known, &shared, &pool),
-        AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
+        AttrJob::Size {
+            path,
+            group,
+            classified,
+        } => process_size(path, &group, &classified, &shared, &pool),
     });
 
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
@@ -807,7 +806,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             progress::DIRS.fetch_add(1, Ordering::Relaxed);
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(kind) = classify_at(&path, &name) {
+            if let Some(classified) = classified_at(&path, &name) {
+                let kind = classified.kind().clone();
                 let worktree = nearest_worktree(known, &child_path).map(str::to_string);
                 let worktree_root = worktree
                     .as_deref()
@@ -844,6 +844,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 pool.push(AttrJob::Size {
                     path: child_path,
                     group,
+                    classified,
                 });
             } else {
                 pool.push(AttrJob::Walk(child_path));
@@ -992,7 +993,13 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
 /// `Size` jobs under the same group. Read errors here are swallowed, same
 /// as the serial `size_as_unit`, since a classified directory is sized as
 /// a best-effort unit rather than reported as a permission gap.
-fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool: &Pool<AttrJob>) {
+fn process_size(
+    path: PathBuf,
+    group: &Arc<SizeGroup>,
+    classified: &Classified,
+    shared: &AttrShared,
+    pool: &Pool<AttrJob>,
+) {
     // Pruned (#45-#49's external-location double-measurement fix): a
     // subtree named in `shared.excluded` is measured independently
     // elsewhere (typically as its own external unit), so this job
@@ -1040,6 +1047,7 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             pool.push(AttrJob::Size {
                 path: entry.path(),
                 group: Arc::clone(group),
+                classified: classified.clone(),
             });
         } else if ft.is_file() {
             crate::work_counters::record_files_statted(1);
@@ -1331,10 +1339,15 @@ pub fn resize_artifact_stamped(
     pool.push(AttrJob::Size {
         path: root_path.to_path_buf(),
         group,
+        classified: Classified::stored(kind.clone()),
     });
     pool.drain(worker_count(), |job| match job {
         AttrJob::Walk(path) => process_walk(path, &[], &shared, &pool),
-        AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
+        AttrJob::Size {
+            path,
+            group,
+            classified,
+        } => process_size(path, &group, &classified, &shared, &pool),
     });
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
     let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
@@ -1439,6 +1452,7 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
 /// worktree, measured, or reported as unowned. Empty for every caller
 /// with no scope-level exclusions to enforce.
 pub fn discover_and_attribute(
+    _stage: &crate::bus::Stage,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,

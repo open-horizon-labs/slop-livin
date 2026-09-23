@@ -49,6 +49,7 @@ pub mod nvm;
 pub mod oh_my_pi;
 pub mod ollama;
 pub mod opencode;
+pub mod permitted;
 pub mod pi;
 pub mod pip;
 pub mod pnpm;
@@ -849,14 +850,14 @@ impl Registry {
     pub fn resolve(
         &self,
         env: &Environment,
-        disabled: &[String],
+        permitted: &permitted::PermittedDetectors,
     ) -> Vec<(String, Vec<ProposedLocation>)> {
         self.detectors
             .iter()
             .filter(|d| d.platforms().contains(&env.platform))
             .map(|d| {
                 let id = d.id().to_string();
-                if disabled.iter().any(|x| x == d.id()) {
+                if !permitted.permits(d.id()) {
                     (
                         id.clone(),
                         vec![ProposedLocation {

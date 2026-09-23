@@ -95,7 +95,8 @@ fn read_compose_file(path: &Path) -> Option<ComposeFile> {
 
     let mut names = Vec::new();
     if metadata.len() <= MAX_COMPOSE_FILE_BYTES
-        && let Ok(contents) = crate::fs_gate::read::bounded_string(path, crate::fs_gate::read::BoundedCap::MANIFEST)
+        && let Ok(contents) =
+            crate::fs_gate::read::bounded_string(path, crate::fs_gate::read::BoundedCap::MANIFEST)
         && let Some(name) = parse_top_level_name(&contents)
     {
         names.push(name);

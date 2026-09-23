@@ -3,14 +3,21 @@ id: dir-mtime-int32-minutes
 severity: hard
 statement: "Per-directory and per-file store rows carry the newest mtime as int32 minutes (mod_time_min), the store-depth design from the Go plumbing."
 outcome: disk-growth-by-project
-audit: dir_mtime_int32_minutes
+audit: gate_paths_only_inside_gates
+compile_fail:
+  - history_rows_are_private_to_the_store
+runtime_tests:
+  - crates/core/tests/dirs_and_files.rs::mod_time_min_round_trips_as_i32_minutes
 ---
 
 ## Detection
 
-Every `Field::new` anywhere whose name (a literal or a constant) starts with `mod_time` must be `mod_time_min` with `DataType::Int32`; `dirs_schema` and `files_schema` exist, and at least two schemas declare the minutes column.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `dir_mtime_int32_minutes/01-seconds-in-the-minutes-column`, `dir_mtime_int32_minutes/02-renamed-column`, `dir_mtime_int32_minutes/03-widened-column`, `dir_mtime_int32_minutes/04-sweep3`.
+**Type.** The directory and file row schemas and their writers are private to `growth::columns`.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** Arrow schema types may be named only in the column-store modules, so no other module can declare a `mod_time*` column; the round-trip test below pins the Int32 minutes encoding.
 
+Retired 2026-09-22: the `dir_mtime_int32_minutes` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `history_rows_are_private_to_the_store`.

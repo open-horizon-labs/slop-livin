@@ -306,8 +306,8 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, ProjectLinkState, bounded_io, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -355,7 +355,7 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unknown format)");
+        assert_eq!(units[0].relative_path(), "(unknown format)");
     }
 
     #[test]
@@ -374,13 +374,13 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Linked { .. }
         ));
-        assert_eq!(session.action, AgentActionCapability::SessionRemoval);
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -404,9 +404,9 @@ mod tests {
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(
-            matches!(session.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(session.project_link(), ProjectLinkState::Unresolved { .. }),
             "a shape this tool does not document must not resolve a project: {:?}",
-            session.project_link
+            session.project_link()
         );
         let note = session.note.as_deref().unwrap_or_default();
         assert!(
@@ -421,9 +421,9 @@ mod tests {
         let home = home.path();
         touch(&home.join("npm/pkg/index.js"), b"module.exports = {}");
         let units = run(home);
-        let u = units.iter().find(|u| u.relative_path == "npm").unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        let u = units.iter().find(|u| u.relative_path() == "npm").unwrap();
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -435,9 +435,9 @@ mod tests {
         touch(&home.join("models.json"), b"{}");
         let units = run(home);
         for rel in ["settings.json", "trust.json", "models.json"] {
-            let u = units.iter().find(|u| u.relative_path == rel).unwrap();
-            assert!(u.protected);
-            assert!(u.protect_reason.is_some());
+            let u = units.iter().find(|u| u.relative_path() == rel).unwrap();
+            assert!(u.protected());
+            assert!(u.protect_reason().is_some());
         }
     }
 
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -479,8 +479,8 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1, "an unrecognized home must still surface");
-        assert_eq!(units[0].relative_path, "(unknown format)");
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unknown format)");
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         assert!(
             units[0]
                 .note
@@ -499,7 +499,7 @@ mod tests {
         touch(&jsonl, b"not a session header at all\n");
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
-        match &session.project_link {
+        match &session.project_link() {
             ProjectLinkState::Unresolved { reason } => {
                 assert!(
                     reason.contains("byte offset 0"),
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             20
         );
@@ -581,11 +581,11 @@ mod tests {
         contract::protection_defaults_hold(&units);
         let settings = units
             .iter()
-            .find(|u| u.relative_path == "settings.json")
+            .find(|u| u.relative_path() == "settings.json")
             .unwrap();
-        assert_eq!(settings.category, AgentCategory::ProtectedConfig);
+        assert_eq!(settings.category(), AgentCategory::ProtectedConfig);
         assert_eq!(
-            settings.protect_reason.as_deref(),
+            settings.protect_reason().as_deref(),
             Some("main configuration"),
             "the adapter's own, more specific reason survives the builder default"
         );
@@ -613,7 +613,7 @@ mod tests {
 
         let units = run(home);
         let a = units.iter().find(|u| u.path == declared).unwrap();
-        match &a.project_link {
+        match &a.project_link() {
             ProjectLinkState::Linked { source, .. } => {
                 assert_eq!(*source, crate::agents::LinkSource::Declared)
             }
@@ -621,9 +621,9 @@ mod tests {
         }
         let b = units.iter().find(|u| u.path == undeclared).unwrap();
         assert!(
-            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(b.project_link(), ProjectLinkState::Unresolved { .. }),
             "a directory name is not evidence: {:?}",
-            b.project_link
+            b.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "guessable-repo");
     }

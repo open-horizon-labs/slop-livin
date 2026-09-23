@@ -34,7 +34,12 @@ impl Consumer for ReportAssembler {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::TrackingAnnotated, EventKind::HistoryLoaded]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let mut p = self.pending.lock().unwrap();
         match event {
             Event::TrackingAnnotated(d) => p.draft = Some(d.clone()),

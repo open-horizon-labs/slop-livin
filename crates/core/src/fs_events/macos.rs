@@ -255,9 +255,7 @@ impl FsEventsSource for MacOsFsEventsSource {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan {
         self.replay_roots(std::slice::from_ref(request))
             .pop()
-            .unwrap_or_else(|| {
-                FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, 0, None)
-            })
+            .unwrap_or_else(|| FsEventsPlan::refuse(RefreshRefusal::FseventsdUnavailable, 0, None))
     }
 
     fn replay_roots(&self, requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
@@ -438,8 +436,7 @@ fn run_stream(roots: &[PathBuf], since_id: u64) -> Result<Vec<PathBuf>, RefreshR
     // moved or replaced. Directory-level events (no FileEvents flag)
     // suffice: rows here are per artifact/worktree/dir, never
     // per-file.
-    let create_flags =
-        fs::kFSEventStreamCreateFlagNoDefer | fs::kFSEventStreamCreateFlagWatchRoot;
+    let create_flags = fs::kFSEventStreamCreateFlagNoDefer | fs::kFSEventStreamCreateFlagWatchRoot;
 
     // SAFETY: `paths_array` and `context` outlive the call; the
     // callback pointer has the exact signature FSEvents expects.

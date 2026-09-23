@@ -9,7 +9,13 @@ sufficiency_group: G2
 owner: null
 review_trigger: "A new detector, scope change, contradictory fact, or real user decision exposes a failure."
 tactic_disposition: selected
-audit: activity_and_consumer_evidence_have_limits
+audit: no_verdict_literals
+compile_fail:
+  - blank_reason_does_not_compile
+  - reason_is_not_a_plain_string
+  - fact_status_reason_is_not_a_plain_string
+runtime_tests:
+  - crates/core/tests/evidence_contract.rs
 ---
 
 # Activity and consumer evidence have limits
@@ -45,11 +51,15 @@ vocabulary audit does not establish provenance, freshness, or semantic correctne
 
 ## Detection
 
-A `FactStatus` variant is built only in the module that declares it (struct literals anywhere else, including inside macro arguments, fail). The reasoned constructors are derived: every `Evidence` method with a `reason` parameter; the argument in that position must not evaluate empty -- a literal `""`, a constant holding `""` (constants are followed), `String::new()` or `Default::default()`. Every evidence builder in the activity module names an `EvidenceSource` or delegates to one that does, and `render::render_evidence_lines` prints the reason.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `activity_and_consumer_evidence_have_limits/01-status-struct-literal`, `activity_and_consumer_evidence_have_limits/02-empty-reason`, `activity_and_consumer_evidence_have_limits/03-activity-evidence-without-source`, `activity_and_consumer_evidence_have_limits/04-sweep3`.
+**Type.** Every `FactStatus::Unknown`/`Unavailable`/`Conflicting` carries an `evidence::Reason`, and a `Reason` is made only by `reason!` (a literal template checked non-blank at compile time), `Reason::fixed` (a `&'static str` from a table) or `Reason::carried` (a reason another fact computed); the last two substitute an explicit "not recorded" text for a blank one. There is no `From<String>`, and `From<&str>` exists only under the `testing` feature. A blank literal, `String::from("")` or a `FactStatus` literal with a plain string does not compile.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `no_verdict_literals` rejects any production string literal or serialized field/variant name that asserts "unused", "safe to delete" and the like, so missing evidence cannot be rendered as a verdict.
+
+Retired 2026-09-22: the `activity_and_consumer_evidence_have_limits` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `blank_reason_does_not_compile`, `reason_is_not_a_plain_string`, `fact_status_reason_is_not_a_plain_string`.
 
 ## Runtime tests that complete it
 

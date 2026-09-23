@@ -14,7 +14,6 @@
 //! earn an incremental refresh is a named [`RefreshRefusal`] instead of an
 //! `Err`. A refusal is not a bug; it is this design refusing to guess.
 
-use crate::entities::{Confidence, FactMeta};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -615,25 +614,6 @@ fn add_with_parent(changes: &mut std::collections::HashSet<PathBuf>, root: &Path
         if candidate == root || candidate.starts_with(root) {
             changes.insert(candidate);
         }
-    }
-}
-
-/// Legacy pre-#29 shape kept only so the stub's original two symbols
-/// (`full_refresh`, an early `RefreshRefusal` with fewer variants) do not
-/// silently disappear from anyone who imported them mid-restart. Superseded
-/// by [`FsEventsPlan::refuse`] internally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefreshResult {
-    pub incremental: bool,
-    pub refusal: Option<RefreshRefusal>,
-    pub meta: FactMeta,
-}
-
-pub fn full_refresh(reason: RefreshRefusal) -> RefreshResult {
-    RefreshResult {
-        incremental: false,
-        refusal: Some(reason),
-        meta: FactMeta::now("filesystem.full-refresh", Confidence::High),
     }
 }
 

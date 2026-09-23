@@ -84,32 +84,32 @@ impl ProtectList {
     /// say *why*. It is the only query this type has, so there is no
     /// second (one-directional) predicate to reach for.
     pub fn conflict(&self, candidate: &Path) -> Option<String> {
-    // One spelling for both sides. `external::discover_and_measure`
-    // canonicalizes every candidate and `agents::discover_and_measure`
-    // does not, so the same home comes back as `/var/folders/.../claude`
-    // from one pass and `/private/var/folders/.../claude` from the
-    // other. Compared literally, a single `protect` entry covered one
-    // family and not the other (the 2026-09-22 re-review's P2); through
-    // `scope::comparable` it covers both.
-    let cand = crate::scope::comparable(candidate);
-    for p in &self.paths {
-        let prot = crate::scope::comparable(p);
-        if cand == prot {
-            return Some(format!("{} is kept by `swamp protect`", p.display()));
+        // One spelling for both sides. `external::discover_and_measure`
+        // canonicalizes every candidate and `agents::discover_and_measure`
+        // does not, so the same home comes back as `/var/folders/.../claude`
+        // from one pass and `/private/var/folders/.../claude` from the
+        // other. Compared literally, a single `protect` entry covered one
+        // family and not the other (the 2026-09-22 re-review's P2); through
+        // `scope::comparable` it covers both.
+        let cand = crate::scope::comparable(candidate);
+        for p in &self.paths {
+            let prot = crate::scope::comparable(p);
+            if cand == prot {
+                return Some(format!("{} is kept by `swamp protect`", p.display()));
+            }
+            if cand.starts_with(&prot) {
+                return Some(format!(
+                    "{} is beneath the human-protected path {}",
+                    candidate.display(),
+                    p.display()
+                ));
+            }
+            if prot.starts_with(&cand) {
+                return Some(format!("contains human-protected path {}", p.display()));
+            }
         }
-        if cand.starts_with(&prot) {
-            return Some(format!(
-                "{} is beneath the human-protected path {}",
-                candidate.display(),
-                p.display()
-            ));
-        }
-        if prot.starts_with(&cand) {
-            return Some(format!("contains human-protected path {}", p.display()));
-        }
+        None
     }
-    None
-}
 }
 
 /// What `swamp protect list` prints: the entries as text, one per line

@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `proof`
+ --> $WORKSPACE/crates/core/tests/compile_fail/recheck_proof_is_spent_once.rs
+  |
+  | fn twice(proof: RecheckProof, auth: &Authorized) {
+  |          ----- move occurs because `proof` has type `RecheckProof`, which does not implement the `Copy` trait
+  |     let _ = trash_move(proof, auth, Path::new("/tmp/trash"), "a");
+  |                        ----- value moved here
+  |     let _ = trash_move(proof, auth, Path::new("/tmp/trash"), "b");
+  |                        ^^^^^ value used here after move

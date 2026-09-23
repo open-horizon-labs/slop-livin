@@ -3,7 +3,11 @@ id: tui-actions-off-event-thread
 severity: hard
 statement: "Cleanup review and execution must not run synchronously on the TUI event/render path; workers report progress and stop between groups."
 outcome: disk-growth-by-project
-audit: tui_actions_off_event_thread
+audit: tui_event_thread_has_no_gate_calls
+compile_fail:
+  - human_confirmation_is_not_a_struct_literal
+runtime_tests:
+  - crates/tui/src/app.rs::tests::background_delete_finishes_and_worker_failure_is_visible
 ---
 
 ## Rationale
@@ -14,11 +18,15 @@ expensive checks too; both review and execution belong on background workers.
 
 ## Detection
 
-From every TUI entry point (the required ones, and every function named for key handling, the event loop or drawing), follow exactly resolved calls and value references, never into a `thread::spawn` closure. A TUI function blocks if it builds a subprocess, sleeps, waits on a channel or child, or joins a worker; a core callee blocks if it is in the closure of those plus traversal (stopped at the capped `shallow_list`). Calls inside macro arguments are calls.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `tui_actions_off_event_thread/01-probe-path-per-keystroke`, `tui_actions_off_event_thread/02-command-output-on-event-path`, `tui_actions_off_event_thread/03-aliased-blocking-report`, `tui_actions_off_event_thread/04-sweep3`.
+**Gate audit.** `tui_event_thread_has_no_gate_calls`: from the TUI's `event_loop` (and every workspace impl of a trait the compiler calls implicitly -- `Drop`, `Display`, `Deref`, operators), over every path, UFCS and method-name edge except those inside `worker::spawn` closures, nothing reaches a blocking gate capability (`destroy`, `spawn`, bounded reads, `read_dir`); a call whose callee is not a path is rejected.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Type.** The TUI's sinks take a `HumanConfirmed`, minted only by its confirm dialog.
+
+Retired 2026-09-22: the `tui_actions_off_event_thread` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `human_confirmation_is_not_a_struct_literal`.
 
 ## Limits and runtime checks
 

@@ -406,51 +406,6 @@ pub fn tip_sha(dir: &Path) -> Option<String> {
     Some(id.to_string())
 }
 
-/// Parallel equivalent of calling [`compute_signals`] once per path,
-/// preserving input order. Each worktree's git signals are independent
-/// (own `gix::open`, own object store access), so this fans them out
-/// across a small worker pool instead of computing them one at a time in
-/// the report's hot path -- the same rationale `walk.rs` documents for
-/// discovery/attribution, applied to signals.
-pub fn compute_signals_parallel(
-    paths: &[std::path::PathBuf],
-    observed_at: u64,
-) -> Vec<Vec<Signal>> {
-    let n = paths.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let workers = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(4)
-        .min(n)
-        .max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<std::sync::Mutex<Vec<Signal>>> =
-        (0..n).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let next = &next;
-            let results = &results;
-            let paths = &paths;
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if i >= n {
-                        break;
-                    }
-                    let sigs = compute_signals(&paths[i], observed_at);
-                    *results[i].lock().unwrap() = sigs;
-                }
-            });
-        }
-    });
-    results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect()
-}
-
 /// Parallel equivalent of [`compute_signals_raw`], preserving input
 /// order. Used by `report.rs` so the merge_complete composite and
 /// `idle_secs` field get the raw values without a second per-worktree

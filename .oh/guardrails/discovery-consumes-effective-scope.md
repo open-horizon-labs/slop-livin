@@ -3,7 +3,19 @@ id: discovery-consumes-effective-scope
 severity: hard
 statement: "Only crate::scope interprets detector candidates. Discovery and measurement consume EffectiveScope::authorized_roots(), which has already applied exclusions, disabled detectors and explicit-root replacement. An excluded home yields zero units; a disabled detector yields zero units; a missing or unreadable root yields a coverage note and zero units, never a tombstone."
 outcome: coverage-aware-storage-history
-audit: discovery_consumes_effective_scope
+audit: none
+audit_none_reason: "2026-09-22: the property is a type: raw detector candidates are private to `scope`, and resolving locations takes a `PermittedDetectors` built only from the config"
+compile_fail:
+  - permitted_detectors_come_from_config
+  - permitted_detectors_are_not_a_literal
+  - detector_candidates_are_private
+  - detector_candidates_cannot_be_destructured
+runtime_tests:
+  - crates/core/tests/reviewer_counterexamples.rs::excluded_agent_home_must_not_be_scanned
+  - crates/core/src/scope.rs::tests::authorized_roots_drops_excluded_and_explains_missing
+  - crates/core/src/scope.rs::tests::explicit_roots_do_not_authorize_detector_paths_outside_them
+  - crates/core/tests/reviewer_counterexamples_stack2.rs::an_excluded_home_must_stay_excluded_under_an_explicit_root
+  - crates/core/tests/explicit_root_scope_exclusions.rs
 ---
 
 ## Rationale
@@ -23,11 +35,13 @@ exclusion it refuses.
 
 ## Detection
 
-The discovery region is derived: the modules (and child modules) exactly reachable from `external::discover_and_measure` and `agents::discover_and_measure`, plus the adapters, less the modules that define or produce raw detector output. No function there reads a field that holds raw detector output wholesale (derived from the field types: collections of `DetectorSummary`/`ProposedLocation`), whatever the binding is called, or names a `LocationStatus` variant; both discovery passes reach `EffectiveScope::authorized_roots()`.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `discovery_consumes_effective_scope/01-raw-detector-candidates`, `discovery_consumes_effective_scope/02-resolved-status-in-an-adapter`, `discovery_consumes_effective_scope/03-summary-locations-one-file-away`, `discovery_consumes_effective_scope/04-sweep3`.
+**Type.** `DetectorSummary::locations` is private (reading or destructuring it outside `scope` does not compile); `Registry::resolve` takes a `locations::permitted::PermittedDetectors`, which only `from_config` builds.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `discovery_consumes_effective_scope` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `permitted_detectors_come_from_config`, `permitted_detectors_are_not_a_literal`, `detector_candidates_are_private`, `detector_candidates_cannot_be_destructured`.
 
 ## Runtime tests that complete it
 

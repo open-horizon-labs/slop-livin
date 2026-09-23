@@ -3,7 +3,11 @@ id: store-data-is-parquet-not-json-sidecars
 severity: hard
 statement: "Per-unit, per-worktree and per-row data -- measurements, identities, associations, identification caches, evidence caches -- lives only in the existing Parquet current + reverse-delta store. JSON under the store directory is limited to a fixed list of small control and recovery files."
 outcome: disk-growth-by-project
-audit: store_data_is_parquet_not_json_sidecars
+audit: json_writes_allowlisted
+compile_fail:
+  - json_writes_name_a_store_file
+runtime_tests:
+  - crates/core/tests/store_contents_are_allowlisted.rs
 ---
 
 ## Rationale
@@ -20,11 +24,15 @@ syntax.
 
 ## Detection
 
-For every write anywhere (a primitive, or an exact call to a local writer), the names that make up the written path -- literals in the path argument, in the bindings it derives from, in the local path helpers either calls, and in the constants they name -- must not be a JSON file other than the small control files and patterns.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `store_data_is_parquet_not_json_sidecars/01-format-sidecar`, `store_data_is_parquet_not_json_sidecars/02-plain-sidecar`, `store_data_is_parquet_not_json_sidecars/03-jsonl-sidecar`, `store_data_is_parquet_not_json_sidecars/04-sweep3`.
+**Type.** Every `JsonFile` variant's file name is fixed (or a validated id under a fixed prefix); there is no per-unit or free-named JSON file to write.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `json_writes_allowlisted`: no serializer outside the gate's store module.
+
+Retired 2026-09-22: the `store_data_is_parquet_not_json_sidecars` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `json_writes_name_a_store_file`.
 
 ## Runtime tests that complete it
 

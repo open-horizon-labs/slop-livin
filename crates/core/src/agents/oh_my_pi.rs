@@ -655,8 +655,8 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, ProjectLinkState, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -705,8 +705,8 @@ mod tests {
         touch(&dir.path().join("unrelated-file.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].relative_path, "(unknown format)");
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unknown format)");
+        assert_eq!(units[0].action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -726,13 +726,13 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions && u.path == jsonl)
+            .find(|u| u.category() == AgentCategory::Sessions && u.path == jsonl)
             .expect("session identified");
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Linked { .. }
         ));
-        assert_eq!(session.action, AgentActionCapability::SessionRemoval);
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "prompt content leaked");
     }
@@ -758,7 +758,7 @@ mod tests {
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            session.project_link,
+            session.project_link(),
             ProjectLinkState::Shared { .. }
         ));
     }
@@ -777,9 +777,9 @@ mod tests {
         let units = run(home);
         let blob = units
             .iter()
-            .find(|u| u.category == AgentCategory::Attachments)
+            .find(|u| u.category() == AgentCategory::Attachments)
             .expect("blob unit present");
-        assert_eq!(blob.action, AgentActionCapability::None);
+        assert_eq!(blob.action(), AgentActionCapability::None);
         assert!(blob.note.as_deref().unwrap().contains("referenced by 1"));
     }
 
@@ -793,9 +793,9 @@ mod tests {
         let units = run(home);
         let blob = units
             .iter()
-            .find(|u| u.category == AgentCategory::Attachments)
+            .find(|u| u.category() == AgentCategory::Attachments)
             .unwrap();
-        assert_eq!(blob.action, AgentActionCapability::None);
+        assert_eq!(blob.action(), AgentActionCapability::None);
         assert!(
             blob.note
                 .as_deref()
@@ -818,9 +818,9 @@ mod tests {
         let units = run(home);
         let blob = units
             .iter()
-            .find(|u| u.category == AgentCategory::Attachments)
+            .find(|u| u.category() == AgentCategory::Attachments)
             .unwrap();
-        assert_eq!(blob.action, AgentActionCapability::None);
+        assert_eq!(blob.action(), AgentActionCapability::None);
         assert!(
             blob.note
                 .as_deref()
@@ -840,13 +840,13 @@ mod tests {
         let units = run(home);
         let db = units
             .iter()
-            .find(|u| u.relative_path == "agent.db")
+            .find(|u| u.relative_path() == "agent.db")
             .unwrap();
-        assert!(db.protected);
-        assert_eq!(db.action, AgentActionCapability::None);
-        assert_eq!(db.members.len(), 2);
+        assert!(db.protected());
+        assert_eq!(db.action(), AgentActionCapability::None);
+        assert_eq!(db.members().len(), 2);
         assert!(
-            db.members
+            db.members()
                 .iter()
                 .all(|m| m.kind == AgentMemberKind::Database)
         );
@@ -861,10 +861,10 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "terminal-sessions")
+            .find(|u| u.relative_path() == "terminal-sessions")
             .unwrap();
-        assert!(!u.protected);
-        assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+        assert!(!u.protected());
+        assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -906,7 +906,7 @@ mod tests {
         touch(&dir.path().join("unrelated-file.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1, "an unrecognized home must still surface");
-        assert_eq!(units[0].relative_path, "(unknown format)");
+        assert_eq!(units[0].relative_path(), "(unknown format)");
         assert!(
             units[0]
                 .note
@@ -931,7 +931,7 @@ mod tests {
         );
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
-        match &session.project_link {
+        match &session.project_link() {
             ProjectLinkState::Unresolved { reason } => assert!(
                 reason.contains("title slot"),
                 "the reason must name the shape that was expected: {reason}"
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             20
         );
@@ -1022,11 +1022,11 @@ mod tests {
         contract::protection_defaults_hold(&units);
         let config = units
             .iter()
-            .find(|u| u.relative_path == "config.yml")
+            .find(|u| u.relative_path() == "config.yml")
             .unwrap();
-        assert_eq!(config.category, AgentCategory::ProtectedConfig);
+        assert_eq!(config.category(), AgentCategory::ProtectedConfig);
         assert_eq!(
-            config.protect_reason.as_deref(),
+            config.protect_reason().as_deref(),
             Some("main configuration"),
             "the adapter's own, more specific reason survives the builder default"
         );
@@ -1057,7 +1057,7 @@ mod tests {
 
         let units = run(home);
         let a = units.iter().find(|u| u.path == declared).unwrap();
-        match &a.project_link {
+        match &a.project_link() {
             ProjectLinkState::Linked { source, .. } => {
                 assert_eq!(*source, crate::agents::LinkSource::Declared)
             }
@@ -1065,9 +1065,9 @@ mod tests {
         }
         let b = units.iter().find(|u| u.path == undeclared).unwrap();
         assert!(
-            matches!(b.project_link, ProjectLinkState::Unresolved { .. }),
+            matches!(b.project_link(), ProjectLinkState::Unresolved { .. }),
             "a directory name is not evidence: {:?}",
-            b.project_link
+            b.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "guessable-repo");
     }

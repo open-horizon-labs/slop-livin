@@ -106,3 +106,51 @@ pub fn retire(path: &Path) -> Result<()> {
     }
     super::store::remove_owned_file(path).with_context(|| format!("remove {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::sync::Arc;
+
+    /// `.oh/guardrails/column-store-parquet-zstd.md`, at run time: every
+    /// column chunk the one writer produces is zstd, whatever level the
+    /// caller asked for (an out-of-range level falls back to the default
+    /// level, never to another codec).
+    #[test]
+    fn every_column_chunk_written_is_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("mod_time_min", DataType::Int32, false),
+        ]));
+        for level in [1, DEFAULT_ZSTD_LEVEL, 9, 999] {
+            let path = dir.path().join(format!("t{level}.parquet"));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            write_parquet_atomic(&path, schema.clone(), [Ok(batch)], level).unwrap();
+            assert!(has_parquet_footer(&path).unwrap());
+            let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let meta = reader.metadata();
+            assert!(meta.num_row_groups() > 0);
+            for rg in meta.row_groups() {
+                for col in rg.columns() {
+                    assert!(
+                        matches!(col.compression(), Compression::ZSTD(_)),
+                        "level {level}: column {} is {:?}",
+                        col.column_path(),
+                        col.compression()
+                    );
+                }
+            }
+        }
+    }
+}

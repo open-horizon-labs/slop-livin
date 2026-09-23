@@ -1,10 +1,6 @@
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::disallowed_methods,
-        clippy::disallowed_types,
-        unsafe_code
-    )
+    deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
 )]
 
 mod schedule;
@@ -702,7 +698,7 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
     }
     let _ = writeln!(out, "detectors:");
     for d in &scope.detectors {
-        for loc in &d.locations {
+        for loc in d.locations_for_display() {
             let status = match &loc.status {
                 swamp_core::locations::LocationStatus::Resolved => "resolved".to_string(),
                 swamp_core::locations::LocationStatus::NotPresent => "not-present".to_string(),

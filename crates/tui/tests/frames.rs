@@ -1222,7 +1222,10 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     std::fs::write(work.join("secrets.env"), vec![b'k'; 2048]).unwrap();
     let mut u = unit(&work);
     u.warnings = vec!["secrets.env untracked 2.0KB".into()];
-    let (plan, grant) = authorize(std::slice::from_ref(&u), &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
+    let (plan, grant) = authorize(
+        std::slice::from_ref(&u),
+        &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+    );
     let res = execute_plan(
         std::slice::from_ref(&u),
         &plan,

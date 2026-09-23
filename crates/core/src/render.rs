@@ -915,13 +915,6 @@ pub fn render_view_deps(report: &Report, only_project: Option<&str>) -> String {
     render_kind_view(report, only_project, &[ArtifactKind::DependencyTree])
 }
 
-/// rust view: nested Cargo units inside already-accounted target rows.
-/// Aggregate rows show logical bytes while leaves show physically charged
-/// bytes, making hardlink and residual limits visible.
-pub fn render_view_rust(report: &Report, only_project: Option<&str>) -> String {
-    render_view_rust_with_limit(report, only_project, Some(30))
-}
-
 pub fn render_view_rust_with_limit(
     report: &Report,
     only_project: Option<&str>,

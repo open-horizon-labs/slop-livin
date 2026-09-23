@@ -198,8 +198,9 @@ pub trait GithubResponder: Sync {
 pub struct GhCliResponder;
 
 fn bounded_gh(args: &[String]) -> Result<String, String> {
-    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Gh, args, PER_CALL_TIMEOUT)
-        .map_err(|e| format!("gh not runnable: {e}"))?;
+    let out =
+        crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Gh, args, PER_CALL_TIMEOUT)
+            .map_err(|e| format!("gh not runnable: {e}"))?;
     if out.timed_out {
         return Err(format!("gh {args:?} timed out after {PER_CALL_TIMEOUT:?}"));
     }

@@ -3,7 +3,12 @@ id: column-store-parquet-zstd
 severity: hard
 statement: "Every persisted observation is Parquet written with zstd compression, keyed per volume; no JSON, SQLite or bespoke binary store for rows."
 outcome: disk-growth-by-project
-audit: column_store_parquet_zstd
+audit: gate_paths_only_inside_gates
+compile_fail:
+  - parquet_codec_is_not_selectable
+  - history_rows_are_private_to_the_store
+runtime_tests:
+  - crates/core/src/fs_gate/columns.rs::tests::every_column_chunk_written_is_zstd
 ---
 
 ## Rationale
@@ -11,9 +16,12 @@ Column store + reverse delta was the design carried from the Go plumbing. It is 
 
 ## Detection
 
-Every `ArrowWriter::try_new`/`new` call anywhere in the workspace must pass writer properties (not `None`), and the writing function, or a helper it calls, must declare `Compression::ZSTD`.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `column_store_parquet_zstd/01-uncompressed-writer`, `column_store_parquet_zstd/02-snappy-instead-of-zstd`, `column_store_parquet_zstd/03-uncompressed-writer-in-the-other-store-file`, `column_store_parquet_zstd/04-sweep3`.
+**Type.** `fs_gate::columns::write_parquet_atomic` takes a zstd *level*; the writer properties are built privately and always zstd.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `parquet` (and `zstd`) may be named only inside the gate, so no module can build an `ArrowWriter` with other options; Arrow schemas only in the column-store modules.
 
+Retired 2026-09-22: the `column_store_parquet_zstd` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `parquet_codec_is_not_selectable`, `history_rows_are_private_to_the_store`.

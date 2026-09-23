@@ -185,8 +185,8 @@ pub fn reuse_folded_measurement(
     })
 }
 
-fn stamp_ns(meta: &std::fs::Metadata) -> (i64, i64) {
-    use std::os::unix::fs::MetadataExt;
+fn stamp_ns(meta: &crate::fs_gate::Metadata) -> (i64, i64) {
+    use crate::fs_gate::MetadataExt;
     (
         meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
         meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
@@ -360,7 +360,7 @@ pub fn folded_bytes_bounded_stamped(
     (total, mtime_max, truncated, stamps)
 }
 
-pub fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+pub fn mtime_secs(meta: &crate::fs_gate::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

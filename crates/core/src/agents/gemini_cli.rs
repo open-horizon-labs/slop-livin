@@ -459,8 +459,8 @@ fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::{IdentificationCache, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -489,16 +489,16 @@ mod tests {
         assert!(
             units
                 .iter()
-                .find(|u| u.relative_path == "settings.json")
+                .find(|u| u.relative_path() == "settings.json")
                 .unwrap()
-                .protected
+                .protected()
         );
         assert!(
             units
                 .iter()
-                .find(|u| u.relative_path == "GEMINI.md")
+                .find(|u| u.relative_path() == "GEMINI.md")
                 .unwrap()
-                .protected
+                .protected()
         );
     }
 
@@ -510,18 +510,17 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == OAUTH_CREDS_FILE)
+            .find(|u| u.relative_path() == OAUTH_CREDS_FILE)
             .expect("the confirmed credential file is identified on its own");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
         // Not `.unwrap_or_default()`: an absent reason is a failure of
         // this assertion, not an empty string to search. `check.sh`'s
         // grep layer also rejects that pattern on any line mentioning
         // protection, deliberately without exception
         // (`.oh/guardrails/protection-fails-closed.md`).
         let reason = u
-            .protect_reason
-            .as_deref()
+            .protect_reason()
             .expect("a protected unit must carry a stated reason");
         assert!(
             reason.contains("storage.ts") && reason.contains("OAUTH_FILE"),
@@ -541,12 +540,12 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "google_accounts_credentials.json")
+            .find(|u| u.relative_path() == "google_accounts_credentials.json")
             .expect("credential-shaped file identified");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
         assert!(
-            u.protect_reason
+            u.protect_reason()
                 .as_deref()
                 .unwrap_or_default()
                 .contains("defensive pattern match"),
@@ -570,9 +569,9 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "extensions")
+            .find(|u| u.relative_path() == "extensions")
             .unwrap();
-        assert!(u.protected);
+        assert!(u.protected());
     }
 
     #[test]
@@ -590,22 +589,22 @@ mod tests {
         let units = run(home);
         let shell = units
             .iter()
-            .find(|u| u.category == AgentCategory::Logs)
+            .find(|u| u.category() == AgentCategory::Logs)
             .expect("shell history");
         assert!(matches!(
-            shell.project_link,
+            shell.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
         let checkpoint = units
             .iter()
-            .find(|u| u.category == AgentCategory::Checkpoints)
+            .find(|u| u.category() == AgentCategory::Checkpoints)
             .expect("checkpoint dir");
-        assert_eq!(checkpoint.action, AgentActionCapability::None);
+        assert_eq!(checkpoint.action(), AgentActionCapability::None);
         let chat = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("saved chat");
-        assert_eq!(chat.action, AgentActionCapability::SessionRemoval);
+        assert_eq!(chat.action(), AgentActionCapability::SessionRemoval);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "chat content leaked");
     }
@@ -627,12 +626,12 @@ mod tests {
         let units = run(home);
         let cache = units
             .iter()
-            .find(|u| u.relative_path == "tmp/bin")
+            .find(|u| u.relative_path() == "tmp/bin")
             .expect("tmp/bin must be the downloaded-tools cache");
-        assert_eq!(cache.category, AgentCategory::Caches);
-        assert!(cache.bytes >= 4096, "{}", cache.bytes);
+        assert_eq!(cache.category(), AgentCategory::Caches);
+        assert!(cache.bytes() >= 4096, "{}", cache.bytes());
         assert!(
-            !units.iter().any(|u| u.relative_path == "bin"),
+            !units.iter().any(|u| u.relative_path() == "bin"),
             "~/.gemini/bin is not a path this tool writes; identifying it would be a guess"
         );
         // And `tmp/bin` must not also be reported as a per-project
@@ -641,11 +640,11 @@ mod tests {
         assert!(
             !units
                 .iter()
-                .any(|u| u.relative_path.starts_with("tmp/bin/")),
+                .any(|u| u.relative_path().starts_with("tmp/bin/")),
             "tmp/bin is the tools cache, not a project id: {:?}",
             units
                 .iter()
-                .map(|u| u.relative_path.clone())
+                .map(|u| u.relative_path().to_string())
                 .collect::<Vec<_>>()
         );
     }
@@ -663,7 +662,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             1,
             "a slug-named project directory is identified, not skipped"
@@ -671,7 +670,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .any(|u| u.category == AgentCategory::Checkpoints),
+                .any(|u| u.category() == AgentCategory::Checkpoints),
             "a slug-named history directory is identified too"
         );
     }
@@ -688,11 +687,11 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.category == AgentCategory::Checkpoints)
+            .find(|u| u.category() == AgentCategory::Checkpoints)
             .expect("history shadow repo identified");
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert_eq!(u.action(), AgentActionCapability::None);
         assert!(matches!(
-            u.project_link,
+            u.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -717,7 +716,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             300
         );
@@ -732,9 +731,9 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1, "an unrecognized home still surfaces a row");
-        assert_eq!(units[0].relative_path, "(unsupported layout version)");
-        assert_eq!(units[0].category, AgentCategory::Unclassified);
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unsupported layout version)");
+        assert_eq!(units[0].category(), AgentCategory::Unclassified);
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         assert!(
             units[0]
                 .note
@@ -779,7 +778,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             40
         );
@@ -807,7 +806,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .any(|u| u.relative_path == OAUTH_CREDS_FILE && u.protected),
+                .any(|u| u.relative_path() == OAUTH_CREDS_FILE && u.protected()),
             "the confirmed credential file is protected"
         );
     }
@@ -829,14 +828,14 @@ mod tests {
         );
         for u in &units {
             assert!(
-                !matches!(u.project_link, ProjectLinkState::Linked { .. }),
+                !matches!(u.project_link(), ProjectLinkState::Linked { .. }),
                 "{} claimed a link with no declared metadata",
-                u.relative_path
+                u.relative_path()
             );
         }
         let reason = units
             .iter()
-            .find_map(|u| match &u.project_link {
+            .find_map(|u| match &u.project_link() {
                 ProjectLinkState::Unresolved { reason } => Some(reason.clone()),
                 _ => None,
             })

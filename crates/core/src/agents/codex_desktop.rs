@@ -94,10 +94,10 @@ mod tests {
         fs::write(day.join("session.log"), b"line 1\nline 2\n").unwrap();
         let units = run(dir.path());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].category, AgentCategory::Logs);
-        assert_eq!(units[0].action, AgentActionCapability::CacheOrLogTrash);
-        assert!(!units[0].protected);
-        assert!(units[0].bytes > 0);
+        assert_eq!(units[0].category(), AgentCategory::Logs);
+        assert_eq!(units[0].action(), AgentActionCapability::CacheOrLogTrash);
+        assert!(!units[0].protected());
+        assert!(units[0].bytes() > 0);
     }
 
     // --- the five contract tests ---------------------------------------
@@ -164,7 +164,7 @@ mod tests {
         fs::write(dir.path().join("a.log"), b"x").unwrap();
         let units = run(dir.path());
         assert!(
-            units.iter().all(|u| !u.category.default_protected()),
+            units.iter().all(|u| !u.category().default_protected()),
             "this adapter is documented as modeling logs only"
         );
         let config = AgentUnitBuilder::new(
@@ -187,7 +187,7 @@ mod tests {
         fs::write(repo.join("a.log"), b"x").unwrap();
         let units = run(dir.path());
         assert!(matches!(
-            units[0].project_link,
+            units[0].project_link(),
             crate::agents::ProjectLinkState::NotApplicable
         ));
         contract::linkage_is_declared_or_explicit(&units, "my-repo-name");

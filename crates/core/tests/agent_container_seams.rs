@@ -59,7 +59,7 @@ fn pass(
     });
     cache.save(store, at).unwrap();
     containers.save(store, at).unwrap();
-    let bytes = units.iter().map(|u| u.bytes).sum();
+    let bytes = units.iter().map(|u| u.bytes()).sum();
     (bytes, units.len(), counted)
 }
 
@@ -286,8 +286,8 @@ fn a_codex_day_container_does_not_depend_on_its_siblings() {
         let ctx = IdentifyCtx::with_containers(1_000, &cache, &containers);
         let mut names: Vec<String> = swamp_core::agents::codex::identify(&home, &ctx)
             .into_iter()
-            .filter(|u| u.path.to_string_lossy().contains("2026/02/11"))
-            .map(|u| u.path.file_name().unwrap().to_string_lossy().to_string())
+            .filter(|u| u.path().to_string_lossy().contains("2026/02/11"))
+            .map(|u| u.path().file_name().unwrap().to_string_lossy().to_string())
             .collect();
         names.sort();
         names
@@ -458,8 +458,8 @@ fn a_replayed_container_without_its_partial_makes_the_count_unknown() {
     };
     let cold = run(1_000, EventCoverage::untrusted());
     assert!(
-        cold.iter().any(|u| u.path.ends_with(&hash)
-            && u.note
+        cold.iter().any(|u| u.path().ends_with(&hash)
+            && u.note()
                 .as_deref()
                 .is_some_and(|n| n.contains("referenced by 1"))),
         "precondition: the cold pass counts the reference"
@@ -480,8 +480,8 @@ fn a_replayed_container_without_its_partial_makes_the_count_unknown() {
     let replayed = run(2_000, quiet(&root, 1_000));
     let note = replayed
         .iter()
-        .find(|u| u.path.ends_with(&hash))
-        .and_then(|u| u.note.clone())
+        .find(|u| u.path().ends_with(&hash))
+        .and_then(|u| u.note().clone())
         .unwrap_or_default();
     assert!(
         note.contains("unknown"),

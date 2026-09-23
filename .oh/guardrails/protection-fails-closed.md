@@ -3,7 +3,14 @@ id: protection-fails-closed
 severity: hard
 statement: "Human keep/protect intent is loaded through one function that returns a Result; unreadable or malformed protection state is unknown, never an empty keep list, and every action refuses until it can be read. There is exactly ONE protection predicate (agents::protection_conflict), it tests both directions -- a unit beneath a protected path and a unit containing one -- and no other function answers the question except by delegating to it. The list is written atomically."
 outcome: decision-relevant-storage-evidence
-audit: protection_fails_closed
+audit: sinks_have_no_path_predicates
+compile_fail:
+  - protect_list_has_only_conflict
+runtime_tests:
+  - crates/core/tests/reviewer_counterexamples.rs::protected_descendant_must_prevent_parent_cache_proposal
+  - crates/core/tests/execution_rechecks.rs
+  - crates/core/tests/evidence_action_recheck.rs::ordinary_unit_containing_protected_descendant_is_refused_at_proposal
+  - crates/tui/tests/scope_preserving_refresh.rs::marking_an_ordinary_row_that_contains_a_protected_file_is_refused_with_the_reason
 ---
 
 ## Rationale
@@ -42,11 +49,15 @@ any name.
 
 ## Detection
 
-`agents::protection_conflict` tests containment in both directions; every function that persists the protect list goes through `agents::write_atomic`; every function that loads the list and does not manage it reaches the predicate; no loader's error is turned into an empty list (resolved, so an alias is still the loader); in modules that define an execution or proposal entry point, a verdict-returning path-containment test must be, or reach, the one predicate.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `protection_fails_closed/01-one-directional-helper`, `protection_fails_closed/02-discarded-error`, `protection_fails_closed/03-aliased-discard`, `protection_fails_closed/04-sweep3`.
+**Type.** `protection::ProtectList` is opaque: its only query is `conflict(candidate)` (both directions), and a corrupt or unreadable protect file is an error, never an empty list.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `sinks_have_no_path_predicates`: the execution sinks call no path containment method (`starts_with`, `strip_prefix`, `ancestors`) of their own, so a second, one-directional protection predicate cannot be written there.
+
+Retired 2026-09-22: the `protection_fails_closed` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `protect_list_has_only_conflict`.
 
 ## Runtime tests that complete it
 

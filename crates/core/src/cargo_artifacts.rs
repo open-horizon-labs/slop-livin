@@ -10,9 +10,9 @@ use crate::artifact::{
     architecture_from_target, relative_path,
 };
 use crate::entities::Confidence;
+use crate::fs_gate::MetadataExt;
 use crate::report::{ArtifactKind, ProjectRow};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +72,9 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
 
     let config_values = config
         .as_ref()
-        .and_then(|p| crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::MANIFEST).ok())
+        .and_then(|p| {
+            crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::MANIFEST).ok()
+        })
         .map(|text| parse_build_paths(&text));
     if let Some((target, build)) = config_values {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
@@ -625,7 +627,10 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
         let Some(profile) = dir.parent().and_then(Path::parent) else {
             continue;
         };
-        let Ok(text) = crate::fs_gate::read::bounded_string(&u.path, crate::fs_gate::read::BoundedCap::MANIFEST) else {
+        let Ok(text) = crate::fs_gate::read::bounded_string(
+            &u.path,
+            crate::fs_gate::read::BoundedCap::MANIFEST,
+        ) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -838,20 +843,6 @@ pub fn apply_message_evidence(inspection: &mut CargoInspection, messages: &[Carg
     }
 }
 
-/// Inspect a target and apply only pre-existing Cargo JSON output. The text
-/// is supplied by the caller so observation never searches for or creates a
-/// build log and never invokes Cargo.
-pub fn inspect_target_with_json(
-    target_dir: &Path,
-    workspace_root: Option<&Path>,
-    json_text: &str,
-) -> CargoInspection {
-    let mut inspection = inspect_target(target_dir, workspace_root);
-    let messages = parse_json_messages(json_text);
-    apply_message_evidence(&mut inspection, &messages);
-    inspection
-}
-
 /// Parse existing JSON lines without executing Cargo. Unknown message kinds
 /// are ignored, as Cargo may add message variants over time.
 pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
@@ -901,16 +892,6 @@ pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
         .collect()
 }
 
-/// Finds Cargo target/build rows already discovered by the common walker and
-/// annotates them. It intentionally does not add an out-of-scope path to a
-/// report: an external shared target must be observed explicitly first.
-pub fn inspect_projects(projects: &[ProjectRow]) -> Vec<NestedArtifact> {
-    project_roots(projects)
-        .into_iter()
-        .flat_map(|(root, workspace)| inspect_target(&root, Some(&workspace)).units)
-        .collect()
-}
-
 /// Already observed Cargo build boundaries only, deduplicated across owners.
 pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
@@ -932,7 +913,8 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
                 if !matches_layout {
                     continue;
                 }
-                let canonical = crate::fs_gate::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+                let canonical =
+                    crate::fs_gate::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
                 if seen.insert(canonical) {
                     out.push((row.path.clone(), wt.path.clone()));
                 }

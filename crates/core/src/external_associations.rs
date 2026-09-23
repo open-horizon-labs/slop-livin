@@ -109,7 +109,7 @@ pub fn xcode_derived_data_association(
             FactSubtype::DeclaredConsumer,
             source,
             now(),
-            "info.plist has no WorkspacePath recorded",
+            crate::reason!("info.plist has no WorkspacePath recorded"),
         );
     };
     let ws = Path::new(workspace_path);
@@ -124,7 +124,7 @@ pub fn xcode_derived_data_association(
             FactSubtype::DeclaredConsumer,
             source,
             now(),
-            format!(
+            crate::reason!(
                 "WorkspacePath {workspace_path} matches no currently known project (moved or missing)"
             ),
         ),
@@ -141,7 +141,9 @@ pub fn xcode_derived_data_association(
             matches.into_iter().map(FactValue::Text).collect(),
             source,
             now(),
-            "WorkspacePath matches more than one known project root (nested checkouts)",
+            crate::reason!(
+                "WorkspacePath matches more than one known project root (nested checkouts)"
+            ),
         ),
     }
 }
@@ -506,7 +508,7 @@ pub fn unresolved_dependency_evidence(ecosystem: &str, path: &Path, gap: &str) -
             path: path.display().to_string(),
         },
         now(),
-        format!("declared dependency with an unresolved identity: {gap}"),
+        crate::reason!("declared dependency with an unresolved identity: {gap}"),
     )
 }
 
@@ -519,7 +521,7 @@ pub fn invalid_lockfile_evidence(ecosystem: &str, path: &Path, parse_error: &str
             path: path.display().to_string(),
         },
         now(),
-        format!("could not parse lockfile: {parse_error}"),
+        crate::reason!("could not parse lockfile: {parse_error}"),
     )
 }
 
@@ -548,7 +550,9 @@ pub fn docker_join_evidence(project_label: Option<&str>, join_basis: &str) -> Ev
             FactSubtype::InferredConsumer,
             source,
             now(),
-            "no compose-project label, image-source label, or worktree-path label matched a discovered project",
+            crate::reason!(
+                "no compose-project label, image-source label, or worktree-path label matched a discovered project"
+            ),
         ),
     }
 }

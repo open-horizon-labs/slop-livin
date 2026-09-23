@@ -10,11 +10,7 @@
 
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::disallowed_methods,
-        clippy::disallowed_types,
-        unsafe_code
-    )
+    deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
 )]
 
 #[cfg(all(feature = "testing", not(debug_assertions)))]
@@ -44,7 +40,6 @@ pub mod evidence;
 pub mod execution;
 pub mod external;
 pub mod external_associations;
-pub mod extractor;
 pub mod filter;
 pub mod folded_measurement;
 pub mod fs_events;
@@ -56,13 +51,12 @@ pub mod growth;
 pub mod ignore;
 pub mod ledger;
 pub mod locations;
-pub mod measurement;
 pub mod occupancy;
+pub mod preserve;
+pub mod protection;
 pub mod recheck;
 pub mod reclaimability;
 pub mod recovery;
-pub mod preserve;
-pub mod protection;
 pub mod render;
 pub mod report;
 pub mod scan;
@@ -72,7 +66,6 @@ pub mod signals;
 pub mod store;
 pub mod toolchain_declarations;
 pub mod tree;
-pub mod volume;
 pub mod walk;
 pub mod work_counters;
 

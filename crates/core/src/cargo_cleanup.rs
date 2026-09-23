@@ -2,9 +2,9 @@
 //! Supports the tested legacy profile layout only. Locks are advisory: manual
 //! writers that ignore Cargo's locks must be stopped by the user.
 use crate::artifact::{ArtifactRole, NestedArtifact};
+use crate::fs_gate::{self as fs, MetadataExt, sys::RegularFile};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use crate::fs_gate::{self as fs, MetadataExt, sys::RegularFile};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -564,7 +564,8 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     {
         bail!("this Cargo role is inspection-only; select a test or example executable");
     }
-    let relative = selected.strip_prefix(container)?;
+    let relative = crate::scope::relative_to(selected, container)
+        .context("selection is not inside its container")?;
     let canonical_container = fs::canonicalize(container)?;
     let canonical_selected = fs::canonicalize(selected)?;
     if canonical_container.join(relative) != canonical_selected
@@ -574,7 +575,8 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     let container = canonical_container;
     let selected = canonical_selected;
-    let rel = selected.strip_prefix(&container)?;
+    let rel = crate::scope::relative_to(&selected, &container)
+        .context("selection is not inside its container")?;
     let count = rel.components().count();
     if !(count == 3 || count == 4) {
         bail!("unsupported Cargo executable layout");

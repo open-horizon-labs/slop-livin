@@ -258,7 +258,11 @@ mod tests {
     #[test]
     fn mutating_verbs_are_refused_without_spawning() {
         let (r, counted) = crate::work_counters::measured(|| {
-            run(Program::Docker, ["image", "rm", "x"], Duration::from_secs(5))
+            run(
+                Program::Docker,
+                ["image", "rm", "x"],
+                Duration::from_secs(5),
+            )
         });
         assert!(r.is_err());
         assert_eq!(counted.subprocess_spawns, 0);

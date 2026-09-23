@@ -9,7 +9,13 @@ sufficiency_group: G1
 owner: null
 review_trigger: "A new detector, scope change, contradictory fact, or real user decision exposes a failure."
 tactic_disposition: selected
-audit: coverage_changes_are_not_storage_changes
+audit: none
+audit_none_reason: "2026-09-22: tombstones and regrowth bumps are writes to private rows that only an `Owned` claim unlocks, which is a type, not a source pattern"
+compile_fail:
+  - history_rows_are_private_to_the_store
+runtime_tests:
+  - crates/core/tests/coverage_changes_are_not_storage_changes.rs
+  - crates/core/tests/reviewer_counterexamples_stack2.rs::a_config_only_exclusion_must_not_invent_growth_or_regrowth
 ---
 
 # Coverage changes are not storage changes
@@ -34,11 +40,13 @@ are enabled. That is a validation hypothesis, not a claim of completed checks.
 
 ## Detection
 
-Every tombstone (`.present = ` a value that is not provably `true`, including through a `&mut` binding) and every regrowth bump (`.regrowth_count += n`, `= .. + n`, or a binding computed that way) anywhere must sit inside a condition that makes the row this observation's: an `ObservationOwnership` verdict method, a negated membership test on a region the caller declared unconfirmed (a parameter), or, for a regrowth, a keyed lookup of an observed row. `ObservationOwnership` has `excluded_subtrees` and `covers` reads it.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `coverage_changes_are_not_storage_changes/01-unguarded-tombstone`, `coverage_changes_are_not_storage_changes/02-discarded-ownership-answer`, `coverage_changes_are_not_storage_changes/03-aliased-tombstone-helper`, `coverage_changes_are_not_storage_changes/04-sweep3`.
+**Type.** Stored rows (`growth::columns::StoredRow` and friends) have private fields; a row is tombstoned only by `ArtifactHistory::tombstone`/`ExternalHistory::tombstone`, which take an `Owned<'_>` minted only by an ownership's `claim(key)` (this pass covered and observed the row's region), and regrowth is counted only inside `observe`. `row.present = false` or `row.regrowth_count.saturating_add(1)` outside that module does not compile.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `coverage_changes_are_not_storage_changes` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `history_rows_are_private_to_the_store`.
 
 ## Runtime tests that complete it
 

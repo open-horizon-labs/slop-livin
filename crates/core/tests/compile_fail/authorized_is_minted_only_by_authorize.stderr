@@ -1,0 +1,9 @@
+error[E0451]: fields `anchors` and `grant_id` of struct `Authorized` are private
+ --> $WORKSPACE/crates/core/tests/compile_fail/authorized_is_minted_only_by_authorize.rs
+  |
+  |     let _auth = Authorized {
+  |                 ---------- in this type
+  |         anchors: vec![PathBuf::from("/")],
+  |         ^^^^^^^ private field
+  |         grant_id: String::from("forged"),
+  |         ^^^^^^^^ private field

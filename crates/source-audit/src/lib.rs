@@ -1,11 +1,10 @@
-//! Source audits as a library, so the mutation corpus under `tests/` can
-//! run each audit by name against a mutated copy of the real workspace.
+//! Source audits as a library, so the mutation evidence under `tests/`
+//! can run each audit by name against a mutated copy of the workspace.
 //!
-//! `program.rs` is the whole-crate model; `rules/` holds every rule,
-//! written only against it; `audits.rs` registers them by name.
+//! `model.rs` is the workspace as the compiler sees it (module tree,
+//! test code by attribute, every path reference resolved); `rules/`
+//! holds the exact path-reference rules; `audits.rs` registers them.
 
-pub mod ast;
 pub mod audits;
-pub mod program;
-pub mod resolve;
+pub mod model;
 pub mod rules;

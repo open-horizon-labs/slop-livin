@@ -1,170 +1,44 @@
-//! One named audit per guardrail in `.oh/guardrails/`. Every rule lives
-//! in `rules/` and is written only against the whole-program model
-//! (`program.rs`): no rule names a file to scan or lists this
-//! workspace's own function names as its coverage. `adr_validation`
-//! closes the loop: every hard guardrail names a registered audit (or a
-//! dated `none` with runtime tests), every audit's guardrail names a
-//! mutation-corpus fixture, and every ADR `validate:` entry resolves.
+//! Every registered audit, by name. The guardrail semantics the old
+//! call-graph audits approximated are types now
+//! (`crates/core/src/fs_gate`, `docs/architecture.md` "Capability
+//! gates"), each shown by a compile-fail case in
+//! `crates/core/tests/compile_fail/`; what is left here are the rules a
+//! token model decides exactly. `guardrail_metadata` closes the loop:
+//! every hard guardrail names a registered audit or a dated
+//! `audit: none` with compile-fail cases or runtime tests that exist,
+//! compile, run and assert.
 
-use crate::rules::{adapters, bus, evidence, execution, meta, scope, store, tui, walk};
-
-/// Rules that run as tests rather than as registered audits (see each
-/// rule's guardrail for why).
-pub const TEST_ONLY_RULES: &[(&str, Audit)] =
-    &[("every_spawn_is_counted", execution::every_spawn_is_counted)];
+use crate::model::Workspace;
+use crate::rules::{Rule, gate, literals, meta};
 use std::path::Path;
 
 pub type Audit = fn(&Path) -> Result<(), String>;
 
-pub const AUDITS: &[(&str, Audit)] = &[
-    (
-        "tui_actions_off_event_thread",
-        tui::tui_actions_off_event_thread,
-    ),
-    ("one_byte_formatter", walk::one_byte_formatter),
-    ("legacy_invariants", walk::legacy_invariants),
-    ("fsevents_before_full_walk", walk::fsevents_before_full_walk),
-    ("column_store_parquet_zstd", walk::column_store_parquet_zstd),
-    (
-        "reverse_delta_current_plus_deltas",
-        walk::reverse_delta_current_plus_deltas,
-    ),
-    (
-        "scheduled_refresh_launchagent",
-        walk::scheduled_refresh_launchagent,
-    ),
-    (
-        "folding_only_for_artifacts",
-        walk::folding_only_for_artifacts,
-    ),
-    ("symlinks_never_followed", walk::symlinks_never_followed),
-    (
-        "incremental_walk_only_changed_subtrees",
-        walk::incremental_walk_only_changed_subtrees,
-    ),
-    (
-        "walk_optimized_parallel_pool",
-        walk::walk_optimized_parallel_pool,
-    ),
-    ("dir_mtime_int32_minutes", walk::dir_mtime_int32_minutes),
-    (
-        "agent_interface_facts_not_verdicts",
-        evidence::agent_interface_facts_not_verdicts,
-    ),
-    (
-        "human_only_authorization",
-        execution::human_only_authorization,
-    ),
-    (
-        "no_consumer_knows_other_consumers",
-        bus::no_consumer_knows_other_consumers,
-    ),
-    ("static_registration_only", bus::static_registration_only),
-    (
-        "all_report_paths_through_bus",
-        bus::all_report_paths_through_bus,
-    ),
-    ("extractors_are_pluggable", bus::extractors_are_pluggable),
-    (
-        "event_bus_pluggable_consumers",
-        bus::event_bus_pluggable_consumers,
-    ),
-    ("adr_validation", meta::adr_validation),
-    (
-        "execution_sinks_recheck_live_state",
-        execution::execution_sinks_recheck_live_state,
-    ),
-    (
-        "protection_fails_closed",
-        execution::protection_fails_closed,
-    ),
-    (
-        "discovery_consumes_effective_scope",
-        scope::discovery_consumes_effective_scope,
-    ),
-    (
-        "explicit_only_scope_when_defaults_false",
-        scope::explicit_only_scope_when_defaults_false,
-    ),
-    ("history_sweeps_are_owned", store::history_sweeps_are_owned),
-    (
-        "no_second_traversal_on_report_path",
-        walk::no_second_traversal_on_report_path,
-    ),
-    (
-        "occupancy_is_tristate_at_sinks",
-        execution::occupancy_is_tristate_at_sinks,
-    ),
-    (
-        "tui_refresh_preserves_scope",
-        scope::tui_refresh_preserves_scope,
-    ),
-    (
-        "store_data_is_parquet_not_json_sidecars",
-        store::store_data_is_parquet_not_json_sidecars,
-    ),
-    (
-        "json_persistence_is_allowlisted",
-        store::json_persistence_is_allowlisted,
-    ),
-    (
-        "agent_adapters_are_pluggable",
-        adapters::agent_adapters_are_pluggable,
-    ),
-    (
-        "agent_adapters_read_bounded_headers_only",
-        adapters::agent_adapters_read_bounded_headers_only,
-    ),
-    (
-        "agent_adapters_do_not_traverse",
-        adapters::agent_adapters_do_not_traverse,
-    ),
-    (
-        "agent_adapters_are_inspection_only",
-        adapters::agent_adapters_are_inspection_only,
-    ),
-    (
-        "agent_adapters_do_not_emit_content",
-        adapters::agent_adapters_do_not_emit_content,
-    ),
-    (
-        "agent_units_built_through_builder",
-        adapters::agent_units_built_through_builder,
-    ),
-    (
-        "agent_adapters_are_environment_free",
-        adapters::agent_adapters_are_environment_free,
-    ),
-    (
-        "agent_adapters_do_not_reach_detectors",
-        adapters::agent_adapters_do_not_reach_detectors,
-    ),
-    (
-        "agent_adapter_test_contract",
-        adapters::agent_adapter_test_contract,
-    ),
-    (
-        "detector_ids_only_in_registry",
-        scope::detector_ids_only_in_registry,
-    ),
-    (
-        "discovery_owned_by_report_pipeline",
-        scope::discovery_owned_by_report_pipeline,
-    ),
-    (
-        "no_dead_public_evidence_api",
-        evidence::no_dead_public_evidence_api,
-    ),
-    (
-        "computed_but_not_delivered",
-        evidence::computed_but_not_delivered,
-    ),
-    (
-        "coverage_changes_are_not_storage_changes",
-        store::coverage_changes_are_not_storage_changes,
-    ),
-    (
-        "activity_and_consumer_evidence_have_limits",
-        evidence::activity_and_consumer_evidence_have_limits,
-    ),
-];
+/// Every rule, in the order the binary prints them.
+pub fn rules() -> Vec<Rule> {
+    let mut out: Vec<Rule> = Vec::new();
+    out.extend_from_slice(gate::RULES);
+    out.extend_from_slice(literals::RULES);
+    out.extend_from_slice(meta::RULES);
+    out
+}
+
+/// Runs one rule by name against the workspace at `root`.
+pub fn run(name: &str, root: &Path) -> Result<(), String> {
+    let ws = Workspace::load(root);
+    match rules().into_iter().find(|(n, _)| *n == name) {
+        Some((_, rule)) => rule(&ws),
+        None => Err(format!("no audit named `{name}` is registered")),
+    }
+}
+
+/// Runs every rule once against one load of the workspace.
+pub fn run_all(root: &Path) -> Vec<(&'static str, Result<(), String>)> {
+    let ws = Workspace::load(root);
+    rules().into_iter().map(|(n, r)| (n, r(&ws))).collect()
+}
+
+/// The registered names.
+pub fn names() -> Vec<&'static str> {
+    rules().into_iter().map(|(n, _)| n).collect()
+}

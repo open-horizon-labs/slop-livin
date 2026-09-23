@@ -5,10 +5,10 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use swamp_core::authority::{Authorized, HumanConfirmed};
 use swamp_core::entities::{id_for, now};
 use swamp_core::execution::Outcome;
 use swamp_core::grants::{Grant, Predicate, Verb, plan};
-use swamp_core::authority::{Authorized, HumanConfirmed};
 use swamp_core::ledger::Ledger;
 
 use crate::model::human_bytes;
@@ -277,8 +277,17 @@ fn execute_one(
     } else {
         None
     };
-    let outcome = trash_path(unit, Verb::Delete, grant, &auth, ledger, trash_root, actor, extra)
-        .map_err(|e| e.to_string());
+    let outcome = trash_path(
+        unit,
+        Verb::Delete,
+        grant,
+        &auth,
+        ledger,
+        trash_root,
+        actor,
+        extra,
+    )
+    .map_err(|e| e.to_string());
     UnitResult {
         path: unit.path.clone(),
         outcome,
@@ -455,11 +464,8 @@ fn remove_worktree(
         })),
     )?;
     if let Some(c) = common {
-        let _ = swamp_core::fs_gate::destroy::git_worktree_prune(
-            auth,
-            path,
-            c.parent().unwrap_or(&c),
-        );
+        let _ =
+            swamp_core::fs_gate::destroy::git_worktree_prune(auth, path, c.parent().unwrap_or(&c));
     }
     Ok(outcome)
 }
@@ -525,7 +531,15 @@ pub fn execute_plan_progress(
         if !progress(i, &u.path, None) {
             break;
         }
-        let result = execute_one(u, pu, grant, confirmed, ledger, trash_root, keep_executables);
+        let result = execute_one(
+            u,
+            pu,
+            grant,
+            confirmed,
+            ledger,
+            trash_root,
+            keep_executables,
+        );
         let keep_going = progress(i + 1, &u.path, Some(result.outcome.is_ok()));
         results.push(result);
         if !keep_going {
@@ -751,18 +765,37 @@ mod tests {
         let mut marked = unit(selected.to_str().unwrap(), core_plan.planned_bytes(), None);
         marked.cargo_plan = Some(core_plan);
         let units = vec![marked];
-        let (plan, mut grant) = authorize(&units, &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
+        let (plan, mut grant) = authorize(
+            &units,
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+        );
         let ledger = Ledger::open(store.path().join("ledger.jsonl")).unwrap();
         let trash = store.path().join("Trash");
         grant.created_outside_index = false;
         assert!(
-            execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false)[0]
-                .outcome
-                .is_err()
+            execute_plan(
+                &units,
+                &plan,
+                &grant,
+                &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+                &ledger,
+                &trash,
+                false
+            )[0]
+            .outcome
+            .is_err()
         );
         assert!(selected.exists());
         grant.created_outside_index = true;
-        let results = execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false);
+        let results = execute_plan(
+            &units,
+            &plan,
+            &grant,
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+            &ledger,
+            &trash,
+            false,
+        );
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
         assert!(!selected.exists());
         assert!(
@@ -773,9 +806,17 @@ mod tests {
                 .any(|r| r.outcome == "completed")
         );
         assert!(
-            execute_plan(&units, &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false)[0]
-                .outcome
-                .is_err()
+            execute_plan(
+                &units,
+                &plan,
+                &grant,
+                &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+                &ledger,
+                &trash,
+                false
+            )[0]
+            .outcome
+            .is_err()
         );
     }
 
@@ -800,10 +841,21 @@ mod tests {
             warnings: Vec::new(),
             worktree: None,
         };
-        let (plan, grant) = authorize(std::slice::from_ref(&unit), &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
+        let (plan, grant) = authorize(
+            std::slice::from_ref(&unit),
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+        );
         let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
         let trash = workdir.path().join("Trash");
-        let results = execute_plan(&[unit], &plan, &grant, &swamp_core::authority::HumanConfirmed::tui_dialog("human"), &ledger, &trash, false);
+        let results = execute_plan(
+            &[unit],
+            &plan,
+            &grant,
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+            &ledger,
+            &trash,
+            false,
+        );
 
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
@@ -865,7 +917,10 @@ mod tests {
                 unit(path.to_str().unwrap(), 7, None)
             })
             .collect();
-        let (plan, grant) = authorize(&units, &swamp_core::authority::HumanConfirmed::tui_dialog("human"));
+        let (plan, grant) = authorize(
+            &units,
+            &swamp_core::authority::HumanConfirmed::tui_dialog("human"),
+        );
         let ledger = Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
         let mut events = Vec::new();
         let results = execute_plan_progress(

@@ -3,7 +3,15 @@ id: discovery-owned-by-report-pipeline
 severity: hard
 statement: "One observation owns discovery. Outside tests, only report.rs::observe_scope may run external::discover_and_measure or agents::discover_and_measure, and it must run both; CLI and TUI take their units from that observation."
 outcome: coverage-aware-storage-history
-audit: discovery_owned_by_report_pipeline
+audit: none
+audit_none_reason: "2026-09-22: the property is a type: discovery takes a `report::DiscoveryPass` that only `observe_scope` mints"
+compile_fail:
+  - discovery_pass_is_minted_by_observe_scope
+  - discovery_pass_has_no_public_constructor
+runtime_tests:
+  - crates/core/tests/shared_history_ownership.rs
+  - crates/tui/tests/scope_preserving_refresh.rs
+  - crates/core/tests/store_contents_are_allowlisted.rs
 ---
 
 ## Rationale
@@ -18,11 +26,13 @@ safe; a single pass makes the question not arise.
 
 ## Detection
 
-The set of production callers of either discovery pass must be exactly one function, and it must call both. No owner is named: a second caller anywhere, including in the owner's own module, fails.
+Mechanism: type, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `discovery_owned_by_report_pipeline/01-second-discovery-pass-in-the-cli`, `discovery_owned_by_report_pipeline/02-second-agent-pass-in-the-tui`, `discovery_owned_by_report_pipeline/03-second-pass-inside-core`, `discovery_owned_by_report_pipeline/04-sweep3`.
+**Type.** `external::discover_and_measure_in` and `agents::discover_and_measure_in` take a `&report::DiscoveryPass`; its field and `begin` are private to `report`, which mints one in `observe_scope`. The test constructor exists only under the `testing` feature.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `discovery_owned_by_report_pipeline` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `discovery_pass_is_minted_by_observe_scope`, `discovery_pass_has_no_public_constructor`.
 
 ## Why this checks call sites and not visibility
 

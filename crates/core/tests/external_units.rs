@@ -279,7 +279,11 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
     let env = fixture_env(home.path(), &[]);
     let registry = Registry::with_builtins();
     let mut escaping: Vec<(String, String)> = Vec::new();
-    for (id, proposals) in registry.resolve(&env, &[]) {
+    let every_detector = swamp_core::locations::permitted::PermittedDetectors::from_config(
+        &swamp_core::scope::ScanConfig::default(),
+        &registry,
+    );
+    for (id, proposals) in registry.resolve(&env, &every_detector) {
         for p in proposals {
             if p.status != LocationStatus::Resolved {
                 continue;

@@ -3,7 +3,12 @@ id: symlinks-never-followed
 severity: hard
 statement: "The walk never follows a symlink: every directory listing that descends checks is_symlink first and discards the entry."
 outcome: disk-growth-by-project
-audit: symlinks_never_followed
+audit: gate_paths_only_inside_gates
+compile_fail:
+  - metadata_does_not_follow_by_default
+runtime_tests:
+  - crates/core/src/walk.rs::shallow_parallel_measurement_counts_allocations_without_following_links_or_children
+  - crates/core/src/compose.rs::tests::never_follows_a_symlinked_compose_file
 ---
 
 ## Rationale
@@ -11,9 +16,14 @@ Following symlinks double-counts bytes and can loop. Symlinks are either optimiz
 
 ## Detection
 
-Anywhere: no size is taken from a following `fs::metadata`, and nothing canonicalizes a child (`.join(..)`) path. In every function that lists a directory: no following stat of a listed entry, and no `is_dir`/`is_file`/`exists` on a `.path()` or a `.join(..)`.
+Mechanism: type, gate audit, clippy, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `symlinks_never_followed/01-aliased-metadata`, `symlinks_never_followed/02-plain-metadata`, `symlinks_never_followed/03-canonicalize-a-child`, `symlinks_never_followed/04-sweep3`.
+**Type.** The gate names its two stat calls `symlink_metadata` and `metadata_following`; there is no plain `metadata`.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `std::fs` and the `Path` I/O methods are gate paths.
 
+**Clippy.** `Path::{metadata, exists, is_dir, is_file, canonicalize}` and `std::fs::metadata` are disallowed methods outside the gate.
+
+Retired 2026-09-22: the `symlinks_never_followed` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `metadata_does_not_follow_by_default`.

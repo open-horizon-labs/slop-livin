@@ -245,8 +245,8 @@ fn identify_sessions(
             // claims exactly what an identified one does -- otherwise a
             // reused pass would report every `file-history/<id>` as an
             // orphan.
-            if unit.category == AgentCategory::Sessions
-                && let Some(stem) = unit.path.file_stem().and_then(|s| s.to_str())
+            if unit.category() == AgentCategory::Sessions
+                && let Some(stem) = unit.path().file_stem().and_then(|s| s.to_str())
             {
                 claimed.insert(stem.to_string());
             }
@@ -809,9 +809,9 @@ fn relative_to(home: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::agents::ProjectLinkState;
     use crate::agents::{IdentificationCache, bounded_io, contract};
+    use std::fs;
     use std::time::{Duration, SystemTime};
 
     fn run(home: &Path) -> Vec<CandidateAgentUnit> {
@@ -881,18 +881,18 @@ mod tests {
         let units = run(home);
         let session_unit = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions && u.path == jsonl)
+            .find(|u| u.category() == AgentCategory::Sessions && u.path == jsonl)
             .expect("session unit present");
         assert_eq!(
-            session_unit.members.len(),
+            session_unit.members().len(),
             4,
             "transcript + subagents + file-history + todos"
         );
         assert!(matches!(
-            session_unit.project_link,
+            session_unit.project_link(),
             ProjectLinkState::Linked { .. }
         ));
-        assert_eq!(session_unit.action, AgentActionCapability::SessionRemoval);
+        assert_eq!(session_unit.action(), AgentActionCapability::SessionRemoval);
 
         // Privacy: the canary never appears in any unit's identity/path
         // fields (the only place content could have leaked into).
@@ -916,7 +916,7 @@ mod tests {
         let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            unit.project_link,
+            unit.project_link(),
             ProjectLinkState::Missing { .. }
         ));
     }
@@ -939,7 +939,7 @@ mod tests {
         let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            unit.project_link,
+            unit.project_link(),
             ProjectLinkState::NotAProject { .. }
         ));
     }
@@ -957,7 +957,7 @@ mod tests {
         let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            unit.project_link,
+            unit.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -975,7 +975,7 @@ mod tests {
         let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(matches!(
-            unit.project_link,
+            unit.project_link(),
             ProjectLinkState::Unresolved { .. }
         ));
     }
@@ -996,7 +996,10 @@ mod tests {
         touch(&jsonl, line.as_bytes());
         let units = run(home);
         let unit = units.iter().find(|u| u.path == jsonl).unwrap();
-        assert!(matches!(unit.project_link, ProjectLinkState::Linked { .. }));
+        assert!(matches!(
+            unit.project_link(),
+            ProjectLinkState::Linked { .. }
+        ));
     }
 
     #[test]
@@ -1007,9 +1010,9 @@ mod tests {
         touch(&home.join(".credentials.json"), b"[redacted]");
         let units = run(home);
         for rel in ["settings.json", ".credentials.json"] {
-            let u = units.iter().find(|u| u.relative_path == rel).unwrap();
-            assert!(u.protected, "{rel} must be protected");
-            assert_eq!(u.action, AgentActionCapability::None);
+            let u = units.iter().find(|u| u.relative_path() == rel).unwrap();
+            assert!(u.protected(), "{rel} must be protected");
+            assert_eq!(u.action(), AgentActionCapability::None);
         }
     }
 
@@ -1021,9 +1024,9 @@ mod tests {
         touch(&home.join("debug").join("log.txt"), b"debug line");
         let units = run(home);
         for rel in ["shell-snapshots", "debug"] {
-            let u = units.iter().find(|u| u.relative_path == rel).unwrap();
-            assert!(!u.protected, "{rel} must not be protected");
-            assert_eq!(u.action, AgentActionCapability::CacheOrLogTrash);
+            let u = units.iter().find(|u| u.relative_path() == rel).unwrap();
+            assert!(!u.protected(), "{rel} must not be protected");
+            assert_eq!(u.action(), AgentActionCapability::CacheOrLogTrash);
         }
     }
 
@@ -1035,11 +1038,11 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "history.jsonl")
+            .find(|u| u.relative_path() == "history.jsonl")
             .unwrap();
-        assert_eq!(u.category, AgentCategory::Sessions);
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert_eq!(u.category(), AgentCategory::Sessions);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     #[test]
@@ -1057,10 +1060,10 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "projects/-x/memory")
+            .find(|u| u.relative_path() == "projects/-x/memory")
             .expect("memory directory is its own unit");
-        assert_eq!(u.category, AgentCategory::Unclassified);
-        assert!(u.protected, "auto memory is retained work");
+        assert_eq!(u.category(), AgentCategory::Unclassified);
+        assert!(u.protected(), "auto memory is retained work");
         assert!(
             u.note
                 .as_deref()
@@ -1069,7 +1072,7 @@ mod tests {
             "{:?}",
             u.note
         );
-        assert_eq!(u.action, AgentActionCapability::None);
+        assert_eq!(u.action(), AgentActionCapability::None);
     }
 
     /// THE CLOSED GAP (2026-09-22). This test used to assert the gap --
@@ -1088,13 +1091,17 @@ mod tests {
         );
         let units = run(home);
         // Still never a fabricated session.
-        assert!(units.iter().all(|u| u.category != AgentCategory::Sessions));
+        assert!(
+            units
+                .iter()
+                .all(|u| u.category() != AgentCategory::Sessions)
+        );
         let orphan = units
             .iter()
-            .find(|u| u.relative_path == "todos (unlinked)")
+            .find(|u| u.relative_path() == "todos (unlinked)")
             .expect("an unmatched todos entry must be reported somewhere");
-        assert_eq!(orphan.bytes, 2048, "exactly its bytes, and only once");
-        assert_eq!(orphan.action, AgentActionCapability::None);
+        assert_eq!(orphan.bytes(), 2048, "exactly its bytes, and only once");
+        assert_eq!(orphan.action(), AgentActionCapability::None);
         let note = orphan.note.as_deref().unwrap_or_default();
         assert!(
             note.contains("no longer written"),
@@ -1121,18 +1128,20 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.category == AgentCategory::Sessions)
+            .find(|u| u.category() == AgentCategory::Sessions)
             .expect("session identified");
         assert!(
             session
-                .members
+                .members()
                 .iter()
                 .any(|m| m.kind == AgentMemberKind::Todos),
             "the matching todos entry belongs to its session: {:?}",
-            session.members
+            session.members()
         );
         assert!(
-            !units.iter().any(|u| u.relative_path == "todos (unlinked)"),
+            !units
+                .iter()
+                .any(|u| u.relative_path() == "todos (unlinked)"),
             "a claimed todos entry must not also be swept as an orphan"
         );
     }
@@ -1151,11 +1160,11 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "file-history/(unlinked-file-history)")
+            .find(|u| u.relative_path() == "file-history/(unlinked-file-history)")
             .expect("orphan file-history is reported, never dropped");
-        assert!(u.protected);
-        assert_eq!(u.action, AgentActionCapability::None);
-        assert_eq!(u.members.len(), 1);
+        assert!(u.protected());
+        assert_eq!(u.action(), AgentActionCapability::None);
+        assert_eq!(u.members().len(), 1);
     }
 
     #[test]
@@ -1188,7 +1197,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -1226,9 +1235,9 @@ mod tests {
 
         let residual = units
             .iter()
-            .find(|u| u.relative_path == "(unclassified residual)")
+            .find(|u| u.relative_path() == "(unclassified residual)")
             .expect("residual unit present");
-        assert_eq!(residual.category, AgentCategory::Unclassified);
+        assert_eq!(residual.category(), AgentCategory::Unclassified);
         assert!(
             residual
                 .note
@@ -1241,7 +1250,7 @@ mod tests {
 
         let orphan = units
             .iter()
-            .find(|u| u.relative_path == "projects/-x/some-future-companion")
+            .find(|u| u.relative_path() == "projects/-x/some-future-companion")
             .expect("an unrecognized project-directory entry is still a unit");
         assert!(
             orphan
@@ -1253,7 +1262,9 @@ mod tests {
             orphan.note
         );
         assert!(
-            units.iter().all(|u| u.category != AgentCategory::Sessions),
+            units
+                .iter()
+                .all(|u| u.category() != AgentCategory::Sessions),
             "an unrecognized entry must never be guessed into a session"
         );
     }
@@ -1321,7 +1332,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             SESSIONS
         );
@@ -1372,17 +1383,17 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::ProtectedConfig)
+                .filter(|u| u.category() == AgentCategory::ProtectedConfig)
                 .count(),
             5,
             "settings, credentials, keybindings, themes, rules"
         );
         let cache = units
             .iter()
-            .find(|u| u.relative_path == "shell-snapshots")
+            .find(|u| u.relative_path() == "shell-snapshots")
             .expect("cache unit present");
-        assert!(!cache.protected);
-        assert_eq!(cache.action, AgentActionCapability::CacheOrLogTrash);
+        assert!(!cache.protected());
+        assert_eq!(cache.action(), AgentActionCapability::CacheOrLogTrash);
     }
 
     #[test]
@@ -1418,7 +1429,7 @@ mod tests {
         let units = run(home);
 
         let linked = units.iter().find(|u| u.path == linked_jsonl).unwrap();
-        match &linked.project_link {
+        match &linked.project_link() {
             ProjectLinkState::Linked { source, .. } => {
                 assert_eq!(*source, crate::agents::LinkSource::Declared)
             }
@@ -1426,7 +1437,7 @@ mod tests {
         }
 
         let unresolved = units.iter().find(|u| u.path == unresolved_jsonl).unwrap();
-        match &unresolved.project_link {
+        match &unresolved.project_link() {
             ProjectLinkState::Unresolved { reason } => {
                 assert!(reason.contains("cwd"), "{reason}")
             }

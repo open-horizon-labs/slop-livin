@@ -15,7 +15,12 @@ impl Consumer for CacheWriter {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::ReportAssembled]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         if let Event::ReportAssembled(report) = event
             && ctx.observe
             && let Some(dir) = &ctx.store_dir

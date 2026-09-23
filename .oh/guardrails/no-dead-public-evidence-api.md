@@ -3,7 +3,10 @@ id: no-dead-public-evidence-api
 severity: hard
 statement: "Every pub fn in the evidence, activity, occupancy, recovery, reclaimability, consumer-wiring, association, toolchain-declaration and recheck modules has at least one non-test caller in the workspace. A capability the docs claim is either wired into the live pipeline or deleted along with the claim."
 outcome: decision-relevant-storage-evidence
-audit: no_dead_public_evidence_api
+audit: no_unreferenced_public_items
+runtime_tests:
+  - crates/core/tests/evidence_api_is_wired.rs
+  - crates/core/tests/agent_matrix_matches_docs.rs
 ---
 
 ## Rationale
@@ -27,11 +30,11 @@ toolchain_installation_recovery}`.
 
 ## Detection
 
-The evidence API is derived: the modules (and child modules) whose public functions return the evidence vocabulary or whose code builds `Evidence`. Every public function and constant there must be reachable from a binary: every CLI `main`, every trait method, and the TUI's public run functions. A caller that is itself unreachable does not count.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `no_dead_public_evidence_api/01-dead-code-allowed-caller`, `no_dead_public_evidence_api/02-dead-pub-fn`, `no_dead_public_evidence_api/03-dead-pub-const`, `no_dead_public_evidence_api/04-sweep3`.
+**Gate audit.** `no_unreferenced_public_items`: every public function and type in the workspace crates is named somewhere (a path, a method call, a serde attribute, an inline format capture). A trait impl does not make what it calls live.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `no_dead_public_evidence_api` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
 ## Runtime tests that complete it
 

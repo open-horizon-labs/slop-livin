@@ -438,12 +438,12 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.relative_path.ends_with("s-empty.json"))
+            .find(|u| u.relative_path().ends_with("s-empty.json"))
             .expect("session identified");
-        let ProjectLinkState::Unresolved { reason } = &session.project_link else {
+        let ProjectLinkState::Unresolved { reason } = &session.project_link() else {
             panic!(
                 "an empty workspaceDirectory must be Unresolved, got {:?}",
-                session.project_link
+                session.project_link()
             );
         };
         assert!(
@@ -466,9 +466,9 @@ mod tests {
         let units = run(home);
         let u = units
             .iter()
-            .find(|u| u.relative_path == "config.yaml")
+            .find(|u| u.relative_path() == "config.yaml")
             .unwrap();
-        assert!(u.protected);
+        assert!(u.protected());
     }
 
     #[test]
@@ -484,16 +484,16 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.relative_path == "sessions/s1.json")
+            .find(|u| u.relative_path() == "sessions/s1.json")
             .expect("session identified");
-        assert_eq!(session.action, AgentActionCapability::SessionRemoval);
-        assert!(!session.protected);
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
+        assert!(!session.protected());
         let index = units
             .iter()
-            .find(|u| u.relative_path == "sessions/sessions.json")
+            .find(|u| u.relative_path() == "sessions/sessions.json")
             .expect("index identified");
-        assert!(index.protected);
-        assert_eq!(index.action, AgentActionCapability::None);
+        assert!(index.protected());
+        assert_eq!(index.action(), AgentActionCapability::None);
         let serialized = format!("{units:?}");
         assert!(!serialized.contains(canary), "content leaked");
     }
@@ -508,17 +508,17 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .find(|u| u.relative_path == "index")
+                .find(|u| u.relative_path() == "index")
                 .unwrap()
-                .action,
+                .action(),
             AgentActionCapability::CacheOrLogTrash
         );
         assert_eq!(
             units
                 .iter()
-                .find(|u| u.relative_path == "dev_data")
+                .find(|u| u.relative_path() == "dev_data")
                 .unwrap()
-                .action,
+                .action(),
             AgentActionCapability::CacheOrLogTrash
         );
     }
@@ -546,12 +546,12 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.relative_path == "sessions/s1.json")
+            .find(|u| u.relative_path() == "sessions/s1.json")
             .expect("session identified");
         assert!(
-            matches!(session.project_link, ProjectLinkState::Linked { .. }),
+            matches!(session.project_link(), ProjectLinkState::Linked { .. }),
             "{:?}",
-            session.project_link
+            session.project_link()
         );
         contract::no_content_leak(&units, canary);
     }
@@ -577,9 +577,9 @@ mod tests {
         let units = run(home);
         let session = units
             .iter()
-            .find(|u| u.relative_path == "sessions/s1.json")
+            .find(|u| u.relative_path() == "sessions/s1.json")
             .expect("session identified");
-        match &session.project_link {
+        match &session.project_link() {
             ProjectLinkState::Unresolved { reason } => assert!(
                 reason.contains("past the bounded read's cap"),
                 "the reason must say the field may sit past the cap: {reason}"
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             500
         );
@@ -622,9 +622,9 @@ mod tests {
         touch(&dir.path().join("unrelated.txt"), b"hello");
         let units = run(dir.path());
         assert_eq!(units.len(), 1, "an unrecognized home still surfaces a row");
-        assert_eq!(units[0].relative_path, "(unknown format)");
-        assert_eq!(units[0].category, AgentCategory::Unclassified);
-        assert_eq!(units[0].action, AgentActionCapability::None);
+        assert_eq!(units[0].relative_path(), "(unknown format)");
+        assert_eq!(units[0].category(), AgentCategory::Unclassified);
+        assert_eq!(units[0].action(), AgentActionCapability::None);
         assert!(
             units[0]
                 .note
@@ -657,7 +657,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .any(|u| matches!(u.project_link, ProjectLinkState::Linked { .. })),
+                .any(|u| matches!(u.project_link(), ProjectLinkState::Linked { .. })),
             "the fixture must actually exercise the header read"
         );
         contract::no_content_leak(&units, canary);
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|u| u.category == AgentCategory::Sessions)
+                .filter(|u| u.category() == AgentCategory::Sessions)
                 .count(),
             sessions as usize
         );
@@ -712,13 +712,13 @@ mod tests {
         assert!(
             units
                 .iter()
-                .any(|u| u.relative_path == "config.yaml" && u.protected),
+                .any(|u| u.relative_path() == "config.yaml" && u.protected()),
             "the main configuration is protected"
         );
         assert!(
             units
                 .iter()
-                .any(|u| u.relative_path == "sessions/sessions.json" && u.protected),
+                .any(|u| u.relative_path() == "sessions/sessions.json" && u.protected()),
             "the session index is protected separately from the bodies"
         );
     }
@@ -744,9 +744,9 @@ mod tests {
         let units = run(home);
         let linked = units
             .iter()
-            .find(|u| u.relative_path == "sessions/linked.json")
+            .find(|u| u.relative_path() == "sessions/linked.json")
             .expect("declared session identified");
-        match &linked.project_link {
+        match &linked.project_link() {
             ProjectLinkState::Linked { source, .. } => {
                 assert_eq!(*source, crate::agents::LinkSource::Declared);
             }
@@ -754,9 +754,9 @@ mod tests {
         }
         let guessed = units
             .iter()
-            .find(|u| u.relative_path == "sessions/my-repo-name.json")
+            .find(|u| u.relative_path() == "sessions/my-repo-name.json")
             .expect("undeclared session identified");
-        match &guessed.project_link {
+        match &guessed.project_link() {
             ProjectLinkState::Unresolved { reason } => {
                 assert!(
                     reason.contains(WORKSPACE_FIELD),

@@ -43,6 +43,46 @@ fn shim_dir(dir: &Path, counter: &Path, names: &[&str]) -> String {
     prev
 }
 
+/// The PATH-shim oracle: every `Program` the gate can run, plus the
+/// original list's `simctl` and `mdls`.
+fn spawn_oracle() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = swamp_core::fs_gate::spawn::Program::ALL
+        .iter()
+        .map(|p| p.binary())
+        .collect();
+    names.extend(["simctl", "mdls"]);
+    names
+}
+
+/// The oracle cannot fall behind the gate: a new `Program` variant is
+/// shimmed the moment it exists, and the binaries the 2026-09-22
+/// re-review found unshimmed are in it.
+#[test]
+fn spawn_oracle_covers_every_program_the_gate_can_run() {
+    let oracle = spawn_oracle();
+    for p in swamp_core::fs_gate::spawn::Program::ALL {
+        assert!(oracle.contains(&p.binary()), "{p:?} is not shimmed");
+    }
+    for name in [
+        "lsof",
+        "plutil",
+        "xcrun",
+        "du",
+        "docker",
+        "git",
+        "gh",
+        "df",
+        "id",
+        "launchctl",
+    ] {
+        assert!(oracle.contains(&name), "`{name}` is not shimmed");
+        assert!(
+            swamp_core::fs_gate::spawn::Program::named(name).is_some(),
+            "`{name}` is spawned by production but is not a gate Program"
+        );
+    }
+}
+
 fn spawns(counter: &Path) -> Vec<String> {
     fs::read_to_string(counter)
         .unwrap_or_default()
@@ -183,11 +223,11 @@ fn unchanged_observations_spaced_past_the_toosoon_floor() {
     let shims = root.join("shims");
     let counter = root.join("spawns.log");
     fs::write(&counter, b"").unwrap();
-    let prev_path = shim_dir(
-        &shims,
-        &counter,
-        &["lsof", "plutil", "xcrun", "du", "docker", "simctl", "mdls"],
-    );
+    // Every binary production may spawn (the gate's `Program::ALL`:
+    // git, gh, df, id, launchctl, kill, brew, defaults as well as the
+    // original seven's lsof, plutil, xcrun, du, docker), plus `simctl`
+    // and `mdls` from the original list: "spawns: []" means all of them.
+    let prev_path = shim_dir(&shims, &counter, &spawn_oracle());
 
     // The fixture's own 25,000 file creations are real filesystem
     // events. fseventsd persists them with a lag, so a first pass taken

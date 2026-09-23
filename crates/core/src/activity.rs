@@ -43,7 +43,7 @@ pub fn modification_evidence(mtime_max: u64, observed_at: u64) -> Evidence {
                 detail: "no modification time recorded for this unit".into(),
             },
             observed_at,
-            "this row's walk did not record a modification time",
+            crate::reason!("this row's walk did not record a modification time"),
         );
     }
     let mut ev = Evidence::known(
@@ -204,7 +204,7 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
                 detail: "access time".into(),
             },
             observed_at,
-            reason,
+            crate::evidence::Reason::carried(reason),
         ),
         AtimeReliability::Undetermined(reason) => Evidence::unavailable(
             FactKind::Activity,
@@ -213,11 +213,11 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
                 detail: "access time".into(),
             },
             observed_at,
-            reason,
+            crate::evidence::Reason::carried(reason),
         ),
         AtimeReliability::Reliable => match crate::fs_gate::metadata_following(path) {
             Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
+                use crate::fs_gate::MetadataExt;
                 let atime = meta.atime();
                 if atime <= 0 {
                     Evidence::unknown(
@@ -227,7 +227,7 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
                             detail: "access time".into(),
                         },
                         observed_at,
-                        "no access time recorded",
+                        crate::reason!("no access time recorded"),
                     )
                 } else {
                     Evidence::known(
@@ -251,7 +251,7 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
                     detail: "access time".into(),
                 },
                 observed_at,
-                format!("could not stat path: {e}"),
+                crate::reason!("could not stat path: {e}"),
             ),
         },
     }
@@ -290,7 +290,7 @@ pub fn tool_reported_use_evidence(
                 detail: detail.clone(),
             },
             observed_at,
-            format!("{detail}: no timestamp reported"),
+            crate::reason!("{detail}: no timestamp reported"),
         ),
     }
 }

@@ -7,10 +7,12 @@
 //! left over inside a worktree becomes that worktree's single `Source`
 //! row. Anything outside every worktree is an `UnownedRow`.
 
-use crate::report::{ArtifactKind, ArtifactRow, Source, UnownedReason, UnownedRow, WorktreeRow};
+use crate::fs_gate::{self as fs, MetadataExt};
+use crate::report::{ArtifactKind, ArtifactRow, UnownedRow, WorktreeRow};
+#[cfg(test)]
+use crate::report::{Source, UnownedReason};
+#[cfg(test)]
 use std::collections::HashSet;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// One basename -> kind entry. Data-driven so a later slice (R7) can
@@ -142,6 +144,33 @@ fn has_marker(parent: &Path, markers: &[&str]) -> bool {
     })
 }
 
+/// What a fold job carries to prove its directory was classified: only
+/// [`classified_at`] (a name/marker/self-declared-cache match) and
+/// [`Classified::stored`] (a row the store already classified when it
+/// was first walked) make one. `walk::AttrJob::Size` requires it, so
+/// "fold this subtree" cannot be written without the classification --
+/// not under an `if let` whose initializer merely *mentions*
+/// `classify_at`, not anywhere (`.oh/guardrails/folding-only-for-artifacts.md`).
+#[derive(Debug, Clone)]
+pub(crate) struct Classified(ArtifactKind);
+
+impl Classified {
+    /// A kind the store recorded when this path was first walked and
+    /// classified; a re-size never reclassifies.
+    pub(crate) fn stored(kind: ArtifactKind) -> Classified {
+        Classified(kind)
+    }
+
+    pub(crate) fn kind(&self) -> &ArtifactKind {
+        &self.0
+    }
+}
+
+/// [`classify_at`], as the witness a fold job needs.
+pub(crate) fn classified_at(parent: &Path, name: &str) -> Option<Classified> {
+    classify_at(parent, name).map(Classified)
+}
+
 /// Classification with the parent directory available, so marker-gated
 /// names (`bin`, `obj`, Unity's `Library`, Unreal's `Intermediate`) count
 /// only inside the project type that generates them.
@@ -226,6 +255,7 @@ pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
 
 /// A worktree known to the attribution pass: its path (for nearest-match)
 /// and the id it should attach rows to.
+#[cfg(test)]
 struct KnownWorktree<'a> {
     path: &'a Path,
     worktree_id: &'a str,
@@ -256,6 +286,7 @@ pub struct AttributionResult {
     pub files: Vec<crate::report::FileRow>,
 }
 
+#[cfg(test)]
 struct Ctx<'a> {
     worktrees: Vec<KnownWorktree<'a>>,
     seen_inodes: HashSet<(u64, u64)>,
@@ -268,6 +299,7 @@ struct Ctx<'a> {
     observed_at: u64,
 }
 
+#[cfg(test)]
 /// Finds the id of the worktree whose path is the longest prefix of
 /// `path` (the nearest containing checkout/worktree), if any.
 fn nearest_worktree<'a>(worktrees: &'a [KnownWorktree<'a>], path: &Path) -> Option<&'a str> {
@@ -278,6 +310,7 @@ fn nearest_worktree<'a>(worktrees: &'a [KnownWorktree<'a>], path: &Path) -> Opti
         .map(|w| w.worktree_id)
 }
 
+#[cfg(test)]
 impl<'a> Ctx<'a> {
     fn dedup(&mut self, meta: &fs::Metadata) -> bool {
         // Hardlinks are counted once per report.
@@ -470,7 +503,14 @@ impl<'a> Ctx<'a> {
 }
 
 /// Runs the R3 classification/attribution walk under `root`, given the
-/// worktrees R2 already discovered (path + worktree_id).
+/// worktrees R2 already discovered (path + worktree_id): the serial
+/// reference walk, kept as the oracle this module's tests compare the
+/// parallel pool (`walk::discover_and_attribute`) against.
+///
+/// Test-only (`.oh/guardrails/walk-optimized-parallel-pool.md`): a
+/// production path that reached for it -- directly, through an alias,
+/// or inside a local `macro_rules!` -- does not compile.
+#[cfg(test)]
 pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -620,6 +660,7 @@ mod marker_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 

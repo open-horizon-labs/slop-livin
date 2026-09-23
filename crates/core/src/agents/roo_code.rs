@@ -107,10 +107,10 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(
             units[0]
-                .relative_path
+                .relative_path()
                 .starts_with("VS Code Server (remote)/tasks/")
         );
-        assert_eq!(units[0].action, AgentActionCapability::SessionRemoval);
+        assert_eq!(units[0].action(), AgentActionCapability::SessionRemoval);
     }
 
     #[test]
@@ -129,10 +129,10 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(
             units[0]
-                .relative_path
+                .relative_path()
                 .ends_with("(unsupported layout version)"),
             "{}",
-            units[0].relative_path
+            units[0].relative_path()
         );
         assert!(
             units[0]
@@ -168,7 +168,7 @@ mod tests {
         );
         let units = run(&ext_home);
         assert!(matches!(
-            units[0].project_link,
+            units[0].project_link(),
             ProjectLinkState::Linked { .. }
         ));
         contract::no_content_leak(&units, canary);
@@ -231,18 +231,18 @@ mod tests {
         let units = run(&ext_home);
         let linked = units
             .iter()
-            .find(|u| u.relative_path.ends_with("/t1"))
+            .find(|u| u.relative_path().ends_with("/t1"))
             .expect("declared task identified");
-        let ProjectLinkState::Linked { source, .. } = &linked.project_link else {
-            panic!("expected Linked, got {:?}", linked.project_link);
+        let ProjectLinkState::Linked { source, .. } = &linked.project_link() else {
+            panic!("expected Linked, got {:?}", linked.project_link());
         };
         assert_eq!(*source, LinkSource::Declared);
         let guessed = units
             .iter()
-            .find(|u| u.relative_path.ends_with("/basename-only-repo"))
+            .find(|u| u.relative_path().ends_with("/basename-only-repo"))
             .expect("named task identified");
-        let ProjectLinkState::Unresolved { reason } = &guessed.project_link else {
-            panic!("expected Unresolved, got {:?}", guessed.project_link);
+        let ProjectLinkState::Unresolved { reason } = &guessed.project_link() else {
+            panic!("expected Unresolved, got {:?}", guessed.project_link());
         };
         assert!(
             reason.contains("history_item.json"),

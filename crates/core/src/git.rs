@@ -10,12 +10,12 @@
 //! identity used to group worktrees into a project.
 
 use crate::entities::id_for;
-use crate::report::WorktreeKind;
-use anyhow::{Context, Result};
 use crate::fs_gate::{
     self as fs,
     read::{BoundedCap, bounded_read},
 };
+use crate::report::WorktreeKind;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Directories that are never descended into during discovery: `.git`

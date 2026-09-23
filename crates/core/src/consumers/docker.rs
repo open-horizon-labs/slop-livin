@@ -18,7 +18,12 @@ impl Consumer for DockerConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::ProjectsGrouped]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::ProjectsGrouped {
             projects,
             worktree_paths,

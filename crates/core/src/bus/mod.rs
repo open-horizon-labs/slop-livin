@@ -37,9 +37,11 @@ use crate::report::{
 };
 use crate::signals::RawSignals;
 use anyhow::{Result, bail};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod registry;
 
 /// Everything a run was asked for. Consumers read it; nobody writes it.
 pub struct Ctx<'a> {
@@ -252,121 +254,15 @@ pub trait Consumer {
     /// events whose kind appears here.
     fn subscribes_to(&self) -> &[EventKind];
     /// React to an event; return follow-on events to emit.
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>>;
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>>;
 }
 
-pub struct EventBus {
-    consumers: Vec<Box<dyn Consumer>>,
-    sealed: bool,
-}
-
-impl Default for EventBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EventBus {
-    pub fn new() -> Self {
-        EventBus {
-            consumers: Vec::new(),
-            sealed: false,
-        }
-    }
-
-    /// Every builtin stage, in registration order. Static: this is the
-    /// one place the pipeline's membership is written down.
-    pub fn with_builtins() -> Self {
-        use crate::consumers::*;
-        let mut bus = EventBus::new();
-        for c in [
-            Box::new(WalkConsumer::default()) as Box<dyn Consumer>,
-            Box::new(ProjectsConsumer),
-            Box::new(SignalsConsumer),
-            Box::new(EcosystemConsumer),
-            Box::new(GithubConsumer::default()),
-            Box::new(DockerConsumer),
-            Box::new(AssemblyGate::default()),
-            Box::new(CargoConsumer::default()),
-            Box::new(GrowthConsumer),
-            Box::new(TrackingConsumer),
-            Box::new(HistoryConsumer),
-            Box::new(ReportAssembler::default()),
-            Box::new(CacheWriter),
-        ] {
-            bus.register(c).expect("builtins register before any run");
-        }
-        bus
-    }
-
-    /// Registers a consumer. Refused once `run` has started: the registry
-    /// is fixed before the first event fires.
-    pub fn register(&mut self, consumer: Box<dyn Consumer>) -> Result<()> {
-        if self.sealed {
-            bail!(
-                "event bus is sealed: `{}` cannot register after run started",
-                consumer.name()
-            );
-        }
-        self.consumers.push(consumer);
-        Ok(())
-    }
-
-    pub fn consumer_names(&self) -> Vec<&str> {
-        self.consumers.iter().map(|c| c.name()).collect()
-    }
-
-    /// Dispatches `seed` and every follow-on until the queue is empty.
-    /// Subscribers of one event run concurrently; their follow-ons are
-    /// queued depth-first (a follow-on is dispatched before anything that
-    /// was already waiting). Returns every event that was dispatched, in
-    /// dispatch order.
-    pub async fn run(&mut self, seed: Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
-        self.sealed = true;
-        let mut queue: VecDeque<Event> = VecDeque::from([seed]);
-        let mut dispatched: Vec<Event> = Vec::new();
-        while let Some(event) = queue.pop_front() {
-            let kind = event.kind();
-            let subscribers: Vec<&dyn Consumer> = self
-                .consumers
-                .iter()
-                .map(|c| c.as_ref())
-                .filter(|c| c.subscribes_to().contains(&kind))
-                .collect();
-            let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
-            let results = futures_util::future::join_all(subscribers.iter().map(|c| async {
-                let t = std::time::Instant::now();
-                let r = c.on_event(&event, ctx).await;
-                if trace {
-                    eprintln!("[trace] {:?} → {}: {:?}", kind, c.name(), t.elapsed());
-                }
-                r
-            }))
-            .await;
-            let mut follow_on: Vec<Event> = Vec::new();
-            for (c, r) in subscribers.iter().zip(results) {
-                let events =
-                    r.map_err(|e| anyhow::anyhow!("consumer `{}` on {:?}: {e}", c.name(), kind))?;
-                follow_on.extend(events);
-            }
-            for e in follow_on.into_iter().rev() {
-                queue.push_front(e);
-            }
-            dispatched.push(event);
-        }
-        Ok(dispatched)
-    }
-
-    /// `run` on a fresh tokio current-thread runtime, for the synchronous
-    /// callers (CLI, TUI worker thread). Must not be called from
-    /// inside another tokio runtime.
-    pub fn run_blocking(&mut self, seed: Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(self.run(seed, ctx))
-    }
-}
+pub use registry::{EventBus, Stage};
 
 /// Builds a [`Report`] for `ctx` by running the builtin consumers from
 /// `RootRequested`. The one entry point the report module calls.
@@ -490,7 +386,12 @@ mod tests {
         fn subscribes_to(&self) -> &[EventKind] {
             &[EventKind::Probe]
         }
-        async fn on_event(&self, event: &Event, _ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+        async fn on_event(
+            &self,
+            event: &Event,
+            _ctx: &Ctx<'_>,
+            _stage: &crate::bus::Stage,
+        ) -> Result<Vec<Event>> {
             let Event::Probe { tag, depth } = event else {
                 return Ok(vec![]);
             };
@@ -517,8 +418,8 @@ mod tests {
     fn follow_on_events_are_routed_to_subscribers() {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 1)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 1)).unwrap();
         let events = bus
             .run_blocking(
                 Event::Probe {
@@ -547,8 +448,8 @@ mod tests {
         // Two seeds queued; a's follow-on from seed1 must run before seed2.
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 1)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 1)).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -556,7 +457,7 @@ mod tests {
             .block_on(async {
                 // Seed with a probe whose follow-on itself has a follow-on:
                 // order must be seed, seed>a, (seed>a)>a — never breadth-first.
-                bus.register(prober("b", 2)).unwrap();
+                bus.register_for_test(prober("b", 2)).unwrap();
                 bus.run(
                     Event::Probe {
                         tag: "s".into(),
@@ -585,9 +486,9 @@ mod tests {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
         for order in [["a", "b"], ["b", "a"]] {
-            let mut bus = EventBus::new();
+            let mut bus = EventBus::new_for_test();
             for n in order {
-                bus.register(prober(n, 0)).unwrap();
+                bus.register_for_test(prober(n, 0)).unwrap();
             }
             let events = bus
                 .run_blocking(
@@ -607,8 +508,8 @@ mod tests {
     fn registration_is_closed_once_run_starts() {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 0)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 0)).unwrap();
         bus.run_blocking(
             Event::Probe {
                 tag: "x".into(),
@@ -617,7 +518,7 @@ mod tests {
             &c,
         )
         .unwrap();
-        let err = bus.register(prober("late", 0)).unwrap_err();
+        let err = bus.register_for_test(prober("late", 0)).unwrap_err();
         assert!(err.to_string().contains("sealed"), "{err}");
     }
 

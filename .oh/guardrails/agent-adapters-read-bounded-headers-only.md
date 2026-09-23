@@ -3,7 +3,14 @@ id: agent-adapters-read-bounded-headers-only
 severity: hard
 statement: "An adapter's only access to file contents is the shared capped reader agents::bounded_io::read_header(path, max_bytes), whose cap is at most 64 KiB. No adapter reads a whole file, streams lines, or deserializes from a reader. Everything else it knows comes from metadata."
 outcome: decision-relevant-storage-evidence
-audit: agent_adapters_read_bounded_headers_only
+audit: adapters_do_not_reach_gates, gate_paths_only_inside_gates
+compile_fail:
+  - content_reads_need_a_cap
+  - caps_are_named_constants
+  - no_unbounded_read_in_the_gate
+runtime_tests:
+  - identification_reads_no_more_than_header_cap
+  - crates/core/tests/incremental_external_and_agent_measurement.rs
 ---
 
 ## Rationale
@@ -21,11 +28,15 @@ the per-session cost, so they must be provably small.
 
 ## Detection
 
-No adapter function is in the derived unbounded-read set (every function that transitively calls `fs::read`, `fs::read_to_string`, `io::read_to_string`, a `read_to_string`/`read_to_end` method, `serde_json::from_reader` or `BufReader::new`), with the closure stopped only at `bounded_io::read_header` (which must name and stop on `MAX_HEADER_BYTES`, evaluate to at most 64 KiB, and neither list nor walk) and the declared-project handoff.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_read_bounded_headers_only/01-aliased-read-to-string`, `agent_adapters_read_bounded_headers_only/02-serde-from-reader`, `agent_adapters_read_bounded_headers_only/03-buf-reader-lines`, `agent_adapters_read_bounded_headers_only/04-sweep3`.
+**Type.** The gate's content read is `fs_gate::read::bounded_read(path, BoundedCap)`; a `BoundedCap` is one of the named constants or `header_at_most(n)` (clamped to the header cap), and there is no whole-file read of user content.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `std::io::{Read, BufRead, BufReader, copy, read_to_string}`, `std::fs` and `serde_json::from_reader`-style reads need `std::io`/`std::fs` paths the gate audit rejects outside `fs_gate`; adapters reach reads only through `IdentifyCtx`.
+
+Retired 2026-09-22: the `agent_adapters_read_bounded_headers_only` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `content_reads_need_a_cap`, `caps_are_named_constants`, `no_unbounded_read_in_the_gate`.
 
 ## Runtime tests that complete it
 

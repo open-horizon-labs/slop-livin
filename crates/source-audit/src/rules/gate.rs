@@ -1,0 +1,1055 @@
+//! The capability gate, by exact path reference
+//! (`crates/core/src/fs_gate/mod.rs`, `docs/architecture.md` "Capability
+//! gates").
+//!
+//! What the compiler already enforces (proof tokens, private fields, the
+//! `Program` enum, clippy's type-resolved `disallowed_methods`) is not
+//! re-checked here. These rules check what *names* may appear where:
+//!
+//! * `gate_paths_only_inside_gates` -- the I/O crates and `std` modules
+//!   only inside the gate; each gate group only in the modules allowed
+//!   to hold that capability; no `unsafe`/`extern`/`#[path]` outside the
+//!   gate; no orphan files; no production build enabling `testing`.
+//! * `adapters_do_not_reach_gates` -- agent adapters reach I/O only
+//!   through `IdentifyCtx`, never detectors, actions or the environment,
+//!   and never print or panic.
+//! * `sinks_have_no_path_predicates` -- the execution sinks hold no path
+//!   containment logic of their own.
+//! * `json_writes_allowlisted` -- no JSON writer outside the gate.
+//! * `bus_static_registration` -- consumers never name each other.
+//! * `tui_event_thread_has_no_gate_calls` -- the TUI's event/render code
+//!   reaches no blocking gate capability except through `worker::spawn`.
+//! * `no_unreferenced_public_items` -- a public workspace item nothing
+//!   names is dead, and dead code is where a capability hides.
+
+use super::{Rule, verdict};
+use crate::model::{Krate, Module, RefKind, Workspace, under};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// Modules that are the gate: everything under `fs_gate`, and the
+/// FSEvents FFI child of `fs_events`.
+pub fn is_gate(m: &Module) -> bool {
+    m.is_within(Krate::Core, &["fs_gate"]) || m.is_within(Krate::Core, &["fs_events", "macos"])
+}
+
+/// External paths only the gate may name (prefix match, segment-wise).
+const GATED: &[&str] = &[
+    "std::fs",
+    "core::fs",
+    "std::os::unix::fs",
+    "std::os::fd",
+    "std::os::unix::io",
+    "std::io::Read",
+    "std::io::BufRead",
+    "std::io::BufReader",
+    "std::io::Seek",
+    "std::io::copy",
+    "std::io::read_to_string",
+    "std::process",
+    "libc",
+    "tempfile",
+    "trash",
+    "walkdir",
+    "jwalk",
+    "tokio::fs",
+    "tokio::process",
+    "fsevent_sys",
+    "core_foundation",
+    "core_foundation_sys",
+    "parquet",
+    "zstd",
+];
+
+/// `std::process` items that start nothing.
+const PROCESS_OK: &[&str] = &[
+    "std::process::exit",
+    "std::process::id",
+    "std::process::ExitCode",
+];
+
+/// Arrow is the column-store modules' vocabulary only.
+const ARROW: &[&str] = &["arrow_array", "arrow_schema"];
+const ARROW_MODULES: &[&[&str]] = &[
+    &["growth", "columns"],
+    &["assoc_store"],
+    &["store"],
+    &["github"],
+    &["fs_gate"],
+];
+
+/// A gate capability group and the modules that may name it.
+struct Group {
+    /// Absolute path prefix (`@core::fs_gate::read_dir`).
+    path: &'static str,
+    /// Modules (crate, path prefix) allowed to reference it.
+    allowed: &'static [(Krate, &'static [&'static str])],
+    why: &'static str,
+}
+
+const WALKERS: &[(Krate, &[&str])] = &[
+    (Krate::Core, &["walk"]),
+    (Krate::Core, &["attribution"]),
+    (Krate::Core, &["folded_measurement"]),
+    (Krate::Core, &["scan"]),
+    (Krate::Core, &["git"]),
+    (Krate::Core, &["signals"]),
+    (Krate::Core, &["ignore"]),
+    (Krate::Core, &["ecosystem"]),
+    (Krate::Core, &["compose"]),
+    (Krate::Core, &["cargo_artifacts"]),
+    (Krate::Core, &["cargo_cleanup"]),
+    (Krate::Core, &["recheck"]),
+    (Krate::Core, &["preserve"]),
+    (Krate::Core, &["growth"]),
+    (Krate::Core, &["locations"]),
+];
+
+const STORE_MODULES: &[(Krate, &[&str])] = &[
+    (Krate::Core, &["actions"]),
+    (Krate::Core, &["growth"]),
+    (Krate::Core, &["protection"]),
+    (Krate::Core, &["scope"]),
+    (Krate::Core, &["schedule"]),
+    (Krate::Core, &["docker"]),
+    (Krate::Core, &["ledger"]),
+    (Krate::Core, &["report"]),
+    (Krate::Core, &["store"]),
+    (Krate::Core, &["assoc_store"]),
+    (Krate::Core, &["github"]),
+    (Krate::Core, &["agents"]),
+    (Krate::Tui, &["app"]),
+    (Krate::Cli, &[]),
+];
+
+const GROUPS: &[Group] = &[
+    Group {
+        path: "@core::fs_gate::read_dir",
+        allowed: WALKERS,
+        why: "a directory listing is a traversal: only the walker, the reviewed-unit snapshot and \
+              the capped shallow listing may take one (no-second-traversal-on-report-path, \
+              agent-adapters-do-not-traverse)",
+    },
+    Group {
+        path: "@core::fs_gate::store",
+        allowed: STORE_MODULES,
+        why: "writes to swamp's own files belong to the store modules",
+    },
+    Group {
+        path: "@core::fs_gate::read::read_owned_string",
+        allowed: STORE_MODULES,
+        why: "a whole-file read is for swamp's own state; anything else is a bounded read",
+    },
+    Group {
+        path: "@core::fs_gate::read::read_owned_lines",
+        allowed: STORE_MODULES,
+        why: "a whole-file read is for swamp's own state; anything else is a bounded read",
+    },
+    Group {
+        path: "@core::fs_gate::columns",
+        allowed: &[
+            (Krate::Core, &["growth"]),
+            (Krate::Core, &["assoc_store"]),
+            (Krate::Core, &["store"]),
+            (Krate::Core, &["github"]),
+        ],
+        why: "Parquet is the history store's format",
+    },
+    Group {
+        path: "@core::fs_gate::destroy",
+        allowed: &[
+            (Krate::Core, &["actions"]),
+            (Krate::Core, &["cargo_cleanup"]),
+            (Krate::Core, &["preserve"]),
+            (Krate::Core, &["docker"]),
+            (Krate::Tui, &["actions"]),
+        ],
+        why: "destructive operations belong to the execution sinks",
+    },
+    Group {
+        path: "@core::fs_gate::sys",
+        allowed: &[
+            (Krate::Core, &["activity"]),
+            (Krate::Core, &["report"]),
+            (Krate::Core, &["cargo_cleanup"]),
+            (Krate::Core, &["occupancy"]),
+        ],
+        why: "statfs/flock/O_NOFOLLOW are for the modules that need them",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::run",
+        allowed: &[
+            (Krate::Core, &["occupancy"]),
+            (Krate::Core, &["external_associations"]),
+            (Krate::Core, &["locations"]),
+            (Krate::Core, &["attribution"]),
+            (Krate::Core, &["docker"]),
+            (Krate::Core, &["github"]),
+            (Krate::Core, &["actions"]),
+            (Krate::Core, &["schedule"]),
+        ],
+        why: "every module that starts a process is one of these",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::named",
+        allowed: &[(Krate::Core, &["locations"])],
+        why: "only the detector command runner maps a name to a program",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Lsof",
+        allowed: &[(Krate::Core, &["occupancy"])],
+        why: "lsof is the occupancy probe",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Plutil",
+        allowed: &[(Krate::Core, &["external_associations"])],
+        why: "plutil reads Xcode plists",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Du",
+        allowed: &[(Krate::Core, &["attribution"])],
+        why: "du is the --verify-du cross-check",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Docker",
+        allowed: &[(Krate::Core, &["docker"])],
+        why: "docker is the Docker module's",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Gh",
+        allowed: &[(Krate::Core, &["github"])],
+        why: "gh is GitHub enrichment's",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Git",
+        allowed: &[],
+        why: "mutating git runs only through fs_gate::destroy",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Df",
+        allowed: &[(Krate::Core, &["actions"])],
+        why: "df measures free space around an execution",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Id",
+        allowed: &[(Krate::Core, &["schedule"])],
+        why: "the launchd domain",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Launchctl",
+        allowed: &[(Krate::Core, &["schedule"])],
+        why: "the scheduled refresh is a LaunchAgent, and only `schedule` installs it \
+              (scheduled-refresh-launchagent)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Kill",
+        allowed: &[(Krate::Core, &["schedule"])],
+        why: "liveness of the observation lock holder",
+    },
+    Group {
+        path: "@core::authority::HumanConfirmed::cli_command",
+        allowed: &[(Krate::Cli, &[])],
+        why: "authorization is minted only at the reviewed CLI approve/grant handlers \
+              (human-only-authorization)",
+    },
+    Group {
+        path: "@core::authority::HumanConfirmed::tui_dialog",
+        allowed: &[(Krate::Tui, &["app"])],
+        why: "authorization is minted only at the TUI's confirm dialog (human-only-authorization)",
+    },
+    Group {
+        path: "@core::authority::authorize",
+        allowed: &[(Krate::Core, &["actions"])],
+        why: "a grant becomes an authorization only in the plan executor",
+    },
+    Group {
+        path: "@core::authority::authorize_confirmed",
+        allowed: &[(Krate::Tui, &["actions"])],
+        why: "a TUI confirmation becomes an authorization only in the TUI sink",
+    },
+    Group {
+        path: "@core::recheck::run_all",
+        allowed: &[
+            (Krate::Core, &["actions"]),
+            (Krate::Core, &["cargo_cleanup"]),
+            (Krate::Tui, &["actions"]),
+        ],
+        why: "a recheck proof is taken only by an execution sink",
+    },
+    Group {
+        path: "@core::evidence::Reason::__from_checked_format",
+        allowed: &[(Krate::Core, &["evidence"])],
+        why: "only the `reason!` macro, which checks the template is not blank, may build a \
+              formatted reason this way",
+    },
+];
+
+fn allowed(m: &Module, list: &[(Krate, &[&str])]) -> bool {
+    list.iter().any(|(k, p)| m.is_within(*k, p))
+}
+
+fn names_gated(abs: &str) -> Option<&'static str> {
+    if PROCESS_OK.iter().any(|ok| under(abs, ok)) {
+        return None;
+    }
+    GATED.iter().copied().find(|g| under(abs, g))
+}
+
+/// Method names that on `Path` touch the filesystem and exist nowhere
+/// else in the workspace; called on any receiver outside the gate they
+/// are a gate violation (clippy's `disallowed_methods` is the
+/// type-resolved half, and also covers `is_dir`/`exists`/`metadata`).
+const PATH_IO_METHODS: &[&str] = &[
+    "read_dir",
+    "symlink_metadata",
+    "canonicalize",
+    "read_link",
+    "try_exists",
+];
+
+pub fn gate_paths_only_inside_gates(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for e in &ws.parse_errors {
+        problems.push(format!("does not parse or cannot be found: {e}"));
+    }
+    for o in &ws.orphans {
+        problems.push(format!(
+            "{o} is not part of any crate (no `mod` declaration reaches it): code the compiler \
+             never builds cannot be audited as if it were, so it may not exist"
+        ));
+    }
+    for (mi, m) in ws.modules.iter().enumerate() {
+        let gate = is_gate(m);
+        for h in &m.hazards {
+            if h.test {
+                continue;
+            }
+            if h.what.contains("#[path]") || !gate {
+                problems.push(format!(
+                    "{}: {} outside the capability gate",
+                    h.site, h.what
+                ));
+            }
+        }
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            // A bare single identifier in code is a local, not a crate
+            // (`trash` the Trash path, not the `trash` crate); `use trash;`
+            // and `trash::x` are the crate.
+            if r.segments.len() == 1 && r.kind == RefKind::Code {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments).join("::");
+            if !gate && let Some(g) = names_gated(&abs) {
+                problems.push(format!(
+                    "{}: `{}` names `{g}`{} outside the capability gate (crates/core/src/fs_gate)",
+                    r.site,
+                    r.segments.join("::"),
+                    if r.kind == RefKind::Glob {
+                        " (glob import)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if ARROW.iter().any(|a| under(&abs, a))
+                && !ARROW_MODULES.iter().any(|p| m.is_within(Krate::Core, p))
+            {
+                problems.push(format!(
+                    "{}: `{}` names Arrow outside the column-store modules (growth::columns, \
+                     assoc_store, store, github): table schemas are the column modules' \
+                     (dir-mtime-int32-minutes, column-store-parquet-zstd)",
+                    r.site,
+                    r.segments.join("::")
+                ));
+            }
+            if m.krate == Krate::Tui
+                && under(&abs, "std::thread")
+                && !m.is_within(Krate::Tui, &["worker"])
+                && !(abs == "std::thread::sleep")
+            {
+                problems.push(format!(
+                    "{}: `{}` names `std::thread` in the TUI outside `worker.rs`: work leaves the \
+                     event thread only through `worker::spawn`, which cannot be joined \
+                     (tui-actions-off-event-thread)",
+                    r.site,
+                    r.segments.join("::")
+                ));
+            }
+            if gate {
+                continue;
+            }
+            for g in GROUPS {
+                if under(&abs, g.path) && !allowed(m, g.allowed) {
+                    problems.push(format!(
+                        "{}: {} names `{}`, which it may not: {}",
+                        r.site,
+                        m.display(),
+                        g.path.trim_start_matches("@core::"),
+                        g.why
+                    ));
+                }
+            }
+        }
+        if !gate {
+            for c in &m.methods {
+                if !c.test && PATH_IO_METHODS.contains(&c.name.as_str()) {
+                    problems.push(format!(
+                        "{}: `.{}()` outside the capability gate: filesystem access goes through \
+                         crates/core/src/fs_gate",
+                        c.site, c.name
+                    ));
+                }
+            }
+        }
+    }
+    // No production dependency graph may enable the test-fixture API.
+    for k in Krate::ALL {
+        let manifest = ws.root.join(k.dir()).join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap_or_default();
+        let mut section = String::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                section = t.to_string();
+                continue;
+            }
+            let production = section == "[dependencies]"
+                || (section.starts_with("[target.") && section.ends_with(".dependencies]"));
+            if production && t.starts_with("swamp-core") && t.contains("testing") {
+                problems.push(format!(
+                    "{}/Cargo.toml: a [dependencies] entry enables swamp-core's `testing` \
+                     feature; the test-fixture API must never be in a production build",
+                    k.dir()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// The adapter modules: every module under `agents` except the shared
+/// machinery (the context, the registry, the support matrix, the unit
+/// builder and the bounded reader).
+pub fn is_adapter(m: &Module) -> bool {
+    m.krate == Krate::Core
+        && m.path.first().is_some_and(|s| s == "agents")
+        && m.path.len() >= 2
+        && !matches!(
+            m.path[1].as_str(),
+            "registry" | "matrix" | "unit" | "bounded_io"
+        )
+}
+
+const ADAPTER_DENIED: &[(&str, &str)] = &[
+    (
+        "@core::fs_gate",
+        "adapters reach the filesystem only through `IdentifyCtx` (list, stat, bounded header \
+         reads), never the gate directly",
+    ),
+    (
+        "@core::locations",
+        "adapters do not reach detectors (agent-adapters-do-not-reach-detectors)",
+    ),
+    (
+        "@core::actions",
+        "adapters are inspection-only (agent-adapters-are-inspection-only)",
+    ),
+    (
+        "@core::recheck",
+        "adapters are inspection-only (agent-adapters-are-inspection-only)",
+    ),
+    (
+        "@core::authority",
+        "adapters are inspection-only (agent-adapters-are-inspection-only)",
+    ),
+    (
+        "@core::protection",
+        "adapters never read or change human keep intent",
+    ),
+    (
+        "std::env",
+        "adapters take every path from the context they are handed \
+         (agent-adapters-are-environment-free)",
+    ),
+    (
+        "std::thread",
+        "adapters run on the thread they are called on",
+    ),
+    (
+        "std::io::stdout",
+        "adapters emit nothing (agent-adapters-do-not-emit-content)",
+    ),
+    (
+        "std::io::stderr",
+        "adapters emit nothing (agent-adapters-do-not-emit-content)",
+    ),
+];
+
+/// Types from the gate an adapter may name: pure data about a `stat`
+/// already taken through its context.
+const ADAPTER_GATE_TYPES: &[&str] = &[
+    "@core::fs_gate::Metadata",
+    "@core::fs_gate::MetadataExt",
+    "@core::fs_gate::FileType",
+];
+
+const EMITTING_MACROS: &[&str] = &[
+    "panic",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "dbg",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+];
+
+const EMITTING_METHODS: &[&str] = &["unwrap", "expect", "unwrap_err", "expect_err"];
+
+/// Candidate-unit methods only the shared machinery may call.
+const ADAPTER_DENIED_METHODS: &[&str] = &[
+    "replayed",
+    "push_replayed_member",
+    "withdraw_for_unverified_layout",
+    "set_resolved_link",
+    "into_parts",
+];
+
+pub fn adapters_do_not_reach_gates(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (mi, m) in ws.modules.iter().enumerate() {
+        if !is_adapter(m) {
+            continue;
+        }
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments).join("::");
+            if ADAPTER_GATE_TYPES.iter().any(|t| under(&abs, t)) {
+                continue;
+            }
+            for (p, why) in ADAPTER_DENIED {
+                if under(&abs, p) {
+                    problems.push(format!(
+                        "{}: adapter {} names `{}`: {why}",
+                        r.site,
+                        m.display(),
+                        r.segments.join("::")
+                    ));
+                }
+            }
+            if let Some(last) = r.segments.last()
+                && (EMITTING_METHODS.contains(&last.as_str())
+                    || ADAPTER_DENIED_METHODS.contains(&last.as_str()))
+                && r.segments.len() > 1
+            {
+                problems.push(format!(
+                    "{}: adapter {} names `{}`",
+                    r.site,
+                    m.display(),
+                    r.segments.join("::")
+                ));
+            }
+        }
+        for c in &m.methods {
+            if c.test {
+                continue;
+            }
+            if EMITTING_METHODS.contains(&c.name.as_str()) {
+                problems.push(format!(
+                    "{}: adapter {} calls `.{}()`: a panic prints the value it carries -- a \
+                     path, a header -- to stderr (agent-adapters-do-not-emit-content)",
+                    c.site,
+                    m.display(),
+                    c.name
+                ));
+            }
+            if ADAPTER_DENIED_METHODS.contains(&c.name.as_str()) {
+                problems.push(format!(
+                    "{}: adapter {} calls `.{}()`, which only the shared agents machinery may",
+                    c.site,
+                    m.display(),
+                    c.name
+                ));
+            }
+        }
+        for mc in &m.macros {
+            if !mc.test && EMITTING_MACROS.contains(&mc.name.as_str()) {
+                problems.push(format!(
+                    "{}: adapter {} invokes `{}!` in production code \
+                     (agent-adapters-do-not-emit-content)",
+                    mc.site,
+                    m.display(),
+                    mc.name
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// The execution sinks: the modules that move or remove data.
+fn is_sink(m: &Module) -> bool {
+    m.is_within(Krate::Core, &["actions"])
+        || m.is_within(Krate::Core, &["cargo_cleanup"])
+        || m.is_within(Krate::Core, &["preserve"])
+        || m.is_within(Krate::Core, &["recheck"])
+        || m.is_within(Krate::Core, &["fs_gate", "destroy"])
+        || m.is_within(Krate::Tui, &["actions"])
+}
+
+const CONTAINMENT: &[&str] = &["starts_with", "strip_prefix", "ancestors"];
+
+pub fn sinks_have_no_path_predicates(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for m in &ws.modules {
+        if !is_sink(m) {
+            continue;
+        }
+        for c in &m.methods {
+            if !c.test && CONTAINMENT.contains(&c.name.as_str()) {
+                problems.push(format!(
+                    "{}: `.{}()` in execution sink {}: containment belongs to \
+                     `protection::ProtectList::conflict` and `scope::{{under, overlapping, \
+                     relative_to}}`, so a sink cannot grow a second, one-directional protection \
+                     predicate (protection-fails-closed)",
+                    c.site,
+                    c.name,
+                    m.display()
+                ));
+            }
+        }
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            if let Some(last) = r.segments.last()
+                && CONTAINMENT.contains(&last.as_str())
+                && r.segments.len() > 1
+            {
+                problems.push(format!(
+                    "{}: `{}` in execution sink {}",
+                    r.site,
+                    r.segments.join("::"),
+                    m.display()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+pub fn json_writes_allowlisted(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (mi, m) in ws.modules.iter().enumerate() {
+        if is_gate(m) {
+            continue;
+        }
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments).join("::");
+            if under(&abs, "serde_json::to_writer")
+                || under(&abs, "serde_json::to_writer_pretty")
+                || under(&abs, "serde_json::ser")
+            {
+                problems.push(format!(
+                    "{}: `{}` outside the gate: JSON reaches disk only through \
+                     `fs_gate::store::write_json`, whose `JsonFile` variants are the allow-list \
+                     (json-persistence-is-allowlisted)",
+                    r.site,
+                    r.segments.join("::")
+                ));
+            }
+        }
+    }
+    problems
+}
+
+pub fn bus_static_registration(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    let consumers: HashSet<String> = ws
+        .modules
+        .iter()
+        .filter(|m| m.krate == Krate::Core && m.path.len() == 2 && m.path[0] == "consumers")
+        .map(|m| m.path[1].clone())
+        .collect();
+    for (mi, m) in ws.modules.iter().enumerate() {
+        let own = if m.krate == Krate::Core && m.path.len() >= 2 && m.path[0] == "consumers" {
+            Some(m.path[1].clone())
+        } else {
+            None
+        };
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments);
+            if let Some(own) = &own {
+                // A consumer may name the consumers module itself (its
+                // shared helpers) but no sibling consumer.
+                if abs.len() >= 3 && abs[0] == "@core" && abs[1] == "consumers" {
+                    let other = &abs[2];
+                    if consumers.contains(other) && other != own {
+                        problems.push(format!(
+                            "{}: consumer `{own}` names consumer `{other}` (`{}`): the bus is the \
+                             only coupling between stages (no-consumer-knows-other-consumers)",
+                            r.site,
+                            r.segments.join("::")
+                        ));
+                    }
+                }
+                if r.kind == RefKind::Glob && abs == ["@core", "consumers"] {
+                    problems.push(format!(
+                        "{}: consumer `{own}` glob-imports the consumers module, which brings \
+                         every sibling consumer into scope",
+                        r.site
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// Gate capabilities that block: what the TUI event thread may not reach
+/// except through `worker::spawn`.
+const BLOCKING: &[&str] = &[
+    "@core::fs_gate::destroy",
+    "@core::fs_gate::spawn",
+    "@core::fs_gate::read::bounded_read",
+    "@core::fs_gate::read::bounded_read_header",
+    "@core::fs_gate::read::bounded_string",
+    "@core::fs_gate::read_dir",
+];
+
+pub fn tui_event_thread_has_no_gate_calls(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    // Functions by absolute path; methods by name (method-call syntax,
+    // conservatively: every non-gate workspace method of that name -- a
+    // gate object is obtained only through a gate path, which is an edge
+    // of its own) and by `(owner or trait, name)` (paths `Type::m`,
+    // `Trait::m`).
+    let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut methods: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut owned: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (fi, f) in ws.fns.iter().enumerate() {
+        if f.test {
+            continue;
+        }
+        let m = &ws.modules[f.module];
+        let mut abs = m.abs();
+        if let Some(o) = &f.owner {
+            abs.push(o.clone());
+            if !is_gate(m) {
+                methods.entry(f.name.clone()).or_default().push(fi);
+            }
+            owned
+                .entry((o.clone(), f.name.clone()))
+                .or_default()
+                .push(fi);
+            if let Some(t) = &f.impl_trait {
+                owned
+                    .entry((t.clone(), f.name.clone()))
+                    .or_default()
+                    .push(fi);
+            }
+        }
+        abs.push(f.name.clone());
+        by_path.entry(abs.join("::")).or_default().push(fi);
+    }
+    // A gate function is a leaf: what it is, not what it calls inside.
+    let gate_fn = |fi: usize| is_gate(&ws.modules[ws.fns[fi].module]);
+    let mut blocks: Vec<Option<String>> = vec![None; ws.fns.len()];
+    for (fi, f) in ws.fns.iter().enumerate() {
+        if !gate_fn(fi) {
+            continue;
+        }
+        let m = &ws.modules[f.module];
+        let mut abs = m.abs();
+        if let Some(o) = &f.owner {
+            abs.push(o.clone());
+        }
+        abs.push(f.name.clone());
+        let abs = abs.join("::");
+        if let Some(b) = BLOCKING.iter().find(|b| under(&abs, b)) {
+            blocks[fi] = Some(b.trim_start_matches("@core::").to_string());
+        }
+    }
+    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); ws.fns.len()];
+    for (mi, m) in ws.modules.iter().enumerate() {
+        if is_gate(m) {
+            continue;
+        }
+        for r in &m.refs {
+            let Some(f) = r.in_fn else { continue };
+            if r.test || r.in_worker {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments).join("::");
+            if let Some(targets) = by_path.get(&abs) {
+                edges[f].extend(targets.iter().copied());
+            }
+            // `Type::method` / `Trait::method` paths: that type's method, or
+            // every implementor's (a UFCS call on a trait with no default
+            // body reaches its implementors).
+            if r.segments.len() >= 2 {
+                let n = r.segments.len();
+                let key = (r.segments[n - 2].clone(), r.segments[n - 1].clone());
+                if let Some(ms) = owned.get(&key) {
+                    edges[f].extend(ms.iter().copied());
+                }
+            }
+        }
+        for c in &m.methods {
+            let Some(f) = c.in_fn else { continue };
+            if c.test || c.in_worker {
+                continue;
+            }
+            if let Some(ms) = methods.get(&c.name) {
+                edges[f].extend(ms.iter().copied());
+            }
+        }
+    }
+    // What each function reaches: the first blocking capability found.
+    let mut reaches: Vec<Option<(usize, String)>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b.clone().map(|w| (i, w)))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for f in 0..ws.fns.len() {
+            if reaches[f].is_some() || gate_fn(f) {
+                continue;
+            }
+            if let Some(g) = edges[f].iter().find(|g| reaches[**g].is_some()) {
+                reaches[f] = Some((*g, reaches[*g].as_ref().unwrap().1.clone()));
+                changed = true;
+            }
+        }
+    }
+    // The event thread: everything reachable, over non-worker edges, from
+    // the TUI's `event_loop` (which draws, polls and handles keys), plus
+    // every workspace impl of a trait the compiler calls *implicitly*
+    // (`Drop` at scope end, `Display` inside `format!`, `Deref`, an
+    // iterator's `next` in a `for`, operators, comparisons, `Clone`):
+    // those have no call site to follow, so they count as reachable from
+    // anywhere. References inside closures handed to `worker::spawn` are
+    // not edges (dropped above). Startup (`run` before the loop) may read
+    // the store; once the loop runs, nothing may block it.
+    const IMPLICIT: &[&str] = &[
+        "Drop",
+        "Display",
+        "Debug",
+        "Deref",
+        "DerefMut",
+        "Iterator",
+        "Index",
+        "IndexMut",
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "AddAssign",
+        "SubAssign",
+        "PartialEq",
+        "Eq",
+        "PartialOrd",
+        "Ord",
+        "Hash",
+        "Clone",
+    ];
+    let mut on_thread: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut roots = 0;
+    for (fi, f) in ws.fns.iter().enumerate() {
+        if f.test || gate_fn(fi) {
+            continue;
+        }
+        let m = &ws.modules[f.module];
+        let loop_root = m.krate == Krate::Tui && f.owner.is_none() && f.name == "event_loop";
+        let implicit = matches!(m.krate, Krate::Core | Krate::Tui)
+            && f.impl_trait
+                .as_deref()
+                .is_some_and(|t| IMPLICIT.contains(&t));
+        if loop_root {
+            roots += 1;
+        }
+        if loop_root || implicit {
+            stack.push(fi);
+        }
+    }
+    if roots == 0 {
+        problems.push(
+            "crates/tui: no `event_loop` function found -- the rule has no event thread to \
+             follow, so it cannot pass"
+                .to_string(),
+        );
+    }
+    while let Some(f) = stack.pop() {
+        if !on_thread.insert(f) {
+            continue;
+        }
+        for g in &edges[f] {
+            if !gate_fn(*g) {
+                stack.push(*g);
+            }
+        }
+    }
+    for &fi in &on_thread {
+        let f = &ws.fns[fi];
+        for site in &f.opaque_calls {
+            problems.push(format!(
+                "{site}: `{}` (TUI event-thread code) calls a value whose target is not a path -- \
+                 a field, an index, a call's result -- which this rule cannot follow; call a \
+                 named function, or do the work in `worker::spawn`",
+                f.name
+            ));
+        }
+        for g in &edges[fi] {
+            if gate_fn(*g)
+                && let Some((_, what)) = &reaches[*g]
+            {
+                let gf = &ws.fns[*g];
+                problems.push(format!(
+                    "{}: `{}` runs on the TUI event thread and calls `{}` ({}), blocking gate \
+                     capability {what}; do the work in `worker::spawn`",
+                    f.site, f.name, gf.name, gf.site
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// Public items in the workspace crates that nothing names -- no path
+/// reference, no method call, no serde attribute string -- anywhere in
+/// the workspace, its tests included. Dead public code is where the old
+/// audits' blind spots lived (a capability "kept live" by an unused
+/// `Drop`, a delivered field nothing fills), and rustc's `dead_code`
+/// lint cannot see it because `pub` items of a library are exported.
+pub fn no_unreferenced_public_items(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    // Every name referenced anywhere: last segments of every path, every
+    // method name, and every identifier in test files.
+    let mut named: HashSet<String> = HashSet::new();
+    for m in &ws.modules {
+        for r in &m.refs {
+            if let Some(l) = r.segments.last() {
+                named.insert(l.clone());
+            }
+        }
+        for c in &m.methods {
+            named.insert(c.name.clone());
+        }
+        for l in &m.literals {
+            // `#[serde(serialize_with = "crate::x::f")]` names `f`.
+            if let Some(last) = l.value.rsplit("::").next() {
+                named.insert(last.to_string());
+            }
+            // Inline format captures: `format!("{ADAPTER_VERSION}")`.
+            for cap in l.value.split('{').skip(1) {
+                let id: String = cap
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !id.is_empty() {
+                    named.insert(id);
+                }
+            }
+        }
+    }
+    for id in crate::model::test_identifiers(&ws.root) {
+        named.insert(id);
+    }
+    for (name, site, what) in public_definitions(ws) {
+        if !named.contains(&name) {
+            problems.push(format!(
+                "{site}: public {what} `{name}` is named nowhere in the workspace (not by \
+                 production code, not by a test): dead public code is where a capability hides \
+                 from review; delete it, use it, or make it private so rustc's dead_code lint \
+                 sees it"
+            ));
+        }
+    }
+    problems
+}
+
+fn public_definitions(ws: &Workspace) -> Vec<(String, crate::model::Site, &'static str)> {
+    let mut out = Vec::new();
+    for f in &ws.fns {
+        let m = &ws.modules[f.module];
+        if f.test || !f.public {
+            continue;
+        }
+        if f.trait_impl {
+            continue;
+        }
+        if matches!(f.name.as_str(), "main" | "new" | "default" | "fmt" | "drop") {
+            continue;
+        }
+        let _ = m;
+        out.push((f.name.clone(), f.site.clone(), "fn"));
+    }
+    for (name, site) in ws.public_types() {
+        out.push((name, site, "type"));
+    }
+    out
+}
+
+pub const RULES: &[Rule] = &[
+    ("gate_paths_only_inside_gates", |ws| {
+        verdict(
+            "gate paths only inside the capability gate",
+            gate_paths_only_inside_gates(ws),
+        )
+    }),
+    ("adapters_do_not_reach_gates", |ws| {
+        verdict(
+            "agent adapters reach I/O only through IdentifyCtx, never detectors, actions or the \
+             environment, and never emit",
+            adapters_do_not_reach_gates(ws),
+        )
+    }),
+    ("sinks_have_no_path_predicates", |ws| {
+        verdict(
+            "execution sinks hold no path containment logic",
+            sinks_have_no_path_predicates(ws),
+        )
+    }),
+    ("json_writes_allowlisted", |ws| {
+        verdict(
+            "no JSON writer outside the gate",
+            json_writes_allowlisted(ws),
+        )
+    }),
+    ("bus_static_registration", |ws| {
+        verdict(
+            "consumers never name each other",
+            bus_static_registration(ws),
+        )
+    }),
+    ("tui_event_thread_has_no_gate_calls", |ws| {
+        verdict(
+            "TUI event-thread code reaches no blocking gate capability except through \
+             worker::spawn",
+            tui_event_thread_has_no_gate_calls(ws),
+        )
+    }),
+    ("no_unreferenced_public_items", |ws| {
+        verdict(
+            "every public item is named somewhere",
+            no_unreferenced_public_items(ws),
+        )
+    }),
+];

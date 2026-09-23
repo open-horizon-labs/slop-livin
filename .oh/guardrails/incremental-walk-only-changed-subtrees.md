@@ -3,7 +3,13 @@ id: incremental-walk-only-changed-subtrees
 severity: hard
 statement: "The incremental path re-walks only the worktrees and folded artifacts FSEvents implicated and carries every other row forward from the store; it never calls the full parallel walk."
 outcome: disk-growth-by-project
-audit: incremental_walk_only_changed_subtrees
+audit: none
+audit_none_reason: "2026-09-22: which subtrees a replay re-walks is data flow no path-reference rule can check; the runtime tests assert it against a full walk"
+compile_fail:
+  - bus_stage_is_minted_by_the_bus
+runtime_tests:
+  - crates/core/tests/fsevents_incremental.rs::touching_one_artifact_resizes_only_that_row_and_matches_a_full_walk
+  - crates/core/tests/fsevents_incremental.rs::deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a_full_walk
 ---
 
 ## Rationale
@@ -11,9 +17,10 @@ Incremental means incremental. If the incremental path can fall into a full walk
 
 ## Detection
 
-Every `apply_incremental` calls `attribute_one_worktree` and a `resize_artifact*`, and any other call it makes that reaches the traversal set must be handed the changed paths (an argument derived, through bindings and collections they are pushed into, from its changed-path parameter).
+Mechanism: runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `incremental_walk_only_changed_subtrees/01-full-walk-fallback`, `incremental_walk_only_changed_subtrees/02-parallel-whole-tree`, `incremental_walk_only_changed_subtrees/03-no-targeted-rewalk`, `incremental_walk_only_changed_subtrees/04-sweep3`.
+**Runtime test.** The incremental tests change one artifact (and one file deep inside a folded artifact), replay, and assert that only that row was re-sized and that the result equals a full walk's, with the work counters bounding what was listed and statted.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `incremental_walk_only_changed_subtrees` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `bus_stage_is_minted_by_the_bus`.

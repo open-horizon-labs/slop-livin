@@ -261,7 +261,12 @@ pub(super) fn write_dir_rows(path: &Path, rows: &[StoredDirRow], zstd_level: i32
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
-    crate::fs_gate::columns::write_parquet_atomic(path, schema, std::iter::once(Ok(batch)), zstd_level)
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        zstd_level,
+    )
 }
 
 pub(super) fn read_dir_rows(path: &Path) -> Result<Vec<StoredDirRow>> {
@@ -354,7 +359,12 @@ pub(super) fn write_file_rows(path: &Path, rows: &[StoredFileRow], zstd_level: i
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
-    crate::fs_gate::columns::write_parquet_atomic(path, schema, std::iter::once(Ok(batch)), zstd_level)
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        zstd_level,
+    )
 }
 
 pub(super) fn read_file_rows(path: &Path) -> Result<Vec<StoredFileRow>> {
@@ -638,7 +648,12 @@ impl StoredRow {
         self.regrowth_count
     }
     pub(super) fn key(&self) -> String {
-        super::row_key(&self.project_id, &self.worktree_id, &self.kind, &self.rel_path)
+        super::row_key(
+            &self.project_id,
+            &self.worktree_id,
+            &self.kind,
+            &self.rel_path,
+        )
     }
 
     /// A row as stored, for this module's own tests and the compaction
@@ -1022,8 +1037,7 @@ impl ExternalHistory {
 
     pub(super) fn commit(self) -> Result<()> {
         if !self.deltas.is_empty() {
-            let seq_path =
-                super::next_seq_path(&super::external_deltas_dir(&self.dir), "delta-");
+            let seq_path = super::next_seq_path(&super::external_deltas_dir(&self.dir), "delta-");
             write_external_rows(&seq_path, &self.deltas)?;
         }
         if self.changed {

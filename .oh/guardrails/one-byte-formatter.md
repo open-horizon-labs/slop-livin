@@ -3,7 +3,9 @@ id: one-byte-formatter
 severity: hard
 statement: "There is one byte formatter in the product, decimal, SI-labelled; the TUI re-exports core's."
 outcome: disk-growth-by-project
-audit: one_byte_formatter
+audit: byte_units_only_in_the_formatter
+runtime_tests:
+  - crates/core/tests/render_snapshot.rs
 ---
 
 ## Rationale
@@ -11,8 +13,8 @@ The TUI once divided by 1024 under a GB label while core divided by 1000; rows v
 
 ## Detection
 
-`render::human_bytes` divides by 1000; no other definition carries the formatter's name; the TUI re-exports core's formatter; and no function anywhere divides by 1024 and puts a binary unit label into formatted output, whether the label is in the macro or in a constant (a unit table) it indexes.
+Mechanism: gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `one_byte_formatter/01-second-1024-formatter`, `one_byte_formatter/02-core-formatter-uses-1024`, `one_byte_formatter/03-tui-defines-its-own`, `one_byte_formatter/04-sweep3`.
+**Gate audit.** `byte_units_only_in_the_formatter`: outside `render.rs`, no string literal renders a placeholder followed by a byte unit (`"{v:.1} KiB"`, `"{} MB"`) -- whatever the divisor is called.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+Retired 2026-09-22: the `one_byte_formatter` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.

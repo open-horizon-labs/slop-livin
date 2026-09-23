@@ -74,7 +74,9 @@ impl JsonFile<'_> {
     /// Where the file lives.
     pub fn path(&self) -> io::Result<PathBuf> {
         Ok(match *self {
-            JsonFile::Plan { store, id } => store.join("plans").join(format!("{}.json", plain(id)?)),
+            JsonFile::Plan { store, id } => {
+                store.join("plans").join(format!("{}.json", plain(id)?))
+            }
             JsonFile::Grants { store } => store.join("grants.json"),
             JsonFile::ProtectList { store } => store.join("agent_protect.json"),
             JsonFile::Scope { store } => store.join("scope.json"),

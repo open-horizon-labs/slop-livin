@@ -217,7 +217,22 @@ impl ScopeRoot {
 pub struct DetectorSummary {
     pub detector_id: String,
     pub name: String,
-    pub locations: Vec<ProposedLocation>,
+    /// Raw detector output, before exclusion, dedup and explicit-root
+    /// replacement. Private: discovery consumes the authorized
+    /// [`EffectiveScope`] roots, never these candidates
+    /// (`.oh/guardrails/discovery-consumes-effective-scope.md`), and a
+    /// destructuring `let DetectorSummary { locations, .. }` outside this
+    /// module does not compile.
+    locations: Vec<ProposedLocation>,
+}
+
+impl DetectorSummary {
+    /// The raw candidates, for `swamp scope`'s explanation of what each
+    /// detector proposed and why it was or was not authorized. The gate
+    /// audit allows calling this only from the CLI's scope printer.
+    pub fn locations_for_display(&self) -> &[ProposedLocation] {
+        &self.locations
+    }
 }
 
 /// A reusable, serde-serializable description of exactly what swamp will
@@ -820,6 +835,13 @@ pub fn under(candidate: &Path, ancestor: &Path) -> bool {
     candidate == ancestor || candidate.starts_with(ancestor)
 }
 
+/// `path` relative to `base`, or `None` when it does not lie beneath it.
+/// The one spelling of "relative to" the execution sinks use, so a sink
+/// holds no path containment logic of its own.
+pub fn relative_to<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    path.strip_prefix(base).ok()
+}
+
 /// Whether two selected paths overlap (one is, or lies beneath, the
 /// other): the "parent and child selected together" refusal the sinks
 /// apply before anything moves. Containment logic lives here and in
@@ -849,28 +871,8 @@ pub fn resolve_effective_scope(
     registry: &Registry,
     generated_at: u64,
 ) -> EffectiveScope {
-    let permitted = detectors_permitted(config);
-    let mut effective_disabled = config.disabled_detectors.clone();
-    if !config.defaults {
-        // Explicit-only scope: the builtin-defaults detector never runs,
-        // and -- unless the config names detectors -- neither does any
-        // other one. When an allow-list *is* present, everything outside
-        // it is disabled.
-        effective_disabled
-            .push(crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID.to_string());
-        for d in registry.detectors() {
-            let id = d.id().to_string();
-            if !permitted
-                || (!config.enabled_detectors.is_empty() && !config.enabled_detectors.contains(&id))
-            {
-                effective_disabled.push(id);
-            }
-        }
-    }
-    effective_disabled.sort();
-    effective_disabled.dedup();
-
-    let per_detector = registry.resolve(env, &effective_disabled);
+    let permitted = crate::locations::permitted::PermittedDetectors::from_config(config, registry);
+    let per_detector = registry.resolve(env, &permitted);
 
     let detectors: Vec<DetectorSummary> = registry
         .detectors()
@@ -1048,7 +1050,7 @@ pub fn resolve_effective_scope(
         catalog_version: crate::locations::CATALOG_VERSION.to_string(),
         generated_at,
         defaults_enabled: config.defaults,
-        disabled_detectors: effective_disabled,
+        disabled_detectors: permitted.disabled(),
         configured_include: config.include.clone(),
         configured_exclude: config.exclude.clone(),
         explicit: !explicit_roots.is_empty(),

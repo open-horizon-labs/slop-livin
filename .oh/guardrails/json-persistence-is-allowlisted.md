@@ -3,7 +3,12 @@ id: json-persistence-is-allowlisted
 severity: hard
 statement: "JSON is a wire and CLI output format, and the format of a fixed set of small control files. It is never a data store. Every code path that serializes JSON into a file must appear in JSON_WRITE_ALLOWLIST with a justification naming a control or recovery artifact."
 outcome: disk-growth-by-project
-audit: json_persistence_is_allowlisted
+audit: json_writes_allowlisted, gate_paths_only_inside_gates
+compile_fail:
+  - json_writes_name_a_store_file
+  - atomic_write_is_private
+runtime_tests:
+  - crates/core/tests/store_contents_are_allowlisted.rs
 ---
 
 ## Rationale
@@ -16,11 +21,15 @@ is the thing that quietly becomes a database.
 
 ## Detection
 
-A function persists JSON when a serialized value (`serde_json::to_*` other than `to_value`, or `json!(..).to_string()`, however the serializer is imported) reaches a write: as a write's argument, through a binding (including `if let Ok(x) = ..`), `to_writer` into a file, or `write!`/`writeln!` into anything but a terminal or a string buffer. Every such function must be on the allow-list, and every allow-list entry must still do it.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `json_persistence_is_allowlisted/01-json-macro-to-string`, `json_persistence_is_allowlisted/02-serializer-outside-allowlist`, `json_persistence_is_allowlisted/03-aliased-writer`, `json_persistence_is_allowlisted/04-sweep3`.
+**Type.** JSON reaches disk only through `fs_gate::store::write_json(JsonFile, ..)`; `JsonFile` is the allow-list (a new control file is a new variant), and the atomic byte writer is private.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `json_writes_allowlisted`: no serde serializer that produces bytes or text (`to_vec*`, `to_string*`, `to_writer*`, `Value`'s `Display`) outside the gate's store module; `std::fs` writes are gate paths.
+
+Retired 2026-09-22: the `json_persistence_is_allowlisted` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `json_writes_name_a_store_file`, `atomic_write_is_private`.
 
 ## Allow-list and why each entry is a control artifact
 

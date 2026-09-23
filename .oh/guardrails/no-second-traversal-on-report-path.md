@@ -3,7 +3,15 @@ id: no-second-traversal-on-report-path
 severity: hard
 statement: "The ordinary report path traverses directories only in the folded walk. External units take their bytes from folded rows; agent adapters take directory structure from those rows or from the capped locations::shallow_list; nothing on the report path re-walks a tree the walk already measured."
 outcome: disk-growth-by-project
-audit: no_second_traversal_on_report_path
+audit: gate_paths_only_inside_gates, adapters_do_not_reach_gates
+compile_fail:
+  - bus_stage_is_minted_by_the_bus
+  - bus_stage_has_no_production_test_constructor
+  - discovery_pass_is_minted_by_observe_scope
+runtime_tests:
+  - crates/core/tests/incremental_external_and_agent_measurement.rs
+  - crates/core/tests/agent_container_seams.rs
+  - crates/core/tests/unit_root_event_cursors.rs
 ---
 
 ## Rationale
@@ -19,11 +27,17 @@ fixture does not test an unchanged large tool home.
 
 ## Detection
 
-Traversal is a dataflow-aware closure: a function that lists a path it was handed, and whatever hands such a function a path it was handed (listing a store path the function constructed is bookkeeping). Stopped at the bounded primitives, the declared-project handoff, readability probes, and `folded_measurement::measure` only while it returns early on a reuse lookup before any walk. On the report path's modules -- exactly reachable from `report::observe_scope`/`bus::run_report`, plus the adapters -- no function outside the bus's work and the folded walk itself may be in it.
+Mechanism: type, gate audit, clippy, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `no_second_traversal_on_report_path/01-adapter-traverses`, `no_second_traversal_on_report_path/02-aliased-read-dir`, `no_second_traversal_on_report_path/03-measure-rewalks-without-consulting-rows`, `no_second_traversal_on_report_path/04-sweep3`.
+**Type.** The walk takes a `bus::Stage` (minted only by `EventBus::run`) and discovery a `report::DiscoveryPass` (minted only by `observe_scope`), so no other entry point can run either.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** A directory listing is `fs_gate::read_dir`, which only the walker modules may name; `walkdir`/`jwalk` are gate paths.
+
+**Clippy.** `Path::read_dir`/`std::fs::read_dir` are disallowed methods outside the gate.
+
+Retired 2026-09-22: the `no_second_traversal_on_report_path` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `bus_stage_is_minted_by_the_bus`, `bus_stage_has_no_production_test_constructor`, `discovery_pass_is_minted_by_observe_scope`.
 
 ## The gate: trusted event coverage, not directory stamps (2026-09-22)
 

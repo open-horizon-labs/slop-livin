@@ -3,7 +3,12 @@ id: agent-adapters-are-inspection-only
 severity: hard
 statement: "Identification never acts. An adapter declares an action capability on the unit it returns; only the shared sink -- with the plan, grant, recheck, ledger and Trash discipline -- executes anything. Adapters reference no action, plan, grant, ledger or filesystem-mutating API."
 outcome: decision-relevant-storage-evidence
-audit: agent_adapters_are_inspection_only
+audit: adapters_do_not_reach_gates, gate_paths_only_inside_gates
+compile_fail:
+  - trash_move_needs_a_recheck_proof
+  - recheck_proof_is_minted_only_by_run_all
+runtime_tests:
+  - crates/core/tests/execution_rechecks.rs
 ---
 
 ## Rationale
@@ -18,11 +23,15 @@ through.
 
 ## Detection
 
-No adapter function is in the derived mutating set: every function that transitively calls a `std::fs` primitive that replaces, removes, copies, links or re-permissions bytes, `File::create`, `OpenOptions` opened for `write`/`truncate`/`append`, `trash::*`, a persisted temp file, `create_dir*`, or a subprocess.
+Mechanism: type, gate audit, runtime test.
 
-Covered by the operators in `crates/source-audit/tests/mutation_operators.rs` (alias, pub-use shim, same-file helper, child module, macro wrap, constant hoisting, injection into an exempt bounded primitive; discard, and precision variants, for legitimate seeds), applied to every fixture below. Fixtures: `agent_adapters_are_inspection_only/01-remove-dir-all-in-identify`, `agent_adapters_are_inspection_only/02-aliased-remove`, `agent_adapters_are_inspection_only/03-plan-in-adapter`, `agent_adapters_are_inspection_only/04-sweep3`.
+**Type.** Every destructive operation lives in `fs_gate::destroy` and takes a `RecheckProof` and an `Authorized`; an adapter has neither.
 
-**Limits.** The program model (`crates/source-audit/src/program.rs`) is lexical: a method call on a receiver whose type it cannot see is possibly every method of that name and arity; trait-object dispatch resolves to every implementor; a function pointer stored in a struct and a `proc_macro` that generates calls are invisible.
+**Gate audit.** `adapters_do_not_reach_gates` limits adapters to `IdentifyCtx`; `gate_paths_only_inside_gates` rejects `std::fs`, `libc` (`truncate`, `unlink`), `trash` and `std::process` outside the gate, and `fs_gate::destroy` outside the execution sinks.
+
+Retired 2026-09-22: the `agent_adapters_are_inspection_only` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `trash_move_needs_a_recheck_proof`, `recheck_proof_is_minted_only_by_run_all`.
 
 ## Runtime tests that complete it
 

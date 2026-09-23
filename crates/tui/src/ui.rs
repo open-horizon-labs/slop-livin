@@ -2,7 +2,7 @@
 //! video selection, yellow `✗` for marked rows, no other color. See
 //! DESIGN.md.
 
-use crate::app::{App, ViewKind};
+use crate::app::App;
 use crate::model::{
     diverging_bar, human_bytes, human_signed_bytes, is_noise, max_abs_growth, net_change,
     pad_display, spark_deltas, truncate_middle,
@@ -908,23 +908,6 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .title("help (? to close)");
     frame.render_widget(Paragraph::new(text).block(block), popup);
-}
-
-#[allow(dead_code)]
-pub fn view_index(v: ViewKind) -> usize {
-    match v {
-        ViewKind::Projects => 1,
-        ViewKind::Tree => 2,
-        ViewKind::Builds => 3,
-        ViewKind::Deps => 4,
-        ViewKind::Docker => 5,
-        ViewKind::Kinds => 6,
-        ViewKind::Unowned => 7,
-        ViewKind::Types => 8,
-        ViewKind::External => 9,
-        // No dedicated digit ('0' is "clear filter"); reached via `v`.
-        ViewKind::Agents => 10,
-    }
 }
 
 /// Chooses up to `n` signals worth a narrow column: anything that is not

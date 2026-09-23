@@ -11,10 +11,9 @@
 //! writes the growth store -- it never renders a report and has no path to
 //! any destructive command (there are none in this tool).
 
-use anyhow::{Context, Result, bail};
 use crate::fs_gate::{self, read::read_owned_string, store};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LABEL: &str = "com.open-horizon-labs.swamp.observe";
 
@@ -107,8 +106,8 @@ fn domain() -> String {
         )
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "0".to_string())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0".to_string())
     });
     format!("gui/{uid}")
 }
@@ -578,14 +577,6 @@ pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
             }
             Err(e) => return Err(e).context("create observe lock"),
         }
-    }
-}
-
-pub fn timestamp_display(secs: u64) -> String {
-    let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-    match now.duration_since(UNIX_EPOCH) {
-        Ok(_) => secs.to_string(),
-        Err(_) => secs.to_string(),
     }
 }
 

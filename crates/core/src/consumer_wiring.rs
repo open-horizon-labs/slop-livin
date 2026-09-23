@@ -58,6 +58,7 @@
 
 use crate::external::ExternalUnit;
 use crate::external_associations;
+use crate::fs_gate as fs;
 use crate::locations::{
     self, ConventionRole, GlobalDefaultFile, GlobalDefaultFormat, InstalledVersionLayout,
     InstalledVersionNaming, StorageCategory, StoreAnchor, StoreEntryLookup,
@@ -65,7 +66,6 @@ use crate::locations::{
 use crate::report::{ArtifactKind, Report};
 use crate::toolchain_declarations::{self, ProjectDeclarationSources, ToolVersionDeclaration};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 fn now() -> u64 {
@@ -99,7 +99,7 @@ const LOCKFILE_FILENAMES: &[&str] = &[
 
 #[cfg(unix)]
 fn mtime_secs(meta: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     meta.mtime().max(0) as u64
 }
 #[cfg(not(unix))]
@@ -147,7 +147,13 @@ type CacheMap = HashMap<String, crate::assoc_store::CachedRows>;
 // ---------------------------------------------------------------------
 
 fn read_declarations(root: &Path) -> Vec<ToolVersionDeclaration> {
-    let read = |name: &str| crate::fs_gate::read::bounded_string(root.join(name), crate::fs_gate::read::BoundedCap::LOCKFILE).ok();
+    let read = |name: &str| {
+        crate::fs_gate::read::bounded_string(
+            root.join(name),
+            crate::fs_gate::read::BoundedCap::LOCKFILE,
+        )
+        .ok()
+    };
     let tool_versions = read(".tool-versions");
     let mise_toml = read(".mise.toml").or_else(|| read("mise.toml"));
     let python_version = read(".python-version");
@@ -237,7 +243,10 @@ fn declaration_from_row(row: &[String]) -> Option<ToolVersionDeclaration> {
 fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("Cargo.lock"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("Cargo.lock"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         match external_associations::parse_cargo_lock(&text) {
             Ok(ids) => out.extend(ids.into_iter().map(|i| CachedIdentity {
                 ecosystem: i.ecosystem.to_string(),
@@ -247,7 +256,10 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
             Err(e) => errors.push(("cargo".to_string(), e)),
         }
     }
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("package-lock.json"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("package-lock.json"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         match external_associations::parse_package_lock_json(&text) {
             Ok(ids) => out.extend(ids.into_iter().map(|i| CachedIdentity {
                 ecosystem: i.ecosystem.to_string(),
@@ -257,7 +269,10 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
             Err(e) => errors.push(("npm".to_string(), e)),
         }
     }
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("pnpm-lock.yaml"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("pnpm-lock.yaml"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         out.extend(
             external_associations::parse_pnpm_lock_yaml(&text)
                 .into_iter()
@@ -268,7 +283,10 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("go.sum"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("go.sum"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         out.extend(
             external_associations::parse_go_sum(&text)
                 .into_iter()
@@ -279,7 +297,10 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("gradle.lockfile"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("gradle.lockfile"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         out.extend(
             external_associations::parse_gradle_lockfile(&text)
                 .into_iter()
@@ -290,7 +311,10 @@ fn read_identities(root: &Path) -> (Vec<CachedIdentity>, Vec<(String, String)>) 
                 }),
         );
     }
-    if let Ok(text) = crate::fs_gate::read::bounded_string(root.join("pom.xml"), crate::fs_gate::read::BoundedCap::LOCKFILE) {
+    if let Ok(text) = crate::fs_gate::read::bounded_string(
+        root.join("pom.xml"),
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    ) {
         match external_associations::parse_pom_xml_with_gaps(&text) {
             Ok((ids, gaps)) => {
                 out.extend(ids.into_iter().map(|i| CachedIdentity {
@@ -726,7 +750,7 @@ pub fn attach_associations(
                             basis: basis.into(),
                         },
                         now(),
-                        reason,
+                        crate::evidence::Reason::carried(reason),
                     ));
             }
         }
@@ -963,7 +987,11 @@ fn attach_global_default(
         return;
     };
     let settings_path = units[local_state_idx].path.join(global_default.file_name);
-    let Some(text) = crate::fs_gate::read::bounded_string(&settings_path, crate::fs_gate::read::BoundedCap::LOCKFILE).ok() else {
+    let Some(text) = crate::fs_gate::read::bounded_string(
+        &settings_path,
+        crate::fs_gate::read::BoundedCap::LOCKFILE,
+    )
+    .ok() else {
         return;
     };
     let declared = match global_default.format {
@@ -1002,7 +1030,9 @@ fn attach_global_default(
                 path: settings_path.display().to_string(),
             },
             now(),
-            format!("{manager_name} {field} '{declared}' matches no installed toolchain directory"),
+            crate::reason!(
+                "{manager_name} {field} '{declared}' matches no installed toolchain directory"
+            ),
         ),
     }
     .with_note(format!(
@@ -1108,7 +1138,7 @@ fn attach_workspace_index(
                     path: info_plist.display().to_string(),
                 },
                 now(),
-                detail,
+                crate::evidence::Reason::carried(detail),
             ),
             "workspace" => external_associations::xcode_derived_data_association(
                 Some(detail.as_str()),

@@ -59,7 +59,12 @@ impl Consumer for AssemblyGate {
             EventKind::DockerJoined,
         ]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let mut p = self.pending.lock().unwrap();
         match event {
             Event::ProjectsGrouped {
