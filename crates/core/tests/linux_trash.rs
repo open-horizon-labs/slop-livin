@@ -15,7 +15,6 @@
 //! touches the runner user's own Trash.
 #![cfg(target_os = "linux")]
 
-
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use swamp_core::authority::{Confirmable, HumanConfirmed, SelectedUnit, authorize_confirmed};
