@@ -15,7 +15,9 @@ use std::path::Path;
 /// exists and is not swamp's (`Ok(Some(false))`).
 pub fn is_ours(path: &Path) -> io::Result<Option<bool>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text.lines().next() == Some(crate::systemd_user::MARKER))),
+        Ok(text) => Ok(Some(
+            text.lines().next() == Some(crate::systemd_user::MARKER),
+        )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -42,4 +44,21 @@ pub fn write_unit(dir: &Path, name: &str, body: &str) -> io::Result<()> {
 /// `is_ours(path) == Ok(Some(true))`.
 pub fn remove_unit(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
+}
+
+/// This process's real uid, for a `loginctl show-user <uid>` argument
+/// (`systemd_user::linger`).
+pub fn current_uid() -> u32 {
+    super::sys::current_uid()
+}
+
+/// Runs `systemctl --user`/`loginctl` (`program`/`args` -- the shape
+/// allow-list in `fs_gate::spawn` decides what is actually permitted),
+/// bounded by `timeout`.
+pub fn run(
+    program: super::spawn::Program,
+    args: Vec<&str>,
+    timeout: std::time::Duration,
+) -> io::Result<super::spawn::RunOutput> {
+    super::spawn::run(program, args, timeout)
 }

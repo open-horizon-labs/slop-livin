@@ -120,12 +120,12 @@ pub fn cmd_collect_status(store_dir: PathBuf, roots: Vec<PathBuf>, json: bool) -
                     Some(l) => println!("  coverage lost: {} ({})", l.reason, l.detail),
                 }
                 println!(
-                    "  {} inotify watches (limit {}), ~{} KiB of kernel memory",
+                    "  {} inotify watches (limit {}), ~{} of kernel memory",
                     c.watches,
                     c.max_user_watches
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "unknown".into()),
-                    c.kernel_bytes_estimate / 1024
+                    swamp_core::render::human_bytes_pub(c.kernel_bytes_estimate)
                 );
             }
         }

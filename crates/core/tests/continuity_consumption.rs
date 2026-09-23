@@ -112,9 +112,18 @@ fn the_dirty_list_survives_a_crash_before_or_after_the_history_write_and_goes_af
     let pending = || read_checkpoint(&p).unwrap().dirty;
 
     // Crash before the history commit: the checkpoint is dropped.
-    let (walk, c) =
-        stage_tracked_with_source(&swamp_core::bus::Stage::for_tests(), store.path(), &root, 2_000, 1 << 20, false, true, &src, &[])
-            .unwrap();
+    let (walk, c) = stage_tracked_with_source(
+        &swamp_core::bus::Stage::for_tests(),
+        store.path(),
+        &root,
+        2_000,
+        1 << 20,
+        false,
+        true,
+        &src,
+        &[],
+    )
+    .unwrap();
     assert_eq!(walk.mode, "incremental");
     drop(c);
     assert_eq!(
@@ -124,9 +133,18 @@ fn the_dirty_list_survives_a_crash_before_or_after_the_history_write_and_goes_af
     );
 
     // Crash between the history write and the consumption.
-    let (_w, c) =
-        stage_tracked_with_source(&swamp_core::bus::Stage::for_tests(), store.path(), &root, 3_000, 1 << 20, false, true, &src, &[])
-            .unwrap();
+    let (_w, c) = stage_tracked_with_source(
+        &swamp_core::bus::Stage::for_tests(),
+        store.path(),
+        &root,
+        3_000,
+        1 << 20,
+        false,
+        true,
+        &src,
+        &[],
+    )
+    .unwrap();
     c.unwrap().commit_without_consuming_for_test().unwrap();
     assert_eq!(
         pending().len(),
@@ -135,9 +153,18 @@ fn the_dirty_list_survives_a_crash_before_or_after_the_history_write_and_goes_af
     );
 
     // The real commit consumes exactly what the plan covered.
-    let (_w, c) =
-        stage_tracked_with_source(&swamp_core::bus::Stage::for_tests(), store.path(), &root, 4_000, 1 << 20, false, true, &src, &[])
-            .unwrap();
+    let (_w, c) = stage_tracked_with_source(
+        &swamp_core::bus::Stage::for_tests(),
+        store.path(),
+        &root,
+        4_000,
+        1 << 20,
+        false,
+        true,
+        &src,
+        &[],
+    )
+    .unwrap();
     c.unwrap().commit().unwrap();
     assert_eq!(
         pending(),
@@ -215,9 +242,18 @@ fn a_second_writer_of_the_same_root_waits_for_the_first_to_commit() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (store2, root2) = (store.path().to_path_buf(), root.clone());
     let second = std::thread::spawn(move || {
-        let (_w, c) =
-            stage_tracked_with_source(&swamp_core::bus::Stage::for_tests(), &store2, &root2, 2_000, 1 << 20, false, true, &Refuse, &[])
-                .unwrap();
+        let (_w, c) = stage_tracked_with_source(
+            &swamp_core::bus::Stage::for_tests(),
+            &store2,
+            &root2,
+            2_000,
+            1 << 20,
+            false,
+            true,
+            &Refuse,
+            &[],
+        )
+        .unwrap();
         tx.send(()).unwrap();
         c.unwrap().commit().unwrap();
     });

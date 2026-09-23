@@ -298,10 +298,6 @@ impl Scheduling {
         }
     }
 
-    pub fn is_available(self) -> bool {
-        matches!(self, Scheduling::LaunchdUserAgent | Scheduling::SystemdUser)
-    }
-
     /// The message a scheduling command prints when it cannot proceed.
     /// `None` where the build has a backend (which may still refuse at
     /// runtime, with its own diagnostics).

@@ -6,7 +6,16 @@ outcome: decision-relevant-storage-evidence
 audit: none
 audit_none_reason: "2026-09-23 (Linux-on-gates port): the procfs probe this guardrail is about now lives entirely inside `fs_gate::procfs` (`.oh/architecture.md`, \"Capability gates\" -- every `std::fs` read on this path is inside the gate, so `gate_paths_only_inside_gates` no longer has a location violation to catch here). What is left is control flow inside one gate module -- exactly the kind of rule four review rounds found a `syn` call-graph audit cannot make mutation-proof (a `.flatten()`, an aliased `read_link`, a helper one call away, a read inside a macro argument each defeated the retired `linux_audits::occupancy_gaps_are_unknown_never_free`). The runtime tests below assert the real behavior directly against the shapes the retired audit's nine mutation fixtures named, rather than a second, weaker copy of the same check."
 runtime_tests:
-  - crates/core/src/fs_gate/procfs.rs::tests
+  - crates/core/src/occupancy.rs::tests::procfs_a_process_holding_a_descendant_file_or_cwd_is_occupied
+  - crates/core/src/occupancy.rs::tests::procfs_a_deleted_open_file_under_the_anchor_still_counts
+  - crates/core/src/occupancy.rs::tests::procfs_an_unreadable_process_of_this_user_is_unknown_not_free
+  - crates/core/src/occupancy.rs::tests::procfs_privilege_not_the_uid_alone_decides_who_is_in_scope
+  - crates/core/src/occupancy.rs::tests::procfs_the_kernels_non_dumpable_boundary_is_read_from_ownership
+  - crates/core/src/occupancy.rs::tests::procfs_a_foreign_pid_namespace_or_missing_proc_is_unknown
+  - crates/core/src/occupancy.rs::tests::procfs_a_process_that_exited_mid_scan_is_skipped
+  - crates/core/src/occupancy.rs::tests::procfs_past_its_time_bound_is_unknown
+  - crates/core/src/fs_gate/procfs.rs::tests::withheld_owner_is_pure
+  - crates/core/src/fs_gate/procfs.rs::tests::parse_status_reads_uid_gid_and_caps
   - crates/core/tests/linux_occupancy.rs
 ---
 

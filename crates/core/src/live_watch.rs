@@ -48,9 +48,9 @@
 //! the real-filesystem tests are Linux-only.
 
 use crate::fs_events::RefreshRefusal;
+use crate::fs_gate::MetadataExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// inotify's event bits, with the values of the Linux ABI (stable since
@@ -138,20 +138,6 @@ impl Loss {
 
     pub fn as_str(self) -> &'static str {
         self.refusal().as_str()
-    }
-
-    pub fn from_code(s: &str) -> Option<Loss> {
-        [
-            Loss::QueueOverflow,
-            Loss::WatchLimit,
-            Loss::PermissionGap,
-            Loss::Unmounted,
-            Loss::WatchRemoved,
-            Loss::DirtyBound,
-            Loss::RootMoved,
-        ]
-        .into_iter()
-        .find(|l| l.as_str() == s)
     }
 
     /// Whether opening a new epoch can restore the claim. A lost event

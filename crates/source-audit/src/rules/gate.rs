@@ -118,6 +118,7 @@ const WALKERS: &[(Krate, &[&str])] = &[
     (Krate::Core, &["preserve"]),
     (Krate::Core, &["growth"]),
     (Krate::Core, &["locations"]),
+    (Krate::Core, &["live_watch"]),
 ];
 
 const STORE_MODULES: &[(Krate, &[&str])] = &[
@@ -209,6 +210,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["report"]),
             (Krate::Core, &["cargo_cleanup"]),
             (Krate::Core, &["occupancy"]),
+            (Krate::Core, &["live_watch"]),
         ],
         why: "statfs/flock/O_NOFOLLOW are for the modules that need them",
     },
@@ -299,6 +301,16 @@ const GROUPS: &[Group] = &[
         allowed: &[],
         why: "defaults runs only as an allow-listed detector command (`Program::named` in \
               `locations`)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Systemctl",
+        allowed: &[(Krate::Core, &["systemd_user"])],
+        why: "systemd --user's own manager belongs to the systemd scheduling module",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Loginctl",
+        allowed: &[(Krate::Core, &["systemd_user"])],
+        why: "session state (Linger) belongs to the systemd scheduling module",
     },
     Group {
         path: "@core::recheck::capture_anchor",

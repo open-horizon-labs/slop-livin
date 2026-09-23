@@ -6,8 +6,9 @@
 //! to remove". A negative result is evidence, not proof of no consumer
 //! (`.oh/guardrails/activity-and-consumer-evidence-have-limits.md`).
 //!
-//! [`occupied`] is the original boolean gate (`execution.rs`'s protection
-//! check, `agents::is_active`) and is unchanged. The functions below
+//! [`is_active`] is the original boolean gate (test/fixture-only;
+//! `.oh/guardrails/occupancy-is-tristate-at-sinks.md` bans a collapsed
+//! boolean from production code) and is unchanged. The functions below
 //! build the structured [`crate::evidence::Evidence`] the report/action
 //! layers attach; they are the same underlying signal, offered with
 //! provenance and freshness rather than a bare bool.
@@ -204,15 +205,6 @@ fn classify_lsof_exit(
     }
 }
 
-/// Boolean convenience over [`probe_path`], fail-closed: anything but
-/// [`OccupancyState::Free`] is `true`. **Never call this from a
-/// destructive sink** -- it collapses `Unknown` into `Occupied` and so
-/// cannot record *why* an action was refused; sinks use
-/// `crate::recheck::member_occupancy` (audited by
-/// `occupancy_is_tristate_at_sinks`).
-pub fn occupied(path: &Path) -> bool {
-    !matches!(probe_path(path), OccupancyState::Free)
-}
 /// Structured current-use evidence for whether some process holds this
 /// unit open right now.
 ///
@@ -455,9 +447,7 @@ pub fn is_active(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::evidence::FactStatus;
-    use crate::fs_gate::procfs::{
-        Creds, parse_status, probe as procfs_probe, withheld_owner,
-    };
+    use crate::fs_gate::procfs::{Creds, parse_status, probe as procfs_probe, withheld_owner};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;

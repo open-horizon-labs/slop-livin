@@ -400,7 +400,10 @@ mod linux_trashinfo_tests {
 
     #[test]
     fn percent_encodes_only_the_reserved_bytes() {
-        assert_eq!(trashinfo_percent_encode("/home/me/build dir"), "/home/me/build dir");
+        assert_eq!(
+            trashinfo_percent_encode("/home/me/build dir"),
+            "/home/me/build dir"
+        );
         assert_eq!(trashinfo_percent_encode("100%"), "100%25");
         assert_eq!(trashinfo_percent_encode("a\nb\tc\r"), "a%0Ab%09c%0D");
     }

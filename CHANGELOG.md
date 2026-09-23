@@ -4,6 +4,46 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Linux track ported onto the capability gates
+
+The Linux work below (inotify, `swamp collect`, `systemd --user`, the
+freedesktop Trash mover, `/proc` occupancy) was cut before the capability
+gates existed; porting it onto them changed a few specifics from what
+"Linux x86_64" below describes:
+
+- Every Linux `libc`/`std::fs`/`std::process` call now lives inside
+  `crates/core/src/fs_gate` (`fs_gate::inotify`, `fs_gate::procfs`,
+  `fs_gate::systemd`, `fs_gate::continuity`, plus Linux-only additions to
+  `fs_gate::destroy`, `fs_gate::spawn` and `fs_gate::sys`), the same
+  discipline the macOS backends already followed
+  (`docs/architecture.md`, "Capability gates").
+- The Trash move is `fs_gate::destroy::trash_move`/`Envelope` -- the same
+  proof-and-authorization-gated call the macOS path uses -- laying out
+  `files/`+`info/` and writing the `.trashinfo` sidecar on Linux, rather
+  than a second, ungated mover. It is a plain existence check immediately
+  before the rename, not an atomic `renameat2(RENAME_NOREPLACE)`, and a
+  trash root on another filesystem is refused outright rather than
+  falling back to that mount's own `.Trash-$uid`: a narrower guarantee
+  than first shipped, noted here rather than overclaimed.
+- The two Linux-specific source audits this track added
+  (`trash_backend_owns_every_move`, `occupancy_gaps_are_unknown_never_free`)
+  and the pre-existing `platform_capabilities_gate_their_backends` no
+  longer exist as `syn` call-graph rules: the write-location half of each
+  is now a type/gate-audit property (`gate_paths_only_inside_gates` catches
+  a raw move, write or process spawn outside the gate structurally), and
+  the control-flow half that has no compile-time equivalent is now stated
+  as `audit: none` with named runtime tests, matching how the four review
+  rounds that retired the macOS-side call-graph audits were already
+  handled. See the three affected `.oh/guardrails/*.md` files.
+- The `HOME`-missing-is-an-error fix and the `$XDG_DATA_HOME`-aware
+  `platform::data_dir` this track's "Linux-native locations" bullet
+  describes were **not** ported: the gate's existing single resolver
+  (`fs_gate::store::StoreDir::resolved`, `$SWAMP_DIR` else
+  `$HOME/.local/share/swamp`) was kept as the one place that decides
+  where swamp's state lives, unchanged on both platforms, rather than
+  adding a second one. A missing `HOME` still falls back to `.` there, as
+  it did before this Linux track.
+
 ### Token binding and gate hardening (re-review 5)
 
 - **Plans and grants are bound to swamp's own code.** Each stored plan

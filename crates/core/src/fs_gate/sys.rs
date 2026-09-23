@@ -175,21 +175,6 @@ impl RegularFile {
     }
 }
 
-/// Whether `e` is `ENOSPC` -- on Linux, `inotify_add_watch` returning it
-/// means `fs.inotify.max_user_watches` is exhausted. The one named
-/// `libc::` constant a caller outside the gate (`live_watch::LiveTree`,
-/// portable over its `Kernel` trait) needs, so it does not have to name
-/// `libc` itself.
-#[cfg(unix)]
-pub fn is_enospc(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOSPC)
-}
-
-#[cfg(not(unix))]
-pub fn is_enospc(_e: &io::Error) -> bool {
-    false
-}
-
 /// This process's real uid, for a `loginctl show-user <uid>` argument
 /// (`systemd_user::linger`).
 #[cfg(unix)]
@@ -253,4 +238,19 @@ pub fn install_stop_signal_handlers() -> &'static std::sync::atomic::AtomicBool 
         );
     }
     &STOP
+}
+
+/// Whether `e` is `ENOSPC` -- on Linux, `inotify_add_watch` returning it
+/// means `fs.inotify.max_user_watches` is exhausted. The one named
+/// `libc::` constant a caller outside the gate (`live_watch::LiveTree`,
+/// portable over its `Kernel` trait) needs, so it does not have to name
+/// `libc` itself.
+#[cfg(unix)]
+pub fn is_enospc(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOSPC)
+}
+
+#[cfg(not(unix))]
+pub fn is_enospc(_e: &io::Error) -> bool {
+    false
 }

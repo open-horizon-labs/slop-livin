@@ -69,7 +69,11 @@ pub struct RealSystemctl;
 
 #[cfg(target_os = "linux")]
 impl RealSystemctl {
-    fn run(program: crate::fs_gate::spawn::Program, pre: &[&str], args: &[&str]) -> Result<CmdOutput> {
+    fn run(
+        program: crate::fs_gate::spawn::Program,
+        pre: &[&str],
+        args: &[&str],
+    ) -> Result<CmdOutput> {
         if std::env::var("SWAMP_TEST_MODE").is_ok_and(|v| v == "1") {
             println!(
                 "[test-mode] {} {} {}",
@@ -83,7 +87,7 @@ impl RealSystemctl {
             });
         }
         let all: Vec<&str> = pre.iter().chain(args.iter()).copied().collect();
-        let out = crate::fs_gate::spawn::run(program, all, std::time::Duration::from_secs(60))
+        let out = crate::fs_gate::systemd::run(program, all, std::time::Duration::from_secs(60))
             .map_err(|e| anyhow!("could not run {}: {e}", program.binary()))?;
         Ok(CmdOutput {
             success: out.success(),
@@ -307,7 +311,7 @@ pub fn user_manager(sc: &mut dyn Systemctl) -> Result<(), String> {
 
 /// `Linger=yes|no` for this user, where `loginctl` answers.
 fn linger(sc: &mut dyn Systemctl) -> Option<bool> {
-    let uid = crate::fs_gate::sys::current_uid().to_string();
+    let uid = crate::fs_gate::systemd::current_uid().to_string();
     let o = sc
         .loginctl(&["show-user", &uid, "--property=Linger", "--value"])
         .ok()?;

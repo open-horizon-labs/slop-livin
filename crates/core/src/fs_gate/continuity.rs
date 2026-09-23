@@ -27,6 +27,12 @@ pub fn ensure_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// Reads a whole small file swamp owns here (a checkpoint, a sync
+/// token, `/proc/sys/kernel/random/boot_id`) as UTF-8.
+pub fn read_text(path: impl AsRef<Path>) -> io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
 /// An `flock` held for as long as this value lives.
 #[derive(Debug)]
 pub struct FileLock {
@@ -71,4 +77,11 @@ pub fn collector_alive(alive_path: &Path) -> bool {
         Err(std::fs::TryLockError::WouldBlock) => true,
         Err(std::fs::TryLockError::Error(_)) => false,
     }
+}
+
+/// Makes SIGINT and SIGTERM stop the collector cleanly and returns the
+/// flag they set. The signal handler itself lives in `fs_gate::sys`.
+#[cfg(target_os = "linux")]
+pub fn stop_on_signals() -> &'static std::sync::atomic::AtomicBool {
+    super::sys::install_stop_signal_handlers()
 }

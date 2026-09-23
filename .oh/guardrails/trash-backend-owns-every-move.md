@@ -15,6 +15,8 @@ The obvious fix, `trash::delete` from the `trash` crate, was read before it was 
 
 ## Detection (historical)
 
+Mechanism: gate audit.
+
 Retired 2026-09-23: the derived-call-graph AST audit `trash_backend_owns_every_move` (`crates/source-audit/src/linux_audits.rs`) this section describes no longer exists; the six kept mutation fixtures (`crates/source-audit/tests/mutations/trash_backend_owns_every_move/`) now target `crates/core/src/actions.rs` and are rejected by `gate_paths_only_inside_gates`/clippy directly, the same mechanism as every other gate-location rule. What follows is the record of what the retired rule checked:
 
 - **The backend is found by module path** (`platform::trash`), not a file name.

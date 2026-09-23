@@ -5,6 +5,12 @@ statement: "A capability the running platform does not have is refused with a na
 outcome: disk-growth-by-project
 audit: none
 audit_none_reason: "2026-09-23 (Linux-on-gates port): the write-ordering half this audit checked (every install/write path asks its scheduling/continuity capability first, honours the answer, never a second time) is now a location property: every non-test write is inside `fs_gate`, and asking-then-writing outside it does not compile-check as I/O at all, so `gate_paths_only_inside_gates` (plus clippy's disallowed_methods/disallowed_types) already rejects a write that skips, discards, aliases, moves-to-a-helper or renames its way around the check -- eight of this guardrail's ten mutation fixtures are that shape and are kept, retargeted to the gated call sites, `by:`ing the existing rule. The other two are about a *second decider* of which `RefreshRefusal` a platform without replay gives; one (an unreferenced duplicate) is caught by the existing `no_unreferenced_public_items`, the other is retired (see its fixture) because a whole-file replacement's fallout lands outside the lines the mutation wrote. The retired `platform_audits::platform_capabilities_gate_their_backends` derived-call-graph rule this section documents is not replaced function-for-function; see Detection and Limits for what is and is not still checked."
+runtime_tests:
+  - crates/core/src/schedule.rs::tests::install_without_a_user_manager_refuses_and_writes_nothing
+  - crates/core/src/systemd_user.rs::tests::no_user_manager_refuses_and_writes_nothing
+  - crates/core/src/systemd_user.rs::tests::a_unit_swamp_did_not_write_is_never_replaced_or_removed
+  - crates/core/src/platform/mod.rs::tests::each_platform_has_its_own_scheduler_and_neither_the_others
+  - crates/core/src/fs_events.rs::tests::a_kernel_without_persisted_history_says_so_rather_than_unsupported
 ---
 
 ## Rationale
@@ -20,6 +26,8 @@ The most consequential one is continuity. `RefreshRefusal::UnsupportedPlatform` 
 A refused capability is visible. An approximated one is not.
 
 ## Detection
+
+Mechanism: runtime test.
 
 Retired 2026-09-23 (Linux-on-gates port): the derived-call-graph `platform_audits::platform_capabilities_gate_their_backends` this section describes historically. Kept below as the record of what it checked and why each check either transferred to `gate_paths_only_inside_gates`/`no_unreferenced_public_items` (mechanism: type, gate audit) or did not survive the port (mechanism for those two: none; see `audit_none_reason` above and the retired fixture's own note).
 

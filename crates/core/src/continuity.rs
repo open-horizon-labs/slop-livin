@@ -133,7 +133,7 @@ pub fn paths(store: &Path, root: &Path) -> Paths {
 }
 
 pub fn read_checkpoint(p: &Paths) -> Option<Checkpoint> {
-    let text = crate::fs_gate::read::read_owned_string(&p.checkpoint).ok()?;
+    let text = crate::fs_gate::continuity::read_text(&p.checkpoint).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -151,7 +151,7 @@ pub fn write_checkpoint(p: &Paths, c: &Checkpoint) -> Result<()> {
 /// This boot's id, where the kernel has one (Linux). Two checkpoints
 /// from different boots are different epochs whatever they claim.
 pub fn boot_id() -> Option<String> {
-    match crate::fs_gate::read::read_owned_string("/proc/sys/kernel/random/boot_id") {
+    match crate::fs_gate::continuity::read_text("/proc/sys/kernel/random/boot_id") {
         Ok(s) => Some(s.trim().to_string()),
         Err(_) => None,
     }
@@ -216,7 +216,7 @@ pub struct Consumption {
 /// observation re-walked.
 pub fn consume(c: &Consumption) -> Result<()> {
     let _lock = lock_wait(&c.dirty_lock, true, Duration::from_secs(10))?;
-    let text = match crate::fs_gate::read::read_owned_string(&c.checkpoint) {
+    let text = match crate::fs_gate::continuity::read_text(&c.checkpoint) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -277,7 +277,7 @@ pub fn plan_from_checkpoint(
     alive: bool,
     timeout: Duration,
 ) -> FsEventsPlan {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let device = crate::fs_gate::metadata_following(&req.root)
         .ok()
         .map(|m| m.dev());
@@ -400,7 +400,7 @@ impl FsEventsSource for CollectorSource {
 /// `fs_gate::sys`, inside the capability gate.
 #[cfg(target_os = "linux")]
 pub fn stop_on_signals() -> &'static std::sync::atomic::AtomicBool {
-    crate::fs_gate::sys::install_stop_signal_handlers()
+    crate::fs_gate::continuity::stop_on_signals()
 }
 
 /// One root the collector watches, and what it must not watch under it.
@@ -455,8 +455,8 @@ fn collect_one(
     stop: &std::sync::atomic::AtomicBool,
     log: &dyn Fn(&str),
 ) -> Result<()> {
+    use crate::fs_gate::MetadataExt;
     use crate::live_watch::{Coverage, LiveTree, inotify};
-    use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::Ordering;
 
     let p = paths(store, &r.root);
@@ -517,7 +517,7 @@ fn collect_one(
             pending_sync = true;
         }
         if pending_sync {
-            sync_token = crate::fs_gate::read::read_owned_string(&p.sync)
+            sync_token = crate::fs_gate::continuity::read_text(&p.sync)
                 .ok()
                 .map(|s| s.trim().to_string());
         }
