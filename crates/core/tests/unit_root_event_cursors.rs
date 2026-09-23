@@ -820,11 +820,12 @@ fn a_platform_without_fsevents_re_measures_and_says_so() {
         false,
         &swamp_core::fs_events::UnsupportedPlatformSource,
     );
+    #[cfg(target_os = "linux")]
+    let expected_reason = "no_persisted_change_history";
+    #[cfg(not(target_os = "linux"))]
+    let expected_reason = "unsupported_platform";
     assert!(
-        replay
-            .outcomes
-            .iter()
-            .all(|(_, r)| r == "unsupported_platform"),
+        replay.outcomes.iter().all(|(_, r)| r == expected_reason),
         "{:?}",
         replay.outcomes
     );

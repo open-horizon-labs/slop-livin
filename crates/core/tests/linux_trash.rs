@@ -204,10 +204,11 @@ fn a_cross_device_trash_root_is_refused_not_copied() {
     let auth = authorize(&fx.store_dir, &src);
     let proof = swamp_core::recheck::run_all(&auth).unwrap();
     let err = swamp_core::fs_gate::destroy::trash_move(proof, &auth, other_trash.path(), "target")
-        .unwrap_err()
-        .to_string();
-    // The kernel's own EXDEV, surfaced rather than papered over with a
-    // copy; the unit must still be exactly where it was.
+        .unwrap_err();
+    // The kernel's own EXDEV, surfaced (in the error chain, under the
+    // sink's own context message) rather than papered over with a copy;
+    // the unit must still be exactly where it was.
+    let err = format!("{err:#}");
     assert!(err.to_lowercase().contains("cross-device link"), "{err}");
     assert!(src.join("debug/deps/libx.rlib").exists());
     assert!(
@@ -219,38 +220,12 @@ fn a_cross_device_trash_root_is_refused_not_copied() {
     );
 }
 
-/// A multi-member unit (a Cargo group, an agent session) goes into one
-/// envelope, member by member; `Envelope::open`'s own `same_device_as`
-/// refuses before anything moves when the trash is on another
-/// filesystem, and every member move is a plain rename.
-#[test]
-fn a_multi_member_envelope_moves_every_member_and_gets_one_sidecar() {
-    use std::os::unix::fs::MetadataExt;
-    let fx = fixture();
-    let session = fx.root.join("session");
-    std::fs::create_dir_all(&session).unwrap();
-    let members = [session.join("transcript.jsonl"), session.join("meta.json")];
-    for m in &members {
-        std::fs::write(m, b"fixture content").unwrap();
-    }
-    let trash_root = fx.data.join("Trash");
-
-    let auth = authorize(&fx.store_dir, &session);
-    let proof = swamp_core::recheck::run_all(&auth).unwrap();
-    let dev = std::fs::metadata(&session).unwrap().dev();
-    let mut envelope =
-        destroy::Envelope::open(proof, &auth, &trash_root, "session-1", Some(dev)).unwrap();
-    for (i, m) in members.iter().enumerate() {
-        envelope.move_member(m, &i.to_string()).unwrap();
-    }
-    for m in &members {
-        assert!(!m.exists());
-    }
-    assert!(envelope.path().join("0").exists());
-    assert!(envelope.path().join("1").exists());
-    assert_eq!(envelope.path(), trash_root.join("files/session-1"));
-    assert!(
-        trash_root.join("info/session-1.trashinfo").exists(),
-        "the envelope itself is the trashed item and gets one sidecar"
-    );
-}
+// The multi-member-envelope test (`Envelope::open`'s `same_device_as`,
+// `move_member` moving every declared member, one sidecar for the whole
+// envelope) lives in `crates/core/src/fs_gate/destroy.rs`'s own test
+// module instead of here: building a proof whose coverage extends past
+// a single anchor to named sidecar members needs
+// `authority::for_tests`, which is crate-internal (`pub(crate)`) and so
+// unavailable to this external integration-test crate. The TUI's own
+// `authorize_confirmed`, which this file's `authorize()` helper uses,
+// only ever authorizes a bare single-path unit.

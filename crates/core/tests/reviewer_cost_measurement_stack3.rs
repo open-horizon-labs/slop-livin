@@ -324,7 +324,7 @@ fn unchanged_observations_spaced_past_the_toosoon_floor() {
 }
 
 /// Linux: no FSEvents, so no replay window. Every pass re-measures, and
-/// says why: every unit root is `unsupported_platform` and not
+/// says why: every unit root is `no_persisted_change_history` and not
 /// event-covered, and no walk claims an incremental mode. What must still
 /// hold from the second pass: zero session-header bytes (identification
 /// is cached independently of events) and zero subprocesses.
@@ -357,7 +357,7 @@ fn linux_contract(
     for r in &reasons {
         if let Some(rest) = r.strip_prefix("unit:") {
             assert_eq!(
-                rest, "false:unsupported_platform",
+                rest, "false:no_persisted_change_history",
                 "a Linux unit root is re-measured and names the platform as the reason: {reasons:?}"
             );
         }

@@ -129,14 +129,18 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     wait_for_checkpoint(&store, c1.0.id());
     std::thread::sleep(Duration::from_millis(1100));
 
-    // A fresh store's first observation records the classification
-    // rules and the second anchors the cursor (both full, as on macOS);
-    // from the third on the collector can vouch.
+    // A fresh store's first observation is full: it records the
+    // classification rules and anchors the cursor. With the collector
+    // already alive and checkpointed *before* this first call, that one
+    // full walk is enough to start vouching -- the very next observation
+    // (nothing having changed since) is already incremental, with
+    // nothing to walk.
     let first = observe(&root, &store, &home, false);
     assert_eq!(field(&first, "mode"), "full", "{first}");
     std::thread::sleep(Duration::from_millis(1100));
     let anchor = observe(&root, &store, &home, false);
-    assert_eq!(field(&anchor, "mode"), "full", "{anchor}");
+    assert_eq!(field(&anchor, "mode"), "incremental", "{anchor}");
+    assert_eq!(field(&anchor, "changed_dirs"), "0", "{anchor}");
 
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::write(

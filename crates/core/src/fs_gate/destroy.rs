@@ -420,4 +420,48 @@ mod linux_trashinfo_tests {
         let root = Path::new("/tmp/Trash");
         assert_eq!(items_dir(root), root.join("files"));
     }
+
+    /// A multi-member unit (a Cargo group, an agent session) goes into
+    /// one envelope, member by member; every member the proof recorded
+    /// moves, and the envelope itself -- not each member -- gets the one
+    /// `.trashinfo` sidecar. `authority::for_tests` is the only public
+    /// (crate-internal) way to mint an `Authorized` whose proof covers
+    /// members outside the anchor, so this lives beside the gate it
+    /// exercises rather than in the external `linux_trash.rs` spec-reader
+    /// suite, which only has the TUI's single-unit `authorize_confirmed`
+    /// available to it.
+    #[test]
+    fn a_multi_member_envelope_moves_every_member_and_gets_one_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let session = root.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let members = [session.join("transcript.jsonl"), session.join("meta.json")];
+        for m in &members {
+            std::fs::write(m, b"fixture content").unwrap();
+        }
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let trash_root = root.join("Trash");
+
+        let auth = crate::authority::for_tests(&session, &store, &members);
+        let proof = crate::recheck::run_all(&auth).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(&session).unwrap().dev();
+        let mut envelope =
+            Envelope::open(proof, &auth, &trash_root, "session-1", Some(dev)).unwrap();
+        for (i, m) in members.iter().enumerate() {
+            envelope.move_member(m, &i.to_string()).unwrap();
+        }
+        for m in &members {
+            assert!(!m.exists());
+        }
+        assert!(envelope.path().join("0").exists());
+        assert!(envelope.path().join("1").exists());
+        assert_eq!(envelope.path(), trash_root.join("files/session-1"));
+        assert!(
+            trash_root.join("info/session-1.trashinfo").exists(),
+            "the envelope itself is the trashed item and gets one sidecar"
+        );
+    }
 }

@@ -3083,7 +3083,14 @@ mod agent_partial_removal_tests {
 
         let slug = session_path.file_stem().and_then(|s| s.to_str()).unwrap();
         assert_eq!(slug, session_id);
-        let envelope = trash.join(format!("agent-session-{slug}-{at}"));
+        // On Linux, `Envelope::open` nests items under `trash/files/`
+        // (the freedesktop Trash layout); on other platforms the item
+        // sits directly under `trash`.
+        #[cfg(target_os = "linux")]
+        let items_root = trash.join("files");
+        #[cfg(not(target_os = "linux"))]
+        let items_root = trash.to_path_buf();
+        let envelope = items_root.join(format!("agent-session-{slug}-{at}"));
         fs::create_dir_all(&envelope).unwrap();
 
         let last_idx = members.len() - 1;

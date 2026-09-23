@@ -762,7 +762,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
         assert!(!target.exists());
-        let entries: Vec<_> = std::fs::read_dir(&trash).unwrap().collect();
+        // On Linux the trash root follows the freedesktop layout
+        // (`files/` + `info/` sidecars), so the item lands under `files/`
+        // rather than directly under the trash root.
+        #[cfg(target_os = "linux")]
+        let items_root = trash.join("files");
+        #[cfg(not(target_os = "linux"))]
+        let items_root = trash.clone();
+        let entries: Vec<_> = std::fs::read_dir(&items_root).unwrap().collect();
         assert_eq!(entries.len(), 1, "node_modules should have landed in Trash");
 
         let records = ledger.all().unwrap();
