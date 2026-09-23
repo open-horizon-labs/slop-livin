@@ -1,0 +1,26 @@
+error[E0603]: function `capture` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/capture_is_private_to_the_propose_path.rs
+  |
+  |     let _now = swamp_core::recheck::capture(Path::new("/w/target"));
+  |                                     ^^^^^^^ private function
+  |
+note: the function `capture` is defined here
+ --> $WORKSPACE/crates/core/src/recheck.rs
+  |
+  | pub(crate) fn capture(path: &Path) -> Result<ReviewedIdentity> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: function `reviewed_snapshot` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/capture_is_private_to_the_propose_path.rs
+  |
+  |     let _check = swamp_core::recheck::reviewed_snapshot(Path::new("/w/target"), None);
+  |                                       ^^^^^^^^^^^^^^^^^ private function
+  |
+note: the function `reviewed_snapshot` is defined here
+ --> $WORKSPACE/crates/core/src/recheck.rs
+  |
+  | / pub(crate) fn reviewed_snapshot(
+  | |     path: &Path,
+  | |     reviewed: Option<&ReviewedIdentity>,
+  | | ) -> Result<ReviewedIdentity> {
+  | |_____________________________^

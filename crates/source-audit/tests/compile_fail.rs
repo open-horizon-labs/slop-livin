@@ -9,6 +9,7 @@
 //! output after an intended API change with `TRYBUILD=overwrite`.
 
 #[test]
+#[ignore = "heavy harness: scripts/check-full.sh runs it once, with --ignored"]
 fn retired_rule_shortcuts_do_not_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("../core/tests/compile_fail/*.rs");

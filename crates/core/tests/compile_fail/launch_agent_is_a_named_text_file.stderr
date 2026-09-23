@@ -11,9 +11,3 @@ note: function defined here
   |
   | pub fn write_text(file: TextFile<'_>, text: &str) -> io::Result<()> {
   |        ^^^^^^^^^^
-help: try wrapping the expression in a variant of `TextFile`
-  |
-8 |     let _ = store::write_text(swamp_core::fs_gate::store::TextFile::Config { store: Path::new("/tmp/LaunchAgents/other.plist") }, "<plist/>");
-  |                               +++++++++++++++++++++++++++++++++++++++++++++++++++++                                            +
-8 |     let _ = store::write_text(swamp_core::fs_gate::store::TextFile::LaunchAgent { plist: Path::new("/tmp/LaunchAgents/other.plist") }, "<plist/>");
-  |                               ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++                                            +

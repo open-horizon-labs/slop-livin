@@ -1,0 +1,29 @@
+error[E0425]: cannot find function `protect_remove` in module `swamp_core::agents`
+ --> $WORKSPACE/crates/core/tests/compile_fail/protect_changes_are_human_only.rs
+  |
+  |     let _ = swamp_core::agents::protect_remove(Path::new("/tmp/store"), Path::new("/w/keep"));
+  |                                 ^^^^^^^^^^^^^^ not found in `swamp_core::agents`
+  |
+note: found an item that was configured out
+ --> $WORKSPACE/crates/core/src/agents/mod.rs
+  |
+  | #[cfg(feature = "testing")]
+  |       ------------------- the item is gated behind the `testing` feature
+  | pub use crate::protection::{protect_add, protect_list, protect_remove};
+  |                                                        ^^^^^^^^^^^^^^
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+  --> $WORKSPACE/crates/core/tests/compile_fail/protect_changes_are_human_only.rs
+   |
+   |     let _ = swamp_core::agents::protect_remove_confirmed(Path::new("/tmp/store"), Path::new("/w/keep"));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^----------------------------------------------- argument #3 of type `HumanConfirmed` is missing
+   |
+note: function defined here
+  --> $WORKSPACE/crates/core/src/protection.rs
+   |
+   | pub fn protect_remove_confirmed(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+   |
+10 |     let _ = swamp_core::agents::protect_remove_confirmed(Path::new("/tmp/store"), Path::new("/w/keep"), /* HumanConfirmed */);
+   |                                                                                                       ++++++++++++++++++++++

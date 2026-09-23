@@ -1,0 +1,15 @@
+error: cannot construct `swamp_core::actions::Grant` with struct literal syntax due to private fields
+ --> $WORKSPACE/crates/core/tests/compile_fail/grant_is_not_a_struct_literal.rs
+  |
+  |     let _grant = Grant {
+  |                  ^^^^^
+  |         id: String::from("forged"),
+  |         -------------------------- private field
+  |         plan_id: Some(String::from("plan")),
+  |         ----------------------------------- private field
+  |         budget_bytes: Some(u64::MAX),
+  |         ---------------------------- private field
+  |         revoked: false,
+  |         -------------- private field
+  |
+  = note: ...and other private fields that were not provided

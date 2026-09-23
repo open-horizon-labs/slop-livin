@@ -2,12 +2,12 @@
 //! `authority::authorize` (a live grant a human minted) or
 //! `authority::authorize_confirmed` (a human confirmation). A literal does
 //! not compile.
-use std::path::PathBuf;
 use swamp_core::authority::Authorized;
+use swamp_core::fs_gate::StoreDir;
 
 fn main() {
     let _auth = Authorized {
-        anchors: vec![PathBuf::from("/")],
         grant_id: String::from("forged"),
+        store: StoreDir::resolved(),
     };
 }

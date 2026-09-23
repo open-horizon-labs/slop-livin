@@ -849,6 +849,7 @@ fn fixture_verdicts() -> &'static (Vec<Fixture>, HashMap<String, Verdict>) {
 }
 
 #[test]
+#[ignore = "heavy harness: scripts/check-full.sh runs it once, with --ignored"]
 fn every_mutation_is_rejected_by_its_intended_mechanism_and_legitimate_shapes_are_accepted() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (all, verdicts) = fixture_verdicts();
@@ -1510,6 +1511,7 @@ fn suffixed(f: &Fixture, suffix: &str) -> Fixture {
 }
 
 #[test]
+#[ignore = "heavy harness: scripts/check-full.sh runs it once, with --ignored"]
 fn mutation_operators_keep_the_rejection_kind() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (all, seed_verdicts) = fixture_verdicts();

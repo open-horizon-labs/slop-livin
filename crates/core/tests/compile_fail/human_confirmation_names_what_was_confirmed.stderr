@@ -1,0 +1,36 @@
+error[E0599]: no function or associated item named `cli_command` found for struct `HumanConfirmed` in the current scope
+ --> $WORKSPACE/crates/core/tests/compile_fail/human_confirmation_names_what_was_confirmed.rs
+  |
+  |     let _anything = HumanConfirmed::cli_command("human:cli");
+  |                                     ^^^^^^^^^^^ function or associated item not found in `HumanConfirmed`
+  |
+note: if you're trying to build a new `HumanConfirmed` consider using one of the following associated functions:
+      HumanConfirmed::cli_approve
+      HumanConfirmed::cli_grant
+      HumanConfirmed::cli_protect
+ --> $WORKSPACE/crates/core/src/authority.rs
+  |
+  |     pub fn cli_approve(actor: &str, plan: &crate::actions::Plan) -> HumanConfirmed {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+  |     pub fn cli_grant(actor: &str, terms: StandingTerms) -> HumanConfirmed {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+  |     pub fn cli_protect(actor: &str, change: ProtectChange) -> HumanConfirmed {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> $WORKSPACE/crates/core/tests/compile_fail/human_confirmation_names_what_was_confirmed.rs
+  |
+  |     let _no_plan = HumanConfirmed::cli_approve("human:cli");
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^------------- argument #2 of type `&swamp_core::actions::Plan` is missing
+  |
+note: associated function defined here
+ --> $WORKSPACE/crates/core/src/authority.rs
+  |
+  |     pub fn cli_approve(actor: &str, plan: &crate::actions::Plan) -> HumanConfirmed {
+  |            ^^^^^^^^^^^
+help: provide the argument
+  |
+9 |     let _no_plan = HumanConfirmed::cli_approve("human:cli", /* &swamp_core::actions::Plan */);
+  |                                                           ++++++++++++++++++++++++++++++++++

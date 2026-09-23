@@ -11,14 +11,3 @@ note: function defined here
   |
   | pub fn write_json<T: Serialize + ?Sized>(file: JsonFile<'_>, value: &T) -> io::Result<()> {
   |        ^^^^^^^^^^
-help: try wrapping the expression in a variant of `JsonFile`
-  |
-8 |     let _ = store::write_json(swamp_core::fs_gate::store::JsonFile::Grants { store: Path::new("/tmp/unit-sidecar.json") }, &1u32);
-  |                               +++++++++++++++++++++++++++++++++++++++++++++++++++++                                     +
-8 |     let _ = store::write_json(swamp_core::fs_gate::store::JsonFile::ProtectList { store: Path::new("/tmp/unit-sidecar.json") }, &1u32);
-  |                               ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++                                     +
-8 |     let _ = store::write_json(swamp_core::fs_gate::store::JsonFile::Scope { store: Path::new("/tmp/unit-sidecar.json") }, &1u32);
-  |                               ++++++++++++++++++++++++++++++++++++++++++++++++++++                                     +
-8 |     let _ = store::write_json(swamp_core::fs_gate::store::JsonFile::LastRun { store: Path::new("/tmp/unit-sidecar.json") }, &1u32);
-  |                               ++++++++++++++++++++++++++++++++++++++++++++++++++++++                                     +
-  = and 5 other candidates

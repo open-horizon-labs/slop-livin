@@ -6,16 +6,26 @@ error: cannot construct `HumanConfirmed` with struct literal syntax due to priva
   |         actor: String::from("agent"),
   |         ---------------------------- private field
   |
-  = note: ...and other private field `site` that was not provided
+  = note: ...and other private fields `id`, `site` and `subject` that were not provided
 help: you might have meant to use an associated function to build this type
   |
 7 -     let _c = HumanConfirmed {
 8 -         actor: String::from("agent"),
 9 -     };
-7 +     let _c = HumanConfirmed::cli_command(_);
+7 +     let _c = HumanConfirmed::mint(_, _, _);
   |
 7 -     let _c = HumanConfirmed {
 8 -         actor: String::from("agent"),
 9 -     };
-7 +     let _c = HumanConfirmed::tui_dialog(_);
+7 +     let _c = HumanConfirmed::cli_approve(_, _);
+  |
+7 -     let _c = HumanConfirmed {
+8 -         actor: String::from("agent"),
+9 -     };
+7 +     let _c = HumanConfirmed::cli_grant(_, _);
+  |
+7 -     let _c = HumanConfirmed {
+8 -         actor: String::from("agent"),
+9 -     };
+7 +     let _c = HumanConfirmed::cli_protect(_, _);
   |

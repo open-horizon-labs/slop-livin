@@ -8,4 +8,4 @@ error: cannot construct `RecheckProof` with struct literal syntax due to private
   |         covered: vec![],
   |         --------------- private field
   |
-  = note: ...and other private fields `identity` and `taken_at` that were not provided
+  = note: ...and other private fields `kind`, `taken_at` and `linked_common` that were not provided

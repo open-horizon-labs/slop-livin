@@ -1,9 +1,11 @@
-error[E0451]: fields `anchors` and `grant_id` of struct `Authorized` are private
+error: cannot construct `Authorized` with struct literal syntax due to private fields
  --> $WORKSPACE/crates/core/tests/compile_fail/authorized_is_minted_only_by_authorize.rs
   |
   |     let _auth = Authorized {
-  |                 ---------- in this type
-  |         anchors: vec![PathBuf::from("/")],
-  |         ^^^^^^^ private field
+  |                 ^^^^^^^^^^
   |         grant_id: String::from("forged"),
-  |         ^^^^^^^^ private field
+  |         -------------------------------- private field
+  |         store: StoreDir::resolved(),
+  |         --------------------------- private field
+  |
+  = note: ...and other private field `target` that was not provided
