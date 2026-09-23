@@ -166,6 +166,24 @@ pub fn trash_move(
         bail!("refused: a Docker object is removed in the daemon, never moved to the Trash");
     }
     plain_name(dest_name)?;
+    // Checked before anything is created under `trash_root`: a
+    // cross-device `trash_root` has no permanent-delete fallback here,
+    // and creating the freedesktop `files/` subdirectory only to have
+    // the rename itself fail with EXDEV would leave an empty directory
+    // behind as if something had been copied there.
+    if let Ok(anchor_meta) = std::fs::symlink_metadata(proof.anchor())
+        && let Ok(trash_meta) = std::fs::metadata(trash_root)
+    {
+        use std::os::unix::fs::MetadataExt;
+        if trash_meta.dev() != anchor_meta.dev() {
+            bail!(
+                "refused: {} is on a different filesystem than {}; cross-device link (no \
+                 permanent-delete fallback)",
+                trash_root.display(),
+                proof.anchor().display()
+            );
+        }
+    }
     let items = items_dir(trash_root);
     std::fs::create_dir_all(&items).context("could not create the Trash directory")?;
     let dest = items.join(dest_name);
