@@ -76,7 +76,7 @@ pub fn self_pid() -> u32 {
 }
 
 /// `status`'s `Uid:`, `Gid:` and `CapPrm:` lines.
-fn parse_status(text: &str) -> Option<Creds> {
+pub(crate) fn parse_status(text: &str) -> Option<Creds> {
     let four = |key: &str| -> Option<[u32; 4]> {
         let line = text.lines().find_map(|l| l.strip_prefix(key))?;
         let v: Vec<u32> = line
@@ -158,7 +158,7 @@ fn kernel_withholds(dir: &Path, my_uid: u32) -> std::io::Result<bool> {
 
 /// The ownership rule `kernel_withholds` reads, pure so both platforms
 /// test it.
-fn withheld_owner(fd_dir_owner: u32, my_uid: u32) -> bool {
+pub(crate) fn withheld_owner(fd_dir_owner: u32, my_uid: u32) -> bool {
     fd_dir_owner != my_uid
 }
 

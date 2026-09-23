@@ -2096,7 +2096,7 @@ pub fn external_rows_with(
     observed_at: u64,
 ) -> Vec<Row> {
     let mut sorted: Vec<&swamp_core::external::ExternalUnit> = units.iter().collect();
-    sorted.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let mut rows = Vec::new();
     for u in sorted {
         let consumers = if u.consumers.is_empty() {

@@ -85,6 +85,7 @@ impl FsEventsSource for ScriptedSource {
                 current_event_id: self.current_event_id,
                 device: Some(self.device),
                 live: false,
+                consume: None,
             };
         }
         FsEventsPlan {
@@ -99,6 +100,7 @@ impl FsEventsSource for ScriptedSource {
             current_event_id: self.current_event_id,
             device: Some(self.device),
             live: false,
+            consume: None,
         }
     }
 }

@@ -2120,10 +2120,10 @@ fn main() -> Result<()> {
             let (authorized, _) = scope.authorized_roots();
             let present: Vec<collect::Root> = authorized
                 .into_iter()
-                .filter(|r| r.nested_in.is_none() && r.path.is_dir())
+                .filter(|r| r.nested_in.is_none() && swamp_core::fs_gate::is_dir(&r.path))
                 .map(|r| collect::Root {
                     excluded: r.pruned_subtrees.clone(),
-                    path: std::fs::canonicalize(&r.path).unwrap_or(r.path),
+                    path: swamp_core::fs_gate::canonicalize(&r.path).unwrap_or(r.path),
                 })
                 .collect();
             if present.is_empty() {

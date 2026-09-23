@@ -126,6 +126,7 @@ impl FsEventsSource for Refusing {
             current_event_id: 999,
             device: Some(1),
             live: false,
+            consume: None,
         }
     }
 }

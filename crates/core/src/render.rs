@@ -953,7 +953,7 @@ fn render_build_containers(report: &Report, only_project: Option<&str>) -> Strin
             sections.push(section);
         }
     }
-    sections.sort_by(|a, b| b.0.cmp(&a.0));
+    sections.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, s) in sections {
         out.push_str(&s);
     }
@@ -1105,7 +1105,7 @@ fn render_buildkit_records(report: &Report) -> String {
             .iter()
             .filter(|u| Some(u.id.as_str()) != u.container_id.as_deref())
             .collect();
-        records.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        records.sort_by_key(|a| std::cmp::Reverse(a.bytes));
         for r in records.iter().take(25) {
             let flags: Vec<&str> = r
                 .coverage

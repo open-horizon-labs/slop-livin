@@ -50,7 +50,9 @@ pub mod git;
 #[cfg(target_os = "linux")]
 pub mod inotify;
 pub mod key;
-#[cfg(target_os = "linux")]
+// Not target-gated: the fail-closed rules are pure over a fixture tree
+// and are tested on both platforms (`occupancy::tests`'s `FakeProc`);
+// only `occupancy::probe_paths`'s call into it is Linux-only.
 pub mod procfs;
 pub mod read;
 pub mod spawn;

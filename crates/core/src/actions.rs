@@ -502,7 +502,7 @@ pub fn list_plans(dir: &Path) -> Result<Vec<Plan>> {
             out.push(p);
         }
     }
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
     Ok(out)
 }
 
@@ -794,7 +794,7 @@ pub fn propose(
             }
         }
     }
-    units.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    units.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let created_at = now();
     Ok(Plan {
         id: crate::entities::new_id(),

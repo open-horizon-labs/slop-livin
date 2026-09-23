@@ -518,7 +518,7 @@ fn identify_downloads(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedA
     }
     let (mut modules, too_deep) = module_dirs(ctx, &container.path, &|n: &str| n == "@v");
     modules.retain(|d| !d.path.starts_with(container.path.join("sumdb")));
-    modules.sort_by(|a, b| b.allocated_total.cmp(&a.allocated_total));
+    modules.sort_by_key(|a| std::cmp::Reverse(a.allocated_total));
     let budget = MODULE_LISTING_BUDGET.min(modules.len());
     for (i, at_v) in modules.iter().enumerate() {
         let Some(module_dir) = at_v.path.parent() else {

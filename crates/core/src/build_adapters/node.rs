@@ -601,7 +601,7 @@ fn identify_node_modules(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
     // Identity for the largest entries first: those are the ones a size
     // decision is about, and the budget is what keeps a monorepo's
     // forty thousand packages from costing forty thousand reads.
-    packages.sort_by(|a, b| b.1.allocated_total.cmp(&a.1.allocated_total));
+    packages.sort_by_key(|a| std::cmp::Reverse(a.1.allocated_total));
     let budget = PACKAGE_IDENTITY_BUDGET.min(packages.len());
     let skipped = packages.len() - budget;
     for (i, (path, dir)) in packages.into_iter().enumerate() {

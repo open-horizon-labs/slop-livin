@@ -238,8 +238,8 @@ impl<K: Kernel> LiveTree<K> {
         kernel: K,
         limits: Limits,
     ) -> std::io::Result<Self> {
-        let root = std::fs::canonicalize(root)?;
-        let device = std::fs::metadata(&root)?.dev();
+        let root = crate::fs_gate::canonicalize(root)?;
+        let device = crate::fs_gate::metadata_following(&root)?.dev();
         Ok(Self {
             root,
             device,
@@ -391,7 +391,7 @@ impl<K: Kernel> LiveTree<K> {
             if self.excluded(&d) {
                 continue;
             }
-            match std::fs::symlink_metadata(&d) {
+            match crate::fs_gate::symlink_metadata(&d) {
                 Ok(m) if m.is_dir() && !m.file_type().is_symlink() && m.dev() == self.device => {}
                 // Another filesystem is outside the walk too; a symlink
                 // is never followed; a vanished entry was reported by
@@ -442,7 +442,7 @@ impl<K: Kernel> LiveTree<K> {
             if dirty {
                 self.mark(&d);
             }
-            let entries = match std::fs::read_dir(&d) {
+            let entries = match crate::fs_gate::read_dir(&d) {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {

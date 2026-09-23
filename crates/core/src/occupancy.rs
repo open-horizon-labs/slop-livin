@@ -89,39 +89,28 @@ pub(crate) fn probe_paths(paths: &[&Path]) -> OccupancyState {
             OccupancyState::Free
         }
         crate::platform::OccupancyProbe::Procfs => {
-            #[cfg(target_os = "linux")]
-            {
-                let procfs = crate::fs_gate::procfs::probe(
-                    Path::new("/proc"),
-                    paths,
-                    &crate::fs_gate::procfs::Creds::of_self(),
-                    crate::fs_gate::procfs::self_pid(),
-                    OCCUPANCY_TIMEOUT,
-                );
-                // procfs is the answer; `lsof`, where one is installed, is
-                // a second reader of the same kernel state and can only
-                // make the answer stricter: Occupied or Unknown from
-                // either wins, Free needs both. With no `lsof` on PATH,
-                // procfs stands on its own -- a minimal install has none,
-                // and needs none.
-                if procfs != OccupancyState::Free || !lsof_on_path() {
-                    return procfs;
-                }
-                for p in paths {
-                    match lsof_probe(p) {
-                        OccupancyState::Free => {}
-                        other => return other,
-                    }
-                }
-                OccupancyState::Free
+            let procfs = crate::fs_gate::procfs::probe(
+                Path::new("/proc"),
+                paths,
+                &crate::fs_gate::procfs::Creds::of_self(),
+                crate::fs_gate::procfs::self_pid(),
+                OCCUPANCY_TIMEOUT,
+            );
+            // procfs is the answer; `lsof`, where one is installed, is a
+            // second reader of the same kernel state and can only make
+            // the answer stricter: Occupied or Unknown from either wins,
+            // Free needs both. With no `lsof` on PATH, procfs stands on
+            // its own -- a minimal install has none, and needs none.
+            if procfs != OccupancyState::Free || !lsof_on_path() {
+                return procfs;
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = paths;
-                OccupancyState::Unknown(
-                    "this build has no procfs occupancy backend".to_string(),
-                )
+            for p in paths {
+                match lsof_probe(p) {
+                    OccupancyState::Free => {}
+                    other => return other,
+                }
             }
+            OccupancyState::Free
         }
     }
 }
@@ -138,7 +127,7 @@ fn lsof_on_path() -> bool {
         return false;
     };
     for dir in std::env::split_paths(&path) {
-        match crate::fs_gate::symlink_metadata(&dir.join("lsof")) {
+        match crate::fs_gate::symlink_metadata(dir.join("lsof")) {
             Ok(_) => return true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return true,
@@ -466,6 +455,9 @@ pub fn is_active(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::evidence::FactStatus;
+    use crate::fs_gate::procfs::{
+        Creds, parse_status, probe as procfs_probe, withheld_owner,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
