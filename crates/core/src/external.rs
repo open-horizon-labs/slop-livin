@@ -403,6 +403,18 @@ pub fn discover_and_measure_in(
                 protected_keys.insert(key);
                 continue;
             }
+            // The root read fine, but the fold hit an unreadable
+            // directory somewhere underneath it: `row.bytes` is a
+            // partial sum, not the unit's size this pass. Treated the
+            // same as the root being unreadable -- protected from
+            // tombstoning and from a growth/regrowth delta, last known
+            // value shown instead -- because a folder going unreadable
+            // for one pass is coverage shrinking, not the unit shrinking
+            // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+            crate::folded_measurement::UnitObservation::Unit(row) if !row.complete => {
+                protected_keys.insert(key);
+                continue;
+            }
             crate::folded_measurement::UnitObservation::Unit(row) => row,
         };
         if row.reused {

@@ -32,7 +32,7 @@ use crate::report::{
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Same boundary `git::discover` stops recursion at: `.git` itself, plus
@@ -542,6 +542,17 @@ struct AttrShared {
     /// would pay for a vector the size of the tree's directory count.
     dir_stamps: Mutex<Vec<DirStamp>>,
     stamp_dirs: bool,
+    /// Set when any `Size` job hit a directory it could not list, root or
+    /// not. `dirs` only carries per-directory completeness for a real
+    /// Source-tree worktree (`worktree_root: Some`); a folded re-size
+    /// called with no worktree (every external-unit and build-container
+    /// measurement) gets no `DirRollup`s at all, so a caller that needs
+    /// "did this fold see everything" -- `resize_artifact_stamped`'s
+    /// fourth return value -- reads this flag instead
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`: an
+    /// unreadable subdirectory is incomplete coverage, never a smaller
+    /// complete tree).
+    incomplete: AtomicBool,
 }
 
 /// One directory's identity and change stamp, recorded while it was
@@ -614,6 +625,7 @@ fn attribute_parallel_inner(
         excluded: excluded.to_vec(),
         dir_stamps: Mutex::new(Vec::new()),
         stamp_dirs: false,
+        incomplete: AtomicBool::new(false),
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -999,6 +1011,7 @@ fn process_size(
         // with one unreadable package read as a complete, smaller tree
         // (#65: partial/unreadable containers are incomplete coverage,
         // never a disappearance or a quiet shrink).
+        shared.incomplete.store(true, Ordering::Relaxed);
         if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
             let rel_path = rel_path_string(root, &path);
             let parent_rel_path = parent_rel_path_of(&rel_path);
@@ -1285,7 +1298,7 @@ pub fn resize_artifact_with_dirs_excluding(
     worktree: Option<(&str, &Path)>,
     excluded: &[PathBuf],
 ) -> (ArtifactRow, Vec<DirRollup>) {
-    let (row, dirs, _) =
+    let (row, dirs, _, _) =
         resize_artifact_stamped(root_path, kind, observed_at, worktree, excluded, false);
     (row, dirs)
 }
@@ -1303,7 +1316,7 @@ pub fn resize_artifact_stamped(
     worktree: Option<(&str, &Path)>,
     excluded: &[PathBuf],
     stamp_dirs: bool,
-) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>) {
+) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>, bool) {
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
@@ -1325,6 +1338,7 @@ pub fn resize_artifact_stamped(
         excluded: excluded.to_vec(),
         dir_stamps: Mutex::new(Vec::new()),
         stamp_dirs,
+        incomplete: AtomicBool::new(false),
     });
     let wt_id = worktree
         .map(|(id, _)| id.to_string())
@@ -1357,6 +1371,7 @@ pub fn resize_artifact_stamped(
         } => process_size(path, &group, &classified, &shared, &pool),
     });
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
+    let complete = !shared.incomplete.load(Ordering::Relaxed);
     let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
     let stamps: Vec<DirStamp> = shared.dir_stamps.into_inner().unwrap();
     let mut rows = shared
@@ -1395,7 +1410,7 @@ pub fn resize_artifact_stamped(
     // `local_bytes` (the full walk charges shared inodes to whichever row
     // saw them first; the incremental merge applies the local delta).
     row.local_bytes = row.bytes.max(row.local_bytes);
-    (row, dirs, stamps)
+    (row, dirs, stamps, complete)
 }
 
 /// Checkouts at `dir` and its immediate children only: what a changed

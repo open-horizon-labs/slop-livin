@@ -79,6 +79,16 @@ pub struct FoldedUnit {
     /// modification age for external locations while `ExternalUnit` had
     /// no `mtime_max` field at all (the 2026-09-22 re-review).
     pub mtime_max: u64,
+    /// Every directory this measurement descended into was readable.
+    /// `false` when some subdirectory *inside* the unit -- not the unit's
+    /// own root, which [`access`] already probes -- could not be listed
+    /// (a `chmod 000` a few levels down). `bytes` is still the honest sum
+    /// of what *was* read, but it is a lower bound, not the unit's true
+    /// size: the caller must never let it overwrite a stored measurement
+    /// or feed a growth/regrowth delta (`.oh/guardrails/coverage-changes-
+    /// are-not-storage-changes.md`) -- a folder going unreadable for one
+    /// pass is coverage shrinking, not the unit shrinking.
+    pub complete: bool,
 }
 
 /// Measures `path`, reusing the previous pass's folded rows when this
@@ -98,7 +108,7 @@ pub fn measure(
         crate::work_counters::record_cache_hit();
         return folded;
     }
-    let (row, _dirs, stamps) = crate::walk::resize_artifact_stamped(
+    let (row, _dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
         path,
         ArtifactKind::Unknown,
         observed_at,
@@ -107,13 +117,27 @@ pub fn measure(
         store.is_some(),
     );
     crate::work_counters::record_cache_miss();
+    // `complete` is `resize_artifact_stamped`'s own record of whether
+    // every directory its `Size` jobs tried to list actually listed:
+    // `_dirs` (per-worktree `DirRollup`s) is empty here, because this
+    // call has no worktree, so it cannot be used to detect an
+    // unreadable subdirectory the way the Source-tree walk does.
     let folded = FoldedUnit {
         reused: false,
         bytes: row.bytes,
         hardlinked: row.hardlinked,
         mtime_max: row.mtime_max,
+        complete,
     };
-    if let Some(dir) = store {
+    // An incomplete measurement is never stored: writing it would either
+    // overwrite a good prior measurement with a smaller partial one (a
+    // fabricated shrink) or anchor a future reuse on rows that undercount
+    // the tree. The key keeps whatever it last had; the caller decides
+    // how to report this pass (`.oh/guardrails/coverage-changes-are-not-
+    // storage-changes.md`).
+    if let Some(dir) = store
+        && complete
+    {
         record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
     }
     folded
@@ -182,6 +206,9 @@ pub fn reuse_folded_measurement(
         bytes: root.bytes,
         hardlinked: root.hardlinked,
         mtime_max: root.mtime_max,
+        // Only a `complete` fold is ever stored (see `measure`), so a
+        // replayed root row was complete when it was taken.
+        complete: true,
     })
 }
 

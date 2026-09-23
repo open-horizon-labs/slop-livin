@@ -213,3 +213,62 @@ fn losing_access_to_a_location_is_not_a_deletion() {
         assert_no_invented_history("lost access pass 3 (access restored)", &third);
     }
 }
+
+/// The queued bug this file's family missed: `losing_access_to_a_location`
+/// above makes a whole *unit's root* unreadable. Here the root
+/// (`f.outer`, the CARGO_HOME unit) stays readable and only a plain
+/// subdirectory a few levels inside it goes `chmod 000`. The folded walk
+/// still visits and sums everything it *can* read, so it used to report
+/// a smaller, "complete" total -- indistinguishable from bytes actually
+/// having been removed, which regrowth on pass 3 would then report as
+/// growth returning. `FoldedUnit::complete` (`folded_measurement.rs`) is
+/// what closes this: an incomplete fold is never stored, so it never
+/// overwrites pass 1's baseline and never anchors a reuse.
+#[test]
+fn an_unreadable_subdirectory_inside_a_unit_is_not_growth_or_regrowth() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let base = only(&["cargo-home"]);
+
+    // A subdirectory of the CARGO_HOME unit itself, well clear of the
+    // separately-measured `registry/cache` nested unit.
+    let locked = f.outer.join("bin").join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("cargo-fmt"), vec![b'z'; 8192]).unwrap();
+
+    let first = observe(&f.env, &base, &[], store.path(), 1_000);
+    let canonical_outer = fs::canonicalize(&f.outer).unwrap();
+    let baseline = first
+        .iter()
+        .find(|(p, _, _, _)| *p == canonical_outer)
+        .expect("the cargo home unit is measured")
+        .1;
+    assert!(baseline > 0, "precondition: {first:?}");
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let second = observe(&f.env, &base, &[], store.path(), 2_000);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Running as root defeats the permission bit; only assert where the
+    // platform actually enforces it -- i.e. the pass really did see a
+    // smaller, incomplete total for the unit.
+    let saw_incomplete_total = second
+        .iter()
+        .find(|(p, _, _, _)| *p == canonical_outer)
+        .is_some_and(|(_, b, _, _)| *b < baseline);
+    if saw_incomplete_total {
+        assert_no_invented_history("unreadable subdirectory pass 2", &second);
+        let third = observe(&f.env, &base, &[], store.path(), 3_000);
+        assert_no_invented_history("unreadable subdirectory pass 3 (access restored)", &third);
+        let restored = third
+            .iter()
+            .find(|(p, _, _, _)| *p == canonical_outer)
+            .map(|(_, b, _, _)| *b);
+        assert_eq!(
+            restored,
+            Some(baseline),
+            "pass 3 must see the same total pass 1 did, not a partial one carried forward"
+        );
+    }
+}
