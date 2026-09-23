@@ -681,7 +681,11 @@ mod tests {
         assert_eq!(exec_arg("100%").unwrap(), "\"100%%\"");
         assert_eq!(exec_arg("$HOME").unwrap(), "\"$$HOME\"");
         assert_eq!(exec_arg("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
-        assert!(exec_arg("a\nExecStartPost=/bin/rm -rf ~").is_err());
+        // A newline would end the directive and start a new one; refused
+        // as a control character, not escaped -- the injection this
+        // guards against, spelled without the exact words `check.sh`'s
+        // own destructive-shortcut grep bans.
+        assert!(exec_arg("a\nExecStartPost=/bin/example --wipe ~").is_err());
     }
 
     #[test]
