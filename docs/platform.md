@@ -5,7 +5,7 @@ Swamp supports two targets:
 | | Target triple | Validated on | Status |
 |---|---|---|---|
 | macOS | `aarch64-apple-darwin` | macOS arm64, in CI on every push | Builds, tests, releases |
-| Linux | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 x86_64, in CI on every push | Builds and tests; release packaging is [#88](https://github.com/open-horizon-labs/swamp/issues/88) |
+| Linux | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 x86_64, in CI on every push; the archive also smoke-tested on the newest hosted Ubuntu | Builds, tests, releases (glibc; see [Release archives](#release-archives-and-what-they-require)) |
 
 No other target is supported, and none is planned here. Windows is not a target. ARM Linux is not a target. Nothing in this work makes either one closer; adding one means doing this exercise again for that kernel.
 
@@ -30,7 +30,7 @@ This table is generated from `crates/core/src/platform/CAPABILITIES`, and `crate
 | `trash` | supported | supported | macOS renames into ~/.Trash. Linux follows the freedesktop Trash spec (home trash, or the mount's own .Trash-$uid) with a .trashinfo record; a rename or a refusal, never a copy or a permanent fallback. |
 | `occupancy` | supported | supported | macOS runs a bounded lsof; Linux reads procfs (fds, cwd, exe, maps) of this user's processes. Anything that cannot be read is Unknown, which every destructive sink refuses on -- never 'nothing is open'. |
 | `atime-reliability` | supported | supported | macOS reads statfs mount flags; Linux reads /proc/mounts. Either failing is Undetermined, not 'atime is fine'. |
-| `release-artifact` | supported | planned | macOS arm64 tarballs ship today. Linux x86_64 packaging is #88; CI builds and tests Linux but publishes nothing. |
+| `release-artifact` | supported | supported | Separate archives with checksums per target (binary, README, skill), each built and tested on its own runner; a release publishes only after both targets and a newer-Ubuntu test pass. |
 
 "Unavailable" and "planned" both mean the same thing at runtime: swamp refuses and says why. The difference is whether an issue exists that would change the answer.
 
@@ -42,7 +42,7 @@ macOS's `fseventsd` writes a per-volume change log to disk. A stored event id is
 
 Linux has no equivalent. inotify reports what happens while a watch is open, keeps no history, and tells you with `IN_Q_OVERFLOW` when it dropped even some of that. An inotify watch descriptor is a handle on a running watch — it is not a cursor, and storing one where an event id belongs would turn "swamp was not watching" into "nothing changed". That is a false measurement, and the growth store's whole value is that it does not contain any.
 
-So a Linux observation walks fully and reports `mode=full reason=no_persisted_change_history`. [#81](https://github.com/open-horizon-labs/swamp/issues/81) adds a live watcher, which will let a *running* swamp narrow the gap to the time since its watch opened (`ContinuityCursor::LiveWatchEpoch`). It does not remove the gap, and no amount of implementation work will.
+So a Linux observation walks fully and reports `mode=full reason=no_persisted_change_history` -- unless something was watching the whole time. The TUI's live watch ([#81](https://github.com/open-horizon-labs/swamp/issues/81)) and the opt-in collector ([#82](https://github.com/open-horizon-labs/swamp/issues/82), `swamp collect`) narrow the gap to the time since their watch opened (see [Live watching and continuity](#live-watching-and-continuity-on-linux)). They do not remove it: a period with no watcher is a gap, and no amount of implementation work will change that.
 
 ## Reuse assessment
 
@@ -50,25 +50,27 @@ Issue [#79](https://github.com/open-horizon-labs/swamp/issues/79) requires this 
 
 Versions and platform statements below were checked against crates.io, docs.rs and the upstream repositories on **2026-09-22**.
 
-### `trash` 5.2.9 — **adopt for [#85](https://github.com/open-horizon-labs/swamp/issues/85)**
+### `trash` 5.2.9 — **adopted as the independent reader; not used for the move ([#85](https://github.com/open-horizon-labs/swamp/issues/85))**
 
 | | |
 |---|---|
 | Licence | MIT. MSRV 1.85.0. |
 | Platforms | Windows, macOS, and freedesktop-compliant environments. Implements v1.0 of the freedesktop Trash specification. |
-| Dependencies (macOS) | `log`, `objc2`, `objc2-foundation`, `percent-encoding`. |
-| Dependencies (Linux) | `log`, `libc`, `once_cell`, `scopeguard`, `urlencoding`, optional `chrono`. **No D-Bus, no C build script.** |
-| Build scripts | None in the crate itself. |
+| Dependencies (Linux) | `log`, `libc`, `once_cell`, `scopeguard`, `urlencoding`, `chrono`. **No D-Bus, no C build script.** |
+| In swamp | A **Linux-only dev-dependency**, pinned `=5.2.9`. Ships in nothing. |
 
-It does the cross-device rule properly: `execute_on_mounted_trash_folders` checks `$topdir/.Trash` for the sticky bit and rejects a symlink (`InvalidNotSticky`, `InvalidSymlink`) before falling back to `$topdir/.Trash-$uid`, which is exactly what the spec requires and exactly the part a hand-rolled implementation gets wrong.
+Part 1 recommended adopting it for the move. Reading the 5.2.9 source to implement #85 changed that, for four reasons, each a rule this project will not break:
 
-Errors are typed and visible: `Error::{Os, FileSystem, TargetedRoot, RestoreCollision, ...}`, and `TargetedRoot` guarantees that a failed multi-item delete removed **none** of them. Nothing in the source falls back to permanent deletion — a failure that cannot reach a per-volume trash falls back to the *home* trash and then returns `Err`.
+1. **It copies across devices.** `move_items_no_replace` tries `rename`, and on `EXDEV` falls back to `copy_dir_all` followed by `remove_dir_all` of the source. For a build directory that is a whole-tree copy that expands sparse files and splits hardlinks -- it can need more space than the disk has -- and it is not atomic.
+2. **It falls back to the home trash across devices.** When a per-volume trash is not writable (`PermissionDenied`), `delete_all_canonicalized` moves the item to the home trash instead, which on another filesystem is the same copy.
+3. **It does not say where an item went.** `delete` returns `()`. The ledger records a recovery location for every removal; it could not, without re-listing every trash on the machine and guessing by name and second.
+4. **It honours a relative `$XDG_DATA_HOME`**, which the base-directory specification says to ignore.
 
-One real caveat, documented by the crate itself: on Linux and FreeBSD it calls the non-thread-safe `getmntent`/`getmntinfo`, guarding its own calls with a mutex, and its docs say plainly that a crate calling those functions from other threads "rather not use this crate". Swamp does not call them — `activity.rs` reads `/proc/mounts` as a file and `cargo_cleanup.rs` uses `statfs` — so the caveat is satisfiable, but it is a constraint on future code and is recorded here as one.
+So the move is swamp's own, in `crates/core/src/platform/trash.rs`, following the same specification: the home trash for an item on the same filesystem, the mount's `$topdir/.Trash/$uid` (only if `.Trash` is a sticky, non-symlink directory) or `$topdir/.Trash-$uid` otherwise; a `.trashinfo` record created with `O_EXCL` *before* the move (it reserves the name; collisions become `name.2`, `name.3`, ...); `renameat2(RENAME_NOREPLACE)`; and **a rename or a refusal** -- no copy, no permanent fallback, a symlinked or foreign-owned trash directory refused. The mount's top directory is found by walking up while `st_dev` is unchanged, so no mount table is read and the crate's `getmntent` thread-safety caveat does not arise in production at all.
 
-**Decision: adopt in #85**, behind swamp's own protection, occupancy and grant checks. Adopting it does *not* transfer any of those: `trash::delete` is a filesystem operation, and every safeguard in `actions.rs` still has to run at the sink first. Path resolution is already implemented in `crates/core/src/platform/trash.rs` so #85 is a move implementation rather than a second path design.
+The crate is still used, for what it is good at: `crates/core/tests/linux_trash.rs` lists and restores every item swamp trashes through `trash::os_limited::{list, restore_all}`. That is the evidence that a file manager following the same specification can find swamp's items, read their original path and deletion time, and put them back. Those tests hold a lock around the crate's calls, since it reads `$XDG_DATA_HOME` from the process environment.
 
-### `notify` 8.2.0 — **decide in [#81](https://github.com/open-horizon-labs/swamp/issues/81); the recommendation is direct inotify**
+### `notify` 8.2.0 — **not adopted; #81 uses inotify directly**
 
 | | |
 |---|---|
@@ -81,7 +83,7 @@ That single omission is disqualifying for swamp's purposes, because overflow is 
 
 `notify` also cannot replay history, which nothing can on Linux (see above). So the value it would add over `inotify` directly is cross-platform abstraction swamp does not need: macOS already has a hand-written FSEvents backend that does exactly what the replay design requires.
 
-**Decision: #81 should use `inotify` directly and surface `IN_Q_OVERFLOW` as a named coverage failure.** Recorded here rather than implemented, because #81 is where a watcher lands.
+**Decision: `inotify` directly, through `libc` -- no new dependency -- with `IN_Q_OVERFLOW` surfaced as a named coverage loss.** Implemented in [#81](https://github.com/open-horizon-labs/swamp/issues/81) (`crates/core/src/live_watch.rs`).
 
 ### `walkdir` 2.5.0 — **already a transitive dependency; kept as the reference walker, not the production one**
 
@@ -140,8 +142,8 @@ Adopting it would also mean pulling a CLI's presentation stack — `clap`, `colo
 
 | Candidate | Decision | Because |
 |---|---|---|
-| `trash` 5.2.9 | Adopt in #85 | Implements the spec's cross-device rules correctly, typed errors, never silently permanently deletes. |
-| `notify` 8.2.0 | Do not adopt; use `inotify` directly in #81 | No documented way to surface `IN_Q_OVERFLOW`, which is the one event a coverage claim depends on. |
+| `trash` 5.2.9 | Adopt as the test-only reader (#85); do not adopt for the move | Its `delete` copies and deletes across devices and does not return where an item went; its listing and restore are the independent check that swamp's records are readable. |
+| `notify` 8.2.0 | Do not adopt; `inotify` directly (#81) | No documented way to surface `IN_Q_OVERFLOW`, which is the one event a coverage claim depends on. |
 | `walkdir` 2.5.0 | Keep as the test reference | Correct but generic; swamp's walker is 1.7–2.4× faster once the same semantics are applied to both. |
 | `jwalk` 0.9.0 | Reject | Upstream archived and explicitly unmaintained. |
 | `clean-dev-dirs` 2.8.2 | Reuse its conventions, not its scanner | Apparent size, no hardlink dedup, no filesystem boundary; brings a CLI's dependency stack. |
@@ -155,10 +157,10 @@ Shared portable code stays shared. Target gating is for genuinely different kern
 | Contracts | `platform/mod.rs` (`Os`, `ContinuitySource`, `ContinuityCursor`, `Scheduling`, `CAPABILITIES`) | | |
 | Traversal and accounting | `walk.rs`, `attribution.rs` — POSIX `st_blocks`, `st_dev`, `st_ino` | | |
 | Free space | `platform/fs_space.rs` contract | `statfs` (64-bit block counts) | `statvfs` (64-bit block counts) |
-| Change observation | `fs_events.rs` types and refusals | `fs_events::macos` (CoreServices) | none yet (#81) |
-| Scheduling | `schedule.rs` interval parsing, status | `launchctl`, plist | refuses, names #86 |
-| Trash location | `platform/trash.rs` | `~/.Trash` | freedesktop spec |
-| Occupancy | `occupancy.rs` (`lsof`, tri-state) | | |
+| Change observation | `fs_events.rs` types and refusals; `live_watch.rs` state machine | `fs_events::macos` (CoreServices) | `live_watch::inotify`; `continuity.rs` collector |
+| Scheduling | `schedule.rs` interval parsing, status; unit rendering in `systemd_user.rs` | `launchctl`, plist | `systemctl --user` (`systemd_user::RealSystemctl`) |
+| Trash | `platform/trash.rs` (`move_item`, `Envelope`) | rename into `~/.Trash` | freedesktop spec, `.trashinfo`, `renameat2` |
+| Occupancy | `occupancy.rs` (tri-state, one scan for all anchors) | bounded `lsof` | procfs |
 | atime reliability | `activity.rs` contract | `statfs` mount flags | `/proc/mounts` |
 | Default scan roots | `locations/builtin.rs` | `~/src`, `~/Library/Developer`, `~/Library/Caches` | `~/src`, `$XDG_CACHE_HOME` |
 | Data and log directories | `platform::data_dir`, `schedule::log_dir` | `~/.local/share/swamp`, `~/Library/Logs/swamp` | `$XDG_DATA_HOME/swamp`, `$XDG_STATE_HOME/swamp` |
@@ -173,8 +175,9 @@ Cargo enforces the dependency half: Apple framework crates (`core-foundation`, `
 |---|---|---|
 | Growth store | `~/.local/share/swamp` | `$XDG_DATA_HOME/swamp`, default `~/.local/share/swamp` |
 | Scheduled-run log | `~/Library/Logs/swamp` | `$XDG_STATE_HOME/swamp`, default `~/.local/state/swamp` |
-| Trash | `~/.Trash` | `$XDG_DATA_HOME/Trash`, or `$topdir/.Trash-$uid` on another mount |
-| Scheduling | `~/Library/LaunchAgents` | not applicable |
+| Trash | `~/.Trash` | `$XDG_DATA_HOME/Trash` (`files/` + `info/`), or the mount's `.Trash/$uid` / `.Trash-$uid` |
+| Scheduling | `~/Library/LaunchAgents` | `$XDG_CONFIG_HOME/systemd/user` (default `~/.config/systemd/user`); `SWAMP_SYSTEMD_UNIT_DIR` overrides |
+| Collector checkpoint | not applicable | `<growth store>/continuity/<root id>.json` (+ `.lock`, `.dirty.lock`, `.sync`) |
 
 The macOS growth store path is deliberately unchanged, including its XDG-shaped spelling: existing installs keep their history where it is, and this work moves no user data.
 
@@ -199,11 +202,115 @@ Homebrew is detected on both, with the prefixes each platform actually uses: `/o
 
 A detector that does not apply to the running platform (Xcode's, CoreSimulator's and the other macOS-only ones on Linux) is **reported, not omitted**. Silence would be indistinguishable from a detector that ran and found nothing, or one that failed. `swamp scope` lists them under their own heading, *not applicable on this platform*, with the platforms each one does apply to, and `swamp scope --json` carries the same list as `not_applicable_detectors`. Every registered detector is in exactly one of the applicable and not-applicable lists, and a macOS scope must list no macOS detector as inapplicable (`scope::tests`, both directions).
 
+## Live watching and continuity on Linux
+
+**The watcher (#81).** `crates/core/src/live_watch.rs` holds one claim and names every way it stops being true:
+
+> Since `opened_at`, every change under the root is in the dirty set.
+
+inotify is not recursive, so the watcher adds one watch per directory -- on the root's filesystem only, never through a symlink, never under swamp's own store or a scope exclusion -- and **registers each directory before listing it**, so a subdirectory created during the listing is reported by its parent. Everything reported during registration is kept as dirty, and `opened_at` is the second registration *finished*, rounded up. A change during bootstrap is therefore either in the dirty set or before `opened_at`; there is no third place for it.
+
+A directory created or moved in is registered with its whole subtree, all of it dirty. A rename pair inside the root keeps its watches (inotify watches inodes) under the new path; a directory moved out of the root has its watches dropped. The dirty set is exactly the directory an entry changed in (and the entry itself when it is a directory) -- not its parent as well, which would turn a write inside a build directory into a re-walk of the worktree around it.
+
+The claim ends, with a named reason, on: `IN_Q_OVERFLOW` (`watch_queue_overflow`), running out of watches (`watch_limit_reached`, naming `fs.inotify.max_user_watches`), a directory that cannot be watched or listed (`watch_permission_gap`), `IN_UNMOUNT` (`watched_filesystem_unmounted`), a watch the kernel removed unasked (`watch_removed`), the root itself moved (`root_mismatch`), and more than 512 dirty directories (`too_many_changes`). A lost claim is **never** an empty change set: the next observation walks the root fully and names the loss. An overflow, an unmount or a removed watch are recoverable -- a fresh epoch opens and the observation after the full walk can be incremental again. A watch limit or a permission gap is not, and the TUI says "live refresh off for <root>" with the reason.
+
+**In the TUI** each live batch feeds the same incremental pipeline FSEvents batches do, after a 400 ms quiet window. On Linux the watch's epoch opens after the TUI's first observation, so the first live refresh of each root is one full walk (`live_watch_gap`), and live batches are incremental after that.
+
+**The collector (#82).** Between processes -- a scheduled `observe`, a one-shot `report` -- nothing survives on Linux unless something kept watching. `swamp collect` is that something: opt-in, user-started (directly, or as a user service through `swamp schedule --collector`), foreground, stopped by SIGINT/SIGTERM. It keeps a bounded checkpoint per root under the growth store (`continuity/<root id>.json`): root identity (canonical path, `st_dev`, root inode), the boot id, the epoch, the coverage, the dirty directories with sequence numbers, and its exclusions. An observation reuses the list -- walking only those directories -- when **all** of these hold, and otherwise walks fully naming the first that fails:
+
+| Condition | Refusal when it does not hold |
+|---|---|
+| a collector for this root is running (it holds an `flock` for its whole life, which the kernel releases however it dies) | `no_persisted_change_history` (never one) / `collector_stopped` |
+| same boot, same root identity | `collector_stopped` / `root_mismatch` |
+| its exclusions hide nothing this observation walks | `scope_changed` |
+| it confirms it has read every queued event (a sync request written into its control directory, on the *same* inotify instance as the root, so it is queued behind every earlier change) within 2 s | `collector_unresponsive` |
+| coverage held since its epoch opened | the loss |
+| the stored observation is inside the epoch | `live_watch_gap`, or the loss that ended the previous epoch |
+
+The list is **consumed only after the observation's history and replay cursor are written**, under a lock the collector's own read-modify-write also takes, and only up to the sequence number the plan covered: an entry dirtied again during the walk survives. A crash before the history write, or between it and the consumption, leaves the entries, and the next observation re-walks them -- redundant, never wrong. An observation lock per root, held from reading the previous state to committing the next, keeps a TUI refresh, a CLI run and a scheduled run from interleaving (so one cannot overwrite the other's rows with an older walk).
+
+A fresh store's first observation records the classification rules and its second anchors the cursor, as on macOS; from the third on, a collector that has been running can vouch.
+
+## Scheduling on Linux
+
+`swamp schedule --every 1h [--collector] [roots]` writes swamp-owned units into `~/.config/systemd/user/` (every one begins with a marker line; a unit of the same name without it is never replaced or removed) and enables them through `systemctl --user`:
+
+- `swamp-observe.timer` → `swamp-observe.service`: a oneshot `swamp observe` with the binary's absolute path, systemd-quoted arguments (`%` and `$` doubled, control characters refused), `Nice=10`, idle I/O, three restarts an hour at most, output in the user journal (`journalctl --user -u swamp-observe.service`) as well as swamp's own `observe.log`. systemd never runs two instances of one oneshot at once, and swamp's observation lock serializes it against a manual run.
+- with `--collector`, `swamp-collect.service`: the collector as a user service, restarted on failure (five times an hour at most).
+
+The timer alone keeps nothing between runs: **without the collector every scheduled run walks fully**, and `swamp schedule` (status) says so. With it, a run walks only what changed while the collector was running.
+
+Nothing runs as root, and **lingering is never enabled**: without it a user manager runs only while you have a session, so both units stop at logout and start again at the next login. Status reports `Linger=yes/no` and what `loginctl enable-linger` would change -- your decision. Where no user manager is reachable (no `$XDG_RUNTIME_DIR`, `systemctl --user` does not answer: a container, WSL without systemd, `su`, cron) `install` refuses before writing anything and says to use cron or your own timer instead. A start that fails is rolled back. `swamp schedule --off` stops, disables and removes swamp's units only. launchd is compiled into the macOS build only and systemd into the Linux build only.
+
+## Trash on Linux
+
+Every recoverable action -- the CLI's `execute`, the TUI's confirm, a Cargo group, an agent-storage cache or session -- moves through one backend, `platform::trash` (the [reuse assessment](#reuse-assessment) says why it is swamp's own and not `trash::delete`). On Linux the item goes to the freedesktop Trash a file manager shows: `$XDG_DATA_HOME/Trash/files/<name>` with `info/<name>.trashinfo` holding its original path and deletion time, or, on another mount, that mount's `.Trash/$uid` or `.Trash-$uid`. It is a rename or a refusal -- never a copy, never a permanent deletion -- and the ledger records both the location and the `.trashinfo`. Cargo groups and agent sessions go in as one *envelope* per group, with swamp's `restore.json` inside naming each member's original path; the envelope's `.trashinfo` points beside the members' original directory, so a file manager's Restore puts the envelope back there and `restore.json` says where each member goes. `SWAMP_TRASH_DIR` is a plain directory on both platforms, not the system Trash, and nothing claims otherwise. Moving to Trash frees no space until the Trash is emptied.
+
+## Occupancy on Linux
+
+Linux has no `lsof` requirement: `occupancy::procfs_probe` reads `/proc` directly, unprivileged, once for every anchor of an action. For each process it may inspect it compares `cwd`, `root`, `exe`, every fd and every mapped file with the selection (a deleted-but-open file still counts).
+
+**Which processes it may inspect is the kernel's rule, not a list.** `ptrace_may_access` lets an unprivileged process read another's fds only when every uid and gid match, the target holds no capability the reader lacks, and the target is dumpable. Processes outside that -- another user's, one with more privilege (a setuid program, a capability), one the kernel marks non-dumpable (its procfs entries turn root-owned) -- are outside the question, as they are for `lsof` without root; the evidence's coverage note says so. Measured on the Ubuntu 24.04 runner, this is what makes cleanup possible at all: the user manager `systemd --user` holds `CAP_WAKE_ALARM`, and its `(sd-pam)` PAM holder is non-dumpable; neither is readable by the user they run as.
+
+Everything else it cannot answer is **`Unknown`, which every destructive sink refuses**: a process with exactly this user's credentials whose entries are still this user's and yet cannot be read (an LSM denial), a procfs that belongs to another PID namespace (`/proc/self` is not this process), an unreadable `/proc`, and the 10 s bound. A process that exits mid-scan is skipped. A nested PID namespace that mounts its own `/proc` cannot be told apart from the host from inside it; that limit is recorded, not claimed as covered.
+
+**This scope is a decision, not a fact of the code**, and is listed for the owner in the session note: the literal reading -- every unreadable same-user process is `Unknown` -- refuses every Linux action on any machine with a systemd user session, which is every standard Ubuntu login.
+
+## Release archives and what they require
+
+`release.yml` builds each target on its own runner and publishes only after both, and a test-only run on the newest hosted Ubuntu, have passed (#88):
+
+| Asset | Contents |
+|---|---|
+| `swamp-<version>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | `swamp`, `README.md`, `skills/swamp/` |
+| `swamp-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | the same, under the name `releases/latest/download/` resolves |
+| `swamp-<version>-aarch64-apple-darwin.tar.gz`, `swamp-aarch64-apple-darwin.tar.gz` (+ `.sha256`) | the macOS equivalents |
+
+No MCP server artifact exists for either target (#104). The same `scripts/package-release.sh` and `scripts/release-smoke.sh` run in `ci.yml` on every push, so the archive CI smoke-tests is the archive a release publishes. The smoke test verifies the checksum, extracts, and runs the *extracted* binary: `--version`, `--help`, the packaged skill, an explicit-root `report --json`, `observe` twice into a scratch store and a `report --json` of that history, and TUI startup and quit under a pseudo-terminal.
+
+Measured on the Ubuntu 24.04 runner (CI run 35789903497, 2026-09-22):
+
+| | |
+|---|---|
+| Runtime libraries (`ldd`) | `linux-vdso.so.1`, `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `/lib64/ld-linux-x86-64.so.2` -- nothing else, asserted by `scripts/platform-isolation.sh linkage` |
+| Newest glibc symbol version required (`objdump -T`) | **`GLIBC_2.39`** -- so the archive needs glibc 2.39 or newer: Ubuntu 24.04 and later. Older distributions (Ubuntu 22.04's glibc 2.35, Debian 12's 2.36) will not load it; build from source there |
+| CPU | generic x86-64 (no `target-cpu=native`, `RUSTFLAGS` empty in both workflows) |
+| Kernel features used | inotify, `renameat2(RENAME_NOREPLACE)` (falls back to check-then-rename on a filesystem without it), procfs; tested on Linux 6.17 (Azure) |
+| Not required | root, `lsof`, D-Bus, a desktop session; `systemd --user` only for `swamp schedule` |
+
+The minimum glibc is a property of the build image, not a promise: it is re-measured by every CI run's smoke step, and would move if the baseline image moved. No musl or static build, no ARM Linux archive, and no Windows artifact exist or are implied.
+
+## Linux validation
+
+`scripts/linux-validation.sh` runs in CI (job *Linux x86_64 release archive, smoke and validation*) against the **extracted release archive**, a generated workload and scratch state, and writes `linux-validation.txt` to the job's artifact. From run 35789903497:
+
+| | |
+|---|---|
+| Machine | GitHub `ubuntu-24.04` runner: Ubuntu 24.04.5 LTS, Linux 6.17.0-1022-azure, AMD EPYC 7763 × 4, 16 GB, ext4; `max_user_watches` 655360, `max_queued_events` 16384 |
+| Workload | 21 checkouts (20 Cargo projects, 1 node), ~1,480 directories, ~8,500 files, 36.8 MB allocated |
+| Install to first report | 468 ms (checksum, extract, `report --json`) |
+| Initial full scan | 311 / 279 / 281 ms (3 runs) |
+| Unchanged, collector running | 196 / 198 / 196 ms, `mode=incremental changed_dirs=0` (3 runs) |
+| One-subtree mutation | 225 / 224 / 225 ms, `mode=incremental changed_dirs=2-3` (3 runs); `walked_total` equal to a reference full walk into a fresh store |
+| Collector killed (SIGKILL), change made while down | `mode=full reason=collector_stopped` |
+| New collector epoch | `mode=full reason=live_watch_gap` |
+| Real inotify queue overflow (collector SIGSTOPped through 10k creates) | `mode=full reason=watch_queue_overflow`, then `mode=incremental` on the next run |
+| Watch memory | 1,481 watches, ~1.5 MiB kernel estimate (1,080 B/watch), collector RSS 8.3 MB |
+| On-disk state | growth store 110 KB; collector checkpoint 623 B |
+| Reviewed cleanup | `propose -> approve -> execute` moved `node_modules` to `$XDG_DATA_HOME/Trash/files/node_modules` with a `.trashinfo` |
+| systemd user lifecycle | the runner exposes a user manager (lingering on): `schedule --every 1h --collector` installed both units, the collector ran, one scheduled observation ran (`Result=success`, incremental), `--off` removed every swamp unit |
+
+Wall times are one shared runner's, and are recorded rather than asserted. The **regression thresholds are asserted on work, not time**, in `crates/core/tests/live_watch_cost_bounds.rs`, on both platforms: an unchanged observation under a live epoch lists **0** directories (bound: ≤ 4, and under 2% of the full walk); a change inside a build output lists that artifact's own directories (measured: 1, of 714 for the full walk); a change in one worktree's source lists that worktree, not its 300-directory sibling (measured: 19; bound: under a quarter of the full walk). Linux is not expected to match macOS latency -- it has no persisted history to replay -- and nothing here claims it does; what is claimed is that, with a collector running, repeat observation is proportional to what changed.
+
+The same script and the smoke test run on the newest hosted Ubuntu against the 24.04-built archive (job *Linux x86_64 archive on the newest hosted Ubuntu*).
+
+**The user's own Linux machine is unverified.** Everything above is GitHub's runner. To validate a real host: check out the repository, download the release archive and its `.sha256` into one directory, and run `REPS=3 scripts/linux-validation.sh <archive> <version> <out-dir>`. It uses scratch `HOME`/`SWAMP_DIR`/Trash only; its systemd step installs swamp's units into your real user unit directory and removes them again, so skip it (unset `XDG_RUNTIME_DIR`) if you would rather it did not.
+
 ## How the platform invariants are enforced
 
 Two kinds of check, because each misses what the other catches.
 
-**Runtime tests on both runners** hold the behaviour: `install_refuses_and_writes_nothing_where_there_is_no_scheduler` asserts the plist, agents and log directories are *empty* after a Linux refusal; `a_kernel_without_persisted_history_says_so_rather_than_unsupported` pins the Linux refusal; `neither_platforms_conventions_leak_into_the_other` pins the defaults; `platform_matrix_matches_docs` pins the table above.
+**Runtime tests on both runners** hold the behaviour: `install_without_a_user_manager_refuses_and_writes_nothing` asserts the unit, agents and log directories are *empty* after a Linux refusal with no user manager, and `systemd_user::tests` drive the whole systemd lifecycle through an injected backend; `a_kernel_without_persisted_history_says_so_rather_than_unsupported` pins the Linux refusal; `neither_platforms_conventions_leak_into_the_other` pins the defaults; `platform_matrix_matches_docs` pins the table above.
 
 **A source audit**, `platform_capabilities_gate_their_backends`, holds the shape future code must keep, and is written in the derived-set form the audit re-review asked for rather than as file or function-name lists:
 
@@ -230,7 +337,7 @@ Known limits, not tested because no CI runner provides them:
 
 - **Overlay filesystems** (Docker's container layers, `overlayfs` generally) report the *upper* layer's allocation for a file the container modified and the lower layer's for one it did not. A total is therefore about the merged view, not about reclaimable space in either layer.
 - **Network filesystems** (NFS, SMB, sshfs) may report `st_blocks` that does not correspond to local allocation at all, and `statvfs` figures that describe the server. `cargo_cleanup.rs` already refuses to act on a filesystem it does not recognise as local; measurement still reports what the filesystem says, labelled as such.
-- **Btrfs and ZFS** deduplicate and compress below the file level, so a sum of `st_blocks` can exceed the space that removing those files would return. This is the same class of overstatement APFS clones cause on macOS, where `reclaimability::apfs_clone_or_snapshot_bound` reports a bound rather than a figure. No Linux equivalent is implemented; a total on those filesystems is an upper bound and not labelled as one.
+- **Btrfs, ZFS, XFS, bcachefs and overlayfs** can share extents (reflinks, snapshots, a lower layer) or compress below the file, so a sum of `st_blocks` can exceed the space that removing those files would return. On those filesystems (read from `statfs`'s `f_type`) each row's reclaimable figure is reported as an **upper bound** naming the filesystem and the mechanism -- the same class of overstatement APFS clones cause on macOS, handled the same way (`reclaimability::shared_extent_bound`). ext4 and tmpfs share nothing and keep the exact figure. Totals remain allocated bytes, as everywhere.
 
 ## Running the platform checks yourself
 

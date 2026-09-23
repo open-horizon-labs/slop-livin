@@ -41,11 +41,11 @@ macOS on Apple silicon (`aarch64-apple-darwin`) and Linux on x86_64
 (`x86_64-unknown-linux-gnu`, validated on Ubuntu 24.04). CI builds and runs the
 whole test suite natively on both on every push.
 
-Linux is supported to build and run from source. There is no Linux release
-artifact yet ([#88](https://github.com/open-horizon-labs/swamp/issues/88)), and
-three capabilities are macOS-only today: replaying a change log to keep an
-update small, the live watcher behind the TUI, and scheduled observation. Swamp
-says so and falls back rather than pretending; the
+On Linux, a release archive is published alongside the macOS one (glibc,
+generic x86-64, built on Ubuntu 24.04). Linux has no persisted change history,
+so an observation there walks fully unless a live watch -- the TUI, or the
+opt-in `swamp collect` -- has been running since the last one; scheduling uses
+`systemd --user`, and Trash is the freedesktop one your file manager shows. The
 [platform guide](docs/platform.md) has the whole table and the reasons.
 
 ## Install
@@ -58,6 +58,16 @@ swamp --version
 ```
 
 Update with `brew upgrade swamp`. See the [installation guide](docs/usage.md#installing-a-release) if you previously installed manually.
+
+On Linux x86_64, install the release archive after checking its checksum:
+
+```bash
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
+```
 
 ### Build from source
 
@@ -88,7 +98,7 @@ To collect history while the UI is closed:
 swamp schedule --every 15m ~/src
 ```
 
-This installs a per-user LaunchAgent that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
+This installs a per-user LaunchAgent (macOS) or `systemd --user` timer (Linux; add `--collector` to keep a live change list between runs) that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
 
 Every root above is explicit. Omit it and `report`/`observe`/`ui`/`schedule` resolve swamp's **effective scope** instead: built-in roots (`~/src`, `~/Library/Developer`, `~/Library/Caches`), plus detected developer-tool locations (Cargo, rustup, Homebrew, and more), plus anything you add or exclude in `config.toml`. Run `swamp scope` to see exactly what's in scope, why, and what's missing or excluded -- see [Scope and coverage](docs/usage.md#scope-and-coverage).
 

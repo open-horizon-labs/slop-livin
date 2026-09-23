@@ -470,9 +470,10 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         id: "release-artifact",
         macos: Support::Supported,
-        linux: Support::Planned,
-        note: "macOS arm64 tarballs ship today. Linux x86_64 packaging is #88; CI builds and \
-               tests Linux but publishes nothing.",
+        linux: Support::Supported,
+        note: "Separate archives with checksums per target (binary, README, skill), each built \
+               and tested on its own runner; a release publishes only after both targets and a \
+               newer-Ubuntu test pass.",
     },
 ];
 

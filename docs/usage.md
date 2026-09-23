@@ -2,9 +2,11 @@
 
 For the product overview, start with the [README](../README.md). For which
 platform can do what, and where swamp keeps its files on each, see the
-[platform guide](platform.md) -- three capabilities named below
-(scheduled observation, the live watcher, and the small-update path) are
-macOS-only today, and swamp says so rather than pretending.
+[platform guide](platform.md). The one real difference between the two:
+macOS keeps a change history swamp replays, so an observation there is
+small whenever nothing much changed; Linux keeps none, so an observation
+walks fully unless a live watch (the TUI, or the opt-in `swamp collect`)
+has been running since the last one -- and swamp says which it did.
 
 ## Installing a release
 
@@ -25,20 +27,47 @@ copy after verifying `"$(brew --prefix)/bin/swamp" --version`.
 Release archives remain available on the [releases page](https://github.com/open-horizon-labs/swamp/releases).
 You can also [build from source](../README.md#build-from-source).
 
+### Linux x86_64
+
+There is no package-manager formula for Linux. Download the archive and its
+checksum, verify, and install the binary (and, if you use an agent, the
+skill):
+
+```bash
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
+swamp --version
+```
+
+The binary links glibc (not musl, not static) and is built on Ubuntu 24.04
+for a generic x86-64 CPU; the [platform guide](platform.md#release-archives-and-what-they-require)
+lists the measured minimum glibc and the Ubuntu releases it has been run on.
+It needs no root, no daemon and no `lsof`. Update by repeating the download;
+there is no migration step. Versioned archives (`swamp-<version>-x86_64-unknown-linux-gnu.tar.gz`)
+are attached to each release as well.
+
 ## Observations and history
 
 ```bash
 swamp report ~/src --since 24h
 swamp report ~/src --since 7d --sort size --reverse
 swamp observe ~/src
-swamp schedule --every 15m ~/src   # macOS only; see below
+swamp schedule --every 15m ~/src   # LaunchAgent on macOS, systemd --user timer on Linux
+swamp schedule --every 1h --collector ~/src   # Linux: also keep a live change list
 swamp schedule
 swamp schedule --off
+swamp collect ~/src                # Linux: watch in the foreground until Ctrl-C
+swamp collect --status --json ~/src
 ```
 
 `report` measures and persists by default. `observe` records data without rendering and permits GitHub enrichment. Scheduling runs that observation command; it does not delete anything.
 
-`swamp schedule` installs a per-user LaunchAgent, which exists only on macOS. On Linux the command refuses, names [#86](https://github.com/open-horizon-labs/swamp/issues/86) as what would change it, and writes nothing -- installing a job that cannot run and reporting success would leave you believing you had a baseline you do not have. Until then, run `swamp observe` from your own timer.
+`swamp schedule` installs a per-user LaunchAgent on macOS. On Linux it installs `systemd --user` units instead: a timer that runs `swamp observe` on the interval and, with `--collector`, the collector as a user service. Neither needs root; lingering is never enabled for you, so without `loginctl enable-linger` both stop at logout and resume at the next login, and `swamp schedule` (status) says which. Where no systemd user manager is reachable -- a container, WSL without systemd, a shell outside a login session -- the command refuses, says so, and writes nothing; schedule `swamp observe` from cron instead. `--off` stops and removes only the units swamp wrote. `--collector` is refused on macOS, which does not need one.
+
+**Linux: the timer alone walks fully every time.** inotify keeps no history between processes, so each scheduled run reports `mode=full reason=no_persisted_change_history`. `swamp collect` -- run it yourself, or install it with `--collector` -- keeps a bounded change list while it runs, and an `observe`/`report` then walks only what changed. It stops being trusted, and the next run walks fully naming why, when it is not running (`collector_stopped`), after a reboot, when its watch lost events (`watch_queue_overflow`), hit the watch limit (`watch_limit_reached`) or could not read a directory (`watch_permission_gap`), when its exclusions differ from the observation's (`scope_changed`), or when the last observation predates it (`live_watch_gap`). `swamp collect --status [--json]` shows each root's epoch, coverage, dirty directories, inotify watches and their approximate kernel memory. See [Live watching and continuity](platform.md#live-watching-and-continuity-on-linux).
 
 History starts when swamp observes a root. `--since` selects a comparison window, defaulting to the `since` config value. Use seconds, minutes, hours, or days here: `30m`, `24h`, `7d`. The filter language also accepts weeks, but the CLI/config history-duration parser does not; use `7d` rather than `1w` for `--since`.
 
@@ -594,13 +623,15 @@ swamp plans
 
 | Unit | Removal and recovery |
 |---|---|
-| Filesystem path | Moved to Trash; swamp records its recovery location. Bytes remain on disk until the trashed data is removed. |
+| Filesystem path | Moved to Trash; swamp records its recovery location. Bytes remain on disk until the trashed data is removed. macOS: `~/.Trash`. Linux: the freedesktop Trash your file manager shows (`~/.local/share/Trash`, or the mount's own `.Trash-$uid`), with a `.trashinfo` record of the original path and deletion time, so the file manager's Restore works. A move that is not a rename on one filesystem is refused, never copied. |
 | Linked worktree or checkout | Can be moved to Trash through its specific action path. Inspect warnings about local work and repository context. |
 | Docker image | Removed by Docker. Pulling or rebuilding depends on the image still being available or reproducible. |
 | Docker volume | Removed by Docker. Swamp creates no copy of its contents. |
 | Docker build-cache record | Reported, but individual removal is refused. |
 
 `--keep-executables` copies supported Rust executables from `target/{release,debug}` and Python wheels/shared libraries from `dist` or `build` into the worktree's `bin/` before removal. It is not a backup of everything in the selected directory.
+
+On Linux, whether something holds a unit open is read from `/proc` for every process running with your credentials; a process the kernel does not let you read (another user's, a more privileged one, one marked non-dumpable) is outside what swamp can see, as it is for `lsof` without root. A process of yours that cannot be read for any other reason makes the answer *unknown*, and unknown refuses the action.
 
 The ledger lives at `~/.local/share/swamp/ledger.jsonl`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
 

@@ -963,7 +963,11 @@ Apple documents event coalescing and rescan requirements in its [FSEvents flags 
 
 The TUI opens a cached report when one exists, then observes on a background thread. While open, it receives live FSEvents and waits for 400 ms of quiet before observing the affected directories. Live events bypass the replay-lag floor. The first run, without a cached report, must wait for its initial observation.
 
-The optional LaunchAgent starts `swamp observe` at an interval and lets it exit. It keeps observations accumulating when no UI is open. It is not a permanent swamp daemon.
+On Linux the same live path is fed by inotify (`live_watch.rs`): one watch per directory, registered before it is listed, with every loss of coverage (queue overflow, watch limit, permissions, unmount, a removed watch) turned into a named full walk rather than a partial change list. Between processes, an opt-in collector (`swamp collect`, `continuity.rs`) keeps a bounded change list that `platform_source()` reuses only while the collector runs, in the same boot, with coverage intact and the stored observation inside its epoch; the list is consumed only after the observation's history is written, and one writer per root holds an observation lock from reading the baseline to committing. See [Live watching and continuity](platform.md#live-watching-and-continuity-on-linux).
+
+The optional LaunchAgent (macOS) or `systemd --user` timer (Linux) starts `swamp observe` at an interval and lets it exit. It keeps observations accumulating when no UI is open. It is not a permanent swamp daemon; on Linux the collector is the one resident process, and only when the user asks for it (`--collector`).
+
+Every recoverable action moves through one Trash backend (`platform/trash.rs`): a rename into `~/.Trash` on macOS, into the freedesktop Trash with a `.trashinfo` record on Linux, and a refusal -- never a copy or a permanent fallback -- wherever a rename cannot do it. Occupancy is `lsof` on macOS and procfs on Linux, tri-state on both.
 
 ## History storage
 

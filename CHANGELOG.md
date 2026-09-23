@@ -6,16 +6,65 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ### Linux x86_64
 
+- **Linux release archives.** Each release now publishes
+  `swamp-<version>-x86_64-unknown-linux-gnu.tar.gz` and
+  `swamp-x86_64-unknown-linux-gnu.tar.gz` (binary, README, `skills/swamp/`)
+  with SHA-256 checksums, built on Ubuntu 24.04 for a generic x86-64 CPU and
+  tested in the release profile there; the archive is also smoke-tested on the
+  newest hosted Ubuntu. Publication waits for both targets and that test-only
+  job, so a release is never half-built. The same packaging and smoke scripts
+  run in CI on every push. No MCP artifact exists for either target.
+- **A live watcher on Linux.** The TUI refreshes live on Linux through inotify,
+  used directly: every directory is watched before it is listed, and every way
+  the watch can lose track -- queue overflow, the watch limit, an unreadable
+  directory, an unmount, a removed watch, too many changes -- makes the next
+  refresh a full walk that names it, never an empty change list. swamp's own
+  store is never watched.
+- **`swamp collect`: optional continuity between runs on Linux.** A
+  user-started collector keeps a bounded change list per root; `observe` and
+  `report` walk only what changed while it runs, and walk fully -- saying why
+  -- when it is not running, after a reboot, after a lost event, when its scope
+  differs, or when the last observation predates it. The list is consumed only
+  after the observation's history is written, and one writer per root at a
+  time (TUI, CLI, scheduled) holds an observation lock. macOS refuses it: it
+  does not need one.
+- **`swamp schedule` on Linux uses `systemd --user`.** A timer and oneshot
+  service, and with `--collector` the collector as a service; absolute binary
+  path, systemd-quoted arguments, bounded retries, journal logs, only
+  swamp-marked units ever replaced or removed, a failed start rolled back.
+  Lingering is reported and never enabled; with no user manager it refuses and
+  writes nothing.
+- **Linux Trash is the freedesktop one.** Every recoverable action now moves
+  through one backend: on Linux into `~/.local/share/Trash` (or the mount's own
+  `.Trash-$uid`) with a `.trashinfo` restore record a file manager reads, by
+  rename only -- a move that would be a copy is refused, never performed, and
+  never replaced by a deletion. A symlinked or foreign-owned trash directory
+  refuses. The ledger records the location and the record. macOS is unchanged.
+  The `trash` crate was evaluated for the move and not used: its `delete`
+  copies and deletes across devices and does not say where an item went.
+- **Linux occupancy reads `/proc`, not `lsof`.** Cwd, root, executable, open
+  files and mapped files of every process running with your credentials; an
+  unreadable process of yours, another PID namespace's `/proc`, or a timeout is
+  unknown, which refuses the action. Processes the kernel does not let you read
+  -- another user's, a more privileged one, a non-dumpable one -- are outside
+  the answer, as they are for `lsof`. Found on the way: the macOS `lsof` probe
+  read a capture it could not read back as "nothing open"; it is now unknown.
+- **Shared-extent filesystems are labelled.** On Btrfs, ZFS, XFS, bcachefs and
+  overlayfs a row's reclaimable bytes are an upper bound naming the
+  filesystem, as APFS's already were.
+- **The toolchain is pinned** (`rust-toolchain.toml`, 1.98.1), so `-D warnings`
+  stops failing on days nobody changed the code.
+
 - **Swamp builds, runs and is tested on Linux x86_64.** CI runs the whole
   workspace suite natively on Ubuntu 24.04 and on macOS arm64 on every push,
   and checks on each that the build carries only its own platform's backend --
   once through the resolved dependency graph and once through the built
-  binary's linkage and symbol table. There is no Linux release artifact yet
-  (#88); build from source.
+  binary's linkage and symbol table.
 - **A capability a platform does not have is refused and named, never
-  approximated.** `swamp schedule` on Linux refuses, says why, names #86, and
-  writes nothing -- it previously wrote a LaunchAgent plist into a
-  `~/Library/LaunchAgents` no daemon reads and reported success. An
+  approximated.** Before this work `swamp schedule` on Linux wrote a
+  LaunchAgent plist into a `~/Library/LaunchAgents` no daemon reads and
+  reported success; it now uses `systemd --user` (below), and refuses and
+  writes nothing where no user manager is reachable. An
   observation on Linux reports `mode=full reason=no_persisted_change_history`
   rather than `unsupported_platform`: the first says this kernel keeps no
   change history to replay, which #81's watcher narrows and cannot remove; the
