@@ -88,10 +88,16 @@ pub fn cmd_observe(
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
             let merged = &observation.merged;
+            // `merged.notes` entries are prefixed `"[{root}] "` by
+            // `merge_root_report_into` (multi-root disambiguation), so a
+            // plain `strip_prefix("fsevents: ")` never matches here (it
+            // did on a per-root `Report.notes`, which is unprefixed, but
+            // this is the *merged* one) -- find the marker wherever it
+            // falls in the line instead of requiring it at the start.
             let fsevents_line = merged
                 .notes
                 .iter()
-                .find_map(|n| n.strip_prefix("fsevents: "))
+                .find_map(|n| n.split_once("fsevents: ").map(|(_, rest)| rest))
                 .map(str::to_string)
                 .unwrap_or_else(|| "mode=full reason=no_store changed_dirs=0".to_string());
             let mode = fsevents_line

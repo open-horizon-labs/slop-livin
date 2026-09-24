@@ -50,6 +50,61 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     assert!(text.contains("\"outcome\":\"ok\""));
 }
 
+/// R16 CI-red fix: `merge_root_report_into` prefixes every per-root note
+/// with `"[{root}] "` before folding it into `Report.notes` (multi-root
+/// disambiguation, long predating R12). `cmd_observe`'s one-line summary
+/// (`crates/cli/src/schedule.rs`) reads that *merged* `notes` list for
+/// its `mode=`/`reason=`/`changed_dirs=` fields with
+/// `strip_prefix("fsevents: ")`, which only ever matched an unprefixed,
+/// single-root `Report.notes` entry -- never the merged one, on any
+/// platform, for any root. The shortcut this fails: reverting to
+/// `strip_prefix` (matching only a note that starts with the marker)
+/// silently falls back to the hardcoded "mode=full reason=no_store
+/// changed_dirs=0" text on every call whose summary line this reads,
+/// which happens to equal the correct text for a first-ever observation
+/// -- so only a *second* observe on an existing store, which must show a
+/// real reason (`too_soon`/`no_stored_event_id`/...), exposes it.
+#[test]
+fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+    let store = tempfile::tempdir().expect("store");
+
+    let run = || {
+        let output = Command::new(bin())
+            .arg("observe")
+            .arg(root.path())
+            .env("SWAMP_DIR", store.path())
+            .env("SWAMP_TEST_MODE", "1")
+            .output()
+            .expect("run observe");
+        assert!(
+            output.status.success(),
+            "observe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let first = run();
+    assert!(
+        first.contains("reason=no_stored_event_id"),
+        "first observation of a fresh store has no stored event id: {first}"
+    );
+
+    let second = run();
+    assert!(
+        !second.contains("reason=no_store "),
+        "a second observe against an existing store must not report the \
+         generic no-store fallback (the merge's \"[{{root}}] \" prefix \
+         must not defeat the summary line's reason lookup): {second}"
+    );
+    assert!(
+        second.contains("reason=too_soon") || second.contains("reason=no_stored_event_id"),
+        "second observe must report a real, specific reason: {second}"
+    );
+}
+
 /// #41: `observe` with no explicit root resolves the configured scope
 /// (shared with `report`/`ui`/`schedule` through
 /// `swamp_core::scope::resolve_effective_scope`) instead of requiring an

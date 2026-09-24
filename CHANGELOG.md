@@ -4,6 +4,29 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### CI: fixed three red jobs left by the observe/report split (R12/R13)
+
+`swamp observe`'s one-line summary (`mode=`/`reason=`/`changed_dirs=`)
+always fell back to the hardcoded "mode=full reason=no_store
+changed_dirs=0" text, on every call, on every platform: it read
+`Report.notes` *after* `merge_root_report_into` prefixes each entry
+`"[{root}] "` (multi-root disambiguation, unrelated and much older),
+so `strip_prefix("fsevents: ")` never matched. Invisible on a first
+observation (the fallback happens to equal the correct first-ever
+answer) and on every other consumer (they all read a per-root
+`Report.notes`, which is unprefixed) -- only a second `swamp observe`
+against an existing store, read through the merged summary line,
+showed it. Fixed to search for the marker instead of requiring it at
+the string's start (`crates/cli/src/schedule.rs`); regression test
+`observe_summary_line_reports_the_real_reason_not_the_no_store_fallback`
+in `crates/cli/tests/observe.rs`. Also: `crates/cli/tests/linux_collect.rs`
+was still matching observe's old `"root="`-prefixed line (the summary
+line has been `"observed_at=..."` since the observe/report split); and
+`scripts/release-smoke.sh`/`scripts/linux-validation.sh` still passed
+`swamp report --no-observe`, a flag R12 removed (`report` is now
+unconditionally a pure read) -- `linux-validation.sh` had the same
+stale `grep '^root='` on `observe` output as the Rust test.
+
 ### No JSON in the store: `projects.parquet`, `worktrees.parquet`, artifact `ecosystem` (tables 2-4)
 
 `swamp observe` now writes three more typed tables next to
