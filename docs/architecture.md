@@ -487,6 +487,91 @@ snapshot's tree unchanged; there is no migration.
 directions: a snapshot whose `report_json` was tampered with still
 reports the tables' values, and a tampered note still shows.
 
+R16 migrates three more of the snapshot's cells the same way (units,
+consumers, nested artifacts, evidence -- item A of the handoff's
+remaining list):
+
+- `<store>/external_units.parquet` / `<store>/agent_units.parquet` --
+  one shared row shape, one row per `ExternalUnit`/`AgentUnit`:
+  `scope_key`, `id` (an `AgentUnit`'s own id; an `ExternalUnit`'s is
+  minted from `(detector_id, category, path)` --
+  `growth::external_unit_table_id`, independent of the growth store's
+  device-inclusive row key), `source_id`/`source_name`
+  (detector/tool id and name), `category`, `path`, `bytes`, `complete`
+  (nullable -- agent-only), `mtime_max`, `linkage_state`/
+  `linkage_basis`/`project_id` (nullable -- agent-only:
+  `ProjectLinkState`'s label and its variant detail flattened to one
+  string, plus the id when `linked`), `protected`/`protect_reason`
+  (nullable -- agent-only), `consequence` (each type's own `note`
+  field), `observed_at`, `growth_bytes` (nullable), `regrowth_count`.
+  Not migrated (overlaid from the snapshot by `id`): an `ExternalUnit`'s
+  `provenance`; an `AgentUnit`'s `tool_home`/`relative_path`/`members`/
+  `action`. `evidence` on both is replaced from `evidence.parquet`
+  below, never overlaid.
+- `<store>/unit_consumers.parquet` -- the child table for an
+  `ExternalUnit`'s declared-consumer list (an `AgentUnit` has no
+  consumer list -- its single `project_link` is a unit-row column
+  above): `scope_key`, `unit_id`, `consumer_label`,
+  `consumer_project_id` (nullable; nothing produces one yet),
+  `basis` (`ExternalConsumer::note`), `seq`.
+- `<store>/nested_artifacts.parquet` -- one row per `NestedArtifact`,
+  from either producer that builds them (a per-project build-artifact
+  interior, `Report.nested_artifacts`, and a shared-store interior,
+  `ReportSnapshot.store_interiors`): `scope_key`, `origin` (`report` |
+  `store-interior`, so reading splits the two lists back apart without
+  guessing from `container_id`/path overlap), `id`, `container_id`
+  (nullable -- the id of the *container* `NestedArtifact` whose own
+  `path` equals the owning `ArtifactRow`'s path; there is no other
+  "artifact row key" a `NestedArtifact` carries), `adapter` (nullable),
+  `family` (`ArtifactRole::family`'s label), `role`, `path`, `bytes`,
+  `basis` (`AccountingBasis`), `mtime` (nullable), `consequence`, and
+  the variant's `profile`/`configuration`/`target`/`arch` (all
+  nullable). Not migrated: `parent_id`, `membership`, `is_dir`,
+  `device`, `inode`, `logical_bytes`, `physical_bytes`,
+  `physical_total`, `coverage`, `producer_evidence`/`consumer_evidence`
+  (the older, narrower per-nested-unit evidence shape -- distinct from
+  `decision_evidence`, which moves to `evidence.parquet`),
+  `action_group`, `present`, `growth_bytes`, `regrowth_count`, `action`,
+  `reported_by`, `writer_lock`, and the variant's `package`/`version`/
+  `toolchain`/`features`/`generation`/`unknowns`.
+- `<store>/evidence.parquet` -- one row per `crate::evidence::Evidence`
+  entry, across every entity kind that carries the #53 decision-evidence
+  contract (an `ArtifactRow`, keyed by `growth::artifact_row_key`; an
+  `ExternalUnit`/`AgentUnit`, keyed by the id the unit tables use; a
+  `NestedArtifact`'s `decision_evidence`, keyed by its own id):
+  `scope_key`, `row_key` (`"<entity_kind>:<id>"`), `seq`, `kind`,
+  `subtype`, `status` (`known` | `unknown` | `unavailable` |
+  `conflicting`), `value_kind` (the `FactValue` tag), `value_num`
+  (nullable f64), `value_ts` (nullable i64), `value_text` (nullable),
+  `conflicting_extra` (nullable -- every `Conflicting` candidate after
+  the first, `|`-joined; every production `Conflicting` site uses one
+  `FactValue` variant across all its candidates), `reason` (nullable --
+  `Unknown`/`Unavailable`/`Conflicting`'s message), `source`,
+  `source_detail` (nullable), `event_at` (nullable), `observed_at`,
+  `freshness_expires_after_secs`/`freshness_coverage_note` (nullable),
+  `note` (nullable). Unlike the other R16 tables this is never overlaid
+  and never a row-count no-op: an entity with no evidence at all looks
+  identical to "table not written yet" by row count alone, so
+  `growth::evidence_table_exists` (does the file exist at all) is the
+  real "has this store ever written this table" check;
+  `report::rebuild_evidence_from_tables` is a no-op only when that is
+  `false`.
+
+`report_scope_from_store` extends the same rebuild to these: an
+`ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`
+come from the unit tables; a `NestedArtifact`'s own scalars come from
+`nested_artifacts.parquet`, split by `origin` back into
+`Report.nested_artifacts`/`ReportSnapshot.store_interiors`; and finally
+every entity's `evidence`/`decision_evidence` is replaced from
+`evidence.parquet`, run last so it sees the rebuilt lists. A store with
+no rows for a table (an older store) is a no-op for that table, same as
+R15. `crates/core/tests/units_nested_evidence_tables.rs` pins the units/
+nested-artifacts direction (a real Claude Code + Cargo-home fixture,
+`observe_scope` then `report_scope_from_store`, tampering the
+snapshot's copies); `growth::tests::
+evidence_table_round_trips_every_status_and_source_variant` pins every
+`FactStatus`/`FactValue`/`EvidenceSource` variant's exact round trip.
+
 `swamp report` (`report::report_scope_from_store`) does the reverse:
 resolve the scope (a config read plus one presence `stat` per candidate
 root, never a recursive walk), compute its key, and read the stored

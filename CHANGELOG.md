@@ -4,6 +4,27 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: units, consumers, nested artifacts, evidence (R16)
+
+`swamp observe` now writes four more typed tables: `external_units.parquet`
+and `agent_units.parquet` (one shared row shape: id, detector/tool id and
+name, category, path, bytes, mtime, observed_at, growth/regrowth, plus
+agent-only `complete`/project-linkage/`protected` columns),
+`unit_consumers.parquet` (an external unit's declared-consumer list),
+and `nested_artifacts.parquet` (per-project build-artifact interiors and
+shared-store interiors, split back apart by an `origin` column). A new
+`evidence.parquet` holds every artifact/unit/nested-artifact's decision
+evidence (#53) in one table, keyed by `"<entity_kind>:<id>"`, including
+`Conflicting`'s multi-candidate case and every `EvidenceSource` variant.
+`swamp report` rebuilds `external_units`/`agent_units`/`nested_artifacts`
+from these tables (overlaying the not-yet-migrated fields by id) and
+replaces every entity's evidence from `evidence.parquet` outright.
+Verified end-to-end with a real Cargo-home + Claude-Code-session fixture
+(`crates/core/tests/units_nested_evidence_tables.rs`) and an exhaustive
+per-variant round trip
+(`growth::tests::evidence_table_round_trips_every_status_and_source_variant`).
+No migration: a store from before this reads as it did.
+
 ### CI: full tier (compile-fail, mutation sweep, cost test) off the push path
 
 Split `check-full.yml` out of `ci.yml`: the two `*-check-full` jobs
