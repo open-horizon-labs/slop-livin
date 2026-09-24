@@ -31,7 +31,6 @@ const ALLOWED_NAMES: &[&str] = &[
     "fsevents.json",
     "topology.json",
     "docker_facts.json",
-    "unowned.json",
     "ui_state.json",
     "scope.json",
     "agent_protect.json",
@@ -304,9 +303,17 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
          {unexpected:?}"
     );
 
+    // HARD RULE (2026-09-24, non-negotiable): any file under the store
+    // other than `*.parquet` is a control file, and a control file that
+    // keeps growing with observed data is a data store in disguise --
+    // this is what let `unowned.json` reach 473 MB while still being
+    // named like a small control file. The size cap therefore applies to
+    // *every* non-Parquet file, not only `.json`/`.jsonl` names: it would
+    // have caught a JSON report cache (`last_report*.json.zst`) or a
+    // `.sync` continuity file quietly becoming a data store too.
     for rel in &files {
         let name = rel.file_name().unwrap_or_default().to_string_lossy();
-        if !(name.ends_with(".json") || name.ends_with(".jsonl")) {
+        if name.ends_with(".parquet") {
             continue;
         }
         let size = fs::metadata(fx.store.join(rel))

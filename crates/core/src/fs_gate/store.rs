@@ -113,10 +113,19 @@ pub enum JsonFile<'a> {
     FsEventsCursor { volume: &'a StoreDir },
     /// `<volume>/topology.json`: the worktree topology of one root.
     Topology { volume: &'a StoreDir },
-    /// `<volume>/unowned.json`: the unowned rows of one root.
-    Unowned { volume: &'a StoreDir },
     /// `<store>/last_report-<key>.json.zst`: the last report, zstd
     /// compressed, so a `--no-observe` or TUI start never re-walks.
+    ///
+    /// The unowned/remainder rows of a volume are **not** here any more
+    /// (#R10 item 1): `<volume>/unowned.json` used to scale with the
+    /// unowned *file* count (473 MB on a real default-scope store) --
+    /// exactly the giant JSON artifact cache the handoff forbids. They
+    /// now live in `<volume>/unowned.parquet`
+    /// (`growth::{read_unowned, write_unowned}` /
+    /// `growth::columns::{read_unowned_rows, write_unowned_rows}`),
+    /// folded per directory by `walk.rs`, and are not written through
+    /// this gate at all -- like every other history table, only through
+    /// `crate::fs_gate::columns::write_parquet_atomic`.
     LastReport { store: &'a StoreDir, key: &'a str },
 }
 
@@ -152,7 +161,6 @@ impl JsonFile<'_> {
             JsonFile::UiState { store } => store.0.join("ui_state.json"),
             JsonFile::FsEventsCursor { volume } => volume.0.join("fsevents.json"),
             JsonFile::Topology { volume } => volume.0.join("topology.json"),
-            JsonFile::Unowned { volume } => volume.0.join("unowned.json"),
             JsonFile::LastReport { store, key } => store
                 .0
                 .join(format!("last_report-{}.json.zst", plain(key)?)),

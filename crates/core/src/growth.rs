@@ -29,7 +29,7 @@ use crate::fs_events::{FsEventsRequest, FsEventsState};
 use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use crate::git::DiscoveredWorktree;
 use crate::report::{
-    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedRow,
+    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedReason, UnownedRow,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1228,7 +1228,7 @@ fn topology_path(dir: &Path) -> PathBuf {
     dir.join("topology.json")
 }
 fn unowned_path(dir: &Path) -> PathBuf {
-    dir.join("unowned.json")
+    dir.join("unowned.parquet")
 }
 
 fn read_fsevents_state(dir: &Path) -> FsEventsState {
@@ -1295,22 +1295,79 @@ fn write_topology(dir: &Path, worktrees: &[StoredWorktree]) -> Result<()> {
     .with_context(|| format!("write {}", topology_path(dir).display()))
 }
 
-fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
-    read_owned_string(unowned_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
+    match reason {
+        UnownedReason::OutsideAnyCheckout => "OutsideAnyCheckout",
+        UnownedReason::OwnedByNothing => "OwnedByNothing",
+        UnownedReason::InconclusiveEvidence => "InconclusiveEvidence",
+        UnownedReason::NoContainingRepo => "NoContainingRepo",
+        UnownedReason::SharedCache => "SharedCache",
+        UnownedReason::PermissionDenied => "PermissionDenied",
+        UnownedReason::DockerNoJoin => "DockerNoJoin",
+    }
 }
 
+fn unowned_reason_from_str(s: &str) -> UnownedReason {
+    match s {
+        "OutsideAnyCheckout" => UnownedReason::OutsideAnyCheckout,
+        "OwnedByNothing" => UnownedReason::OwnedByNothing,
+        "InconclusiveEvidence" => UnownedReason::InconclusiveEvidence,
+        "SharedCache" => UnownedReason::SharedCache,
+        "PermissionDenied" => UnownedReason::PermissionDenied,
+        "DockerNoJoin" => UnownedReason::DockerNoJoin,
+        _ => UnownedReason::NoContainingRepo,
+    }
+}
+
+/// Reads the volume's folded unowned/remainder rows from
+/// `unowned.parquet` (#R10 item 1: a Parquet current-state table, never
+/// a JSON sidecar that scales with the unowned *file* count). Returns
+/// an empty vec when the table is missing or unreadable -- a cache miss,
+/// rebuilt whole by the next full walk, same as `folded_rows_for`.
+fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
+    columns::read_unowned_rows(&unowned_path(dir))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| UnownedRow {
+            path_or_object: r.path_or_object,
+            bytes: r.bytes,
+            reason: unowned_reason_from_str(&r.reason),
+            shared_bytes: r.shared_bytes,
+            note: r.note,
+            docker_kind: r.docker_kind,
+            created_at: r.created_at,
+            containers: serde_json::from_str(&r.containers_json).unwrap_or_default(),
+            shared_with: serde_json::from_str(&r.shared_with_json).unwrap_or_default(),
+            dangling: r.dangling,
+            evidence: serde_json::from_str(&r.evidence_json).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Replaces the volume's `unowned.parquet` wholesale: like
+/// `store_folded_rows`, this is a measurement cache (no growth/regrowth
+/// semantics), so a full walk's rows simply overwrite whatever was
+/// there, folded per directory by `walk.rs` before this ever sees them.
 fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
     store::StoreDir::at(dir)?.create()?;
-    store::write_json(
-        store::JsonFile::Unowned {
-            volume: &store::StoreDir::at(dir)?,
-        },
-        unowned,
-    )
-    .with_context(|| format!("write {}", unowned_path(dir).display()))
+    let rows: Vec<columns::StoredUnownedRow> = unowned
+        .iter()
+        .map(|u| columns::StoredUnownedRow {
+            path_or_object: u.path_or_object.clone(),
+            bytes: u.bytes,
+            reason: unowned_reason_to_str(&u.reason).to_string(),
+            shared_bytes: u.shared_bytes,
+            note: u.note.clone(),
+            docker_kind: u.docker_kind.clone(),
+            created_at: u.created_at.clone(),
+            containers_json: serde_json::to_string(&u.containers).unwrap_or_default(),
+            shared_with_json: serde_json::to_string(&u.shared_with).unwrap_or_default(),
+            dangling: u.dangling,
+            evidence_json: serde_json::to_string(&u.evidence).unwrap_or_default(),
+        })
+        .collect();
+    columns::write_unowned_rows(&unowned_path(dir), &rows)
+        .with_context(|| format!("write {}", unowned_path(dir).display()))
 }
 
 fn parse_artifact_kind(s: &str) -> ArtifactKind {

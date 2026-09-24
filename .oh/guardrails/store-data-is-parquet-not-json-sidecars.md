@@ -37,8 +37,32 @@ Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-aud
 ## Runtime tests that complete it
 
 - `crates/core/tests/store_contents_are_allowlisted.rs` — a full
-  observe → report → propose → approve → execute cycle on a
-  multi-ecosystem fixture, then a recursive walk of `SWAMP_DIR`
-  asserting every file matches exactly one allow-list pattern, that no
-  `.json` exceeds 64 KiB, and that a Trash envelope holds exactly
-  `restore.json` plus the moved members.
+  observe → report → Trash-move cycle on a multi-ecosystem fixture (the
+  CLI action path -- propose/approve/execute/grants -- no longer exists;
+  the TUI Trash move is the one supported action), then a recursive walk
+  of `SWAMP_DIR` asserting every file matches exactly one allow-list
+  pattern, that no file other than `*.parquet` exceeds 64 KiB, and that a
+  Trash envelope holds exactly `restore.json` plus the moved members.
+
+## 2026-09-24: `unowned.json` was the violation this rule was meant to catch
+
+`<volume>/unowned.json` grew to 473 MB on a real default-scope store —
+one JSON row per unowned *file*, wrongly allow-listed as a "control
+file" because its name looked like one. Fixed: `walk.rs` now folds every
+directory's direct unowned files into one row before it ever reaches
+storage, and the rows land in `<volume>/unowned.parquet`
+(`growth::columns::{StoredUnownedRow, read_unowned_rows,
+write_unowned_rows}`), a measurement cache replaced wholesale each walk
+like `external/folded.parquet`, not reverse-delta history. `JsonFile::Unowned`
+is removed. The lesson generalizes: the allow-list test's per-file size
+cap now applies to every non-Parquet file, not only `.json`/`.jsonl`
+names, so a JSON *cache* wearing a different extension (the
+`last_report*.json.zst` report cache, in particular) is still caught if
+it starts scaling with observed data instead of staying a small
+summary. Not yet done: `grants.json`, `agent_protect.json`,
+`scope.json`, `last_run.json`, `docker_facts.json`, `topology.json` and
+`last_report*.json.zst` itself are all still JSON files under the
+store; none of them showed unbounded growth on the fixtures measured so
+far, but the 2026-09-24 hard-rule decision asks for the allow-list to
+shrink to exactly `config.toml`, `ui_state.json` and `ledger.jsonl` --
+that full migration is unstarted.

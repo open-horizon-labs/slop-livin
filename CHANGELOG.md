@@ -4,6 +4,37 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Unowned/remainder rows no longer live in a JSON file
+
+`<volume>/unowned.json` reached 473 MB on a real default-scope store (one
+row per unowned *file*), which is exactly the giant JSON artifact cache
+the handoff forbids. Unowned rows are now folded per directory during
+the walk (`walk.rs`: every direct unowned file under a directory outside
+any known worktree sums into one row for that directory, never one row
+per file) and stored as a Parquet table, `<volume>/unowned.parquet`
+(`growth::{read_unowned, write_unowned}`,
+`growth::columns::{StoredUnownedRow, read_unowned_rows, write_unowned_rows}`),
+replaced wholesale each full walk like the existing `external/folded.parquet`
+measurement cache -- not reverse-delta history, since unowned rows carry
+no growth/regrowth semantics.
+
+`JsonFile::Unowned` is removed; the on-disk allow-list test
+(`store_contents_are_allowlisted.rs`) drops `unowned.json` from its
+allowed names and now caps *every* non-`.parquet` file at 64 KiB (not
+only `.json`/`.jsonl` names), closing the loophole that let the
+compressed `last_report*.json.zst` report cache grow unchecked. No
+migration: delete an old `unowned.json` on sight and let the next
+observation rebuild it.
+
+### Toolchain floats on stable
+
+`rust-toolchain.toml` and CI now resolve `stable` instead of pinning
+`1.98.1`; a new stable release adding a lint that trips `-D warnings` is
+handled with lint fixes and regenerated `TRYBUILD=overwrite` snapshots,
+not a version freeze. The `compile_fail` suite's per-OS `.stderr`
+override mechanism already tolerates cosmetic diagnostic-text drift
+between rustc versions.
+
 ### Swamp no longer performs CLI cleanup
 
 Product decision: swamp reports, the human removes (in its TUI, or by

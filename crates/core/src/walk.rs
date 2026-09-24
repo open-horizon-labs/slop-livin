@@ -726,7 +726,12 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         return;
     }
     if meta.is_file() {
-        record_file(&path, &meta, known, shared);
+        // The walk root itself is a single file (rare: an explicit
+        // include naming a file, not a directory) -- at most one row,
+        // so no directory to fold into; push it directly.
+        if let (_, FileTally::Unowned(bytes)) = record_file(&path, &meta, known, shared) {
+            push_unowned_dir(&path, bytes, shared);
+        }
         return;
     }
     if !meta.is_dir() {
@@ -760,6 +765,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     // classified below. Only recorded at the end if `path` is inside a
     // known worktree's Source tree (`nearest_worktree` returns `Some`).
     let mut dir_own_allocated: u64 = 0;
+    // Direct-file unowned bytes, folded into exactly one `UnownedRow` for
+    // `path` at the end of this call instead of one row per file (#R10
+    // item 1).
+    let mut dir_unowned_bytes: u64 = 0;
     let mut dir_file_count: u32 = 0;
     let mut dir_dir_count: u32 = 0;
     let mut dir_symlink_count: u32 = 0;
@@ -782,13 +791,19 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         }
         if ft.is_file() {
             dir_file_count += 1;
-            if let Some((mtime, bytes_opt)) = record_file_typed(&child_path, known, shared) {
+            if let Some((mtime, tally)) = record_file_typed(&child_path, known, shared) {
                 dir_mtime_max = dir_mtime_max.max(mtime);
-                if let Some(bytes) = bytes_opt {
-                    dir_own_allocated += bytes;
-                    if bytes >= shared.large_file_min_bytes {
-                        record_large_file(&child_path, bytes, mtime, known, shared);
+                match tally {
+                    FileTally::Owned(bytes) => {
+                        dir_own_allocated += bytes;
+                        if bytes >= shared.large_file_min_bytes {
+                            record_large_file(&child_path, bytes, mtime, known, shared);
+                        }
                     }
+                    FileTally::Unowned(bytes) => {
+                        dir_unowned_bytes += bytes;
+                    }
+                    FileTally::Duplicate => {}
                 }
             }
         } else if ft.is_dir() {
@@ -841,6 +856,11 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             }
         }
     }
+
+    // Direct-file unowned bytes fold into exactly one row for this
+    // directory (never one per file); zero when `path` is inside a known
+    // worktree, since every direct child file then shares that worktree.
+    push_unowned_dir(&path, dir_unowned_bytes, shared);
 
     if let Some(worktree_id) = nearest_worktree(known, &path).map(str::to_string)
         && let Some(root) = worktree_root_path(known, &worktree_id)
@@ -895,18 +915,34 @@ fn record_large_file(
     });
 }
 
+/// What a recorded file's allocated bytes counted against, so the caller
+/// can fold unowned bytes per *directory* instead of pushing one
+/// [`UnownedRow`] per file (#R10 item 1: a store that scales with the
+/// unowned file count, not the directory count, is exactly the "giant
+/// JSON artifact cache" the handoff forbids).
+enum FileTally {
+    /// Already counted via another hardlink to the same inode; no bytes
+    /// to fold into any rollup.
+    Duplicate,
+    /// Counted against a known worktree.
+    Owned(u64),
+    /// Counted against no known worktree -- folds into this file's
+    /// containing directory's unowned row, never its own row.
+    Unowned(u64),
+}
+
 /// Like `record_file`, but for an entry already known (from
 /// `DirEntry::file_type`) to be a non-symlink file, so it does the one
 /// `lstat` a regular file needs for size/hardlink identity without a
-/// redundant type check first. Returns `(mtime_secs, bytes_if_newly_counted)`
-/// so the caller can fold this file into its directory's rollup (mtime
-/// always; bytes only when this was not a hardlink dup, matching how
+/// redundant type check first. Returns `(mtime_secs, tally)` so the
+/// caller can fold this file into its directory's rollup (mtime always;
+/// bytes only when this was not a hardlink dup, matching how
 /// `walked_total`/`attributed_total` already dedup).
 fn record_file_typed(
     path: &Path,
     known: &[KnownWorktree],
     shared: &AttrShared,
-) -> Option<(i64, Option<u64>)> {
+) -> Option<(i64, FileTally)> {
     crate::work_counters::record_files_statted(1);
     let meta = crate::fs_gate::symlink_metadata(path).ok()?;
     Some(record_file(path, &meta, known, shared))
@@ -917,7 +953,7 @@ fn record_file(
     meta: &fs::Metadata,
     known: &[KnownWorktree],
     shared: &AttrShared,
-) -> (i64, Option<u64>) {
+) -> (i64, FileTally) {
     let mtime = meta.mtime();
     // Per-row local figure first: independent of which row the global
     // dedup below happens to charge.
@@ -929,7 +965,7 @@ fn record_file(
         }
     }
     if !shared.seen_inodes.insert_first((meta.dev(), meta.ino())) {
-        return (mtime, None);
+        return (mtime, FileTally::Duplicate);
     }
     let bytes = allocated_bytes(meta);
     shared.walked_total.fetch_add(bytes, Ordering::Relaxed);
@@ -943,17 +979,27 @@ fn record_file(
                 .unwrap()
                 .entry(worktree_id.to_string())
                 .or_default() += bytes;
+            (mtime, FileTally::Owned(bytes))
         }
         None => {
             shared.unowned_total.fetch_add(bytes, Ordering::Relaxed);
-            push_unowned_file(path, bytes, shared);
+            (mtime, FileTally::Unowned(bytes))
         }
     }
-    (mtime, Some(bytes))
 }
 
-fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
-    let name = path
+/// Pushes exactly one folded [`UnownedRow`] for a directory none of whose
+/// direct files belong to a known worktree, summing every direct
+/// unowned file's bytes into `bytes` -- never one row per file. The
+/// directory's own name decides the shared-cache label, matching
+/// `finish_size_job`'s already-folded convention for classified unowned
+/// artifact directories (e.g. a stray `node_modules` outside any
+/// worktree) so both folding paths agree on labeling.
+fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
+    if bytes == 0 {
+        return;
+    }
+    let name = dir_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
@@ -963,7 +1009,7 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
         UnownedReason::NoContainingRepo
     };
     shared.unowned.lock().unwrap().push(UnownedRow {
-        path_or_object: path.display().to_string(),
+        path_or_object: dir_path.display().to_string(),
         bytes,
         reason,
         shared_bytes: None,

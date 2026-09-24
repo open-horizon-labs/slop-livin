@@ -607,6 +607,151 @@ pub(super) fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
 }
 
 // ---------------------------------------------------------------------
+// unowned/current.parquet -- the unowned/remainder rows of one volume
+// (#R10 item 1). Folded directory rows, never per file (`walk.rs`
+// folds every direct unowned file into one row per containing
+// directory before this table ever sees them). Like `FoldedRow`, this
+// is a measurement cache, not history: unowned rows carry no growth or
+// regrowth semantics and are replaced wholesale by a full walk, so the
+// whole file is rewritten each observation rather than reverse-delta
+// compacted. Complex per-row fields (`containers`, `shared_with`,
+// `evidence`) are JSON-encoded *into a Parquet Utf8 cell*, not a JSON
+// file on disk -- the store-is-Parquet rule is about the file format
+// under `SWAMP_DIR`, not about every cell's encoding.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredUnownedRow {
+    pub path_or_object: String,
+    pub bytes: u64,
+    pub reason: String,
+    pub shared_bytes: Option<u64>,
+    pub note: Option<String>,
+    pub docker_kind: Option<String>,
+    pub created_at: Option<String>,
+    /// JSON-encoded `Vec<String>`.
+    pub containers_json: String,
+    /// JSON-encoded `Vec<String>`.
+    pub shared_with_json: String,
+    pub dangling: bool,
+    /// JSON-encoded `Vec<crate::evidence::Evidence>`.
+    pub evidence_json: String,
+}
+
+fn unowned_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path_or_object", DataType::Utf8, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("reason", DataType::Utf8, false),
+        Field::new("shared_bytes", DataType::UInt64, true),
+        Field::new("note", DataType::Utf8, true),
+        Field::new("docker_kind", DataType::Utf8, true),
+        Field::new("created_at", DataType::Utf8, true),
+        Field::new("containers_json", DataType::Utf8, false),
+        Field::new("shared_with_json", DataType::Utf8, false),
+        Field::new("dangling", DataType::Boolean, false),
+        Field::new("evidence_json", DataType::Utf8, false),
+    ]))
+}
+
+pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Result<()> {
+    let schema = unowned_schema();
+    let path_or_object: Vec<&str> = rows.iter().map(|r| r.path_or_object.as_str()).collect();
+    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
+    let reason: Vec<&str> = rows.iter().map(|r| r.reason.as_str()).collect();
+    let shared_bytes: Vec<Option<u64>> = rows.iter().map(|r| r.shared_bytes).collect();
+    let note: Vec<Option<&str>> = rows.iter().map(|r| r.note.as_deref()).collect();
+    let docker_kind: Vec<Option<&str>> = rows.iter().map(|r| r.docker_kind.as_deref()).collect();
+    let created_at: Vec<Option<&str>> = rows.iter().map(|r| r.created_at.as_deref()).collect();
+    let containers_json: Vec<&str> = rows.iter().map(|r| r.containers_json.as_str()).collect();
+    let shared_with_json: Vec<&str> = rows.iter().map(|r| r.shared_with_json.as_str()).collect();
+    let dangling: Vec<bool> = rows.iter().map(|r| r.dangling).collect();
+    let evidence_json: Vec<&str> = rows.iter().map(|r| r.evidence_json.as_str()).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(path_or_object)) as ArrayRef,
+            Arc::new(UInt64Array::from(bytes)),
+            Arc::new(StringArray::from(reason)),
+            Arc::new(UInt64Array::from(shared_bytes)),
+            Arc::new(StringArray::from(note)),
+            Arc::new(StringArray::from(docker_kind)),
+            Arc::new(StringArray::from(created_at)),
+            Arc::new(StringArray::from(containers_json)),
+            Arc::new(StringArray::from(shared_with_json)),
+            Arc::new(BooleanArray::from(dangling)),
+            Arc::new(StringArray::from(evidence_json)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it to rebuild this store from a full walk)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let path_or_object = downcast_str(&batch, "path_or_object")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let reason = downcast_str(&batch, "reason")?;
+        let shared_bytes = batch
+            .column_by_name("shared_bytes")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .context("column shared_bytes is not UInt64")?;
+        let note = batch
+            .column_by_name("note")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column note is not Utf8")?;
+        let docker_kind = batch
+            .column_by_name("docker_kind")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column docker_kind is not Utf8")?;
+        let created_at = batch
+            .column_by_name("created_at")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column created_at is not Utf8")?;
+        let containers_json = downcast_str(&batch, "containers_json")?;
+        let shared_with_json = downcast_str(&batch, "shared_with_json")?;
+        let dangling = downcast_bool(&batch, "dangling")?;
+        let evidence_json = downcast_str(&batch, "evidence_json")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredUnownedRow {
+                path_or_object: path_or_object.value(i).to_string(),
+                bytes: bytes.value(i),
+                reason: reason.value(i).to_string(),
+                shared_bytes: shared_bytes.is_valid(i).then(|| shared_bytes.value(i)),
+                note: note.is_valid(i).then(|| note.value(i).to_string()),
+                docker_kind: docker_kind
+                    .is_valid(i)
+                    .then(|| docker_kind.value(i).to_string()),
+                created_at: created_at
+                    .is_valid(i)
+                    .then(|| created_at.value(i).to_string()),
+                containers_json: containers_json.value(i).to_string(),
+                shared_with_json: shared_with_json.value(i).to_string(),
+                dangling: dangling.value(i),
+                evidence_json: evidence_json.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
 // The typed history transitions
 // ---------------------------------------------------------------------
 
