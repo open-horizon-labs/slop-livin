@@ -27,11 +27,19 @@ past this to escalate to:
 
 ```sh
 swamp scope --json                                      # what's in scope, and why -- check this first
-swamp report <root> --view grown --json --since 24h   # what grew, plus coverage
+swamp observe <root> --since 24h                         # the only command that scans; run this first
+swamp report <root> --view grown --json                  # what grew, plus coverage
 swamp report <root> --view projects --json             # ranked project list
 swamp report <root> --view worktrees --json             # branch/idle/PR/merge facts
 swamp report --view agents --json                       # Claude Code (etc.) session/cache/log storage
 ```
+
+`swamp observe` is the *only* command that scans a filesystem or shells
+out; `swamp report` is a pure read of whatever the last `observe` wrote
+and never scans on its own. On a scope never observed, `report` prints
+`no observation yet for <scope>; run swamp observe` (`--json`:
+`{"error":"no_observation",...}`) and exits 2 -- run `observe` and
+re-run `report`, never assume a scan happened implicitly.
 
 `<root>` is the directory tree to scan (a `~/src`-style parent of
 several checkouts, or one checkout) and is optional: omit it and

@@ -86,7 +86,7 @@ install -m 755 target/release/swamp ~/.local/bin/
 
 ```bash
 swamp ui ~/src
-swamp report ~/src --since 24h
+swamp observe ~/src --since 24h
 swamp report ~/src --project api
 ```
 
@@ -114,10 +114,11 @@ Swamp reports; the human removes. There is no CLI command for propose/approve/ex
 
 ## Use it from an agent
 
-There is no separate server process, and no CLI command that deletes anything. `swamp report --json` and `--view <name> --json` print one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
+There is no separate server process, and no CLI command that deletes anything. `swamp observe` is the only command that scans; `swamp report --json` and `--view <name> --json` are a pure read of what it last wrote, printing one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
 
 ```bash
-swamp report ~/src --view grown --json --since 24h
+swamp observe ~/src --since 24h
+swamp report ~/src --view grown --json
 ```
 
 Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands and JSON schema. The skill and the CLI are entirely read-only: an agent can gather evidence and explain what removing something would cost, but there is no command left for it (or anyone) to run that would delete anything -- only a human, in the TUI or at a shell, does that. See [the trust model](skills/swamp/references/trust-model.md).

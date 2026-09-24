@@ -1,12 +1,20 @@
 # Commands and JSON contract
 
 Every command in this reference is noninteractive: it reads (and, for
-`report`/`observe`, writes) the growth store under `$SWAMP_DIR`
+`observe`, writes) the growth store under `$SWAMP_DIR`
 (default `~/.local/share/swamp`), prints exactly one JSON document to
 stdout when `--json` is given, and never prompts. Diagnostics, progress
 lines, and parse errors go to stderr only -- stdout is safe to pipe
 straight into `jq` or a JSON parser, and a nonzero exit means stdout is
 empty (no partial/malformed JSON document is ever printed).
+
+`swamp observe` is the *only* command that scans a filesystem, stats a
+header, or shells out (`du`, `gh`, `docker`): `swamp observe [--full] &&
+swamp report ...` is the shape every recipe below assumes. `swamp
+report` is a pure read of whatever the last `observe` wrote; on a scope
+that has never been observed it prints `no observation yet for <scope>;
+run swamp observe` (`--json`: `{"error":"no_observation","scope":...}`)
+and exits 2, rather than scanning to produce one.
 
 This table replaces the MCP server that shipped through v0.6.x
 (`crates/mcp`, removed in favor of this CLI + skill). Every MCP tool
@@ -16,11 +24,16 @@ just similar in spirit.
 
 | Former MCP tool | CLI equivalent |
 |---|---|
-| `report` (root, since, project, view, filter, dirs) | `swamp report <root> --json [--view V] [--project P] [--filter F] [--since S] [--dirs]` |
-| `what_grew` (root, since) | `swamp report <root> --view grown --json --since <S>` |
-| `list_projects` (root, since) | `swamp report <root> --view projects --json [--since S]` |
-| `list_worktrees` (root, since, filter) | `swamp report <root> --view worktrees --json [--filter F]` |
-| `docker_objects` (root, unowned_only, project) | `swamp report <root> --view docker --json [--unowned-only] [--project P]` |
+| `report` (root, since, project, view, filter, dirs) | `swamp observe <root> [--since S] && swamp report <root> --json [--view V] [--project P] [--filter F] [--dirs]` |
+| `what_grew` (root, since) | `swamp observe <root> --since <S> && swamp report <root> --view grown --json` |
+| `list_projects` (root, since) | `swamp observe <root> [--since S] && swamp report <root> --view projects --json` |
+| `list_worktrees` (root, since, filter) | `swamp observe <root> && swamp report <root> --view worktrees --json [--filter F]` |
+| `docker_objects` (root, unowned_only, project) | `swamp observe <root> && swamp report <root> --view docker --json [--unowned-only] [--project P]` |
+
+`since` now belongs to `observe`: growth/regrowth figures are fixed at
+the observation that computed them, from whichever window that pass
+used (its own `--since`, else `config.toml`'s `since`, else the
+hard-coded default). `report` has no `--since` of its own any more.
 
 There is no `propose`/`execute`/`plans`/`grant` command any more (removed
 2026-09-23, "swamp reports; the human removes"): the CLI's only
@@ -140,10 +153,12 @@ carries this key: nothing about its scope is ambiguous.
 describe the array's *unbounded* length and whether `--limit`/
 `--offset` cut anything off this page -- never assume a page is the
 whole answer without checking `truncated`. `since` is the window the
-call actually used (your `--since`, else `config.toml`'s, else the
-1h/24h/7d default) -- not just your raw argument, so a caller always
-knows what window its numbers reflect. `index_refreshed` is `false`
-only under `--no-observe`.
+*last observation* actually used (its own `--since`, else
+`config.toml`'s, else the 1h/24h/7d default) -- `report` takes no
+`--since` of its own, so this is always echoing back what `observe`
+computed with, not a per-`report`-call argument. `index_refreshed` is
+always `false`: `report` is a pure read (R12) and never persists a new
+observation itself.
 
 Views:
 

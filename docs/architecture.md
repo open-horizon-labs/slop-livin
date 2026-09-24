@@ -419,6 +419,64 @@ Before this, running them in sequence over an unchanged filesystem had
 each tombstoning the other's rows, and the next pass reported the
 resurrection as regrowth. Coverage changes are not storage changes.
 
+### `swamp report` is a pure read; `swamp observe` is the only scanner (R12, 2026-09-24)
+
+Two entry points, one direction of data flow: `swamp observe` is the
+only command that walks a filesystem, stats a header, or spawns a
+subprocess (`du`, `gh`, `docker`). It runs the full pipeline above --
+walk, project grouping, signals, evidence, external + agent discovery,
+GitHub/Docker enrichment -- through `report::observe_scope` with
+`ObservationParts::ALL`, and, on a pass that observed and persisted both
+unit families successfully, writes everything `swamp report`/the TUI
+need as one more stored Parquet current row:
+`growth::ReportSnapshot` (`<store>/report_rows.parquet`, one row per
+scope key from `report::scope_snapshot_key`): the fully assembled
+`Report` (evidence, tracking, Docker joins and growth/regrowth already
+attached -- nothing in it needs a fresh `stat` to render), the scope's
+per-root `coverage::RootCoverage` vector, and the external/agent unit
+vectors, JSON-encoded into `Utf8` cells exactly like
+`unowned.parquet`'s `evidence_json` column (a cell encoding, not a JSON
+file on disk).
+
+`swamp report` (`report::report_scope_from_store`) does the reverse:
+resolve the scope (a config read plus one presence `stat` per candidate
+root, never a recursive walk), compute its key, and read the stored
+snapshot back. No walk, no unit discovery, no subprocess -- CLI
+rendering (`render.rs`, `agent_json.rs`) runs unchanged over the
+deserialized `Report`. A scope with no stored snapshot is not an
+error to paper over: text prints `no observation yet for <scope>; run
+swamp observe` and exits 2; JSON prints
+`{"error":"no_observation","scope":...}`. `--since` moved to `observe`
+entirely -- growth/regrowth are fixed at the observation that computed
+them, from whichever `since` window that pass used (CLI override, else
+`config.toml`'s `since`, else the hard-coded default); `report` has no
+`--since` of its own.
+
+The TUI's instant-paint-on-startup cache (`swamp_tui::run`) reads the
+same `ReportSnapshot` instead of the old `last_report-<key>.json.zst`
+cache, and its background refresh (and the live-watch's own full
+rescans) call `observe_scope` exactly as before -- which now also
+leaves a fresh snapshot behind as a side effect, so the next `swamp
+report`/TUI startup sees it too. `observe_scope`'s narrowed, per-root
+live-watch refresh (`ObservationParts::WALK_ONLY`, one root only) does
+*not* write a snapshot: persisting a partial pass under the whole
+scope's key would silently drop the external/agent vectors the last
+full pass had. `--no-observe` is gone from every command (`report`,
+`ui`); `--full`/`--docker-facts`/`--verify-du`/`--enrich` moved from
+`report` to `observe` (`report --verify-du` still exists, but only to
+print whatever `du` total the last `observe --verify-du` stored --
+`report` never spawns `du` itself).
+
+The internal `last_report-<key>.json.zst` cache (`fs_gate::store::write_json`/
+`JsonFile::LastReport`) is a *different*, narrower thing that still
+exists: an incremental-walk optimization a few consumers
+(`consumers/cache.rs`, `consumers/cargo.rs`, `consumers/signals.rs`) use
+to diff against the previous pass's own artifact/cargo/signal state
+*during* a walk. It is not on `report`'s read path any more and never
+was the thing this section's `ReportSnapshot` replaces for the TUI; it
+stayed because deleting it would regress an unrelated incremental-walk
+optimization out of this chunk's scope.
+
 ### There is no recheck model at a destructive sink any more (retired 2026-09-23)
 
 `crate::recheck` and `crate::authority` are deleted along with the CLI
@@ -1200,7 +1258,7 @@ Enrichment gives measured bytes context for a decision. Its freshness differs by
 | Docker | Daemon facts are cached for five minutes; an enrichment run requests fresh facts. |
 | Git tracking | gitoxide reads the index and ignore rules; the exclude stack is reused for path queries within a checkout. |
 
-Plain `report` reads cached GitHub information. `observe` and `report --enrich` allow refreshes, subject to the cache policy and query budgets. Missing credentials, unknown facts, and query failures remain visible. Docker may still be queried by a normal report when its cache expires.
+`report` is a pure read (R12): it never queries GitHub or Docker itself, only whatever `enrich.parquet`/`docker_facts.json` the last `observe` left behind. `observe` (optionally `--enrich`, which forces a live GitHub refresh instead of trusting the cache's TTL) is the only command that queries either, subject to the cache policy and query budgets. Missing credentials, unknown facts, and query failures remain visible.
 
 Merge status is combined with clean/unpushed terms in `merge-complete`; it is evidence a user can inspect, not a permission to delete. The current `tip_reachable` term is derived from the merged result rather than a separate reachability proof.
 
@@ -1467,7 +1525,7 @@ function pointer on the event thread is rejected rather than followed.
 
 - Incremental filesystem work can be local, but report reconstruction, history reads, and changed current-file writes can still scale with the stored dataset.
 - Worktree identity is path-derived. Relative artifact paths do not make history portable across arbitrary moves or renamed remotes.
-- Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use explicit CLI `--since` values for window comparisons.
+- Growth filters use the report's precomputed values. A filter's window does not trigger a new baseline calculation; the TUI can display a filter window different from the configured report window. Use `swamp observe --since <window>` for an explicit window comparison (R12: `--since` is `observe`'s, not `report`'s).
 - Sibling scan roots keep independent physical stores (still true), but
   `report_scope` (#42) now merges their totals coherently for a
   multi-root `report`/`observe`/`ui` call: each root's bytes are summed

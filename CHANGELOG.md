@@ -4,6 +4,30 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### `swamp report` is a pure read; `swamp observe` is the only scanner
+
+`report` never walks a directory, stats a file, or spawns a subprocess
+any more: it reads back the stored snapshot the last `swamp observe`
+wrote (`report_rows.parquet`, one row per resolved scope, holding the
+fully assembled report plus per-root coverage and external/agent unit
+vectors) and renders it. `observe` now runs the full pipeline over the
+whole resolved scope in one coherent pass -- walk, project grouping,
+signals, evidence, Docker join, GitHub enrichment, external and agent
+discovery -- and persists all of it, including that snapshot.
+
+`--no-observe` is removed from `report` and `ui`. `--full`,
+`--docker-facts`, `--enrich`, and `--since` moved from `report` to
+`observe` (growth/regrowth are fixed at the observation that computed
+them, from whichever `since` window that pass used); `report --verify-du`
+stays, but only to print whatever `du` total the last `observe
+--verify-du` stored. On a scope that has never been observed, `report`
+prints `no observation yet for <scope>; run swamp observe` and exits 2
+(JSON: `{"error":"no_observation","scope":...}`) instead of silently
+scanning to produce one. The TUI's instant-paint-on-startup cache reads
+the same stored snapshot instead of a JSON sidecar; its background
+refresh (unchanged) leaves a fresh one behind for the next `report`/TUI
+start to read.
+
 ### Homebrew (a system-wide install tree) is off by default
 
 `Detector::default_enabled()` (default `true`) is a new axis, independent

@@ -51,10 +51,19 @@ are attached to each release as well.
 
 ## Observations and history
 
+`swamp observe` is the only command that scans: it walks the filesystem,
+groups projects, computes signals, discovers external/agent-tool
+storage, and persists all of it. `swamp report` is a pure read of what
+the last `observe` wrote -- it never walks a directory, stats a file, or
+spawns a subprocess. Run `observe` first; `report` on a scope that has
+never been observed prints `no observation yet for <scope>; run swamp
+observe` (JSON: `{"error":"no_observation", ...}`) and exits 2.
+
 ```bash
-swamp report ~/src --since 24h
-swamp report ~/src --since 7d --sort size --reverse
 swamp observe ~/src
+swamp observe ~/src --since 24h --full
+swamp report ~/src
+swamp report ~/src --sort size --reverse
 swamp schedule --every 15m ~/src   # LaunchAgent on macOS, systemd --user timer on Linux
 swamp schedule --every 1h --collector ~/src   # Linux: also keep a live change list
 swamp schedule
@@ -63,17 +72,15 @@ swamp collect ~/src                # Linux: watch in the foreground until Ctrl-C
 swamp collect --status --json ~/src
 ```
 
-`report` measures and persists by default. `observe` records data without rendering and permits GitHub enrichment. Scheduling runs that observation command; it does not delete anything.
+`observe` records data without rendering and permits GitHub enrichment (`--enrich` forces a live refresh). Scheduling runs that observation command; it does not delete anything.
 
 `swamp schedule` installs a per-user LaunchAgent on macOS. On Linux it installs `systemd --user` units instead: a timer that runs `swamp observe` on the interval and, with `--collector`, the collector as a user service. Neither needs root; lingering is never enabled for you, so without `loginctl enable-linger` both stop at logout and resume at the next login, and `swamp schedule` (status) says which. Where no systemd user manager is reachable -- a container, WSL without systemd, a shell outside a login session -- the command refuses, says so, and writes nothing; schedule `swamp observe` from cron instead. `--off` stops and removes only the units swamp wrote. `--collector` is refused on macOS, which does not need one.
 
 **Linux: the timer alone walks fully every time.** inotify keeps no history between processes, so each scheduled run reports `mode=full reason=no_persisted_change_history`. `swamp collect` -- run it yourself, or install it with `--collector` -- keeps a bounded change list while it runs, and an `observe`/`report` then walks only what changed. It stops being trusted, and the next run walks fully naming why, when it is not running (`collector_stopped`), after a reboot, when its watch lost events (`watch_queue_overflow`), hit the watch limit (`watch_limit_reached`) or could not read a directory (`watch_permission_gap`), when its exclusions differ from the observation's (`scope_changed`), or when the last observation predates it (`live_watch_gap`). `swamp collect --status [--json]` shows each root's epoch, coverage, dirty directories, inotify watches and their approximate kernel memory. See [Live watching and continuity](platform.md#live-watching-and-continuity-on-linux).
 
-History starts when swamp observes a root. `--since` selects a comparison window, defaulting to the `since` config value. Use seconds, minutes, hours, or days here: `30m`, `24h`, `7d`. The filter language also accepts weeks, but the CLI/config history-duration parser does not; use `7d` rather than `1w` for `--since`.
+History starts when swamp observes a root. `observe --since` selects the comparison window that pass's growth/regrowth figures use, defaulting to the `since` config value; `report` has no `--since` of its own -- it reads whatever window the last `observe` used. Use seconds, minutes, hours, or days here: `30m`, `24h`, `7d`. The filter language also accepts weeks, but the CLI/config history-duration parser does not; use `7d` rather than `1w` for `since`.
 
-`report --no-observe` skips persisting a new growth observation. It can still inspect the filesystem and consult enrichment caches; it is not a command for reading only cached JSON. The TUI's `--no-observe` uses its last cached report when one is available and disables the live watch.
-
-Use `--full` to force a full filesystem walk. A normal observation can also fall back to a full walk when event history is insufficient; the report notes explain why.
+Use `observe --full` to force a full filesystem walk. A normal observation can also fall back to a full walk when event history is insufficient; the report notes explain why.
 
 Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
 
@@ -472,6 +479,9 @@ Rows show size and signed growth. Red bars extend right for increases; green bar
 
 ## Report views
 
+Run `swamp observe ~/src` at least once before any of these -- `report`
+never scans on its own (R12).
+
 ```bash
 swamp report ~/src --all
 swamp report ~/src --project api
@@ -575,10 +585,10 @@ The CLI's *text* rendering applies `--filter` only to the root `--view worktrees
 `--json`, with or without `--view`, applies `--filter` (when given) to the whole report before computing any output, and scopes to `--project` when given -- narrower than an unfiltered dump and consistent between the full report and every named view:
 
 ```bash
-swamp report ~/src --json --no-observe | jq '.summary.by_type'
-swamp report ~/src --json --no-observe | jq '.reconciliation'
-swamp report ~/src --view grown --json --since 24h --filter 'kind:BuildOutput' | jq '.result.grown'
-swamp report ~/src --json --no-observe |
+swamp report ~/src --json | jq '.summary.by_type'
+swamp report ~/src --json | jq '.reconciliation'
+swamp report ~/src --view grown --json --filter 'kind:BuildOutput' | jq '.result.grown'
+swamp report ~/src --json |
   jq '[.projects[].worktrees[].artifacts[] | select(.growth_bytes > 1000000000) | {path, growth_bytes}]'
 ```
 
@@ -590,7 +600,7 @@ Filesystem reconciliation and Docker accounting are separate. `--verify-du` adds
 
 Supported interfaces share the core parser, but apply predicates to their own row types. Combine predicates with spaces:
 
-Growth predicates filter the report's already-computed growth values. Their `in <duration>` clause does not currently recompute the baseline. For an explicit comparison, set CLI `--since` to the same window. The TUI obtains its report window from configuration; changing the filter form's window can change the displayed label without changing those measurements. Use the CLI for an explicit window until that UI behavior is corrected.
+Growth predicates filter the report's already-computed growth values. Their `in <duration>` clause does not currently recompute the baseline. For an explicit comparison, run `swamp observe --since <window>` before `report` (window moved to `observe`, R12). The TUI obtains its report window from configuration; changing the filter form's window can change the displayed label without changing those measurements.
 
 | Expression | Meaning |
 |---|---|
@@ -788,21 +798,23 @@ contract: `skills/swamp/references/commands-and-json.md`.
 
 | Command | Main flags | Result |
 |---|---|---|
-| `report <root> --json` | `--since`, `--project`, `--view`, `--filter`, `--dirs`, `--limit`/`--offset` | Full report or named view, bounded |
-| `report <root> --view grown --json` | Required `--since` for a meaningful window | Growing artifacts plus coverage/history information |
-| `report <root> --view projects --json` | `--since` | Ranked project summaries |
+| `report <root> --json` | `--project`, `--view`, `--filter`, `--dirs`, `--limit`/`--offset` | Full report or named view, bounded |
+| `report <root> --view grown --json` | -- | Growing artifacts (from the last `observe --since` window) plus coverage/history information |
+| `report <root> --view projects --json` | -- | Ranked project summaries |
 | `report <root> --view worktrees --json` | `--filter` | Worktree and GitHub facts |
 | `report <root> --view docker --json` | `--project`, `--unowned-only` | Docker objects and attribution |
 
-`report --json` can record new observations (skip with `--no-observe`).
-It uses cached GitHub facts and may refresh Docker's cache. Result
-metadata differs by view; do not assume every response includes the
-same history fields -- check `skills/swamp/references/commands-and-json.md`.
+`report --json` is a pure read: it never records a new observation, never
+shells out, and never re-derives GitHub/Docker facts -- run `swamp
+observe` (optionally `--enrich`) first. Result metadata differs by view;
+do not assume every response includes the same history fields -- check
+`skills/swamp/references/commands-and-json.md`.
 
 Example calls, with an illustrative root:
 
 ```bash
-swamp report /Users/you/src --view grown --json --since 7d
+swamp observe /Users/you/src --since 7d
+swamp report /Users/you/src --view grown --json
 swamp report /Users/you/src --view builds --json --filter 'type:rust size > 1GB'
 ```
 
