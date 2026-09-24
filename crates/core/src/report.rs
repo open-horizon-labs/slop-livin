@@ -1095,8 +1095,17 @@ pub fn report_full_mode_with_exclusions(
 /// that knows the scope; every other entry point keeps `true`, since a
 /// scope-less single-root call has nothing to consult and its behavior
 /// must not change (the 2026-09-22 re-review's CE6).
+///
+/// `pub`, not `pub(crate)`: an integration test exercising the build
+/// adapters over a disposable fixture must be able to say
+/// `docker_in_scope: false` explicitly, rather than inherit whatever
+/// Docker daemon happens to be running on the machine the test executes
+/// on (stack/26's build_adapter_history root-cause -- see that test
+/// file's `observe` helper). Every existing caller keeps calling
+/// `report_full_mode_with_source`/`_with_exclusions`, which still hand
+/// this `true` unconditionally.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn report_full_mode_scoped(
+pub fn report_full_mode_scoped(
     root: &Path,
     docker_facts: Option<&Path>,
     verify_du: bool,
