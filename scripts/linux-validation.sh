@@ -11,11 +11,13 @@
 #   install-to-first-report, initial full scan, unchanged scan under a
 #   live collector, a one-subtree mutation, a process-stopped gap, a real
 #   inotify queue overflow and its recovery, watch memory and on-disk
-#   state size; checks the CLI --json contract, a reviewed disposable
-#   cleanup (propose -> approve -> execute -> freedesktop Trash, restore
-#   record present), and the scheduled/collector lifecycle through the
-#   runner's systemd user manager where one is reachable (recorded as
-#   unavailable, with the reason, where it is not).
+#   state size; checks the CLI --json contract, that a DependencyTree
+#   unit is reported with its facts (swamp reports; the human removes,
+#   in the TUI or by hand -- the CLI has no propose/approve/execute any
+#   more, so this validation is read-only too), and the
+#   scheduled/collector lifecycle through the runner's systemd user
+#   manager where one is reachable (recorded as unavailable, with the
+#   reason, where it is not).
 set -euo pipefail
 
 archive="${1:?archive}"
@@ -184,21 +186,23 @@ kill -TERM "$collector_pid"; wait "$collector_pid" || true; collector_pid=""
 
 say "on_disk_state: store=$(du -sb "$SWAMP_DIR" | cut -f1) bytes; continuity=$(du -cb "$SWAMP_DIR"/continuity/*.json | tail -1 | cut -f1) bytes"
 
-# --- reviewed disposable cleanup into the freedesktop Trash ----------
-plan="$("$bin" propose "$root" --json --filter 'kind:DependencyTree' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-"$bin" approve "$plan" >/dev/null
-"$bin" execute "$plan" --json > "$work/exec.json"
-python3 - "$work/exec.json" "$XDG_DATA_HOME" <<'PY' | tee -a "$report"
-import json, os, sys
+# --- a DependencyTree unit is reported, with its facts (read-only) ---
+# There is no CLI propose/approve/execute any more (swamp reports; the
+# human removes, in the TUI or by hand): the freedesktop Trash mover
+# itself is exercised by swamp-core's own `linux_trash.rs` unit tests,
+# not by this packaged-binary validation. What this script can and does
+# check is that the packaged binary's read-only surface reports a
+# DependencyTree unit's facts correctly on this machine.
+"$bin" report "$root" --json --no-observe > "$work/deps.json"
+python3 - "$work/deps.json" <<'PY' | tee -a "$report"
+import json, sys
 d = json.load(open(sys.argv[1]))
-done = [o for o in d["outcomes"] if o["status"] == "completed"]
-assert done, d
-info = os.path.join(sys.argv[2], "Trash", "info")
-records = os.listdir(info) if os.path.isdir(info) else []
-assert records, "no .trashinfo written"
-text = open(os.path.join(info, records[0])).read()
-assert text.startswith("[Trash Info]\nPath=/") and "DeletionDate=" in text, text
-print(f"cleanup: {len(done)} unit(s) moved to the freedesktop Trash with {len(records)} restore record(s); recovery_location={done[0]['recovery_location']}")
+rows = [r for p in d["projects"] for wt in p["worktrees"] for r in wt["artifacts"] if r["kind"] == "DependencyTree"]
+assert rows, d
+row = rows[0]
+assert row["bytes"] > 0, row
+assert row["evidence"], "no decision evidence attached to the reported unit"
+print(f"report: {len(rows)} DependencyTree unit(s) reported; first is {row['path']} ({row['bytes']} bytes, {len(row['evidence'])} evidence fact(s))")
 PY
 
 # --- scheduled / collector lifecycle through systemd --user ----------
