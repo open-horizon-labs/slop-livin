@@ -11,22 +11,41 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use swamp_core::growth::load_config;
-use swamp_core::report::observe_only;
+use swamp_core::report::ObservationParts;
 use swamp_core::schedule::{
     self, LockOutcome, RunOutcome, acquire_lock, append_log, log_file, write_last_run,
 };
 
-/// `swamp observe <root>...`. Exits 0 on success, on a graceful
+/// `swamp observe [root...]`. Exits 0 on success, on a graceful
 /// "another observation is running" skip, and even on a timeout/error --
-/// only in-process misuse (e.g. no roots given) is a hard error, since a
-/// launchd-triggered run should never wedge into a retry storm.
-pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) -> Result<()> {
-    if roots.is_empty() {
-        bail!("observe needs at least one root");
-    }
-
+/// only in-process misuse is a hard error, since a launchd-triggered run
+/// should never wedge into a retry storm.
+///
+/// R12: the *only* command that scans. One coherent
+/// `report::observe_scope` call over the whole resolved `scope` --
+/// walk, project grouping, signals, enrichment, external + agent
+/// discovery, evidence, store interiors -- persists everything
+/// `swamp report`/the TUI need as stored Parquet current rows
+/// (including the rendered snapshot in `report_rows.parquet`,
+/// written by `observe_scope` itself). `swamp report` never runs any
+/// of this; it only reads what this call leaves behind.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_observe(
+    store_dir: PathBuf,
+    scope: swamp_core::scope::EffectiveScope,
+    force_full: bool,
+    docker_facts: Option<PathBuf>,
+    verify_du: bool,
+    since: Option<String>,
+    enrich: bool,
+) -> Result<()> {
     let config = load_config(&store_dir);
     let timeout = Duration::from_secs(config.observe_timeout_sec.max(1));
+    let retention_days = config.retention_days;
+    let since_secs = since
+        .as_deref()
+        .and_then(swamp_core::growth::parse_duration_secs)
+        .unwrap_or(24 * 3600);
 
     let lock = match acquire_lock(&store_dir)? {
         LockOutcome::Acquired(guard) => guard,
@@ -38,75 +57,69 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) ->
 
     let start = Instant::now();
     let (tx, rx) = mpsc::channel();
-    let work_roots = roots.clone();
     let work_dir = store_dir.clone();
     thread::spawn(move || {
-        let mut summaries = Vec::new();
-        let mut failure: Option<String> = None;
-        for root in &work_roots {
-            match observe_only(root, &work_dir, None, force_full) {
-                Ok(summary) => summaries.push((root.clone(), summary)),
-                Err(e) => {
-                    failure = Some(e.to_string());
-                    break;
-                }
-            }
-        }
+        let res = swamp_core::report::observe_scope(
+            &scope,
+            ObservationParts::ALL,
+            None,
+            docker_facts.as_deref(),
+            verify_du,
+            Some(&work_dir),
+            since.as_deref(),
+            true,
+            true, // include_dirs: `report`/the TUI need the dir rows stored too
+            enrich,
+            force_full,
+            swamp_core::fs_events::platform_source().as_ref(),
+            retention_days,
+            since_secs,
+        );
         // The receiver may already be gone if we timed out; that's fine,
         // the thread just finishes its work and exits.
-        let _ = tx.send((summaries, failure));
+        let _ = tx.send(res);
     });
 
     match rx.recv_timeout(timeout) {
-        Ok((summaries, failure)) => {
+        Ok(Ok(observation)) => {
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
+            let merged = &observation.merged;
+            let fsevents_line = merged
+                .notes
+                .iter()
+                .find_map(|n| n.strip_prefix("fsevents: "))
+                .map(str::to_string)
+                .unwrap_or_else(|| "mode=full reason=no_store changed_dirs=0".to_string());
+            let mode = fsevents_line
+                .strip_prefix("mode=")
+                .and_then(|s| s.split(' ').next())
+                .unwrap_or("full")
+                .to_string();
+            let github = merged.github_enrichment.clone().unwrap_or_default();
+            let walked_total = merged.reconciliation.walked_total;
+            let projects = merged.projects.len();
 
-            if let Some(msg) = failure {
-                let outcome = RunOutcome {
-                    observed_at: now,
-                    wall_ms,
-                    walked_total: 0,
-                    projects: 0,
-                    mode: "full".to_string(),
-                    outcome: format!("error({msg})"),
-                };
-                append_log(&log_file(), &outcome)?;
-                let _ = write_last_run(&store_dir, &outcome);
-                drop(lock);
-                eprintln!("observe failed: {msg}");
-                std::process::exit(1);
-            }
-
-            for (root, summary) in &summaries {
+            println!(
+                "observed_at={} wall_ms={wall_ms} walked_total={walked_total} projects={projects} external_units={} agent_units={} {fsevents_line}",
+                merged.observed_at,
+                observation.external_units.len(),
+                observation.agent_units.len(),
+            );
+            for c in &observation.coverage {
                 println!(
-                    "root={} observed_at={} wall_ms={} walked_total={} projects={} {}",
-                    root.display(),
-                    summary.observed_at,
-                    wall_ms,
-                    summary.walked_total,
-                    summary.projects,
-                    summary.fsevents_line
-                );
-                println!(
-                    "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
-                    summary.github.calls_made,
-                    summary.github.worktrees_enriched,
-                    summary.github.elapsed_secs
+                    "  root={} mode={} walked_total={} projects={}",
+                    c.path.display(),
+                    if c.mode.is_empty() { "-" } else { &c.mode },
+                    c.walked_total,
+                    c.projects
                 );
             }
+            println!(
+                "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
+                github.calls_made, github.worktrees_enriched, github.elapsed_secs
+            );
 
-            let walked_total: u64 = summaries.iter().map(|(_, s)| s.walked_total).sum();
-            let projects: usize = summaries.iter().map(|(_, s)| s.projects).sum();
-            // When several roots were observed, the run's overall mode is
-            // "incremental" only if every one of them was; one full walk
-            // in the batch means the whole run's cost is dominated by it.
-            let mode = if summaries.iter().all(|(_, s)| s.mode == "incremental") {
-                "incremental"
-            } else {
-                "full"
-            }
-            .to_string();
             let outcome = RunOutcome {
                 observed_at: now,
                 wall_ms,
@@ -119,6 +132,23 @@ pub fn cmd_observe(store_dir: PathBuf, roots: Vec<PathBuf>, force_full: bool) ->
             write_last_run(&store_dir, &outcome)?;
             drop(lock);
             Ok(())
+        }
+        Ok(Err(e)) => {
+            let wall_ms = start.elapsed().as_millis() as u64;
+            let now = swamp_core::entities::now();
+            let outcome = RunOutcome {
+                observed_at: now,
+                wall_ms,
+                walked_total: 0,
+                projects: 0,
+                mode: "full".to_string(),
+                outcome: format!("error({e})"),
+            };
+            append_log(&log_file(), &outcome)?;
+            let _ = write_last_run(&store_dir, &outcome);
+            drop(lock);
+            eprintln!("observe failed: {e}");
+            std::process::exit(1);
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let wall_ms = start.elapsed().as_millis() as u64;

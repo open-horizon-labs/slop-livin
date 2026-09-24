@@ -141,9 +141,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     }
 }
 
-/// Runs the interactive UI against `root`. `no_observe` skips persisting
-/// a new observation (read-only report, same as `swamp report
-/// --no-observe`).
+/// Runs the interactive UI against `root`.
 /// How far back the store can answer for `root`'s volume. Growth windows
 /// are bounded by it: a 7d window over 4h of observations would report a
 /// week of growth that was never observed.
@@ -186,7 +184,7 @@ fn store_dir() -> PathBuf {
         .to_path_buf()
 }
 
-pub fn run(root: &Path, no_observe: bool) -> Result<()> {
+pub fn run(root: &Path) -> Result<()> {
     let store = store_dir();
     let root = swamp_core::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // The authorized scope for this invocation, resolved once with the
@@ -196,21 +194,24 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
     // just to whichever one happened to be written first
     // (`.oh/guardrails/tui-refresh-preserves-scope.md`).
     let scope = resolved_scope(&store, std::slice::from_ref(&root));
-    // Paint the last cached report immediately (milliseconds); observe in
-    // the background and swap the result in. With no cache yet, the first
-    // observation has to happen before there is anything to show.
-    let cached = swamp_core::report::load_last_report(&store, &root);
+    // Paint the last stored observation immediately (milliseconds, a
+    // read of `report_rows.parquet` -- no walk); observe in the
+    // background and swap the result in. With no stored snapshot yet,
+    // the first observation has to happen before there is anything to
+    // show (R12: the TUI never walks to produce its own instant paint,
+    // same discipline as `swamp report`).
+    let cached = scope
+        .as_ref()
+        .and_then(|s| swamp_core::report::report_scope_from_store(s, &store).ok());
     let mut app = match cached {
-        Some(r) if no_observe => {
-            let mut a = App::new(r, root.clone());
-            a.observed_label = "from last observation".into();
-            a
-        }
-        Some(r) => {
-            let mut a = App::new(r, root.clone());
+        Some(snapshot) => {
+            let mut a = App::new(snapshot.report, root.clone());
             a.observed_label = "from last observation".into();
             a.observing = Some((0, 0));
             a.scope = scope.clone();
+            a.set_external_units(snapshot.external_units);
+            a.set_store_interiors(snapshot.store_interiors);
+            a.set_agent_units(snapshot.agent_units);
             let (tx, rx) = std::sync::mpsc::channel();
             let (scope2, store2) = (scope.clone(), store.clone());
             let (roots, cache) = (a.roots.clone(), a.reports_by_root.clone());
@@ -272,7 +273,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
                 false,
                 Some(&store),
                 None,
-                !no_observe,
+                true,
                 true, // include_dirs: Source rows expand into their own directories
                 false,
                 false,
@@ -313,7 +314,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
             );
             coverage_from_scope(&scope)
         });
-    finish_startup(&mut app, &store, no_observe, coverage.as_deref());
+    finish_startup(&mut app, &store, coverage.as_deref());
     run_terminal_loop(&mut app)
 }
 
@@ -335,7 +336,7 @@ pub fn run(root: &Path, no_observe: bool) -> Result<()> {
 /// unchanged multi-root scope opens about as fast as a cached paint
 /// would have, without needing a second, parallel "merge fresh results
 /// into a cached multi-root report" bootstrap path.
-pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) -> Result<()> {
+pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
     let store = store_dir();
     let present_roots = scope.scan_paths();
     anyhow::ensure!(
@@ -350,7 +351,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
         false,
         Some(&store),
         None,
-        !no_observe,
+        true,
         true, // include_dirs: Source rows expand into their own directories
         false,
         false,
@@ -366,7 +367,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope, no_observe: bool) ->
     app.set_agent_units(observation.agent_units);
     app.scope = Some(scope.clone());
     app.observed_label = "just now".into();
-    finish_startup(&mut app, &store, no_observe, Some(&coverage));
+    finish_startup(&mut app, &store, Some(&coverage));
     run_terminal_loop(&mut app)
 }
 
@@ -416,7 +417,6 @@ fn coverage_from_scope(
 fn finish_startup(
     app: &mut App,
     store: &Path,
-    no_observe: bool,
     coverage: Option<&[swamp_core::coverage::RootCoverage]>,
 ) {
     app.store_dir = Some(store.to_path_buf());
@@ -429,9 +429,7 @@ fn finish_startup(
     if let Some(c) = coverage {
         app.set_scope_note(c);
     }
-    if !no_observe {
-        app.start_watch();
-    }
+    app.start_watch();
     // Multi-root history windows are bounded by the *primary* root's own
     // history for now (`App::root`, `roots[0]`) -- a per-root history
     // bound is a real, named simplification (see this chunk's session

@@ -16,7 +16,7 @@ use swamp_core::{
         render_types, render_view_builds, render_view_deps, render_view_docker,
         render_view_reconciliation, render_view_unowned, render_worktree_signals, render_worktrees,
     },
-    report::{Report, report_full_mode},
+    report::Report,
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -123,9 +123,6 @@ enum Command {
         /// root when omitted (see `swamp scope`); an explicit root
         /// still replaces the configured scope for this invocation.
         root: Option<PathBuf>,
-        /// Skip persisting a new observation; render the last one.
-        #[arg(long)]
-        no_observe: bool,
     },
     Scan {
         #[arg(default_value = ".")]
@@ -133,7 +130,11 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Project x worktree x artifact growth report.
+    /// Project x worktree x artifact growth report -- a pure read of
+    /// what `swamp observe` last wrote (R12): never walks a directory,
+    /// stats a file, or spawns a subprocess. Exits 2 (JSON:
+    /// `{"error":"no_observation", ...}`) when the scope has never been
+    /// observed; run `swamp observe` first.
     Report {
         /// Defaults to the configured effective scope's first present
         /// root when omitted (see `swamp scope`); an explicit root
@@ -142,19 +143,11 @@ enum Command {
         root: Option<PathBuf>,
         #[arg(long)]
         json: bool,
-        #[arg(long)]
-        docker_facts: Option<PathBuf>,
-        /// Also run `du -skPx` on the root as an independent total (slow).
+        /// Print the `du -skPx` total the last `swamp observe
+        /// --verify-du` stored, when present. Never runs `du` itself --
+        /// `report` never spawns a subprocess.
         #[arg(long)]
         verify_du: bool,
-        /// How far back to look for the growth baseline (e.g. "24h",
-        /// "30m", "7d"). Overrides the `since` setting in config.toml.
-        #[arg(long)]
-        since: Option<String>,
-        /// Skip persisting this observation into the growth store; the
-        /// report is read-only and growth/regrowth stay unset.
-        #[arg(long)]
-        no_observe: bool,
         /// Drill into one project: worktree -> kind -> path -> bytes ->
         /// growth -> regrowth -> signals. Text output only.
         #[arg(long)]
@@ -180,13 +173,6 @@ enum Command {
         /// by `--view worktrees` at root.
         #[arg(long)]
         filter: Option<String>,
-        /// Refresh GitHub enrichment live before reading it, instead of
-        /// reading `enrich.parquet` as-is. By default `report` never
-        /// shells out to `gh` -- run `swamp observe` (or wait for
-        /// the schedule) to keep the cache warm, and reach for this flag
-        /// only when you're fine waiting on live calls right now.
-        #[arg(long)]
-        enrich: bool,
         /// Show every project row instead of the default top-N. Text
         /// output only.
         #[arg(long)]
@@ -206,10 +192,6 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
-        /// Skip the FSEvents-driven incremental attempt and force a full
-        /// walk (also re-anchors the stored event id for next time).
-        #[arg(long)]
-        full: bool,
         /// Order of the overview's project rows: growth (default), size,
         /// name, type (grouped by ecosystem), age (oldest artifact first).
         #[arg(long, value_enum, default_value = "growth")]
@@ -249,6 +231,24 @@ enum Command {
         /// walk (also re-anchors the stored event id for next time).
         #[arg(long)]
         full: bool,
+        #[arg(long)]
+        docker_facts: Option<PathBuf>,
+        /// Also run `du -skPx` on each root as an independent total
+        /// (slow); `swamp report --verify-du` prints whatever this
+        /// stores.
+        #[arg(long)]
+        verify_du: bool,
+        /// How far back to look for the growth baseline (e.g. "24h",
+        /// "30m", "7d"). Overrides the `since` setting in config.toml.
+        #[arg(long)]
+        since: Option<String>,
+        /// Refresh GitHub enrichment live before persisting it, instead
+        /// of leaving `enrich.parquet` as-is. Every `swamp observe`
+        /// already shells out to `gh` for enrichment (see the command's
+        /// own doc); this additionally forces a live refresh rather
+        /// than trusting the cache's TTL.
+        #[arg(long)]
+        enrich: bool,
     },
     /// Linux: watch the scope's roots with inotify until stopped and keep
     /// a bounded change list, so a later `observe`/`report` can walk only
@@ -361,55 +361,6 @@ fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveSco
         &registry,
         swamp_core::entities::now(),
     ))
-}
-
-/// For the single-root commands (`report`, `ui`) that have not yet
-/// adopted full multi-root observation (#42/#50 -- see
-/// `.oh/sessions/2026-09-21-scope-and-detector-registry.md`): resolves
-/// the configured scope and picks its first present root, noting on
-/// stderr when more than one root is actually in scope. Multi-root
-/// commands (`observe`, `schedule`) use `resolve_scope(...).scan_paths()`
-/// directly instead of this function.
-fn resolve_single_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let explicit_roots: Vec<PathBuf> = explicit.into_iter().collect();
-    let scope = resolve_scope(&explicit_roots)?;
-    if !explicit_roots.is_empty() {
-        return match scope.roots.first() {
-            Some(r)
-                if matches!(
-                    r.status,
-                    swamp_core::scope::RootStatus::Present | swamp_core::scope::RootStatus::Missing
-                ) =>
-            {
-                Ok(r.path.clone())
-            }
-            Some(r) => anyhow::bail!(
-                "root {} is not in scope ({:?}); configured exclusions apply to explicit roots too -- see `swamp scope --json`",
-                r.path.display(),
-                r.status
-            ),
-            None => anyhow::bail!("no root given"),
-        };
-    }
-    let present = scope.scan_paths();
-    if present.is_empty() {
-        if scope.is_empty_scope() {
-            anyhow::bail!(
-                "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
-            );
-        }
-        anyhow::bail!(
-            "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
-        );
-    }
-    if present.len() > 1 {
-        eprintln!(
-            "note: configured scope has {} present roots; using {} (the first). Full multi-root reporting is #50's job -- see `swamp scope --json`, or `swamp observe`/`swamp schedule` for multi-root observation.",
-            present.len(),
-            present[0].display()
-        );
-    }
-    Ok(present[0].clone())
 }
 
 /// Persists the just-resolved scope and, when a previous one exists,
@@ -645,35 +596,6 @@ fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option
     )
 }
 
-/// The CLI's one route into `report::observe_scope`, with this binary's
-/// fixed arguments (no Docker facts, no `du` verification, no directory
-/// rows, no enrichment) filled in.
-fn observe_for_cli(
-    scope: &swamp_core::scope::EffectiveScope,
-    want: swamp_core::report::ObservationParts,
-    base: Option<swamp_core::report::Report>,
-    store_dir: &Path,
-    observe: bool,
-    since_secs: u64,
-) -> Result<swamp_core::report::ScopeObservation> {
-    swamp_core::report::observe_scope(
-        scope,
-        want,
-        base,
-        None,
-        false,
-        Some(store_dir),
-        None,
-        observe,
-        false,
-        false,
-        false,
-        swamp_core::fs_events::platform_source().as_ref(),
-        swamp_core::growth::load_config(store_dir).retention_days,
-        since_secs,
-    )
-}
-
 /// The bounded, documented JSON contract behind `report --json` (see
 /// `skills/swamp/references/commands-and-json.md`): with `--view`, an
 /// envelope `{view, project, result, observed_at, since,
@@ -782,7 +704,7 @@ fn report_json_envelope(
                 "observed_at": observed_at,
                 "since": since_str,
                 "index_refreshed": index_refreshed,
-                "history": swamp_core::agent_json::history_block(&store_dir, root, since),
+                "history": swamp_core::agent_json::history_block(&store_dir, root, Some(&since_str)),
             });
         }
         return Ok(envelope);
@@ -826,13 +748,10 @@ fn report_json_envelope(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Ui {
-        root: None,
-        no_observe: false,
-    }) {
-        Command::Ui { root, no_observe } => {
+    match cli.command.unwrap_or(Command::Ui { root: None }) {
+        Command::Ui { root } => {
             if let Some(explicit) = root {
-                swamp_tui::run(&explicit, no_observe)?;
+                swamp_tui::run(&explicit)?;
             } else {
                 // No explicit root: the TUI opens the *whole* configured
                 // multi-root scope (#51) -- project/shared/external/
@@ -851,10 +770,8 @@ fn main() -> Result<()> {
                         "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
                     );
                 }
-                if !no_observe {
-                    note_and_persist_scope(&swamp_dir(), &scope);
-                }
-                swamp_tui::run_scope(&scope, no_observe)?;
+                note_and_persist_scope(&swamp_dir(), &scope);
+                swamp_tui::run_scope(&scope)?;
             }
         }
         Command::Scan { root, store } => {
@@ -871,21 +788,16 @@ fn main() -> Result<()> {
         Command::Report {
             root,
             json,
-            docker_facts,
             verify_du,
-            since,
-            no_observe,
             project,
             kinds,
             view,
             worktree,
             filter: filter_expr,
-            enrich,
             all,
             docker,
             dirs,
             depth,
-            full,
             sort,
             reverse,
             limit,
@@ -905,122 +817,60 @@ fn main() -> Result<()> {
                     None
                 }
             });
-            // The growth store is always consulted, even under
-            // `--no-observe`: growth is read from whatever prior
-            // observations already exist there (item 5), and only the
-            // *write* of a new observation is skipped. GitHub enrichment
-            // is a separate opt-in (`--enrich`): plain `report` never
-            // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = swamp_dir();
-            let progress =
-                spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
-            // An explicit root replaces the configured scope entirely and
-            // stays on the single-root path (#42's "a single explicit
-            // root is just a scope of one"); with no explicit root, the
-            // whole configured scope is observed coherently in one call
-            // (#42/#50) instead of only its first present root.
-            let (r, coverage) = if let Some(explicit) = &explicit_root {
-                let root = resolve_single_root(Some(explicit.clone()))?;
-                let r = report_full_mode(
-                    &root,
-                    docker_facts.as_deref(),
-                    verify_du,
-                    Some(&store_dir),
-                    since.as_deref(),
-                    !no_observe,
-                    dirs,
-                    enrich,
-                    full,
-                );
-                (r, Vec::new())
-            } else {
-                let scope = resolve_scope(&[])?;
-                if scope.scan_paths().is_empty() {
-                    if scope.is_empty_scope() {
-                        anyhow::bail!(
-                            "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
-                        );
-                    }
+            // R12: `report` is a pure read. The scope this invocation
+            // names (an explicit root is a scope of one, #42) is
+            // resolved only to know *which* stored snapshot to read and
+            // how to describe it if there is none -- resolving a scope
+            // stats each candidate root for presence but never walks
+            // one, so this is not the "no filesystem walk" the pipeline
+            // otherwise avoids.
+            let scope_roots: Vec<PathBuf> = explicit_root.clone().into_iter().collect();
+            let scope = resolve_scope(&scope_roots)?;
+            if scope.scan_paths().is_empty() {
+                if scope.is_empty_scope() {
                     anyhow::bail!(
-                        "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
                     );
                 }
-                // Coverage notes reflect the whole configured scope
-                // (#41's "explain effective coverage and baseline
-                // changes").
-                if !no_observe {
-                    note_and_persist_scope(&store_dir, &scope);
+                anyhow::bail!(
+                    "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            let snapshot = match swamp_core::report::report_scope_from_store(&scope, &store_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "error": "no_observation",
+                                "scope": e.scope_description,
+                            }))?
+                        );
+                    } else {
+                        eprintln!("{e}");
+                    }
+                    std::process::exit(2);
                 }
-                swamp_core::report::report_scope(
-                    &scope,
-                    docker_facts.as_deref(),
-                    verify_du,
-                    Some(&store_dir),
-                    since.as_deref(),
-                    !no_observe,
-                    dirs,
-                    enrich,
-                    full,
-                )
-                .map(|(r, c)| (Ok(r), c))
-                .unwrap_or_else(|e| (Err(e), Vec::new()))
             };
-            progress.stop();
-            let r = r?;
+            let r = snapshot.report;
+            // An explicit root is a scope of one (#42): it never carried
+            // scope-level coverage noise even when the underlying pass
+            // is now the same coherent scope pipeline the catalog uses,
+            // so that contract is preserved here rather than in storage.
+            let coverage = if explicit_root.is_some() {
+                Vec::new()
+            } else {
+                snapshot.coverage
+            };
+            let external_units = snapshot.external_units;
+            let agent_units = snapshot.agent_units;
+            let store_interiors = snapshot.store_interiors;
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
             }
-            // External units (#43) and agent-tool storage (#91/#92/#100)
-            // are detector-resolved, not derived from the walked
-            // root(s): resolved against the configured scope so both
-            // views work the same whether `report` was scoped to the
-            // catalog or to an explicit root.
-            //
-            // They come from `report::observe_scope`, the one
-            // observation that owns discovery, with `r` handed in as its
-            // base so no second walk happens
-            // (`.oh/guardrails/discovery-owned-by-report-pipeline.md`).
-            // Before this the CLI ran each pass itself, against a scope
-            // it re-resolved locally, in an order nobody declared --
-            // which is exactly what let the two tombstone each other's
-            // rows in the shared history table.
-            //
-            // Which parts are asked for is unchanged: external units for
-            // `--view external`; agent units for `--view agents` *and*
-            // for any project-scoped query, so the project tree's
-            // collapsed "Agent storage (linked)" row and
-            // `--project NAME --json`'s linked units are never silently
-            // missing just because `--view agents` was not also passed
-            // (#100's project-linkage acceptance). Aider's per-repo
-            // units (#96) need every known worktree root, which `r`
-            // already carries.
-            let want = swamp_core::report::ObservationParts {
-                external: view == Some(View::External),
-                agents: view == Some(View::Agents) || project.is_some(),
-            };
-            let (r, external_units, agent_units, store_interiors) =
-                if want == swamp_core::report::ObservationParts::WALK_ONLY {
-                    (r, Vec::new(), Vec::new(), Vec::new())
-                } else {
-                    let observation = observe_for_cli(
-                        &resolve_scope(&[])?,
-                        want,
-                        Some(r),
-                        &store_dir,
-                        !no_observe,
-                        since
-                            .as_deref()
-                            .and_then(swamp_core::growth::parse_duration_secs)
-                            .unwrap_or(24 * 3600),
-                    )?;
-                    (
-                        observation.merged,
-                        observation.external_units,
-                        observation.agent_units,
-                        observation.store_interiors,
-                    )
-                };
             if !json
                 && r.projects
                     .iter()
@@ -1029,7 +879,7 @@ fn main() -> Result<()> {
                     .any(|a| a.dedup_stale)
             {
                 eprintln!(
-                    "Unique-byte totals were not recomputed this pass; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
+                    "Unique-byte totals were not recomputed this pass; use `swamp observe --full` to reconcile. Allocated sizes are current and may count hardlinks multiple times."
                 );
             }
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
@@ -1049,8 +899,8 @@ fn main() -> Result<()> {
                         view,
                         project.as_deref(),
                         parsed_filter.as_ref(),
-                        since.as_deref(),
-                        !no_observe,
+                        None,
+                        false,
                         unowned_only,
                         limit,
                         offset,
@@ -1238,11 +1088,17 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Observe { roots, full } => {
+        Command::Observe {
+            roots,
+            full,
+            docker_facts,
+            verify_du,
+            since,
+            enrich,
+        } => {
             let store_dir = swamp_dir();
             let scope = resolve_scope(&roots)?;
-            let resolved = scope.scan_paths();
-            if resolved.is_empty() {
+            if scope.scan_paths().is_empty() {
                 if scope.is_empty_scope() {
                     anyhow::bail!(
                         "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
@@ -1253,7 +1109,19 @@ fn main() -> Result<()> {
                 );
             }
             note_and_persist_scope(&store_dir, &scope);
-            schedule::cmd_observe(store_dir, resolved, full)?;
+            let progress =
+                spawn_progress_line(std::io::IsTerminal::is_terminal(&std::io::stderr()));
+            let result = schedule::cmd_observe(
+                store_dir,
+                scope,
+                full,
+                docker_facts,
+                verify_du,
+                since,
+                enrich,
+            );
+            progress.stop();
+            result?;
         }
         Command::Collect {
             roots,
