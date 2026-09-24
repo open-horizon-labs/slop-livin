@@ -7,5 +7,5 @@ error[E0603]: module `columns` is private
 note: the module `columns` is defined here
  --> $WORKSPACE/crates/core/src/growth.rs
   |
-  | mod columns;
-  | ^^^^^^^^^^^
+  | pub(crate) mod columns;
+  | ^^^^^^^^^^^^^^^^^^^^^^

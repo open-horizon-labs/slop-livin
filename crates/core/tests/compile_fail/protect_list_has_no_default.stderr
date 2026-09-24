@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `swamp_core::agents::ProtectList: Default` is not satisfied
+error[E0277]: the trait bound `ProtectList: Default` is not satisfied
  --> $WORKSPACE/crates/core/tests/compile_fail/protect_list_has_no_default.rs
   |
   |     let _list = swamp_core::protection::load_protect(Path::new("/tmp/store")).unwrap_or_default();
-  |                                                                               ^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `swamp_core::agents::ProtectList`
+  |                                                                               ^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `ProtectList`
   |
 note: required by a bound in `Result::<T, E>::unwrap_or_default`
  --> $RUST/core/src/result.rs
