@@ -276,6 +276,21 @@ impl AccountingBasis {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The inverse of [`Self::label`], for `nested_artifacts.parquet`
+    /// (R16). Exhaustive by construction, like every other `from_label`
+    /// in this module -- a new variant is a compile error here rather
+    /// than a value that round-trips into a default.
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::Allocated,
+            Self::Logical,
+            Self::UniqueAllocated,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|b| b.label() == label)
+    }
 }
 
 /// Where a unit's `mtime_max` came from. #64's cleanup-guidance contract

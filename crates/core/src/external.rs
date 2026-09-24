@@ -762,7 +762,7 @@ pub fn observe_external(
     Ok(ExternalObservation { units, interiors })
 }
 
-fn category_from_str(s: &str) -> Option<StorageCategory> {
+pub(crate) fn category_from_str(s: &str) -> Option<StorageCategory> {
     Some(match s {
         "installation" => StorageCategory::Installation,
         "downloads" => StorageCategory::Downloads,
