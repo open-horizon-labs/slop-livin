@@ -93,14 +93,14 @@ for p in "$root"/proj* "$root"/web; do (cd "$p" && git init -q . && git add -A >
 dirs=$(find "$root" -type d | wc -l); files=$(find "$root" -type f | wc -l)
 say "workload: $dirs directories, $files files, $(du -sh "$root" | cut -f1) on $(stat -f -c %T "$root")"
 
-"$bin" report "$root" --json --no-observe > "$work/first.json"
+"$bin" report "$root" --json > "$work/first.json"
 t1=$(now_ms)
 say "install_to_first_report_ms: $((t1 - t0))"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "projects" in d' "$work/first.json"
 say "cli_json: report --json parses"
 "$bin" scope "$root" --json | python3 -c 'import json,sys; json.load(sys.stdin)' && say "cli_json: scope --json parses"
 
-observe() { "$bin" observe "$root" | grep '^root='; }
+observe() { "$bin" observe "$root" | grep '^observed_at='; }
 timed() { local a b line; a=$(now_ms); line="$(observe)"; b=$(now_ms); echo "$((b - a)) $line"; }
 
 # --- initial full scan -----------------------------------------------
@@ -142,7 +142,7 @@ for r in $(seq "$REPS"); do
     say "one_subtree_mutation run=$r ms=${res%% *} mode=$(field "$res" mode) changed_dirs=$(field "$res" changed_dirs) walked_total=$(field "$res" walked_total)"
 done
 ref_store="$work/ref-store"
-ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full | grep '^root=')"
+ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full | grep '^observed_at=')"
 [ "$(field "$res" walked_total)" = "$(field "$ref" walked_total)" ] &&
     say "equivalence: incremental walked_total $(field "$res" walked_total) == reference full walk $(field "$ref" walked_total)" ||
     { say "equivalence: MISMATCH incremental=$(field "$res" walked_total) full=$(field "$ref" walked_total)"; exit 1; }
@@ -193,7 +193,7 @@ say "on_disk_state: store=$(du -sb "$SWAMP_DIR" | cut -f1) bytes; continuity=$(d
 # not by this packaged-binary validation. What this script can and does
 # check is that the packaged binary's read-only surface reports a
 # DependencyTree unit's facts correctly on this machine.
-"$bin" report "$root" --json --no-observe > "$work/deps.json"
+"$bin" report "$root" --json > "$work/deps.json"
 python3 - "$work/deps.json" <<'PY' | tee -a "$report"
 import json, sys
 d = json.load(open(sys.argv[1]))

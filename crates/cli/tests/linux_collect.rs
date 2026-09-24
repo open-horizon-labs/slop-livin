@@ -79,7 +79,7 @@ fn observe(root: &Path, store: &Path, home: &Path, full: bool) -> String {
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .find(|l| l.starts_with("root="))
+        .find(|l| l.starts_with("observed_at="))
         .expect("an observe line")
         .to_string()
 }

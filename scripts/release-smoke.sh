@@ -59,7 +59,7 @@ head -c 50000 /dev/zero > "$fx/web/node_modules/pkg/index.js"
 store="$work/store"
 export SWAMP_DIR="$store" HOME="$work/home" SWAMP_TEST_MODE=1
 mkdir -p "$HOME"
-"$bin" report "$fx" --json --no-observe > "$work/r0.json"
+"$bin" report "$fx" --json > "$work/r0.json"
 grep -q '"projects"' "$work/r0.json"
 t1=$(now_ms)
 "$bin" observe "$fx" | tee "$work/observe1.txt"
@@ -73,9 +73,9 @@ grep -q '"projects"' "$work/r1.json"
 tui="skipped (no script(1))"
 if command -v script >/dev/null 2>&1; then
     if [ "$(uname -s)" = Linux ]; then
-        (sleep 3; printf 'q') | timeout 30 script -qec "$bin ui $fx --no-observe" /dev/null >/dev/null
+        (sleep 3; printf 'q') | timeout 30 script -qec "$bin ui $fx" /dev/null >/dev/null
     else
-        (sleep 3; printf 'q') | script -q /dev/null "$bin" ui "$fx" --no-observe >/dev/null
+        (sleep 3; printf 'q') | script -q /dev/null "$bin" ui "$fx" >/dev/null
     fi
     tui="started and quit cleanly"
 fi
