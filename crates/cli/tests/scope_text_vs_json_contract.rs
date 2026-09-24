@@ -23,6 +23,18 @@ fn run(store: &Path, home: &Path, args: &[&str]) -> Output {
         .expect("run swamp")
 }
 
+/// `swamp observe` is the only scanner (R12): every fixture below runs
+/// it before a `report`/`report --json` call can read anything back.
+fn observe(store: &Path, home: &Path, extra_env: &[(&str, &str)]) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("observe").env("SWAMP_DIR", store).env("HOME", home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let status = cmd.status().expect("run observe");
+    assert!(status.success(), "observe failed");
+}
+
 fn run_json(store: &Path, home: &Path, args: &[&str]) -> serde_json::Value {
     let out = run(store, home, args);
     assert!(
@@ -142,6 +154,11 @@ fn external_only_scope_reports_zero_projects_consistently() {
     )
     .unwrap();
 
+    observe(
+        store.path(),
+        home.path(),
+        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+    );
     let text_out = Command::new(bin())
         .args(["report"])
         .env("SWAMP_DIR", store.path())
@@ -225,16 +242,20 @@ fn unknown_baseline_is_named_not_fabricated_in_both_renderers() {
     run_git(&["add", "README.md"]);
     run_git(&["commit", "-q", "-m", "initial"]);
 
+    // `since` moved to `observe` (R12: `report` is a pure read and takes
+    // no `--since` of its own); a top-level key must precede the
+    // `[scan]` table in TOML, so it is prepended rather than appended.
     std::fs::write(
         store.path().join("config.toml"),
-        only_include_config(&["~/proj"], &[]),
+        format!("since = \"1h\"\n{}", only_include_config(&["~/proj"], &[])),
     )
     .unwrap();
 
+    observe(store.path(), home.path(), &[]);
     let grown_json = run_json(
         store.path(),
         home.path(),
-        &["report", "--view", "grown", "--json", "--since", "1h"],
+        &["report", "--view", "grown", "--json"],
     );
     let history = &grown_json["coverage"]["history"];
     // The very first observation this call performs gives the store

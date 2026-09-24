@@ -30,6 +30,24 @@ fn write(path: &std::path::Path, content: &[u8]) {
     std::fs::write(path, content).unwrap();
 }
 
+/// `swamp observe` is the only scanner (R12): every fixture below runs
+/// it before a `report --json` call can read anything back.
+fn observe(store: &std::path::Path, home: &std::path::Path, claude_home: &std::path::Path) {
+    let out = Command::new(bin())
+        .arg("observe")
+        .env("SWAMP_DIR", store)
+        .env("HOME", home)
+        .env("CLAUDE_CONFIG_DIR", claude_home)
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run observe");
+    assert!(
+        out.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn session_line(cwd: &std::path::Path) -> String {
     format!(
         "{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{}\",\"gitBranch\":\"main\"}}\n",
@@ -66,6 +84,7 @@ fn report_view_agents_lists_a_claude_code_session_with_project_linkage() {
     let store = tempfile::tempdir().unwrap();
     std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
 
+    observe(store.path(), home.path(), &claude_home);
     let output = Command::new(bin())
         .arg("report")
         .arg("--view")
@@ -106,6 +125,7 @@ fn report_view_agents_project_filter_narrows_to_linked_units() {
     let store = tempfile::tempdir().unwrap();
     std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
 
+    observe(store.path(), home.path(), &claude_home);
     let output = Command::new(bin())
         .arg("report")
         .arg("--view")
@@ -200,6 +220,16 @@ fn report_project_json_without_view_includes_linked_agent_storage() {
     std::fs::write(store.path().join("config.toml"), CLAUDE_ONLY_SCOPE).unwrap();
     let project_name = repo.file_name().unwrap().to_str().unwrap().to_string();
 
+    let observe_status = Command::new(bin())
+        .arg("observe")
+        .arg(home.path())
+        .env("SWAMP_DIR", store.path())
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", &claude_home)
+        .env("SWAMP_TEST_MODE", "1")
+        .status()
+        .expect("run observe against a real root");
+    assert!(observe_status.success());
     let output = Command::new(bin())
         .arg("report")
         .arg(home.path())

@@ -9,6 +9,23 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_swamp"))
 }
 
+/// `swamp observe` is the only scanner (R12): every fixture below must
+/// run it before `report` can read anything back.
+fn observe(store: &std::path::Path, home: Option<&std::path::Path>, extra_env: &[(&str, &str)]) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("observe")
+        .env("SWAMP_DIR", store)
+        .env("SWAMP_TEST_MODE", "1");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let status = cmd.status().expect("run observe");
+    assert!(status.success(), "observe failed");
+}
+
 fn write_project(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     let run = |args: &[&str]| {
@@ -55,6 +72,7 @@ fn report_with_no_explicit_root_observes_every_configured_root() {
     )
     .unwrap();
 
+    observe(store.path(), Some(home.path()), &[]);
     let output = Command::new(bin())
         .arg("report")
         .arg("--json")
@@ -101,6 +119,7 @@ fn report_surfaces_a_missing_configured_root_as_coverage_not_silence() {
     )
     .unwrap();
 
+    observe(store.path(), Some(home.path()), &[]);
     let output = Command::new(bin())
         .arg("report")
         .arg("--json")
@@ -146,6 +165,11 @@ fn report_view_external_lists_detector_resolved_units() {
     )
     .unwrap();
 
+    observe(
+        store.path(),
+        Some(home.path()),
+        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+    );
     let output = Command::new(bin())
         .arg("report")
         .arg("--view")
@@ -183,6 +207,14 @@ fn report_with_an_explicit_root_stays_single_root_and_has_no_scope_coverage_key(
     write_project(&root.path().join("proj"));
     let store = tempfile::tempdir().unwrap();
 
+    let observe_status = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .status()
+        .expect("run observe with an explicit root");
+    assert!(observe_status.success());
     let output = Command::new(bin())
         .arg("report")
         .arg(root.path())

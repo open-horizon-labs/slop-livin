@@ -27,6 +27,21 @@ fn run(store: &Path, args: &[&str]) -> Output {
         .expect("run swamp")
 }
 
+/// `swamp observe` is the only scanner (R12): every fixture below runs
+/// it before a `report`/`report --json` call can read anything back.
+/// `extra_args` lets a caller set e.g. `--full`; the root is always
+/// named explicitly, matching the `report` calls these fixtures make.
+fn observe(store: &Path, root: &Path, extra_args: &[&str]) {
+    let mut args = vec!["observe", root.to_str().unwrap()];
+    args.extend_from_slice(extra_args);
+    let out = run(store, &args);
+    assert!(
+        out.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn run_json(store: &Path, args: &[&str]) -> serde_json::Value {
     let out = run(store, args);
     assert!(
@@ -93,6 +108,7 @@ fn report_json_carries_decision_evidence_on_artifact_rows() {
     make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
 
+    observe(store.path(), root.path(), &[]);
     let v = run_json(
         store.path(),
         &["report", root.path().to_str().unwrap(), "--json"],
@@ -137,6 +153,7 @@ fn bespoke_json_views_carry_evidence_on_their_rows() {
     fs::write(repo.join("target/debug/seed"), vec![b'x'; 4096]).unwrap();
     let store = tempfile::tempdir().unwrap();
 
+    observe(store.path(), root.path(), &[]);
     for view in ["builds", "deps", "kinds", "worktrees"] {
         let v = run_json(
             store.path(),
@@ -195,7 +212,12 @@ fn grown_view_reports_partial_coverage_before_any_history_exists() {
     let root = tempfile::tempdir().unwrap();
     make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
+    // `--since` moved to `observe` (R12: `report` takes no `--since` of
+    // its own and never scans); `config.toml`'s `since` is what the
+    // JSON envelope's `coverage.history` block reports as "asked".
+    fs::write(store.path().join("config.toml"), "since = \"1h\"\n").unwrap();
 
+    observe(store.path(), root.path(), &[]);
     let v = run_json(
         store.path(),
         &[
@@ -204,8 +226,6 @@ fn grown_view_reports_partial_coverage_before_any_history_exists() {
             "--view",
             "grown",
             "--json",
-            "--since",
-            "1h",
         ],
     );
     assert_eq!(v["view"], "grown");
@@ -247,8 +267,14 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     let root = tempfile::tempdir().unwrap();
     let checkout = make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
+    // `--since` moved to `observe` (R12): the window that decides
+    // growth_bytes is fixed at the observation that computed it, read
+    // from `config.toml`'s `since` when `observe` gets no `--since` of
+    // its own.
+    fs::write(store.path().join("config.toml"), "since = \"1h\"\n").unwrap();
 
     // Baseline observation.
+    observe(store.path(), root.path(), &[]);
     let first = run_json(
         store.path(),
         &[
@@ -257,8 +283,6 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
             "--view",
             "grown",
             "--json",
-            "--since",
-            "1h",
         ],
     );
     assert_eq!(first["result"]["grown"].as_array().unwrap().len(), 0);
@@ -266,7 +290,7 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     // The growth store's observed_at has one-second resolution: two
     // observations inside the same wall-clock second can share a
     // baseline. Cross a second boundary between the baseline and the
-    // growth event so the third call below has its own fresh baseline
+    // growth event so the next observation has its own fresh baseline
     // to compare against, not the pre-growth one.
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
@@ -277,6 +301,7 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     )
     .unwrap();
 
+    observe(store.path(), root.path(), &[]);
     let grown = run_json(
         store.path(),
         &[
@@ -285,8 +310,6 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
             "--view",
             "grown",
             "--json",
-            "--since",
-            "1h",
         ],
     );
     let rows = grown["result"]["grown"].as_array().unwrap();
@@ -300,15 +323,17 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     // same reason as above.
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    // No-change rerun: growth is an event, not a clock. Ask for a
-    // *short* window here (not "1h" again): with only a few seconds of
-    // real history, a 1h ask still resolves its baseline to the oldest
-    // retained observation (the pre-growth one), by design -- see
+    // No-change rerun: growth is an event, not a clock. Re-observe with
+    // a *short* window here (not "1h" again): with only a few seconds
+    // of real history, a 1h ask still resolves its baseline to the
+    // oldest retained observation (the pre-growth one), by design -- see
     // `history_block`'s asked-vs-held note -- so it would show the same
-    // growth again, correctly, not a bug. A short --since selects the
+    // growth again, correctly, not a bug. A short `since` selects the
     // most recent observation (the post-growth one just taken above) as
     // the baseline, which is what actually answers "did anything change
     // just now".
+    fs::write(store.path().join("config.toml"), "since = \"1s\"\n").unwrap();
+    observe(store.path(), root.path(), &[]);
     let again = run_json(
         store.path(),
         &[
@@ -317,8 +342,6 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
             "--view",
             "grown",
             "--json",
-            "--since",
-            "1s",
         ],
     );
     assert_eq!(
@@ -337,6 +360,7 @@ fn invalid_filter_errors_to_stderr_with_no_stdout_json() {
     make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
 
+    observe(store.path(), root.path(), &[]);
     let out = run(
         store.path(),
         &[
@@ -367,6 +391,7 @@ fn view_worktrees_json_is_bounded_by_limit_and_offset() {
     make_checkout(root.path(), "repo-b", 1024);
     let store = tempfile::tempdir().unwrap();
 
+    observe(store.path(), root.path(), &[]);
     let whole = run_json(
         store.path(),
         &[
@@ -430,6 +455,7 @@ fn json_only_views_refuse_text_mode_explicitly() {
     make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
 
+    observe(store.path(), root.path(), &[]);
     for view in ["projects", "grown"] {
         let out = run(
             store.path(),
