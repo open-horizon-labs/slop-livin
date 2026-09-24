@@ -1571,3 +1571,310 @@ pub(crate) fn read_project_rows(path: &Path) -> Result<Vec<StoredProjectRow>> {
     }
     Ok(rows)
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredWorktreeRow {
+    pub(crate) scope_key: String,
+    pub(crate) worktree_id: String,
+    pub(crate) project_id: String,
+    pub(crate) path: String,
+    /// `WorktreeKind`'s Debug label (`"Main"`/`"Linked"`/`"Clone"`).
+    pub(crate) kind: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) idle_secs: Option<u64>,
+    pub(crate) github_default_branch: Option<String>,
+    pub(crate) github_branch_exists_on_remote: Option<bool>,
+    pub(crate) github_unavailable_reason: Option<String>,
+    /// `MergedStatus`'s label (`"yes"`/`"no"`/`"unknown"`), only when
+    /// `github` is `Some`.
+    pub(crate) github_merged_state: Option<String>,
+    pub(crate) github_merged_at: Option<String>,
+    pub(crate) github_merged_pr_number: Option<u64>,
+    /// `PrStatus`'s label (`"some"`/`"none"`/`"unknown"`).
+    pub(crate) github_pr_state: Option<String>,
+    pub(crate) github_pr_number: Option<u64>,
+    /// `PrState`'s label (`"open"`/`"closed"`/`"merged"`), only when
+    /// `pr_state == "some"`.
+    pub(crate) github_pr_status: Option<String>,
+    pub(crate) github_pr_draft: Option<bool>,
+    pub(crate) github_pr_url: Option<String>,
+    pub(crate) github_pr_title: Option<String>,
+    pub(crate) github_pr_review_decision: Option<String>,
+    pub(crate) github_pr_updated_at: Option<String>,
+    /// `TriState`'s label (`"yes"`/`"no"`/`"unknown"`), only when
+    /// `merge_complete` is `Some`.
+    pub(crate) merge_complete_verdict: Option<String>,
+    pub(crate) observed_at: u64,
+}
+
+fn worktrees_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("project_id", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("branch", DataType::Utf8, true),
+        Field::new("idle_secs", DataType::UInt64, true),
+        Field::new("github_default_branch", DataType::Utf8, true),
+        Field::new("github_branch_exists_on_remote", DataType::Boolean, true),
+        Field::new("github_unavailable_reason", DataType::Utf8, true),
+        Field::new("github_merged_state", DataType::Utf8, true),
+        Field::new("github_merged_at", DataType::Utf8, true),
+        Field::new("github_merged_pr_number", DataType::UInt64, true),
+        Field::new("github_pr_state", DataType::Utf8, true),
+        Field::new("github_pr_number", DataType::UInt64, true),
+        Field::new("github_pr_status", DataType::Utf8, true),
+        Field::new("github_pr_draft", DataType::Boolean, true),
+        Field::new("github_pr_url", DataType::Utf8, true),
+        Field::new("github_pr_title", DataType::Utf8, true),
+        Field::new("github_pr_review_decision", DataType::Utf8, true),
+        Field::new("github_pr_updated_at", DataType::Utf8, true),
+        Field::new("merge_complete_verdict", DataType::Utf8, true),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+macro_rules! opt_str_col {
+    ($rows:expr, $field:ident) => {
+        Arc::new(StringArray::from(
+            $rows
+                .iter()
+                .map(|r| r.$field.as_deref())
+                .collect::<Vec<Option<&str>>>(),
+        )) as ArrayRef
+    };
+}
+
+macro_rules! opt_u64_col {
+    ($rows:expr, $field:ident) => {
+        Arc::new(UInt64Array::from(
+            $rows.iter().map(|r| r.$field).collect::<Vec<Option<u64>>>(),
+        )) as ArrayRef
+    };
+}
+
+macro_rules! opt_bool_col {
+    ($rows:expr, $field:ident) => {
+        Arc::new(BooleanArray::from(
+            $rows
+                .iter()
+                .map(|r| r.$field)
+                .collect::<Vec<Option<bool>>>(),
+        )) as ArrayRef
+    };
+}
+
+pub(crate) fn write_worktree_rows(path: &Path, rows: &[StoredWorktreeRow]) -> Result<()> {
+    let schema = worktrees_schema();
+    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
+    let worktree_id: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
+    let project_id: Vec<&str> = rows.iter().map(|r| r.project_id.as_str()).collect();
+    let path_col: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+    let kind: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(scope_key)) as ArrayRef,
+            Arc::new(StringArray::from(worktree_id)),
+            Arc::new(StringArray::from(project_id)),
+            Arc::new(StringArray::from(path_col)),
+            Arc::new(StringArray::from(kind)),
+            opt_str_col!(rows, branch),
+            opt_u64_col!(rows, idle_secs),
+            opt_str_col!(rows, github_default_branch),
+            opt_bool_col!(rows, github_branch_exists_on_remote),
+            opt_str_col!(rows, github_unavailable_reason),
+            opt_str_col!(rows, github_merged_state),
+            opt_str_col!(rows, github_merged_at),
+            opt_u64_col!(rows, github_merged_pr_number),
+            opt_str_col!(rows, github_pr_state),
+            opt_u64_col!(rows, github_pr_number),
+            opt_str_col!(rows, github_pr_status),
+            opt_bool_col!(rows, github_pr_draft),
+            opt_str_col!(rows, github_pr_url),
+            opt_str_col!(rows, github_pr_title),
+            opt_str_col!(rows, github_pr_review_decision),
+            opt_str_col!(rows, github_pr_updated_at),
+            opt_str_col!(rows, merge_complete_verdict),
+            Arc::new(UInt64Array::from(observed_at)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+fn opt_str(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<String>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .with_context(|| format!("column {name} is not Utf8"))?;
+    Ok(col.is_valid(i).then(|| col.value(i).to_string()))
+}
+
+fn opt_u64(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<u64>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .with_context(|| format!("column {name} is not UInt64"))?;
+    Ok(col.is_valid(i).then(|| col.value(i)))
+}
+
+fn opt_bool(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<bool>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        .with_context(|| format!("column {name} is not Boolean"))?;
+    Ok(col.is_valid(i).then(|| col.value(i)))
+}
+
+pub(crate) fn read_worktree_rows(path: &Path) -> Result<Vec<StoredWorktreeRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let project_id = downcast_str(&batch, "project_id")?;
+        let path_col = downcast_str(&batch, "path")?;
+        let kind = downcast_str(&batch, "kind")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredWorktreeRow {
+                scope_key: scope_key.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                project_id: project_id.value(i).to_string(),
+                path: path_col.value(i).to_string(),
+                kind: kind.value(i).to_string(),
+                branch: opt_str(&batch, "branch", i)?,
+                idle_secs: opt_u64(&batch, "idle_secs", i)?,
+                github_default_branch: opt_str(&batch, "github_default_branch", i)?,
+                github_branch_exists_on_remote: opt_bool(
+                    &batch,
+                    "github_branch_exists_on_remote",
+                    i,
+                )?,
+                github_unavailable_reason: opt_str(&batch, "github_unavailable_reason", i)?,
+                github_merged_state: opt_str(&batch, "github_merged_state", i)?,
+                github_merged_at: opt_str(&batch, "github_merged_at", i)?,
+                github_merged_pr_number: opt_u64(&batch, "github_merged_pr_number", i)?,
+                github_pr_state: opt_str(&batch, "github_pr_state", i)?,
+                github_pr_number: opt_u64(&batch, "github_pr_number", i)?,
+                github_pr_status: opt_str(&batch, "github_pr_status", i)?,
+                github_pr_draft: opt_bool(&batch, "github_pr_draft", i)?,
+                github_pr_url: opt_str(&batch, "github_pr_url", i)?,
+                github_pr_title: opt_str(&batch, "github_pr_title", i)?,
+                github_pr_review_decision: opt_str(&batch, "github_pr_review_decision", i)?,
+                github_pr_updated_at: opt_str(&batch, "github_pr_updated_at", i)?,
+                merge_complete_verdict: opt_str(&batch, "merge_complete_verdict", i)?,
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// One list entry from a `WorktreeRow`'s `signals` or
+/// `merge_complete.terms`, ordered by `seq` within `(worktree_id,
+/// fact_kind)` so the original `Vec` order round-trips exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredWorktreeFactRow {
+    pub(crate) scope_key: String,
+    pub(crate) worktree_id: String,
+    /// `"signal"` or `"merge_complete_term"`.
+    pub(crate) fact_kind: String,
+    /// A signal's name; `None` for a `merge_complete_term` (a bare
+    /// string list).
+    pub(crate) name: Option<String>,
+    pub(crate) value: String,
+    pub(crate) seq: u32,
+}
+
+fn worktree_facts_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("fact_kind", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+    ]))
+}
+
+pub(crate) fn write_worktree_fact_rows(path: &Path, rows: &[StoredWorktreeFactRow]) -> Result<()> {
+    let schema = worktree_facts_schema();
+    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
+    let worktree_id: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
+    let fact_kind: Vec<&str> = rows.iter().map(|r| r.fact_kind.as_str()).collect();
+    let name: Vec<Option<&str>> = rows.iter().map(|r| r.name.as_deref()).collect();
+    let value: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+    let seq: Vec<u32> = rows.iter().map(|r| r.seq).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(scope_key)) as ArrayRef,
+            Arc::new(StringArray::from(worktree_id)),
+            Arc::new(StringArray::from(fact_kind)),
+            Arc::new(StringArray::from(name)),
+            Arc::new(StringArray::from(value)),
+            Arc::new(UInt32Array::from(seq)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_worktree_fact_rows(path: &Path) -> Result<Vec<StoredWorktreeFactRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let fact_kind = downcast_str(&batch, "fact_kind")?;
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column name is not Utf8")?;
+        let value = downcast_str(&batch, "value")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredWorktreeFactRow {
+                scope_key: scope_key.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                fact_kind: fact_kind.value(i).to_string(),
+                name: name.is_valid(i).then(|| name.value(i).to_string()),
+                value: value.value(i).to_string(),
+                seq: seq.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
