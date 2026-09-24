@@ -4,6 +4,34 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Project roots vs. detector locations
+
+Only `~/src`-style built-in roots, `[scan] include` entries, and
+explicit command roots get ordinary Git/ecosystem discovery and an
+unowned-remainder walk any more. Every detector-resolved location --
+Cargo home, rustup, Homebrew, `~/Library/Caches`, `~/Library/Developer`,
+every other tool home -- is a *detector location*: measured only as an
+external unit (a folded row plus its adapter's own interior
+identification), never walked for projects. A Git checkout planted
+inside a detector location no longer becomes a project, and a detector
+location produces no unowned rows. `swamp scope`'s text output groups
+roots under two headings (project roots / detector locations) and
+hides folded-in (`skipped-as-nested`) rows by default; `--verbose`
+shows everything; `--json` is unaffected. `swamp report`'s per-root
+coverage gets a new state, `detector location (measured as an external
+unit, not scanned for projects)`, for the roots this skips.
+
+This also fixes a real gap the split exposed: `~/Library/Caches` and
+`~/Library/Developer` (the built-in-defaults detector's own non-`~/src`
+candidates) were previously measured only by virtue of getting the
+ordinary project walk; `external::discover_and_measure` explicitly
+excluded anything from the `builtin-defaults` detector, on the
+(previously true) assumption that detector was only ever a source of
+project roots. Now that its `~/Library/Caches`/`~/Library/Developer`/
+XDG-cache-root candidates are detector locations, that exclusion would
+have left them unmeasured by *either* path; fixed so they are measured
+as external units like any other detector-resolved location.
+
 ### `swamp report` is a pure read; `swamp observe` is the only scanner
 
 `report` never walks a directory, stats a file, or spawns a subprocess

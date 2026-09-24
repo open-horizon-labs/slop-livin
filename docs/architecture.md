@@ -188,7 +188,7 @@ reusing facts a pass already has in hand:
 | `external_associations.rs` (#57) | Consumer | Xcode DerivedData `info.plist`'s `WorkspacePath` (read via the bounded, read-only, output-only `plutil -convert xml1 -o -`, never a bespoke binary-plist parser) joined against known project roots; dependency-lockfile identity parsers (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `go.sum`, `gradle.lockfile`, `pom.xml` via the `roxmltree` dependency -- `parse_pom_xml_with_gaps` returns both the resolved identities and the ones it could not resolve, such as a `${property}` or parent-inherited version) joined by exact name+version; targeted existence-check joins (`cargo_registry_entry_exists`, `go_module_cache_entry_exists`, `gradle_cache_entry_exists`, `maven_repo_entry_exists` -- one `Path::exists()` hash lookup per declared identity, never a store enumeration); `docker_join_evidence` normalizes the existing Docker join decision (compose label, image-source label, worktree-path label) into this same contract |
 | `recovery.rs` (#58) | Recovery | Worktree presence (rebuild), lockfile presence (network fetch), a Maven local repository (the **limit**, not a classification: swamp never reads the per-artifact `_remote.repositories` marker, so the whole tree's recovery fact is `Unknown` with that limit stated -- `maven_artifact_recovery` is called with `false` at its one production call site, `actions.rs::external_recovery_facts`, and `docs/locations.md` says the same), a known toolchain version string (local reinstall), Docker image/build-cache/volume context (`docker_image_recovery` names pull-vs-rebuild as two candidate, never-picked-for-you prerequisites; `docker_build_cache_recovery` requires a present joined worktree; `docker_volume_recovery` is always potentially-unique local state with no Trash); every assessment states its unresolved unknowns and a concrete follow-up check, never a fabricated cost or an assumed backup |
 | `reclaimability.rs` (#59) | Reclaimability | `ArtifactRow`'s already-measured `bytes`/`hardlinked`/`dedup_stale`; separates logical vs. allocated vs. estimated-reclaimable (`Known`/`Bounded`/`Unknown`, bounded rather than exact for APFS clones/snapshots and unresolved hardlink membership) vs. observed post-action free-space change (`actions::free_space_bytes`, a real `statvfs` reading before/after); `estimate_selection` reconciles a selection set's shared inodes so the same physical storage is never summed twice, and `actions::propose*` carries its result on the `Plan` as `selection` next to the plain `planned_bytes` sum |
-| `consumer_wiring.rs` (#56/#57 live wiring) | Consumer | The caller that actually runs the two modules above against real worktrees/external units: a per-worktree mtime-keyed cache (`toolchain_declarations_cache.json`/`dependency_identities_cache.json` sidecars under `${SWAMP_DIR}`, mirroring `external.rs`'s existing `external_consumers.json` precedent) so an unchanged worktree's declaration/lockfile files are never re-parsed; attaches consumer evidence both ways (an installation/shared-store `ExternalUnit` <- every project declaring/depending on it; a project's own `Source` row -> the installations/dependencies it declares); a rustup `settings.toml` global default gets its own role, distinct from any project's declaration; Xcode DerivedData subfolders are enumerated (one `plutil` read per subfolder) and joined by `WorkspacePath` |
+| `consumer_wiring.rs` (#56/#57 live wiring) | Consumer | The caller that actually runs the two modules above against real worktrees/external units: a per-worktree mtime-keyed cache (`assoc_store.rs`'s toolchain-declarations/dependency-identities current-state Parquet tables under `${SWAMP_DIR}`, mirroring `external.rs`'s existing `external_consumers.parquet` precedent) so an unchanged worktree's declaration/lockfile files are never re-parsed; attaches consumer evidence both ways (an installation/shared-store `ExternalUnit` <- every project declaring/depending on it; a project's own `Source` row -> the installations/dependencies it declares); a rustup `settings.toml` global default gets its own role, distinct from any project's declaration; Xcode DerivedData subfolders are enumerated (one `plutil` read per subfolder) and joined by `WorkspacePath` |
 
 Attachment point: `report::attach_decision_evidence`, called exactly
 once from `bus::run_report` -- the single choke point every report
@@ -683,11 +683,18 @@ own exclusion list.
 
 ## External and shared storage units
 
-`crate::external` (#43) turns every non-`builtin-defaults` detector
-location from the registry above into a first-class **external unit**:
-identity `(detector_id, category, device, canonical path)`, independent
-of any project or worktree. Two things distinguish it from an ordinary
-artifact row:
+`crate::external` (#43) turns every detector location (every root for
+which `ScopeRoot::is_project_root()` is false -- since #R13 item B this
+includes the `builtin-defaults` detector's own `~/Library/Caches`/
+`~/Library/Developer`/XDG-cache-root candidates, not only the other
+~40 tool-home detectors) from the registry above into a first-class
+**external unit**: identity `(detector_id, category, device, canonical
+path)`, independent of any project or worktree. `builtin-defaults`'
+*project*-root candidate (`~/src`) never reaches this pass at all: it
+carries `RootReason::BuiltinDefault`, so `AuthorizedRoot::detector_id`
+is `None` for it and `authorized_candidates` filters it out the same
+way it always has. Two things distinguish an external unit from an
+ordinary artifact row:
 
 - **Measurement, not a walk.** `folded_measurement::measure` sizes the
   whole location as one opaque unit (hardlink-deduped within the call,
@@ -851,7 +858,7 @@ artifact row:
   reuse the same current+reverse-delta Parquet design as artifact rows,
   under `${SWAMP_DIR}/external/` (scope-wide, not per-volume: an
   external unit's device need not match any scan root's). Consumer
-  associations (`external_consumers.json`) are a deliberately separate
+  associations (`external_consumers.parquet`) are a deliberately separate
   sidecar, never touched by the growth-store write path, so an
   association change can only ever affect `ExternalUnit::consumers` --
   never the unit's identity, its bytes, or its regrowth count.
@@ -1026,7 +1033,7 @@ on any membership drift since the plan was proposed, then moves every
 member into one Trash envelope. Human keep/protect intent
 (`swamp protect add/list/remove`) is a small JSON sidecar
 (`agent_protect.json`) under `$SWAMP_DIR`, deliberately decoupled from
-the growth store exactly like `external_consumers.json` is: touching it
+the growth store exactly like `external_consumers.parquet` is: touching it
 never affects an `AgentUnit`'s bytes or history.
 
 The TUI's Agents view reuses the exact same mark/confirm/execute

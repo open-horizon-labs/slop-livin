@@ -1121,15 +1121,23 @@ pub fn resolve_effective_scope(
     // measurement (the B2 gap fixed alongside #45-#49; see
     // `ExternalPruneNote`'s doc comment). Read before consuming
     // `nested_of` below.
+    //
+    // No `builtin-defaults` exemption here (unlike before #R13 item B):
+    // that detector's own project-root candidate (`~/src`) never carries
+    // a `RootReason::Detector` at all any more (it is
+    // `RootReason::BuiltinDefault`), so it can never match this arm --
+    // and its *other* candidates (`~/Library/Caches`,
+    // `~/Library/Developer`, the XDG cache root) are detector locations
+    // like any other, measured only by `crate::external`, so nesting one
+    // of them under a kept project root needs exactly the same prune as
+    // Cargo home or Homebrew would.
     let mut external_pruned_subtrees: Vec<ExternalPruneNote> = Vec::new();
     for (child, parent) in &nested_of {
         let Some(child_root) = roots.iter().find(|r| &r.path == child) else {
             continue;
         };
         for reason in &child_root.reasons {
-            if let RootReason::Detector { detector_id, .. } = reason
-                && detector_id != crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID
-            {
+            if let RootReason::Detector { detector_id, .. } = reason {
                 external_pruned_subtrees.push(ExternalPruneNote {
                     root: parent.clone(),
                     path: child.clone(),

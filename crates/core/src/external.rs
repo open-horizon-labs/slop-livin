@@ -193,9 +193,18 @@ struct MeasuredUnit {
 }
 
 /// Every detector-proposed location the *authorized* scope actually lets
-/// this pass measure. The `builtin-defaults` detector is skipped -- it
-/// proposes ordinary scan roots (`~/src`, ...), not external storage --
-/// so nothing here duplicates `report_scope`'s walked/unowned totals.
+/// this pass measure. The `builtin-defaults` detector's own project-root
+/// candidate (`~/src`) never reaches here at all: since #R13 item B it
+/// carries `RootReason::BuiltinDefault`, not `RootReason::Detector`, so
+/// `AuthorizedRoot::detector_id` is `None` for it and the `?` below
+/// filters it out -- nothing here can duplicate `report_scope`'s
+/// walked/unowned totals for a project root. The *other* candidates the
+/// same detector proposes (`~/Library/Caches`, `~/Library/Developer`,
+/// the XDG cache root) still carry `RootReason::Detector { detector_id:
+/// "builtin-defaults", .. }`, because they are detector locations, not
+/// project roots -- and since they are never walked for projects any
+/// more either, this is the *only* place they get measured at all, so
+/// they must not be filtered out here too.
 ///
 /// Under an explicit-root invocation, detector locations are in scope
 /// only inside the roots the user named
@@ -237,9 +246,6 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
         .into_iter()
         .filter_map(|root| {
             let detector_id = root.detector_id?;
-            if crate::locations::builtin::is_builtin_defaults(&detector_id) {
-                return None;
-            }
             Some(Candidate {
                 detector_name: root.detector_name.unwrap_or_else(|| detector_id.clone()),
                 detector_id,

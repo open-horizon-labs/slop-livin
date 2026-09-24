@@ -215,4 +215,26 @@ fn macos_builtin_caches_and_developer_are_detector_locations_not_project_roots()
             "{sub} must be a detector location, not a project root"
         );
     }
+
+    // Being excluded from the project walk must never mean being
+    // excluded from measurement altogether: both still show up as
+    // external units (this is the whole point of the split -- they are
+    // *only* measured this way now).
+    std::fs::write(home.path().join("Library/Caches/blob"), vec![b'c'; 4_096]).unwrap();
+    let units = swamp_core::external::discover_and_measure(
+        &scope,
+        None,
+        false,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    )
+    .expect("discover_and_measure succeeds");
+    assert!(
+        units
+            .iter()
+            .any(|u| u.detector_id == "builtin-defaults" && u.bytes > 0),
+        "~/Library/Caches must be measured as an external unit, not silently unmeasured: {units:?}"
+    );
 }

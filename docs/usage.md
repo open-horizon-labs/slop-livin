@@ -95,12 +95,25 @@ swamp scope
 swamp scope --json
 ```
 
-The effective scope is built from four sources, in this order:
+The effective scope is built from four sources, in this order, and
+every root falls into exactly one of two classes: a **project root**
+(ordinary Git/ecosystem discovery, project grouping, and an
+unowned-remainder walk) or a **detector location** (measured only as an
+external unit -- a folded row plus its adapter's own interior
+identification -- and never walked for projects, even when a Git
+checkout happens to live inside it). `swamp scope`'s text output shows
+the two classes under separate headings; `swamp report`'s per-root
+coverage says `detector location (measured as an external unit, not
+scanned for projects)` for the second class.
 
-1. **Built-in default roots**, per platform. macOS: `~/src`,
-   `~/Library/Developer`, `~/Library/Caches`. Linux: `~/src` and
-   `$XDG_CACHE_HOME` (default `~/.cache`). Neither platform's
-   conventions appear in the other's build; see
+1. **Built-in default roots**, per platform. Only `~/src` is a project
+   root. macOS also proposes `~/Library/Developer` and
+   `~/Library/Caches`; Linux also proposes `$XDG_CACHE_HOME` (default
+   `~/.cache`) -- both are detector locations, not project roots: a
+   project checked out inside either one is still discovered (as its
+   own external unit's interior, if its adapter identifies one) but
+   never becomes a "project" the way something under `~/src` would.
+   Neither platform's conventions appear in the other's build; see
    [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are)
    for why Linux has two rather than three.
 2. **Detector results.** A built-in catalog of read-only detectors
@@ -110,7 +123,8 @@ The effective scope is built from four sources, in this order:
    Gradle, Maven, Go, pip), Apple/Android developer tooling (Xcode,
    CoreSimulator, Android SDK), and package/model/VM stores (Homebrew,
    Hugging Face, Ollama, Docker Desktop's host backing file, OrbStack).
-   A conventional path is still proposed even when the tool's
+   Every one of these is a detector location, never a project root. A
+   conventional path is still proposed even when the tool's
    executable is absent, so a leftover cache can still be found. See
    [docs/locations.md](locations.md) for the full table -- every
    detector, its locations, overrides, categories, and documented
@@ -119,13 +133,14 @@ The effective scope is built from four sources, in this order:
    this catalog does not inspect). `swamp scope --json` always lists
    the exact detector IDs and catalog version in use.
 
-   A detector-resolved location that falls *inside* another kept root
-   (a config `include`, a built-in default, or another detector's own
+   A detector-resolved location that falls *inside* another kept
+   project root (a config `include`, `~/src`, or another detector's own
    base directory) is pruned from that root's walk and measured
    exactly once, as its own external unit -- see
    [coverage-and-history.md](../skills/swamp/references/coverage-and-history.md)'s
    "External/shared storage units".
-3. **`[scan] include`** in `config.toml`: extra roots always in scope.
+3. **`[scan] include`** in `config.toml`: extra project roots always in
+   scope.
 4. **`exclude`** and **`disabled_detectors`**: pruned last, and always
    win over every other source -- including an explicit root you pass
    on the command line. Disabling a detector does not hide a path
@@ -200,7 +215,9 @@ Passing an explicit root (`swamp report ~/other-tree`) replaces sources
 sits inside another in-scope root is folded into its parent for
 measurement (not walked twice); `swamp scope --json` still lists it,
 marked `skipped-as-nested`, so you can see exactly why it did not get
-its own line.
+its own line. The default `swamp scope` text view hides these
+folded-in rows as noise; `swamp scope --verbose` shows every root,
+including them.
 
 An effective scope that resolves to nothing at all -- `defaults =
 false` with no `include` and no enabled detectors -- is a visible error,
