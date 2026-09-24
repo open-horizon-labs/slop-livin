@@ -183,6 +183,42 @@ counts. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
 regeneration against the pinned toolchain are covered in the same
 report.
 
+## Correction (verification pass, 2026-09-23)
+
+The WIP checkpoint (d4722fb) deleted
+`crates/core/tests/reviewer_counterexamples_stack2.rs` wholesale,
+uncounted in the "tests deleted wholesale" list above, and left
+`scripts/check.sh`'s named-targets loop pointing at the now-missing
+file (`check.sh` failed outright: "named test target ... is gone").
+Of its 7 tests, only 2 (`an_in_place_rewrite_of_a_reviewed_member_must_
+not_spend_the_approval`, `reviewed_snapshot_must_see_a_same_second_
+same_size_rewrite`) were actually about the deleted recheck/plan/
+approve/execute pipeline. The other 5 -- explicit-root exclusion,
+config-only-exclusion growth/regrowth, a disabled detector's spawn
+count, the spawn counter's own sanity check, and `protect add`'s
+fail-closed behavior on a relative path -- test facts unrelated to the
+action-path removal and were still passing before the deletion. The
+file is restored with those 5 tests intact, the 2 pipeline-specific
+ones dropped, and CE5 rewritten off the removed propose/save_plan/
+approve/execute_with_trash cycle onto the current gate
+(`agents::discover_and_measure`'s `AgentUnit.protected`, `actions::
+propose_agents`'s `agent_refusal`) and the current sink
+(`actions::trash_agent_cache`). All 5 pass unchanged.
+
+Also found while regenerating the trybuild snapshots: the compile-fail
+`.stderr` snapshots already matched rustc 1.98.1 exactly (both plain
+and `TRYBUILD=overwrite` runs produced zero diffs) -- the "8 mismatches"
+the brief flagged were apparently against the deleted compile-fail
+cases themselves (all of which named the removed
+`Plan`/`Grant`/`Authorized`/`HumanConfirmed`/`RecheckProof` types), not
+against any case that survived this chunk's deletions. No snapshot
+changes were needed. `scripts/check-full.sh`'s compile-fail step now
+runs `rustup run <pinned toolchain>` explicitly (reading
+`rust-toolchain.toml`) instead of trusting ambient resolution, and
+`.github/workflows/ci.yml`'s `macos-arm64-check-full` job -- found
+floating on `dtolnay/rust-toolchain@stable` while every other job pins
+1.98.1 -- is now pinned to match.
+
 ## Known gaps (deliberately out of scope this chunk, given time)
 
 - `cargo_cleanup::check`/`CheckResult` (only ever called by the deleted
