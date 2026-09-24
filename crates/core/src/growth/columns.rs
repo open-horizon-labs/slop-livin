@@ -53,6 +53,12 @@ pub(super) struct StoredRow {
     present: bool,
     observed_at: u64,
     regrowth_count: u32,
+    /// Ecosystem tag that generates this artifact (`rs`, `js`, ...);
+    /// `None` for a row with no ecosystem (`Source`/`Git`/etc.) and for
+    /// stores written before this column existed (R15 item 3: render's
+    /// `ArtifactRow::ecosystem` was the one artifact-render field the
+    /// existing current-artifact table did not already carry).
+    ecosystem: Option<String>,
 }
 
 fn schema() -> Arc<Schema> {
@@ -69,6 +75,7 @@ fn schema() -> Arc<Schema> {
         Field::new("mtime_max", DataType::UInt64, false),
         Field::new("hardlinked", DataType::Boolean, false),
         Field::new("dedup_stale", DataType::Boolean, false),
+        Field::new("ecosystem", DataType::Utf8, true),
     ]))
 }
 
@@ -85,6 +92,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
     let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
     let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
     let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
+    let ecosystem: Vec<Option<&str>> = rows.iter().map(|r| r.ecosystem.as_deref()).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -103,6 +111,7 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(BooleanArray::from(
                 rows.iter().map(|r| r.dedup_stale).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(ecosystem)),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -141,6 +150,10 @@ pub(super) fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
         let mtime_max = downcast_u64(&batch, "mtime_max").ok();
         let hardlinked = downcast_bool(&batch, "hardlinked").ok();
         let dedup_stale = downcast_bool(&batch, "dedup_stale").ok();
+        // Stores written before R15 item 3 have no ecosystem column.
+        let ecosystem = batch
+            .column_by_name("ecosystem")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         for i in 0..batch.num_rows() {
             rows.push(StoredRow {
                 project_id: project_id.value(i).to_string(),
@@ -158,6 +171,7 @@ pub(super) fn read_rows(path: &Path) -> Result<Vec<StoredRow>> {
                 present: present.value(i),
                 observed_at: observed_at.value(i),
                 regrowth_count: regrowth.value(i),
+                ecosystem: ecosystem.and_then(|c| c.is_valid(i).then(|| c.value(i).to_string())),
             });
         }
     }
@@ -783,6 +797,9 @@ impl StoredRow {
     pub(super) fn hardlinked(&self) -> bool {
         self.hardlinked
     }
+    pub(super) fn ecosystem(&self) -> Option<&str> {
+        self.ecosystem.as_deref()
+    }
     pub(super) fn present(&self) -> bool {
         self.present
     }
@@ -828,6 +845,7 @@ impl StoredRow {
             present,
             observed_at,
             regrowth_count,
+            ecosystem: None,
         }
     }
 
@@ -957,6 +975,7 @@ impl ArtifactHistory {
                     || prev.dedup_stale != obs.dedup_stale
                     || prev.mtime_max != obs.mtime_max
                     || prev.local_bytes != obs.local_bytes
+                    || prev.ecosystem != obs.ecosystem
                 {
                     self.changed = true;
                 }
@@ -986,6 +1005,7 @@ impl ArtifactHistory {
                 prev.hardlinked = obs.hardlinked;
                 prev.mtime_max = obs.mtime_max;
                 prev.local_bytes = obs.local_bytes;
+                prev.ecosystem = obs.ecosystem.clone();
             }
             None => {
                 self.changed = true;
@@ -1004,6 +1024,7 @@ impl ArtifactHistory {
                         present: true,
                         observed_at,
                         regrowth_count: 0,
+                        ecosystem: obs.ecosystem.clone(),
                     },
                 );
             }

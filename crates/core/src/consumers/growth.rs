@@ -32,6 +32,10 @@ impl Consumer for GrowthConsumer {
         let roots = crate::report::artifact_roots(&d.projects);
         let nested_shadow_paths =
             add_nested_history_rows(&mut d.projects, &d.nested_artifacts, ctx.observed_at);
+        // R15 item 3: the artifact history stores each row's ecosystem,
+        // so it has to be known before the store is written, not one
+        // stage later in tracking.
+        crate::report::annotate_artifact_ecosystems(&mut d.projects);
         if let Some(dir) = &ctx.store_dir {
             // The store is scoped to the canonical requested root, not just
             // the device. Multiple roots on one volume must never share

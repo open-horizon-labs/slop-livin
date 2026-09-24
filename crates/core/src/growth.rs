@@ -30,7 +30,7 @@ use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use crate::git::DiscoveredWorktree;
 use crate::report::{
     ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Report, Source, UnownedReason,
-    UnownedRow,
+    UnownedRow, WorktreeRow,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -287,6 +287,7 @@ struct Observed {
     mtime_max: u64,
     hardlinked: bool,
     dedup_stale: bool,
+    ecosystem: Option<String>,
 }
 
 fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
@@ -316,6 +317,7 @@ fn flatten(projects: &[ProjectRow]) -> Vec<Observed> {
                     dedup_stale: artifact.dedup_stale,
                     rel_path: rel_path_str,
                     bytes: artifact.bytes,
+                    ecosystem: artifact.ecosystem.clone(),
                     local_bytes: if artifact.local_bytes == 0
                         && artifact.source.tool != "cargo.layout"
                     {
@@ -1449,6 +1451,75 @@ pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportS
         agent_units: serde_json::from_str(&row.agent_units_json).ok()?,
         store_interiors: serde_json::from_str(&row.store_interiors_json).ok()?,
     })
+}
+
+/// The current-artifact-table facts `report_scope_from_store` needs per
+/// artifact row (R15 item 3): everything the extended `StoredRow` now
+/// carries, keyed the same way the artifact history already keys rows
+/// (`project_id`/`worktree_id`/`kind`/`rel_path`). Read across every
+/// root's own volume directory, since one scope can span several.
+pub struct ArtifactTableFacts {
+    pub bytes: u64,
+    pub local_bytes: u64,
+    pub mtime_max: u64,
+    pub hardlinked: bool,
+    pub dedup_stale: bool,
+    pub regrowth_count: u32,
+    pub observed_at: u64,
+    pub present: bool,
+    pub ecosystem: Option<String>,
+}
+
+pub fn artifact_table_facts_for_roots(
+    swamp_dir: &Path,
+    roots: &[PathBuf],
+) -> HashMap<String, ArtifactTableFacts> {
+    let mut out = HashMap::new();
+    for root in roots {
+        let dir = volume_dir(swamp_dir, root_scoped_volume_id(root));
+        let Ok(rows) = read_rows(&current_path(&dir)) else {
+            continue;
+        };
+        for r in rows {
+            out.insert(
+                r.key(),
+                ArtifactTableFacts {
+                    bytes: r.bytes(),
+                    local_bytes: r.local_bytes(),
+                    mtime_max: r.mtime_max(),
+                    hardlinked: r.hardlinked(),
+                    dedup_stale: r.dedup_stale(),
+                    regrowth_count: r.regrowth_count(),
+                    observed_at: r.observed_at(),
+                    present: r.present(),
+                    ecosystem: r.ecosystem().map(|s| s.to_string()),
+                },
+            );
+        }
+    }
+    out
+}
+
+/// The same row key the artifact history stores rows under
+/// (`project_id`/`worktree_id`/`observed_kind`/`rel_path`), exposed so
+/// `report::report_scope_from_store` can look up
+/// [`ArtifactTableFacts`] for an `ArtifactRow` it already has (from the
+/// snapshot) without duplicating `observed_kind`'s cargo-nested-id
+/// special case.
+pub(crate) fn artifact_row_key(
+    project_id: &str,
+    worktree_id: &str,
+    worktree_path: &Path,
+    artifact: &ArtifactRow,
+) -> String {
+    let rel_path = artifact
+        .path
+        .strip_prefix(worktree_path)
+        .unwrap_or(&artifact.path)
+        .display()
+        .to_string();
+    let kind = observed_kind(artifact);
+    row_key(project_id, worktree_id, &kind, &rel_path)
 }
 
 fn parse_artifact_kind(s: &str) -> ArtifactKind {
@@ -4553,5 +4624,54 @@ mod tests {
             .unwrap();
         assert_eq!(row.rel_path(), "node_modules");
         assert!(!row.rel_path().starts_with('/'));
+    }
+    /// R15 table 4: the current-artifact table carries `ecosystem`, keeps
+    /// it across an unchanged re-observation, and refreshes it when it
+    /// changes; a store without the column reads `None`, not an error.
+    #[test]
+    fn artifact_history_round_trips_the_ecosystem_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let obs = |eco: Option<&str>, bytes: u64| Observed {
+            key: row_key("p", "w", "BuildOutput", "target"),
+            project_id: "p".into(),
+            worktree_id: "w".into(),
+            kind: "BuildOutput".into(),
+            rel_path: "target".into(),
+            bytes,
+            local_bytes: bytes,
+            mtime_max: 5,
+            hardlinked: false,
+            dedup_stale: false,
+            ecosystem: eco.map(|s| s.to_string()),
+        };
+        let mut h = ArtifactHistory::load(dir).unwrap();
+        h.observe(&obs(Some("rs"), 10), 1);
+        h.commit().unwrap();
+        let rows = read_rows(&current_path(dir)).unwrap();
+        assert_eq!(rows[0].ecosystem(), Some("rs"));
+
+        // Unchanged bytes, changed ecosystem: still rewritten.
+        let mut h = ArtifactHistory::load(dir).unwrap();
+        h.observe(&obs(Some("js"), 10), 2);
+        h.commit().unwrap();
+        let rows = read_rows(&current_path(dir)).unwrap();
+        assert_eq!(rows[0].ecosystem(), Some("js"));
+        assert_eq!(rows[0].bytes(), 10);
+
+        // The facts map `report_scope_from_store` reads is keyed like the
+        // history and carries the column.
+        let facts = artifact_table_facts_for_roots(dir, &[]);
+        assert!(facts.is_empty(), "no roots, no facts");
+
+        // A null cell reads as `None` (a table written without the
+        // column at all goes through the same `Option` path).
+        let old = dir.join("old.parquet");
+        StoredRow::write_for_test(
+            &old,
+            &[StoredRow::for_test("p", "w", "k", "r", 1, true, 1, 0)],
+        )
+        .unwrap();
+        assert_eq!(read_rows(&old).unwrap()[0].ecosystem(), None);
     }
 }

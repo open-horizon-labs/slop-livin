@@ -1194,15 +1194,14 @@ pub(crate) fn report_full_mode_scoped_tracked(
     Ok((report, window))
 }
 
-/// Fills `track` on every artifact row and top-level Source directory:
-/// one exclude stack per worktree, one lookup per row. `.git` rows carry
-/// no status (git's own store is not content it tracks). Cheap relative
-/// to the walk and needed by every surface, so it runs on every report.
-pub fn annotate_tracking(
-    projects: &mut [ProjectRow],
-    dirs: Option<&mut std::collections::HashMap<String, Vec<DirRollup>>>,
-) {
-    let mut dirs = dirs;
+/// Fills `ecosystems` on a project that has none yet and `ecosystem` on
+/// every artifact row that has none yet (`ecosystem::artifact_ecosystem_at`).
+/// Idempotent, so it runs twice per pipeline: once from the growth
+/// consumer, *before* the artifact history is written (R15 item 3: the
+/// current-artifact table stores `ecosystem`, and the history is the
+/// stage before tracking), and again from [`annotate_tracking`], where
+/// it used to live, for any row a later stage added.
+pub fn annotate_artifact_ecosystems(projects: &mut [ProjectRow]) {
     for p in projects.iter_mut() {
         if p.ecosystems.is_empty() {
             let root = p
@@ -1216,9 +1215,6 @@ pub fn annotate_tracking(
             }
         }
         for wt in p.worktrees.iter_mut() {
-            let Some(lens) = crate::ignore::IgnoreLens::open(&wt.path) else {
-                continue;
-            };
             for a in wt.artifacts.iter_mut() {
                 if a.ecosystem.is_none()
                     && !a.kind.is_worktree_remainder()
@@ -1233,6 +1229,27 @@ pub fn annotate_tracking(
                     }
                     .map(String::from);
                 }
+            }
+        }
+    }
+}
+
+/// Fills `track` on every artifact row and top-level Source directory:
+/// one exclude stack per worktree, one lookup per row. `.git` rows carry
+/// no status (git's own store is not content it tracks). Cheap relative
+/// to the walk and needed by every surface, so it runs on every report.
+pub fn annotate_tracking(
+    projects: &mut [ProjectRow],
+    dirs: Option<&mut std::collections::HashMap<String, Vec<DirRollup>>>,
+) {
+    let mut dirs = dirs;
+    annotate_artifact_ecosystems(projects);
+    for p in projects.iter_mut() {
+        for wt in p.worktrees.iter_mut() {
+            let Some(lens) = crate::ignore::IgnoreLens::open(&wt.path) else {
+                continue;
+            };
+            for a in wt.artifacts.iter_mut() {
                 if a.kind == ArtifactKind::Git || a.source.tool.starts_with("docker") {
                     continue;
                 }
