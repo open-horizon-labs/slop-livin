@@ -335,9 +335,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.98.1"
+          targets: aarch64-apple-darwin
           components: rustfmt, clippy
 
       - name: Cargo cache
