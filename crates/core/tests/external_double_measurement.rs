@@ -45,7 +45,12 @@ fn fixture_env(home: &Path) -> Environment {
 }
 
 /// Every detector except `keep` is disabled, so a fixture home never
-/// picks up incidental noise from other catalog entries.
+/// picks up incidental noise from other catalog entries. `keep` also
+/// populates `enabled_detectors`: harmless for an ordinary opt-out
+/// detector, and necessary for one that defaults off on its own
+/// (stack/26 -- currently only Homebrew, a system-wide install tree),
+/// since naming it here is exactly this helper's "keep this one"
+/// intent.
 fn only_config(keep: &[&str], registry: &Registry) -> ScanConfig {
     let disabled: Vec<String> = registry
         .detectors()
@@ -56,7 +61,7 @@ fn only_config(keep: &[&str], registry: &Registry) -> ScanConfig {
     ScanConfig {
         defaults: true,
         disabled_detectors: disabled,
-        enabled_detectors: Vec::new(),
+        enabled_detectors: keep.iter().map(|s| s.to_string()).collect(),
         ..ScanConfig::default()
     }
 }
@@ -194,7 +199,11 @@ fn double_measurement_fix_is_order_independent() {
     let cfg = ScanConfig {
         defaults: true,
         disabled_detectors: keep_disabled,
-        enabled_detectors: Vec::new(),
+        // Homebrew defaults off on its own (stack/26 -- a system-wide
+        // install tree); naming it here is this fixture's explicit
+        // "keep this one" intent, the same as leaving it out of
+        // `keep_disabled` above.
+        enabled_detectors: vec!["homebrew".to_string()],
         ..ScanConfig::default()
     };
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 2_000);

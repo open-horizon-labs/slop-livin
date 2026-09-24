@@ -166,6 +166,28 @@ deny-list reading), and the reviewer's own
 reading, set `enabled_detectors` rather than relying on
 `disabled_detectors`.
 
+**Homebrew is off by default**, even under ordinary `defaults = true`
+scope -- the one detector in the catalog whose store is not per-user.
+`/opt/homebrew` (or `/usr/local`) is a **system-wide install tree**:
+shared by every account on the machine, installed once regardless of
+which developer runs swamp, and its Cellar/Caskroom can hold GUI
+applications and system tools with nothing to do with any project.
+`swamp scope` reports it `disabled (default off)`, distinct from a
+detector you disabled yourself (plain `disabled`); turn it on with:
+
+```toml
+[scan]
+enabled_detectors = ["homebrew"]  # everything else keeps its own default
+```
+
+The same `enabled_detectors` key that means "only these" under
+`defaults = false` means "also this one, which defaults off" under
+`defaults = true` -- one key, read according to which scan mode it
+appears under, rather than a second key for the opposite direction.
+Every other catalog detector -- language version managers, shared
+build/dependency caches, agent-tool homes -- lives under `$HOME` and
+keeps its ordinary opt-out default (`disabled_detectors` turns it off).
+
 Passing an explicit root (`swamp report ~/other-tree`) replaces sources
 1-3 entirely for that invocation -- `exclude` still applies. A root that
 sits inside another in-scope root is folded into its parent for

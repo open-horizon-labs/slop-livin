@@ -36,6 +36,16 @@ impl Detector for HomebrewDetector {
          Linux /home/linuxbrew/.linuxbrew)"
     }
 
+    /// A system-wide install tree, not a per-user one: `/opt/homebrew`
+    /// (or `/usr/local`) is shared by every account on the machine,
+    /// installed once regardless of which developer runs swamp, and its
+    /// Cellar/Caskroom can hold GUI applications and system tools with
+    /// nothing to do with any one project. Off by default; `[scan]
+    /// enabled_detectors = ["homebrew"]` turns it on.
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let mut out = Vec::new();
         // Every prefix this pass resolved, so Cellar/Caskroom (#49) can

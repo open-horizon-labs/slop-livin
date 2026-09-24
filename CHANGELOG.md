@@ -4,6 +4,23 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Homebrew (a system-wide install tree) is off by default
+
+`Detector::default_enabled()` (default `true`) is a new axis, independent
+of `[scan] defaults`: a detector whose store is not per-user -- shared
+by every account on the machine, installed once regardless of which
+developer runs swamp -- can opt out of ordinary `defaults = true` scope
+on its own. Homebrew (`/opt/homebrew`/`/usr/local`, whose Cellar/
+Caskroom can hold GUI applications with nothing to do with any project)
+is the one detector in the catalog this applies to today; it is now off
+by default. `swamp scope` reports it `disabled (default off)`, distinct
+from a detector the user's own `disabled_detectors` turned off;
+`[scan] enabled_detectors = ["homebrew"]` turns it back on -- the same
+config key `defaults = false` already reads as "turned on" for the
+opposite direction. `EffectiveScope`/`swamp scope --json` gain
+`default_off_detectors`, the subset of `disabled_detectors` that is off
+for this reason rather than the user's own choice.
+
 ### Codex agent-storage category reconciliation fixed
 
 `--view agents` on a real Codex home could show a "sessions" total that

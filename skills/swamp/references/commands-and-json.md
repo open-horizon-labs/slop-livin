@@ -43,14 +43,20 @@ invocation (or, given explicit roots, what those resolve to -- config
 (`present`/`missing`/`unreadable`/`skipped-as-nested`/`excluded`) and
 every reason it is in scope, plus the full detector catalog (including
 `disabled`/`not-present`/`unresolved-with-reason` entries never
-promoted to a root) and the catalog version:
+promoted to a root) and the catalog version. `disabled_detectors` is
+every detector not running this pass; `default_off_detectors` (stack/26)
+is the subset of those off because the detector itself defaults to off
+(a system-wide install tree -- currently only Homebrew) rather than
+because your config named it -- `[scan] enabled_detectors = ["homebrew"]`
+turns it back on:
 
 ```json
 {
   "catalog_version": "2026-09-21.4",
   "generated_at": 1758470400,
   "defaults_enabled": true,
-  "disabled_detectors": [],
+  "disabled_detectors": ["homebrew"],
+  "default_off_detectors": ["homebrew"],
   "configured_include": [],
   "configured_exclude": [],
   "explicit": false,

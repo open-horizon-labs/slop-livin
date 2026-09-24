@@ -986,6 +986,24 @@ pub trait Detector: Send + Sync {
     fn build_stores(&self) -> &'static [BuildStoreDecl] {
         &[]
     }
+    /// Whether this detector runs under ordinary `defaults = true` scope
+    /// without the config naming it.
+    ///
+    /// `true` for every detector except a **system-wide install tree**:
+    /// one whose store is not per-user (`$HOME`-rooted) but shared by
+    /// every account on the machine, installed once regardless of which
+    /// developer runs swamp, and often holding bytes with nothing to do
+    /// with any one project (Homebrew's Cellar/Caskroom can contain GUI
+    /// applications installed via `brew install --cask`). Overriding this
+    /// to `false` still lets the detector run: `swamp scope` reports it
+    /// `disabled (default off)` rather than merely `disabled`, and
+    /// `[scan] enabled_detectors = ["<id>"]` turns it on -- the same
+    /// config key `defaults = false` already uses for the opposite
+    /// direction, so it means "on" in both scan modes
+    /// (`crate::locations::permitted::PermittedDetectors::from_config`).
+    fn default_enabled(&self) -> bool {
+        true
+    }
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation>;
 }
 

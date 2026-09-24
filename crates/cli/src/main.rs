@@ -531,7 +531,19 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
             let status = match &loc.status {
                 swamp_core::locations::LocationStatus::Resolved => "resolved".to_string(),
                 swamp_core::locations::LocationStatus::NotPresent => "not-present".to_string(),
-                swamp_core::locations::LocationStatus::Disabled => "disabled".to_string(),
+                // `disabled (default off)` names *why* this one is off
+                // without the config saying so -- a system-wide install
+                // tree like Homebrew (`Detector::default_enabled`) --
+                // distinct from a plain `disabled`, which the user's own
+                // `disabled_detectors` caused. `[scan] enabled_detectors
+                // = ["<id>"]` turns either kind back on.
+                swamp_core::locations::LocationStatus::Disabled => {
+                    if scope.default_off_detectors.contains(&d.detector_id) {
+                        "disabled (default off)".to_string()
+                    } else {
+                        "disabled".to_string()
+                    }
+                }
                 swamp_core::locations::LocationStatus::UnresolvedWithReason { reason } => {
                     format!("unresolved ({reason})")
                 }

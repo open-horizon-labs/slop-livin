@@ -65,11 +65,20 @@ pub struct ScanConfig {
     /// `detect()` is still called by the registry only to be labelled
     /// `Disabled` for transparency -- see `crate::locations::Registry::resolve`).
     pub disabled_detectors: Vec<String>,
-    /// Detector IDs explicitly turned **on** under `defaults = false`
-    /// (explicit-only scope). Ignored when `defaults = true`, where the
-    /// deny-list `disabled_detectors` is the control. This is the
+    /// Detector IDs explicitly turned **on**.
+    ///
+    /// Under `defaults = false` (explicit-only scope), this is the
     /// documented way to say "explicit-only scope, but do still look at
-    /// my Hugging Face cache".
+    /// my Hugging Face cache" -- the deny-list `disabled_detectors`
+    /// controls the opposite direction there.
+    ///
+    /// Under `defaults = true` (the ordinary case), this is instead the
+    /// way to turn on a detector that opts out of ordinary scope on its
+    /// own (`Detector::default_enabled` returning `false` -- a
+    /// system-wide install tree like Homebrew, off by default because it
+    /// is shared by every account on the machine and can hold bytes
+    /// nothing to do with any project). Naming an ordinary opt-out
+    /// detector here does nothing extra: it was already going to run.
     #[serde(default)]
     pub enabled_detectors: Vec<String>,
 }
@@ -130,9 +139,12 @@ exclude = {}\n\
 # Detector IDs to turn off without excluding a path another enabled\n\
 # root already reaches, e.g. [\"homebrew\"]. `swamp scope --json` lists ids.\n\
 disabled_detectors = {}\n\
-# Detector IDs explicitly turned on under `defaults = false`. Ignored\n\
-# when defaults = true. With defaults = false and neither list set, no\n\
-# detector runs at all and the scope is `include` plus explicit roots.\n\
+# Detector IDs explicitly turned on: under defaults = false (explicit-only\n\
+# scope), the only way any detector runs at all; under defaults = true,\n\
+# the way to turn on a detector that is off by default on its own (a\n\
+# system-wide install tree, e.g. \"homebrew\" -- `swamp scope` marks these\n\
+# `disabled (default off)`). With defaults = false and neither list set,\n\
+# no detector runs at all and the scope is `include` plus explicit roots.\n\
 enabled_detectors = {}\n",
             self.defaults, include, exclude, disabled, enabled
         )
@@ -271,6 +283,13 @@ pub struct EffectiveScope {
     pub generated_at: u64,
     pub defaults_enabled: bool,
     pub disabled_detectors: Vec<String>,
+    /// The subset of [`Self::disabled_detectors`] that is off because
+    /// the detector itself defaults to off (`Detector::default_enabled`
+    /// -- a system-wide install tree like Homebrew), not because the
+    /// user's config named it. `swamp scope` reports these `disabled
+    /// (default off)` rather than plain `disabled`.
+    #[serde(default)]
+    pub default_off_detectors: Vec<String>,
     pub configured_include: Vec<String>,
     pub configured_exclude: Vec<String>,
     /// True when this scope was resolved from explicit command-line
@@ -1100,6 +1119,7 @@ pub fn resolve_effective_scope(
         generated_at,
         defaults_enabled: config.defaults,
         disabled_detectors: permitted.disabled(),
+        default_off_detectors: permitted.default_off(),
         configured_include: config.include.clone(),
         configured_exclude: config.exclude.clone(),
         explicit: !explicit_roots.is_empty(),

@@ -381,6 +381,23 @@ the reviewer's `defaults_false_must_mean_explicit_only`. `docs/usage.md`
 says the same thing to a user, including which list to reach for if you
 want the strict reading.
 
+`Detector::default_enabled` (stack/26) is the third axis, independent of
+`defaults = true`/`false`: a detector can opt out of ordinary
+`defaults = true` scope on its own, for a **system-wide install tree**
+whose store is not per-user -- currently only Homebrew
+(`/opt/homebrew`/`/usr/local`, shared by every account on the machine).
+`locations::permitted::PermittedDetectors::from_config` folds this in on
+the `defaults = true` branch only (the `defaults = false` branch is
+already fully explicit, so a detector's own default plays no part
+there): a default-off detector not named in `enabled_detectors` joins
+`disabled`, and is also recorded in the new `default_off` subset so
+`swamp scope` can report `disabled (default off)` instead of a plain
+`disabled` that would read as the user's own choice. `enabled_detectors`
+is therefore read two ways depending on `defaults`: an allow-list under
+`defaults = false`, and "also turn on this default-off detector" under
+`defaults = true` -- one config key, not two, because the two scan
+modes never both apply to the same invocation.
+
 ### Observation ownership: who may tombstone a row
 
 External units and agent units share one key family in one Parquet
@@ -489,7 +506,11 @@ to `Registry::with_builtins`. Every detector:
 - Declares a stable `id()` (used in `disabled_detectors` config and in
   `EffectiveScope` provenance -- never reused for a different meaning
   once released), the `platforms()` it applies to, and a
-  `version_note()` for `swamp scope` output and this doc.
+  `version_note()` for `swamp scope` output and this doc. A detector
+  proposing a system-wide install tree (not per-user -- currently only
+  Homebrew) overrides `default_enabled()` to `false`, so it stays off
+  under ordinary `defaults = true` scope until `enabled_detectors`
+  names it.
 - Returns `ProposedLocation`s carrying a `StorageCategory`
   (installation/downloads/cache/local-state/environments/build-output/
   models/unclassified), a `Provenance` (built-in convention, env var,
