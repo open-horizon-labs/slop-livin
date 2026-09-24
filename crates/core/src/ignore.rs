@@ -30,6 +30,19 @@ impl TrackState {
             TrackState::Unknown => "",
         }
     }
+
+    /// Inverse of [`Self::label`] (R18a-3: `worktree_entries.parquet`'s
+    /// `track` column). `""`/`"unknown"`/anything unrecognized reads back
+    /// as `Unknown` -- the same value `label()` maps *to* `""`, so a
+    /// round trip through this pair is exact.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "tracked" => TrackState::Tracked,
+            "ignored" => TrackState::Ignored,
+            "untracked" => TrackState::Untracked,
+            _ => TrackState::Unknown,
+        }
+    }
 }
 
 /// The per-checkout ignore/index lens: `gix` lives in the capability

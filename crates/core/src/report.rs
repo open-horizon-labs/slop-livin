@@ -2677,6 +2677,28 @@ pub fn observe_scope(
                 &n.decision_evidence,
             ));
         }
+        // R18a-3: an `UnownedRow`'s evidence, keyed by its position in
+        // `Report.unowned` -- the same identity
+        // `write_unowned_summary_table`/`rebuild_unowned_from_tables`
+        // use for the row itself. Folded into this same
+        // `evidence_entities` list (not a second `write_evidence_table`
+        // call) so this pass's evidence write stays the one wholesale
+        // replace for `key` -- a second call would filter out and lose
+        // the entities already pushed above.
+        let unowned_evidence_keys: Vec<String> = (0..observation.merged.unowned.len())
+            .map(|seq| crate::growth::evidence_row_key("unowned-summary", &seq.to_string()))
+            .collect();
+        for (u, row_key) in observation
+            .merged
+            .unowned
+            .iter()
+            .zip(unowned_evidence_keys.iter())
+        {
+            if u.evidence.is_empty() {
+                continue;
+            }
+            evidence_entities.push((row_key.clone(), &u.evidence));
+        }
         crate::growth::write_evidence_table(store_dir, &key, &evidence_entities)?;
         // R17 item 1 of the JSON-in-the-store decomposition:
         // `coverage.parquet`/`series.parquet`/`summary.parquet`/
@@ -2704,12 +2726,37 @@ pub fn observe_scope(
             &key,
             &observation.merged.summary,
             &observation.merged.reconciliation,
+            observation.merged.schedule_line.as_deref(),
             observation.merged.observed_at,
         )?;
         crate::growth::write_notes_table(
             store_dir,
             &key,
             &observation.merged.notes,
+            observation.merged.observed_at,
+        )?;
+        // R18a-3: `unowned_summary.parquet` (+ `unowned_summary_lists.
+        // parquet`), `worktree_entries.parquet`, `github_enrichment.
+        // parquet` -- the last of `report_rows.parquet`'s `report_json`
+        // fields, from this same pass's already-assembled
+        // `observation.merged`.
+        crate::growth::write_unowned_summary_table(
+            store_dir,
+            &key,
+            &observation.merged.unowned,
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_worktree_entries_table(
+            store_dir,
+            &key,
+            observation.merged.dirs_by_worktree.as_ref(),
+            observation.merged.files_by_worktree.as_ref(),
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_github_enrichment_table(
+            store_dir,
+            &key,
+            observation.merged.github_enrichment.as_ref(),
             observation.merged.observed_at,
         )?;
     }
@@ -3214,6 +3261,14 @@ fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut Repo
         let row_key = crate::growth::evidence_row_key("nested-artifact", &n.id);
         n.decision_evidence = by_key.get(&row_key).cloned().unwrap_or_default();
     }
+    // R18a-3: keyed by the row's position in `snapshot.report.unowned`,
+    // same as `write_unowned_summary_table`'s evidence fold-in above --
+    // must run after `rebuild_unowned_from_tables` set this list's final
+    // order/length.
+    for (seq, u) in snapshot.report.unowned.iter_mut().enumerate() {
+        let row_key = crate::growth::evidence_row_key("unowned-summary", &seq.to_string());
+        u.evidence = by_key.get(&row_key).cloned().unwrap_or_default();
+    }
 }
 
 pub fn report_scope_from_store(
@@ -3228,6 +3283,14 @@ pub fn report_scope_from_store(
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
+    // R18a-3: `Report.unowned`/`.dirs_by_worktree`/`.files_by_worktree`/
+    // `.github_enrichment` -- run before `rebuild_evidence_from_tables`,
+    // which fills in the rebuilt `unowned` rows' evidence by position.
+    crate::growth::rebuild_unowned_worktree_entries_github_from_tables(
+        store_dir,
+        &key,
+        &mut snapshot,
+    );
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
     // R17 item 1: last, like `rebuild_evidence_from_tables` -- the
     // by-type project recount inside `rebuild_summary_from_tables` reads

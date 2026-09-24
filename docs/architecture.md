@@ -712,21 +712,77 @@ left open: it types every remaining `NestedArtifact` field (see the
 there is nothing left for one to carry over). `report_json` is now the
 *only* JSON-encoded cell anywhere in `crates/core/src/growth/columns.rs`.
 
-Still open after R18a-2 (left for R18a-3/R18a-4, `.oh/sessions/
-2026-09-24-r18a-unit-and-unowned-tables.md` and `.oh/sessions/
-2026-09-24-r18a2-nested-artifacts-typed.md` name the reasoning):
-`report_rows.parquet` itself is **not yet deleted** -- `Report.root`/
-`unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
-`github_enrichment` still come from `report_json`, since migrating them
-needs either a new scope-wide `unowned` aggregation over the per-volume
-`unowned.parquet` tables or a larger dirs/files-by-worktree table
-design (R18a-3). `last_report-*.json.zst`/`growth::write_last_report`/
-`load_last_report` are also untouched (R18a-4): `consumers/signals.rs`/
-`consumers/cargo.rs` read a *per-root* previous `Report` from it
-(previous git signals; previous `nested_artifacts` + `observed_at`) for
-the incremental walk, a different, lower-level need than the scope-wide
-snapshot this section covers, and redesigning it onto typed tables is
-real, separate work.
+R18a-3 (2026-09-24) types the four `Report` fields R18a-2 left in
+`report_json` -- `unowned`, `dirs_by_worktree`/`files_by_worktree`,
+`schedule_line` and `github_enrichment` -- but does **not** delete
+`report_rows.parquet`/`report_json` itself; see
+`.oh/sessions/2026-09-24-r18a3-snapshot-deleted.md` for the full account
+of why (a real, pre-existing gap discovered mid-slice, not a decision to
+narrow this slice's scope):
+
+- `<store>/unowned_summary.parquet` -- the scope-wide, already-merged-
+  across-roots `Report.unowned` list `observe_scope` assembles, distinct
+  from the per-volume `unowned.parquet` R18a already typed. Keyed by
+  `(scope_key, seq)` (list position), never `path_or_object` alone --
+  two roots merged into one scope can each contribute a row with the
+  same shared-cache basename. `<store>/unowned_summary_lists.parquet`
+  carries `containers`/`shared_with` (`scope_key`, `seq`, `list_kind`,
+  `item_seq`, `value`); the rows' own evidence reuses `evidence.parquet`
+  directly (entity kind `"unowned-summary"`, id = the row's `seq`)
+  rather than a bespoke child table.
+- `<store>/worktree_entries.parquet` -- `Report.dirs_by_worktree`/
+  `.files_by_worktree` (opt-in per-worktree drill-down,
+  `report_with(.., include_dirs: true)`), one table with a `kind` column
+  (`"dir"` | `"file"`) instead of two files: `scope_key`, `worktree_id`,
+  `kind`, `seq`, `rel_path`, dirs-only `parent_rel_path`/`track`/
+  `allocated_total`/`own_allocated`/`file_count`/`entry_count`/
+  `symlink_count`/`complete`, files-only `allocated`, and
+  `mod_time_min`/`growth_bytes`/`observed_at` shared by both kinds.
+  `dirs_by_worktree`/`files_by_worktree` are always populated together
+  by the same `include_dirs` flag, so "any row exists for this
+  `scope_key`" is the one signal the rebuild needs to tell "the last
+  committing observe asked for dirs" from "it did not" -- both come back
+  `None` together, or `Some` together, never one without the other.
+- `Report.schedule_line` is now a `summary.parquet` row (`metric =
+  "schedule"`, `key = "line"`) using a new nullable `text` column added
+  to that table's schema for exactly this purpose (every other row
+  leaves it `None`) -- `write_summary_table` gained a `schedule_line:
+  Option<&str>` parameter, so the row lands in the same single wholesale
+  write as the metric/reconciliation rows instead of a second write to
+  the same file.
+- `<store>/github_enrichment.parquet` -- `Report.github_enrichment`, at
+  most one row per `scope_key` (zero rows when a pass ran no live
+  enrichment, wholesale-replaced like every other scope-keyed table).
+
+**Why `report_rows.parquet` stays**: `report_scope_from_store`'s
+`rebuild_projects_from_tables` seeds its rebuilt artifact list's *shape*
+-- `ArtifactRow::kind`/`path`/`track`/`confidence`/`source`/`note`/
+`created_at`/`containers`/`shared_with`/`dangling`/`allocated_bytes`/
+`allocated_growth_bytes` -- from `old_artifacts_by_worktree`, built from
+whatever `snapshot.report.projects` already held *before* the rebuild
+runs. R15 item 3 only ever typed `bytes`/`local_bytes`/`mtime_max`/
+`hardlinked`/`dedup_stale`/`regrowth_count`/`observed_at`/`ecosystem`/
+`present` into `ArtifactTableFacts` (the current-artifact-history
+table), explicitly documenting the rest as "later slices" -- and no
+later slice through R18a-2 picked it up. `report_json`'s deserialized
+`Report.projects` was the only remaining source for that shape.
+Deleting `report_json` without a table for it does not fail loudly: it
+silently blanks those fields on the very next `report_scope_from_store`
+call after any store write, which is exactly the kind of fabricated-gap
+regression the worker brief's lessons section warns against, so this
+slice keeps the cell (further slimmed: `unowned`/`dirs_by_worktree`/
+`files_by_worktree`/`schedule_line`/`github_enrichment` are cleared from
+it before serializing, same as `notes`/`summary`/`reconciliation`/series
+already were) and flags the remaining gap for the next slice instead of
+deleting blind. `crates/core/src/growth.rs`'s `ReportSnapshot`/
+`StoredReportSnapshotRow` doc comments carry the same account inline.
+
+`last_report-*.json.zst`/`growth::write_last_report`/`load_last_report`
+are untouched (R18a-4): `consumers/signals.rs`/`consumers/cargo.rs` read
+a *per-root* previous `Report` from it (previous git signals; previous
+`nested_artifacts` + `observed_at`) for the incremental walk, a
+different, lower-level need than the scope-wide snapshot this section
+covers, and redesigning it onto typed tables is real, separate work.
 
 `report_scope_from_store` extends the same rebuild to these: an
 `ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`

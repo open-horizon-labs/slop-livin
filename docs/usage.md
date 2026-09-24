@@ -77,8 +77,16 @@ for their producer/consumer evidence); every row's decision evidence
 `evidence.parquet`; and
 per-root coverage, byte-history series, the by-type/reconciliation
 summary and coverage notes come from `coverage.parquet`,
-`series.parquet`, `summary.parquet` and `notes.parquet`. The rest of the
-report still comes from `report_rows.parquet` until the remaining
+`series.parquet`, `summary.parquet` and `notes.parquet`; scope-wide
+unowned rows come from `unowned_summary.parquet` (+
+`unowned_summary_lists.parquet` for their container/shared-with lists);
+opt-in per-worktree directory/large-file drill-down comes from
+`worktree_entries.parquet`; the scheduled-observation status line is a
+`summary.parquet` row; and live GitHub-enrichment call stats come from
+`github_enrichment.parquet`. The rest of the report (mainly a project's
+worktree's artifact rows' own shape -- kind, path, git tracking,
+confidence, containers, and similar render-only fields no table types
+yet) still comes from `report_rows.parquet` until the remaining
 tables land (see `docs/architecture.md`). Every table is rewritten by
 `observe`; delete
 one and the next `observe` recreates it. There is no migration for a

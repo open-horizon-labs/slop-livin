@@ -1499,6 +1499,38 @@ fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
 // (scope-wide, not per-volume): a scope can span several roots/volumes,
 // and this is the *coherent* observation over all of them, exactly what
 // `report::report_scope`/`report::observe_scope` already assemble.
+//
+// R18a-3 note: this row's `report_json` cell was *not* deleted this
+// slice, despite CHUNK_R18a-3's text asking for it. Mid-slice, deleting
+// it and switching `report_scope_from_store` to a from-scratch
+// `Report::default()`-shaped bootstrap broke
+// `project_worktree_tables.rs`'s `observe_writes_the_three_tables_and_
+// every_view_renders_identically_from_them` test: `rebuild_projects_
+// from_tables` seeds its artifact list's *shape* (`ArtifactRow::kind`/
+// `path`/`track`/`confidence`/`source`/`note`/`created_at`/`containers`/
+// `shared_with`/`dangling`/`allocated_bytes`/`allocated_growth_bytes`)
+// from `old_artifacts_by_worktree`, built from whatever
+// `snapshot.report.projects` already held *before* the rebuild runs --
+// which, before this slice, was always this cell's deserialized value.
+// R15 item 3 only ever typed `bytes`/`local_bytes`/`mtime_max`/
+// `hardlinked`/`dedup_stale`/`regrowth_count`/`observed_at`/`ecosystem`/
+// `present` into `ArtifactTableFacts` (the current-artifact-history
+// table), documenting the rest as "explicitly later slices" -- a debt
+// this slice did not create and does not have a table for. Deleting
+// `report_json` today would silently blank every one of those fields on
+// the next report read after a store write, which is a real data-loss
+// regression, not a cosmetic one; see this slice's session note
+// (`.oh/sessions/2026-09-24-r18a3-snapshot-deleted.md`) for the full
+// account and the exact list of what a follow-up slice needs to type
+// before this cell can go.
+//
+// What *did* move this slice: `Report.unowned`/`dirs_by_worktree`/
+// `files_by_worktree`/`schedule_line`/`github_enrichment` are now typed
+// (`unowned_summary.parquet`+children, `worktree_entries.parquet`, a
+// `summary.parquet` row, `github_enrichment.parquet`) and cleared from
+// this cell before it is serialized, same discipline R17 already
+// applied to `notes`/`summary`/`reconciliation`/series -- the tables are
+// authoritative, and the JSON no longer duplicates them.
 // ---------------------------------------------------------------------
 
 fn report_snapshot_path(swamp_dir: &Path) -> PathBuf {
@@ -1527,12 +1559,13 @@ pub struct ReportSnapshot {
 /// distinct scopes (or explicit-root invocations) sharing one store
 /// each keep their own snapshot.
 /// Clears the `Report` fields `coverage.parquet`/`series.parquet`/
-/// `summary.parquet`/`notes.parquet` now own, before `snapshot.report` is
-/// serialized into `report_json` (R17). These fields are rebuilt from
-/// their own tables on every read (`rebuild_summary_from_tables`/
-/// `rebuild_series_from_tables`/`rebuild_notes_from_tables`), so keeping
-/// them in the JSON cell too would be silent duplication -- the tables
-/// are authoritative, not a cache of what the JSON already said.
+/// `summary.parquet`/`notes.parquet` now own (R17), plus (R18a-3)
+/// `unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
+/// `github_enrichment`, before `snapshot.report` is serialized into
+/// `report_json`. These fields are rebuilt from their own tables on
+/// every read, so keeping them in the JSON cell too would be silent
+/// duplication -- the tables are authoritative, not a cache of what the
+/// JSON already said.
 fn slim_report_for_snapshot_json(report: &Report) -> Report {
     let mut r = report.clone();
     r.notes = Vec::new();
@@ -1548,6 +1581,12 @@ fn slim_report_for_snapshot_json(report: &Report) -> Report {
     r.series_by_key = HashMap::new();
     r.total_series = Vec::new();
     r.series_window_secs = 0;
+    // R18a-3:
+    r.unowned = Vec::new();
+    r.dirs_by_worktree = None;
+    r.files_by_worktree = None;
+    r.schedule_line = None;
+    r.github_enrichment = None;
     r
 }
 
@@ -1578,18 +1617,16 @@ pub fn write_report_snapshot(
 /// observation yet" path), never a hard error, same discipline as
 /// `folded_rows_for`.
 ///
-/// `coverage` comes back empty: it is no longer part of this cell (R17
-/// moved it to `coverage.parquet`), and `report::report_scope_from_store`
-/// always calls `rebuild_coverage_series_summary_notes_from_tables` right
-/// after this to fill it in. `report`'s own `notes`/`summary`/
-/// `reconciliation`/series fields come back at their defaults for the
-/// same reason. `external_units`/`agent_units`/`store_interiors` also
-/// come back empty (R18a-2: their own tables --
-/// `external_units.parquet`/`agent_units.parquet`/`nested_artifacts.parquet`
-/// -- are now fully typed, so `rebuild_units_from_tables`/
-/// `rebuild_nested_artifacts_from_tables` no longer need a JSON merge
-/// fallback and always overwrite these fields from those tables right
-/// after this call.
+/// `coverage` comes back empty (R17 moved it to `coverage.parquet`), and
+/// `report`'s own `notes`/`summary`/`reconciliation`/series/(R18a-3)
+/// `unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
+/// `github_enrichment` fields come back at their JSON defaults for the
+/// same reason -- `report::report_scope_from_store` always calls the
+/// matching `rebuild_*_from_tables` right after this to fill each one
+/// in from its own table. `external_units`/`agent_units`/
+/// `store_interiors` also come back empty (R18a-2: their own tables are
+/// now fully typed, so the rebuild always overwrites these fields
+/// regardless of what this cell says).
 pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportSnapshot> {
     let path = report_snapshot_path(swamp_dir);
     let row = columns::read_report_snapshot_rows(&path)
@@ -1625,6 +1662,20 @@ fn summary_path(swamp_dir: &Path) -> PathBuf {
 }
 fn notes_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("notes.parquet")
+}
+/// `unowned_summary.parquet` (R18a-3): scope-wide, distinct from the
+/// per-volume `unowned.parquet` (`unowned_path`) above.
+fn unowned_summary_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unowned_summary.parquet")
+}
+fn unowned_summary_lists_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unowned_summary_lists.parquet")
+}
+fn worktree_entries_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("worktree_entries.parquet")
+}
+fn github_enrichment_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("github_enrichment.parquet")
 }
 
 /// The bare `RegionStatus` variant tag, independent of its `reason`
@@ -1842,6 +1893,7 @@ pub fn write_summary_table(
     scope_key: &str,
     summary: &crate::report::Summary,
     reconciliation: &crate::report::Reconciliation,
+    schedule_line: Option<&str>,
     observed_at: u64,
 ) -> Result<()> {
     store::StoreDir::at(swamp_dir)?.create()?;
@@ -1861,8 +1913,23 @@ pub fn write_summary_table(
                 growth,
                 count,
                 observed_at,
+                text: None,
             }
         };
+    // R18a-3: `Report.schedule_line`, one row, only when this pass has a
+    // line to show (a plain read with no store/schedule never did).
+    if let Some(line) = schedule_line {
+        rows.push(columns::StoredSummaryRow {
+            scope_key: scope_key.to_string(),
+            metric: "schedule".to_string(),
+            key: "line".to_string(),
+            bytes: None,
+            growth: None,
+            count: None,
+            observed_at,
+            text: Some(line.to_string()),
+        });
+    }
     rows.push(row(
         "overview",
         "projects",
@@ -1980,6 +2047,7 @@ fn rebuild_summary_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut
                 reconciliation.docker_unowned = r.bytes.unwrap_or(0)
             }
             ("reconciliation", "du_total") => reconciliation.du_total = r.bytes,
+            ("schedule", "line") => snapshot.report.schedule_line = r.text.clone(),
             _ => {}
         }
     }
@@ -2057,6 +2125,367 @@ pub(crate) fn rebuild_coverage_series_summary_notes_from_tables(
     rebuild_series_from_tables(swamp_dir, scope_key, snapshot);
     rebuild_summary_from_tables(swamp_dir, scope_key, snapshot);
     rebuild_notes_from_tables(swamp_dir, scope_key, snapshot);
+}
+
+// ---------------------------------------------------------------------
+// unowned_summary.parquet / unowned_summary_lists.parquet (R18a-3):
+// `Report.unowned`. See the header comment on
+// `columns::StoredUnownedSummaryRow` for why this is a distinct table
+// from the per-volume `unowned.parquet`. Evidence is not written here --
+// `report::observe_scope` folds an unowned row's evidence into the same
+// `evidence_entities` list it already builds for every other entity kind,
+// so `evidence.parquet` is replaced exactly once per pass.
+// ---------------------------------------------------------------------
+
+/// Writes `unowned_summary.parquet`/`unowned_summary_lists.parquet` for
+/// `scope_key`, replacing that scope's rows wholesale from this pass's
+/// already-merged `Report.unowned` -- no second collection pass.
+pub fn write_unowned_summary_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    unowned: &[crate::report::UnownedRow],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = unowned_summary_path(swamp_dir);
+    let mut rows: Vec<columns::StoredUnownedSummaryRow> = columns::read_unowned_summary_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    let lists_path = unowned_summary_lists_path(swamp_dir);
+    let mut list_rows: Vec<columns::StoredUnownedSummaryListRow> =
+        columns::read_unowned_summary_list_rows(&lists_path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for (seq, u) in unowned.iter().enumerate() {
+        let seq = seq as u32;
+        rows.push(columns::StoredUnownedSummaryRow {
+            scope_key: scope_key.to_string(),
+            seq,
+            path_or_object: u.path_or_object.clone(),
+            bytes: u.bytes,
+            reason: unowned_reason_to_str(&u.reason).to_string(),
+            shared_bytes: u.shared_bytes,
+            note: u.note.clone(),
+            docker_kind: u.docker_kind.clone(),
+            created_at: u.created_at.clone(),
+            dangling: u.dangling,
+            observed_at,
+        });
+        for (item_seq, value) in u.containers.iter().enumerate() {
+            list_rows.push(columns::StoredUnownedSummaryListRow {
+                scope_key: scope_key.to_string(),
+                seq,
+                list_kind: "container".to_string(),
+                item_seq: item_seq as u32,
+                value: value.clone(),
+            });
+        }
+        for (item_seq, value) in u.shared_with.iter().enumerate() {
+            list_rows.push(columns::StoredUnownedSummaryListRow {
+                scope_key: scope_key.to_string(),
+                seq,
+                list_kind: "shared-with".to_string(),
+                item_seq: item_seq as u32,
+                value: value.clone(),
+            });
+        }
+    }
+    columns::write_unowned_summary_rows(&path, &rows)
+        .with_context(|| format!("write {}", path.display()))?;
+    columns::write_unowned_summary_list_rows(&lists_path, &list_rows)
+        .with_context(|| format!("write {}", lists_path.display()))
+}
+
+/// Rebuilds `snapshot.report.unowned` from `unowned_summary.parquet`/
+/// `unowned_summary_lists.parquet`, in `seq` order. Evidence is left
+/// empty here -- `report::rebuild_evidence_from_tables` fills it in
+/// afterward, keyed by `("unowned-summary", seq)`, the same entity-kind
+/// convention every other unit family uses.
+fn rebuild_unowned_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
+    let Ok(rows) = columns::read_unowned_summary_rows(&unowned_summary_path(swamp_dir)) else {
+        return;
+    };
+    let mut rows: Vec<columns::StoredUnownedSummaryRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|r| r.seq);
+    let list_rows: Vec<columns::StoredUnownedSummaryListRow> =
+        columns::read_unowned_summary_list_rows(&unowned_summary_lists_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    let mut containers_by_seq: HashMap<u32, Vec<&columns::StoredUnownedSummaryListRow>> =
+        HashMap::new();
+    let mut shared_with_by_seq: HashMap<u32, Vec<&columns::StoredUnownedSummaryListRow>> =
+        HashMap::new();
+    for r in &list_rows {
+        let bucket = match r.list_kind.as_str() {
+            "container" => containers_by_seq.entry(r.seq).or_default(),
+            "shared-with" => shared_with_by_seq.entry(r.seq).or_default(),
+            _ => continue,
+        };
+        bucket.push(r);
+    }
+    let ordered = |mut v: Vec<&columns::StoredUnownedSummaryListRow>| -> Vec<String> {
+        v.sort_by_key(|r| r.item_seq);
+        v.into_iter().map(|r| r.value.clone()).collect()
+    };
+    snapshot.report.unowned = rows
+        .into_iter()
+        .map(|r| crate::report::UnownedRow {
+            path_or_object: r.path_or_object,
+            bytes: r.bytes,
+            reason: unowned_reason_from_str(&r.reason),
+            shared_bytes: r.shared_bytes,
+            note: r.note,
+            docker_kind: r.docker_kind,
+            created_at: r.created_at,
+            containers: containers_by_seq
+                .remove(&r.seq)
+                .map(ordered)
+                .unwrap_or_default(),
+            shared_with: shared_with_by_seq
+                .remove(&r.seq)
+                .map(ordered)
+                .unwrap_or_default(),
+            dangling: r.dangling,
+            evidence: Vec::new(),
+        })
+        .collect();
+}
+
+// ---------------------------------------------------------------------
+// worktree_entries.parquet (R18a-3): `Report.dirs_by_worktree`/
+// `.files_by_worktree`. See the header comment on
+// `columns::StoredWorktreeEntryRow`.
+// ---------------------------------------------------------------------
+
+/// Writes `worktree_entries.parquet` for `scope_key`, replacing that
+/// scope's rows wholesale from this pass's `dirs_by_worktree`/
+/// `files_by_worktree` (each `None` when this call did not ask for
+/// dirs -- see the table's header comment). A worktree's dir rows are
+/// written in the order `DirRollup`s already carry (parent-before-child,
+/// same order `report::attach_dir_rollups` produced them in); file rows
+/// in their own `FileRow` order.
+pub fn write_worktree_entries_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    dirs_by_worktree: Option<&HashMap<String, Vec<crate::report::DirRollup>>>,
+    files_by_worktree: Option<&HashMap<String, Vec<crate::report::FileRow>>>,
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = worktree_entries_path(swamp_dir);
+    let mut rows: Vec<columns::StoredWorktreeEntryRow> = columns::read_worktree_entry_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    if let Some(dbw) = dirs_by_worktree {
+        // Deterministic worktree order for reproducible golden output.
+        let mut worktree_ids: Vec<&String> = dbw.keys().collect();
+        worktree_ids.sort();
+        for worktree_id in worktree_ids {
+            for (seq, d) in dbw[worktree_id].iter().enumerate() {
+                rows.push(columns::StoredWorktreeEntryRow {
+                    scope_key: scope_key.to_string(),
+                    worktree_id: worktree_id.clone(),
+                    kind: "dir".to_string(),
+                    seq: seq as u32,
+                    rel_path: d.rel_path.clone(),
+                    parent_rel_path: d.parent_rel_path.clone(),
+                    track: d.track.map(|t| t.label().to_string()),
+                    allocated_total: Some(d.allocated_total),
+                    own_allocated: Some(d.own_allocated),
+                    file_count: Some(d.file_count),
+                    entry_count: Some(d.entry_count),
+                    symlink_count: Some(d.symlink_count),
+                    complete: Some(d.complete),
+                    allocated: None,
+                    mod_time_min: d.mod_time_min,
+                    growth_bytes: d.growth_bytes,
+                    observed_at,
+                });
+            }
+        }
+    }
+    if let Some(fbw) = files_by_worktree {
+        let mut worktree_ids: Vec<&String> = fbw.keys().collect();
+        worktree_ids.sort();
+        for worktree_id in worktree_ids {
+            for (seq, f) in fbw[worktree_id].iter().enumerate() {
+                rows.push(columns::StoredWorktreeEntryRow {
+                    scope_key: scope_key.to_string(),
+                    worktree_id: worktree_id.clone(),
+                    kind: "file".to_string(),
+                    seq: seq as u32,
+                    rel_path: f.rel_path.clone(),
+                    parent_rel_path: None,
+                    track: None,
+                    allocated_total: None,
+                    own_allocated: None,
+                    file_count: None,
+                    entry_count: None,
+                    symlink_count: None,
+                    complete: None,
+                    allocated: Some(f.allocated),
+                    mod_time_min: f.mod_time_min,
+                    growth_bytes: f.growth_bytes,
+                    observed_at,
+                });
+            }
+        }
+    }
+    columns::write_worktree_entry_rows(&path, &rows)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.report.dirs_by_worktree`/`.files_by_worktree` from
+/// `worktree_entries.parquet`. Both come back `None` together when this
+/// scope has zero rows (an older store, or the last committing observe
+/// did not ask for dirs); both come back `Some` together otherwise --
+/// see the table's header comment for why that symmetry is safe.
+fn rebuild_worktree_entries_from_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    let Ok(rows) = columns::read_worktree_entry_rows(&worktree_entries_path(swamp_dir)) else {
+        return;
+    };
+    let mut rows: Vec<columns::StoredWorktreeEntryRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|r| r.seq);
+    let mut dirs_by_worktree: HashMap<String, Vec<crate::report::DirRollup>> = HashMap::new();
+    let mut files_by_worktree: HashMap<String, Vec<crate::report::FileRow>> = HashMap::new();
+    for r in rows {
+        match r.kind.as_str() {
+            "dir" => {
+                dirs_by_worktree
+                    .entry(r.worktree_id.clone())
+                    .or_default()
+                    .push(crate::report::DirRollup {
+                        worktree_id: r.worktree_id,
+                        track: r
+                            .track
+                            .as_deref()
+                            .map(crate::ignore::TrackState::from_label),
+                        rel_path: r.rel_path,
+                        parent_rel_path: r.parent_rel_path,
+                        allocated_total: r.allocated_total.unwrap_or(0),
+                        own_allocated: r.own_allocated.unwrap_or(0),
+                        file_count: r.file_count.unwrap_or(0),
+                        entry_count: r.entry_count.unwrap_or(0),
+                        symlink_count: r.symlink_count.unwrap_or(0),
+                        mod_time_min: r.mod_time_min,
+                        complete: r.complete.unwrap_or(false),
+                        growth_bytes: r.growth_bytes,
+                    });
+            }
+            "file" => {
+                files_by_worktree
+                    .entry(r.worktree_id.clone())
+                    .or_default()
+                    .push(crate::report::FileRow {
+                        worktree_id: r.worktree_id,
+                        rel_path: r.rel_path,
+                        allocated: r.allocated.unwrap_or(0),
+                        mod_time_min: r.mod_time_min,
+                        growth_bytes: r.growth_bytes,
+                    });
+            }
+            _ => {}
+        }
+    }
+    snapshot.report.dirs_by_worktree = Some(dirs_by_worktree);
+    snapshot.report.files_by_worktree = Some(files_by_worktree);
+}
+
+// ---------------------------------------------------------------------
+// github_enrichment.parquet (R18a-3): `Report.github_enrichment`.
+// ---------------------------------------------------------------------
+
+/// Writes `github_enrichment.parquet` for `scope_key`, replacing that
+/// scope's row wholesale -- zero rows when this pass ran no live
+/// enrichment (`github_enrichment` is `None`), one row otherwise.
+pub fn write_github_enrichment_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    github_enrichment: Option<&crate::report::GithubEnrichmentSummary>,
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = github_enrichment_path(swamp_dir);
+    let mut rows: Vec<columns::StoredGithubEnrichmentRow> =
+        columns::read_github_enrichment_rows(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    if let Some(g) = github_enrichment {
+        rows.push(columns::StoredGithubEnrichmentRow {
+            scope_key: scope_key.to_string(),
+            calls_made: g.calls_made,
+            worktrees_enriched: g.worktrees_enriched,
+            elapsed_secs: g.elapsed_secs,
+            observed_at,
+        });
+    }
+    columns::write_github_enrichment_rows(&path, &rows)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.report.github_enrichment` from
+/// `github_enrichment.parquet`: `Some` when this scope has a row, `None`
+/// otherwise (no row is written at all for a pass with nothing live to
+/// report -- see `write_github_enrichment_table`).
+fn rebuild_github_enrichment_from_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    let Ok(rows) = columns::read_github_enrichment_rows(&github_enrichment_path(swamp_dir)) else {
+        return;
+    };
+    snapshot.report.github_enrichment =
+        rows.into_iter()
+            .find(|r| r.scope_key == scope_key)
+            .map(|r| crate::report::GithubEnrichmentSummary {
+                calls_made: r.calls_made,
+                worktrees_enriched: r.worktrees_enriched,
+                elapsed_secs: r.elapsed_secs,
+            });
+}
+
+/// The one entry point `report::report_scope_from_store` calls to
+/// replace `snapshot.report.unowned`/`.dirs_by_worktree`/
+/// `.files_by_worktree`/`.github_enrichment` with what
+/// `unowned_summary.parquet`/`worktree_entries.parquet`/
+/// `github_enrichment.parquet` hold for `scope_key` (R18a-3). Called
+/// before `report::rebuild_evidence_from_tables`, which fills in the
+/// unowned rows' evidence afterward.
+pub(crate) fn rebuild_unowned_worktree_entries_github_from_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    rebuild_unowned_from_tables(swamp_dir, scope_key, snapshot);
+    rebuild_worktree_entries_from_tables(swamp_dir, scope_key, snapshot);
+    rebuild_github_enrichment_from_tables(swamp_dir, scope_key, snapshot);
 }
 
 // ---------------------------------------------------------------------
@@ -7483,6 +7912,372 @@ mod tests {
         assert_eq!(rebuilt2.len(), 1);
         assert_eq!(rebuilt2[0].path_or_object, plain_row.path_or_object);
         assert!(rebuilt2[0].containers.is_empty() && rebuilt2[0].evidence.is_empty());
+    }
+
+    /// A minimal `ReportSnapshot` for the R18a-3 rebuild-function tests
+    /// below -- every field the rebuilds under test do not touch is a
+    /// harmless placeholder.
+    fn blank_snapshot_for_test(observed_at: u64) -> ReportSnapshot {
+        ReportSnapshot {
+            observed_at,
+            report: crate::report::Report {
+                observed_at,
+                root: PathBuf::new(),
+                projects: Vec::new(),
+                unowned: Vec::new(),
+                reconciliation: crate::report::Reconciliation {
+                    attributed: 0,
+                    unowned: 0,
+                    walked_total: 0,
+                    du_total: None,
+                    docker_attributed: 0,
+                    docker_unowned: 0,
+                },
+                series_by_key: HashMap::new(),
+                total_series: Vec::new(),
+                series_window_secs: 0,
+                notes: Vec::new(),
+                dirs_by_worktree: None,
+                files_by_worktree: None,
+                schedule_line: None,
+                summary: crate::report::Summary::default(),
+                github_enrichment: None,
+                nested_artifacts: Vec::new(),
+                store_dir: None,
+            },
+            coverage: Vec::new(),
+            external_units: Vec::new(),
+            agent_units: Vec::new(),
+            store_interiors: Vec::new(),
+        }
+    }
+
+    /// R18a-3 (`Report.unowned` -> `unowned_summary.parquet` +
+    /// `unowned_summary_lists.parquet`): every scalar field, both list
+    /// kinds (`containers`/`shared_with`, out of order in the source
+    /// list so a `seq`/`item_seq` bug would show), and two rows sharing
+    /// one `path_or_object` (a real multi-root merge can do this --
+    /// identity here is `(scope_key, seq)`, never `path_or_object`
+    /// alone) all round-trip through `write_unowned_summary_table`/
+    /// `rebuild_unowned_from_tables`.
+    #[test]
+    fn unowned_summary_table_round_trips_every_field_and_keyed_by_seq_not_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let docker_row = crate::report::UnownedRow {
+            path_or_object: "sha256:dup".into(),
+            bytes: 4096,
+            reason: UnownedReason::DockerNoJoin,
+            shared_bytes: Some(8192),
+            note: Some("base image source: example/upstream".into()),
+            docker_kind: Some("image".into()),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            containers: vec!["web (running)".into(), "worker (exited)".into()],
+            shared_with: vec!["example/other:latest".into()],
+            dangling: false,
+            evidence: Vec::new(),
+        };
+        let duplicate_path_row = crate::report::UnownedRow {
+            path_or_object: "sha256:dup".into(),
+            bytes: 111,
+            reason: UnownedReason::SharedCache,
+            shared_bytes: None,
+            note: None,
+            docker_kind: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: true,
+            evidence: Vec::new(),
+        };
+        let unowned = vec![docker_row.clone(), duplicate_path_row.clone()];
+
+        write_unowned_summary_table(store, "k", &unowned, 1_700_000_000).unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(1_700_000_000);
+        rebuild_unowned_from_tables(store, "k", &mut snapshot);
+        assert_eq!(snapshot.report.unowned.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&snapshot.report.unowned).unwrap(),
+            serde_json::to_value(&unowned).unwrap(),
+            "order, every scalar and both list kinds must round-trip, and the duplicate \
+             path_or_object must not merge the two rows"
+        );
+
+        assert!(rebuild_unowned_from_tables_is_noop_for_other_scope(store));
+    }
+
+    fn rebuild_unowned_from_tables_is_noop_for_other_scope(store: &Path) -> bool {
+        let mut snapshot = blank_snapshot_for_test(0);
+        rebuild_unowned_from_tables(store, "no-such-scope", &mut snapshot);
+        snapshot.report.unowned.is_empty()
+    }
+
+    /// R18a-3 tamper test: editing `unowned_summary.parquet`/
+    /// `unowned_summary_lists.parquet` directly on disk (never touching
+    /// the original `UnownedRow`s in memory) and rebuilding must reflect
+    /// exactly the edit, keyed correctly by `(scope_key, seq)` -- a scope
+    /// this pass never wrote to must stay empty.
+    #[test]
+    fn unowned_summary_tables_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let original = vec![crate::report::UnownedRow {
+            path_or_object: "/src/scratch/leftover.bin".into(),
+            bytes: 512,
+            reason: UnownedReason::OutsideAnyCheckout,
+            shared_bytes: None,
+            note: None,
+            docker_kind: None,
+            created_at: None,
+            containers: vec!["original-container".into()],
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        }];
+        write_unowned_summary_table(store, "k", &original, 1000).unwrap();
+
+        let mut rows = columns::read_unowned_summary_rows(&unowned_summary_path(store)).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0].bytes = 999_999;
+        rows[0].path_or_object = "/tampered".into();
+        columns::write_unowned_summary_rows(&unowned_summary_path(store), &rows).unwrap();
+        let mut list_rows =
+            columns::read_unowned_summary_list_rows(&unowned_summary_lists_path(store)).unwrap();
+        assert_eq!(list_rows.len(), 1);
+        list_rows[0].value = "tampered-container".into();
+        columns::write_unowned_summary_list_rows(&unowned_summary_lists_path(store), &list_rows)
+            .unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(1000);
+        rebuild_unowned_from_tables(store, "k", &mut snapshot);
+        assert_eq!(snapshot.report.unowned.len(), 1);
+        assert_eq!(snapshot.report.unowned[0].bytes, 999_999);
+        assert_eq!(snapshot.report.unowned[0].path_or_object, "/tampered");
+        assert_eq!(
+            snapshot.report.unowned[0].containers,
+            vec!["tampered-container".to_string()]
+        );
+    }
+
+    /// R18a-3 (`Report.dirs_by_worktree`/`.files_by_worktree` ->
+    /// `worktree_entries.parquet`): every scalar field of both a
+    /// `DirRollup` and a `FileRow`, across two worktrees (so ordering by
+    /// worktree id is exercised), round-trips. Also proves the `None`/
+    /// `None` symmetry: a scope with zero rows comes back with both
+    /// fields `None`, not `Some(empty map)`.
+    #[test]
+    fn worktree_entries_table_round_trips_every_field_and_is_none_together_when_empty() {
+        let dir_a = crate::report::DirRollup {
+            worktree_id: "wt-a".into(),
+            track: Some(crate::ignore::TrackState::Tracked),
+            rel_path: "".into(),
+            parent_rel_path: None,
+            allocated_total: 8192,
+            own_allocated: 8192,
+            file_count: 2,
+            entry_count: 3,
+            symlink_count: 1,
+            mod_time_min: 12345,
+            complete: true,
+            growth_bytes: Some(-100),
+        };
+        let dir_b = crate::report::DirRollup {
+            worktree_id: "wt-a".into(),
+            track: None,
+            rel_path: "src".into(),
+            parent_rel_path: Some("".into()),
+            allocated_total: 4096,
+            own_allocated: 4096,
+            file_count: 1,
+            entry_count: 1,
+            symlink_count: 0,
+            mod_time_min: 999,
+            complete: false,
+            growth_bytes: None,
+        };
+        let file_a = crate::report::FileRow {
+            worktree_id: "wt-b".into(),
+            rel_path: "big.bin".into(),
+            allocated: 1_000_000,
+            mod_time_min: 42,
+            growth_bytes: Some(7),
+        };
+        let mut dirs_by_worktree = HashMap::new();
+        dirs_by_worktree.insert("wt-a".to_string(), vec![dir_a.clone(), dir_b.clone()]);
+        let mut files_by_worktree = HashMap::new();
+        files_by_worktree.insert("wt-b".to_string(), vec![file_a.clone()]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        write_worktree_entries_table(
+            store,
+            "k",
+            Some(&dirs_by_worktree),
+            Some(&files_by_worktree),
+            2000,
+        )
+        .unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(2000);
+        rebuild_worktree_entries_from_tables(store, "k", &mut snapshot);
+        assert_eq!(
+            serde_json::to_value(&snapshot.report.dirs_by_worktree).unwrap(),
+            serde_json::to_value(Some(dirs_by_worktree)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot.report.files_by_worktree).unwrap(),
+            serde_json::to_value(Some(files_by_worktree)).unwrap()
+        );
+
+        // Zero rows -> both `None`, not `Some(empty)`.
+        let mut empty_snapshot = blank_snapshot_for_test(2000);
+        rebuild_worktree_entries_from_tables(store, "no-such-scope", &mut empty_snapshot);
+        assert!(empty_snapshot.report.dirs_by_worktree.is_none());
+        assert!(empty_snapshot.report.files_by_worktree.is_none());
+    }
+
+    /// R18a-3 tamper test for `worktree_entries.parquet`.
+    #[test]
+    fn worktree_entries_table_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        let dir_a = crate::report::DirRollup {
+            worktree_id: "wt-a".into(),
+            track: Some(crate::ignore::TrackState::Untracked),
+            rel_path: "".into(),
+            parent_rel_path: None,
+            allocated_total: 100,
+            own_allocated: 100,
+            file_count: 1,
+            entry_count: 1,
+            symlink_count: 0,
+            mod_time_min: 1,
+            complete: true,
+            growth_bytes: None,
+        };
+        let mut dirs_by_worktree = HashMap::new();
+        dirs_by_worktree.insert("wt-a".to_string(), vec![dir_a]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        write_worktree_entries_table(
+            store,
+            "k",
+            Some(&dirs_by_worktree),
+            Some(&HashMap::new()),
+            2000,
+        )
+        .unwrap();
+
+        let mut rows = columns::read_worktree_entry_rows(&worktree_entries_path(store)).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0].allocated_total = Some(999_999);
+        rows[0].rel_path = "tampered".into();
+        columns::write_worktree_entry_rows(&worktree_entries_path(store), &rows).unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(2000);
+        rebuild_worktree_entries_from_tables(store, "k", &mut snapshot);
+        let rebuilt = &snapshot.report.dirs_by_worktree.unwrap()["wt-a"][0];
+        assert_eq!(rebuilt.allocated_total, 999_999);
+        assert_eq!(rebuilt.rel_path, "tampered");
+    }
+
+    /// R18a-3 (`Report.github_enrichment` -> `github_enrichment.
+    /// parquet`): round-trips when `Some`, comes back `None` for a
+    /// scope with no row (never a fabricated zeroed row).
+    #[test]
+    fn github_enrichment_table_round_trips_and_is_none_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let g = crate::report::GithubEnrichmentSummary {
+            calls_made: 3,
+            worktrees_enriched: 2,
+            elapsed_secs: 1.25,
+        };
+        write_github_enrichment_table(store, "k", Some(&g), 3000).unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(3000);
+        rebuild_github_enrichment_from_tables(store, "k", &mut snapshot);
+        assert_eq!(
+            serde_json::to_value(&snapshot.report.github_enrichment).unwrap(),
+            serde_json::to_value(Some(g)).unwrap()
+        );
+
+        let mut absent_snapshot = blank_snapshot_for_test(3000);
+        rebuild_github_enrichment_from_tables(store, "no-such-scope", &mut absent_snapshot);
+        assert!(absent_snapshot.report.github_enrichment.is_none());
+
+        // A pass with no live enrichment writes zero rows for its scope,
+        // clearing any earlier one (wholesale replace, like every other
+        // scope-keyed table).
+        write_github_enrichment_table(store, "k", None, 3001).unwrap();
+        let mut cleared_snapshot = blank_snapshot_for_test(3001);
+        rebuild_github_enrichment_from_tables(store, "k", &mut cleared_snapshot);
+        assert!(cleared_snapshot.report.github_enrichment.is_none());
+    }
+
+    /// R18a-3 tamper test for `github_enrichment.parquet`.
+    #[test]
+    fn github_enrichment_table_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let g = crate::report::GithubEnrichmentSummary {
+            calls_made: 1,
+            worktrees_enriched: 1,
+            elapsed_secs: 0.5,
+        };
+        write_github_enrichment_table(store, "k", Some(&g), 3000).unwrap();
+
+        let mut rows =
+            columns::read_github_enrichment_rows(&github_enrichment_path(store)).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0].calls_made = 42;
+        columns::write_github_enrichment_rows(&github_enrichment_path(store), &rows).unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(3000);
+        rebuild_github_enrichment_from_tables(store, "k", &mut snapshot);
+        assert_eq!(snapshot.report.github_enrichment.unwrap().calls_made, 42);
+    }
+
+    /// R18a-3 (`Report.schedule_line` -> a `summary.parquet` row with
+    /// `metric = "schedule"`): round-trips, and is `None` when this pass
+    /// had no schedule to report (no row written at all, not an empty
+    /// string).
+    #[test]
+    fn schedule_line_round_trips_through_summary_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let summary = crate::report::Summary::default();
+        let reconciliation = crate::report::Reconciliation {
+            attributed: 0,
+            unowned: 0,
+            walked_total: 0,
+            du_total: None,
+            docker_attributed: 0,
+            docker_unowned: 0,
+        };
+        write_summary_table(
+            store,
+            "k",
+            &summary,
+            &reconciliation,
+            Some("last scheduled run 12m ago (full, 4.2 s)"),
+            4000,
+        )
+        .unwrap();
+
+        let mut snapshot = blank_snapshot_for_test(4000);
+        rebuild_summary_from_tables(store, "k", &mut snapshot);
+        assert_eq!(
+            snapshot.report.schedule_line.as_deref(),
+            Some("last scheduled run 12m ago (full, 4.2 s)")
+        );
+
+        // No schedule line this pass -> no row -> `None`, not `Some("")`.
+        write_summary_table(store, "k2", &summary, &reconciliation, None, 4001).unwrap();
+        let mut no_line_snapshot = blank_snapshot_for_test(4001);
+        rebuild_summary_from_tables(store, "k2", &mut no_line_snapshot);
+        assert!(no_line_snapshot.report.schedule_line.is_none());
     }
 
     /// R18a-2: every `NestedArtifact` field -- including the ones this

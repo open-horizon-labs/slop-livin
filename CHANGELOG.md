@@ -4,6 +4,29 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: unowned, worktree drill-down, schedule line and GitHub enrichment typed (R18a-3)
+
+`Report.unowned`, `.dirs_by_worktree`/`.files_by_worktree`,
+`.schedule_line` and `.github_enrichment` -- the last of
+`report_rows.parquet`'s `report_json` fields R18a-2 left -- are now
+typed: `unowned_summary.parquet` (+ `unowned_summary_lists.parquet` for
+container/shared-with lists, keyed by `(scope_key, seq)` since a
+multi-root scope's merged unowned list can repeat a `path_or_object`),
+`worktree_entries.parquet` (one table with a `kind` column for both
+per-worktree directory rollups and large-file rows), a `summary.parquet`
+row (`metric = "schedule"`) for the scheduled-observation status line,
+and `github_enrichment.parquet` for live GitHub-enrichment call stats.
+
+`report_rows.parquet`/`report_json` itself is not deleted this slice: a
+project's worktree's artifact rows' own shape (kind, path, git tracking,
+confidence, source, containers/shared-with, and similar fields) has no
+typed column anywhere yet -- a pre-existing gap from R15 item 3, not
+something this slice created -- and `report_scope_from_store` still
+needs `report_json` for it. Deleting the cell now would silently blank
+those fields on every future report read; see
+`docs/architecture.md`/`.oh/sessions/2026-09-24-r18a3-snapshot-deleted.md`
+for the full account.
+
 ### No JSON in the store: every `NestedArtifact` field typed, JSON merge fallbacks deleted (R18a-2)
 
 `nested_artifacts.parquet` now carries every `NestedArtifact` field as a

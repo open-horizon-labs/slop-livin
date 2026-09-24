@@ -324,16 +324,17 @@ fn report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_sn
     );
 }
 
-/// The snapshot's remaining parts (everything CHUNK_R15/R17 left for
-/// later slices) still come from the snapshot: a tampered `unowned` row
-/// is reported as tampered. This pins the boundary in both directions,
-/// so the previous test cannot pass by ignoring the snapshot entirely.
-///
-/// `notes`/`reconciliation` moved to `notes.parquet`/`summary.parquet`
-/// in R17 (`coverage_series_summary_notes_tables.rs` covers that
-/// boundary now), so they are no longer part of this one -- tampering
-/// them here would now be silently overwritten by the rebuild, which is
-/// the *fixed* behavior this slice adds, not a regression.
+/// `Report.unowned` moved off `report_json` in R18a-3
+/// (`unowned_summary.parquet` -- see
+/// `unowned_worktree_entries_schedule_github_wiring.rs`), which flips
+/// this test's old direction: it used to pin "`unowned` still comes
+/// from the snapshot's JSON cell" as the boundary the previous test's
+/// pass must not blur. Now the opposite is true and matters just as
+/// much -- a JSON-only tamper of `.report.unowned` (never persisted to
+/// `unowned_summary.parquet`) must **not** leak into the rebuilt report,
+/// proving `rebuild_unowned_from_tables` always replaces this field
+/// rather than falling back to whatever the (now further-slimmed)
+/// snapshot cell says.
 #[test]
 fn the_remaining_parts_still_come_from_the_snapshot() {
     let fx = build();
@@ -360,11 +361,16 @@ fn the_remaining_parts_still_come_from_the_snapshot() {
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
     assert!(
-        rebuilt
+        !rebuilt
             .report
             .unowned
             .iter()
-            .any(|u| u.path_or_object == "tampered-unowned-path")
+            .any(|u| u.path_or_object == "tampered-unowned-path"),
+        "unowned_summary.parquet must win over a JSON-only tamper of Report.unowned"
+    );
+    assert_eq!(
+        serde_json::to_value(&rebuilt.report.unowned).unwrap(),
+        serde_json::to_value(&observation.merged.unowned).unwrap()
     );
     assert_eq!(
         serde_json::to_value(&rebuilt.report.projects).unwrap(),
