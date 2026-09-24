@@ -445,16 +445,29 @@ pub fn observe_external(
         // `observe_unit` tries the stored folded rows first, so a unit
         // this pass's event window vouches for costs no listing, no
         // `stat` and not even the readability probe.
+        let debug_trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+        let before = debug_trace.then(crate::work_counters::snapshot);
         let observation = match store_containers.get(&idx) {
             Some(container) => {
+                let reuse = probe.can_reuse(container);
                 let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
                     swamp_dir,
                     &canonical,
                     &nested_exclusions,
                     observed_at,
                     coverage,
-                    probe.can_reuse(container),
+                    reuse,
                 );
+                if debug_trace {
+                    let after = crate::work_counters::snapshot();
+                    let before = before.unwrap();
+                    eprintln!(
+                        "[xtrace] store {} can_reuse={reuse} dirs_delta={} files_delta={}",
+                        canonical.display(),
+                        after.dirs_listed - before.dirs_listed,
+                        after.files_statted - before.files_statted
+                    );
+                }
                 if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
                     measured_stores.push((idx, dirs.is_none()));
                 }
@@ -463,13 +476,26 @@ pub fn observe_external(
                 }
                 obs
             }
-            None => crate::folded_measurement::observe_unit(
-                swamp_dir,
-                &canonical,
-                &nested_exclusions,
-                observed_at,
-                coverage,
-            ),
+            None => {
+                let obs = crate::folded_measurement::observe_unit(
+                    swamp_dir,
+                    &canonical,
+                    &nested_exclusions,
+                    observed_at,
+                    coverage,
+                );
+                if debug_trace {
+                    let after = crate::work_counters::snapshot();
+                    let before = before.unwrap();
+                    eprintln!(
+                        "[xtrace] plain  {} dirs_delta={} files_delta={}",
+                        canonical.display(),
+                        after.dirs_listed - before.dirs_listed,
+                        after.files_statted - before.files_statted
+                    );
+                }
+                obs
+            }
         };
         let row = match observation {
             // Genuinely absent: no candidate this pass. If it was

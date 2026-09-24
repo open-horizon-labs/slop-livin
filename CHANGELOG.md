@@ -32,6 +32,28 @@ XDG-cache-root candidates are detector locations, that exclusion would
 have left them unmeasured by *either* path; fixed so they are measured
 as external units like any other detector-resolved location.
 
+### A zero-unit build store now replays instead of re-identifying forever
+
+`build_stores::load_units` discarded any stored container whose units
+decoded to an empty list, even though `save_units` legitimately writes
+one for a container with no build-tool structure inside it (a raw cache
+directory, or a mounted read-only volume). That made such a container's
+identification cache miss on every pass, forever, regardless of
+whether anything under it changed. Fixed: an empty-units entry now
+round-trips like any other.
+
+### Diagnostics: `SWAMP_TRACE=1` also covers external-unit measurement
+
+`swamp observe` under `SWAMP_TRACE=1` now prints the full work-counters
+snapshot (directories listed, files statted, cache hits/misses) after
+the pass, and, per external-unit candidate, its path, whether its
+container cache allowed reuse, and how many directories/files that one
+unit cost -- the trace that found (see the session note) that a single
+external unit spanning several mounted volumes can dominate an
+otherwise-unchanged pass's cost, because the current one-device-per-
+unit-root event model cannot vouch for content on a mounted child
+device.
+
 ### `swamp report` is a pure read; `swamp observe` is the only scanner
 
 `report` never walks a directory, stats a file, or spawns a subprocess

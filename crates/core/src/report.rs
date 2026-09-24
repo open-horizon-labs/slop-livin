@@ -2477,6 +2477,16 @@ pub fn observe_scope(
             reason: reason.clone(),
         })
         .collect();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        for c in &unit_root_coverage {
+            eprintln!(
+                "[xtrace-cov] {} covered={} reason={}",
+                c.path.display(),
+                c.event_covered,
+                c.reason
+            );
+        }
+    }
     // One line on the report saying why the unit families cost what they
     // cost this pass: how many authorized roots this pass's own replay
     // could vouch for, and the named refusal behind each one it could

@@ -887,10 +887,14 @@ text, as `not_applicable_detectors` in JSON, each with the platforms it
 does apply to -- so "does not apply here" is never confused with "found
 nothing" or "failed".
 
-For a trace of stage timings:
+For a trace of stage timings, work counters (directories listed, files
+statted, cache hits/misses), and -- per external-unit candidate --
+whether its container cache allowed reuse and how many directories/
+files that one unit cost (`swamp observe` is the only command that
+scans; `report` is a pure read and has nothing to trace):
 
 ```bash
-SWAMP_TRACE=1 swamp report ~/src
+SWAMP_TRACE=1 swamp observe
 ```
 
 See [architecture](architecture.md) for the meaning of incremental updates, history retention, and cached enrichment.

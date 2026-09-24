@@ -199,6 +199,18 @@ fn fingerprint() -> String {
 
 /// Every stored store container's units, with the observation that last
 /// verified them, keyed by container scope.
+///
+/// Includes a container this pass identified zero nested artifacts in
+/// (`units` empty): that is a real, verified answer -- "this store has
+/// nothing an adapter recognizes" -- not a cache miss, and dropping it
+/// here used to mean any such container (a raw cache directory with no
+/// build-tool structure at all: CoreSimulator device data, a language's
+/// download cache, ...) could never be replayed, so an otherwise
+/// unchanged pass re-walked it in full every single time. `save_units`
+/// already writes these rows (`this_pass` is seeded with every
+/// container's scope before interiors are folded in, so an empty result
+/// still gets an entry); this was the read side silently discarding
+/// them.
 pub(crate) fn load_units(store_dir: &Path) -> HashMap<String, (u64, Vec<NestedArtifact>)> {
     let fp = fingerprint();
     let mut out = HashMap::new();
@@ -207,9 +219,7 @@ pub(crate) fn load_units(store_dir: &Path) -> HashMap<String, (u64, Vec<NestedAr
             continue;
         }
         let units = decode(&cached.rows);
-        if !units.is_empty() {
-            out.insert(key, (cached.observed_at, units));
-        }
+        out.insert(key, (cached.observed_at, units));
     }
     out
 }
@@ -701,6 +711,37 @@ mod tests {
         .build();
         let back = decode(&encode(std::slice::from_ref(&u)));
         assert_eq!(back, vec![u]);
+    }
+
+    /// The bug this session found: `save_units` always writes an entry
+    /// for a container this pass identified -- even one with zero
+    /// nested artifacts, a real verified answer ("this store has
+    /// nothing an adapter recognizes"), not a miss -- but `load_units`
+    /// used to filter those rows back out on read (`if
+    /// !units.is_empty()`), so a container with no build-tool structure
+    /// at all (a raw cache directory, or a mounted read-only volume like
+    /// CoreSimulator's simulator runtimes) could never be replayed and
+    /// was fully re-walked every single pass, unchanged or not. Asserts
+    /// the whole round trip, not just that `load_units` returns
+    /// *something*: the key must be present, its `units` must be empty
+    /// (not fabricated), and its `observed_at` must be the one it was
+    /// saved with.
+    #[test]
+    fn a_container_with_zero_identified_units_still_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let this_pass: Vec<(String, Vec<crate::artifact::NestedArtifact>)> =
+            vec![("empty-store-scope".to_string(), Vec::new())];
+        save_units(tmp.path(), &this_pass, HashMap::new(), 1_000);
+
+        let loaded = load_units(tmp.path());
+        let (observed_at, units) = loaded
+            .get("empty-store-scope")
+            .expect("a zero-unit container must still be recorded, not silently dropped");
+        assert_eq!(*observed_at, 1_000);
+        assert!(
+            units.is_empty(),
+            "a genuinely empty container must round-trip as empty, not fabricate rows"
+        );
     }
 
     #[test]

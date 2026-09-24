@@ -56,6 +56,9 @@ pub fn cmd_observe(
     };
 
     let start = Instant::now();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        swamp_core::work_counters::reset();
+    }
     let (tx, rx) = mpsc::channel();
     let work_dir = store_dir.clone();
     thread::spawn(move || {
@@ -119,6 +122,12 @@ pub fn cmd_observe(
                 "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
                 github.calls_made, github.worktrees_enriched, github.elapsed_secs
             );
+            if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                eprintln!(
+                    "[debug] work counters: {:?}",
+                    swamp_core::work_counters::snapshot()
+                );
+            }
 
             let outcome = RunOutcome {
                 observed_at: now,
