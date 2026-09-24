@@ -24,8 +24,8 @@
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -1665,6 +1665,22 @@ macro_rules! opt_bool_col {
     };
 }
 
+macro_rules! opt_i64_col {
+    ($rows:expr, $field:ident) => {
+        Arc::new(Int64Array::from(
+            $rows.iter().map(|r| r.$field).collect::<Vec<Option<i64>>>(),
+        )) as ArrayRef
+    };
+}
+
+macro_rules! opt_f64_col {
+    ($rows:expr, $field:ident) => {
+        Arc::new(Float64Array::from(
+            $rows.iter().map(|r| r.$field).collect::<Vec<Option<f64>>>(),
+        )) as ArrayRef
+    };
+}
+
 pub(crate) fn write_worktree_rows(path: &Path, rows: &[StoredWorktreeRow]) -> Result<()> {
     let schema = worktrees_schema();
     let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
@@ -1731,6 +1747,22 @@ fn opt_bool(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<bool>> {
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
         .with_context(|| format!("column {name} is not Boolean"))?;
+    Ok(col.is_valid(i).then(|| col.value(i)))
+}
+
+fn opt_i64(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<i64>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .with_context(|| format!("column {name} is not Int64"))?;
+    Ok(col.is_valid(i).then(|| col.value(i)))
+}
+
+fn opt_f64(batch: &RecordBatch, name: &str, i: usize) -> Result<Option<f64>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+        .with_context(|| format!("column {name} is not Float64"))?;
     Ok(col.is_valid(i).then(|| col.value(i)))
 }
 
@@ -1873,6 +1905,621 @@ pub(crate) fn read_worktree_fact_rows(path: &Path) -> Result<Vec<StoredWorktreeF
                 name: name.is_valid(i).then(|| name.value(i).to_string()),
                 value: value.value(i).to_string(),
                 seq: seq.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// external_units.parquet / agent_units.parquet (R16 item 1 of this
+// slice; see `.oh/sessions/2026-09-24-r16-units-nested-evidence.md`).
+// One shared row shape for both files (an `ExternalUnit` and an
+// `AgentUnit` overlap enough that a second, near-identical struct would
+// only be duplication): `id`/`source_id`/`source_name`/`category`/
+// `path`/`bytes`/`mtime_max`/`observed_at`/`growth_bytes`/
+// `regrowth_count` are common to both; `complete`/`linkage_state`/
+// `linkage_basis`/`project_id`/`protected`/`protect_reason` are agent-
+// only (an external unit has no partial-fold cap and no direct project
+// link -- its associations are `unit_consumers.parquet`'s job) and left
+// `None` for an external row. `consequence` is each unit's own `note`
+// field (CHUNK_R16 names "consequence text"; neither struct has a field
+// literally called that -- `note` is the closest fact each one carries,
+// same "name what is actually there" choice R15 made for `remote`).
+// `allocated` bytes: CHUNK_R16 lists it, but neither `ExternalUnit` nor
+// `AgentUnit` has a bytes concept distinct from `bytes` itself (that
+// distinction is `ArtifactRow`'s, already migrated in R15) -- there is
+// nothing to store, so the column does not exist here; see the R16
+// session note's "deviations" section.
+//
+// Not migrated (stay in the snapshot, overlaid by `id`): `provenance`
+// (external), `tool_home`/`relative_path`/`members`/`action` (agent),
+// `hardlinked`, `evidence` (moves to `evidence.parquet` instead of the
+// overlay -- see below).
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredUnitRow {
+    pub(crate) scope_key: String,
+    pub(crate) id: String,
+    pub(crate) source_id: String,
+    pub(crate) source_name: String,
+    pub(crate) category: String,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) complete: Option<bool>,
+    pub(crate) mtime_max: u64,
+    /// `ProjectLinkState`'s label (`"linked"`/`"unresolved"`/
+    /// `"missing"`/`"not-a-project"`/`"moved"`/`"remote"`), agent-only.
+    pub(crate) linkage_state: Option<String>,
+    /// The variant's own detail, flattened to one string (a reason, a
+    /// path, a move's `from -> to`, a remote host); agent-only.
+    pub(crate) linkage_basis: Option<String>,
+    /// Only when `linkage_state == "linked"`.
+    pub(crate) project_id: Option<String>,
+    pub(crate) protected: Option<bool>,
+    pub(crate) protect_reason: Option<String>,
+    pub(crate) consequence: Option<String>,
+    pub(crate) observed_at: u64,
+    pub(crate) growth_bytes: Option<i64>,
+    pub(crate) regrowth_count: u32,
+}
+
+fn unit_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, false),
+        Field::new("source_id", DataType::Utf8, false),
+        Field::new("source_name", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("complete", DataType::Boolean, true),
+        Field::new("mtime_max", DataType::UInt64, false),
+        Field::new("linkage_state", DataType::Utf8, true),
+        Field::new("linkage_basis", DataType::Utf8, true),
+        Field::new("project_id", DataType::Utf8, true),
+        Field::new("protected", DataType::Boolean, true),
+        Field::new("protect_reason", DataType::Utf8, true),
+        Field::new("consequence", DataType::Utf8, true),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("growth_bytes", DataType::Int64, true),
+        Field::new("regrowth_count", DataType::UInt32, false),
+    ]))
+}
+
+pub(crate) fn write_unit_rows(path: &Path, rows: &[StoredUnitRow]) -> Result<()> {
+    let schema = unit_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.source_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.source_name.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.category.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.bytes).collect::<Vec<_>>(),
+            )),
+            opt_bool_col!(rows, complete),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.mtime_max).collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, linkage_state),
+            opt_str_col!(rows, linkage_basis),
+            opt_str_col!(rows, project_id),
+            opt_bool_col!(rows, protected),
+            opt_str_col!(rows, protect_reason),
+            opt_str_col!(rows, consequence),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            )),
+            opt_i64_col!(rows, growth_bytes),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.regrowth_count).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_unit_rows(path: &Path) -> Result<Vec<StoredUnitRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let id = downcast_str(&batch, "id")?;
+        let source_id = downcast_str(&batch, "source_id")?;
+        let source_name = downcast_str(&batch, "source_name")?;
+        let category = downcast_str(&batch, "category")?;
+        let path_col = downcast_str(&batch, "path")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let mtime_max = downcast_u64(&batch, "mtime_max")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        let regrowth_count = downcast_u32(&batch, "regrowth_count")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredUnitRow {
+                scope_key: scope_key.value(i).to_string(),
+                id: id.value(i).to_string(),
+                source_id: source_id.value(i).to_string(),
+                source_name: source_name.value(i).to_string(),
+                category: category.value(i).to_string(),
+                path: path_col.value(i).to_string(),
+                bytes: bytes.value(i),
+                complete: opt_bool(&batch, "complete", i)?,
+                mtime_max: mtime_max.value(i),
+                linkage_state: opt_str(&batch, "linkage_state", i)?,
+                linkage_basis: opt_str(&batch, "linkage_basis", i)?,
+                project_id: opt_str(&batch, "project_id", i)?,
+                protected: opt_bool(&batch, "protected", i)?,
+                protect_reason: opt_str(&batch, "protect_reason", i)?,
+                consequence: opt_str(&batch, "consequence", i)?,
+                observed_at: observed_at.value(i),
+                growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
+                regrowth_count: regrowth_count.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// `unit_consumers.parquet`: one row per `ExternalUnit::consumers`
+/// entry (`AgentUnit` has no consumer list -- its single `project_link`
+/// lives on the unit row itself, above). `ExternalConsumer` has no
+/// `project_id`/`basis` field (only `label`/`note`); CHUNK_R16 names
+/// `consumer_project_id` (always `None` -- nothing produces one yet)
+/// and `basis` (`ExternalConsumer::note`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredUnitConsumerRow {
+    pub(crate) scope_key: String,
+    pub(crate) unit_id: String,
+    pub(crate) consumer_label: String,
+    pub(crate) consumer_project_id: Option<String>,
+    pub(crate) basis: Option<String>,
+    pub(crate) seq: u32,
+}
+
+fn unit_consumers_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("unit_id", DataType::Utf8, false),
+        Field::new("consumer_label", DataType::Utf8, false),
+        Field::new("consumer_project_id", DataType::Utf8, true),
+        Field::new("basis", DataType::Utf8, true),
+        Field::new("seq", DataType::UInt32, false),
+    ]))
+}
+
+pub(crate) fn write_unit_consumer_rows(path: &Path, rows: &[StoredUnitConsumerRow]) -> Result<()> {
+    let schema = unit_consumers_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.unit_id.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.consumer_label.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, consumer_project_id),
+            opt_str_col!(rows, basis),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_unit_consumer_rows(path: &Path) -> Result<Vec<StoredUnitConsumerRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let unit_id = downcast_str(&batch, "unit_id")?;
+        let consumer_label = downcast_str(&batch, "consumer_label")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredUnitConsumerRow {
+                scope_key: scope_key.value(i).to_string(),
+                unit_id: unit_id.value(i).to_string(),
+                consumer_label: consumer_label.value(i).to_string(),
+                consumer_project_id: opt_str(&batch, "consumer_project_id", i)?,
+                basis: opt_str(&batch, "basis", i)?,
+                seq: seq.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// nested_artifacts.parquet (R16 item 2 of this slice). One row per
+// `NestedArtifact` -- both a per-project build-artifact interior
+// (`Report.nested_artifacts`) and a shared-store interior
+// (`ReportSnapshot.store_interiors`), which are the same production
+// type from two different producers (`build_stores`/adapters vs.
+// `external::discover_and_measure`); `origin` says which list a row
+// came from so reading splits them back apart losslessly rather than
+// guessing from `container_id`/path overlap. CHUNK_R16 names `id`,
+// "parent artifact row key" (`container_id` -- the id of the *container*
+// `NestedArtifact` whose own `path` equals the owning `ArtifactRow`'s
+// path; there is no other "artifact row key" a `NestedArtifact` carries
+// today), `adapter`, `family`, `role`, `path`, `bytes`, `basis`
+// (`AccountingBasis`), `mtime` (nullable), `consequence`, and the four
+// variant scalars. Everything else (`parent_id`, `membership`, `is_dir`,
+// `device`, `inode`, `logical_bytes`, `physical_bytes`,
+// `physical_total`, `coverage`, `producer_evidence`/`consumer_evidence`
+// -- the older, narrower per-nested-unit evidence shape, distinct from
+// `decision_evidence`/`crate::evidence::Evidence`, which moves to
+// `evidence.parquet` instead -- `action_group`, `present`,
+// `growth_bytes`, `regrowth_count`, `action`, `reported_by`,
+// `writer_lock`, and the variant's `package`/`version`/`toolchain`/
+// `features`/`generation`/`unknowns`) stays in the snapshot, overlaid by
+// `id`, same as R15's artifact-render fields.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredNestedArtifactRow {
+    pub(crate) scope_key: String,
+    pub(crate) origin: String,
+    pub(crate) id: String,
+    pub(crate) container_id: Option<String>,
+    pub(crate) adapter: Option<String>,
+    pub(crate) family: String,
+    pub(crate) role: String,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) basis: String,
+    pub(crate) mtime: Option<u64>,
+    pub(crate) consequence: Option<String>,
+    pub(crate) variant_profile: Option<String>,
+    pub(crate) variant_configuration: Option<String>,
+    pub(crate) variant_target: Option<String>,
+    pub(crate) variant_arch: Option<String>,
+}
+
+fn nested_artifacts_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("origin", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, false),
+        Field::new("container_id", DataType::Utf8, true),
+        Field::new("adapter", DataType::Utf8, true),
+        Field::new("family", DataType::Utf8, false),
+        Field::new("role", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("basis", DataType::Utf8, false),
+        Field::new("mtime", DataType::UInt64, true),
+        Field::new("consequence", DataType::Utf8, true),
+        Field::new("variant_profile", DataType::Utf8, true),
+        Field::new("variant_configuration", DataType::Utf8, true),
+        Field::new("variant_target", DataType::Utf8, true),
+        Field::new("variant_arch", DataType::Utf8, true),
+    ]))
+}
+
+pub(crate) fn write_nested_artifact_rows(
+    path: &Path,
+    rows: &[StoredNestedArtifactRow],
+) -> Result<()> {
+    let schema = nested_artifacts_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.origin.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, container_id),
+            opt_str_col!(rows, adapter),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.family.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.basis.as_str()).collect::<Vec<_>>(),
+            )),
+            opt_u64_col!(rows, mtime),
+            opt_str_col!(rows, consequence),
+            opt_str_col!(rows, variant_profile),
+            opt_str_col!(rows, variant_configuration),
+            opt_str_col!(rows, variant_target),
+            opt_str_col!(rows, variant_arch),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_nested_artifact_rows(path: &Path) -> Result<Vec<StoredNestedArtifactRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let origin = downcast_str(&batch, "origin")?;
+        let id = downcast_str(&batch, "id")?;
+        let family = downcast_str(&batch, "family")?;
+        let role = downcast_str(&batch, "role")?;
+        let path_col = downcast_str(&batch, "path")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let basis = downcast_str(&batch, "basis")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredNestedArtifactRow {
+                scope_key: scope_key.value(i).to_string(),
+                origin: origin.value(i).to_string(),
+                id: id.value(i).to_string(),
+                container_id: opt_str(&batch, "container_id", i)?,
+                adapter: opt_str(&batch, "adapter", i)?,
+                family: family.value(i).to_string(),
+                role: role.value(i).to_string(),
+                path: path_col.value(i).to_string(),
+                bytes: bytes.value(i),
+                basis: basis.value(i).to_string(),
+                mtime: opt_u64(&batch, "mtime", i)?,
+                consequence: opt_str(&batch, "consequence", i)?,
+                variant_profile: opt_str(&batch, "variant_profile", i)?,
+                variant_configuration: opt_str(&batch, "variant_configuration", i)?,
+                variant_target: opt_str(&batch, "variant_target", i)?,
+                variant_arch: opt_str(&batch, "variant_arch", i)?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// evidence.parquet (R16 item 3 of this slice). One row per
+// `crate::evidence::Evidence` entry, attached to an `ArtifactRow`, an
+// `ExternalUnit`, an `AgentUnit` or a `NestedArtifact`'s
+// `decision_evidence` (the shared #53 contract; NOT `NestedArtifact`'s
+// older, narrower `producer_evidence`/`consumer_evidence`, which stays
+// in the snapshot). `row_key` is `"<entity_kind>:<entity_id>"`
+// (`crate::growth::evidence_row_key`) so one table can key every entity
+// kind without a join table per kind. `seq` keeps one entity's evidence
+// `Vec` in order.
+//
+// CHUNK_R16's column list (`value_num`/`value_ts`/`value_text`) has no
+// room for `FactValue`'s seven variants or for `FactStatus::Conflicting`
+// (a `Vec<FactValue>`, always length >= 2 in production -- see
+// `reclaimability.rs`/`toolchain_declarations.rs`/
+// `external_associations.rs`); `value_kind` (the `FactValue` tag, needed
+// to reconstruct e.g. `Bytes` vs `Count` from the same numeric column)
+// and `conflicting_extra` (every candidate after the first, `|`-joined
+// using each one's own textual form -- every production `Conflicting`
+// site uses one `FactValue` variant across all its candidates, so one
+// `value_kind` describes them all) are added for that reason, the same
+// "extend when byte-identity needs it" call R15 made for `remote`.
+// `reason` (`FactStatus::Unknown`/`Unavailable`/`Conflicting`'s message)
+// and the two `freshness_*` columns are added for the same reason: named
+// in `Evidence`/`FactStatus` but not in CHUNK_R16's list, and dropping
+// them would change `agent_json`'s serialized `"evidence"` array.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredEvidenceRow {
+    pub(crate) scope_key: String,
+    pub(crate) row_key: String,
+    pub(crate) seq: u32,
+    pub(crate) kind: String,
+    pub(crate) subtype: String,
+    pub(crate) status: String,
+    pub(crate) value_kind: Option<String>,
+    pub(crate) value_num: Option<f64>,
+    pub(crate) value_ts: Option<i64>,
+    pub(crate) value_text: Option<String>,
+    pub(crate) conflicting_extra: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) source: String,
+    pub(crate) source_detail: Option<String>,
+    pub(crate) event_at: Option<i64>,
+    pub(crate) observed_at: u64,
+    pub(crate) freshness_expires_after_secs: Option<u64>,
+    pub(crate) freshness_coverage_note: Option<String>,
+    pub(crate) note: Option<String>,
+}
+
+fn evidence_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("row_key", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("subtype", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("value_kind", DataType::Utf8, true),
+        Field::new("value_num", DataType::Float64, true),
+        Field::new("value_ts", DataType::Int64, true),
+        Field::new("value_text", DataType::Utf8, true),
+        Field::new("conflicting_extra", DataType::Utf8, true),
+        Field::new("reason", DataType::Utf8, true),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("source_detail", DataType::Utf8, true),
+        Field::new("event_at", DataType::Int64, true),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("freshness_expires_after_secs", DataType::UInt64, true),
+        Field::new("freshness_coverage_note", DataType::Utf8, true),
+        Field::new("note", DataType::Utf8, true),
+    ]))
+}
+
+pub(crate) fn write_evidence_rows(path: &Path, rows: &[StoredEvidenceRow]) -> Result<()> {
+    let schema = evidence_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.row_key.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.subtype.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.status.as_str()).collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, value_kind),
+            opt_f64_col!(rows, value_num),
+            opt_i64_col!(rows, value_ts),
+            opt_str_col!(rows, value_text),
+            opt_str_col!(rows, conflicting_extra),
+            opt_str_col!(rows, reason),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, source_detail),
+            opt_i64_col!(rows, event_at),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            )),
+            opt_u64_col!(rows, freshness_expires_after_secs),
+            opt_str_col!(rows, freshness_coverage_note),
+            opt_str_col!(rows, note),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_evidence_rows(path: &Path) -> Result<Vec<StoredEvidenceRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let row_key = downcast_str(&batch, "row_key")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let kind = downcast_str(&batch, "kind")?;
+        let subtype = downcast_str(&batch, "subtype")?;
+        let status = downcast_str(&batch, "status")?;
+        let source = downcast_str(&batch, "source")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredEvidenceRow {
+                scope_key: scope_key.value(i).to_string(),
+                row_key: row_key.value(i).to_string(),
+                seq: seq.value(i),
+                kind: kind.value(i).to_string(),
+                subtype: subtype.value(i).to_string(),
+                status: status.value(i).to_string(),
+                value_kind: opt_str(&batch, "value_kind", i)?,
+                value_num: opt_f64(&batch, "value_num", i)?,
+                value_ts: opt_i64(&batch, "value_ts", i)?,
+                value_text: opt_str(&batch, "value_text", i)?,
+                conflicting_extra: opt_str(&batch, "conflicting_extra", i)?,
+                reason: opt_str(&batch, "reason", i)?,
+                source: source.value(i).to_string(),
+                source_detail: opt_str(&batch, "source_detail", i)?,
+                event_at: opt_i64(&batch, "event_at", i)?,
+                observed_at: observed_at.value(i),
+                freshness_expires_after_secs: opt_u64(&batch, "freshness_expires_after_secs", i)?,
+                freshness_coverage_note: opt_str(&batch, "freshness_coverage_note", i)?,
+                note: opt_str(&batch, "note", i)?,
             });
         }
     }

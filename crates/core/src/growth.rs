@@ -1969,6 +1969,1009 @@ pub(crate) fn artifact_row_key(
     row_key(project_id, worktree_id, &kind, &rel_path)
 }
 
+// ---------------------------------------------------------------------
+// external_units.parquet / agent_units.parquet / unit_consumers.parquet
+// (R16 item 1). Scope-wide, keyed like `projects.parquet`; written by
+// `observe_scope` alongside the other tables (same already-measured
+// `ScopeObservation`, no second discovery pass) and read by
+// `report::report_scope_from_store`, which replaces
+// `snapshot.external_units`/`snapshot.agent_units` wholesale and
+// overlays the fields this slice does not migrate (an `ExternalUnit`'s
+// `provenance`; an `AgentUnit`'s `tool_home`/`relative_path`/`members`/
+// `action`) from the snapshot's own list by `id` -- exactly
+// `rebuild_projects_from_tables`'s pattern for artifacts. `evidence` is
+// the one field on both unit types this slice does *not* overlay: it is
+// replaced entirely from `evidence.parquet` (see further down), per
+// CHUNK_R16 ("`report_scope_from_store` builds ... per-row evidence
+// FROM THEM").
+// ---------------------------------------------------------------------
+
+fn external_units_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("external_units.parquet")
+}
+
+fn agent_units_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("agent_units.parquet")
+}
+
+fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unit_consumers.parquet")
+}
+
+/// A stable identity for an external unit independent of the growth
+/// store's own device-inclusive row key (`external_row_key`, which
+/// exists to detect a remounted/replaced device for byte-history
+/// purposes, not to key a report-facing table): `(detector_id,
+/// category, canonical path)`, hashed the same way every other stable
+/// id in this codebase is minted.
+pub(crate) fn external_unit_table_id(detector_id: &str, category: &str, path: &Path) -> String {
+    crate::entities::id_for(&format!(
+        "external-unit-table:v1:{detector_id}:{category}:{}",
+        path.display()
+    ))
+}
+
+const LINK_SEP: char = '\u{1}';
+
+fn project_link_state_label(s: &crate::agents::ProjectLinkState) -> &'static str {
+    use crate::agents::ProjectLinkState as P;
+    match s {
+        P::Linked { .. } => "linked",
+        P::Unresolved { .. } => "unresolved",
+        P::Missing { .. } => "missing",
+        P::NotAProject { .. } => "not-a-project",
+        P::Moved { .. } => "moved",
+        P::Remote { .. } => "remote",
+        P::Shared { .. } => "shared",
+        P::NotApplicable => "not-applicable",
+    }
+}
+
+/// Flattens a `ProjectLinkState`'s variant-specific detail into one
+/// string (`linkage_basis`) plus, for `Linked` only, a separate
+/// `project_id` -- CHUNK_R16's three-column budget for what is, on the
+/// production type, up to five distinct pieces of data. `LINK_SEP`
+/// joins the extra pieces `Linked`/`Moved`/`Remote` carry beyond a
+/// single string; every other variant's detail is already one string.
+fn project_link_state_to_columns(
+    s: &crate::agents::ProjectLinkState,
+) -> (Option<String>, Option<String>) {
+    use crate::agents::{LinkSource, ProjectLinkState as P};
+    match s {
+        P::Linked {
+            project_id,
+            project_name,
+            project_path,
+            source,
+            worktree_kind,
+        } => {
+            let source_label = match source {
+                LinkSource::Declared => "declared",
+                LinkSource::Inferred => "inferred",
+            };
+            (
+                Some(format!(
+                    "{project_name}{LINK_SEP}{}{LINK_SEP}{source_label}{LINK_SEP}{worktree_kind}",
+                    project_path.display()
+                )),
+                Some(project_id.clone()),
+            )
+        }
+        P::Unresolved { reason } => (Some(reason.clone()), None),
+        P::Missing { path } => (Some(path.display().to_string()), None),
+        P::NotAProject { path } => (Some(path.display().to_string()), None),
+        P::Moved { from, to } => (
+            Some(format!("{}{LINK_SEP}{}", from.display(), to.display())),
+            None,
+        ),
+        P::Remote { host, path } => (Some(format!("{host}{LINK_SEP}{}", path.display())), None),
+        P::Shared { project_ids } => (Some(project_ids.join("|")), None),
+        P::NotApplicable => (None, None),
+    }
+}
+
+fn project_link_state_from_columns(
+    state: &str,
+    basis: Option<&str>,
+    project_id: Option<&str>,
+) -> crate::agents::ProjectLinkState {
+    use crate::agents::{LinkSource, ProjectLinkState as P};
+    let basis = basis.unwrap_or_default();
+    match state {
+        "linked" => {
+            let parts: Vec<&str> = basis.split(LINK_SEP).collect();
+            P::Linked {
+                project_id: project_id.unwrap_or_default().to_string(),
+                project_name: parts.first().copied().unwrap_or_default().to_string(),
+                project_path: PathBuf::from(parts.get(1).copied().unwrap_or_default()),
+                source: if parts.get(2) == Some(&"inferred") {
+                    LinkSource::Inferred
+                } else {
+                    LinkSource::Declared
+                },
+                worktree_kind: parts.get(3).copied().unwrap_or_default().to_string(),
+            }
+        }
+        "missing" => P::Missing {
+            path: PathBuf::from(basis),
+        },
+        "not-a-project" => P::NotAProject {
+            path: PathBuf::from(basis),
+        },
+        "moved" => {
+            let mut parts = basis.splitn(2, LINK_SEP);
+            P::Moved {
+                from: PathBuf::from(parts.next().unwrap_or_default()),
+                to: PathBuf::from(parts.next().unwrap_or_default()),
+            }
+        }
+        "remote" => {
+            let mut parts = basis.splitn(2, LINK_SEP);
+            P::Remote {
+                host: parts.next().unwrap_or_default().to_string(),
+                path: PathBuf::from(parts.next().unwrap_or_default()),
+            }
+        }
+        "shared" => P::Shared {
+            project_ids: if basis.is_empty() {
+                Vec::new()
+            } else {
+                basis.split('|').map(str::to_string).collect()
+            },
+        },
+        "not-applicable" => P::NotApplicable,
+        _ => P::Unresolved {
+            reason: basis.to_string(),
+        },
+    }
+}
+
+fn stored_row_from_external_unit(
+    scope_key: &str,
+    u: &crate::external::ExternalUnit,
+) -> columns::StoredUnitRow {
+    let category = crate::external::category_str(u.category);
+    columns::StoredUnitRow {
+        scope_key: scope_key.to_string(),
+        id: external_unit_table_id(&u.detector_id, category, &u.path),
+        source_id: u.detector_id.clone(),
+        source_name: u.detector_name.clone(),
+        category: category.to_string(),
+        path: u.path.display().to_string(),
+        bytes: u.bytes,
+        complete: None,
+        mtime_max: u.mtime_max,
+        linkage_state: None,
+        linkage_basis: None,
+        project_id: None,
+        protected: None,
+        protect_reason: None,
+        consequence: u.note.clone(),
+        observed_at: u.observed_at,
+        growth_bytes: u.growth_bytes,
+        regrowth_count: u.regrowth_count,
+    }
+}
+
+fn stored_row_from_agent_unit(
+    scope_key: &str,
+    u: &crate::agents::AgentUnit,
+) -> columns::StoredUnitRow {
+    let (linkage_basis, project_id) = project_link_state_to_columns(&u.project_link);
+    columns::StoredUnitRow {
+        scope_key: scope_key.to_string(),
+        id: u.id.clone(),
+        source_id: u.tool_id.clone(),
+        source_name: u.tool_name.clone(),
+        category: u.category.label().to_string(),
+        path: u.path.display().to_string(),
+        bytes: u.bytes,
+        complete: Some(u.complete),
+        mtime_max: u.mtime_max,
+        linkage_state: Some(project_link_state_label(&u.project_link).to_string()),
+        linkage_basis,
+        project_id,
+        protected: Some(u.protected),
+        protect_reason: u.protect_reason.clone(),
+        consequence: u.note.clone(),
+        observed_at: u.observed_at,
+        growth_bytes: u.growth_bytes,
+        regrowth_count: u.regrowth_count,
+    }
+}
+
+/// Writes `external_units.parquet`/`agent_units.parquet`/
+/// `unit_consumers.parquet` for `scope_key`, replacing that scope's rows
+/// wholesale (same per-scope-key replace semantics as
+/// `write_project_worktree_tables`). Called from `observe_scope`
+/// alongside the other tables, on the already-measured unit lists --
+/// no second discovery pass.
+pub fn write_unit_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    external_units: &[crate::external::ExternalUnit],
+    agent_units: &[crate::agents::AgentUnit],
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+
+    let ext_file = external_units_path(swamp_dir);
+    let mut ext_rows: Vec<columns::StoredUnitRow> = columns::read_unit_rows(&ext_file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    ext_rows.extend(
+        external_units
+            .iter()
+            .map(|u| stored_row_from_external_unit(scope_key, u)),
+    );
+    columns::write_unit_rows(&ext_file, &ext_rows)
+        .with_context(|| format!("write {}", ext_file.display()))?;
+
+    let agent_file = agent_units_path(swamp_dir);
+    let mut agent_rows: Vec<columns::StoredUnitRow> = columns::read_unit_rows(&agent_file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    agent_rows.extend(
+        agent_units
+            .iter()
+            .map(|u| stored_row_from_agent_unit(scope_key, u)),
+    );
+    columns::write_unit_rows(&agent_file, &agent_rows)
+        .with_context(|| format!("write {}", agent_file.display()))?;
+
+    let consumers_file = unit_consumers_path(swamp_dir);
+    let mut consumer_rows: Vec<columns::StoredUnitConsumerRow> =
+        columns::read_unit_consumer_rows(&consumers_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for u in external_units {
+        let unit_id = external_unit_table_id(
+            &u.detector_id,
+            crate::external::category_str(u.category),
+            &u.path,
+        );
+        for (seq, c) in u.consumers.iter().enumerate() {
+            consumer_rows.push(columns::StoredUnitConsumerRow {
+                scope_key: scope_key.to_string(),
+                unit_id: unit_id.clone(),
+                consumer_label: c.label.clone(),
+                consumer_project_id: None,
+                basis: c.note.clone(),
+                seq: seq as u32,
+            });
+        }
+    }
+    columns::write_unit_consumer_rows(&consumers_file, &consumer_rows)
+        .with_context(|| format!("write {}", consumers_file.display()))?;
+
+    Ok(())
+}
+
+/// Every stored `external_units.parquet`/`agent_units.parquet`/
+/// `unit_consumers.parquet` row for `scope_key`. `None` when neither
+/// unit table has rows for this scope yet (an older store) -- the
+/// caller falls back to the snapshot's own lists in that case.
+pub(crate) struct StoredUnitTables {
+    pub(crate) external: Vec<columns::StoredUnitRow>,
+    pub(crate) agent: Vec<columns::StoredUnitRow>,
+    pub(crate) consumers: Vec<columns::StoredUnitConsumerRow>,
+}
+
+pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<StoredUnitTables> {
+    let external: Vec<columns::StoredUnitRow> =
+        columns::read_unit_rows(&external_units_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    let agent: Vec<columns::StoredUnitRow> = columns::read_unit_rows(&agent_units_path(swamp_dir))
+        .ok()?
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if external.is_empty() && agent.is_empty() {
+        return None;
+    }
+    let consumers: Vec<columns::StoredUnitConsumerRow> =
+        columns::read_unit_consumer_rows(&unit_consumers_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    Some(StoredUnitTables {
+        external,
+        agent,
+        consumers,
+    })
+}
+
+/// Rebuilds one `ExternalUnit` from its stored row, its consumers, and
+/// its previous snapshot copy (for the not-yet-migrated fields:
+/// `provenance`, `hardlinked`). `evidence` is intentionally left empty
+/// here -- the caller fills it from `evidence.parquet` by this same id.
+pub(crate) fn external_unit_from_stored(
+    stored: &columns::StoredUnitRow,
+    consumers: Vec<crate::external::ExternalConsumer>,
+    old: Option<&crate::external::ExternalUnit>,
+) -> crate::external::ExternalUnit {
+    let category = crate::external::category_from_str(&stored.category)
+        .unwrap_or(crate::locations::StorageCategory::Unclassified);
+    crate::external::ExternalUnit {
+        detector_id: stored.source_id.clone(),
+        detector_name: stored.source_name.clone(),
+        category,
+        provenance: old
+            .map(|o| o.provenance.clone())
+            .unwrap_or(crate::locations::Provenance::BuiltinConvention),
+        path: PathBuf::from(&stored.path),
+        bytes: stored.bytes,
+        mtime_max: stored.mtime_max,
+        hardlinked: old.map(|o| o.hardlinked).unwrap_or(true),
+        growth_bytes: stored.growth_bytes,
+        regrowth_count: stored.regrowth_count,
+        observed_at: stored.observed_at,
+        consumers,
+        note: stored.consequence.clone(),
+        evidence: Vec::new(),
+    }
+}
+
+/// Rebuilds one `AgentUnit` from its stored row and its previous
+/// snapshot copy (for `tool_home`/`relative_path`/`members`/`action`,
+/// none of which this slice migrates). `evidence` is left empty for the
+/// same reason as `external_unit_from_stored`.
+pub(crate) fn agent_unit_from_stored(
+    stored: &columns::StoredUnitRow,
+    old: Option<&crate::agents::AgentUnit>,
+) -> crate::agents::AgentUnit {
+    let category = crate::agents::AgentCategory::from_label(&stored.category)
+        .unwrap_or(crate::agents::AgentCategory::Unclassified);
+    let project_link = stored
+        .linkage_state
+        .as_deref()
+        .map(|s| {
+            project_link_state_from_columns(
+                s,
+                stored.linkage_basis.as_deref(),
+                stored.project_id.as_deref(),
+            )
+        })
+        .or_else(|| old.map(|o| o.project_link.clone()))
+        .unwrap_or(crate::agents::ProjectLinkState::Unresolved {
+            reason: "no stored linkage state".to_string(),
+        });
+    crate::agents::AgentUnit {
+        tool_id: stored.source_id.clone(),
+        tool_name: stored.source_name.clone(),
+        tool_home: old.map(|o| o.tool_home.clone()).unwrap_or_default(),
+        category,
+        id: stored.id.clone(),
+        relative_path: old.map(|o| o.relative_path.clone()).unwrap_or_default(),
+        path: PathBuf::from(&stored.path),
+        members: old.map(|o| o.members.clone()).unwrap_or_default(),
+        bytes: stored.bytes,
+        hardlinked: old.map(|o| o.hardlinked).unwrap_or(true),
+        complete: stored.complete.unwrap_or(true),
+        growth_bytes: stored.growth_bytes,
+        regrowth_count: stored.regrowth_count,
+        observed_at: stored.observed_at,
+        mtime_max: stored.mtime_max,
+        protected: stored.protected.unwrap_or(false),
+        protect_reason: stored.protect_reason.clone(),
+        project_link,
+        action: old
+            .map(|o| o.action)
+            .unwrap_or(crate::agents::AgentActionCapability::None),
+        note: stored.consequence.clone(),
+        evidence: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// nested_artifacts.parquet (R16 item 2).
+// ---------------------------------------------------------------------
+
+fn nested_artifacts_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("nested_artifacts.parquet")
+}
+
+const NESTED_ORIGIN_REPORT: &str = "report";
+const NESTED_ORIGIN_STORE_INTERIOR: &str = "store-interior";
+
+fn stored_row_from_nested_artifact(
+    scope_key: &str,
+    origin: &str,
+    n: &crate::artifact::NestedArtifact,
+) -> columns::StoredNestedArtifactRow {
+    columns::StoredNestedArtifactRow {
+        scope_key: scope_key.to_string(),
+        origin: origin.to_string(),
+        id: n.id.clone(),
+        container_id: n.container_id.clone(),
+        adapter: n.adapter.clone(),
+        family: n.role.family().label().to_string(),
+        role: n.role.label().to_string(),
+        path: n.path.display().to_string(),
+        bytes: n.bytes,
+        basis: n.basis.label().to_string(),
+        mtime: Some(n.mtime_max),
+        consequence: n.consequence.clone(),
+        variant_profile: n.variant.profile.clone(),
+        variant_configuration: n.variant.configuration.clone(),
+        variant_target: n.variant.target.clone(),
+        variant_arch: n.variant.architecture.clone(),
+    }
+}
+
+/// Writes `nested_artifacts.parquet` for `scope_key`, replacing that
+/// scope's rows wholesale, from the two already-measured lists this
+/// same pass produced (`Report.nested_artifacts` and
+/// `ReportSnapshot.store_interiors`) -- no second pass over either.
+pub fn write_nested_artifact_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    report_nested: &[crate::artifact::NestedArtifact],
+    store_interiors: &[crate::artifact::NestedArtifact],
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let file = nested_artifacts_path(swamp_dir);
+    let mut rows: Vec<columns::StoredNestedArtifactRow> = columns::read_nested_artifact_rows(&file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    rows.extend(
+        report_nested
+            .iter()
+            .map(|n| stored_row_from_nested_artifact(scope_key, NESTED_ORIGIN_REPORT, n)),
+    );
+    rows.extend(
+        store_interiors
+            .iter()
+            .map(|n| stored_row_from_nested_artifact(scope_key, NESTED_ORIGIN_STORE_INTERIOR, n)),
+    );
+    columns::write_nested_artifact_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))
+}
+
+/// Every stored `nested_artifacts.parquet` row for `scope_key`, split
+/// back into the two lists it was written from (`origin`). `None` when
+/// there are no rows yet (an older store).
+pub(crate) fn read_nested_artifact_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+) -> Option<(
+    Vec<columns::StoredNestedArtifactRow>,
+    Vec<columns::StoredNestedArtifactRow>,
+)> {
+    let all: Vec<columns::StoredNestedArtifactRow> =
+        columns::read_nested_artifact_rows(&nested_artifacts_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    if all.is_empty() {
+        return None;
+    }
+    let (report, store_interior) = all
+        .into_iter()
+        .partition(|r| r.origin == NESTED_ORIGIN_REPORT);
+    Some((report, store_interior))
+}
+
+/// Rebuilds one `NestedArtifact` from its stored row and its previous
+/// snapshot copy, for the fields this slice does not migrate
+/// (`parent_id`, `membership`, `is_dir`, `device`, `inode`,
+/// `logical_bytes`, `physical_bytes`, `physical_total`, `coverage`,
+/// `producer_evidence`/`consumer_evidence`, `action_group`, `present`,
+/// `growth_bytes`, `regrowth_count`, `action`, `reported_by`,
+/// `writer_lock`, and the variant's `package`/`version`/`toolchain`/
+/// `features`/`generation`/`unknowns`). `decision_evidence` is left
+/// empty for `rebuild_evidence_from_table` to fill.
+pub(crate) fn nested_artifact_from_stored(
+    stored: &columns::StoredNestedArtifactRow,
+    old: Option<&crate::artifact::NestedArtifact>,
+) -> crate::artifact::NestedArtifact {
+    let role = crate::artifact::ArtifactRole::from_label(&stored.role)
+        .unwrap_or(crate::artifact::ArtifactRole::Unknown);
+    let basis = crate::artifact::AccountingBasis::from_label(&stored.basis)
+        .unwrap_or(crate::artifact::AccountingBasis::Unknown);
+    let variant = crate::artifact::ArtifactVariant {
+        profile: stored.variant_profile.clone(),
+        configuration: stored.variant_configuration.clone(),
+        target: stored.variant_target.clone(),
+        architecture: stored.variant_arch.clone(),
+        package: old.and_then(|o| o.variant.package.clone()),
+        version: old.and_then(|o| o.variant.version.clone()),
+        toolchain: old.and_then(|o| o.variant.toolchain.clone()),
+        features: old.and_then(|o| o.variant.features.clone()),
+        generation: old.and_then(|o| o.variant.generation.clone()),
+        unknowns: old.map(|o| o.variant.unknowns.clone()).unwrap_or_default(),
+    };
+    crate::artifact::NestedArtifact {
+        id: stored.id.clone(),
+        path: PathBuf::from(&stored.path),
+        relative_path: old.map(|o| o.relative_path.clone()).unwrap_or_default(),
+        parent_id: old.and_then(|o| o.parent_id.clone()),
+        container_id: stored.container_id.clone(),
+        role,
+        membership: old
+            .map(|o| o.membership.clone())
+            .unwrap_or(crate::artifact::Membership::Unknown),
+        is_dir: old.map(|o| o.is_dir).unwrap_or(false),
+        device: old.map(|o| o.device).unwrap_or(0),
+        inode: old.map(|o| o.inode).unwrap_or(0),
+        logical_bytes: old.map(|o| o.logical_bytes).unwrap_or(0),
+        bytes: stored.bytes,
+        physical_bytes: old.map(|o| o.physical_bytes).unwrap_or(0),
+        physical_total: old.map(|o| o.physical_total).unwrap_or(0),
+        mtime_max: stored.mtime.unwrap_or(0),
+        variant,
+        producer_evidence: old.map(|o| o.producer_evidence.clone()).unwrap_or_default(),
+        consumer_evidence: old.map(|o| o.consumer_evidence.clone()).unwrap_or_default(),
+        coverage: old.map(|o| o.coverage.clone()).unwrap_or_default(),
+        action_group: old.and_then(|o| o.action_group.clone()),
+        present: old.map(|o| o.present).unwrap_or(true),
+        growth_bytes: old.and_then(|o| o.growth_bytes),
+        regrowth_count: old.map(|o| o.regrowth_count).unwrap_or(0),
+        decision_evidence: Vec::new(),
+        adapter: stored.adapter.clone(),
+        basis,
+        time_source: old.map(|o| o.time_source).unwrap_or_default(),
+        action: old.map(|o| o.action.clone()).unwrap_or_default(),
+        consequence: stored.consequence.clone(),
+        reported_by: old.and_then(|o| o.reported_by.clone()),
+        writer_lock: old.and_then(|o| o.writer_lock.clone()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// evidence.parquet (R16 item 3). One row per `crate::evidence::Evidence`
+// entry across every entity kind that carries the #53 decision-evidence
+// contract: an `ArtifactRow` (keyed by `artifact_row_key`), an
+// `ExternalUnit`/`AgentUnit` (keyed by the same `id` the unit tables
+// use) and a `NestedArtifact`'s `decision_evidence` (keyed by its own
+// `id`). Every label function here is an exhaustive `match`, not a
+// serde round-trip, matching every other `label`/`from_label` pair in
+// this codebase (a new `FactKind`/`FactSubtype`/`EvidenceSource`
+// variant is a compile error here, not a silently-dropped fact).
+// ---------------------------------------------------------------------
+
+fn evidence_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("evidence.parquet")
+}
+
+/// Whether `evidence.parquet` exists at all -- distinct from "has no
+/// rows for this scope", which is a legitimate outcome once the table
+/// exists (a scope whose entities happen to carry no evidence this
+/// pass). An older store with no such file yet must leave every
+/// entity's `evidence` exactly as the snapshot already has it (the
+/// same no-op-on-an-older-store contract every other R16 table keeps),
+/// not clear it.
+pub(crate) fn evidence_table_exists(swamp_dir: &Path) -> bool {
+    crate::fs_gate::is_file(evidence_path(swamp_dir))
+}
+
+/// `"<entity_kind>:<id>"` -- the one identity space `evidence.parquet`
+/// keys every entity kind under.
+pub(crate) fn evidence_row_key(entity_kind: &str, id: &str) -> String {
+    format!("{entity_kind}:{id}")
+}
+
+fn fact_kind_label(k: crate::evidence::FactKind) -> &'static str {
+    use crate::evidence::FactKind::*;
+    match k {
+        Activity => "activity",
+        Consumer => "consumer",
+        CurrentUse => "current-use",
+        Recovery => "recovery",
+        Reclaimability => "reclaimability",
+    }
+}
+
+fn fact_kind_from_label(s: &str) -> crate::evidence::FactKind {
+    use crate::evidence::FactKind::*;
+    match s {
+        "consumer" => Consumer,
+        "current-use" => CurrentUse,
+        "recovery" => Recovery,
+        "reclaimability" => Reclaimability,
+        _ => Activity,
+    }
+}
+
+fn fact_subtype_label(s: crate::evidence::FactSubtype) -> &'static str {
+    use crate::evidence::FactSubtype::*;
+    match s {
+        Modified => "modified",
+        Accessed => "accessed",
+        ToolReportedUse => "tool-reported-use",
+        DeclaredConsumer => "declared-consumer",
+        InferredConsumer => "inferred-consumer",
+        Process => "process",
+        OpenFile => "open-file",
+        Lock => "lock",
+        RunningContainer => "running-container",
+        Mounted => "mounted",
+        Booted => "booted",
+        Rebuild => "rebuild",
+        NetworkFetch => "network-fetch",
+        LocalReinstall => "local-reinstall",
+        TrashRecovery => "trash-recovery",
+        BackupDependent => "backup-dependent",
+        PotentiallyUniqueLocalState => "potentially-unique-local-state",
+        UnknownPrerequisites => "unknown-prerequisites",
+        LogicalBytes => "logical-bytes",
+        AllocatedBytes => "allocated-bytes",
+        EstimatedReclaimable => "estimated-reclaimable",
+        ObservedFreed => "observed-freed",
+    }
+}
+
+fn fact_subtype_from_label(s: &str) -> crate::evidence::FactSubtype {
+    use crate::evidence::FactSubtype::*;
+    match s {
+        "accessed" => Accessed,
+        "tool-reported-use" => ToolReportedUse,
+        "declared-consumer" => DeclaredConsumer,
+        "inferred-consumer" => InferredConsumer,
+        "process" => Process,
+        "open-file" => OpenFile,
+        "lock" => Lock,
+        "running-container" => RunningContainer,
+        "mounted" => Mounted,
+        "booted" => Booted,
+        "rebuild" => Rebuild,
+        "network-fetch" => NetworkFetch,
+        "local-reinstall" => LocalReinstall,
+        "trash-recovery" => TrashRecovery,
+        "backup-dependent" => BackupDependent,
+        "potentially-unique-local-state" => PotentiallyUniqueLocalState,
+        "unknown-prerequisites" => UnknownPrerequisites,
+        "logical-bytes" => LogicalBytes,
+        "allocated-bytes" => AllocatedBytes,
+        "estimated-reclaimable" => EstimatedReclaimable,
+        "observed-freed" => ObservedFreed,
+        _ => Modified,
+    }
+}
+
+/// Encodes one `FactValue` as `(value_kind, value_num, value_ts,
+/// value_text)`; the inverse of [`fact_value_from_columns`].
+fn fact_value_to_columns(
+    v: &crate::evidence::FactValue,
+) -> (&'static str, Option<f64>, Option<i64>, Option<String>) {
+    use crate::evidence::FactValue::*;
+    match v {
+        Timestamp(t) => ("timestamp", None, Some(*t as i64), None),
+        Bool(b) => ("bool", Some(if *b { 1.0 } else { 0.0 }), None, None),
+        Text(t) => ("text", None, None, Some(t.clone())),
+        Bytes(b) => ("bytes", Some(*b as f64), None, None),
+        SignedBytes(b) => ("signed-bytes", Some(*b as f64), None, None),
+        Count(c) => ("count", Some(*c as f64), None, None),
+        List(l) => ("list", None, None, Some(l.join("|"))),
+    }
+}
+
+/// A `FactValue`'s own textual form, used for `Conflicting`'s
+/// `candidates` (`conflicting_extra`, `|`-joined) -- distinct from
+/// `fact_value_to_columns`'s three-column split, since several
+/// candidates share one row.
+fn fact_value_to_text(v: &crate::evidence::FactValue) -> String {
+    use crate::evidence::FactValue::*;
+    match v {
+        Timestamp(t) => t.to_string(),
+        Bool(b) => b.to_string(),
+        Text(t) => t.clone(),
+        Bytes(b) => b.to_string(),
+        SignedBytes(b) => b.to_string(),
+        Count(c) => c.to_string(),
+        List(l) => l.join(","),
+    }
+}
+
+fn fact_value_from_text(kind: &str, text: &str) -> crate::evidence::FactValue {
+    use crate::evidence::FactValue::*;
+    match kind {
+        "timestamp" => Timestamp(text.parse().unwrap_or(0)),
+        "bool" => Bool(text == "true" || text == "1"),
+        "bytes" => Bytes(text.parse().unwrap_or(0)),
+        "signed-bytes" => SignedBytes(text.parse().unwrap_or(0)),
+        "count" => Count(text.parse().unwrap_or(0)),
+        "list" => List(text.split(',').map(str::to_string).collect()),
+        _ => Text(text.to_string()),
+    }
+}
+
+fn fact_value_from_columns(
+    kind: &str,
+    value_num: Option<f64>,
+    value_ts: Option<i64>,
+    value_text: Option<&str>,
+) -> crate::evidence::FactValue {
+    use crate::evidence::FactValue::*;
+    match kind {
+        "timestamp" => Timestamp(value_ts.unwrap_or(0) as u64),
+        "bool" => Bool(value_num.unwrap_or(0.0) != 0.0),
+        "bytes" => Bytes(value_num.unwrap_or(0.0) as u64),
+        "signed-bytes" => SignedBytes(value_num.unwrap_or(0.0) as i64),
+        "count" => Count(value_num.unwrap_or(0.0) as u64),
+        "list" => List(
+            value_text
+                .unwrap_or_default()
+                .split('|')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => Text(value_text.unwrap_or_default().to_string()),
+    }
+}
+
+fn evidence_source_to_columns(
+    s: &crate::evidence::EvidenceSource,
+) -> (&'static str, Option<String>) {
+    use crate::evidence::EvidenceSource::*;
+    match s {
+        FilesystemMetadata { detail } => ("filesystem-metadata", Some(detail.clone())),
+        ToolReported { tool, detail } => {
+            ("tool-reported", Some(format!("{tool}{LINK_SEP}{detail}")))
+        }
+        ProcessQuery { tool } => ("process-query", Some(tool.clone())),
+        ManagerLock { tool, path } => ("manager-lock", Some(format!("{tool}{LINK_SEP}{path}"))),
+        ConfigDeclaration { path } => ("config-declaration", Some(path.clone())),
+        Lockfile { ecosystem, path } => ("lockfile", Some(format!("{ecosystem}{LINK_SEP}{path}"))),
+        BuildMetadata { path } => ("build-metadata", Some(path.clone())),
+        DockerApi { detail } => ("docker-api", Some(detail.clone())),
+        Statvfs => ("statvfs", None),
+        Inferred { basis } => ("inferred", Some(basis.clone())),
+    }
+}
+
+fn evidence_source_from_columns(
+    kind: &str,
+    detail: Option<&str>,
+) -> crate::evidence::EvidenceSource {
+    use crate::evidence::EvidenceSource::*;
+    let detail = detail.unwrap_or_default();
+    let two = || {
+        let mut parts = detail.splitn(2, LINK_SEP);
+        (
+            parts.next().unwrap_or_default().to_string(),
+            parts.next().unwrap_or_default().to_string(),
+        )
+    };
+    match kind {
+        "tool-reported" => {
+            let (tool, d) = two();
+            ToolReported { tool, detail: d }
+        }
+        "process-query" => ProcessQuery {
+            tool: detail.to_string(),
+        },
+        "manager-lock" => {
+            let (tool, path) = two();
+            ManagerLock { tool, path }
+        }
+        "config-declaration" => ConfigDeclaration {
+            path: detail.to_string(),
+        },
+        "lockfile" => {
+            let (ecosystem, path) = two();
+            Lockfile { ecosystem, path }
+        }
+        "build-metadata" => BuildMetadata {
+            path: detail.to_string(),
+        },
+        "docker-api" => DockerApi {
+            detail: detail.to_string(),
+        },
+        "statvfs" => Statvfs,
+        "inferred" => Inferred {
+            basis: detail.to_string(),
+        },
+        _ => FilesystemMetadata {
+            detail: detail.to_string(),
+        },
+    }
+}
+
+/// Flattens one entity's `Vec<Evidence>` into ordered
+/// `StoredEvidenceRow`s under `row_key`.
+fn stored_evidence_rows(
+    scope_key: &str,
+    row_key: &str,
+    evidence: &[crate::evidence::Evidence],
+) -> Vec<columns::StoredEvidenceRow> {
+    evidence
+        .iter()
+        .enumerate()
+        .map(|(seq, e)| {
+            let (status, value_kind, value_num, value_ts, value_text, conflicting_extra, reason) =
+                match &e.status {
+                    crate::evidence::FactStatus::Known(v) => {
+                        let (vk, num, ts, text) = fact_value_to_columns(v);
+                        ("known", Some(vk.to_string()), num, ts, text, None, None)
+                    }
+                    crate::evidence::FactStatus::Unknown { reason } => (
+                        "unknown",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(reason.to_string()),
+                    ),
+                    crate::evidence::FactStatus::Unavailable { reason } => (
+                        "unavailable",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(reason.to_string()),
+                    ),
+                    crate::evidence::FactStatus::Conflicting { candidates, reason } => {
+                        let (vk, num, ts, text) = candidates
+                            .first()
+                            .map(fact_value_to_columns)
+                            .unwrap_or(("text", None, None, None));
+                        let extra = candidates
+                            .iter()
+                            .skip(1)
+                            .map(fact_value_to_text)
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        (
+                            "conflicting",
+                            Some(vk.to_string()),
+                            num,
+                            ts,
+                            text,
+                            (!extra.is_empty()).then_some(extra),
+                            Some(reason.to_string()),
+                        )
+                    }
+                };
+            let (source, source_detail) = evidence_source_to_columns(&e.source);
+            columns::StoredEvidenceRow {
+                scope_key: scope_key.to_string(),
+                row_key: row_key.to_string(),
+                seq: seq as u32,
+                kind: fact_kind_label(e.kind).to_string(),
+                subtype: fact_subtype_label(e.subtype).to_string(),
+                status: status.to_string(),
+                value_kind,
+                value_num,
+                value_ts,
+                value_text,
+                conflicting_extra,
+                reason,
+                source: source.to_string(),
+                source_detail,
+                event_at: e.event_at.map(|t| t as i64),
+                observed_at: e.observed_at,
+                freshness_expires_after_secs: e.freshness.expires_after_secs,
+                freshness_coverage_note: e.freshness.coverage_note.clone(),
+                note: e.note.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The inverse of [`stored_evidence_rows`]: `rows` must already be every
+/// row for one `row_key`, in `seq` order.
+fn evidence_from_stored_rows(
+    rows: &[&columns::StoredEvidenceRow],
+) -> Vec<crate::evidence::Evidence> {
+    rows.iter()
+        .map(|r| {
+            let source = evidence_source_from_columns(&r.source, r.source_detail.as_deref());
+            let status = match r.status.as_str() {
+                "unknown" => crate::evidence::FactStatus::Unknown {
+                    reason: crate::reason!("{}", r.reason.clone().unwrap_or_default()),
+                },
+                "unavailable" => crate::evidence::FactStatus::Unavailable {
+                    reason: crate::reason!("{}", r.reason.clone().unwrap_or_default()),
+                },
+                "conflicting" => {
+                    let vk = r.value_kind.as_deref().unwrap_or("text");
+                    let mut candidates = vec![fact_value_from_columns(
+                        vk,
+                        r.value_num,
+                        r.value_ts,
+                        r.value_text.as_deref(),
+                    )];
+                    if let Some(extra) = &r.conflicting_extra {
+                        candidates.extend(extra.split('|').map(|t| fact_value_from_text(vk, t)));
+                    }
+                    crate::evidence::FactStatus::Conflicting {
+                        candidates,
+                        reason: crate::reason!("{}", r.reason.clone().unwrap_or_default()),
+                    }
+                }
+                _ => crate::evidence::FactStatus::Known(fact_value_from_columns(
+                    r.value_kind.as_deref().unwrap_or("text"),
+                    r.value_num,
+                    r.value_ts,
+                    r.value_text.as_deref(),
+                )),
+            };
+            crate::evidence::Evidence {
+                kind: fact_kind_from_label(&r.kind),
+                subtype: fact_subtype_from_label(&r.subtype),
+                status,
+                source,
+                observed_at: r.observed_at,
+                event_at: r.event_at.map(|t| t as u64),
+                freshness: crate::evidence::Freshness {
+                    expires_after_secs: r.freshness_expires_after_secs,
+                    coverage_note: r.freshness_coverage_note.clone(),
+                },
+                note: r.note.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Writes `evidence.parquet` for `scope_key`, replacing that scope's
+/// rows wholesale, from every entity this same pass already carries
+/// evidence on -- no second collection pass. `entities` is
+/// `(row_key, evidence)` pairs; the caller assembles them from
+/// `Report.projects`' artifacts, `external_units`, `agent_units` and
+/// `nested_artifacts`/`store_interiors`.
+pub fn write_evidence_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    entities: &[(String, &[crate::evidence::Evidence])],
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let file = evidence_path(swamp_dir);
+    let mut rows: Vec<columns::StoredEvidenceRow> = columns::read_evidence_rows(&file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for (row_key, evidence) in entities {
+        rows.extend(stored_evidence_rows(scope_key, row_key, evidence));
+    }
+    columns::write_evidence_rows(&file, &rows).with_context(|| format!("write {}", file.display()))
+}
+
+/// Every stored `evidence.parquet` row for `scope_key`, grouped by
+/// `row_key` and reassembled into `Vec<Evidence>` in `seq` order.
+/// Empty (never `None`) when there are no rows yet -- unlike the other
+/// R16 tables, an entity with no evidence at all is indistinguishable
+/// from "table not yet written" by row count alone, so the caller
+/// always calls this and gets an empty map rather than falling back to
+/// the snapshot (evidence is replaced, not overlaid).
+pub(crate) fn read_evidence_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+) -> HashMap<String, Vec<crate::evidence::Evidence>> {
+    let Ok(all) = columns::read_evidence_rows(&evidence_path(swamp_dir)) else {
+        return HashMap::new();
+    };
+    let mut by_key: HashMap<String, Vec<&columns::StoredEvidenceRow>> = HashMap::new();
+    for r in &all {
+        if r.scope_key == scope_key {
+            by_key.entry(r.row_key.clone()).or_default().push(r);
+        }
+    }
+    by_key
+        .into_iter()
+        .map(|(k, mut rows)| {
+            rows.sort_by_key(|r| r.seq);
+            (k, evidence_from_stored_rows(&rows))
+        })
+        .collect()
+}
+
 fn parse_artifact_kind(s: &str) -> ArtifactKind {
     match s {
         "BuildOutput" => ArtifactKind::BuildOutput,
@@ -5236,5 +6239,418 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_rows(&old).unwrap()[0].ecosystem(), None);
+    }
+
+    /// R16 item 1: every `ProjectLinkState` variant round-trips through
+    /// `linkage_state`/`linkage_basis`/`project_id`, an `ExternalUnit`'s
+    /// consumers keep their `Vec` order, and the not-yet-migrated fields
+    /// (`provenance`/`hardlinked`; `tool_home`/`relative_path`/`members`/
+    /// `action`) come back from the `old` snapshot copy passed in.
+    #[test]
+    fn unit_tables_round_trip_every_field_and_every_linkage_state() {
+        use crate::agents::{
+            AgentActionCapability, AgentCategory, AgentUnit, LinkSource, ProjectLinkState,
+        };
+        use crate::external::{ExternalConsumer, ExternalUnit};
+        use crate::locations::{Provenance, StorageCategory};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let external = ExternalUnit {
+            detector_id: "cargo-home".into(),
+            detector_name: "Cargo home".into(),
+            category: StorageCategory::Cache,
+            provenance: Provenance::BuiltinConvention,
+            path: PathBuf::from("/home/u/.cargo"),
+            bytes: 1_048_576,
+            mtime_max: 111,
+            hardlinked: false,
+            growth_bytes: Some(2048),
+            regrowth_count: 3,
+            observed_at: 222,
+            consumers: vec![
+                ExternalConsumer {
+                    label: "zeta-project".into(),
+                    note: Some("declared in Cargo.lock".into()),
+                },
+                ExternalConsumer {
+                    label: "alpha-project".into(),
+                    note: None,
+                },
+            ],
+            note: Some("coverage incomplete this pass: could not be read".into()),
+            evidence: Vec::new(),
+        };
+
+        let link_states = [
+            ProjectLinkState::Linked {
+                project_id: "proj-1".into(),
+                project_name: "one".into(),
+                project_path: PathBuf::from("/src/one"),
+                source: LinkSource::Declared,
+                worktree_kind: "main".into(),
+            },
+            ProjectLinkState::Linked {
+                project_id: "proj-2".into(),
+                project_name: "two".into(),
+                project_path: PathBuf::from("/src/two"),
+                source: LinkSource::Inferred,
+                worktree_kind: "linked".into(),
+            },
+            ProjectLinkState::Unresolved {
+                reason: "no cwd field found".into(),
+            },
+            ProjectLinkState::Missing {
+                path: PathBuf::from("/gone"),
+            },
+            ProjectLinkState::NotAProject {
+                path: PathBuf::from("/not-a-repo"),
+            },
+            ProjectLinkState::Moved {
+                from: PathBuf::from("/old"),
+                to: PathBuf::from("/new"),
+            },
+            ProjectLinkState::Remote {
+                host: "other-host".into(),
+                path: PathBuf::from("/remote/path"),
+            },
+            ProjectLinkState::Shared {
+                project_ids: vec!["p1".into(), "p2".into()],
+            },
+            ProjectLinkState::NotApplicable,
+        ];
+
+        let agents: Vec<AgentUnit> = link_states
+            .iter()
+            .enumerate()
+            .map(|(i, link)| AgentUnit {
+                tool_id: "claude-code".into(),
+                tool_name: "Claude Code".into(),
+                tool_home: PathBuf::from("/home/u/.claude"),
+                category: AgentCategory::Sessions,
+                id: format!("agent-{i}"),
+                relative_path: format!("projects/x/{i}.jsonl"),
+                path: PathBuf::from(format!("/home/u/.claude/projects/x/{i}.jsonl")),
+                members: Vec::new(),
+                bytes: 4096 + i as u64,
+                hardlinked: i % 2 == 0,
+                complete: i % 2 == 0,
+                growth_bytes: Some(i as i64 - 4),
+                regrowth_count: i as u32,
+                observed_at: 333,
+                mtime_max: 444 + i as u64,
+                protected: i % 3 == 0,
+                protect_reason: (i % 3 == 0).then(|| "session history".to_string()),
+                project_link: link.clone(),
+                action: AgentActionCapability::SessionRemoval,
+                note: Some(format!("note-{i}")),
+                evidence: Vec::new(),
+            })
+            .collect();
+
+        write_unit_tables(store, "k", std::slice::from_ref(&external), &agents).unwrap();
+        // A second scope's rows must not disturb the first's.
+        write_unit_tables(
+            store,
+            "other",
+            std::slice::from_ref(&external),
+            &agents[..1],
+        )
+        .unwrap();
+
+        let tables = read_unit_tables(store, "k").expect("rows for k");
+        assert_eq!(tables.external.len(), 1);
+        assert_eq!(tables.agent.len(), agents.len());
+
+        let mut consumer_rows: Vec<&columns::StoredUnitConsumerRow> = tables
+            .consumers
+            .iter()
+            .filter(|c| c.unit_id == tables.external[0].id)
+            .collect();
+        consumer_rows.sort_by_key(|c| c.seq);
+        let rebuilt_consumers: Vec<ExternalConsumer> = consumer_rows
+            .into_iter()
+            .map(|c| ExternalConsumer {
+                label: c.consumer_label.clone(),
+                note: c.basis.clone(),
+            })
+            .collect();
+        let rebuilt_external =
+            external_unit_from_stored(&tables.external[0], rebuilt_consumers, Some(&external));
+        assert_eq!(
+            serde_json::to_value(&rebuilt_external).unwrap(),
+            serde_json::to_value(&external).unwrap(),
+            "an ExternalUnit must round-trip field for field, consumers in order"
+        );
+
+        for (stored, original) in tables.agent.iter().zip(agents.iter()) {
+            let rebuilt = agent_unit_from_stored(stored, Some(original));
+            assert_eq!(
+                serde_json::to_value(&rebuilt).unwrap(),
+                serde_json::to_value(original).unwrap(),
+                "AgentUnit with project_link {:?} must round-trip",
+                original.project_link
+            );
+        }
+
+        assert!(read_unit_tables(store, "missing").is_none());
+    }
+
+    /// R16 item 2: a `NestedArtifact`'s `container_id`/`adapter`/`family`/
+    /// `role`/`path`/`bytes`/`basis`/`mtime`/`consequence`/variant
+    /// scalars round-trip, and `nested_artifacts.parquet` splits a
+    /// `Report.nested_artifacts` row back out from a
+    /// `ReportSnapshot.store_interiors` row by `origin`, never mixing
+    /// the two lists.
+    #[test]
+    fn nested_artifact_table_round_trips_every_field_and_splits_by_origin() {
+        use crate::artifact::{
+            AccountingBasis, ArtifactRole, ArtifactVariant, Membership, NestedActionCapability,
+            NestedArtifact, TimeSource,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let report_one = NestedArtifact {
+            id: "n1".into(),
+            path: PathBuf::from("/src/one/target/debug"),
+            relative_path: "target/debug".into(),
+            parent_id: Some("n0".into()),
+            container_id: Some("n0".into()),
+            role: ArtifactRole::Profile,
+            membership: Membership::Exclusive,
+            is_dir: true,
+            device: 5,
+            inode: 99,
+            logical_bytes: 4000,
+            bytes: 3000,
+            physical_bytes: 3000,
+            physical_total: 3000,
+            mtime_max: 555,
+            variant: ArtifactVariant {
+                profile: Some("debug".into()),
+                configuration: Some("dev".into()),
+                target: Some("x86_64-unknown-linux-gnu".into()),
+                architecture: Some("x86_64".into()),
+                package: Some("a".into()),
+                version: Some("0.1.0".into()),
+                toolchain: Some("stable".into()),
+                features: Some("default".into()),
+                generation: None,
+                unknowns: vec!["extra".into()],
+            },
+            producer_evidence: Vec::new(),
+            consumer_evidence: Vec::new(),
+            coverage: Default::default(),
+            action_group: Some("group-1".into()),
+            present: true,
+            growth_bytes: Some(100),
+            regrowth_count: 1,
+            decision_evidence: Vec::new(),
+            adapter: Some("cargo".into()),
+            basis: AccountingBasis::Allocated,
+            time_source: TimeSource::FoldedDirectoryModification,
+            action: NestedActionCapability::Unsupported {
+                reason: "shared store entry".into(),
+            },
+            consequence: Some("rebuild with `cargo build`".into()),
+            reported_by: None,
+            writer_lock: Some(PathBuf::from("/src/one/target/.cargo-lock")),
+        };
+        let interior_one = NestedArtifact {
+            id: "n2".into(),
+            container_id: None,
+            role: ArtifactRole::SharedStoreEntry,
+            path: PathBuf::from("/store/pnpm/pkg@1.0.0"),
+            basis: AccountingBasis::UniqueAllocated,
+            adapter: None,
+            consequence: None,
+            variant: ArtifactVariant::default(),
+            ..report_one.clone()
+        };
+
+        write_nested_artifact_table(
+            store,
+            "k",
+            std::slice::from_ref(&report_one),
+            std::slice::from_ref(&interior_one),
+        )
+        .unwrap();
+
+        let (report_rows, interior_rows) =
+            read_nested_artifact_table(store, "k").expect("rows for k");
+        assert_eq!(report_rows.len(), 1);
+        assert_eq!(interior_rows.len(), 1);
+
+        let rebuilt_report = nested_artifact_from_stored(&report_rows[0], Some(&report_one));
+        assert_eq!(
+            serde_json::to_value(&rebuilt_report).unwrap(),
+            serde_json::to_value(&report_one).unwrap()
+        );
+        let rebuilt_interior = nested_artifact_from_stored(&interior_rows[0], Some(&interior_one));
+        assert_eq!(
+            serde_json::to_value(&rebuilt_interior).unwrap(),
+            serde_json::to_value(&interior_one).unwrap()
+        );
+
+        assert!(read_nested_artifact_table(store, "missing").is_none());
+    }
+
+    /// R16 item 3: every `FactStatus` (`Known` with every `FactValue`
+    /// variant, `Unknown`, `Unavailable`, `Conflicting` with two
+    /// candidates -- the production shape, never a single-candidate
+    /// list), every `EvidenceSource` variant, `event_at`/`freshness`/
+    /// `note`, and list order (`seq`) round-trip through
+    /// `evidence.parquet`. Also pins `evidence_table_exists`: `false`
+    /// before any write, `true` after, independent of whether that
+    /// scope's own rows are empty.
+    #[test]
+    fn evidence_table_round_trips_every_status_and_source_variant() {
+        use crate::evidence::{
+            Evidence, EvidenceSource, FactKind, FactSubtype, FactValue, Freshness,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        assert!(!evidence_table_exists(store));
+
+        let mut e1 = Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            FactValue::Timestamp(1_700_000_000),
+            EvidenceSource::FilesystemMetadata {
+                detail: "folded walk stat".into(),
+            },
+            1_700_000_100,
+        );
+        e1.event_at = Some(1_700_000_050);
+        e1.freshness = Freshness {
+            expires_after_secs: Some(3600),
+            coverage_note: Some("scanned roots only".into()),
+        };
+        e1.note = Some("a human note".into());
+
+        let e_bool = Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::Mounted,
+            FactValue::Bool(true),
+            EvidenceSource::ProcessQuery {
+                tool: "lsof".into(),
+            },
+            1,
+        );
+        let e_bytes = Evidence::known(
+            FactKind::Reclaimability,
+            FactSubtype::LogicalBytes,
+            FactValue::Bytes(123_456),
+            EvidenceSource::ManagerLock {
+                tool: "gradle".into(),
+                path: "/w/x/.lock".into(),
+            },
+            2,
+        );
+        let e_signed = Evidence::known(
+            FactKind::Reclaimability,
+            FactSubtype::ObservedFreed,
+            FactValue::SignedBytes(-4096),
+            EvidenceSource::ConfigDeclaration {
+                path: "/w/.tool-versions".into(),
+            },
+            3,
+        );
+        let e_count = Evidence::known(
+            FactKind::Recovery,
+            FactSubtype::BackupDependent,
+            FactValue::Count(7),
+            EvidenceSource::Lockfile {
+                ecosystem: "node".into(),
+                path: "/w/package-lock.json".into(),
+            },
+            4,
+        );
+        let e_list = Evidence::known(
+            FactKind::Consumer,
+            FactSubtype::InferredConsumer,
+            FactValue::List(vec!["p1".into(), "p2".into()]),
+            EvidenceSource::BuildMetadata {
+                path: "/w/Info.plist".into(),
+            },
+            5,
+        );
+        let e_unknown = Evidence::unknown(
+            FactKind::CurrentUse,
+            FactSubtype::Process,
+            EvidenceSource::DockerApi {
+                detail: "daemon unreachable".into(),
+            },
+            6,
+            crate::reason!("no process query available on this platform"),
+        );
+        let e_unavailable = Evidence::unavailable(
+            FactKind::CurrentUse,
+            FactSubtype::OpenFile,
+            EvidenceSource::Statvfs,
+            7,
+            crate::reason!("permission denied"),
+        );
+        let e_conflicting_text = Evidence::conflicting(
+            FactKind::Consumer,
+            FactSubtype::DeclaredConsumer,
+            vec![
+                FactValue::Text("3.12.4".into()),
+                FactValue::Text("3.12.1".into()),
+            ],
+            EvidenceSource::Inferred {
+                basis: "two installations match".into(),
+            },
+            8,
+            crate::reason!("more than one installation matches"),
+        );
+        let e_conflicting_bytes = Evidence::conflicting(
+            FactKind::Reclaimability,
+            FactSubtype::EstimatedReclaimable,
+            vec![FactValue::Bytes(1000), FactValue::Bytes(5000)],
+            EvidenceSource::Inferred {
+                basis: "min/max bound".into(),
+            },
+            9,
+            crate::reason!("only a bound is known"),
+        );
+
+        let evidence = vec![
+            e1,
+            e_bool,
+            e_bytes,
+            e_signed,
+            e_count,
+            e_list,
+            e_unknown,
+            e_unavailable,
+            e_conflicting_text,
+            e_conflicting_bytes,
+        ];
+
+        write_evidence_table(
+            store,
+            "k",
+            &[("artifact:row-1".to_string(), evidence.as_slice())],
+        )
+        .unwrap();
+        assert!(evidence_table_exists(store));
+
+        let by_key = read_evidence_table(store, "k");
+        let rebuilt = by_key.get("artifact:row-1").expect("evidence for the key");
+        assert_eq!(
+            serde_json::to_value(rebuilt).unwrap(),
+            serde_json::to_value(&evidence).unwrap(),
+            "every FactStatus/FactValue/EvidenceSource variant, freshness, event_at and \
+             note must round-trip, in order"
+        );
+
+        // A different scope key's evidence does not leak in.
+        let empty = read_evidence_table(store, "other-scope");
+        assert!(empty.is_empty());
     }
 }

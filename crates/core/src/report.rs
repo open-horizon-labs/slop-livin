@@ -2574,6 +2574,89 @@ pub fn observe_scope(
             &observation.merged.projects,
             observation.merged.observed_at,
         )?;
+        // R16 item 1 of this slice: `external_units.parquet`/
+        // `agent_units.parquet`/`unit_consumers.parquet`, typed columns
+        // for the unit families this same pass already discovered and
+        // measured (`observation.external_units`/`.agent_units`) -- no
+        // second discovery pass.
+        crate::growth::write_unit_tables(
+            store_dir,
+            &key,
+            &observation.external_units,
+            &observation.agent_units,
+        )?;
+        // R16 item 2 of this slice: `nested_artifacts.parquet`, from the
+        // same pass's two already-measured `NestedArtifact` lists.
+        crate::growth::write_nested_artifact_table(
+            store_dir,
+            &key,
+            &observation.merged.nested_artifacts,
+            &observation.store_interiors,
+        )?;
+        // R16 item 3 of this slice: `evidence.parquet`, one row per
+        // `crate::evidence::Evidence` across every entity kind this same
+        // pass already carries it on -- an `ArtifactRow` (keyed by
+        // `artifact_row_key`), an `ExternalUnit`/`AgentUnit` (keyed by
+        // the id the unit tables use) and a `NestedArtifact`'s
+        // `decision_evidence` (keyed by its own id, from either list).
+        let mut evidence_entities: Vec<(String, &[crate::evidence::Evidence])> = Vec::new();
+        for p in &observation.merged.projects {
+            for wt in &p.worktrees {
+                for a in &wt.artifacts {
+                    if a.evidence.is_empty() {
+                        continue;
+                    }
+                    let artifact_key = crate::growth::artifact_row_key(
+                        &p.project_id,
+                        &wt.worktree_id,
+                        &wt.path,
+                        a,
+                    );
+                    evidence_entities.push((
+                        crate::growth::evidence_row_key("artifact", &artifact_key),
+                        &a.evidence,
+                    ));
+                }
+            }
+        }
+        for u in &observation.external_units {
+            if u.evidence.is_empty() {
+                continue;
+            }
+            let id = crate::growth::external_unit_table_id(
+                &u.detector_id,
+                crate::external::category_str(u.category),
+                &u.path,
+            );
+            evidence_entities.push((
+                crate::growth::evidence_row_key("external-unit", &id),
+                &u.evidence,
+            ));
+        }
+        for u in &observation.agent_units {
+            if u.evidence.is_empty() {
+                continue;
+            }
+            evidence_entities.push((
+                crate::growth::evidence_row_key("agent-unit", &u.id),
+                &u.evidence,
+            ));
+        }
+        for n in observation
+            .merged
+            .nested_artifacts
+            .iter()
+            .chain(observation.store_interiors.iter())
+        {
+            if n.decision_evidence.is_empty() {
+                continue;
+            }
+            evidence_entities.push((
+                crate::growth::evidence_row_key("nested-artifact", &n.id),
+                &n.decision_evidence,
+            ));
+        }
+        crate::growth::write_evidence_table(store_dir, &key, &evidence_entities)?;
     }
 
     Ok(observation)
@@ -2929,6 +3012,170 @@ fn rebuild_projects_from_tables(
 /// scope has never been observed. No walk, no detector I/O beyond the
 /// scope resolution the caller already did to build `scope`, no
 /// subprocess -- see `.oh/sessions/2026-09-24-report-is-a-pure-read.md`.
+/// R16 item 1: overwrites `snapshot.external_units`/`.agent_units` with
+/// `write_unit_tables`'s rows for `key` -- `external_units.parquet`/
+/// `agent_units.parquet` are the source for each unit's own scalars and
+/// `unit_consumers.parquet` for an external unit's declared-consumer
+/// list. Fields the tables do not carry (an `ExternalUnit`'s
+/// `provenance`; an `AgentUnit`'s `tool_home`/`relative_path`/`members`/
+/// `action`) are carried over from the snapshot's own list by `id`, and
+/// each unit's `evidence` is left empty here for
+/// `rebuild_evidence_from_table` to fill. A no-op when this scope has no
+/// unit-table rows yet (an older store).
+fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportSnapshot) {
+    let Some(tables) = crate::growth::read_unit_tables(store_dir, key) else {
+        return;
+    };
+
+    let old_external: std::collections::HashMap<String, &crate::external::ExternalUnit> = snapshot
+        .external_units
+        .iter()
+        .map(|u| {
+            (
+                crate::growth::external_unit_table_id(
+                    &u.detector_id,
+                    crate::external::category_str(u.category),
+                    &u.path,
+                ),
+                u,
+            )
+        })
+        .collect();
+    let old_agent: std::collections::HashMap<String, &crate::agents::AgentUnit> = snapshot
+        .agent_units
+        .iter()
+        .map(|u| (u.id.clone(), u))
+        .collect();
+
+    let mut consumers_by_unit: std::collections::HashMap<
+        String,
+        Vec<&crate::growth::columns::StoredUnitConsumerRow>,
+    > = std::collections::HashMap::new();
+    for c in &tables.consumers {
+        consumers_by_unit
+            .entry(c.unit_id.clone())
+            .or_default()
+            .push(c);
+    }
+
+    snapshot.external_units = tables
+        .external
+        .iter()
+        .map(|stored| {
+            let mut cs = consumers_by_unit
+                .get(&stored.id)
+                .cloned()
+                .unwrap_or_default();
+            cs.sort_by_key(|c| c.seq);
+            let consumers = cs
+                .into_iter()
+                .map(|c| crate::external::ExternalConsumer {
+                    label: c.consumer_label.clone(),
+                    note: c.basis.clone(),
+                })
+                .collect();
+            crate::growth::external_unit_from_stored(
+                stored,
+                consumers,
+                old_external.get(&stored.id).copied(),
+            )
+        })
+        .collect();
+
+    snapshot.agent_units = tables
+        .agent
+        .iter()
+        .map(|stored| {
+            crate::growth::agent_unit_from_stored(stored, old_agent.get(&stored.id).copied())
+        })
+        .collect();
+}
+
+/// R16 item 2: overwrites `snapshot.report.nested_artifacts` and
+/// `snapshot.store_interiors` with `nested_artifacts.parquet`'s two
+/// origin-split lists for `key`, overlaying each row's not-yet-migrated
+/// fields from the snapshot's own matching entry by `id`. A no-op when
+/// this scope has no nested-artifact rows yet (an older store).
+fn rebuild_nested_artifacts_from_tables(
+    store_dir: &Path,
+    key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    let Some((report_rows, interior_rows)) =
+        crate::growth::read_nested_artifact_table(store_dir, key)
+    else {
+        return;
+    };
+    let old_by_id: std::collections::HashMap<String, crate::artifact::NestedArtifact> = snapshot
+        .report
+        .nested_artifacts
+        .iter()
+        .chain(snapshot.store_interiors.iter())
+        .map(|n| (n.id.clone(), n.clone()))
+        .collect();
+    let new_report_nested = report_rows
+        .iter()
+        .map(|stored| crate::growth::nested_artifact_from_stored(stored, old_by_id.get(&stored.id)))
+        .collect();
+    let new_store_interiors = interior_rows
+        .iter()
+        .map(|stored| crate::growth::nested_artifact_from_stored(stored, old_by_id.get(&stored.id)))
+        .collect();
+    snapshot.report.nested_artifacts = new_report_nested;
+    snapshot.store_interiors = new_store_interiors;
+}
+
+/// R16 item 3: replaces every entity's `evidence`/`decision_evidence`
+/// with `evidence.parquet`'s rows for its row key, run last so it sees
+/// the final project/unit/nested-artifact lists the earlier rebuilds
+/// just produced. Unlike the other R16 tables this is never a no-op on
+/// an older store by row *count* (a store with the table but nothing
+/// evidenced yet has zero rows too) -- `evidence_table_exists` is the
+/// actual "has this store ever written this table" check.
+fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportSnapshot) {
+    if !crate::growth::evidence_table_exists(store_dir) {
+        return;
+    }
+    let by_key = crate::growth::read_evidence_table(store_dir, key);
+    for p in &mut snapshot.report.projects {
+        for wt in &mut p.worktrees {
+            let worktree_path = wt.path.clone();
+            for a in &mut wt.artifacts {
+                let artifact_key = crate::growth::artifact_row_key(
+                    &p.project_id,
+                    &wt.worktree_id,
+                    &worktree_path,
+                    a,
+                );
+                let row_key = crate::growth::evidence_row_key("artifact", &artifact_key);
+                a.evidence = by_key.get(&row_key).cloned().unwrap_or_default();
+            }
+        }
+    }
+    for u in &mut snapshot.external_units {
+        let id = crate::growth::external_unit_table_id(
+            &u.detector_id,
+            crate::external::category_str(u.category),
+            &u.path,
+        );
+        let row_key = crate::growth::evidence_row_key("external-unit", &id);
+        u.evidence = by_key.get(&row_key).cloned().unwrap_or_default();
+    }
+    for u in &mut snapshot.agent_units {
+        let row_key = crate::growth::evidence_row_key("agent-unit", &u.id);
+        u.evidence = by_key.get(&row_key).cloned().unwrap_or_default();
+    }
+    for n in snapshot
+        .report
+        .nested_artifacts
+        .iter_mut()
+        .chain(snapshot.store_interiors.iter_mut())
+    {
+        let row_key = crate::growth::evidence_row_key("nested-artifact", &n.id);
+        n.decision_evidence = by_key.get(&row_key).cloned().unwrap_or_default();
+    }
+}
+
 pub fn report_scope_from_store(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
@@ -2939,6 +3186,9 @@ pub fn report_scope_from_store(
             scope_description: describe_scope_for_error(scope),
         })?;
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
+    rebuild_units_from_tables(store_dir, &key, &mut snapshot);
+    rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
+    rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
     Ok(snapshot)
 }
 
