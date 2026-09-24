@@ -36,6 +36,16 @@ name: Release
 on:
   push:
     tags: ['v*']
+    # Explicit, not redundant: `tags` alone is documented to already
+    # exclude every branch push, but this repo's every ordinary branch
+    # push was creating a zero-job, immediately-`failure` Release run
+    # anyway (confirmed back to well before this file's most recent
+    # changes, so not something a recent edit here introduced) --
+    # `branches-ignore: ['**']` removes the ambiguity a `push` filter
+    # combining only a positive `tags` selector with no `branches`/
+    # `branches-ignore` key apparently leaves for the platform to
+    # resolve one way or the other.
+    branches-ignore: ['**']
   workflow_dispatch:
 
 permissions:

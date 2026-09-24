@@ -4,6 +4,17 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### CI: stop a phantom zero-job `Release` run on every ordinary push
+
+Every push to any branch was creating a `Release` workflow run with no
+jobs that immediately reported `failure` (pre-dating this session's own
+changes -- confirmed on commits well before R16 started). `release.yml`
+already reads `on: push: tags: ['v*']`, which is documented to already
+exclude branch pushes; adding `branches-ignore: ['**']` alongside `tags`
+removes whatever ambiguity a `tags`-only filter with no `branches`/
+`branches-ignore` key was apparently leaving open. A branch push now
+starts only the `CI` workflow.
+
 ### No JSON in the store: units, consumers, nested artifacts, evidence (R16)
 
 `swamp observe` now writes four more typed tables: `external_units.parquet`
