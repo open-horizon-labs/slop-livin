@@ -2124,6 +2124,20 @@ pub fn report_scope_with_parts_covered(
             }
             RootStatus::Present => {
                 let path = &scope_root.path;
+                // A detector location (Cargo home, rustup, Homebrew,
+                // `~/Library/Caches`, `~/Library/Developer`, ...) never
+                // gets the ordinary project walk: it is measured only as
+                // an external unit, by `external::discover_and_measure`,
+                // over in `observe_scope` (#R13 item B, "project roots
+                // vs. detector locations"). This is what keeps a Git
+                // checkout planted inside a detector's home from ever
+                // becoming a project, and what keeps an unchanged
+                // `observe` from re-walking every detector home's
+                // contents on top of measuring it as a unit.
+                if !scope_root.is_project_root() {
+                    coverage.push(RootCoverage::detector_only(path.clone()));
+                    continue;
+                }
                 // Scope resolution and this call are never atomic: redo the
                 // presence/readability check right before walking so a
                 // root that lost access in between is never silently

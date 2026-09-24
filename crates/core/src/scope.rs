@@ -221,6 +221,30 @@ impl ScopeRoot {
     pub fn is_scan_target(&self) -> bool {
         matches!(self.status, RootStatus::Present | RootStatus::Missing)
     }
+
+    /// Whether this root gets ordinary project treatment -- Git/ecosystem
+    /// discovery, project grouping, and the unowned-remainder walk --
+    /// versus a *detector location*, which is measured only as an
+    /// external unit (`crate::external::discover_and_measure`) and never
+    /// walked for projects (#R13 item B, "project roots vs. detector
+    /// locations"). A root is a project root when the user named it
+    /// (`include`/an explicit command root) or it is the one built-in
+    /// `~/src`-style habit; a root whose only reasons are detector
+    /// results (Cargo home, rustup, Homebrew, `~/Library/Caches`,
+    /// `~/Library/Developer`, ...) is a detector location, even when it
+    /// is also present and readable.
+    ///
+    /// `NestedFrom` never makes a root a project root by itself -- it
+    /// only says this root absorbed another one's walk; whether *this*
+    /// root gets walked at all still turns on its own other reasons.
+    pub fn is_project_root(&self) -> bool {
+        self.reasons.iter().any(|r| {
+            matches!(
+                r,
+                RootReason::BuiltinDefault | RootReason::Included | RootReason::ExplicitCommand
+            )
+        })
+    }
 }
 
 /// One detector's full output for `swamp scope` transparency, including
@@ -971,14 +995,31 @@ pub fn resolve_effective_scope(
                     continue;
                 }
                 let Some(path) = &loc.path else { continue };
-                candidates.push((
-                    normalize_path(&env.home, path),
+                let normalized = normalize_path(&env.home, path);
+                // Only the `~/src`-style habit gets ordinary project
+                // treatment (Git/ecosystem discovery, unowned remainder).
+                // Every other builtin-defaults candidate
+                // (`~/Library/Developer`, `~/Library/Caches`, the XDG
+                // cache root) is a detector location like any other tool
+                // home: measured only as an external unit, never walked
+                // as a project root (#R13 item B). Matched by identity
+                // against the one path `locations::builtin` proposes for
+                // this purpose, not by index, so a future reordering of
+                // that detector's candidate list cannot silently flip
+                // which one is treated as a project root.
+                let reason = if summary.detector_id
+                    == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID
+                    && normalized == env.home.join("src")
+                {
+                    RootReason::BuiltinDefault
+                } else {
                     RootReason::Detector {
                         detector_id: summary.detector_id.clone(),
                         category: loc.category,
                         provenance: loc.provenance.clone(),
-                    },
-                ));
+                    }
+                };
+                candidates.push((normalized, reason));
             }
         }
         for inc in &config.include {

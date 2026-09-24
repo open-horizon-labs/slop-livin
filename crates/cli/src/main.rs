@@ -305,6 +305,12 @@ enum Command {
         roots: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Show every root, including folded-as-nested and Unclassified
+        /// detector locations, which the default text view hides as
+        /// noise (#R13 item B). `--json` is always the full, unfiltered
+        /// scope -- this flag only changes the text renderer.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Human keep/protect intent for agent-storage paths (#100/#101):
     /// survives refresh and is never itself inferred from observation --
@@ -413,7 +419,7 @@ fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
     eprintln!("scope coverage: {summary}");
 }
 
-fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
+fn render_scope_text(scope: &swamp_core::scope::EffectiveScope, verbose: bool) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(
@@ -433,20 +439,9 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
             "configured scope"
         }
     );
-    for root in &scope.roots {
-        let status = match &root.status {
-            swamp_core::scope::RootStatus::Present => "present".to_string(),
-            swamp_core::scope::RootStatus::Missing => "missing".to_string(),
-            swamp_core::scope::RootStatus::Unreadable { reason } => {
-                format!("unreadable ({reason})")
-            }
-            swamp_core::scope::RootStatus::SkippedAsNested { parent } => {
-                format!("skipped-as-nested (folded into {})", parent.display())
-            }
-            swamp_core::scope::RootStatus::Excluded { pattern } => format!("excluded ({pattern})"),
-        };
-        let reasons: Vec<String> = root
-            .reasons
+
+    fn reason_labels(root: &swamp_core::scope::ScopeRoot) -> Vec<String> {
+        root.reasons
             .iter()
             .map(|r| match r {
                 swamp_core::scope::RootReason::BuiltinDefault => "built-in default".to_string(),
@@ -461,15 +456,81 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
                     format!("covers nested {}", path.display())
                 }
             })
-            .collect();
+            .collect()
+    }
+    fn status_label(status: &swamp_core::scope::RootStatus) -> String {
+        match status {
+            swamp_core::scope::RootStatus::Present => "present".to_string(),
+            swamp_core::scope::RootStatus::Missing => "missing".to_string(),
+            swamp_core::scope::RootStatus::Unreadable { reason } => {
+                format!("unreadable ({reason})")
+            }
+            swamp_core::scope::RootStatus::SkippedAsNested { parent } => {
+                format!("skipped-as-nested (folded into {})", parent.display())
+            }
+            swamp_core::scope::RootStatus::Excluded { pattern } => format!("excluded ({pattern})"),
+        }
+    }
+    // Noise the default view hides (#R13 item B): a root already folded
+    // into a parent's walk tells a reader nothing beyond what its
+    // parent's own row already says -- `--verbose`/`--json` still show
+    // it in full.
+    fn is_noise(root: &swamp_core::scope::ScopeRoot) -> bool {
+        matches!(
+            root.status,
+            swamp_core::scope::RootStatus::SkippedAsNested { .. }
+        )
+    }
+
+    // Two classes (#R13 item B): project roots get ordinary Git/
+    // ecosystem discovery and an unowned remainder; detector locations
+    // are measured only as external units. `swamp report`'s coverage
+    // (`RegionStatus::DetectorOnly`) is this same split at observe time.
+    let (project_roots, detector_roots): (Vec<_>, Vec<_>) =
+        scope.roots.iter().partition(|r| r.is_project_root());
+
+    let _ = writeln!(
+        out,
+        "project roots (Git/ecosystem discovery, unowned remainder):"
+    );
+    for root in &project_roots {
+        if !verbose && is_noise(root) {
+            continue;
+        }
         let _ = writeln!(
             out,
             "  {:<10} {}  [{}]",
-            status,
+            status_label(&root.status),
             root.path.display(),
-            reasons.join("; ")
+            reason_labels(root).join("; ")
         );
     }
+    let _ = writeln!(
+        out,
+        "detector locations (measured as external units only, never a project):"
+    );
+    for root in &detector_roots {
+        if !verbose && is_noise(root) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  {:<10} {}  [{}]",
+            status_label(&root.status),
+            root.path.display(),
+            reason_labels(root).join("; ")
+        );
+    }
+    if !verbose {
+        let hidden = scope.roots.iter().filter(|r| is_noise(r)).count();
+        if hidden > 0 {
+            let _ = writeln!(
+                out,
+                "({hidden} nested/Unclassified root(s) hidden; --verbose to show)"
+            );
+        }
+    }
+
     if !scope.pruned_subtrees.is_empty() {
         let _ = writeln!(out, "pruned subtrees (excluded, inside an in-scope root):");
         for p in &scope.pruned_subtrees {
@@ -1075,12 +1136,16 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Scope { roots, json } => {
+        Command::Scope {
+            roots,
+            json,
+            verbose,
+        } => {
             let scope = resolve_scope(&roots)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&scope)?);
             } else {
-                print!("{}", render_scope_text(&scope));
+                print!("{}", render_scope_text(&scope, verbose));
                 if scope.is_empty_scope() {
                     eprintln!(
                         "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."

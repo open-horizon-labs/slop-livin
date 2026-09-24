@@ -67,11 +67,15 @@ fn only_config(keep: &[&str], registry: &Registry) -> ScanConfig {
 }
 
 /// The concrete FOLLOWUPS scenario: Homebrew's downloads cache
-/// (`~/Library/Caches/Homebrew`) sits inside the built-in default root
-/// `~/Library/Caches`. Before this fix, `report_scope`'s ordinary walk
-/// of `~/Library/Caches` counted the Homebrew subtree as unowned bytes
-/// *and* `external::discover_and_measure` counted the same subtree
-/// again as the Homebrew downloads unit.
+/// (`~/Library/Caches/Homebrew`) sits inside `~/Library/Caches`. Before
+/// the original fix, `report_scope`'s ordinary walk of `~/Library/Caches`
+/// counted the Homebrew subtree as unowned bytes *and*
+/// `external::discover_and_measure` counted the same subtree again as
+/// the Homebrew downloads unit. Since #R13 item B ("project roots vs.
+/// detector locations"), `~/Library/Caches` is not a scan root at all --
+/// it is a detector location, walked by nothing -- so the old double
+/// count cannot happen for a much simpler reason: only one of the two
+/// measurement paths ever runs over it.
 #[test]
 fn nested_external_location_is_pruned_from_its_parent_roots_walk() {
     let home = tempfile::tempdir().unwrap();
@@ -91,57 +95,52 @@ fn nested_external_location_is_pruned_from_its_parent_roots_walk() {
     let cfg = only_config(&["homebrew"], &registry);
     let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1_000);
 
-    // The scope resolution itself must record why: an
-    // `ExternalPruneNote` naming the Homebrew cache as pruned from the
-    // Caches root, attributed to the homebrew detector.
-    let note = scope
-        .external_pruned_subtrees
+    // `~/Library/Caches` itself is a detector location, not a project
+    // root: it must never appear in `authorized_roots()` treated as a
+    // project root, and the scope's own root list must record it as
+    // such.
+    let caches_root = scope
+        .roots
         .iter()
-        .find(|n| n.path == homebrew_cache && n.root == caches)
-        .expect("homebrew cache must be recorded as pruned from ~/Library/Caches");
-    assert_eq!(note.detector_id, "homebrew");
+        .find(|r| r.path == caches)
+        .expect("~/Library/Caches is a candidate root");
+    assert!(
+        !caches_root.is_project_root(),
+        "~/Library/Caches must not be a project root (#R13 item B)"
+    );
 
-    let (report, _coverage) =
+    let (report, coverage) =
         report_scope(&scope, None, false, None, None, false, false, false, true)
             .expect("report_scope succeeds over the fixture scope");
 
-    // Reconstruction identity: measuring ~/Library/Caches with the
-    // Homebrew subtree explicitly excluded (the same machinery, called
-    // directly) must equal exactly what the ordinary walk attributed to
-    // that root -- no more (would mean Homebrew leaked back in), no
-    // less (would mean real non-Homebrew cache content vanished).
-    let expected_without_homebrew = resize_artifact_excluding(
-        &caches,
-        swamp_core::report::ArtifactKind::Unknown,
-        1_000,
-        std::slice::from_ref(&homebrew_cache),
-    );
+    // The ordinary walk never touches `~/Library/Caches` at all -- not
+    // "walked minus Homebrew", walked_total is exactly zero because no
+    // walk of it happened.
     assert_eq!(
-        report.reconciliation.walked_total, expected_without_homebrew.bytes,
-        "the ordinary walk of ~/Library/Caches must attribute exactly the \
-         non-Homebrew bytes once Homebrew's cache is pruned as an external unit"
+        report.reconciliation.walked_total, 0,
+        "a detector location contributes nothing to the ordinary project walk"
     );
-    assert!(
-        report.reconciliation.walked_total > 0,
-        "the unrelated some-other-tool cache content must still be counted"
-    );
-
-    // The prune must be visible in the report's own notes, not just in
-    // `EffectiveScope` -- "the root's report notes say so".
     assert!(
         report
-            .notes
+            .projects
             .iter()
-            .any(|n| n.contains("measured as external unit") && n.contains("homebrew")),
-        "{:?}",
-        report.notes
+            .all(|p| p.worktrees.iter().all(|w| w.path != caches)),
+        "a detector location must never become a project"
+    );
+    let caches_coverage = coverage
+        .iter()
+        .find(|c| c.path == caches)
+        .expect("~/Library/Caches gets its own coverage row");
+    assert_eq!(
+        caches_coverage.status,
+        swamp_core::coverage::RegionStatus::DetectorOnly,
+        "coverage must say this root was a detector location, not silently 'missing'"
     );
 
-    // Now reconstruct the *other* half: `external::discover_and_measure`
-    // must independently measure exactly the pruned subtree, and the
-    // sum of the two halves must equal one naive, unexcluded measurement
-    // of the whole Caches directory -- proving the bytes appear exactly
-    // once across the two views, never zero and never twice.
+    // Now the other half: `external::discover_and_measure` must still
+    // independently measure the Homebrew subtree as its own unit, with
+    // real bytes -- the measurement did not just vanish along with the
+    // walk.
     let units = swamp_core::external::discover_and_measure(
         &scope,
         None,
@@ -157,15 +156,11 @@ fn nested_external_location_is_pruned_from_its_parent_roots_walk() {
         .find(|u| u.detector_id == "homebrew" && u.path == homebrew_cache_canonical)
         .expect("homebrew cache is measured as its own external unit");
     assert!(homebrew_unit.bytes > 0);
-
-    let naive_whole_caches =
-        resize_artifact(&caches, swamp_core::report::ArtifactKind::Unknown, 1_000);
-    assert_eq!(
-        report.reconciliation.walked_total + homebrew_unit.bytes,
-        naive_whole_caches.bytes,
-        "walked (non-Homebrew) bytes plus the Homebrew external unit's bytes \
-         must reconstruct one undivided measurement of Caches exactly -- \
-         proving nothing was double-counted or dropped"
+    assert!(
+        homebrew_unit.bytes
+            < resize_artifact(&caches, swamp_core::report::ArtifactKind::Unknown, 1_000).bytes,
+        "the Homebrew unit alone must be smaller than the whole Caches directory \
+         (the unrelated some-other-tool content is real and excluded from it)"
     );
 }
 
@@ -227,13 +222,16 @@ fn double_measurement_fix_is_order_independent() {
         report_scope(&scope, None, false, None, None, false, false, false, true)
             .expect("report_scope succeeds over the fixture scope");
 
-    let naive_whole_caches =
-        resize_artifact(&caches, swamp_core::report::ArtifactKind::Unknown, 2_000);
+    // `~/Library/Caches` is a detector location, not a project root
+    // (#R13 item B): the ordinary walk never touches it, regardless of
+    // detector registration order, so it contributes nothing to
+    // `walked_total`. The Homebrew subtree is still fully measured, on
+    // its own, as an external unit.
     assert_eq!(
-        homebrew_unit.bytes + report.reconciliation.walked_total,
-        naive_whole_caches.bytes,
-        "order of resolution must not change the reconstruction identity"
+        report.reconciliation.walked_total, 0,
+        "order of resolution must not change: a detector location is never walked"
     );
+    assert!(homebrew_unit.bytes > 0);
 }
 
 /// #47 refined Cargo home into five separate proposed locations

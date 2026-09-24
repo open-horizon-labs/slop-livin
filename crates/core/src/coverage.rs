@@ -43,6 +43,14 @@ pub enum RegionStatus {
     /// walk was attempted; the store for this root is completely
     /// untouched, and no FSEvents cursor was advanced for it.
     Inaccessible { reason: String },
+    /// This root is a detector location, not a project root
+    /// (`crate::scope::ScopeRoot::is_project_root`): present and
+    /// readable, but this pass did not walk it for projects/unowned
+    /// remainder. It is still measured, independently, as an external
+    /// unit (`crate::external::discover_and_measure`) -- this status
+    /// only says the *ordinary project walk* skipped it, never that it
+    /// went unmeasured (#R13 item B).
+    DetectorOnly,
 }
 
 impl RegionStatus {
@@ -53,6 +61,10 @@ impl RegionStatus {
             RegionStatus::Excluded => "excluded".to_string(),
             RegionStatus::Missing => "missing".to_string(),
             RegionStatus::Inaccessible { reason } => format!("inaccessible ({reason})"),
+            RegionStatus::DetectorOnly => {
+                "detector location (measured as an external unit, not scanned for projects)"
+                    .to_string()
+            }
         }
     }
 
@@ -142,6 +154,15 @@ impl RootCoverage {
         Self {
             path,
             status: RegionStatus::Inaccessible { reason },
+            walked_total: 0,
+            projects: 0,
+            mode: String::new(),
+        }
+    }
+    pub fn detector_only(path: PathBuf) -> Self {
+        Self {
+            path,
+            status: RegionStatus::DetectorOnly,
             walked_total: 0,
             projects: 0,
             mode: String::new(),
