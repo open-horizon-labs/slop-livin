@@ -70,8 +70,11 @@ volume's unowned/remainder rows come from `unowned.parquet` (+
 `unowned_lists.parquet` for its container/shared-with lists and
 `unowned_evidence.parquet` for its per-row evidence); per-project and
 shared-store nested build-artifact units come from
-`nested_artifacts.parquet`; every row's decision evidence (an artifact,
-a unit, or a nested artifact's) comes from `evidence.parquet`; and
+`nested_artifacts.parquet` (+ `nested_artifact_lists.parquet` for their
+coverage-limit/variant-unknown lists and `nested_artifact_evidence.parquet`
+for their producer/consumer evidence); every row's decision evidence
+(an artifact, a unit, or a nested artifact's) comes from
+`evidence.parquet`; and
 per-root coverage, byte-history series, the by-type/reconciliation
 summary and coverage notes come from `coverage.parquet`,
 `series.parquet`, `summary.parquet` and `notes.parquet`. The rest of the

@@ -521,21 +521,40 @@ remaining list):
   interior, `Report.nested_artifacts`, and a shared-store interior,
   `ReportSnapshot.store_interiors`): `scope_key`, `origin` (`report` |
   `store-interior`, so reading splits the two lists back apart without
-  guessing from `container_id`/path overlap), `id`, `container_id`
-  (nullable -- the id of the *container* `NestedArtifact` whose own
-  `path` equals the owning `ArtifactRow`'s path; there is no other
-  "artifact row key" a `NestedArtifact` carries), `adapter` (nullable),
-  `family` (`ArtifactRole::family`'s label), `role`, `path`, `bytes`,
-  `basis` (`AccountingBasis`), `mtime` (nullable), `consequence`, and
-  the variant's `profile`/`configuration`/`target`/`arch` (all
-  nullable). Not migrated: `parent_id`, `membership`, `is_dir`,
-  `device`, `inode`, `logical_bytes`, `physical_bytes`,
-  `physical_total`, `coverage`, `producer_evidence`/`consumer_evidence`
-  (the older, narrower per-nested-unit evidence shape -- distinct from
-  `decision_evidence`, which moves to `evidence.parquet`),
-  `action_group`, `present`, `growth_bytes`, `regrowth_count`, `action`,
-  `reported_by`, `writer_lock`, and the variant's `package`/`version`/
-  `toolchain`/`features`/`generation`/`unknowns`.
+  guessing from `container_id`/path overlap), `id`, `relative_path`,
+  `parent_id` (nullable), `container_id` (nullable -- the id of the
+  *container* `NestedArtifact` whose own `path` equals the owning
+  `ArtifactRow`'s path; there is no other "artifact row key" a
+  `NestedArtifact` carries), `adapter` (nullable), `family`
+  (`ArtifactRole::family`'s label), `role`, `path`, `membership`,
+  `is_dir`, `device`, `inode`, `logical_bytes`, `bytes`,
+  `physical_bytes`, `physical_total`, `basis` (`AccountingBasis`),
+  `mtime` (nullable), `time_source`, `coverage_supported`,
+  `coverage_complete`, `action_group` (nullable), `present`,
+  `growth_bytes` (nullable), `regrowth_count`, `action_capability`
+  (`NestedActionCapability`'s tag), `action_unsupported_reason`
+  (nullable -- the `Unsupported` variant's `reason`), `consequence`
+  (nullable), `reported_by` (nullable), `writer_lock` (nullable), and
+  the variant's `profile`/`configuration`/`target`/`arch`/`package`/
+  `version`/`toolchain`/`features`/`generation` (all nullable). R18a-2
+  completes this table's field list -- every `NestedArtifact` field now
+  has a typed home, no JSON fallback anywhere -- and adds two child
+  tables for the list-valued fields:
+  - `<store>/nested_artifact_lists.parquet` -- one row per
+    `coverage.limits` or `variant.unknowns` entry, disambiguated by
+    `list_kind` (`coverage-limit` | `variant-unknown`): `scope_key`,
+    `origin`, `artifact_id`, `list_kind`, `seq`, `value`.
+  - `<store>/nested_artifact_evidence.parquet` -- one row per
+    `producer_evidence`/`consumer_evidence` entry (the older, narrower
+    `ArtifactEvidence { source, detail, confidence }` shape, distinct
+    from `decision_evidence`, which stays in `evidence.parquet`),
+    disambiguated by `kind` (`producer` | `consumer`): `scope_key`,
+    `origin`, `artifact_id`, `kind`, `seq`, `source`, `detail`,
+    `confidence`.
+
+  Both child tables are keyed by `(scope_key, origin, artifact_id)`,
+  not just `artifact_id`, because the two origins' id spaces are not
+  guaranteed disjoint.
 - `<store>/evidence.parquet` -- one row per `crate::evidence::Evidence`
   entry, across every entity kind that carries the #53 decision-evidence
   contract (an `ArtifactRow`, keyed by `growth::artifact_row_key`; an
@@ -607,12 +626,11 @@ sees the final project list) to replace `snapshot.coverage` and
 `growth::write_report_snapshot` also stops serializing those `Report`
 fields into `report_json` at all (`slim_report_for_snapshot_json` clears
 them to their defaults first) -- the tables are authoritative, not a
-cache of what the JSON cell already said. `ReportSnapshot`'s
-`external_units_json`/`agent_units_json`/`store_interiors_json` cells
-stay (R16): they are still the merge-fallback source for the fields
-`external_units.parquet`/`agent_units.parquet`/`nested_artifacts.parquet`
-do not carry yet, unlike `coverage`, which had nothing left to fall back
-to. `crates/core/tests/coverage_series_summary_notes_tables.rs` pins the
+cache of what the JSON cell already said. (R16's `ReportSnapshot`
+`external_units_json`/`agent_units_json`/`store_interiors_json` cells,
+mentioned here as the merge-fallback source at the time, are gone as of
+R18a-2 below -- `report_json` is the only JSON-encoded cell left in
+`StoredReportSnapshotRow`.) `crates/core/tests/coverage_series_summary_notes_tables.rs` pins the
 new direction the same way R15/R16's tests do: a snapshot whose
 `report_json` was tampered with in every coverage/series/summary/
 reconciliation/notes field still reports the tables' values.
@@ -642,10 +660,9 @@ JSON cells onto typed columns/child tables:
   or query description; `"builtin"` and `None` for `BuiltinConvention`),
   `hardlinked` (both families -- a real per-unit fold fact, not the
   conservative default), and, agent-only, `tool_home`, `relative_path`
-  and `action` (`AgentActionCapability::label`). `old` (the pre-R18a
-  snapshot copy) is now only the fallback for a store written before
-  these columns existed; `external_unit_from_stored`/
-  `agent_unit_from_stored` read the typed column first.
+  and `action` (`AgentActionCapability::label`). As of R18a-2,
+  `external_unit_from_stored`/`agent_unit_from_stored` take no snapshot
+  fallback at all -- every field comes from the typed column.
 - `<store>/agent_unit_members.parquet` -- the child table for an
   `AgentUnit::members` list: `scope_key`, `unit_id`, `seq`, `path`,
   `bytes`, `kind` (`AgentMemberKind::label`).
@@ -684,23 +701,32 @@ on-demand review action) is unchanged and still calls `guidance`/
 `guidance_at` live on purpose -- a bounded, explicit check is not the
 "report is a pure read" contract.
 
-Still open after R18a (CHUNK_R18a's remaining items; see
-`.oh/sessions/2026-09-24-r18a-unit-and-unowned-tables.md` for the full
-accounting): `report_rows.parquet`'s `report_json`/`external_units_json`/
-`agent_units_json`/`store_interiors_json` cells are **not yet deleted**
--- the typed replacements above remove the *need* for the first two as
-a merge fallback, but `report_scope_from_store` still reads
-`read_report_snapshot` to bootstrap `ReportSnapshot` and the file/cells
-still exist on disk. `Report.unowned`/`dirs_by_worktree`/
-`files_by_worktree`/`schedule_line`/`github_enrichment` and
-`nested_artifacts.parquet`'s own long not-yet-migrated field list
-(`parent_id`, `membership`, `is_dir`, `device`, `inode`,
-`logical_bytes`, `physical_bytes`, `physical_total`, `coverage`,
-`producer_evidence`/`consumer_evidence`, `action_group`, `present`,
-`growth_bytes`, `regrowth_count`, `action`, `reported_by`,
-`writer_lock`, the variant's `package`/`version`/`toolchain`/
-`features`/`generation`/`unknowns`) are untouched. `last_report-*.json.zst`
-is also untouched, same reasoning as R17's note above.
+R18a-2 (2026-09-24, the next slice) finishes what R18a's first session
+left open: it types every remaining `NestedArtifact` field (see the
+`nested_artifacts.parquet`/`nested_artifact_lists.parquet`/
+`nested_artifact_evidence.parquet` description above) and then deletes
+`StoredReportSnapshotRow`'s `external_units_json`/`agent_units_json`/
+`store_interiors_json` cells and every merge-fallback that read them
+(`external_unit_from_stored`/`agent_unit_from_stored`/
+`nested_artifact_from_stored` no longer take a fallback value at all --
+there is nothing left for one to carry over). `report_json` is now the
+*only* JSON-encoded cell anywhere in `crates/core/src/growth/columns.rs`.
+
+Still open after R18a-2 (left for R18a-3/R18a-4, `.oh/sessions/
+2026-09-24-r18a-unit-and-unowned-tables.md` and `.oh/sessions/
+2026-09-24-r18a2-nested-artifacts-typed.md` name the reasoning):
+`report_rows.parquet` itself is **not yet deleted** -- `Report.root`/
+`unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
+`github_enrichment` still come from `report_json`, since migrating them
+needs either a new scope-wide `unowned` aggregation over the per-volume
+`unowned.parquet` tables or a larger dirs/files-by-worktree table
+design (R18a-3). `last_report-*.json.zst`/`growth::write_last_report`/
+`load_last_report` are also untouched (R18a-4): `consumers/signals.rs`/
+`consumers/cargo.rs` read a *per-root* previous `Report` from it
+(previous git signals; previous `nested_artifacts` + `observed_at`) for
+the incremental walk, a different, lower-level need than the scope-wide
+snapshot this section covers, and redesigning it onto typed tables is
+real, separate work.
 
 `report_scope_from_store` extends the same rebuild to these: an
 `ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`

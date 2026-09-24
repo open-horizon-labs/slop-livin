@@ -4,6 +4,53 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: every `NestedArtifact` field typed, JSON merge fallbacks deleted (R18a-2)
+
+`nested_artifacts.parquet` now carries every `NestedArtifact` field as a
+typed column: `relative_path`, `parent_id`, `membership`, `is_dir`,
+`device`, `inode`, `logical_bytes`, `physical_bytes`, `physical_total`,
+`time_source`, `coverage_supported`/`coverage_complete`, `action_group`,
+`present`, `growth_bytes`, `regrowth_count`, `action_capability` (+
+`action_unsupported_reason` for the `Unsupported` variant's reason),
+`reported_by`, `writer_lock`, and the variant's `package`/`version`/
+`toolchain`/`features`/`generation`. Two new child tables carry the
+list-valued fields: `nested_artifact_lists.parquet` (`coverage.limits`/
+`variant.unknowns`, disambiguated by `list_kind`) and
+`nested_artifact_evidence.parquet` (`producer_evidence`/
+`consumer_evidence`, disambiguated by `kind`) -- both keyed by
+`(scope_key, origin, artifact_id)` since the report/store-interior
+origins' id spaces are not guaranteed disjoint.
+
+With every field typed, the JSON merge fallback this table used to need
+is gone: `StoredReportSnapshotRow`'s `external_units_json`/
+`agent_units_json`/`store_interiors_json` cells are deleted, and
+`external_unit_from_stored`/`agent_unit_from_stored`/
+`nested_artifact_from_stored` no longer take a fallback value at all --
+there is nothing left for one to carry over. `report_json` is now the
+only JSON-encoded cell left anywhere in
+`crates/core/src/growth/columns.rs`.
+
+Verified with an extended `growth::tests::
+nested_artifact_table_round_trips_every_field_and_splits_by_origin`
+(now covers every field, including non-empty `producer_evidence`/
+`consumer_evidence`/`coverage.limits`/`variant.unknowns` and the
+`Unsupported` action variant's reason string, with no fallback
+parameter to lean on at all) and a new `growth::tests::
+nested_artifact_tables_rebuild_reflects_a_direct_tamper_not_the_original_value`
+(edits the three tables directly on disk and asserts the rebuild
+reflects exactly that edit, per artifact id, with no cross-artifact
+leakage). `crates/core/tests/units_nested_evidence_tables.rs`'s existing
+tamper test (`report_reads_units_and_nested_artifacts_from_the_tables_not_the_snapshot_json`)
+continues to pass unchanged in substance, now against a snapshot row
+with no unit/nested-artifact JSON cell to tamper with at all.
+
+This is CHUNK_R18a-2, the second slice of CHUNK_R18a; see
+`.oh/sessions/2026-09-24-r18a2-nested-artifacts-typed.md`. Still open
+(R18a-3/R18a-4): `report_rows.parquet` itself (`Report.unowned`/
+`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
+`github_enrichment` still come from `report_json`) and
+`last_report-*.json.zst`.
+
 ### No JSON in the store: unit provenance/members, unowned lists/evidence (R18a, partial)
 
 `external_units.parquet`/`agent_units.parquet` gain typed columns for
@@ -20,14 +67,15 @@ two new per-volume tables, `unowned_lists.parquet` and
 None`) and a new `growth::tests::
 unowned_round_trips_lists_and_evidence_through_their_own_tables`.
 
-This is a partial slice of CHUNK_R18a: `report_rows.parquet` and its
-`report_json`/`external_units_json`/`agent_units_json`/
-`store_interiors_json` cells are not yet deleted, `Report.unowned`/
+This was a partial slice of CHUNK_R18a: at the time, `report_rows.parquet`
+and its `report_json`/`external_units_json`/`agent_units_json`/
+`store_interiors_json` cells were not yet deleted, `Report.unowned`/
 `dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
-`github_enrichment` have no table yet, and `nested_artifacts.parquet`'s
-own long not-yet-migrated field list is untouched. See
+`github_enrichment` had no table yet, and `nested_artifacts.parquet`'s
+own long not-yet-migrated field list was untouched. See
 `.oh/sessions/2026-09-24-r18a-unit-and-unowned-tables.md` for the full
-accounting.
+accounting at the time, and the R18a-2 entry above for what closed the
+`nested_artifacts.parquet`/JSON-cell part of this out.
 
 ### Fix: `swamp report --json` was not a pure read of cargo-cleanup guidance
 
