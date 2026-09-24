@@ -69,6 +69,7 @@ fn synthetic_unit(
         members,
         bytes: 4096,
         hardlinked: false,
+        complete: true,
         growth_bytes: None,
         regrowth_count: 0,
         observed_at: 1_000,

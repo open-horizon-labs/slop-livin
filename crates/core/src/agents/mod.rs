@@ -339,6 +339,16 @@ pub struct AgentUnit {
     pub members: Vec<AgentMember>,
     pub bytes: u64,
     pub hardlinked: bool,
+    /// `false` when `bytes` is a lower bound rather than this unit's
+    /// confirmed size this pass (the bounded fold hit its entry cap or
+    /// an unreadable subdirectory a few levels in --
+    /// [`crate::agents::unit::CandidateAgentUnit::complete`]). `note`
+    /// carries the human-readable reason; this field is the structured
+    /// signal a caller can act on without parsing text. An incomplete
+    /// unit never carries a fresh `growth_bytes`/`regrowth_count`
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    #[serde(default = "default_true")]
+    pub complete: bool,
     pub growth_bytes: Option<i64>,
     pub regrowth_count: u32,
     pub observed_at: u64,
@@ -1424,6 +1434,14 @@ pub fn relative_to(home: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// `serde(default = ...)` for [`AgentUnit::complete`]: a unit
+/// deserialized from a shape written before this field existed was, by
+/// construction, whatever that shape always reported -- a complete
+/// total.
+fn default_true() -> bool {
+    true
+}
+
 pub fn unit_id(tool_id: &str, category: AgentCategory, relative_path: &str) -> String {
     crate::entities::id_for(&format!(
         "agent-unit:v1:{tool_id}:{}:{relative_path}",
@@ -1696,6 +1714,15 @@ pub fn discover_and_measure_in(
     let mut candidates_by_key: HashMap<String, (String, PathBuf, CandidateAgentUnit, u64)> =
         HashMap::new();
     let mut observed: Vec<ObservedExternal> = Vec::new();
+    // Keys this pass identified but could not measure completely (a
+    // bounded fold that hit its entry cap or an unreadable
+    // subdirectory). Never entered into `observed`, so never diffed
+    // against history; passed to `observe_and_annotate_external` so its
+    // owned sweep does not tombstone them either -- a folder going
+    // unreadable for one pass is coverage shrinking, not the unit
+    // disappearing (`.oh/guardrails/coverage-changes-are-not-storage-
+    // changes.md`), mirroring `external.rs`'s `protected_keys`.
+    let mut incomplete_keys: HashSet<String> = HashSet::new();
     let mut covered_roots: Vec<PathBuf> = Vec::new();
 
     let adapters = registry::Registry::with_builtins();
@@ -1735,15 +1762,19 @@ pub fn discover_and_measure_in(
         let device = device_of(&home);
         for cand in units {
             let key = unit_key(&tool_id, cand.category(), device, cand.path());
-            observed.push(ObservedExternal {
-                key: key.clone(),
-                detector_id: tool_id.clone(),
-                category: cand.category().key_str(),
-                device,
-                path: cand.path().display().to_string(),
-                bytes: cand.bytes(),
-                hardlinked: true,
-            });
+            if cand.complete() {
+                observed.push(ObservedExternal {
+                    key: key.clone(),
+                    detector_id: tool_id.clone(),
+                    category: cand.category().key_str(),
+                    device,
+                    path: cand.path().display().to_string(),
+                    bytes: cand.bytes(),
+                    hardlinked: true,
+                });
+            } else {
+                incomplete_keys.insert(key.clone());
+            }
             candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
         }
     }
@@ -1775,15 +1806,19 @@ pub fn discover_and_measure_in(
             let device = device_of(wt_path);
             for cand in adapter.project_local_units(wt_path, &ctx) {
                 let key = unit_key(tool_id, cand.category(), device, cand.path());
-                observed.push(ObservedExternal {
-                    key: key.clone(),
-                    detector_id: tool_id.to_string(),
-                    category: cand.category().key_str(),
-                    device,
-                    path: cand.path().display().to_string(),
-                    bytes: cand.bytes(),
-                    hardlinked: true,
-                });
+                if cand.complete() {
+                    observed.push(ObservedExternal {
+                        key: key.clone(),
+                        detector_id: tool_id.to_string(),
+                        category: cand.category().key_str(),
+                        device,
+                        path: cand.path().display().to_string(),
+                        bytes: cand.bytes(),
+                        hardlinked: true,
+                    });
+                } else {
+                    incomplete_keys.insert(key.clone());
+                }
                 candidates_by_key.insert(key, (tool_name.clone(), wt_path.clone(), cand, device));
             }
         }
@@ -1810,7 +1845,7 @@ pub fn discover_and_measure_in(
         Some(dir) if observe => observe_and_annotate_external(
             dir,
             &observed,
-            &HashSet::new(),
+            &incomplete_keys,
             &ownership,
             observed_at,
             retention_days,
@@ -1839,7 +1874,28 @@ pub fn discover_and_measure_in(
         if matrix::support_for(&tool_id) == Some(matrix::SupportLevel::Unverified) {
             cand.withdraw_for_unverified_layout(&tool_name);
         }
-        let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
+        // An incomplete candidate was never pushed into `observed`
+        // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`:
+        // a bounded fold's partial total must never anchor a
+        // growth/regrowth delta), so it has no fresh entry in
+        // `annotations` either. `growth_bytes` stays `None` rather than
+        // "reset to a false zero"; `regrowth_count` is read back from
+        // the store's last complete observation instead of defaulting
+        // to 0, exactly as a protected external unit does
+        // (`external.rs`'s `protected_keys` fallback).
+        let (growth_bytes, regrowth_count) = if cand.complete() {
+            annotations.get(&key).copied().unwrap_or((None, 0))
+        } else {
+            let stored_regrowth = swamp_dir
+                .and_then(|dir| {
+                    crate::growth::peek_external_current(dir, &key)
+                        .ok()
+                        .flatten()
+                })
+                .map(|(_, r)| r)
+                .unwrap_or(0);
+            (None, stored_regrowth)
+        };
         let default_protected = cand.category().default_protected();
         // Both directions (`protection_conflict`): a unit beneath a
         // protected path, *and* a unit containing one. The latter is the
@@ -1887,6 +1943,7 @@ pub fn discover_and_measure_in(
             members: parts.members,
             bytes: parts.bytes,
             hardlinked: true,
+            complete: parts.complete,
             growth_bytes,
             regrowth_count,
             observed_at,
@@ -2061,6 +2118,7 @@ pub(crate) mod contract {
                 members: u.members().to_vec(),
                 bytes: u.bytes(),
                 hardlinked: true,
+                complete: u.complete(),
                 growth_bytes: None,
                 regrowth_count: 0,
                 observed_at: 0,

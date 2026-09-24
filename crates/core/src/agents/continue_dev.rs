@@ -277,7 +277,7 @@ fn identify_sessions(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
                 .project_link(link)
                 .action(AgentActionCapability::SessionRemoval);
         if truncated {
-            builder = builder.note("directory entry count bound reached");
+            builder = builder.incomplete("directory entry count bound reached");
         }
         out.push(builder.build());
     }
@@ -308,21 +308,19 @@ fn identify_index(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUn
     let index_dir = home.join("index");
     if ctx.is_dir(&index_dir) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&index_dir, MAX_FOLD_ENTRIES);
-        out.push(
-            AgentUnitBuilder::new(CONTINUE_TOOL_ID, AgentCategory::Caches, index_dir)
-                .relative_path("index")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .project_link(ProjectLinkState::NotApplicable)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "embeddings/tag caches, regenerated on next indexing pass; directory entry \
-                     count bound reached"
-                } else {
-                    "embeddings/tag caches, regenerated on next indexing pass"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(CONTINUE_TOOL_ID, AgentCategory::Caches, index_dir)
+            .relative_path("index")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(ProjectLinkState::NotApplicable)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("embeddings/tag caches, regenerated on next indexing pass");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 }
 
@@ -332,20 +330,19 @@ fn identify_dev_data(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgen
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-    out.push(
-        AgentUnitBuilder::new(CONTINUE_TOOL_ID, AgentCategory::Logs, path)
-            .relative_path("dev_data")
-            .bytes(bytes)
-            .mtime_max(mtime)
-            .project_link(ProjectLinkState::NotApplicable)
-            .action(AgentActionCapability::CacheOrLogTrash)
-            .note(if truncated {
-                "anonymized development/usage event logs; directory entry count bound reached"
-            } else {
-                "anonymized development/usage event logs"
-            })
-            .build(),
-    );
+    let unit = AgentUnitBuilder::new(CONTINUE_TOOL_ID, AgentCategory::Logs, path)
+        .relative_path("dev_data")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::CacheOrLogTrash)
+        .note("anonymized development/usage event logs");
+    let unit = if truncated {
+        unit.incomplete("directory entry count bound reached")
+    } else {
+        unit
+    };
+    out.push(unit.build());
 }
 
 fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {

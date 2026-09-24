@@ -20,7 +20,8 @@
 
 use std::{collections::HashMap, fs};
 use swamp_core::{
-    external,
+    agents, external,
+    fs_events::EventCoverage,
     locations::{Environment, Platform, Registry},
     scope::{ScanConfig, resolve_effective_scope},
 };
@@ -269,6 +270,119 @@ fn an_unreadable_subdirectory_inside_a_unit_is_not_growth_or_regrowth() {
             restored,
             Some(baseline),
             "pass 3 must see the same total pass 1 did, not a partial one carried forward"
+        );
+    }
+}
+
+/// The queued follow-up this session note named directly:
+/// `folded_measurement::folded_bytes_bounded_stamped` (the agent
+/// family's bounded per-session fold, used by `agents::IdentifyCtx::
+/// folded_bytes`) had the identical `let Ok(rd) = ... else { continue };`
+/// shape as the CARGO_HOME bug above, with *no* completeness signal at
+/// all -- only `truncated` (hitting `max_entries`) was tracked. An
+/// agent unit's `bytes` is persisted as growth/regrowth history exactly
+/// like an external unit's (`agents::discover_and_measure_in` pushes
+/// `ObservedExternal` into the same `crate::growth::
+/// observe_and_annotate_external` external.rs uses), so this was the
+/// same bug, one call away.
+///
+/// Fixed the same way: an unreadable subdirectory now sets `truncated`
+/// (this function's one incompleteness signal) instead of silently
+/// `continue`ing past it, and `CandidateAgentUnit::complete` /
+/// `AgentUnit::complete` carry that signal out to the caller, which
+/// skips the growth-history write and keeps the store's last regrowth
+/// count rather than resetting it to zero (mirroring `external.rs`'s
+/// `protected_keys`).
+#[test]
+fn an_unreadable_subdirectory_inside_an_agent_unit_is_not_growth_or_regrowth() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("claude");
+
+    // Claude Code's `shell-snapshots` static category: an ordinary,
+    // unprotected `CacheOrLogTrash` unit folded through
+    // `IdentifyCtx::folded_bytes`, well clear of the `sessions/`
+    // container machinery this file's other tests do not exercise.
+    let shell_snapshots = home.join("shell-snapshots");
+    let locked = shell_snapshots.join("nested").join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("snap.sh"), vec![b'z'; 8192]).unwrap();
+    fs::write(shell_snapshots.join("top.sh"), vec![b'x'; 4096]).unwrap();
+
+    let env = Environment::fixture(
+        root.clone(),
+        HashMap::from([("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string())]),
+        Platform::MacOS,
+    );
+    let cfg = only(&["claude-code"]);
+    let scope = resolve_effective_scope(&env, &cfg, &[], &Registry::with_builtins(), 1_000);
+    let store = tempfile::tempdir().unwrap();
+
+    let observe = |at: u64, coverage: &EventCoverage| {
+        agents::discover_and_measure(
+            &scope,
+            &[],
+            Some(store.path()),
+            true,
+            at,
+            30,
+            3600,
+            coverage,
+        )
+        .expect("agent discovery")
+    };
+
+    let first = observe(1_000, &EventCoverage::untrusted());
+    let baseline = first
+        .iter()
+        .find(|u| u.relative_path == "shell-snapshots")
+        .expect("the shell-snapshots unit is measured")
+        .bytes;
+    assert!(baseline > 0, "precondition: {baseline}");
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let second = observe(2_000, &EventCoverage::untrusted());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Running as root defeats the permission bit; only assert where the
+    // platform actually enforces it -- i.e. the pass really did see a
+    // smaller, incomplete total for the unit.
+    let second_unit = second.iter().find(|u| u.relative_path == "shell-snapshots");
+    let saw_incomplete_total = second_unit.is_some_and(|u| u.bytes < baseline);
+    if saw_incomplete_total {
+        let u = second_unit.unwrap();
+        assert!(
+            !u.complete,
+            "a partial total must be marked incomplete, not presented as a confirmed size"
+        );
+        assert_eq!(
+            u.growth_bytes, None,
+            "an incomplete pass must never report a growth/regrowth delta"
+        );
+        assert_eq!(u.regrowth_count, 0, "no regrowth recorded yet");
+
+        let third = observe(3_000, &EventCoverage::untrusted());
+        let third_unit = third
+            .iter()
+            .find(|u| u.relative_path == "shell-snapshots")
+            .expect("still measured with access restored");
+        assert!(
+            third_unit.complete,
+            "access restored: the total is complete again"
+        );
+        assert_eq!(
+            third_unit.bytes, baseline,
+            "pass 3 must see the same total pass 1 did, not a partial one carried forward"
+        );
+        assert_eq!(
+            third_unit.growth_bytes,
+            Some(0),
+            "restoring access must never read as growth"
+        );
+        assert_eq!(
+            third_unit.regrowth_count, 0,
+            "restoring access must never read as regrowth"
         );
     }
 }

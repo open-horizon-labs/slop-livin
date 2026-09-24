@@ -258,11 +258,7 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
                 .action(AgentActionCapability::None)
                 .note(NO_LINKAGE_SOURCE_REASON);
         if truncated {
-            unit = unit.note(concat!(
-                "directory entry count bound reached. ",
-                "Linkage and selective removal are withheld: no upstream source documents a \
-                 working-directory field in Copilot CLI session state"
-            ));
+            unit = unit.incomplete("directory entry count bound reached");
         }
         out.push(unit.build());
     }
@@ -274,20 +270,19 @@ fn identify_command_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candid
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-    out.push(
-        AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Caches, path)
-            .relative_path("command-history-state")
-            .bytes(bytes)
-            .mtime_max(mtime)
-            .project_link(ProjectLinkState::NotApplicable)
-            .action(AgentActionCapability::CacheOrLogTrash)
-            .note(if truncated {
-                "reverse-search command recall history; directory entry count bound reached"
-            } else {
-                "reverse-search command recall history, not conversation content"
-            })
-            .build(),
-    );
+    let unit = AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Caches, path)
+        .relative_path("command-history-state")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::CacheOrLogTrash)
+        .note("reverse-search command recall history, not conversation content");
+    let unit = if truncated {
+        unit.incomplete("directory entry count bound reached")
+    } else {
+        unit
+    };
+    out.push(unit.build());
 }
 
 fn identify_session_store(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
@@ -347,7 +342,7 @@ fn identify_logs(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUni
         .project_link(ProjectLinkState::NotApplicable)
         .action(AgentActionCapability::CacheOrLogTrash);
     if truncated {
-        unit = unit.note("directory entry count bound reached");
+        unit = unit.incomplete("directory entry count bound reached");
     }
     out.push(unit.build());
 }
@@ -362,25 +357,23 @@ fn identify_ide_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-    out.push(
-        AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Unclassified, path)
-            .relative_path("ide")
-            .bytes(bytes)
-            .mtime_max(mtime)
-            .project_link(ProjectLinkState::NotApplicable)
-            .action(AgentActionCapability::None)
-            .note(format!(
-                "IDE integration state and lock files; not offered as a supported action this \
-                 chunk -- a lock file backing an active integration could be corrupted by \
-                 removal, and this adapter has no documented way to tell which entries are idle{}",
-                if truncated {
-                    " (directory entry count bound reached)"
-                } else {
-                    ""
-                }
-            ))
-            .build(),
-    );
+    let unit = AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Unclassified, path)
+        .relative_path("ide")
+        .bytes(bytes)
+        .mtime_max(mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::None)
+        .note(
+            "IDE integration state and lock files; not offered as a supported action this \
+             chunk -- a lock file backing an active integration could be corrupted by \
+             removal, and this adapter has no documented way to tell which entries are idle",
+        );
+    let unit = if truncated {
+        unit.incomplete("directory entry count bound reached")
+    } else {
+        unit
+    };
+    out.push(unit.build());
 }
 
 fn identify_residual(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {

@@ -378,7 +378,13 @@ pub const STORE_WORKTREE_ID: &str = "build-store";
 /// the agent epic guards against. Reads directory names and `stat` calls
 /// only -- never file contents. Bounded by `max_entries`; a directory
 /// that hits the bound is reported truncated rather than silently
-/// under-measured.
+/// under-measured. The same `truncated` signal also covers an
+/// unreadable subdirectory a few levels inside `path` (e.g. `chmod
+/// 000`, `path` itself is not this): the walk still sums whatever it
+/// *can* read, but that sum is a lower bound, not the tree's true size,
+/// so it must never be mistaken for a complete measurement -- neither
+/// displayed as one nor fed into a growth/regrowth delta
+/// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
 ///
 /// It lives here rather than in `agents/mod.rs` because this module is
 /// the one place allowed to traverse on the ordinary report path
@@ -421,6 +427,16 @@ pub fn folded_bytes_bounded_stamped(
     while let Some((dir, dir_meta)) = stack.pop() {
         crate::work_counters::record_dir_listed();
         let Ok(rd) = crate::fs_gate::read_dir(&dir) else {
+            // An unreadable subdirectory (e.g. `chmod 000` a few levels
+            // in; the root itself is handled by the caller before this
+            // function is ever reached) makes `total` a partial sum, not
+            // the tree's true size. Treated exactly like hitting
+            // `max_entries`: `truncated` is this function's one
+            // incompleteness signal, and a silent `continue` here used
+            // to leave it untouched, so the caller received a smaller
+            // number with nothing to say it was not the whole answer
+            // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+            truncated = true;
             continue;
         };
         let (mtime_ns, ctime_ns) = stamp_ns(&dir_meta);

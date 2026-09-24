@@ -228,21 +228,19 @@ fn identify_protected(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAge
     let bin = home.join("tmp").join("bin");
     if ctx.is_dir(&bin) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&bin, MAX_FOLD_ENTRIES);
-        out.push(
-            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Caches, bin)
-                .relative_path("tmp/bin")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .project_link(ProjectLinkState::NotApplicable)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable; directory entry \
-                     count bound reached"
-                } else {
-                    "downloaded runtime tools (e.g. LiteRT-LM), re-downloadable"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Caches, bin)
+            .relative_path("tmp/bin")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(ProjectLinkState::NotApplicable)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("downloaded runtime tools (e.g. LiteRT-LM), re-downloadable");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 }
 
@@ -285,7 +283,7 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
         if ctx.is_dir(&checkpoints) {
             seen.insert("checkpoints");
             let (bytes, mtime, truncated) = ctx.folded_bytes(&checkpoints, MAX_FOLD_ENTRIES);
-            out.push(
+            let unit =
                 AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Checkpoints, checkpoints)
                     .relative_to(home)
                     .bytes(bytes)
@@ -294,15 +292,16 @@ fn identify_tmp(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit
                         reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
                     })
                     .action(AgentActionCapability::None)
-                    .note(if truncated {
-                        "tool-call checkpoint state for /restore; not a supported selective action \
-                     this chunk (directory entry count bound reached)"
-                    } else {
-                        "tool-call checkpoint state for /restore; not a supported selective action \
-                     this chunk"
-                    })
-                    .build(),
-            );
+                    .note(
+                        "tool-call checkpoint state for /restore; not a supported selective \
+                         action this chunk",
+                    );
+            let unit = if truncated {
+                unit.incomplete("directory entry count bound reached")
+            } else {
+                unit
+            };
+            out.push(unit.build());
         }
 
         let chats = project_dir.join("chats");
@@ -370,26 +369,25 @@ fn identify_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgent
     for project_id in ctx.dir_names(&base) {
         let path = base.join(&project_id);
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-        out.push(
-            AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Checkpoints, path)
-                .relative_to(home)
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .project_link(ProjectLinkState::Unresolved {
-                    reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
-                })
-                .action(AgentActionCapability::None)
-                .note(if truncated {
-                    "shadow Git repository backing this project's /restore checkpoints, \
-                     independent of the project's own .git; not a supported selective action \
-                     this chunk (directory entry count bound reached)"
-                } else {
-                    "shadow Git repository backing this project's /restore checkpoints, \
-                     independent of the project's own .git; not a supported selective action \
-                     this chunk"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(GEMINI_CLI_TOOL_ID, AgentCategory::Checkpoints, path)
+            .relative_to(home)
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(ProjectLinkState::Unresolved {
+                reason: PROJECT_ID_UNRESOLVED_REASON.to_string(),
+            })
+            .action(AgentActionCapability::None)
+            .note(
+                "shadow Git repository backing this project's /restore checkpoints, \
+                 independent of the project's own .git; not a supported selective action \
+                 this chunk",
+            );
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 }
 

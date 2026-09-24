@@ -291,20 +291,18 @@ pub fn identify_editor_profile(
     let history = user.join("History");
     if ctx.is_dir(&history) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&history, MAX_FOLD_ENTRIES);
-        units.push(
-            AgentUnitBuilder::new("vscode-family", AgentCategory::Caches, history)
-                .relative_path("User/History")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "local file-history/undo snapshots, unrelated to AI chat content; directory \
-                     entry count bound reached"
-                } else {
-                    "local file-history/undo snapshots, unrelated to AI chat content"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new("vscode-family", AgentCategory::Caches, history)
+            .relative_path("User/History")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("local file-history/undo snapshots, unrelated to AI chat content");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        units.push(unit.build());
     }
 
     for (rel, category) in [
@@ -324,7 +322,7 @@ pub fn identify_editor_profile(
             .mtime_max(mtime)
             .action(AgentActionCapability::CacheOrLogTrash);
         if truncated {
-            b = b.note("directory entry count bound reached");
+            b = b.incomplete("directory entry count bound reached");
         }
         units.push(b.build());
     }
@@ -499,7 +497,7 @@ pub fn identify_extension_globalstorage(
             }
             other => task_link(&task_dir, ctx, other),
         };
-        units.push(
+        let unit =
             AgentUnitBuilder::new("vscode-family", AgentCategory::Sessions, task_dir.clone())
                 .relative_path(format!("{host}/tasks/{name}"))
                 .members_keep_bytes(vec![AgentMember {
@@ -511,14 +509,15 @@ pub fn identify_extension_globalstorage(
                 .mtime_max(mtime)
                 .project_link(project_link)
                 .action(AgentActionCapability::SessionRemoval)
-                .note(if truncated {
-                    "conversation history, UI messages and any checkpoint snapshots for this \
-                     task; directory entry count bound reached"
-                } else {
-                    "conversation history, UI messages and any checkpoint snapshots for this task"
-                })
-                .build(),
-        );
+                .note(
+                    "conversation history, UI messages and any checkpoint snapshots for this task",
+                );
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        units.push(unit.build());
     }
     units
 }

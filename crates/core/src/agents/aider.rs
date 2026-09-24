@@ -73,20 +73,18 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let caches_existed = ctx.exists(&caches);
     if ctx.is_dir(&caches) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&caches, MAX_FOLD_ENTRIES);
-        units.push(
-            AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, caches)
-                .relative_path("caches")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "model-price/context-window and version-check caches, wholly re-downloadable; \
-                     directory entry count bound reached"
-                } else {
-                    "model-price/context-window and version-check caches, wholly re-downloadable"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, caches)
+            .relative_path("caches")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("model-price/context-window and version-check caches, wholly re-downloadable");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        units.push(unit.build());
     }
 
     let conf = home.join(".aider.conf.yml");
@@ -189,21 +187,19 @@ pub fn identify_repo_units(worktree_root: &Path, ctx: &IdentifyCtx) -> Vec<Candi
         }
         let path = worktree_root.join(&name);
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-        units.push(
-            AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, path)
-                .relative_path(name)
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .project_link(project_link.clone())
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "repo-map tags cache, regenerated on next Aider run; directory entry count \
-                     bound reached"
-                } else {
-                    "repo-map tags cache, regenerated on next Aider run"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(AIDER_TOOL_ID, AgentCategory::Caches, path)
+            .relative_path(name)
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(project_link.clone())
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("repo-map tags cache, regenerated on next Aider run");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        units.push(unit.build());
     }
     units
 }

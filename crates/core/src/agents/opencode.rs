@@ -473,7 +473,7 @@ fn identify_storage_auxiliary(
         )
         .action(AgentActionCapability::None);
         if truncated {
-            builder = builder.note("directory entry count bound reached");
+            builder = builder.incomplete("directory entry count bound reached");
         }
         out.push(builder.build());
     }
@@ -493,26 +493,24 @@ fn identify_snapshots(
     for project_id in ctx.dir_names(&base) {
         let path = base.join(&project_id);
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-        let note = if truncated {
-            "git-backed checkpoint history for this project's /undo; removing it loses the \
-             ability to revert past this point (directory entry count bound reached) -- not a \
-             supported selective action in this chunk"
-        } else {
-            "git-backed checkpoint history for this project's /undo; removing it loses the \
-             ability to revert past this point -- not a supported selective action in this \
-             chunk"
-        };
         let relative_path = relative_to(home, &path);
-        out.push(
-            AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Checkpoints, path)
-                .relative_path(relative_path)
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .project_link(project_link_for(projects, &project_id))
-                .action(AgentActionCapability::None)
-                .note(note)
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(OPENCODE_TOOL_ID, AgentCategory::Checkpoints, path)
+            .relative_path(relative_path)
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .project_link(project_link_for(projects, &project_id))
+            .action(AgentActionCapability::None)
+            .note(
+                "git-backed checkpoint history for this project's /undo; removing it loses the \
+                 ability to revert past this point -- not a supported selective action in this \
+                 chunk",
+            );
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 }
 
@@ -555,7 +553,7 @@ fn identify_static_categories(
             .mtime_max(mtime)
             .action(AgentActionCapability::CacheOrLogTrash);
         if truncated {
-            builder = builder.note("directory entry count bound reached");
+            builder = builder.incomplete("directory entry count bound reached");
         }
         out.push(builder.build());
     }

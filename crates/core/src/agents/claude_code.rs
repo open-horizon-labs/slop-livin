@@ -731,20 +731,17 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
             continue;
         }
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-        let note = if truncated {
-            format!(
-                "{} (directory entry count bound reached; total may be an undercount)",
-                entry.note
-            )
-        } else {
-            entry.note.to_string()
-        };
         let unit = AgentUnitBuilder::new(CLAUDE_CODE_TOOL_ID, entry.category, path)
             .relative_path(entry.rel)
             .bytes(bytes)
             .mtime_max(mtime)
             .action(entry.action)
-            .note(note);
+            .note(entry.note);
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached; total may be an undercount")
+        } else {
+            unit
+        };
         // `protect` carries the entry's own reason, which is more
         // specific than the category default the builder already
         // applied to a `ProtectedConfig` unit.

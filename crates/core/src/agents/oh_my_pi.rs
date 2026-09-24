@@ -590,19 +590,18 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     let terminal = home.join("terminal-sessions");
     if ctx.is_dir(&terminal) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&terminal, MAX_FOLD_ENTRIES);
-        out.push(
-            AgentUnitBuilder::new(OH_MY_PI_TOOL_ID, AgentCategory::Logs, terminal)
-                .relative_path("terminal-sessions")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "terminal breadcrumb files; directory entry count bound reached"
-                } else {
-                    "terminal breadcrumb files; regenerated automatically"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(OH_MY_PI_TOOL_ID, AgentCategory::Logs, terminal)
+            .relative_path("terminal-sessions")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("terminal breadcrumb files; regenerated automatically");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 
     let seen: HashSet<&str> = [

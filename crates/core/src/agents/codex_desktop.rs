@@ -47,26 +47,25 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         return Vec::new();
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(home, MAX_FOLD_ENTRIES);
-    let note = if truncated {
-        "desktop app log directory (date-tree session logs); directory entry count bound \
-         reached, total may be an undercount"
-    } else {
+    let unit = AgentUnitBuilder::new(
+        CODEX_DESKTOP_TOOL_ID,
+        AgentCategory::Logs,
+        home.to_path_buf(),
+    )
+    .relative_path("(log directory)")
+    .bytes(bytes)
+    .mtime_max(mtime)
+    .action(AgentActionCapability::CacheOrLogTrash)
+    .note(
         "desktop app log directory (date-tree session logs); settings/session storage beyond \
-         logs is an unconfirmed layout, not modeled here"
+         logs is an unconfirmed layout, not modeled here",
+    );
+    let unit = if truncated {
+        unit.incomplete("directory entry count bound reached, total may be an undercount")
+    } else {
+        unit
     };
-    vec![
-        AgentUnitBuilder::new(
-            CODEX_DESKTOP_TOOL_ID,
-            AgentCategory::Logs,
-            home.to_path_buf(),
-        )
-        .relative_path("(log directory)")
-        .bytes(bytes)
-        .mtime_max(mtime)
-        .action(AgentActionCapability::CacheOrLogTrash)
-        .note(note)
-        .build(),
-    ]
+    vec![unit.build()]
 }
 
 #[cfg(test)]

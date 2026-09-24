@@ -11,6 +11,7 @@ pub(super) struct CandidateParts {
     pub(super) project_link: ProjectLinkState,
     pub(super) action: AgentActionCapability,
     pub(super) note: Option<String>,
+    pub(super) complete: bool,
 }
 
 use super::{
@@ -49,6 +50,17 @@ pub struct CandidateAgentUnit {
     /// tell a fact that lives inside the container from one that does
     /// not. See [`LinkBasis`].
     link_basis: LinkBasis,
+    /// `false` when `bytes` is a lower bound rather than this unit's true
+    /// size -- a bounded fold
+    /// ([`crate::folded_measurement::folded_bytes_bounded_stamped`])
+    /// that hit its entry cap or an unreadable subdirectory a few levels
+    /// in. Never lifted back to `true` by anything outside this module
+    /// ([`AgentUnitBuilder::incomplete`] is the only way to clear it):
+    /// the caller that turns this into an [`super::AgentUnit`] must
+    /// protect it from a growth/regrowth delta the same way
+    /// `external.rs` protects an unreadable unit
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    complete: bool,
 }
 
 impl CandidateAgentUnit {
@@ -87,6 +99,12 @@ impl CandidateAgentUnit {
     }
     pub fn link_basis(&self) -> &LinkBasis {
         &self.link_basis
+    }
+    /// `false` means `bytes` is a partial sum this pass, never this
+    /// unit's confirmed size -- see the field doc on
+    /// [`CandidateAgentUnit::complete`].
+    pub fn complete(&self) -> bool {
+        self.complete
     }
 
     /// Nests this unit's relative path under `prefix` (a host label).
@@ -147,6 +165,13 @@ impl CandidateAgentUnit {
             action,
             note,
             link_basis,
+            // Only a complete container is ever stored (`unstorable` in
+            // `agents/mod.rs::container_with_facts`, set whenever a
+            // fold inside it came back truncated), so a replayed unit
+            // was complete when it was recorded -- the exact precedent
+            // `folded_measurement::reuse_folded_measurement` states for
+            // the external-unit case.
+            complete: true,
         }
     }
 
@@ -170,6 +195,7 @@ impl CandidateAgentUnit {
             project_link: self.project_link,
             action: self.action,
             note: self.note,
+            complete: self.complete,
         }
     }
 
@@ -227,6 +253,7 @@ impl AgentUnitBuilder {
                 action: AgentActionCapability::None,
                 note: None,
                 link_basis: LinkBasis::Fixed,
+                complete: true,
             },
         }
     }
@@ -310,6 +337,26 @@ impl AgentUnitBuilder {
 
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.unit.note = Some(note.into());
+        self
+    }
+
+    /// Marks this unit's `bytes` as a lower bound rather than its
+    /// confirmed size -- a bounded fold that hit its entry cap or an
+    /// unreadable subdirectory a few levels in. `reason` is folded into
+    /// the unit's note (appended to whatever it already had, same as
+    /// [`CandidateAgentUnit::withdraw_for_unverified_layout`]) so a human
+    /// sees why the total may be an undercount; the caller in
+    /// `agents::discover_and_measure_in` also reads
+    /// [`CandidateAgentUnit::complete`] directly to keep this pass's
+    /// partial total out of growth/regrowth history
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    pub fn incomplete(mut self, reason: impl Into<String>) -> Self {
+        self.unit.complete = false;
+        let reason = reason.into();
+        self.unit.note = Some(match self.unit.note.take() {
+            Some(n) => format!("{n}; {reason}"),
+            None => reason,
+        });
         self
     }
 

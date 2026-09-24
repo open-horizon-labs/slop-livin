@@ -249,20 +249,18 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     let npm = home.join("npm");
     if ctx.is_dir(&npm) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&npm, MAX_FOLD_ENTRIES);
-        out.push(
-            AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Caches, npm)
-                .relative_path("npm")
-                .bytes(bytes)
-                .mtime_max(mtime)
-                .action(AgentActionCapability::CacheOrLogTrash)
-                .note(if truncated {
-                    "user-scoped npm package installs, reinstallable; directory entry count bound \
-                     reached"
-                } else {
-                    "user-scoped npm package installs, reinstallable"
-                })
-                .build(),
-        );
+        let unit = AgentUnitBuilder::new(PI_TOOL_ID, AgentCategory::Caches, npm)
+            .relative_path("npm")
+            .bytes(bytes)
+            .mtime_max(mtime)
+            .action(AgentActionCapability::CacheOrLogTrash)
+            .note("user-scoped npm package installs, reinstallable");
+        let unit = if truncated {
+            unit.incomplete("directory entry count bound reached")
+        } else {
+            unit
+        };
+        out.push(unit.build());
     }
 
     let seen: std::collections::HashSet<&str> = [

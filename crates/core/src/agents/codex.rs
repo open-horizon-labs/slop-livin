@@ -455,21 +455,17 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
             continue;
         }
         let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-        let note = if truncated {
-            format!(
-                "{} (directory entry count bound reached; total may be an undercount)",
-                entry.note
-            )
-        } else {
-            entry.note.to_string()
-        };
         let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, entry.category, path)
             .relative_path(entry.rel)
             .bytes(bytes)
             .mtime_max(mtime)
             .project_link(ProjectLinkState::NotApplicable)
             .action(entry.action)
-            .note(note);
+            .note(entry.note);
+        if truncated {
+            unit =
+                unit.incomplete("directory entry count bound reached; total may be an undercount");
+        }
         if entry.protected {
             unit = unit.protect(entry.note);
         }
