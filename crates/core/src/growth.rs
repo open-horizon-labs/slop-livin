@@ -29,7 +29,8 @@ use crate::fs_events::{FsEventsRequest, FsEventsState};
 use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use crate::git::DiscoveredWorktree;
 use crate::report::{
-    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Source, UnownedReason, UnownedRow,
+    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Report, Source, UnownedReason,
+    UnownedRow,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1368,6 +1369,86 @@ fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
         .collect();
     columns::write_unowned_rows(&unowned_path(dir), &rows)
         .with_context(|| format!("write {}", unowned_path(dir).display()))
+}
+
+// ---------------------------------------------------------------------
+// report_rows.parquet -- the rendered-row data `swamp report` reads
+// instead of walking (R12: `swamp report` is a pure read; `swamp
+// observe` is the only scanner). One file at the top of the store
+// (scope-wide, not per-volume): a scope can span several roots/volumes,
+// and this is the *coherent* observation over all of them, exactly what
+// `report::report_scope`/`report::observe_scope` already assemble.
+// ---------------------------------------------------------------------
+
+fn report_snapshot_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("report_rows.parquet")
+}
+
+/// One scope's whole rendered observation, kept exactly as
+/// `report::observe_scope` produced it: the assembled [`Report`]
+/// (evidence, tracking and Docker joins already attached -- nothing
+/// here needs a fresh `stat` to render), its per-root coverage, and the
+/// external/agent unit families discovered in the same pass.
+#[derive(Debug, Clone)]
+pub struct ReportSnapshot {
+    pub observed_at: u64,
+    pub report: Report,
+    pub coverage: Vec<crate::coverage::RootCoverage>,
+    pub external_units: Vec<crate::external::ExternalUnit>,
+    pub agent_units: Vec<crate::agents::AgentUnit>,
+    pub store_interiors: Vec<crate::artifact::NestedArtifact>,
+}
+
+/// Replaces `report_rows.parquet`'s row for `scope_key` wholesale --
+/// like `unowned.parquet`/`folded.parquet`, a measurement cache with no
+/// growth/regrowth semantics, rewritten whole by the observation that
+/// produced it. Every other scope key's row is untouched, so several
+/// distinct scopes (or explicit-root invocations) sharing one store
+/// each keep their own snapshot.
+pub fn write_report_snapshot(
+    swamp_dir: &Path,
+    scope_key: &str,
+    snapshot: &ReportSnapshot,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = report_snapshot_path(swamp_dir);
+    let mut rows: Vec<columns::StoredReportSnapshotRow> = columns::read_report_snapshot_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    rows.push(columns::StoredReportSnapshotRow {
+        scope_key: scope_key.to_string(),
+        observed_at: snapshot.observed_at,
+        report_json: serde_json::to_string(&snapshot.report)?,
+        coverage_json: serde_json::to_string(&snapshot.coverage)?,
+        external_units_json: serde_json::to_string(&snapshot.external_units)?,
+        agent_units_json: serde_json::to_string(&snapshot.agent_units)?,
+        store_interiors_json: serde_json::to_string(&snapshot.store_interiors)?,
+    });
+    columns::write_report_snapshot_rows(&path, &rows)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Reads back the stored snapshot for `scope_key`. `None` when this
+/// scope has never been observed, or the table is missing/unreadable/
+/// corrupt/from a stale schema -- a cache miss (the caller's "no
+/// observation yet" path), never a hard error, same discipline as
+/// `folded_rows_for`.
+pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportSnapshot> {
+    let path = report_snapshot_path(swamp_dir);
+    let row = columns::read_report_snapshot_rows(&path)
+        .ok()?
+        .into_iter()
+        .find(|r| r.scope_key == scope_key)?;
+    Some(ReportSnapshot {
+        observed_at: row.observed_at,
+        report: serde_json::from_str(&row.report_json).ok()?,
+        coverage: serde_json::from_str(&row.coverage_json).ok()?,
+        external_units: serde_json::from_str(&row.external_units_json).ok()?,
+        agent_units: serde_json::from_str(&row.agent_units_json).ok()?,
+        store_interiors: serde_json::from_str(&row.store_interiors_json).ok()?,
+    })
 }
 
 fn parse_artifact_kind(s: &str) -> ArtifactKind {

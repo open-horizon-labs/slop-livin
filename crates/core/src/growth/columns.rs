@@ -1220,3 +1220,119 @@ pub(super) fn compact_external_deltas(dir: &Path, files: &[PathBuf], horizon: u6
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// report_rows.parquet -- the rendered-row data `swamp report` and the
+// TUI need to render without walking anything (R12: `swamp report` is a
+// pure read; `swamp observe` is the only scanner). One row per scope
+// key, replaced wholesale by every `observe` that covers that scope --
+// like `unowned.parquet`/`folded.parquet`, this is a measurement cache,
+// not reverse-delta history. The rendered `Report` (evidence, tracking
+// and Docker joins already attached by the pipeline that produced it),
+// per-root coverage, external units, agent units and store interiors
+// are each JSON-encoded into their own Parquet `Utf8` cell -- a cell
+// encoding, not a JSON file on disk, exactly like `unowned.parquet`'s
+// `evidence_json`/`containers_json` columns.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReportSnapshotRow {
+    pub scope_key: String,
+    pub observed_at: u64,
+    /// JSON-encoded `crate::report::Report`.
+    pub report_json: String,
+    /// JSON-encoded `Vec<crate::coverage::RootCoverage>`.
+    pub coverage_json: String,
+    /// JSON-encoded `Vec<crate::external::ExternalUnit>`.
+    pub external_units_json: String,
+    /// JSON-encoded `Vec<crate::agents::AgentUnit>`.
+    pub agent_units_json: String,
+    /// JSON-encoded `Vec<crate::artifact::NestedArtifact>`.
+    pub store_interiors_json: String,
+}
+
+fn report_snapshot_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("report_json", DataType::Utf8, false),
+        Field::new("coverage_json", DataType::Utf8, false),
+        Field::new("external_units_json", DataType::Utf8, false),
+        Field::new("agent_units_json", DataType::Utf8, false),
+        Field::new("store_interiors_json", DataType::Utf8, false),
+    ]))
+}
+
+pub(super) fn write_report_snapshot_rows(
+    path: &Path,
+    rows: &[StoredReportSnapshotRow],
+) -> Result<()> {
+    let schema = report_snapshot_schema();
+    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+    let report_json: Vec<&str> = rows.iter().map(|r| r.report_json.as_str()).collect();
+    let coverage_json: Vec<&str> = rows.iter().map(|r| r.coverage_json.as_str()).collect();
+    let external_units_json: Vec<&str> = rows
+        .iter()
+        .map(|r| r.external_units_json.as_str())
+        .collect();
+    let agent_units_json: Vec<&str> = rows.iter().map(|r| r.agent_units_json.as_str()).collect();
+    let store_interiors_json: Vec<&str> = rows
+        .iter()
+        .map(|r| r.store_interiors_json.as_str())
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(scope_key)) as ArrayRef,
+            Arc::new(UInt64Array::from(observed_at)),
+            Arc::new(StringArray::from(report_json)),
+            Arc::new(StringArray::from(coverage_json)),
+            Arc::new(StringArray::from(external_units_json)),
+            Arc::new(StringArray::from(agent_units_json)),
+            Arc::new(StringArray::from(store_interiors_json)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportSnapshotRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        let report_json = downcast_str(&batch, "report_json")?;
+        let coverage_json = downcast_str(&batch, "coverage_json")?;
+        let external_units_json = downcast_str(&batch, "external_units_json")?;
+        let agent_units_json = downcast_str(&batch, "agent_units_json")?;
+        let store_interiors_json = downcast_str(&batch, "store_interiors_json")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredReportSnapshotRow {
+                scope_key: scope_key.value(i).to_string(),
+                observed_at: observed_at.value(i),
+                report_json: report_json.value(i).to_string(),
+                coverage_json: coverage_json.value(i).to_string(),
+                external_units_json: external_units_json.value(i).to_string(),
+                agent_units_json: agent_units_json.value(i).to_string(),
+                store_interiors_json: store_interiors_json.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}

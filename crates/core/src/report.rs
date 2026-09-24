@@ -1916,71 +1916,6 @@ pub(crate) fn join_docker_facts(
     result
 }
 
-/// One root's outcome from an observe-only pass: walk + growth-store
-/// write, no rendering. See [`observe_only`].
-#[derive(Debug, Clone)]
-pub struct ObserveSummary {
-    pub observed_at: u64,
-    pub walked_total: u64,
-    pub projects: usize,
-    /// "full" or "incremental" (#29): read straight off the
-    /// `"fsevents: mode=.. reason=.. changed_dirs=.."` note this same
-    /// pass records.
-    pub mode: String,
-    /// The `mode=.. reason=.. changed_dirs=..` line for the `observe` log
-    /// (`schedule::RunOutcome`) and stdout, straight from that note.
-    pub fsevents_line: String,
-    /// Live GitHub enrichment stats for this same pass (#35): `observe`
-    /// refreshes both the growth store and `enrich.parquet` in one walk,
-    /// since it already has every worktree's path/branch/tip in hand.
-    pub github: GithubEnrichmentSummary,
-}
-
-/// Observe-only entry point for `swamp observe`: walks `root`,
-/// writes the growth store under `store_dir`, refreshes GitHub
-/// enrichment live for every GitHub-remote worktree found (concurrent,
-/// coalesced per repo -- see `github::observe_all`), and returns the
-/// summary facts the caller prints/logs. Never renders a report.
-/// `force_full` (`--full`) skips the FSEvents-driven incremental attempt.
-pub fn observe_only(
-    root: &Path,
-    store_dir: &Path,
-    since_override: Option<&str>,
-    force_full: bool,
-) -> Result<ObserveSummary> {
-    let r = report_full_mode_with_source(
-        root,
-        None,
-        false,
-        Some(store_dir),
-        since_override,
-        true,
-        false,
-        true,
-        force_full,
-        crate::fs_events::platform_source().as_ref(),
-    )?;
-    let fsevents_line = r
-        .notes
-        .iter()
-        .find_map(|n| n.strip_prefix("fsevents: "))
-        .map(str::to_string)
-        .unwrap_or_else(|| "mode=full reason=no_store changed_dirs=0".to_string());
-    let mode = fsevents_line
-        .strip_prefix("mode=")
-        .and_then(|s| s.split(' ').next())
-        .unwrap_or("full")
-        .to_string();
-    Ok(ObserveSummary {
-        observed_at: r.observed_at,
-        walked_total: r.reconciliation.walked_total,
-        projects: r.projects.len(),
-        mode,
-        fsevents_line,
-        github: r.github_enrichment.unwrap_or_default(),
-    })
-}
-
 pub fn to_json(report: &Report) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
 }
@@ -2558,7 +2493,7 @@ pub fn observe_scope(
         unit_replay.commit()?;
     }
 
-    Ok(ScopeObservation {
+    let observation = ScopeObservation {
         merged,
         coverage,
         per_root,
@@ -2566,7 +2501,30 @@ pub fn observe_scope(
         agent_units,
         unit_root_coverage,
         store_interiors,
-    })
+    };
+
+    // R12: persist the scope-wide render cache `swamp report` reads
+    // instead of walking. Gated exactly like `unit_replay.commit()`
+    // above and for the same reason -- only a pass that persisted
+    // (`observe`), covered both unit families (`want == ALL`, so the
+    // stored snapshot is not missing a family the caller never asked
+    // for) and did not error measuring either one gets to replace what
+    // the last full observation wrote.
+    if observe
+        && want == ObservationParts::ALL
+        && external_ok
+        && agents_ok
+        && let Some(store_dir) = store_dir
+    {
+        let key = scope_snapshot_key(scope);
+        crate::growth::write_report_snapshot(
+            store_dir,
+            &key,
+            &snapshot_from_observation(&observation),
+        )?;
+    }
+
+    Ok(observation)
 }
 
 /// Folds one already-fully-formed single-root [`Report`] `r` into a
@@ -2752,6 +2710,105 @@ fn merge_summary_into(acc: &mut Summary, add: &Summary) {
             e.growth_bytes = Some(e.growth_bytes.unwrap_or(0) + g);
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// R12: `swamp report` is a pure read of stored Parquet rows; `swamp
+// observe` is the only scanner. `crate::growth::ReportSnapshot`
+// (`report_rows.parquet`) is what `observe_scope` persists and this
+// module reads back -- never a filesystem walk, a `stat`, or a
+// subprocess.
+// ---------------------------------------------------------------------
+
+/// Re-exported so `report::ReportSnapshot` names the one type both
+/// `observe` (which builds one from a [`ScopeObservation`]) and
+/// `report` (which reads one back) deal in; it is stored by
+/// `crate::growth` because that is where every other current-state
+/// table lives (`unowned.parquet`, `external/folded.parquet`, ...).
+pub use crate::growth::ReportSnapshot;
+
+/// The stable key `swamp report`/`swamp observe` use to find/store a
+/// scope's snapshot in `report_rows.parquet`: the sorted set of this
+/// scope's candidate root paths, hashed. An explicit root (a scope of
+/// one, #42) and the configured multi-root scope therefore key
+/// differently by construction -- neither caller has to say which one
+/// it built, and re-resolving the same scope always finds what the
+/// last observation of it wrote.
+pub fn scope_snapshot_key(scope: &crate::scope::EffectiveScope) -> String {
+    let mut paths: Vec<String> = scope
+        .roots
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+    paths.sort();
+    crate::entities::id_for(&paths.join("\n"))[..16].to_string()
+}
+
+/// Why `swamp report` has nothing to render for a scope: it has never
+/// been observed. `swamp report` never scans to produce one --
+/// `swamp observe` is the only command that does.
+#[derive(Debug)]
+pub struct NoObservation {
+    /// The scope's own description, for the error text: its present
+    /// root(s), or a note that none are present.
+    pub scope_description: String,
+}
+
+impl std::fmt::Display for NoObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no observation yet for {}; run `swamp observe`",
+            self.scope_description
+        )
+    }
+}
+
+impl std::error::Error for NoObservation {}
+
+fn describe_scope_for_error(scope: &crate::scope::EffectiveScope) -> String {
+    let mut present: Vec<String> = scope
+        .roots
+        .iter()
+        .filter(|r| matches!(r.status, crate::scope::RootStatus::Present))
+        .map(|r| r.path.display().to_string())
+        .collect();
+    present.sort();
+    if present.is_empty() {
+        "this scope (no present root)".to_string()
+    } else {
+        present.join(", ")
+    }
+}
+
+/// Builds the snapshot `swamp observe` persists from one
+/// [`ScopeObservation`] -- the same value `observe_scope` already
+/// returns, so persisting it is the last step of `observe`, not a
+/// second pass over anything it measured.
+pub fn snapshot_from_observation(o: &ScopeObservation) -> ReportSnapshot {
+    ReportSnapshot {
+        observed_at: o.merged.observed_at,
+        report: o.merged.clone(),
+        coverage: o.coverage.clone(),
+        external_units: o.external_units.clone(),
+        agent_units: o.agent_units.clone(),
+        store_interiors: o.store_interiors.clone(),
+    }
+}
+
+/// `swamp report`'s only read path: loads the stored snapshot for
+/// `scope`'s key and returns it, or [`NoObservation`] when this exact
+/// scope has never been observed. No walk, no detector I/O beyond the
+/// scope resolution the caller already did to build `scope`, no
+/// subprocess -- see `.oh/sessions/2026-09-24-report-is-a-pure-read.md`.
+pub fn report_scope_from_store(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+) -> std::result::Result<ReportSnapshot, NoObservation> {
+    let key = scope_snapshot_key(scope);
+    crate::growth::read_report_snapshot(store_dir, &key).ok_or_else(|| NoObservation {
+        scope_description: describe_scope_for_error(scope),
+    })
 }
 
 mod pass;
