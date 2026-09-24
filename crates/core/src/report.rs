@@ -451,12 +451,13 @@ pub struct Report {
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     /// Nested Cargo/build-artifact facts. These are identification units
     /// inside existing artifact rows; their physical bytes are not added to
-    /// reconciliation totals a second time.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        serialize_with = "crate::cargo_cleanup::serialize_units"
-    )]
+    /// reconciliation totals a second time. Each unit's own `guidance`
+    /// field (serialized as `"cleanup"`) carries the cargo-cleanup
+    /// recommendation computed once at observe time
+    /// (`attach_cargo_guidance`) -- R18a removed the `serialize_with`
+    /// hook that used to compute it fresh from a live clock at
+    /// serialization time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
     /// The store this report was produced against, when there was one.
     ///
@@ -692,6 +693,26 @@ pub fn attach_decision_evidence(report: &mut Report) {
         }
     }
     attach_nested_decision_evidence(report);
+    attach_cargo_guidance(report);
+}
+
+/// Computes every `NestedArtifact`'s cargo-cleanup
+/// `crate::cargo_cleanup::Guidance` exactly once, from
+/// `report.observed_at` (never a fresh `crate::entities::now()` read) --
+/// R18a. Called once per observe pass, alongside
+/// [`attach_nested_decision_evidence`]: before this, the guidance shown
+/// in `swamp report --json` (and compared in this crate's own tests)
+/// was computed lazily at *serialization* time by a
+/// `#[serde(serialize_with = ...)]` hook that called
+/// `crate::entities::now()` directly, so serializing the same `Report`
+/// twice a wall-clock second apart produced two different
+/// `modified_age_secs` values -- a real "`swamp report --json` is not a
+/// pure read" bug, not just a test flake.
+fn attach_cargo_guidance(report: &mut Report) {
+    let observed_at = report.observed_at;
+    for unit in &mut report.nested_artifacts {
+        unit.guidance = crate::cargo_cleanup::guidance_at(unit, observed_at);
+    }
 }
 
 /// The nested build-artifact units' half of [`attach_decision_evidence`].
@@ -3091,6 +3112,16 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
             .or_default()
             .push(c);
     }
+    let mut members_by_unit: std::collections::HashMap<
+        String,
+        Vec<&crate::growth::columns::StoredAgentMemberRow>,
+    > = std::collections::HashMap::new();
+    for m in &tables.agent_members {
+        members_by_unit
+            .entry(m.unit_id.clone())
+            .or_default()
+            .push(m);
+    }
 
     snapshot.external_units = tables
         .external
@@ -3120,7 +3151,12 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
         .agent
         .iter()
         .map(|stored| {
-            crate::growth::agent_unit_from_stored(stored, old_agent.get(&stored.id).copied())
+            let members = members_by_unit.get(&stored.id).cloned().unwrap_or_default();
+            crate::growth::agent_unit_from_stored(
+                stored,
+                &members,
+                old_agent.get(&stored.id).copied(),
+            )
         })
         .collect();
 }

@@ -526,6 +526,7 @@ fn decode_one(id: &str, fields: &[(String, String)]) -> Option<NestedArtifact> {
         consequence: one("consequence"),
         reported_by: one("reported_by"),
         writer_lock: one("writer_lock").map(PathBuf::from),
+        guidance: crate::cargo_cleanup::Guidance::default(),
     })
 }
 

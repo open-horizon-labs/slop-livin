@@ -64,8 +64,12 @@ and artifact rows come from `projects.parquet`, `worktrees.parquet`
 (+ `worktree_facts.parquet` for signals and merge-complete terms) and
 the per-volume current-artifact table; external and agent-tool storage
 units come from `external_units.parquet`/`agent_units.parquet` (+
-`unit_consumers.parquet` for an external unit's declared consumers);
-per-project and shared-store nested build-artifact units come from
+`unit_consumers.parquet` for an external unit's declared consumers and
+`agent_unit_members.parquet` for an agent unit's member paths); a
+volume's unowned/remainder rows come from `unowned.parquet` (+
+`unowned_lists.parquet` for its container/shared-with lists and
+`unowned_evidence.parquet` for its per-row evidence); per-project and
+shared-store nested build-artifact units come from
 `nested_artifacts.parquet`; every row's decision evidence (an artifact,
 a unit, or a nested artifact's) comes from `evidence.parquet`; and
 per-root coverage, byte-history series, the by-type/reconciliation

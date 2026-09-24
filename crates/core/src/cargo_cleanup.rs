@@ -48,16 +48,39 @@ pub struct CargoGroup {
 }
 
 /// Derived from existing facts only. Never performs I/O or implies authorization.
-#[derive(Debug, Serialize)]
+///
+/// R18a: computed exactly once per observe pass, from the report's own
+/// fixed `observed_at` (`report::attach_cargo_guidance`), and stored as
+/// typed columns on `nested_artifacts.parquet`
+/// (`NestedArtifact::guidance`) -- never recomputed from a live clock at
+/// serialization time. Before this, `Report.nested_artifacts`'s
+/// `#[serde(serialize_with = "serialize_units")]` hook called
+/// `guidance(unit)` (i.e. `guidance_at(unit, entities::now())`) at
+/// serialize time, so serializing the same `Report` twice a wall-clock
+/// second apart produced two different `modified_age_secs` values --
+/// the flaky
+/// `project_worktree_tables::report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_snapshot_json`
+/// (a `swamp report --json` run had the identical non-reproducibility
+/// bug). `guidance`/`guidance_at` below are still used for on-demand,
+/// intentionally-live computations (`swamp cargo check`'s human-
+/// initiated review, the TUI's live rendering) -- only the report JSON
+/// serialization path stopped calling them at read time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct Guidance {
     pub recommendation: String,
     pub modified_age_secs: Option<u64>,
-    pub consequence: &'static str,
-    pub scope: &'static str,
-    pub check_status: &'static str,
-    pub reason_code: &'static str,
-    pub message: &'static str,
-    pub next_action: &'static str,
+    /// Owned (not `&'static str`, unlike [`recommendation`]'s own return
+    /// type) so a rebuilt `Guidance` -- read back from
+    /// `nested_artifacts.parquet`'s typed `guidance_*` columns rather
+    /// than recomputed from a live clock -- can be constructed from a
+    /// stored `String` without leaking memory or guessing which static
+    /// constant it came from (R18a).
+    pub consequence: String,
+    pub scope: String,
+    pub check_status: String,
+    pub reason_code: String,
+    pub message: String,
+    pub next_action: String,
 }
 
 pub fn guidance(unit: &NestedArtifact) -> Guidance {
@@ -115,12 +138,12 @@ pub fn guidance_at(unit: &NestedArtifact, now: u64) -> Guidance {
     Guidance {
         recommendation: advice,
         modified_age_secs: age,
-        consequence: recommendation(unit).1,
-        scope,
-        check_status: status,
-        reason_code: code,
-        message,
-        next_action: next,
+        consequence: recommendation(unit).1.to_string(),
+        scope: scope.to_string(),
+        check_status: status.to_string(),
+        reason_code: code.to_string(),
+        message: message.to_string(),
+        next_action: next.to_string(),
     }
 }
 
@@ -174,39 +197,17 @@ pub fn recommendation(unit: &NestedArtifact) -> (&'static str, &'static str) {
     }
 }
 
-/// Add derived guidance to report JSON without persisting a second action model.
-pub fn serialize_units<S: serde::Serializer>(
-    units: &[NestedArtifact],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeSeq;
-    #[derive(Serialize)]
-    struct View<'a> {
-        #[serde(flatten)]
-        unit: &'a NestedArtifact,
-        cleanup: Guidance,
-    }
-    let mut seq = serializer.serialize_seq(Some(units.len()))?;
-    for unit in units {
-        seq.serialize_element(&View {
-            unit,
-            cleanup: guidance(unit),
-        })?;
-    }
-    seq.end()
-}
-
 #[derive(Debug, Serialize)]
 pub struct CheckResult {
     pub recommendation: String,
-    pub consequence: &'static str,
+    pub consequence: String,
     pub modified_age_secs: Option<u64>,
     pub path: PathBuf,
     pub allocated_bytes: u64,
-    pub check_status: &'static str,
-    pub reason_code: &'static str,
+    pub check_status: String,
+    pub reason_code: String,
     pub message: String,
-    pub next_action: &'static str,
+    pub next_action: String,
     pub plan_id: Option<String>,
     /// Argument vector, never shell-interpolated. Caller must retain its store.
     pub next_command: Vec<String>,
@@ -260,6 +261,7 @@ pub fn check(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let g = guidance(unit);
+        let check_status_is_unchecked = g.check_status == "unchecked";
         let mut result = CheckResult {
             recommendation: g.recommendation,
             consequence: g.consequence,
@@ -268,7 +270,7 @@ pub fn check(
             allocated_bytes: unit.bytes,
             check_status: g.check_status,
             reason_code: g.reason_code,
-            message: g.message.into(),
+            message: g.message,
             next_action: g.next_action,
             plan_id: None,
             next_command: vec![
@@ -285,7 +287,7 @@ pub fn check(
             checked_at,
             elapsed_ms: 0,
         };
-        if g.check_status == "unchecked" {
+        if check_status_is_unchecked {
             match crate::actions::propose(
                 report,
                 None,
@@ -303,27 +305,28 @@ pub fn check(
                         .iter()
                         .flat_map(|u| u.warnings().iter().cloned())
                         .collect();
-                    result.check_status = "ready_for_review";
-                    result.reason_code = "checks_passed";
+                    result.check_status = "ready_for_review".to_string();
+                    result.reason_code = "checks_passed".to_string();
                     result.message = "Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences before deleting; swamp does not delete anything itself.".into();
-                    result.next_action = "review_members";
+                    result.next_action = "review_members".to_string();
                     result.allocated_bytes = units.iter().map(|u| u.bytes()).sum();
                 }
                 Err(error) => {
-                    result.check_status = "blocked";
+                    result.check_status = "blocked".to_string();
                     let message = error.to_string();
-                    result.reason_code = if message.contains("Cargo build busy or lock unavailable")
-                    {
-                        "lock_unavailable"
-                    } else if message.contains("no established Cargo build lock") {
-                        "missing_lock"
-                    } else {
-                        "review_refused"
-                    };
+                    result.reason_code =
+                        if message.contains("Cargo build busy or lock unavailable") {
+                            "lock_unavailable"
+                        } else if message.contains("no established Cargo build lock") {
+                            "missing_lock"
+                        } else {
+                            "review_refused"
+                        }
+                        .to_string();
                     result.message = message;
                     if result.reason_code == "lock_unavailable" {
                         result.message.push_str(" A build may hold the lock, or locking may be unavailable. Wait for builds to finish, then retry this exact selection. Nothing changed.");
-                        result.next_action = "retry_after_builds";
+                        result.next_action = "retry_after_builds".to_string();
                         result.next_command = vec![
                             "swamp".into(),
                             "cleanup-check".into(),
@@ -332,7 +335,7 @@ pub fn check(
                             unit.path.display().to_string(),
                         ];
                     } else {
-                        result.next_action = "inspect";
+                        result.next_action = "inspect".to_string();
                     }
                 }
             }

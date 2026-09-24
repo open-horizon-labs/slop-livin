@@ -527,6 +527,7 @@ fn node(
         consequence: None,
         reported_by: None,
         writer_lock: None,
+        guidance: crate::cargo_cleanup::Guidance::default(),
     }
 }
 

@@ -4,6 +4,46 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: unit provenance/members, unowned lists/evidence (R18a, partial)
+
+`external_units.parquet`/`agent_units.parquet` gain typed columns for
+what used to be a merge-fallback read from the stored snapshot's JSON
+cell: an external unit's `provenance` (kind + payload) and both
+families' `hardlinked`; an agent unit's `tool_home`, `relative_path` and
+`action`. A new `agent_unit_members.parquet` child table carries an
+agent unit's member paths. `unowned.parquet` drops its
+`containers_json`/`shared_with_json`/`evidence_json` cells in favor of
+two new per-volume tables, `unowned_lists.parquet` and
+`unowned_evidence.parquet`. Verified with an extended
+`growth::tests::unit_tables_round_trip_every_field_and_every_linkage_state`
+(now proves the round trip with no snapshot fallback at all, `old:
+None`) and a new `growth::tests::
+unowned_round_trips_lists_and_evidence_through_their_own_tables`.
+
+This is a partial slice of CHUNK_R18a: `report_rows.parquet` and its
+`report_json`/`external_units_json`/`agent_units_json`/
+`store_interiors_json` cells are not yet deleted, `Report.unowned`/
+`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
+`github_enrichment` have no table yet, and `nested_artifacts.parquet`'s
+own long not-yet-migrated field list is untouched. See
+`.oh/sessions/2026-09-24-r18a-unit-and-unowned-tables.md` for the full
+accounting.
+
+### Fix: `swamp report --json` was not a pure read of cargo-cleanup guidance
+
+`Report.nested_artifacts` computed its `"cleanup"` guidance (including
+`modified_age_secs`) from a live clock at *serialization* time (a
+`#[serde(serialize_with = ...)]` hook calling `crate::entities::now()`
+directly), not at observation time -- so serializing the same `Report`
+twice, a wall-clock second apart, produced two different JSON bodies.
+This was the root cause of the `project_worktree_tables` flake CHUNK_R18a
+named. Fixed: `NestedArtifact` now carries its own `guidance` field,
+computed exactly once per observe pass from the report's fixed
+`observed_at`, and `nested_artifacts.parquet` gains eight `guidance_*`
+typed columns so a later read-back never recomputes it either. Verified
+with a new test that serializes the same `Report` twice across a real
+1.1-second sleep and asserts byte-identical output.
+
 ### No JSON in the store: coverage, series, summary, notes, topology (R17)
 
 `swamp observe` now writes four more typed tables: `coverage.parquet`

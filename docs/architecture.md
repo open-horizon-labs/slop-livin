@@ -504,10 +504,12 @@ remaining list):
   string, plus the id when `linked`), `protected`/`protect_reason`
   (nullable -- agent-only), `consequence` (each type's own `note`
   field), `observed_at`, `growth_bytes` (nullable), `regrowth_count`.
-  Not migrated (overlaid from the snapshot by `id`): an `ExternalUnit`'s
-  `provenance`; an `AgentUnit`'s `tool_home`/`relative_path`/`members`/
-  `action`. `evidence` on both is replaced from `evidence.parquet`
-  below, never overlaid.
+  R18a adds `provenance_kind`/`provenance_value` (`ExternalUnit`),
+  `hardlinked` (both), and `tool_home`/`relative_path`/`action`
+  (`AgentUnit`) as typed columns too, plus the `agent_unit_members.
+  parquet` child table for `members` -- see the R18a paragraph below.
+  `evidence` on both is replaced from `evidence.parquet` below, never
+  overlaid.
 - `<store>/unit_consumers.parquet` -- the child table for an
   `ExternalUnit`'s declared-consumer list (an `AgentUnit` has no
   consumer list -- its single `project_link` is a unit-row column
@@ -629,6 +631,76 @@ named as this slice's four tables. `last_report-*.json.zst`/
 `observed_at`) for the incremental walk, a different, lower-level need
 than the scope-wide snapshot this section covers, and redesigning it
 onto typed tables is real, separate work.
+
+R18a (2026-09-24) migrates the `external_units.parquet`/
+`agent_units.parquet` merge fallback and `unowned.parquet`'s remaining
+JSON cells onto typed columns/child tables:
+
+- `external_units.parquet`/`agent_units.parquet` gain `provenance_kind`/
+  `provenance_value` (an `ExternalUnit`'s `locations::Provenance`
+  variant tag plus its own payload -- env var name, config field name,
+  or query description; `"builtin"` and `None` for `BuiltinConvention`),
+  `hardlinked` (both families -- a real per-unit fold fact, not the
+  conservative default), and, agent-only, `tool_home`, `relative_path`
+  and `action` (`AgentActionCapability::label`). `old` (the pre-R18a
+  snapshot copy) is now only the fallback for a store written before
+  these columns existed; `external_unit_from_stored`/
+  `agent_unit_from_stored` read the typed column first.
+- `<store>/agent_unit_members.parquet` -- the child table for an
+  `AgentUnit::members` list: `scope_key`, `unit_id`, `seq`, `path`,
+  `bytes`, `kind` (`AgentMemberKind::label`).
+- `<volume>/unowned.parquet` drops `containers_json`/`shared_with_json`/
+  `evidence_json`. Two new per-volume tables, co-located with
+  `unowned.parquet` (no `scope_key` needed -- `path_or_object` is
+  already that table's own unique key within one volume):
+  `<volume>/unowned_lists.parquet` (`path_or_object`, `list_kind`
+  (`container` | `shared-with`), `seq`, `value`) replaces the two JSON
+  cells, and `<volume>/unowned_evidence.parquet` reuses
+  `evidence.parquet`'s own row shape and (de)serialization
+  (`stored_evidence_rows`/`evidence_from_stored_rows`) rather than a new
+  encoding, written with `scope_key = ""` (unused; the file is already
+  volume-scoped) and `row_key = path_or_object`.
+
+R18a also fixed a real "`swamp report --json` is not a pure read" bug
+(the root cause of a wall-clock flake in
+`project_worktree_tables::report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_snapshot_json`):
+`Report.nested_artifacts` used to compute its `"cleanup"` cargo-guidance
+view (`cargo_cleanup::Guidance`, including `modified_age_secs`) at
+*serialization* time via a `#[serde(serialize_with = ...)]` hook that
+called `crate::entities::now()` directly, so serializing the same
+`Report` twice a wall-clock second apart produced two different JSON
+bodies. `NestedArtifact` now carries its own `guidance` field
+(`#[serde(rename = "cleanup")]`, reproducing the old JSON shape
+exactly), computed exactly once per observe pass by
+`report::attach_cargo_guidance` (called alongside
+`attach_nested_decision_evidence` inside `attach_decision_evidence`)
+from that pass's own fixed `observed_at`. `nested_artifacts.parquet`
+gains eight matching `guidance_*` columns (`guidance_recommendation`,
+`guidance_modified_age_secs`, `guidance_consequence`, `guidance_scope`,
+`guidance_check_status`, `guidance_reason_code`, `guidance_message`,
+`guidance_next_action`) so `report_scope_from_store`'s rebuild never
+recomputes it either. `cargo_cleanup::check` (the human-initiated
+on-demand review action) is unchanged and still calls `guidance`/
+`guidance_at` live on purpose -- a bounded, explicit check is not the
+"report is a pure read" contract.
+
+Still open after R18a (CHUNK_R18a's remaining items; see
+`.oh/sessions/2026-09-24-r18a-unit-and-unowned-tables.md` for the full
+accounting): `report_rows.parquet`'s `report_json`/`external_units_json`/
+`agent_units_json`/`store_interiors_json` cells are **not yet deleted**
+-- the typed replacements above remove the *need* for the first two as
+a merge fallback, but `report_scope_from_store` still reads
+`read_report_snapshot` to bootstrap `ReportSnapshot` and the file/cells
+still exist on disk. `Report.unowned`/`dirs_by_worktree`/
+`files_by_worktree`/`schedule_line`/`github_enrichment` and
+`nested_artifacts.parquet`'s own long not-yet-migrated field list
+(`parent_id`, `membership`, `is_dir`, `device`, `inode`,
+`logical_bytes`, `physical_bytes`, `physical_total`, `coverage`,
+`producer_evidence`/`consumer_evidence`, `action_group`, `present`,
+`growth_bytes`, `regrowth_count`, `action`, `reported_by`,
+`writer_lock`, the variant's `package`/`version`/`toolchain`/
+`features`/`generation`/`unknowns`) are untouched. `last_report-*.json.zst`
+is also untouched, same reasoning as R17's note above.
 
 `report_scope_from_store` extends the same rebuild to these: an
 `ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`

@@ -643,13 +643,7 @@ pub struct StoredUnownedRow {
     pub note: Option<String>,
     pub docker_kind: Option<String>,
     pub created_at: Option<String>,
-    /// JSON-encoded `Vec<String>`.
-    pub containers_json: String,
-    /// JSON-encoded `Vec<String>`.
-    pub shared_with_json: String,
     pub dangling: bool,
-    /// JSON-encoded `Vec<crate::evidence::Evidence>`.
-    pub evidence_json: String,
 }
 
 fn unowned_schema() -> Arc<Schema> {
@@ -661,10 +655,7 @@ fn unowned_schema() -> Arc<Schema> {
         Field::new("note", DataType::Utf8, true),
         Field::new("docker_kind", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
-        Field::new("containers_json", DataType::Utf8, false),
-        Field::new("shared_with_json", DataType::Utf8, false),
         Field::new("dangling", DataType::Boolean, false),
-        Field::new("evidence_json", DataType::Utf8, false),
     ]))
 }
 
@@ -677,10 +668,7 @@ pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Resu
     let note: Vec<Option<&str>> = rows.iter().map(|r| r.note.as_deref()).collect();
     let docker_kind: Vec<Option<&str>> = rows.iter().map(|r| r.docker_kind.as_deref()).collect();
     let created_at: Vec<Option<&str>> = rows.iter().map(|r| r.created_at.as_deref()).collect();
-    let containers_json: Vec<&str> = rows.iter().map(|r| r.containers_json.as_str()).collect();
-    let shared_with_json: Vec<&str> = rows.iter().map(|r| r.shared_with_json.as_str()).collect();
     let dangling: Vec<bool> = rows.iter().map(|r| r.dangling).collect();
-    let evidence_json: Vec<&str> = rows.iter().map(|r| r.evidence_json.as_str()).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -692,10 +680,7 @@ pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Resu
             Arc::new(StringArray::from(note)),
             Arc::new(StringArray::from(docker_kind)),
             Arc::new(StringArray::from(created_at)),
-            Arc::new(StringArray::from(containers_json)),
-            Arc::new(StringArray::from(shared_with_json)),
             Arc::new(BooleanArray::from(dangling)),
-            Arc::new(StringArray::from(evidence_json)),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -704,6 +689,84 @@ pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Resu
         std::iter::once(Ok(batch)),
         super::ARTIFACT_ZSTD_LEVEL,
     )
+}
+
+/// `unowned_lists.parquet`: one row per `UnownedRow::containers` or
+/// `::shared_with` entry, disambiguated by `list_kind`
+/// (`"container"`/`"shared-with"`) -- R18a item 3, replacing
+/// `unowned.parquet`'s `containers_json`/`shared_with_json` cells. Lives
+/// alongside `unowned.parquet` in the same per-volume directory, so
+/// `path_or_object` (already that table's own natural key) is enough to
+/// join without a `scope_key`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredUnownedListRow {
+    pub(crate) path_or_object: String,
+    pub(crate) list_kind: String,
+    pub(crate) seq: u32,
+    pub(crate) value: String,
+}
+
+fn unowned_list_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path_or_object", DataType::Utf8, false),
+        Field::new("list_kind", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("value", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_unowned_list_rows(path: &Path, rows: &[StoredUnownedListRow]) -> Result<()> {
+    let schema = unowned_list_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.path_or_object.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.list_kind.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_unowned_list_rows(path: &Path) -> Result<Vec<StoredUnownedListRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let path_or_object = downcast_str(&batch, "path_or_object")?;
+        let list_kind = downcast_str(&batch, "list_kind")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let value = downcast_str(&batch, "value")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredUnownedListRow {
+                path_or_object: path_or_object.value(i).to_string(),
+                list_kind: list_kind.value(i).to_string(),
+                seq: seq.value(i),
+                value: value.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
 }
 
 pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
@@ -738,10 +801,7 @@ pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
             .column_by_name("created_at")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .context("column created_at is not Utf8")?;
-        let containers_json = downcast_str(&batch, "containers_json")?;
-        let shared_with_json = downcast_str(&batch, "shared_with_json")?;
         let dangling = downcast_bool(&batch, "dangling")?;
-        let evidence_json = downcast_str(&batch, "evidence_json")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredUnownedRow {
                 path_or_object: path_or_object.value(i).to_string(),
@@ -755,10 +815,7 @@ pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
                 created_at: created_at
                     .is_valid(i)
                     .then(|| created_at.value(i).to_string()),
-                containers_json: containers_json.value(i).to_string(),
-                shared_with_json: shared_with_json.value(i).to_string(),
                 dangling: dangling.value(i),
-                evidence_json: evidence_json.value(i).to_string(),
             });
         }
     }
@@ -2468,6 +2525,24 @@ pub(crate) struct StoredUnitRow {
     pub(crate) observed_at: u64,
     pub(crate) growth_bytes: Option<i64>,
     pub(crate) regrowth_count: u32,
+    /// [`crate::locations::Provenance`]'s variant tag
+    /// (`"builtin"`/`"env-var"`/`"config-field"`/`"tool-query"`),
+    /// external-unit-only. R18a: was the merge-fallback's
+    /// `old.provenance`, read from `report_rows.parquet`'s JSON cell.
+    pub(crate) provenance_kind: Option<String>,
+    /// The variant's own payload (env var name / config field name /
+    /// query description); empty for `BuiltinConvention`.
+    pub(crate) provenance_value: Option<String>,
+    /// Whether this unit contains hardlinked files -- external- and
+    /// agent-unit rows both carry this now (R18a; was the JSON
+    /// merge-fallback for both families).
+    pub(crate) hardlinked: Option<bool>,
+    /// This unit's tool home as resolved this pass, agent-only (R18a).
+    pub(crate) tool_home: Option<String>,
+    /// Relative to `tool_home`, forward slashes, agent-only (R18a).
+    pub(crate) relative_path: Option<String>,
+    /// [`crate::agents::AgentActionCapability::label`], agent-only (R18a).
+    pub(crate) action: Option<String>,
 }
 
 fn unit_schema() -> Arc<Schema> {
@@ -2490,6 +2565,12 @@ fn unit_schema() -> Arc<Schema> {
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("growth_bytes", DataType::Int64, true),
         Field::new("regrowth_count", DataType::UInt32, false),
+        Field::new("provenance_kind", DataType::Utf8, true),
+        Field::new("provenance_value", DataType::Utf8, true),
+        Field::new("hardlinked", DataType::Boolean, true),
+        Field::new("tool_home", DataType::Utf8, true),
+        Field::new("relative_path", DataType::Utf8, true),
+        Field::new("action", DataType::Utf8, true),
     ]))
 }
 
@@ -2542,6 +2623,12 @@ pub(crate) fn write_unit_rows(path: &Path, rows: &[StoredUnitRow]) -> Result<()>
             Arc::new(UInt32Array::from(
                 rows.iter().map(|r| r.regrowth_count).collect::<Vec<_>>(),
             )),
+            opt_str_col!(rows, provenance_kind),
+            opt_str_col!(rows, provenance_value),
+            opt_bool_col!(rows, hardlinked),
+            opt_str_col!(rows, tool_home),
+            opt_str_col!(rows, relative_path),
+            opt_str_col!(rows, action),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -2595,6 +2682,104 @@ pub(crate) fn read_unit_rows(path: &Path) -> Result<Vec<StoredUnitRow>> {
                 observed_at: observed_at.value(i),
                 growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
                 regrowth_count: regrowth_count.value(i),
+                provenance_kind: opt_str(&batch, "provenance_kind", i)?,
+                provenance_value: opt_str(&batch, "provenance_value", i)?,
+                hardlinked: opt_bool(&batch, "hardlinked", i)?,
+                tool_home: opt_str(&batch, "tool_home", i)?,
+                relative_path: opt_str(&batch, "relative_path", i)?,
+                action: opt_str(&batch, "action", i)?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// `agent_unit_members.parquet`: one row per `AgentUnit::members` entry
+/// (R18a; external units have no member list). `unit_id` joins to
+/// `agent_units.parquet`'s own `id` column within the same `scope_key`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredAgentMemberRow {
+    pub(crate) scope_key: String,
+    pub(crate) unit_id: String,
+    pub(crate) seq: u32,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) kind: String,
+}
+
+fn agent_member_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("unit_id", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("kind", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_agent_member_rows(path: &Path, rows: &[StoredAgentMemberRow]) -> Result<()> {
+    let schema = agent_member_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.unit_id.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_agent_member_rows(path: &Path) -> Result<Vec<StoredAgentMemberRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let unit_id = downcast_str(&batch, "unit_id")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let path_col = downcast_str(&batch, "path")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let kind = downcast_str(&batch, "kind")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredAgentMemberRow {
+                scope_key: scope_key.value(i).to_string(),
+                unit_id: unit_id.value(i).to_string(),
+                seq: seq.value(i),
+                path: path_col.value(i).to_string(),
+                bytes: bytes.value(i),
+                kind: kind.value(i).to_string(),
             });
         }
     }
@@ -2736,6 +2921,21 @@ pub(crate) struct StoredNestedArtifactRow {
     pub(crate) variant_configuration: Option<String>,
     pub(crate) variant_target: Option<String>,
     pub(crate) variant_arch: Option<String>,
+    /// `cargo_cleanup::Guidance`, computed once at observe time from
+    /// this report's own `observed_at` and stored here (R18a) so a
+    /// later `report_scope_from_store` rebuild never recomputes it from
+    /// a live clock. `None` only for a row written before this column
+    /// existed (an older store) -- `nested_artifact_from_stored` falls
+    /// back to `Guidance::default()` in that case, never a fresh
+    /// `guidance_at` call.
+    pub(crate) guidance_recommendation: Option<String>,
+    pub(crate) guidance_modified_age_secs: Option<u64>,
+    pub(crate) guidance_consequence: Option<String>,
+    pub(crate) guidance_scope: Option<String>,
+    pub(crate) guidance_check_status: Option<String>,
+    pub(crate) guidance_reason_code: Option<String>,
+    pub(crate) guidance_message: Option<String>,
+    pub(crate) guidance_next_action: Option<String>,
 }
 
 fn nested_artifacts_schema() -> Arc<Schema> {
@@ -2756,6 +2956,14 @@ fn nested_artifacts_schema() -> Arc<Schema> {
         Field::new("variant_configuration", DataType::Utf8, true),
         Field::new("variant_target", DataType::Utf8, true),
         Field::new("variant_arch", DataType::Utf8, true),
+        Field::new("guidance_recommendation", DataType::Utf8, true),
+        Field::new("guidance_modified_age_secs", DataType::UInt64, true),
+        Field::new("guidance_consequence", DataType::Utf8, true),
+        Field::new("guidance_scope", DataType::Utf8, true),
+        Field::new("guidance_check_status", DataType::Utf8, true),
+        Field::new("guidance_reason_code", DataType::Utf8, true),
+        Field::new("guidance_message", DataType::Utf8, true),
+        Field::new("guidance_next_action", DataType::Utf8, true),
     ]))
 }
 
@@ -2801,6 +3009,14 @@ pub(crate) fn write_nested_artifact_rows(
             opt_str_col!(rows, variant_configuration),
             opt_str_col!(rows, variant_target),
             opt_str_col!(rows, variant_arch),
+            opt_str_col!(rows, guidance_recommendation),
+            opt_u64_col!(rows, guidance_modified_age_secs),
+            opt_str_col!(rows, guidance_consequence),
+            opt_str_col!(rows, guidance_scope),
+            opt_str_col!(rows, guidance_check_status),
+            opt_str_col!(rows, guidance_reason_code),
+            opt_str_col!(rows, guidance_message),
+            opt_str_col!(rows, guidance_next_action),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -2850,6 +3066,14 @@ pub(crate) fn read_nested_artifact_rows(path: &Path) -> Result<Vec<StoredNestedA
                 variant_configuration: opt_str(&batch, "variant_configuration", i)?,
                 variant_target: opt_str(&batch, "variant_target", i)?,
                 variant_arch: opt_str(&batch, "variant_arch", i)?,
+                guidance_recommendation: opt_str(&batch, "guidance_recommendation", i)?,
+                guidance_modified_age_secs: opt_u64(&batch, "guidance_modified_age_secs", i)?,
+                guidance_consequence: opt_str(&batch, "guidance_consequence", i)?,
+                guidance_scope: opt_str(&batch, "guidance_scope", i)?,
+                guidance_check_status: opt_str(&batch, "guidance_check_status", i)?,
+                guidance_reason_code: opt_str(&batch, "guidance_reason_code", i)?,
+                guidance_message: opt_str(&batch, "guidance_message", i)?,
+                guidance_next_action: opt_str(&batch, "guidance_next_action", i)?,
             });
         }
     }

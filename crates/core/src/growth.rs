@@ -1234,6 +1234,23 @@ fn unowned_path(dir: &Path) -> PathBuf {
     dir.join("unowned.parquet")
 }
 
+/// `unowned_lists.parquet` (R18a item 3): co-located with
+/// `unowned.parquet` in the same per-volume directory.
+fn unowned_lists_path(dir: &Path) -> PathBuf {
+    dir.join("unowned_lists.parquet")
+}
+
+/// `unowned_evidence.parquet` (R18a item 3): reuses `evidence.parquet`'s
+/// own row shape and (de)serialization (`stored_evidence_rows`/
+/// `evidence_from_stored_rows`), written to its own per-volume file
+/// rather than the scope-keyed top-level `evidence.parquet` -- an
+/// unowned row's identity (`path_or_object`) is already unique within
+/// one volume's own unowned set, so no `scope_key` is needed here; the
+/// `scope_key` column is written as `""` and ignored on read.
+fn unowned_evidence_path(dir: &Path) -> PathBuf {
+    dir.join("unowned_evidence.parquet")
+}
+
 fn worktree_kind_to_label(kind: &crate::report::WorktreeKind) -> &'static str {
     match kind {
         crate::report::WorktreeKind::Main => "main",
@@ -1374,29 +1391,62 @@ fn unowned_reason_from_str(s: &str) -> UnownedReason {
 /// an empty vec when the table is missing or unreadable -- a cache miss,
 /// rebuilt whole by the next full walk, same as `folded_rows_for`.
 fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
-    columns::read_unowned_rows(&unowned_path(dir))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| UnownedRow {
-            path_or_object: r.path_or_object,
-            bytes: r.bytes,
-            reason: unowned_reason_from_str(&r.reason),
-            shared_bytes: r.shared_bytes,
-            note: r.note,
-            docker_kind: r.docker_kind,
-            created_at: r.created_at,
-            containers: serde_json::from_str(&r.containers_json).unwrap_or_default(),
-            shared_with: serde_json::from_str(&r.shared_with_json).unwrap_or_default(),
-            dangling: r.dangling,
-            evidence: serde_json::from_str(&r.evidence_json).unwrap_or_default(),
+    let rows = columns::read_unowned_rows(&unowned_path(dir)).unwrap_or_default();
+    let list_rows = columns::read_unowned_list_rows(&unowned_lists_path(dir)).unwrap_or_default();
+    let mut containers_by_key: HashMap<String, Vec<&columns::StoredUnownedListRow>> =
+        HashMap::new();
+    let mut shared_with_by_key: HashMap<String, Vec<&columns::StoredUnownedListRow>> =
+        HashMap::new();
+    for r in &list_rows {
+        let by_key = match r.list_kind.as_str() {
+            "shared-with" => &mut shared_with_by_key,
+            _ => &mut containers_by_key,
+        };
+        by_key.entry(r.path_or_object.clone()).or_default().push(r);
+    }
+    let evidence_rows =
+        columns::read_evidence_rows(&unowned_evidence_path(dir)).unwrap_or_default();
+    let mut evidence_by_key: HashMap<String, Vec<&columns::StoredEvidenceRow>> = HashMap::new();
+    for r in &evidence_rows {
+        evidence_by_key
+            .entry(r.row_key.clone())
+            .or_default()
+            .push(r);
+    }
+    let list_values =
+        |by_key: &HashMap<String, Vec<&columns::StoredUnownedListRow>>, key: &str| -> Vec<String> {
+            let mut v = by_key.get(key).cloned().unwrap_or_default();
+            v.sort_by_key(|r| r.seq);
+            v.into_iter().map(|r| r.value.clone()).collect()
+        };
+    rows.into_iter()
+        .map(|r| {
+            let evidence = evidence_by_key
+                .get(&r.path_or_object)
+                .map(|rows| evidence_from_stored_rows(rows))
+                .unwrap_or_default();
+            UnownedRow {
+                containers: list_values(&containers_by_key, &r.path_or_object),
+                shared_with: list_values(&shared_with_by_key, &r.path_or_object),
+                path_or_object: r.path_or_object,
+                bytes: r.bytes,
+                reason: unowned_reason_from_str(&r.reason),
+                shared_bytes: r.shared_bytes,
+                note: r.note,
+                docker_kind: r.docker_kind,
+                created_at: r.created_at,
+                dangling: r.dangling,
+                evidence,
+            }
         })
         .collect()
 }
 
-/// Replaces the volume's `unowned.parquet` wholesale: like
-/// `store_folded_rows`, this is a measurement cache (no growth/regrowth
-/// semantics), so a full walk's rows simply overwrite whatever was
-/// there, folded per directory by `walk.rs` before this ever sees them.
+/// Replaces the volume's `unowned.parquet` (+ `unowned_lists.parquet`/
+/// `unowned_evidence.parquet`) wholesale: like `store_folded_rows`, this
+/// is a measurement cache (no growth/regrowth semantics), so a full
+/// walk's rows simply overwrite whatever was there, folded per
+/// directory by `walk.rs` before this ever sees them.
 fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
     store::StoreDir::at(dir)?.create()?;
     let rows: Vec<columns::StoredUnownedRow> = unowned
@@ -1409,14 +1459,37 @@ fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
             note: u.note.clone(),
             docker_kind: u.docker_kind.clone(),
             created_at: u.created_at.clone(),
-            containers_json: serde_json::to_string(&u.containers).unwrap_or_default(),
-            shared_with_json: serde_json::to_string(&u.shared_with).unwrap_or_default(),
             dangling: u.dangling,
-            evidence_json: serde_json::to_string(&u.evidence).unwrap_or_default(),
         })
         .collect();
     columns::write_unowned_rows(&unowned_path(dir), &rows)
-        .with_context(|| format!("write {}", unowned_path(dir).display()))
+        .with_context(|| format!("write {}", unowned_path(dir).display()))?;
+
+    let mut list_rows: Vec<columns::StoredUnownedListRow> = Vec::new();
+    let mut evidence_rows: Vec<columns::StoredEvidenceRow> = Vec::new();
+    for u in unowned {
+        for (seq, value) in u.containers.iter().enumerate() {
+            list_rows.push(columns::StoredUnownedListRow {
+                path_or_object: u.path_or_object.clone(),
+                list_kind: "container".to_string(),
+                seq: seq as u32,
+                value: value.clone(),
+            });
+        }
+        for (seq, value) in u.shared_with.iter().enumerate() {
+            list_rows.push(columns::StoredUnownedListRow {
+                path_or_object: u.path_or_object.clone(),
+                list_kind: "shared-with".to_string(),
+                seq: seq as u32,
+                value: value.clone(),
+            });
+        }
+        evidence_rows.extend(stored_evidence_rows("", &u.path_or_object, &u.evidence));
+    }
+    columns::write_unowned_list_rows(&unowned_lists_path(dir), &list_rows)
+        .with_context(|| format!("write {}", unowned_lists_path(dir).display()))?;
+    columns::write_evidence_rows(&unowned_evidence_path(dir), &evidence_rows)
+        .with_context(|| format!("write {}", unowned_evidence_path(dir).display()))
 }
 
 // ---------------------------------------------------------------------
@@ -2531,6 +2604,10 @@ fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_consumers.parquet")
 }
 
+fn agent_unit_members_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("agent_unit_members.parquet")
+}
+
 /// A stable identity for an external unit independent of the growth
 /// store's own device-inclusive row key (`external_row_key`, which
 /// exists to detect a remounted/replaced device for byte-history
@@ -2659,11 +2736,36 @@ fn project_link_state_from_columns(
     }
 }
 
+/// `Provenance`'s variant tag plus its own payload, flattened to two
+/// columns (R18a: replaces the `report_rows.parquet` JSON merge
+/// fallback `external_unit_from_stored` used to read `old.provenance`
+/// from).
+fn provenance_to_columns(p: &crate::locations::Provenance) -> (&'static str, Option<String>) {
+    use crate::locations::Provenance as P;
+    match p {
+        P::BuiltinConvention => ("builtin", None),
+        P::EnvVar(name) => ("env-var", Some(name.clone())),
+        P::ConfigField(field) => ("config-field", Some(field.clone())),
+        P::ToolQuery(desc) => ("tool-query", Some(desc.clone())),
+    }
+}
+
+fn provenance_from_columns(kind: &str, value: Option<&str>) -> crate::locations::Provenance {
+    use crate::locations::Provenance as P;
+    match kind {
+        "env-var" => P::EnvVar(value.unwrap_or_default().to_string()),
+        "config-field" => P::ConfigField(value.unwrap_or_default().to_string()),
+        "tool-query" => P::ToolQuery(value.unwrap_or_default().to_string()),
+        _ => P::BuiltinConvention,
+    }
+}
+
 fn stored_row_from_external_unit(
     scope_key: &str,
     u: &crate::external::ExternalUnit,
 ) -> columns::StoredUnitRow {
     let category = crate::external::category_str(u.category);
+    let (provenance_kind, provenance_value) = provenance_to_columns(&u.provenance);
     columns::StoredUnitRow {
         scope_key: scope_key.to_string(),
         id: external_unit_table_id(&u.detector_id, category, &u.path),
@@ -2683,6 +2785,12 @@ fn stored_row_from_external_unit(
         observed_at: u.observed_at,
         growth_bytes: u.growth_bytes,
         regrowth_count: u.regrowth_count,
+        provenance_kind: Some(provenance_kind.to_string()),
+        provenance_value,
+        hardlinked: Some(u.hardlinked),
+        tool_home: None,
+        relative_path: None,
+        action: None,
     }
 }
 
@@ -2710,7 +2818,49 @@ fn stored_row_from_agent_unit(
         observed_at: u.observed_at,
         growth_bytes: u.growth_bytes,
         regrowth_count: u.regrowth_count,
+        provenance_kind: None,
+        provenance_value: None,
+        hardlinked: Some(u.hardlinked),
+        tool_home: Some(u.tool_home.display().to_string()),
+        relative_path: Some(u.relative_path.clone()),
+        action: Some(u.action.label().to_string()),
     }
+}
+
+/// One `agent_unit_members.parquet` row per [`crate::agents::AgentMember`].
+fn stored_agent_member_rows(
+    scope_key: &str,
+    unit_id: &str,
+    members: &[crate::agents::AgentMember],
+) -> Vec<columns::StoredAgentMemberRow> {
+    members
+        .iter()
+        .enumerate()
+        .map(|(seq, m)| columns::StoredAgentMemberRow {
+            scope_key: scope_key.to_string(),
+            unit_id: unit_id.to_string(),
+            seq: seq as u32,
+            path: m.path.display().to_string(),
+            bytes: m.bytes,
+            kind: m.kind.label().to_string(),
+        })
+        .collect()
+}
+
+fn agent_members_from_stored(
+    rows: &[&columns::StoredAgentMemberRow],
+) -> Vec<crate::agents::AgentMember> {
+    let mut sorted: Vec<&&columns::StoredAgentMemberRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.seq);
+    sorted
+        .into_iter()
+        .map(|r| crate::agents::AgentMember {
+            path: PathBuf::from(&r.path),
+            bytes: r.bytes,
+            kind: crate::agents::AgentMemberKind::from_label(&r.kind)
+                .unwrap_or(crate::agents::AgentMemberKind::CategoryDir),
+        })
+        .collect()
 }
 
 /// Writes `external_units.parquet`/`agent_units.parquet`/
@@ -2782,17 +2932,32 @@ pub fn write_unit_tables(
     columns::write_unit_consumer_rows(&consumers_file, &consumer_rows)
         .with_context(|| format!("write {}", consumers_file.display()))?;
 
+    let members_file = agent_unit_members_path(swamp_dir);
+    let mut member_rows: Vec<columns::StoredAgentMemberRow> =
+        columns::read_agent_member_rows(&members_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for u in agent_units {
+        member_rows.extend(stored_agent_member_rows(scope_key, &u.id, &u.members));
+    }
+    columns::write_agent_member_rows(&members_file, &member_rows)
+        .with_context(|| format!("write {}", members_file.display()))?;
+
     Ok(())
 }
 
 /// Every stored `external_units.parquet`/`agent_units.parquet`/
-/// `unit_consumers.parquet` row for `scope_key`. `None` when neither
-/// unit table has rows for this scope yet (an older store) -- the
-/// caller falls back to the snapshot's own lists in that case.
+/// `unit_consumers.parquet`/`agent_unit_members.parquet` row for
+/// `scope_key`. `None` when neither unit table has rows for this scope
+/// yet (an older store) -- the caller falls back to the snapshot's own
+/// lists in that case.
 pub(crate) struct StoredUnitTables {
     pub(crate) external: Vec<columns::StoredUnitRow>,
     pub(crate) agent: Vec<columns::StoredUnitRow>,
     pub(crate) consumers: Vec<columns::StoredUnitConsumerRow>,
+    pub(crate) agent_members: Vec<columns::StoredAgentMemberRow>,
 }
 
 pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<StoredUnitTables> {
@@ -2816,17 +2981,28 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
             .into_iter()
             .filter(|r| r.scope_key == scope_key)
             .collect();
+    let agent_members: Vec<columns::StoredAgentMemberRow> =
+        columns::read_agent_member_rows(&agent_unit_members_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
     Some(StoredUnitTables {
         external,
         agent,
         consumers,
+        agent_members,
     })
 }
 
-/// Rebuilds one `ExternalUnit` from its stored row, its consumers, and
-/// its previous snapshot copy (for the not-yet-migrated fields:
-/// `provenance`, `hardlinked`). `evidence` is intentionally left empty
-/// here -- the caller fills it from `evidence.parquet` by this same id.
+/// Rebuilds one `ExternalUnit` from its stored row and its consumers.
+/// `provenance`/`hardlinked` are read from `stored`'s own typed columns
+/// (R18a); `old` (the pre-R18a snapshot copy) is kept only as the
+/// fallback for a store written before those columns existed, so an
+/// older store's next `report` still shows a value rather than
+/// silently reverting to the always-safe default. `evidence` is
+/// intentionally left empty here -- the caller fills it from
+/// `evidence.parquet` by this same id.
 pub(crate) fn external_unit_from_stored(
     stored: &columns::StoredUnitRow,
     consumers: Vec<crate::external::ExternalConsumer>,
@@ -2834,17 +3010,24 @@ pub(crate) fn external_unit_from_stored(
 ) -> crate::external::ExternalUnit {
     let category = crate::external::category_from_str(&stored.category)
         .unwrap_or(crate::locations::StorageCategory::Unclassified);
+    let provenance = match &stored.provenance_kind {
+        Some(kind) => provenance_from_columns(kind, stored.provenance_value.as_deref()),
+        None => old
+            .map(|o| o.provenance.clone())
+            .unwrap_or(crate::locations::Provenance::BuiltinConvention),
+    };
     crate::external::ExternalUnit {
         detector_id: stored.source_id.clone(),
         detector_name: stored.source_name.clone(),
         category,
-        provenance: old
-            .map(|o| o.provenance.clone())
-            .unwrap_or(crate::locations::Provenance::BuiltinConvention),
+        provenance,
         path: PathBuf::from(&stored.path),
         bytes: stored.bytes,
         mtime_max: stored.mtime_max,
-        hardlinked: old.map(|o| o.hardlinked).unwrap_or(true),
+        hardlinked: stored
+            .hardlinked
+            .or_else(|| old.map(|o| o.hardlinked))
+            .unwrap_or(true),
         growth_bytes: stored.growth_bytes,
         regrowth_count: stored.regrowth_count,
         observed_at: stored.observed_at,
@@ -2854,12 +3037,16 @@ pub(crate) fn external_unit_from_stored(
     }
 }
 
-/// Rebuilds one `AgentUnit` from its stored row and its previous
-/// snapshot copy (for `tool_home`/`relative_path`/`members`/`action`,
-/// none of which this slice migrates). `evidence` is left empty for the
-/// same reason as `external_unit_from_stored`.
+/// Rebuilds one `AgentUnit` from its stored row, its `agent_unit_members.
+/// parquet` rows, and its previous snapshot copy. `tool_home`/
+/// `relative_path`/`hardlinked`/`action` are read from `stored`'s own
+/// typed columns and `members` from `member_rows` (R18a); `old` is kept
+/// only as the fallback for a store written before this slice, same
+/// discipline as `external_unit_from_stored`. `evidence` is left empty
+/// for the same reason as `external_unit_from_stored`.
 pub(crate) fn agent_unit_from_stored(
     stored: &columns::StoredUnitRow,
+    member_rows: &[&columns::StoredAgentMemberRow],
     old: Option<&crate::agents::AgentUnit>,
 ) -> crate::agents::AgentUnit {
     let category = crate::agents::AgentCategory::from_label(&stored.category)
@@ -2878,17 +3065,34 @@ pub(crate) fn agent_unit_from_stored(
         .unwrap_or(crate::agents::ProjectLinkState::Unresolved {
             reason: "no stored linkage state".to_string(),
         });
+    let members = if member_rows.is_empty() {
+        old.map(|o| o.members.clone()).unwrap_or_default()
+    } else {
+        agent_members_from_stored(member_rows)
+    };
     crate::agents::AgentUnit {
         tool_id: stored.source_id.clone(),
         tool_name: stored.source_name.clone(),
-        tool_home: old.map(|o| o.tool_home.clone()).unwrap_or_default(),
+        tool_home: stored
+            .tool_home
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| old.map(|o| o.tool_home.clone()))
+            .unwrap_or_default(),
         category,
         id: stored.id.clone(),
-        relative_path: old.map(|o| o.relative_path.clone()).unwrap_or_default(),
+        relative_path: stored
+            .relative_path
+            .clone()
+            .or_else(|| old.map(|o| o.relative_path.clone()))
+            .unwrap_or_default(),
         path: PathBuf::from(&stored.path),
-        members: old.map(|o| o.members.clone()).unwrap_or_default(),
+        members,
         bytes: stored.bytes,
-        hardlinked: old.map(|o| o.hardlinked).unwrap_or(true),
+        hardlinked: stored
+            .hardlinked
+            .or_else(|| old.map(|o| o.hardlinked))
+            .unwrap_or(true),
         complete: stored.complete.unwrap_or(true),
         growth_bytes: stored.growth_bytes,
         regrowth_count: stored.regrowth_count,
@@ -2897,8 +3101,11 @@ pub(crate) fn agent_unit_from_stored(
         protected: stored.protected.unwrap_or(false),
         protect_reason: stored.protect_reason.clone(),
         project_link,
-        action: old
-            .map(|o| o.action)
+        action: stored
+            .action
+            .as_deref()
+            .and_then(crate::agents::AgentActionCapability::from_label)
+            .or_else(|| old.map(|o| o.action))
             .unwrap_or(crate::agents::AgentActionCapability::None),
         note: stored.consequence.clone(),
         evidence: Vec::new(),
@@ -2938,6 +3145,14 @@ fn stored_row_from_nested_artifact(
         variant_configuration: n.variant.configuration.clone(),
         variant_target: n.variant.target.clone(),
         variant_arch: n.variant.architecture.clone(),
+        guidance_recommendation: Some(n.guidance.recommendation.clone()),
+        guidance_modified_age_secs: n.guidance.modified_age_secs,
+        guidance_consequence: Some(n.guidance.consequence.clone()),
+        guidance_scope: Some(n.guidance.scope.clone()),
+        guidance_check_status: Some(n.guidance.check_status.clone()),
+        guidance_reason_code: Some(n.guidance.reason_code.clone()),
+        guidance_message: Some(n.guidance.message.clone()),
+        guidance_next_action: Some(n.guidance.next_action.clone()),
     }
 }
 
@@ -3060,6 +3275,23 @@ pub(crate) fn nested_artifact_from_stored(
         consequence: stored.consequence.clone(),
         reported_by: old.and_then(|o| o.reported_by.clone()),
         writer_lock: old.and_then(|o| o.writer_lock.clone()),
+        guidance: match &stored.guidance_recommendation {
+            Some(recommendation) => crate::cargo_cleanup::Guidance {
+                recommendation: recommendation.clone(),
+                modified_age_secs: stored.guidance_modified_age_secs,
+                consequence: stored.guidance_consequence.clone().unwrap_or_default(),
+                scope: stored.guidance_scope.clone().unwrap_or_default(),
+                check_status: stored.guidance_check_status.clone().unwrap_or_default(),
+                reason_code: stored.guidance_reason_code.clone().unwrap_or_default(),
+                message: stored.guidance_message.clone().unwrap_or_default(),
+                next_action: stored.guidance_next_action.clone().unwrap_or_default(),
+            },
+            // An older store, written before R18a added these columns:
+            // never recompute from a live clock here (that is exactly
+            // the bug this slice fixed) -- fall back to the snapshot's
+            // last-known value, or a bare default if there is none.
+            None => old.map(|o| o.guidance.clone()).unwrap_or_default(),
+        },
     }
 }
 
@@ -6774,15 +7006,19 @@ mod tests {
         assert_eq!(read_rows(&old).unwrap()[0].ecosystem(), None);
     }
 
-    /// R16 item 1: every `ProjectLinkState` variant round-trips through
-    /// `linkage_state`/`linkage_basis`/`project_id`, an `ExternalUnit`'s
-    /// consumers keep their `Vec` order, and the not-yet-migrated fields
-    /// (`provenance`/`hardlinked`; `tool_home`/`relative_path`/`members`/
-    /// `action`) come back from the `old` snapshot copy passed in.
+    /// R16/R18a item 1: every `ProjectLinkState` variant round-trips
+    /// through `linkage_state`/`linkage_basis`/`project_id`, an
+    /// `ExternalUnit`'s consumers keep their `Vec` order, and
+    /// `provenance`/`hardlinked` (external) and `tool_home`/
+    /// `relative_path`/`members`/`action`/`hardlinked` (agent) round-trip
+    /// through their own typed columns -- `old: None` here proves it,
+    /// since the pre-R18a fallback path can only produce a value when
+    /// `old` is `Some`.
     #[test]
     fn unit_tables_round_trip_every_field_and_every_linkage_state() {
         use crate::agents::{
-            AgentActionCapability, AgentCategory, AgentUnit, LinkSource, ProjectLinkState,
+            AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, AgentUnit,
+            LinkSource, ProjectLinkState,
         };
         use crate::external::{ExternalConsumer, ExternalUnit};
         use crate::locations::{Provenance, StorageCategory};
@@ -6794,7 +7030,7 @@ mod tests {
             detector_id: "cargo-home".into(),
             detector_name: "Cargo home".into(),
             category: StorageCategory::Cache,
-            provenance: Provenance::BuiltinConvention,
+            provenance: Provenance::EnvVar("CARGO_HOME".into()),
             path: PathBuf::from("/home/u/.cargo"),
             bytes: 1_048_576,
             mtime_max: 111,
@@ -6865,7 +7101,18 @@ mod tests {
                 id: format!("agent-{i}"),
                 relative_path: format!("projects/x/{i}.jsonl"),
                 path: PathBuf::from(format!("/home/u/.claude/projects/x/{i}.jsonl")),
-                members: Vec::new(),
+                members: vec![
+                    AgentMember {
+                        path: PathBuf::from(format!("/home/u/.claude/projects/x/{i}.jsonl")),
+                        bytes: 4096 + i as u64,
+                        kind: AgentMemberKind::Transcript,
+                    },
+                    AgentMember {
+                        path: PathBuf::from(format!("/home/u/.claude/projects/x/{i}-todos.json")),
+                        bytes: 12,
+                        kind: AgentMemberKind::Todos,
+                    },
+                ],
                 bytes: 4096 + i as u64,
                 hardlinked: i % 2 == 0,
                 complete: i % 2 == 0,
@@ -6910,7 +7157,7 @@ mod tests {
             })
             .collect();
         let rebuilt_external =
-            external_unit_from_stored(&tables.external[0], rebuilt_consumers, Some(&external));
+            external_unit_from_stored(&tables.external[0], rebuilt_consumers, None);
         assert_eq!(
             serde_json::to_value(&rebuilt_external).unwrap(),
             serde_json::to_value(&external).unwrap(),
@@ -6918,7 +7165,12 @@ mod tests {
         );
 
         for (stored, original) in tables.agent.iter().zip(agents.iter()) {
-            let rebuilt = agent_unit_from_stored(stored, Some(original));
+            let member_rows: Vec<&columns::StoredAgentMemberRow> = tables
+                .agent_members
+                .iter()
+                .filter(|m| m.unit_id == stored.id)
+                .collect();
+            let rebuilt = agent_unit_from_stored(stored, &member_rows, None);
             assert_eq!(
                 serde_json::to_value(&rebuilt).unwrap(),
                 serde_json::to_value(original).unwrap(),
@@ -6930,12 +7182,96 @@ mod tests {
         assert!(read_unit_tables(store, "missing").is_none());
     }
 
+    /// R18a item 3: `unowned.parquet`'s `containers`/`shared_with`/
+    /// `evidence` now round-trip through `unowned_lists.parquet`/
+    /// `unowned_evidence.parquet` instead of a JSON cell -- list order
+    /// and every `Evidence` field must survive, and a row with empty
+    /// lists/no evidence must not leave stray rows for other rows to
+    /// pick up.
+    #[test]
+    fn unowned_round_trips_lists_and_evidence_through_their_own_tables() {
+        use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let docker_row = UnownedRow {
+            path_or_object: "sha256:abc123".into(),
+            bytes: 4096,
+            reason: UnownedReason::DockerNoJoin,
+            shared_bytes: Some(8192),
+            note: Some("base image source: example/upstream".into()),
+            docker_kind: Some("image".into()),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            containers: vec!["web (running)".into(), "worker (exited)".into()],
+            shared_with: vec!["example/other:latest".into()],
+            dangling: false,
+            evidence: vec![Evidence::known(
+                FactKind::Activity,
+                FactSubtype::Modified,
+                FactValue::Timestamp(1_700_000_000),
+                EvidenceSource::FilesystemMetadata {
+                    detail: "docker inspect".into(),
+                },
+                1_700_000_100,
+            )],
+        };
+        let plain_row = UnownedRow {
+            path_or_object: "/src/scratch/leftover.bin".into(),
+            bytes: 512,
+            reason: UnownedReason::OutsideAnyCheckout,
+            shared_bytes: None,
+            note: None,
+            docker_kind: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        };
+
+        write_unowned(dir, &[docker_row.clone(), plain_row.clone()]).unwrap();
+
+        let rebuilt = read_unowned(dir);
+        assert_eq!(rebuilt.len(), 2);
+        let rebuilt_docker = rebuilt
+            .iter()
+            .find(|r| r.path_or_object == docker_row.path_or_object)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(rebuilt_docker).unwrap(),
+            serde_json::to_value(&docker_row).unwrap(),
+            "containers/shared_with order and every evidence field must round-trip"
+        );
+        let rebuilt_plain = rebuilt
+            .iter()
+            .find(|r| r.path_or_object == plain_row.path_or_object)
+            .unwrap();
+        assert!(
+            rebuilt_plain.containers.is_empty()
+                && rebuilt_plain.shared_with.is_empty()
+                && rebuilt_plain.evidence.is_empty(),
+            "a row with nothing to carry must not pick up another row's list/evidence rows"
+        );
+
+        // A second full-walk write replaces both tables wholesale, same
+        // as `unowned.parquet` itself -- no leftover rows from the first
+        // write's now-gone docker row.
+        write_unowned(dir, &[plain_row.clone()]).unwrap();
+        let rebuilt2 = read_unowned(dir);
+        assert_eq!(rebuilt2.len(), 1);
+        assert_eq!(rebuilt2[0].path_or_object, plain_row.path_or_object);
+        assert!(rebuilt2[0].containers.is_empty() && rebuilt2[0].evidence.is_empty());
+    }
+
     /// R16 item 2: a `NestedArtifact`'s `container_id`/`adapter`/`family`/
     /// `role`/`path`/`bytes`/`basis`/`mtime`/`consequence`/variant
     /// scalars round-trip, and `nested_artifacts.parquet` splits a
     /// `Report.nested_artifacts` row back out from a
     /// `ReportSnapshot.store_interiors` row by `origin`, never mixing
-    /// the two lists.
+    /// the two lists. R18a adds `guidance` (the cargo-cleanup
+    /// recommendation) as its own typed columns, round-tripped with no
+    /// snapshot fallback at all.
     #[test]
     fn nested_artifact_table_round_trips_every_field_and_splits_by_origin() {
         use crate::artifact::{
@@ -6991,6 +7327,20 @@ mod tests {
             consequence: Some("rebuild with `cargo build`".into()),
             reported_by: None,
             writer_lock: Some(PathBuf::from("/src/one/target/.cargo-lock")),
+            guidance: crate::cargo_cleanup::Guidance {
+                recommendation: "Cleanup candidate · last modified 2h ago".into(),
+                modified_age_secs: Some(7_200),
+                consequence:
+                    "Remove to trade cached compilation work for space; next build may be slower"
+                        .into(),
+                scope: "group".into(),
+                check_status: "unchecked".into(),
+                reason_code: "checks_not_run".into(),
+                message:
+                    "Cleanup candidate; review rebuilding cost and run exact-selection checks."
+                        .into(),
+                next_action: "review_cleanup".into(),
+            },
         };
         let interior_one = NestedArtifact {
             id: "n2".into(),
@@ -7017,6 +7367,11 @@ mod tests {
         assert_eq!(report_rows.len(), 1);
         assert_eq!(interior_rows.len(), 1);
 
+        // Most fields here still come from `old` (the pre-R16/R18a
+        // snapshot fallback) -- this test's whole point. `guidance`
+        // (R18a) is the exception: a second assertion below rebuilds
+        // with `old: None` to prove it comes back from its own typed
+        // columns, not this fallback.
         let rebuilt_report = nested_artifact_from_stored(&report_rows[0], Some(&report_one));
         assert_eq!(
             serde_json::to_value(&rebuilt_report).unwrap(),
@@ -7026,6 +7381,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&rebuilt_interior).unwrap(),
             serde_json::to_value(&interior_one).unwrap()
+        );
+        let rebuilt_report_no_fallback = nested_artifact_from_stored(&report_rows[0], None);
+        assert_eq!(
+            rebuilt_report_no_fallback.guidance, report_one.guidance,
+            "guidance must round-trip through its own typed columns with no snapshot fallback"
         );
 
         assert!(read_nested_artifact_table(store, "missing").is_none());

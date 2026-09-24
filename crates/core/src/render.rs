@@ -1254,7 +1254,7 @@ pub fn render_view_rust_with_limit(
             unit.growth_bytes
                 .map(human_bytes_signed)
                 .unwrap_or_else(|| "—".into()),
-            match crate::cargo_cleanup::guidance(unit).next_action {
+            match crate::cargo_cleanup::guidance(unit).next_action.as_str() {
                 "inspect_groups" => "inspect-groups",
                 "review_cleanup" => "unchecked",
                 _ => "inspection-only",

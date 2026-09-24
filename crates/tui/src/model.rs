@@ -1191,7 +1191,7 @@ fn cargo_children_from_index(
         row.expansion_key = has_children.then_some(key);
         row.collapsed_children = closed.then_some(count);
         let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
-        row.signals = vec![guidance.recommendation, guidance.consequence.into()];
+        row.signals = vec![guidance.recommendation, guidance.consequence];
         row.allocated = true;
         let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
         let advice = match unit.role {
@@ -1505,11 +1505,8 @@ fn append_cleanup_group(
                     report.observed_at
                 ))
             ));
-            row.signals = vec![
-                swamp_core::cargo_cleanup::guidance_at(u, report.observed_at)
-                    .consequence
-                    .into(),
-            ];
+            row.signals =
+                vec![swamp_core::cargo_cleanup::guidance_at(u, report.observed_at).consequence];
             rows.push(row);
         }
     }
@@ -1944,7 +1941,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                             1,
                             format!(
                                 "{} · {}",
-                                match swamp_core::cargo_cleanup::guidance(u).next_action {
+                                match swamp_core::cargo_cleanup::guidance(u).next_action.as_str() {
                                     "inspect_groups" => "category",
                                     "review_cleanup" => "unchecked",
                                     _ => "inspection-only",
@@ -1966,7 +1963,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 swamp_core::cargo_cleanup::guidance_at(u, report.observed_at);
                             row.signals = vec![
                                 guidance.recommendation,
-                                guidance.consequence.into(),
+                                guidance.consequence,
                                 "review required".into(),
                             ];
                         } else {
@@ -1986,7 +1983,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         let guidance = swamp_core::cargo_cleanup::guidance(u);
                         if guidance.check_status != "unchecked" {
                             row.signals
-                                .extend([guidance.recommendation, guidance.consequence.into()]);
+                                .extend([guidance.recommendation, guidance.consequence]);
                         }
                         row.signals
                             .push("allocated bytes; reclaimable space unknown".into());

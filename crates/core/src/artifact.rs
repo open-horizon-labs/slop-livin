@@ -494,6 +494,18 @@ pub struct NestedArtifact {
     /// either way: a crashed build leaves one behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_lock: Option<PathBuf>,
+    /// Cargo-cleanup guidance (recommendation, age, consequence, exact-
+    /// selection check status), computed exactly once per observe pass
+    /// from this unit's own facts and the report's fixed `observed_at`
+    /// (`report::attach_cargo_guidance`) -- R18a. Constructed as
+    /// `Guidance::default()` at identification time everywhere a unit
+    /// is built; the observe-pass finalizer overwrites every unit's
+    /// value before the report is ever read or serialized, so a
+    /// `Default` value here is never what a caller actually sees.
+    /// Serialized under `"cleanup"`, matching the pre-R18a
+    /// `serialize_with` hook's JSON shape exactly.
+    #[serde(default, skip_deserializing, rename = "cleanup")]
+    pub guidance: crate::cargo_cleanup::Guidance,
 }
 
 impl NestedArtifact {
