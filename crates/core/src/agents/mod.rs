@@ -75,6 +75,12 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "kebab-case")]
 pub enum AgentCategory {
     Sessions,
+    /// A session hidden from a tool's default/live listing but not
+    /// deleted -- distinct from [`Self::Sessions`] so the two are never
+    /// silently summed into one number a user cannot decompose (the
+    /// stack/26 Codex reconciliation defect: archived sessions counted
+    /// as ordinary sessions inflated the "sessions" total against `du`).
+    ArchivedSessions,
     Attachments,
     Checkpoints,
     Caches,
@@ -82,6 +88,14 @@ pub enum AgentCategory {
     ManagedWorktrees,
     Plugins,
     ProtectedConfig,
+    /// A protected database (SQLite and its `-wal`/`-shm` sidecars, or
+    /// equivalent): never opened for a row-level drill-down, never a
+    /// target for guessed cleanup (see the store-side guardrail against
+    /// guessed SQLite/WAL/SHM cleanup), but not configuration/credential
+    /// material either -- its own category, distinct from both
+    /// [`Self::Sessions`] (which it used to be folded into) and
+    /// [`Self::ProtectedConfig`].
+    ProtectedDatabases,
     Unclassified,
 }
 
@@ -89,6 +103,7 @@ impl AgentCategory {
     pub fn label(self) -> &'static str {
         match self {
             Self::Sessions => "sessions",
+            Self::ArchivedSessions => "archived-sessions",
             Self::Attachments => "attachments",
             Self::Checkpoints => "checkpoints",
             Self::Caches => "caches",
@@ -96,6 +111,7 @@ impl AgentCategory {
             Self::ManagedWorktrees => "managed-worktrees",
             Self::Plugins => "plugins",
             Self::ProtectedConfig => "protected-config",
+            Self::ProtectedDatabases => "protected-databases",
             Self::Unclassified => "unclassified",
         }
     }
@@ -107,6 +123,7 @@ impl AgentCategory {
     pub fn from_label(label: &str) -> Option<Self> {
         let all = [
             Self::Sessions,
+            Self::ArchivedSessions,
             Self::Attachments,
             Self::Checkpoints,
             Self::Caches,
@@ -114,6 +131,7 @@ impl AgentCategory {
             Self::ManagedWorktrees,
             Self::Plugins,
             Self::ProtectedConfig,
+            Self::ProtectedDatabases,
             Self::Unclassified,
         ];
         all.into_iter().find(|c| c.label() == label)
@@ -133,7 +151,7 @@ impl AgentCategory {
     /// adapter (e.g. Claude Code's `history.jsonl`) or by a human
     /// `swamp protect` entry.
     pub fn default_protected(self) -> bool {
-        matches!(self, Self::ProtectedConfig)
+        matches!(self, Self::ProtectedConfig | Self::ProtectedDatabases)
     }
 }
 
@@ -2398,6 +2416,7 @@ mod tests {
     fn category_default_protection_is_config_only() {
         for c in [
             AgentCategory::Sessions,
+            AgentCategory::ArchivedSessions,
             AgentCategory::Attachments,
             AgentCategory::Checkpoints,
             AgentCategory::Caches,
@@ -2412,6 +2431,7 @@ mod tests {
             );
         }
         assert!(AgentCategory::ProtectedConfig.default_protected());
+        assert!(AgentCategory::ProtectedDatabases.default_protected());
     }
 
     #[test]
@@ -2432,6 +2452,7 @@ mod tests {
         ];
         for c in [
             AgentCategory::Sessions,
+            AgentCategory::ArchivedSessions,
             AgentCategory::Attachments,
             AgentCategory::Checkpoints,
             AgentCategory::Caches,
@@ -2439,6 +2460,7 @@ mod tests {
             AgentCategory::ManagedWorktrees,
             AgentCategory::Plugins,
             AgentCategory::ProtectedConfig,
+            AgentCategory::ProtectedDatabases,
             AgentCategory::Unclassified,
         ] {
             assert!(!storage_strs.contains(&c.key_str().as_str()));

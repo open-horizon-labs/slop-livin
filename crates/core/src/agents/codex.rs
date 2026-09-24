@@ -162,7 +162,17 @@ fn session_unit(
     // (`crate::agents::LinkBasis`). A unit whose link is `Fixed` makes
     // its whole container unstorable.
     let declared = read_header_cwd(&jsonl, ctx);
-    let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, jsonl.clone())
+    // `archived_sessions/` is its own category, not folded into
+    // `sessions/`: stack/26's Codex reconciliation defect was exactly
+    // this row reporting into `AgentCategory::Sessions` regardless of
+    // `archived`, which summed live and archived bytes into one
+    // "sessions" total a user could not decompose against `du`.
+    let category = if archived {
+        AgentCategory::ArchivedSessions
+    } else {
+        AgentCategory::Sessions
+    };
+    let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, category, jsonl.clone())
         .relative_to(home)
         .members(vec![AgentMember {
             path: jsonl,
@@ -374,7 +384,13 @@ fn identify_sqlite_stores(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
             }
         }
         out.push(
-            AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::Sessions, path)
+            // `ProtectedDatabases`, not `Sessions`: these are state
+            // stores, not conversation history, and folding them into
+            // `Sessions` was stack/26's Codex reconciliation defect --
+            // it inflated the reported "sessions" total by every
+            // SQLite store's bytes (plus `-wal`/`-shm`) against what
+            // `du` shows per top-level entry.
+            AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::ProtectedDatabases, path)
                 .relative_path(store.filename)
                 .bytes(bytes)
                 .members_keep_bytes(members)
@@ -443,6 +459,16 @@ const STATIC_ENTRIES: &[StaticEntry] = &[
         protected: false,
         note: "CLI debug logs; regenerated automatically. Directory name is this epic's prior \
                research, not independently re-confirmed by source in this chunk",
+    },
+    StaticEntry {
+        rel: "plugins",
+        category: AgentCategory::Plugins,
+        action: AgentActionCapability::None,
+        protected: false,
+        note: "installed plugin cache (`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/`, \
+               per developers.openai.com/codex/plugins/build: \"ChatGPT installs plugins into \
+               ~/.codex/plugins/cache/$MARKETPLACE_NAME/$PLUGIN_NAME/$VERSION/\"); previously fell \
+               into the unclassified residual, which is stack/26's Codex reconciliation defect",
     },
 ];
 
@@ -941,5 +967,90 @@ mod tests {
             b.project_link()
         );
         contract::linkage_is_declared_or_explicit(&units, "guessable-project-name");
+    }
+
+    /// stack/26's Codex reconciliation defect, falsified directly: build
+    /// a home with one entry in every category this adapter knows about
+    /// (live session, archived session, every SQLite store with its
+    /// `-wal`/`-shm` sidecars, `config.toml`, `auth.json`, `skills/`,
+    /// `log/`, `plugins/`) plus one genuinely unrecognized entry, and
+    /// assert the identified units' bytes sum to *exactly* the home's
+    /// own folded byte total -- not "close", not "within a category or
+    /// two of each other". Before this chunk, `state_5.sqlite`/
+    /// `logs_2.sqlite`/`thread_history_1.sqlite` (etc.) reported into
+    /// `AgentCategory::Sessions`, `plugins/` fell into the unclassified
+    /// residual, and `archived_sessions/` was indistinguishable from
+    /// `sessions/` -- category *totals* were wrong even when this
+    /// grand total happened to still add up, which is exactly the
+    /// silent failure mode a per-category breakdown (`--view agents`)
+    /// exists to prevent.
+    #[test]
+    fn category_totals_reconcile_against_the_homes_folded_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+
+        touch(
+            &home.join("sessions/2026/09/21/rollout-live.jsonl"),
+            header_line("/nonexistent/live", "x").as_bytes(),
+        );
+        touch(
+            &home.join(
+                "archived_sessions/2026/01/02/rollout-2026-01-02T00-00-00-\
+                 22222222-2222-4222-8222-222222222222.jsonl",
+            ),
+            header_line("/nonexistent/archived", "x").as_bytes(),
+        );
+        for store in SQLITE_STORES {
+            touch(&home.join(store.filename), b"sqlite-bytes-payload");
+            touch(&home.join(format!("{}-wal", store.filename)), b"wal-bytes");
+            touch(&home.join(format!("{}-shm", store.filename)), b"shm-bytes");
+        }
+        touch(&home.join("config.toml"), b"model = \"gpt\"\n");
+        touch(&home.join("auth.json"), b"{\"token\":\"x\"}");
+        touch(&home.join("skills/foo/SKILL.md"), b"# a skill\n");
+        touch(&home.join("log/codex.log"), b"debug line\n");
+        touch(
+            &home.join("plugins/marketplace/example-plugin/1.0.0/plugin.json"),
+            b"{\"name\":\"example-plugin\"}",
+        );
+        // The one entry nothing here has a rule for.
+        touch(&home.join("some-future-store.bin"), b"opaque-future-bytes");
+
+        let units = run(home);
+
+        // Every category this fixture touches is represented, and
+        // distinctly: a defect that folds two of them together would
+        // still pass a bytes-only reconciliation (the totals can agree
+        // by coincidence), so this asserts the *set* of categories
+        // present first.
+        let categories: std::collections::HashSet<AgentCategory> =
+            units.iter().map(|u| u.category()).collect();
+        for expected in [
+            AgentCategory::Sessions,
+            AgentCategory::ArchivedSessions,
+            AgentCategory::ProtectedDatabases,
+            AgentCategory::ProtectedConfig,
+            AgentCategory::Logs,
+            AgentCategory::Plugins,
+            AgentCategory::Unclassified,
+        ] {
+            assert!(
+                categories.contains(&expected),
+                "{expected:?} missing from {categories:?}"
+            );
+        }
+
+        let identified_total: u64 = units.iter().map(|u| u.bytes()).sum();
+        let (home_total, _mtime, truncated) = crate::agents::folded_bytes(home, MAX_FOLD_ENTRIES);
+        assert!(!truncated, "fixture is far under the fold bound");
+        assert_eq!(
+            identified_total,
+            home_total,
+            "identified units: {:?}",
+            units
+                .iter()
+                .map(|u| (u.category(), u.relative_path().to_string(), u.bytes()))
+                .collect::<Vec<_>>()
+        );
     }
 }

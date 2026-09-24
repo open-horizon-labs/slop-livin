@@ -169,6 +169,7 @@ Every identified unit falls into one of these (`AgentCategory` in
 | Category | Meaning | Protected by default? | Supported action |
 |---|---|---|---|
 | Sessions | Transcripts and their directly-linked recovery material (companion subagent dir, checkpoints, todos, attachments) | Individually (e.g. `history.jsonl`) where an adapter says so | **Session removal** -- exact member set, reference-verified fresh at execution |
+| Archived sessions | A session a tool itself moved out of its default/live listing (e.g. Codex's `archived_sessions/`) but did not delete -- kept distinct from Sessions so the two are never silently summed into one total a user cannot decompose against `du` (stack/26's Codex reconciliation defect) | Individually, same as Sessions | **Session removal**, same as Sessions |
 | Attachments | Shared or per-session pasted/uploaded content | Often, when shared/not session-scoped | None yet |
 | Checkpoints | File-history/backup material not currently linked to any live session | No (unless orphaned and adapter-flagged) | None yet |
 | Caches | Regenerated-automatically technical caches | No | **Cache/log Trash move** |
@@ -176,6 +177,7 @@ Every identified unit falls into one of these (`AgentCategory` in
 | Managed worktrees | Git worktrees a tool created | N/A -- reuses existing worktree identity, never separately re-measured | Existing Git/worktree action protections apply, not this module's |
 | Plugins | Marketplace configuration and downloaded plugin/skill code | No (the `.trash` staging subdirectories are actionable; the rest is not) | **Cache/log Trash move** for `.trash` only |
 | Protected config | Credentials, settings, skills, commands, subagent/automation definitions | **Yes, always** | None -- never actionable |
+| Protected databases | SQLite state stores and their `-wal`/`-shm` sidecars (e.g. Codex's `state_5.sqlite`, `logs_2.sqlite`, `thread_history_1.sqlite`) -- never opened for a row-level drill-down, never a target for guessed cleanup | **Yes, always** | None -- never actionable |
 | Unclassified | Anything with no specific rule (a residual bucket, never silently dropped) | Case by case | None yet |
 
 Only **cache/log Trash move** and **session removal** have a supported
@@ -368,21 +370,28 @@ version-varying wire format); any shape not matched resolves to
   <thread-id>[_<rollout-id>].jsonl` -- one file per session, no
   documented companion directory, so a session's member set is always
   exactly that one file.
-- **Archived sessions:** `archived_sessions/` in the same date-tree
-  shape, identified the same way with an explicit "archived, not
-  evidence of disuse" note -- archiving is a Codex-side visibility
-  change, not a deletion.
-- **SQLite state stores (a version boundary):** `state_5.sqlite`,
-  `logs_2.sqlite`, `goals_1.sqlite`, `memories_1.sqlite`,
-  `memories_v2_1.sqlite`, `queue_1.sqlite`, `thread_history_1.sqlite`,
-  each folded with its `-wal`/`-shm` sidecars into one protected,
-  non-actionable unit. That is **seven**, which is what upstream's
-  `const RUNTIME_DBS: [RuntimeDbSpec; 7]` declares; this catalog
-  modelled six, because `memories_v2_1.sqlite`'s filename is an inline
-  literal rather than one of the six `*_DB_FILENAME` constants, so it
-  was neither folded with its sidecars nor protected. The sidecars are
-  also excluded from the unclassified residual now -- previously their
-  bytes were counted twice, once in the store's unit and once there.
+- **Archived sessions** (category `archived-sessions`, distinct from
+  `sessions` since stack/26): `archived_sessions/` in the same
+  date-tree shape, identified the same way with an explicit "archived,
+  not evidence of disuse" note -- archiving is a Codex-side visibility
+  change, not a deletion. Reported under its own category rather than
+  folded into `sessions` so the two are never silently summed into one
+  total a user cannot decompose against `du` (the reconciliation defect
+  this chunk fixed: `--view agents` had shown a "sessions" total that
+  was actually live + archived + every SQLite store combined).
+- **SQLite state stores (a version boundary), category
+  `protected-databases` (not `sessions`, since stack/26):**
+  `state_5.sqlite`, `logs_2.sqlite`, `goals_1.sqlite`,
+  `memories_1.sqlite`, `memories_v2_1.sqlite`, `queue_1.sqlite`,
+  `thread_history_1.sqlite`, each folded with its `-wal`/`-shm`
+  sidecars into one protected, non-actionable unit. That is **seven**,
+  which is what upstream's `const RUNTIME_DBS: [RuntimeDbSpec; 7]`
+  declares; this catalog modelled six, because `memories_v2_1.sqlite`'s
+  filename is an inline literal rather than one of the six
+  `*_DB_FILENAME` constants, so it was neither folded with its
+  sidecars nor protected. The sidecars are also excluded from the
+  unclassified residual now -- previously their bytes were counted
+  twice, once in the store's unit and once there.
   `CODEX_SQLITE_HOME` can relocate all seven *outside* `CODEX_HOME`; this
   adapter does not follow that override (a documented gap, same shape
   as Claude Code's `~/.claude.json` sibling gap) -- if set, these files
@@ -391,6 +400,10 @@ version-varying wire format); any shape not matched resolves to
   upstream comments this last one "Deprecated user skills location" and
   puts the current root at `~/.agents/skills`, which is outside
   `CODEX_HOME` and is not modeled here.
+- **Plugins (category `plugins`, since stack/26):** `plugins/`, the
+  installed-plugin cache (`~/.codex/plugins/cache/<marketplace>/
+  <plugin>/<version>/` per developers.openai.com/codex/plugins/build).
+  Previously fell into the unclassified residual.
 - **Individually protected, not by category:** `history.jsonl`
   (cross-session prompt history, category `sessions`).
 - **Logs (actionable):** `log/` (name carried over from this epic's

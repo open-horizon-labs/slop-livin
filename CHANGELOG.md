@@ -4,6 +4,36 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Codex agent-storage category reconciliation fixed
+
+`--view agents` on a real Codex home could show a "sessions" total that
+did not decompose against `du`: SQLite state stores (`state_5.sqlite`,
+`logs_2.sqlite`, `thread_history_1.sqlite`, etc., with their `-wal`/
+`-shm` sidecars) reported into the `sessions` category instead of their
+own, `archived_sessions/` was indistinguishable from live `sessions/`,
+and `plugins/` fell into the unclassified residual. Two new categories
+-- `archived-sessions` and `protected-databases` (the latter protected
+by default, same as `protected-config`) -- and a new `plugins/`
+top-level entry (`~/.codex/plugins/cache/<marketplace>/<plugin>/
+<version>/`, per developers.openai.com/codex/plugins/build) fix the
+category assignment; a new test asserts every identified unit's bytes
+sum to exactly the home's own folded byte total on a fixture covering
+every category.
+
+### Pre-existing `build_adapter_history` test failures fixed
+
+Three tests failed on a machine with a live Docker daemon running
+(previously misattributed to a Linux-only "container re-identification"
+defect): the test helper's entry point hardcodes `docker_in_scope: true`
+(intentional for pre-scope single-root callers), which pulled real
+BuildKit builder facts from whatever Docker daemon the test happened to
+run under -- daemon-store containers are never inside a trusted
+`EventCoverage` window, so they were always re-"identified", adding one
+per active builder to every count regardless of the fixture.
+`report_full_mode_scoped` (already takes `docker_in_scope` explicitly)
+is now `pub` so a test can force it `false` and get a result that
+depends only on its own fixture.
+
 ### Unowned/remainder rows no longer live in a JSON file
 
 `<volume>/unowned.json` reached 473 MB on a real default-scope store (one
