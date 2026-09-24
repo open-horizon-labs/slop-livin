@@ -61,7 +61,12 @@ names, so a JSON *cache* wearing a different extension (the
 it starts scaling with observed data instead of staying a small
 summary. `agent_protect.json` is done (R14, stack/26): the human keep
 list is now `protect.parquet` (`path`, `added_at`), typed columns, no
-JSON cell -- see `crates/core/src/protection.rs`. Not yet done:
+JSON cell -- see `crates/core/src/protection.rs`. `projects.parquet`,
+`worktrees.parquet`, `worktree_facts.parquet` and the current-artifact
+table's `ecosystem` column are done (R15, stack/26): `swamp report`
+builds `Report.projects` from them and reads only the remaining parts
+from `report_rows.parquet`'s JSON cell (see
+`crates/core/tests/project_worktree_tables.rs`). Not yet done:
 `grants.json`, `scope.json`, `last_run.json`, `docker_facts.json`,
 `topology.json`, `fsevents.json`, `ledger.jsonl` and
 `last_report*.json.zst` itself are all still JSON files under the

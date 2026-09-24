@@ -438,6 +438,55 @@ vectors, JSON-encoded into `Utf8` cells exactly like
 `unowned.parquet`'s `evidence_json` column (a cell encoding, not a JSON
 file on disk).
 
+Three of the snapshot's `report_json` cell's contents now have typed
+tables of their own (R15, tables 2-4 of the JSON-in-the-store
+decomposition begun with `protect.parquet`), written by the same
+`observe_scope` call under the same gate and keyed by the same scope
+key, and rebuilt from by `report_scope_from_store`:
+
+- `<store>/projects.parquet` -- one row per `ProjectRow`: `scope_key`,
+  `project_id`, `name`, `ecosystems` (`|`-joined tags, original order),
+  `remote`, `bytes`, `local_bytes`, `allocated_bytes`, `growth_bytes`
+  (nullable), `regrowth_count`, `worktree_count`, `observed_at`. The
+  byte/growth/regrowth columns are rollups over the project's artifact
+  rows; nothing renders them yet (`render.rs` still sums on the fly).
+- `<store>/worktrees.parquet` -- one row per `WorktreeRow`: `scope_key`,
+  `worktree_id`, `project_id`, `path`, `kind`, `branch`, `idle_secs`,
+  the `GithubFacts` scalars flattened under a `github_` prefix
+  (`default_branch`, `branch_exists_on_remote`, `unavailable_reason`,
+  `merged_state`/`merged_at`/`merged_pr_number`, `pr_state`/`pr_number`/
+  `pr_status`/`pr_draft`/`pr_url`/`pr_title`/`pr_review_decision`/
+  `pr_updated_at`), `merge_complete_verdict`, `observed_at`. All
+  nullable except identity/path/kind/observed_at.
+- `<store>/worktree_facts.parquet` -- the child table for a worktree's
+  two list-valued facts: `scope_key`, `worktree_id`, `fact_kind`
+  (`signal` | `merge_complete_term`), `name` (the signal's name; null for
+  a term), `value`, `seq` (list position, so order round-trips).
+- the per-volume current-artifact table (`<store>/<volume>/current.parquet`,
+  `growth::columns::StoredRow`) gained an `ecosystem` column; its
+  `kind`, `rel_path`, `bytes`, `local_bytes`, `mtime_max`, `hardlinked`,
+  `dedup_stale`, `regrowth_count` and `observed_at` were already the
+  render's artifact columns. The growth consumer now fills artifact
+  ecosystems (`report::annotate_artifact_ecosystems`, idempotent) before
+  the history is written; tracking still calls it too.
+
+`report_scope_from_store` builds `Report.projects` from these tables: a
+project's/worktree's own scalars, signals and GitHub/merge-complete facts
+come from `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`,
+an artifact's bytes/local_bytes/mtime_max/hardlinked/dedup_stale/
+regrowth_count/observed_at/ecosystem from the current-artifact table
+(keyed like the history, `growth::artifact_row_key`), and only the
+fields CHUNK_R15 left for later slices (an artifact's evidence,
+confidence, source, track, containers, shared_with, dangling, note,
+created_at, allocated bytes and growth, plus the report's unowned rows,
+reconciliation, series, notes, summary, nested artifacts, coverage and
+unit vectors) are still taken from the snapshot's cells. A store with no
+table rows for the scope (written before this) falls back to the
+snapshot's tree unchanged; there is no migration.
+`crates/core/tests/project_worktree_tables.rs` pins this in both
+directions: a snapshot whose `report_json` was tampered with still
+reports the tables' values, and a tampered note still shows.
+
 `swamp report` (`report::report_scope_from_store`) does the reverse:
 resolve the scope (a config read plus one presence `stat` per candidate
 root, never a recursive walk), compute its key, and read the stored

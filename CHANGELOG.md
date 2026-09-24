@@ -4,6 +4,26 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: `projects.parquet`, `worktrees.parquet`, artifact `ecosystem` (tables 2-4)
+
+`swamp observe` now writes three more typed tables next to
+`report_rows.parquet`, keyed by the same scope key: `projects.parquet`
+(one row per project: id, name, `|`-joined ecosystem tags, remote,
+byte/growth/regrowth rollups, worktree count), `worktrees.parquet`
+(one row per worktree: id, project, path, kind, branch, idle time and
+every GitHub/merge-complete scalar flattened under a `github_` prefix)
+and its child `worktree_facts.parquet` (signals and merge-complete
+terms, one row per entry, order kept). The per-volume current-artifact
+table gained an `ecosystem` column, the one artifact-render field it
+did not already hold. `swamp report` rebuilds a report's projects,
+worktrees and artifact byte/age/ecosystem facts from these tables and
+takes only the not-yet-migrated parts (per-artifact evidence and
+provenance, unowned rows, reconciliation, series, summary, coverage,
+unit vectors) from the snapshot. Text and JSON output are unchanged
+(`crates/core/tests/project_worktree_tables.rs` renders every view from
+both sources and compares). No migration: a store from before this
+reads as it did.
+
 ### No JSON in the store: `protect.parquet` (item A, in progress)
 
 `swamp protect add/list/remove`'s human keep list moved from

@@ -59,6 +59,16 @@ spawns a subprocess. Run `observe` first; `report` on a scope that has
 never been observed prints `no observation yet for <scope>; run swamp
 observe` (JSON: `{"error":"no_observation", ...}`) and exits 2.
 
+What `report` reads is Parquet, table by table: the project, worktree
+and artifact rows come from `projects.parquet`, `worktrees.parquet`
+(+ `worktree_facts.parquet` for signals and merge-complete terms) and
+the per-volume current-artifact table; the rest of the report still
+comes from `report_rows.parquet` until the remaining tables land (see
+`docs/architecture.md`). Every table is rewritten by `observe`; delete
+one and the next `observe` recreates it. There is no migration for a
+store written before a table existed -- `report` simply reads what the
+last `observe` wrote.
+
 ```bash
 swamp observe ~/src
 swamp observe ~/src --since 24h --full

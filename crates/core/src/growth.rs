@@ -1453,6 +1453,305 @@ pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportS
     })
 }
 
+// ---------------------------------------------------------------------
+// projects.parquet / worktrees.parquet / worktree_facts.parquet (R15
+// item 2/~10 of the JSON-in-the-store decomposition; see
+// `.oh/sessions/2026-09-24-r14-json-decomposition.md` for item 1,
+// `protect.parquet`). Scope-wide, keyed by the same `scope_key` as
+// `report_rows.parquet`, written by the same `observe_scope` call and
+// read back by `report::report_scope_from_store`, which uses these
+// tables as the source of a `WorktreeRow`'s/`ProjectRow`'s own scalars
+// and overlays the fields this slice does not migrate (an
+// `ArtifactRow`'s evidence/confidence/track/containers/... -- CHUNK_R15
+// item 3 names exactly which artifact-render columns move this slice;
+// the rest are explicitly later slices) from the snapshot by key.
+// ---------------------------------------------------------------------
+
+fn projects_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("projects.parquet")
+}
+
+fn worktrees_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("worktrees.parquet")
+}
+
+fn worktree_facts_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("worktree_facts.parquet")
+}
+
+/// Sums one project's artifacts for `projects.parquet`'s aggregate
+/// columns. Not read by any render/agent_json path today (`ProjectRow`
+/// itself carries no byte totals; `render.rs` sums worktrees/artifacts
+/// on the fly instead) -- computed here anyway because CHUNK_R15 names
+/// these columns explicitly, and a stored rollup is real, cheap
+/// information for a future summary table even before anything reads
+/// it back.
+fn project_totals(p: &ProjectRow) -> (u64, u64, u64, Option<i64>, u32) {
+    let mut bytes = 0u64;
+    let mut local_bytes = 0u64;
+    let mut allocated_bytes = 0u64;
+    let mut growth_bytes: Option<i64> = None;
+    let mut regrowth_count = 0u32;
+    for wt in &p.worktrees {
+        for a in &wt.artifacts {
+            bytes += a.bytes;
+            local_bytes += a.local_bytes;
+            allocated_bytes += a.allocated_bytes.unwrap_or(0);
+            if let Some(g) = a.growth_bytes {
+                growth_bytes = Some(growth_bytes.unwrap_or(0) + g);
+            }
+            regrowth_count += a.regrowth_count;
+        }
+    }
+    (
+        bytes,
+        local_bytes,
+        allocated_bytes,
+        growth_bytes,
+        regrowth_count,
+    )
+}
+
+fn github_merged_label(m: &crate::github::MergedStatus) -> &'static str {
+    match m {
+        crate::github::MergedStatus::Yes { .. } => "yes",
+        crate::github::MergedStatus::No => "no",
+        crate::github::MergedStatus::Unknown => "unknown",
+    }
+}
+
+fn github_pr_state_label(p: &crate::github::PrState) -> &'static str {
+    match p {
+        crate::github::PrState::Open => "open",
+        crate::github::PrState::Closed => "closed",
+        crate::github::PrState::Merged => "merged",
+    }
+}
+
+fn github_review_decision_label(d: crate::github::ReviewDecision) -> &'static str {
+    use crate::github::ReviewDecision;
+    match d {
+        ReviewDecision::Approved => "approved",
+        ReviewDecision::ChangesRequested => "changes_requested",
+        ReviewDecision::ReviewRequired => "review_required",
+        ReviewDecision::None => "none",
+        ReviewDecision::Unknown => "unknown",
+    }
+}
+
+fn tristate_label(t: crate::github::TriState) -> &'static str {
+    use crate::github::TriState;
+    match t {
+        TriState::Yes => "yes",
+        TriState::No => "no",
+        TriState::Unknown => "unknown",
+    }
+}
+
+fn build_stored_worktree_row(
+    scope_key: &str,
+    project_id: &str,
+    wt: &WorktreeRow,
+    observed_at: u64,
+) -> columns::StoredWorktreeRow {
+    let mut row = columns::StoredWorktreeRow {
+        scope_key: scope_key.to_string(),
+        worktree_id: wt.worktree_id.clone(),
+        project_id: project_id.to_string(),
+        path: wt.path.display().to_string(),
+        kind: format!("{:?}", wt.kind),
+        branch: wt.branch.clone(),
+        idle_secs: wt.idle_secs,
+        github_default_branch: None,
+        github_branch_exists_on_remote: None,
+        github_unavailable_reason: None,
+        github_merged_state: None,
+        github_merged_at: None,
+        github_merged_pr_number: None,
+        github_pr_state: None,
+        github_pr_number: None,
+        github_pr_status: None,
+        github_pr_draft: None,
+        github_pr_url: None,
+        github_pr_title: None,
+        github_pr_review_decision: None,
+        github_pr_updated_at: None,
+        merge_complete_verdict: None,
+        observed_at,
+    };
+    if let Some(g) = &wt.github {
+        row.github_default_branch = g.default_branch.clone();
+        row.github_branch_exists_on_remote = g.branch_exists_on_remote;
+        row.github_unavailable_reason = g.unavailable_reason.clone();
+        row.github_merged_state = Some(github_merged_label(&g.merged).to_string());
+        if let crate::github::MergedStatus::Yes {
+            merged_at,
+            pr_number,
+        } = &g.merged
+        {
+            row.github_merged_at = merged_at.clone();
+            row.github_merged_pr_number = *pr_number;
+        }
+        match &g.pull_request {
+            crate::github::PrStatus::Some(pr) => {
+                row.github_pr_state = Some("some".to_string());
+                row.github_pr_number = Some(pr.number);
+                row.github_pr_status = Some(github_pr_state_label(&pr.state).to_string());
+                row.github_pr_draft = Some(pr.draft);
+                row.github_pr_url = Some(pr.url.clone());
+                row.github_pr_title = Some(pr.title.clone());
+                row.github_pr_review_decision =
+                    Some(github_review_decision_label(pr.review_decision).to_string());
+                row.github_pr_updated_at = Some(pr.updated_at.clone());
+            }
+            crate::github::PrStatus::None => row.github_pr_state = Some("none".to_string()),
+            crate::github::PrStatus::Unknown => row.github_pr_state = Some("unknown".to_string()),
+        }
+    }
+    if let Some(mc) = &wt.merge_complete {
+        row.merge_complete_verdict = Some(tristate_label(mc.verdict).to_string());
+    }
+    row
+}
+
+/// Writes `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`
+/// for `scope_key`, replacing that scope's rows wholesale (same
+/// per-scope-key replace semantics as `write_report_snapshot`). Called
+/// from `observe_scope` alongside the snapshot write, on the same
+/// already-merged multi-root `projects` tree -- no second walk.
+pub fn write_project_worktree_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    projects: &[ProjectRow],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+
+    let projects_file = projects_path(swamp_dir);
+    let mut project_rows: Vec<columns::StoredProjectRow> =
+        columns::read_project_rows(&projects_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+
+    let worktrees_file = worktrees_path(swamp_dir);
+    let mut worktree_rows: Vec<columns::StoredWorktreeRow> =
+        columns::read_worktree_rows(&worktrees_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+
+    let facts_file = worktree_facts_path(swamp_dir);
+    let mut fact_rows: Vec<columns::StoredWorktreeFactRow> =
+        columns::read_worktree_fact_rows(&facts_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+
+    for p in projects {
+        let (bytes, local_bytes, allocated_bytes, growth_bytes, regrowth_count) = project_totals(p);
+        project_rows.push(columns::StoredProjectRow {
+            scope_key: scope_key.to_string(),
+            project_id: p.project_id.clone(),
+            name: p.name.clone(),
+            ecosystems: p.ecosystems.join("|"),
+            remote: p.remote.clone(),
+            bytes,
+            local_bytes,
+            allocated_bytes,
+            growth_bytes,
+            regrowth_count,
+            worktree_count: p.worktrees.len() as u32,
+            observed_at,
+        });
+
+        for wt in &p.worktrees {
+            worktree_rows.push(build_stored_worktree_row(
+                scope_key,
+                &p.project_id,
+                wt,
+                observed_at,
+            ));
+            for (seq, s) in wt.signals.iter().enumerate() {
+                fact_rows.push(columns::StoredWorktreeFactRow {
+                    scope_key: scope_key.to_string(),
+                    worktree_id: wt.worktree_id.clone(),
+                    fact_kind: "signal".to_string(),
+                    name: Some(s.name.clone()),
+                    value: s.value.clone(),
+                    seq: seq as u32,
+                });
+            }
+            if let Some(mc) = &wt.merge_complete {
+                for (seq, t) in mc.terms.iter().enumerate() {
+                    fact_rows.push(columns::StoredWorktreeFactRow {
+                        scope_key: scope_key.to_string(),
+                        worktree_id: wt.worktree_id.clone(),
+                        fact_kind: "merge_complete_term".to_string(),
+                        name: None,
+                        value: t.clone(),
+                        seq: seq as u32,
+                    });
+                }
+            }
+        }
+    }
+
+    columns::write_project_rows(&projects_file, &project_rows)
+        .with_context(|| format!("write {}", projects_file.display()))?;
+    columns::write_worktree_rows(&worktrees_file, &worktree_rows)
+        .with_context(|| format!("write {}", worktrees_file.display()))?;
+    columns::write_worktree_fact_rows(&facts_file, &fact_rows)
+        .with_context(|| format!("write {}", facts_file.display()))?;
+    Ok(())
+}
+
+/// Every stored row of `projects.parquet`/`worktrees.parquet`/
+/// `worktree_facts.parquet` for `scope_key`. `None` when no table exists
+/// yet (an older store, or a scope never observed under this build) --
+/// same cache-miss discipline as [`read_report_snapshot`]; the caller
+/// falls back to the snapshot's own `report.projects` in that case.
+pub(crate) struct StoredProjectWorktreeTables {
+    pub(crate) projects: Vec<columns::StoredProjectRow>,
+    pub(crate) worktrees: Vec<columns::StoredWorktreeRow>,
+    pub(crate) worktree_facts: Vec<columns::StoredWorktreeFactRow>,
+}
+
+pub(crate) fn read_project_worktree_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+) -> Option<StoredProjectWorktreeTables> {
+    let projects: Vec<columns::StoredProjectRow> =
+        columns::read_project_rows(&projects_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    if projects.is_empty() {
+        return None;
+    }
+    let worktrees: Vec<columns::StoredWorktreeRow> =
+        columns::read_worktree_rows(&worktrees_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    let worktree_facts: Vec<columns::StoredWorktreeFactRow> =
+        columns::read_worktree_fact_rows(&worktree_facts_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    Some(StoredProjectWorktreeTables {
+        projects,
+        worktrees,
+        worktree_facts,
+    })
+}
+
 /// The current-artifact-table facts `report_scope_from_store` needs per
 /// artifact row (R15 item 3): everything the extended `StoredRow` now
 /// carries, keyed the same way the artifact history already keys rows
@@ -1498,6 +1797,154 @@ pub fn artifact_table_facts_for_roots(
         }
     }
     out
+}
+
+fn parse_worktree_kind(s: &str) -> crate::report::WorktreeKind {
+    match s {
+        "Linked" => crate::report::WorktreeKind::Linked,
+        "Clone" => crate::report::WorktreeKind::Clone,
+        _ => crate::report::WorktreeKind::Main,
+    }
+}
+
+fn parse_merged_status(
+    state: Option<&str>,
+    merged_at: Option<String>,
+    pr_number: Option<u64>,
+) -> crate::github::MergedStatus {
+    match state {
+        Some("yes") => crate::github::MergedStatus::Yes {
+            merged_at,
+            pr_number,
+        },
+        Some("no") => crate::github::MergedStatus::No,
+        _ => crate::github::MergedStatus::Unknown,
+    }
+}
+
+fn parse_pr_state(s: Option<&str>) -> crate::github::PrState {
+    match s {
+        Some("closed") => crate::github::PrState::Closed,
+        Some("merged") => crate::github::PrState::Merged,
+        _ => crate::github::PrState::Open,
+    }
+}
+
+fn parse_review_decision(s: Option<&str>) -> crate::github::ReviewDecision {
+    use crate::github::ReviewDecision;
+    match s {
+        Some("approved") => ReviewDecision::Approved,
+        Some("changes_requested") => ReviewDecision::ChangesRequested,
+        Some("review_required") => ReviewDecision::ReviewRequired,
+        Some("none") => ReviewDecision::None,
+        _ => ReviewDecision::Unknown,
+    }
+}
+
+fn parse_tristate(s: Option<&str>) -> crate::github::TriState {
+    use crate::github::TriState;
+    match s {
+        Some("yes") => TriState::Yes,
+        Some("no") => TriState::No,
+        _ => TriState::Unknown,
+    }
+}
+
+/// Reconstructs a `WorktreeRow`'s own scalars (everything but
+/// `artifacts`, left empty for the caller to fill from the artifact
+/// table) from `projects.parquet`'s sibling `worktrees.parquet` row plus
+/// its `worktree_facts.parquet` entries.
+pub(crate) fn worktree_row_from_stored(
+    stored: &columns::StoredWorktreeRow,
+    facts: &[columns::StoredWorktreeFactRow],
+) -> WorktreeRow {
+    let mut signal_facts: Vec<&columns::StoredWorktreeFactRow> = facts
+        .iter()
+        .filter(|f| f.worktree_id == stored.worktree_id && f.fact_kind == "signal")
+        .collect();
+    signal_facts.sort_by_key(|f| f.seq);
+    let signals = signal_facts
+        .into_iter()
+        .map(|f| crate::report::Signal {
+            name: f.name.clone().unwrap_or_default(),
+            value: f.value.clone(),
+        })
+        .collect();
+
+    let github =
+        stored
+            .github_merged_state
+            .as_deref()
+            .map(|merged_state| crate::github::GithubFacts {
+                default_branch: stored.github_default_branch.clone(),
+                branch_exists_on_remote: stored.github_branch_exists_on_remote,
+                merged: parse_merged_status(
+                    Some(merged_state),
+                    stored.github_merged_at.clone(),
+                    stored.github_merged_pr_number,
+                ),
+                pull_request: match stored.github_pr_state.as_deref() {
+                    Some("some") => crate::github::PrStatus::Some(crate::github::PullRequestInfo {
+                        number: stored.github_pr_number.unwrap_or(0),
+                        state: parse_pr_state(stored.github_pr_status.as_deref()),
+                        draft: stored.github_pr_draft.unwrap_or(false),
+                        url: stored.github_pr_url.clone().unwrap_or_default(),
+                        title: stored.github_pr_title.clone().unwrap_or_default(),
+                        review_decision: parse_review_decision(
+                            stored.github_pr_review_decision.as_deref(),
+                        ),
+                        updated_at: stored.github_pr_updated_at.clone().unwrap_or_default(),
+                    }),
+                    Some("none") => crate::github::PrStatus::None,
+                    _ => crate::github::PrStatus::Unknown,
+                },
+                unavailable_reason: stored.github_unavailable_reason.clone(),
+            });
+
+    let merge_complete = stored.merge_complete_verdict.as_deref().map(|verdict| {
+        let mut term_facts: Vec<&columns::StoredWorktreeFactRow> = facts
+            .iter()
+            .filter(|f| f.worktree_id == stored.worktree_id && f.fact_kind == "merge_complete_term")
+            .collect();
+        term_facts.sort_by_key(|f| f.seq);
+        crate::github::MergeComplete {
+            verdict: parse_tristate(Some(verdict)),
+            terms: term_facts.into_iter().map(|f| f.value.clone()).collect(),
+        }
+    });
+
+    WorktreeRow {
+        worktree_id: stored.worktree_id.clone(),
+        path: PathBuf::from(&stored.path),
+        kind: parse_worktree_kind(&stored.kind),
+        artifacts: Vec::new(),
+        signals,
+        branch: stored.branch.clone(),
+        github,
+        merge_complete,
+        idle_secs: stored.idle_secs,
+    }
+}
+
+/// Reconstructs a `ProjectRow`'s own scalars (everything but
+/// `worktrees`, left empty for the caller to fill) from a
+/// `projects.parquet` row.
+pub(crate) fn project_row_from_stored(stored: &columns::StoredProjectRow) -> ProjectRow {
+    ProjectRow {
+        project_id: stored.project_id.clone(),
+        name: stored.name.clone(),
+        worktrees: Vec::new(),
+        ecosystems: if stored.ecosystems.is_empty() {
+            Vec::new()
+        } else {
+            stored
+                .ecosystems
+                .split('|')
+                .map(|s| s.to_string())
+                .collect()
+        },
+        remote: stored.remote.clone(),
+    }
 }
 
 /// The same row key the artifact history stores rows under
@@ -4625,6 +5072,122 @@ mod tests {
         assert_eq!(row.rel_path(), "node_modules");
         assert!(!row.rel_path().starts_with('/'));
     }
+    /// R15 tables 2/3: a `ProjectRow`/`WorktreeRow` with every optional
+    /// field populated (a GitHub PR with all of its scalars, a merged
+    /// status carrying `merged_at`/`pr_number`, a merge-complete verdict
+    /// with ordered terms, ordered signals, several ecosystem tags, a
+    /// remote) round-trips through `projects.parquet`/`worktrees.parquet`/
+    /// `worktree_facts.parquet` field for field. The tempting shortcut
+    /// this fails is a lossy flattening -- dropping a PR field, or
+    /// letting the child table lose list order.
+    #[test]
+    fn project_and_worktree_tables_round_trip_every_field_and_keep_list_order() {
+        use crate::github::{
+            GithubFacts, MergeComplete, MergedStatus, PrState, PrStatus, PullRequestInfo,
+            ReviewDecision, TriState,
+        };
+        use crate::report::{Signal, WorktreeKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let wt = |id: &str, kind: WorktreeKind, github: Option<GithubFacts>| WorktreeRow {
+            worktree_id: id.to_string(),
+            path: PathBuf::from(format!("/src/{id}")),
+            kind,
+            artifacts: Vec::new(),
+            signals: vec![
+                Signal {
+                    name: "zeta".into(),
+                    value: "1".into(),
+                },
+                Signal {
+                    name: "alpha".into(),
+                    value: "2".into(),
+                },
+                Signal {
+                    name: "alpha".into(),
+                    value: "3".into(),
+                },
+            ],
+            branch: Some("feature/x".into()),
+            merge_complete: github.as_ref().map(|_| MergeComplete {
+                verdict: TriState::No,
+                terms: vec!["merged=yes".into(), "dirty=yes".into(), "unpushed=0".into()],
+            }),
+            github,
+            idle_secs: Some(12_345),
+        };
+        let full = GithubFacts {
+            default_branch: Some("main".into()),
+            branch_exists_on_remote: Some(true),
+            merged: MergedStatus::Yes {
+                merged_at: Some("2026-09-01T00:00:00Z".into()),
+                pr_number: Some(42),
+            },
+            pull_request: PrStatus::Some(PullRequestInfo {
+                number: 42,
+                state: PrState::Merged,
+                draft: true,
+                url: "https://github.com/o/r/pull/42".into(),
+                title: "a title".into(),
+                review_decision: ReviewDecision::ChangesRequested,
+                updated_at: "2026-09-02T00:00:00Z".into(),
+            }),
+            unavailable_reason: Some("stale cache".into()),
+        };
+        let sparse = GithubFacts::unknown(None);
+        let projects = vec![
+            ProjectRow {
+                project_id: "p1".into(),
+                name: "one".into(),
+                worktrees: vec![
+                    wt("w1", WorktreeKind::Main, Some(full)),
+                    wt("w2", WorktreeKind::Linked, Some(sparse)),
+                ],
+                ecosystems: vec!["rs".into(), "js".into()],
+                remote: Some("github.com/o/r".into()),
+            },
+            ProjectRow {
+                project_id: "p2".into(),
+                name: "two".into(),
+                worktrees: vec![WorktreeRow {
+                    signals: Vec::new(),
+                    branch: None,
+                    idle_secs: None,
+                    ..wt("w3", WorktreeKind::Clone, None)
+                }],
+                ecosystems: Vec::new(),
+                remote: None,
+            },
+        ];
+        write_project_worktree_tables(store, "k", &projects, 7).unwrap();
+        // A second scope's rows must not disturb the first's.
+        write_project_worktree_tables(store, "other", &projects[..1], 8).unwrap();
+
+        let tables = read_project_worktree_tables(store, "k").expect("rows for k");
+        assert_eq!(tables.projects.len(), 2);
+        assert_eq!(tables.projects[0].ecosystems, "rs|js");
+        assert_eq!(tables.projects[0].worktree_count, 2);
+        let rebuilt: Vec<ProjectRow> = tables
+            .projects
+            .iter()
+            .map(|sp| {
+                let mut p = project_row_from_stored(sp);
+                p.worktrees = tables
+                    .worktrees
+                    .iter()
+                    .filter(|w| w.project_id == sp.project_id)
+                    .map(|w| worktree_row_from_stored(w, &tables.worktree_facts))
+                    .collect();
+                p
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(&projects).unwrap()
+        );
+        assert!(read_project_worktree_tables(store, "missing").is_none());
+    }
+
     /// R15 table 4: the current-artifact table carries `ecosystem`, keeps
     /// it across an unchanged re-observation, and refreshes it when it
     /// changes; a store without the column reads `None`, not an error.

@@ -2563,6 +2563,17 @@ pub fn observe_scope(
             &key,
             &snapshot_from_observation(&observation),
         )?;
+        // R15 item 2/~10 of the JSON-in-the-store decomposition:
+        // `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`,
+        // typed columns for what was otherwise only recoverable from
+        // this snapshot's `report_json` cell. Same gate, same already-
+        // merged `projects` tree -- no second pass.
+        crate::growth::write_project_worktree_tables(
+            store_dir,
+            &key,
+            &observation.merged.projects,
+            observation.merged.observed_at,
+        )?;
     }
 
     Ok(observation)
@@ -2837,6 +2848,82 @@ pub fn snapshot_from_observation(o: &ScopeObservation) -> ReportSnapshot {
     }
 }
 
+/// R15 item 4: overwrites `snapshot.report.projects` with the tree
+/// [`crate::growth::write_project_worktree_tables`] wrote for `key` --
+/// `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet` are
+/// the source for a project's/worktree's own scalars (identity,
+/// ecosystems, remote, branch, GitHub facts, merge-complete, signals)
+/// and for the artifact-render columns R15 item 3 moved (bytes,
+/// local_bytes, mtime_max, hardlinked, dedup_stale, regrowth_count,
+/// observed_at, ecosystem). Everything else CHUNK_R15 named as a later
+/// slice (evidence, confidence, source, track, containers, shared_with,
+/// dangling, note, created_at, allocated_bytes, allocated_growth_bytes,
+/// growth_bytes) is carried over from the snapshot's own tree by key --
+/// "leave those in `ReportSnapshot`", per the chunk. A no-op when this
+/// scope has no table rows yet (an older store), leaving `snapshot`
+/// exactly as `read_report_snapshot` returned it.
+fn rebuild_projects_from_tables(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+    key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    let Some(tables) = crate::growth::read_project_worktree_tables(store_dir, key) else {
+        return;
+    };
+
+    let mut old_artifacts_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>> =
+        std::collections::HashMap::new();
+    for p in &snapshot.report.projects {
+        for wt in &p.worktrees {
+            old_artifacts_by_worktree.insert(wt.worktree_id.clone(), wt.artifacts.clone());
+        }
+    }
+
+    let roots: Vec<PathBuf> = scope.roots.iter().map(|r| r.path.clone()).collect();
+    let facts = crate::growth::artifact_table_facts_for_roots(store_dir, &roots);
+
+    let mut new_projects = Vec::with_capacity(tables.projects.len());
+    for stored_project in &tables.projects {
+        let mut project = crate::growth::project_row_from_stored(stored_project);
+        let mut worktrees = Vec::new();
+        for stored_wt in tables
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == stored_project.project_id)
+        {
+            let mut wt = crate::growth::worktree_row_from_stored(stored_wt, &tables.worktree_facts);
+            let worktree_path = wt.path.clone();
+            let mut artifacts = old_artifacts_by_worktree
+                .remove(&stored_wt.worktree_id)
+                .unwrap_or_default();
+            for a in artifacts.iter_mut() {
+                let k = crate::growth::artifact_row_key(
+                    &stored_project.project_id,
+                    &stored_wt.worktree_id,
+                    &worktree_path,
+                    a,
+                );
+                if let Some(f) = facts.get(&k) {
+                    a.bytes = f.bytes;
+                    a.local_bytes = f.local_bytes;
+                    a.mtime_max = f.mtime_max;
+                    a.hardlinked = f.hardlinked;
+                    a.dedup_stale = f.dedup_stale;
+                    a.regrowth_count = f.regrowth_count;
+                    a.observed_at = f.observed_at;
+                    a.ecosystem = f.ecosystem.clone();
+                }
+            }
+            wt.artifacts = artifacts;
+            worktrees.push(wt);
+        }
+        project.worktrees = worktrees;
+        new_projects.push(project);
+    }
+    snapshot.report.projects = new_projects;
+}
+
 /// `swamp report`'s only read path: loads the stored snapshot for
 /// `scope`'s key and returns it, or [`NoObservation`] when this exact
 /// scope has never been observed. No walk, no detector I/O beyond the
@@ -2847,9 +2934,12 @@ pub fn report_scope_from_store(
     store_dir: &Path,
 ) -> std::result::Result<ReportSnapshot, NoObservation> {
     let key = scope_snapshot_key(scope);
-    crate::growth::read_report_snapshot(store_dir, &key).ok_or_else(|| NoObservation {
-        scope_description: describe_scope_for_error(scope),
-    })
+    let mut snapshot =
+        crate::growth::read_report_snapshot(store_dir, &key).ok_or_else(|| NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        })?;
+    rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
+    Ok(snapshot)
 }
 
 mod pass;
