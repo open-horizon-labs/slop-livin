@@ -97,8 +97,6 @@ pub enum JsonFile<'a> {
     Plan { store: &'a StoreDir, id: &'a str },
     /// `<store>/grants.json`: every grant a human minted.
     Grants { store: &'a StoreDir },
-    /// `<store>/agent_protect.json`: the human keep list.
-    ProtectList { store: &'a StoreDir },
     /// `<store>/scope.json`: the last resolved scope (coverage
     /// bookkeeping only).
     Scope { store: &'a StoreDir },
@@ -154,7 +152,6 @@ impl JsonFile<'_> {
                 store.0.join("plans").join(format!("{}.json", plain(id)?))
             }
             JsonFile::Grants { store } => store.0.join("grants.json"),
-            JsonFile::ProtectList { store } => store.0.join("agent_protect.json"),
             JsonFile::Scope { store } => store.0.join("scope.json"),
             JsonFile::LastRun { store } => store.0.join("last_run.json"),
             JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
@@ -169,10 +166,9 @@ impl JsonFile<'_> {
 
     fn encoding(&self) -> Encoding {
         match self {
-            JsonFile::Plan { .. }
-            | JsonFile::Grants { .. }
-            | JsonFile::ProtectList { .. }
-            | JsonFile::Scope { .. } => Encoding::Pretty,
+            JsonFile::Plan { .. } | JsonFile::Grants { .. } | JsonFile::Scope { .. } => {
+                Encoding::Pretty
+            }
             JsonFile::LastReport { .. } => Encoding::CompactZstd,
             _ => Encoding::Compact,
         }

@@ -1031,10 +1031,10 @@ since `tool_home` for an Aider unit is a project worktree root, not a
 tool home directory (see below) -- refuses
 on any membership drift since the plan was proposed, then moves every
 member into one Trash envelope. Human keep/protect intent
-(`swamp protect add/list/remove`) is a small JSON sidecar
-(`agent_protect.json`) under `$SWAMP_DIR`, deliberately decoupled from
-the growth store exactly like `external_consumers.parquet` is: touching it
-never affects an `AgentUnit`'s bytes or history.
+(`swamp protect add/list/remove`) is a small typed table
+(`protect.parquet`: `path`, `added_at`) under `$SWAMP_DIR`, deliberately
+decoupled from the growth store exactly like `external_consumers.parquet`
+is: touching it never affects an `AgentUnit`'s bytes or history.
 
 The TUI's Agents view reuses the exact same mark/confirm/execute
 machinery every other markable view uses, not a parallel one:

@@ -4,6 +4,18 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: `protect.parquet` (item A, in progress)
+
+`swamp protect add/list/remove`'s human keep list moved from
+`agent_protect.json` to a typed table, `protect.parquet` (`path`,
+`added_at`) -- no JSON control file, no migration (an old
+`agent_protect.json` is simply ignored; re-add the paths). This is the
+first table of a table-by-table decomposition removing every remaining
+JSON control file from the store (`scope.json`, `last_run.json`,
+`docker_facts.json`, `topology.json`, `fsevents.json`, `ledger.jsonl`,
+`last_report-*.json.zst`, `grants.json`); see
+`.oh/sessions/2026-09-24-r14-json-decomposition.md` for what remains.
+
 ### Project roots vs. detector locations
 
 Only `~/src`-style built-in roots, `[scan] include` entries, and

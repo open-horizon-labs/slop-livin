@@ -1,7 +1,8 @@
 //! Human keep/protect intent (#100's `swamp protect add/list/remove`):
-//! a small JSON control file in the store, deliberately decoupled from
-//! the growth store. Survives refresh; blocks actions; never inferred
-//! from observation (`.oh/guardrails/protection-fails-closed.md`).
+//! a small typed table in the store (`protect.parquet`), deliberately
+//! decoupled from the growth store. Survives refresh; blocks actions;
+//! never inferred from observation
+//! (`.oh/guardrails/protection-fails-closed.md`).
 //!
 //! [`ProtectList`] is opaque. Its one query is [`ProtectList::conflict`],
 //! the both-directions containment test; there is no accessor to the
@@ -12,21 +13,27 @@
 //! be written, but it cannot be written *about protection*
 //! (`crates/core/tests/compile_fail/protect_list_*.rs`). That replaces
 //! the `protection_fails_closed` call-graph audit.
+//!
+//! This module never names Arrow directly (`gate_paths_only_inside_gates`
+//! confines table schemas to `growth::columns`/`assoc_store`/`store`/
+//! `github`/`fs_gate`): the Parquet schema and (de)serialization live in
+//! `crate::growth::columns::{StoredProtectRow, read_protect_rows,
+//! write_protect_rows}`, and this module owns only the semantics.
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ProtectFile {
-    /// Canonical absolute paths a human explicitly asked to keep.
-    paths: Vec<String>,
-}
+use crate::growth::columns::{StoredProtectRow, read_protect_rows, write_protect_rows};
 
-/// The file the protect list lives in.
+/// One row of the human keep list: an absolute path and when it was
+/// added (epoch seconds), typed -- not a JSON control file
+/// (`.oh/guardrails/store-data-is-parquet-not-json-sidecars.md`).
+type ProtectRow = StoredProtectRow;
+
+/// The table the protect list lives in.
 pub fn protect_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("agent_protect.json")
+    swamp_dir.join("protect.parquet")
 }
 
 /// The human keep list, loaded. Opaque: see the module docs.
@@ -145,19 +152,12 @@ impl std::fmt::Display for ProtectListing {
     }
 }
 
-fn load_paths(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
+fn load_rows(swamp_dir: &Path) -> Result<Vec<ProtectRow>> {
     let path = protect_path(swamp_dir);
-    match crate::fs_gate::read::read_owned_string(&path) {
-        Ok(text) => {
-            let f: ProtectFile = serde_json::from_str(&text).map_err(|e| {
-                anyhow::anyhow!(
-                    "protection state unknown: {} is malformed ({e}). Every action is refused \
-                     until it is repaired or removed; `swamp protect list` shows this same error.",
-                    path.display()
-                )
-            })?;
-            for p in &f.paths {
-                if p.trim().is_empty() {
+    match read_protect_rows(&path) {
+        Ok(rows) => {
+            for r in &rows {
+                if r.path.trim().is_empty() {
                     anyhow::bail!(
                         "protection state unknown: {} contains an empty path entry. Every action \
                          is refused until it is repaired or removed.",
@@ -165,15 +165,21 @@ fn load_paths(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
                     );
                 }
             }
-            Ok(f.paths.into_iter().map(PathBuf::from).collect())
+            Ok(rows)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(anyhow::anyhow!(
             "protection state unknown: {} could not be read ({e}). Every action is refused \
-             until it can be read again.",
+             until it is repaired or removed; `swamp protect list` shows this same error.",
             path.display()
         )),
     }
+}
+
+fn load_paths(swamp_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(load_rows(swamp_dir)?
+        .into_iter()
+        .map(|r| PathBuf::from(r.path))
+        .collect())
 }
 
 /// The single entry point for protection state
@@ -190,17 +196,9 @@ pub fn load_protect(swamp_dir: &Path) -> Result<ProtectList> {
     })
 }
 
-fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
-    let f = ProtectFile {
-        paths: paths.iter().map(|p| p.display().to_string()).collect(),
-    };
-    crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::ProtectList {
-            store: &crate::fs_gate::store::StoreDir::at(swamp_dir)?,
-        },
-        &f,
-    )?;
-    Ok(())
+fn save_rows(swamp_dir: &Path, rows: &[ProtectRow]) -> Result<()> {
+    crate::fs_gate::store::StoreDir::at(swamp_dir)?.create()?;
+    write_protect_rows(&protect_path(swamp_dir), rows)
 }
 
 /// Adds `path` to the human keep list. Stored verbatim, and **refused
@@ -246,10 +244,14 @@ fn protect_add_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let mut paths = load_paths(swamp_dir)?;
-    if !paths.iter().any(|p| p == path) {
-        paths.push(path.to_path_buf());
-        save_protect(swamp_dir, &paths)?;
+    let mut rows = load_rows(swamp_dir)?;
+    let candidate = path.display().to_string();
+    if !rows.iter().any(|r| r.path == candidate) {
+        rows.push(ProtectRow {
+            path: candidate,
+            added_at: crate::entities::now(),
+        });
+        save_rows(swamp_dir, &rows)?;
     }
     Ok(())
 }
@@ -261,11 +263,12 @@ pub fn protect_remove(swamp_dir: &Path, path: &Path) -> Result<()> {
 }
 
 fn protect_remove_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
-    let mut paths = load_paths(swamp_dir)?;
-    let before = paths.len();
-    paths.retain(|p| p != path);
-    if paths.len() != before {
-        save_protect(swamp_dir, &paths)?;
+    let mut rows = load_rows(swamp_dir)?;
+    let target = path.display().to_string();
+    let before = rows.len();
+    rows.retain(|r| r.path != target);
+    if rows.len() != before {
+        save_rows(swamp_dir, &rows)?;
     }
     Ok(())
 }
@@ -287,4 +290,86 @@ pub fn protect_listing(swamp_dir: &Path) -> Result<ProtectListing> {
             .map(|p| p.display().to_string())
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of R14 item A for this file: `protect.parquet` is
+    /// the table, not a JSON sidecar -- and it round-trips through the
+    /// public API exactly as `agent_protect.json` used to, including the
+    /// `added_at` column the old file never had.
+    #[test]
+    fn protect_round_trips_through_parquet_with_added_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        protect_add(dir.path(), &a).unwrap();
+        protect_add(dir.path(), &b).unwrap();
+
+        let table = protect_path(dir.path());
+        assert!(table.exists(), "protect.parquet must exist after an add");
+        assert!(
+            !dir.path().join("agent_protect.json").exists(),
+            "no JSON control file for the protect list"
+        );
+
+        let rows = read_protect_rows(&table).unwrap();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert!(r.added_at > 0, "added_at must be stamped, not left at 0");
+        }
+
+        let list = load_protect(dir.path()).unwrap();
+        assert!(list.conflict(&a).is_some());
+        assert!(list.conflict(&b).is_some());
+
+        protect_remove(dir.path(), &a).unwrap();
+        let rows = read_protect_rows(&table).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, b.display().to_string());
+    }
+
+    /// Adding twice does not duplicate the row or reset `added_at`.
+    #[test]
+    fn protect_add_is_idempotent_and_keeps_the_original_added_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("kept");
+        protect_add(dir.path(), &p).unwrap();
+        let first = read_protect_rows(&protect_path(dir.path())).unwrap();
+        assert_eq!(first.len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        protect_add(dir.path(), &p).unwrap();
+        let second = read_protect_rows(&protect_path(dir.path())).unwrap();
+        assert_eq!(second.len(), 1, "re-adding must not duplicate the row");
+        assert_eq!(
+            second[0].added_at, first[0].added_at,
+            "re-adding an already-protected path must not reset when it was added"
+        );
+    }
+
+    /// Fails closed: a `protect.parquet` that exists but cannot be read
+    /// as Parquet must refuse every caller, not silently mean "nothing
+    /// protected" (`.oh/guardrails/protection-fails-closed.md`).
+    #[test]
+    fn a_corrupt_protect_table_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(protect_path(dir.path()), b"not a parquet file").unwrap();
+        let err = load_protect(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("protection state unknown"),
+            "got: {err}"
+        );
+    }
+
+    /// A missing table is the ordinary "nothing protected yet" case, not
+    /// an error.
+    #[test]
+    fn a_missing_protect_table_is_an_empty_list_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = load_protect(dir.path()).unwrap();
+        assert!(list.is_empty());
+    }
 }

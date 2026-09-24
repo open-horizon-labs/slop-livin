@@ -33,7 +33,6 @@ const ALLOWED_NAMES: &[&str] = &[
     "docker_facts.json",
     "ui_state.json",
     "scope.json",
-    "agent_protect.json",
     "restore.json",
     "last_report.json",
     "last_report.json.zst",

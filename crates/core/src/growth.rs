@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-mod columns;
+pub(crate) mod columns;
 pub use columns::FoldedRow;
 use columns::*;
 

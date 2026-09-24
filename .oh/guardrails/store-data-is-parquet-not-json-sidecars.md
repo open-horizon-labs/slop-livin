@@ -59,10 +59,13 @@ cap now applies to every non-Parquet file, not only `.json`/`.jsonl`
 names, so a JSON *cache* wearing a different extension (the
 `last_report*.json.zst` report cache, in particular) is still caught if
 it starts scaling with observed data instead of staying a small
-summary. Not yet done: `grants.json`, `agent_protect.json`,
-`scope.json`, `last_run.json`, `docker_facts.json`, `topology.json` and
+summary. `agent_protect.json` is done (R14, stack/26): the human keep
+list is now `protect.parquet` (`path`, `added_at`), typed columns, no
+JSON cell -- see `crates/core/src/protection.rs`. Not yet done:
+`grants.json`, `scope.json`, `last_run.json`, `docker_facts.json`,
+`topology.json`, `fsevents.json`, `ledger.jsonl` and
 `last_report*.json.zst` itself are all still JSON files under the
 store; none of them showed unbounded growth on the fixtures measured so
 far, but the 2026-09-24 hard-rule decision asks for the allow-list to
-shrink to exactly `config.toml`, `ui_state.json` and `ledger.jsonl` --
-that full migration is unstarted.
+shrink to exactly `config.toml`, `ui_state.json` (small) and lock files
+-- that full migration is in progress, table by table.

@@ -1336,3 +1336,68 @@ pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportS
     }
     Ok(rows)
 }
+
+// ---------------------------------------------------------------------
+// protect.parquet -- the human keep list (`crate::protection`; R14 item
+// A). Two typed columns, no JSON cell: the whole point of moving it off
+// `agent_protect.json`. `crate::protection` owns the semantics (the one
+// `conflict` predicate, absolute-path validation, idempotent add); this
+// module only owns the Arrow schema, like every other table here.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredProtectRow {
+    pub(crate) path: String,
+    pub(crate) added_at: u64,
+}
+
+fn protect_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("added_at", DataType::UInt64, false),
+    ]))
+}
+
+pub(crate) fn write_protect_rows(path: &Path, rows: &[StoredProtectRow]) -> Result<()> {
+    let schema = protect_schema();
+    let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+    let added_at: Vec<u64> = rows.iter().map(|r| r.added_at).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(paths)) as ArrayRef,
+            Arc::new(UInt64Array::from(added_at)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        crate::fs_gate::columns::DEFAULT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_protect_rows(path: &Path) -> Result<Vec<StoredProtectRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it to reset the human keep list)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let path_col = downcast_str(&batch, "path")?;
+        let added_at_col = downcast_u64(&batch, "added_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredProtectRow {
+                path: path_col.value(i).to_string(),
+                added_at: added_at_col.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
