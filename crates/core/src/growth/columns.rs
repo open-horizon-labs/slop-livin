@@ -1422,3 +1422,152 @@ pub(crate) fn read_protect_rows(path: &Path) -> Result<Vec<StoredProtectRow>> {
     }
     Ok(rows)
 }
+
+// ---------------------------------------------------------------------
+// projects.parquet / worktrees.parquet / worktree_facts.parquet -- R15
+// item 2/~10 of the JSON-in-the-store decomposition begun by R14 item A
+// (`protect.parquet`). One row per `ProjectRow`/`WorktreeRow`, scope-wide
+// (top-level `swamp_dir`, keyed by `scope_key` exactly like
+// `report_rows.parquet`, since one scope can span several volumes) and
+// rewritten wholesale for that key by every `observe` that covers it --
+// a measurement cache, not reverse-delta history, like
+// `report_rows.parquet` itself. `worktree_facts.parquet` is the child
+// table for the two list-valued facts a `WorktreeRow` carries
+// (`signals`, `merge_complete.terms`): one row per list entry, ordered
+// by `seq` so the original `Vec` order is recoverable exactly.
+//
+// What is deliberately NOT here: a `WorktreeRow`'s `artifacts` (their
+// own table, extended in this same slice -- see the `ecosystem` column
+// added to `StoredRow` above) and everything CHUNK_R15 named as later
+// slices (nested artifacts, evidence, external/agent units, coverage,
+// series, summary) -- those stay in `report_rows.parquet`'s JSON cell
+// for now; `report::report_scope_from_store` reads this table for a
+// `WorktreeRow`'s own scalars and overlays the remaining fields from
+// that snapshot by key.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredProjectRow {
+    pub(crate) scope_key: String,
+    pub(crate) project_id: String,
+    pub(crate) name: String,
+    /// `|`-joined ecosystem tags, in their original order (`|` never
+    /// appears in a tag).
+    pub(crate) ecosystems: String,
+    pub(crate) remote: Option<String>,
+    pub(crate) bytes: u64,
+    pub(crate) local_bytes: u64,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) growth_bytes: Option<i64>,
+    pub(crate) regrowth_count: u32,
+    pub(crate) worktree_count: u32,
+    pub(crate) observed_at: u64,
+}
+
+fn projects_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("project_id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("ecosystems", DataType::Utf8, false),
+        Field::new("remote", DataType::Utf8, true),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("local_bytes", DataType::UInt64, false),
+        Field::new("allocated_bytes", DataType::UInt64, false),
+        Field::new("growth_bytes", DataType::Int64, true),
+        Field::new("regrowth_count", DataType::UInt32, false),
+        Field::new("worktree_count", DataType::UInt32, false),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+pub(crate) fn write_project_rows(path: &Path, rows: &[StoredProjectRow]) -> Result<()> {
+    let schema = projects_schema();
+    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
+    let project_id: Vec<&str> = rows.iter().map(|r| r.project_id.as_str()).collect();
+    let name: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let ecosystems: Vec<&str> = rows.iter().map(|r| r.ecosystems.as_str()).collect();
+    let remote: Vec<Option<&str>> = rows.iter().map(|r| r.remote.as_deref()).collect();
+    let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
+    let local_bytes: Vec<u64> = rows.iter().map(|r| r.local_bytes).collect();
+    let allocated_bytes: Vec<u64> = rows.iter().map(|r| r.allocated_bytes).collect();
+    let growth_bytes: Vec<Option<i64>> = rows.iter().map(|r| r.growth_bytes).collect();
+    let regrowth_count: Vec<u32> = rows.iter().map(|r| r.regrowth_count).collect();
+    let worktree_count: Vec<u32> = rows.iter().map(|r| r.worktree_count).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(scope_key)) as ArrayRef,
+            Arc::new(StringArray::from(project_id)),
+            Arc::new(StringArray::from(name)),
+            Arc::new(StringArray::from(ecosystems)),
+            Arc::new(StringArray::from(remote)),
+            Arc::new(UInt64Array::from(bytes)),
+            Arc::new(UInt64Array::from(local_bytes)),
+            Arc::new(UInt64Array::from(allocated_bytes)),
+            Arc::new(Int64Array::from(growth_bytes)),
+            Arc::new(UInt32Array::from(regrowth_count)),
+            Arc::new(UInt32Array::from(worktree_count)),
+            Arc::new(UInt64Array::from(observed_at)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_project_rows(path: &Path) -> Result<Vec<StoredProjectRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let project_id = downcast_str(&batch, "project_id")?;
+        let name = downcast_str(&batch, "name")?;
+        let ecosystems = downcast_str(&batch, "ecosystems")?;
+        let remote = batch
+            .column_by_name("remote")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("column remote is not Utf8")?;
+        let bytes = downcast_u64(&batch, "bytes")?;
+        let local_bytes = downcast_u64(&batch, "local_bytes")?;
+        let allocated_bytes = downcast_u64(&batch, "allocated_bytes")?;
+        let growth_bytes = batch
+            .column_by_name("growth_bytes")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("column growth_bytes is not Int64")?;
+        let regrowth_count = downcast_u32(&batch, "regrowth_count")?;
+        let worktree_count = downcast_u32(&batch, "worktree_count")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredProjectRow {
+                scope_key: scope_key.value(i).to_string(),
+                project_id: project_id.value(i).to_string(),
+                name: name.value(i).to_string(),
+                ecosystems: ecosystems.value(i).to_string(),
+                remote: remote.is_valid(i).then(|| remote.value(i).to_string()),
+                bytes: bytes.value(i),
+                local_bytes: local_bytes.value(i),
+                allocated_bytes: allocated_bytes.value(i),
+                growth_bytes: growth_bytes.is_valid(i).then(|| growth_bytes.value(i)),
+                regrowth_count: regrowth_count.value(i),
+                worktree_count: worktree_count.value(i),
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
