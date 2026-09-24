@@ -557,6 +557,79 @@ remaining list):
   `report::rebuild_evidence_from_tables` is a no-op only when that is
   `false`.
 
+R17 migrates four more of the snapshot's `report_json` fields, plus the
+per-volume `topology.json` sidecar:
+
+- `<store>/coverage.parquet` -- one row per scope-wide observation's
+  per-root coverage outcome: `scope_key`, `root_path`, `class`
+  (`project` for a walked scan root's `coverage::RootCoverage`,
+  `detector` for an authorized unit root's own
+  `coverage::UnitRootCoverage`), `status` (the bare `RegionStatus`/
+  event-covered tag, independent of its reason text), `reason`
+  (nullable), `walked_total`/`projects` (nullable, `RootCoverage` only),
+  `mode` (nullable, `RootCoverage` only), `cursor_family` (`walk` for a
+  project row, `unit_root` for a detector row), `observed_at`. Replaces
+  `ReportSnapshot`'s `coverage_json` cell entirely (not overlaid --
+  `RootCoverage`'s fields are all typed columns here).
+- `<store>/series.parquet` -- one row per `(series_key, bucket_index)`:
+  `scope_key`, `series_key` (a `growth::series_key` entity key, or the
+  reserved `columns::TOTAL_SERIES_KEY` for `Report.total_series`),
+  `bucket_index`, `value` (nullable), `window_secs`, `observed_at`.
+- `<store>/summary.parquet` -- `Summary`'s overview counts and by-type
+  totals plus `Reconciliation`'s scalars, one `(metric, key)` row each:
+  `metric = overview` (`key` = `projects`/`worktrees`/`artifacts`,
+  `count`), `metric = by_type` (`key` = ecosystem tag, `bytes`/`growth`/
+  `count`; a tag's `projects` count is recounted live from the rebuilt
+  project list rather than stored, since it is derivable and CHUNK_R17's
+  column list does not name it), `metric = reconciliation` (`key` =
+  `attributed`/`unowned`/`walked_total`/`docker_attributed`/
+  `docker_unowned`/`du_total`, `bytes`; `du_total`'s row is omitted
+  entirely when `None`).
+- `<store>/notes.parquet` -- `Report.notes`, one row per note: `scope_key`,
+  `seq` (order), `note`, `observed_at`.
+- `<volume>/topology.parquet` replaces `<volume>/topology.json`: the same
+  `growth::StoredWorktree` structural fields (`worktree_id`,
+  `project_id`, `project_name`, `path`, `kind`, `remote_url`), plus
+  `device` (from this volume's own FSEvents walk anchor, nullable) and
+  `observed_at`. Still a wholesale-replace measurement cache, still read
+  only by the incremental walk's own topology comparison
+  (`growth::compute_unconfirmed_worktrees`/`apply_incremental`) -- not a
+  `report_scope_from_store` input.
+
+`report_scope_from_store` calls
+`growth::rebuild_coverage_series_summary_notes_from_tables` last (after
+projects/units/nested-artifacts/evidence, so the by-type project recount
+sees the final project list) to replace `snapshot.coverage` and
+`snapshot.report`'s `notes`/`summary`/`reconciliation`/`series_by_key`/
+`total_series`/`series_window_secs` from these four tables.
+`growth::write_report_snapshot` also stops serializing those `Report`
+fields into `report_json` at all (`slim_report_for_snapshot_json` clears
+them to their defaults first) -- the tables are authoritative, not a
+cache of what the JSON cell already said. `ReportSnapshot`'s
+`external_units_json`/`agent_units_json`/`store_interiors_json` cells
+stay (R16): they are still the merge-fallback source for the fields
+`external_units.parquet`/`agent_units.parquet`/`nested_artifacts.parquet`
+do not carry yet, unlike `coverage`, which had nothing left to fall back
+to. `crates/core/tests/coverage_series_summary_notes_tables.rs` pins the
+new direction the same way R15/R16's tests do: a snapshot whose
+`report_json` was tampered with in every coverage/series/summary/
+reconciliation/notes field still reports the tables' values.
+
+Not attempted this slice (left for R18/R19, `.oh/sessions/
+2026-09-24-r17-tables.md` names the reasoning): `report_rows.parquet`
+itself is not deleted -- `Report.root`/`unowned`/`dirs_by_worktree`/
+`files_by_worktree`/`schedule_line`/`github_enrichment` still come from
+`report_json`, since migrating them needs either a new scope-wide
+`unowned` aggregation over the per-volume `unowned.parquet` tables or a
+larger dirs/files-by-worktree table design, neither of which CHUNK_R17
+named as this slice's four tables. `last_report-*.json.zst`/
+`growth::write_last_report`/`load_last_report` are also untouched:
+`consumers/signals.rs`/`consumers/cargo.rs` read a *per-root* previous
+`Report` from it (previous git signals; previous `nested_artifacts` +
+`observed_at`) for the incremental walk, a different, lower-level need
+than the scope-wide snapshot this section covers, and redesigning it
+onto typed tables is real, separate work.
+
 `report_scope_from_store` extends the same rebuild to these: an
 `ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`
 come from the unit tables; a `NestedArtifact`'s own scalars come from

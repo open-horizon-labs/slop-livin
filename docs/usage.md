@@ -66,11 +66,14 @@ the per-volume current-artifact table; external and agent-tool storage
 units come from `external_units.parquet`/`agent_units.parquet` (+
 `unit_consumers.parquet` for an external unit's declared consumers);
 per-project and shared-store nested build-artifact units come from
-`nested_artifacts.parquet`; and every row's decision evidence (an
-artifact, a unit, or a nested artifact's) comes from
-`evidence.parquet`. The rest of the report still comes from
-`report_rows.parquet` until the remaining tables land (see
-`docs/architecture.md`). Every table is rewritten by `observe`; delete
+`nested_artifacts.parquet`; every row's decision evidence (an artifact,
+a unit, or a nested artifact's) comes from `evidence.parquet`; and
+per-root coverage, byte-history series, the by-type/reconciliation
+summary and coverage notes come from `coverage.parquet`,
+`series.parquet`, `summary.parquet` and `notes.parquet`. The rest of the
+report still comes from `report_rows.parquet` until the remaining
+tables land (see `docs/architecture.md`). Every table is rewritten by
+`observe`; delete
 one and the next `observe` recreates it. There is no migration for a
 store written before a table existed -- `report` simply reads what the
 last `observe` wrote.

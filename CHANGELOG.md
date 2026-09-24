@@ -4,6 +4,28 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: coverage, series, summary, notes, topology (R17)
+
+`swamp observe` now writes four more typed tables: `coverage.parquet`
+(per-root walk/detector coverage outcomes, one `class` column
+distinguishing a walked scan root from an authorized unit root's own
+FSEvents-replay answer), `series.parquet` (one row per byte-history
+series key and bucket), `summary.parquet` (by-type/overview totals plus
+reconciliation's scalars), and `notes.parquet` (coverage notes, in
+order). `swamp report` rebuilds `coverage`/`series_by_key`/
+`total_series`/`series_window_secs`/`summary`/`reconciliation`/`notes`
+from these tables instead of the stored snapshot's JSON cell, which no
+longer carries that data at all. The per-volume `topology.json` sidecar
+(the incremental walk's previous checkout/worktree list) is now
+`topology.parquet`. Verified with a real two-project fixture
+(`crates/core/tests/coverage_series_summary_notes_tables.rs`), tampering
+every migrated field in the snapshot's own JSON copy to prove the
+rebuild ignores it. No migration: a store from before this reads as it
+did. `report_rows.parquet` itself, and the per-root
+`last_report-*.json.zst` cache the incremental walk's git-signals/
+build-artifact consumers read, are not migrated this slice -- see
+`.oh/sessions/2026-09-24-r17-tables.md` for what is left and why.
+
 ### CI: stop a phantom zero-job `Release` run on every ordinary push
 
 Every push to any branch was creating a `Release` workflow run with no
