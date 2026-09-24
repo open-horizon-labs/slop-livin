@@ -86,10 +86,20 @@ fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
 
+    // The specific "no anchor yet" reason code is per-platform
+    // (`RefreshRefusal::reason_str`: FSEvents says `no_stored_event_id`;
+    // the Linux persisted-change-log source says
+    // `no_persisted_change_history`) -- either is a real reason, and
+    // either is distinct from the generic fallback this test guards
+    // against.
+    let real_first_reason = |s: &str| {
+        s.contains("reason=no_stored_event_id") || s.contains("reason=no_persisted_change_history")
+    };
+
     let first = run();
     assert!(
-        first.contains("reason=no_stored_event_id"),
-        "first observation of a fresh store has no stored event id: {first}"
+        real_first_reason(&first),
+        "first observation of a fresh store has no stored anchor: {first}"
     );
 
     let second = run();
@@ -100,7 +110,7 @@ fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
          must not defeat the summary line's reason lookup): {second}"
     );
     assert!(
-        second.contains("reason=too_soon") || second.contains("reason=no_stored_event_id"),
+        second.contains("reason=too_soon") || real_first_reason(&second),
         "second observe must report a real, specific reason: {second}"
     );
 }

@@ -93,11 +93,14 @@ for p in "$root"/proj* "$root"/web; do (cd "$p" && git init -q . && git add -A >
 dirs=$(find "$root" -type d | wc -l); files=$(find "$root" -type f | wc -l)
 say "workload: $dirs directories, $files files, $(du -sh "$root" | cut -f1) on $(stat -f -c %T "$root")"
 
-"$bin" report "$root" --json > "$work/first.json"
+# `report` is a pure read (R12): a scope with no prior `observe` has
+# nothing to read, and exits 2 with a `no_observation` JSON error rather
+# than an empty-but-successful report.
+! "$bin" report "$root" --json > "$work/first.json"
 t1=$(now_ms)
 say "install_to_first_report_ms: $((t1 - t0))"
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "projects" in d' "$work/first.json"
-say "cli_json: report --json parses"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("error") == "no_observation"' "$work/first.json"
+say "cli_json: report --json parses (no_observation before the first observe)"
 "$bin" scope "$root" --json | python3 -c 'import json,sys; json.load(sys.stdin)' && say "cli_json: scope --json parses"
 
 observe() { "$bin" observe "$root" | grep '^observed_at='; }

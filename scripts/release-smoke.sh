@@ -59,8 +59,11 @@ head -c 50000 /dev/zero > "$fx/web/node_modules/pkg/index.js"
 store="$work/store"
 export SWAMP_DIR="$store" HOME="$work/home" SWAMP_TEST_MODE=1
 mkdir -p "$HOME"
-"$bin" report "$fx" --json > "$work/r0.json"
-grep -q '"projects"' "$work/r0.json"
+# `report` is a pure read (R12): a scope with no prior `observe` has
+# nothing to read, and exits 2 with a `no_observation` JSON error rather
+# than an empty-but-successful report.
+! "$bin" report "$fx" --json > "$work/r0.json"
+grep -q '"error": *"no_observation"' "$work/r0.json"
 t1=$(now_ms)
 "$bin" observe "$fx" | tee "$work/observe1.txt"
 t2=$(now_ms)
