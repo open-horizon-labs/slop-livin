@@ -2657,6 +2657,40 @@ pub fn observe_scope(
             ));
         }
         crate::growth::write_evidence_table(store_dir, &key, &evidence_entities)?;
+        // R17 item 1 of the JSON-in-the-store decomposition:
+        // `coverage.parquet`/`series.parquet`/`summary.parquet`/
+        // `notes.parquet`, from this same pass's already-computed
+        // coverage (`observation.coverage`/`.unit_root_coverage`) and
+        // `observation.merged`'s series/summary/notes fields -- no
+        // second pass.
+        crate::growth::write_coverage_table(
+            store_dir,
+            &key,
+            &observation.coverage,
+            &observation.unit_root_coverage,
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_series_table(
+            store_dir,
+            &key,
+            &observation.merged.series_by_key,
+            &observation.merged.total_series,
+            observation.merged.series_window_secs,
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_summary_table(
+            store_dir,
+            &key,
+            &observation.merged.summary,
+            &observation.merged.reconciliation,
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_notes_table(
+            store_dir,
+            &key,
+            &observation.merged.notes,
+            observation.merged.observed_at,
+        )?;
     }
 
     Ok(observation)
@@ -3189,6 +3223,14 @@ pub fn report_scope_from_store(
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
+    // R17 item 1: last, like `rebuild_evidence_from_tables` -- the
+    // by-type project recount inside `rebuild_summary_from_tables` reads
+    // `snapshot.report.projects`, so it must see the final rebuilt list.
+    crate::growth::rebuild_coverage_series_summary_notes_from_tables(
+        store_dir,
+        &key,
+        &mut snapshot,
+    );
     Ok(snapshot)
 }
 

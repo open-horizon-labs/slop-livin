@@ -109,8 +109,6 @@ pub enum JsonFile<'a> {
     UiState { store: &'a StoreDir },
     /// `<volume>/fsevents.json`: the FSEvents cursor for one root.
     FsEventsCursor { volume: &'a StoreDir },
-    /// `<volume>/topology.json`: the worktree topology of one root.
-    Topology { volume: &'a StoreDir },
     /// `<store>/last_report-<key>.json.zst`: the last report, zstd
     /// compressed, so a `--no-observe` or TUI start never re-walks.
     ///
@@ -157,7 +155,6 @@ impl JsonFile<'_> {
             JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
             JsonFile::UiState { store } => store.0.join("ui_state.json"),
             JsonFile::FsEventsCursor { volume } => volume.0.join("fsevents.json"),
-            JsonFile::Topology { volume } => volume.0.join("topology.json"),
             JsonFile::LastReport { store, key } => store
                 .0
                 .join(format!("last_report-{}.json.zst", plain(key)?)),

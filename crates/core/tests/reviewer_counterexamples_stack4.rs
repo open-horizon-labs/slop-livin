@@ -193,7 +193,7 @@ fn a_stored_rules_version_without_an_anchor_still_forces_the_rules_walk() {
         ),
     )
     .unwrap();
-    assert!(dir.join("topology.json").exists(), "topology is stored");
+    assert!(dir.join("topology.parquet").exists(), "topology is stored");
 
     fs::write(fx.node_modules.join("touched.bin"), vec![b't'; 4096]).unwrap();
     let second = swamp_core::report::report_full_mode_with_source(

@@ -1228,10 +1228,26 @@ fn fsevents_state_path(dir: &Path) -> PathBuf {
     dir.join("fsevents.json")
 }
 fn topology_path(dir: &Path) -> PathBuf {
-    dir.join("topology.json")
+    dir.join("topology.parquet")
 }
 fn unowned_path(dir: &Path) -> PathBuf {
     dir.join("unowned.parquet")
+}
+
+fn worktree_kind_to_label(kind: &crate::report::WorktreeKind) -> &'static str {
+    match kind {
+        crate::report::WorktreeKind::Main => "main",
+        crate::report::WorktreeKind::Linked => "linked",
+        crate::report::WorktreeKind::Clone => "clone",
+    }
+}
+
+fn worktree_kind_from_label(label: &str) -> crate::report::WorktreeKind {
+    match label {
+        "linked" => crate::report::WorktreeKind::Linked,
+        "clone" => crate::report::WorktreeKind::Clone,
+        _ => crate::report::WorktreeKind::Main,
+    }
 }
 
 fn read_fsevents_state(dir: &Path) -> FsEventsState {
@@ -1283,19 +1299,49 @@ fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor)
 }
 
 fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
-    let text = read_owned_string(topology_path(dir)).ok()?;
-    serde_json::from_str(&text).ok()
+    let rows = columns::read_topology_rows(&topology_path(dir)).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.into_iter()
+            .map(|r| StoredWorktree {
+                worktree_id: r.worktree_id,
+                project_id: r.project_id,
+                project_name: r.project_name,
+                path: PathBuf::from(r.path),
+                kind: worktree_kind_from_label(&r.kind),
+                remote_url: r.remote_url,
+            })
+            .collect(),
+    )
 }
 
+/// Replaces `<volume>/topology.parquet` wholesale (R17 item 2 --
+/// replaces `topology.json`): the structural checkout/worktree list is a
+/// measurement cache like `unowned.parquet`, not history. `device` comes
+/// from this volume's own `fsevents.json` walk anchor when one has been
+/// written (the same device the FSEvents replay that produced this
+/// topology ran against); `None` before any observation has run.
 fn write_topology(dir: &Path, worktrees: &[StoredWorktree]) -> Result<()> {
     store::StoreDir::at(dir)?.create()?;
-    store::write_json(
-        store::JsonFile::Topology {
-            volume: &store::StoreDir::at(dir)?,
-        },
-        worktrees,
-    )
-    .with_context(|| format!("write {}", topology_path(dir).display()))
+    let device = read_fsevents_state(dir).device;
+    let observed_at = crate::entities::now();
+    let rows: Vec<columns::StoredTopologyRow> = worktrees
+        .iter()
+        .map(|w| columns::StoredTopologyRow {
+            worktree_id: w.worktree_id.clone(),
+            project_id: w.project_id.clone(),
+            project_name: w.project_name.clone(),
+            path: w.path.display().to_string(),
+            kind: worktree_kind_to_label(&w.kind).to_string(),
+            remote_url: w.remote_url.clone(),
+            device,
+            observed_at,
+        })
+        .collect();
+    columns::write_topology_rows(&topology_path(dir), &rows)
+        .with_context(|| format!("write {}", topology_path(dir).display()))
 }
 
 fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
@@ -1407,6 +1453,31 @@ pub struct ReportSnapshot {
 /// produced it. Every other scope key's row is untouched, so several
 /// distinct scopes (or explicit-root invocations) sharing one store
 /// each keep their own snapshot.
+/// Clears the `Report` fields `coverage.parquet`/`series.parquet`/
+/// `summary.parquet`/`notes.parquet` now own, before `snapshot.report` is
+/// serialized into `report_json` (R17). These fields are rebuilt from
+/// their own tables on every read (`rebuild_summary_from_tables`/
+/// `rebuild_series_from_tables`/`rebuild_notes_from_tables`), so keeping
+/// them in the JSON cell too would be silent duplication -- the tables
+/// are authoritative, not a cache of what the JSON already said.
+fn slim_report_for_snapshot_json(report: &Report) -> Report {
+    let mut r = report.clone();
+    r.notes = Vec::new();
+    r.summary = crate::report::Summary::default();
+    r.reconciliation = crate::report::Reconciliation {
+        attributed: 0,
+        unowned: 0,
+        walked_total: 0,
+        du_total: None,
+        docker_attributed: 0,
+        docker_unowned: 0,
+    };
+    r.series_by_key = HashMap::new();
+    r.total_series = Vec::new();
+    r.series_window_secs = 0;
+    r
+}
+
 pub fn write_report_snapshot(
     swamp_dir: &Path,
     scope_key: &str,
@@ -1422,8 +1493,7 @@ pub fn write_report_snapshot(
     rows.push(columns::StoredReportSnapshotRow {
         scope_key: scope_key.to_string(),
         observed_at: snapshot.observed_at,
-        report_json: serde_json::to_string(&snapshot.report)?,
-        coverage_json: serde_json::to_string(&snapshot.coverage)?,
+        report_json: serde_json::to_string(&slim_report_for_snapshot_json(&snapshot.report))?,
         external_units_json: serde_json::to_string(&snapshot.external_units)?,
         agent_units_json: serde_json::to_string(&snapshot.agent_units)?,
         store_interiors_json: serde_json::to_string(&snapshot.store_interiors)?,
@@ -1437,6 +1507,16 @@ pub fn write_report_snapshot(
 /// corrupt/from a stale schema -- a cache miss (the caller's "no
 /// observation yet" path), never a hard error, same discipline as
 /// `folded_rows_for`.
+///
+/// `coverage` comes back empty: it is no longer part of this cell (R17
+/// moved it to `coverage.parquet`), and `report::report_scope_from_store`
+/// always calls `rebuild_coverage_series_summary_notes_from_tables` right
+/// after this to fill it in. `report`'s own `notes`/`summary`/
+/// `reconciliation`/series fields come back at their defaults for the
+/// same reason. `external_units`/`agent_units`/`store_interiors` still
+/// come back from this cell (R16): `rebuild_units_from_tables`/
+/// `rebuild_nested_artifacts_from_tables` need them as the merge
+/// fallback for fields their own tables do not carry yet.
 pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportSnapshot> {
     let path = report_snapshot_path(swamp_dir);
     let row = columns::read_report_snapshot_rows(&path)
@@ -1446,11 +1526,464 @@ pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportS
     Some(ReportSnapshot {
         observed_at: row.observed_at,
         report: serde_json::from_str(&row.report_json).ok()?,
-        coverage: serde_json::from_str(&row.coverage_json).ok()?,
+        coverage: Vec::new(),
         external_units: serde_json::from_str(&row.external_units_json).ok()?,
         agent_units: serde_json::from_str(&row.agent_units_json).ok()?,
         store_interiors: serde_json::from_str(&row.store_interiors_json).ok()?,
     })
+}
+
+// ---------------------------------------------------------------------
+// coverage.parquet / series.parquet / summary.parquet / notes.parquet
+// (R17 item 1 of the JSON-in-the-store decomposition -- see
+// `.oh/sessions/2026-09-24-r17-tables.md`). Scope-wide, keyed by the same
+// `scope_key` as `report_rows.parquet`, written by the same
+// `observe_scope` call and read back by `report::report_scope_from_store`.
+// ---------------------------------------------------------------------
+
+fn coverage_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("coverage.parquet")
+}
+fn series_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("series.parquet")
+}
+fn summary_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("summary.parquet")
+}
+fn notes_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("notes.parquet")
+}
+
+/// The bare `RegionStatus` variant tag, independent of its `reason`
+/// text -- `label()` formats `Partial`/`Inaccessible` with their reason
+/// inline (`"partial (...)"`), which is for display, not a round-trip
+/// key; `reason` is stored in its own column instead.
+fn region_status_tag(status: &crate::coverage::RegionStatus) -> &'static str {
+    match status {
+        crate::coverage::RegionStatus::Complete => "complete",
+        crate::coverage::RegionStatus::Partial { .. } => "partial",
+        crate::coverage::RegionStatus::Excluded => "excluded",
+        crate::coverage::RegionStatus::Missing => "missing",
+        crate::coverage::RegionStatus::Inaccessible { .. } => "inaccessible",
+        crate::coverage::RegionStatus::DetectorOnly => "detector_only",
+    }
+}
+
+/// Writes `coverage.parquet` for `scope_key`, replacing that scope's
+/// rows wholesale from this same pass's already-computed coverage --
+/// `class = "project"` for a walked scan root's [`crate::coverage::RootCoverage`],
+/// `class = "detector"` for an authorized unit root's own
+/// [`crate::coverage::UnitRootCoverage`].
+pub fn write_coverage_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    project_coverage: &[crate::coverage::RootCoverage],
+    unit_root_coverage: &[crate::coverage::UnitRootCoverage],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = coverage_path(swamp_dir);
+    let mut rows: Vec<columns::StoredCoverageRow> = columns::read_coverage_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for c in project_coverage {
+        rows.push(columns::StoredCoverageRow {
+            scope_key: scope_key.to_string(),
+            root_path: c.path.display().to_string(),
+            class: "project".to_string(),
+            status: region_status_tag(&c.status).to_string(),
+            reason: match &c.status {
+                crate::coverage::RegionStatus::Partial { reason }
+                | crate::coverage::RegionStatus::Inaccessible { reason } => Some(reason.clone()),
+                _ => None,
+            },
+            walked_total: c.status.was_observed().then_some(c.walked_total),
+            projects: c.status.was_observed().then_some(c.projects as u32),
+            mode: (!c.mode.is_empty()).then(|| c.mode.clone()),
+            cursor_family: Some("walk".to_string()),
+            observed_at,
+        });
+    }
+    for c in unit_root_coverage {
+        rows.push(columns::StoredCoverageRow {
+            scope_key: scope_key.to_string(),
+            root_path: c.path.display().to_string(),
+            class: "detector".to_string(),
+            status: if c.event_covered {
+                "event_covered".to_string()
+            } else {
+                "re_measured".to_string()
+            },
+            reason: Some(c.reason.clone()),
+            walked_total: None,
+            projects: None,
+            mode: None,
+            cursor_family: Some("unit_root".to_string()),
+            observed_at,
+        });
+    }
+    columns::write_coverage_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.coverage` (the project-class rows only --
+/// `UnitRootCoverage` has no `ReportSnapshot` field to rebuild into; it
+/// is written for completeness and future readers) from `coverage.parquet`,
+/// and, when at least one row was walked, `snapshot.report.root` from the
+/// first walked row in scope-root order -- the same value
+/// `report::merge_root_report_into` would have set. A no-op (leaves
+/// `snapshot` exactly as `read_report_snapshot` returned it) when this
+/// scope has no coverage rows yet (an older store).
+fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
+    let Ok(rows) = columns::read_coverage_rows(&coverage_path(swamp_dir)) else {
+        return;
+    };
+    let rows: Vec<columns::StoredCoverageRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let mut coverage = Vec::new();
+    let mut root: Option<PathBuf> = None;
+    for r in rows.iter().filter(|r| r.class == "project") {
+        let status = match r.status.as_str() {
+            "complete" => crate::coverage::RegionStatus::Complete,
+            "excluded" => crate::coverage::RegionStatus::Excluded,
+            "missing" => crate::coverage::RegionStatus::Missing,
+            "detector_only" => crate::coverage::RegionStatus::DetectorOnly,
+            "partial" => crate::coverage::RegionStatus::Partial {
+                reason: r.reason.clone().unwrap_or_default(),
+            },
+            "inaccessible" => crate::coverage::RegionStatus::Inaccessible {
+                reason: r.reason.clone().unwrap_or_default(),
+            },
+            _ => crate::coverage::RegionStatus::Missing,
+        };
+        if root.is_none() && status.was_observed() {
+            root = Some(PathBuf::from(&r.root_path));
+        }
+        coverage.push(crate::coverage::RootCoverage {
+            path: PathBuf::from(&r.root_path),
+            status,
+            walked_total: r.walked_total.unwrap_or(0),
+            projects: r.projects.unwrap_or(0) as usize,
+            mode: r.mode.clone().unwrap_or_default(),
+        });
+    }
+    snapshot.coverage = coverage;
+    if let Some(root) = root {
+        snapshot.report.root = root;
+    }
+}
+
+/// Writes `series.parquet` for `scope_key`: one row per
+/// `(series_key, bucket_index)` from `Report.series_by_key`, plus
+/// `Report.total_series` under the reserved key
+/// [`columns::TOTAL_SERIES_KEY`].
+pub fn write_series_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    series_by_key: &HashMap<String, Vec<Option<u64>>>,
+    total_series: &[Option<u64>],
+    window_secs: u64,
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = series_path(swamp_dir);
+    let mut rows: Vec<columns::StoredSeriesRow> = columns::read_series_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for (key, values) in series_by_key {
+        for (i, v) in values.iter().enumerate() {
+            rows.push(columns::StoredSeriesRow {
+                scope_key: scope_key.to_string(),
+                series_key: key.clone(),
+                bucket_index: i as u32,
+                value: *v,
+                window_secs,
+                observed_at,
+            });
+        }
+    }
+    for (i, v) in total_series.iter().enumerate() {
+        rows.push(columns::StoredSeriesRow {
+            scope_key: scope_key.to_string(),
+            series_key: columns::TOTAL_SERIES_KEY.to_string(),
+            bucket_index: i as u32,
+            value: *v,
+            window_secs,
+            observed_at,
+        });
+    }
+    columns::write_series_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.report.series_by_key`/`.total_series`/
+/// `.series_window_secs` from `series.parquet`. A no-op when this scope
+/// has no series rows yet.
+fn rebuild_series_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
+    let Ok(rows) = columns::read_series_rows(&series_path(swamp_dir)) else {
+        return;
+    };
+    let mut rows: Vec<columns::StoredSeriesRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|r| r.bucket_index);
+    let mut window_secs = 0u64;
+    let mut by_key: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+    let mut total: Vec<Option<u64>> = Vec::new();
+    for r in rows {
+        window_secs = r.window_secs;
+        let bucket = r.bucket_index as usize;
+        if r.series_key == columns::TOTAL_SERIES_KEY {
+            if total.len() <= bucket {
+                total.resize(bucket + 1, None);
+            }
+            total[bucket] = r.value;
+        } else {
+            let entry = by_key.entry(r.series_key).or_default();
+            if entry.len() <= bucket {
+                entry.resize(bucket + 1, None);
+            }
+            entry[bucket] = r.value;
+        }
+    }
+    snapshot.report.series_by_key = by_key;
+    snapshot.report.total_series = total;
+    snapshot.report.series_window_secs = window_secs;
+}
+
+/// Writes `summary.parquet` for `scope_key`: `Summary`'s overview counts
+/// and by-type totals, plus `Reconciliation`'s scalars.
+pub fn write_summary_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    summary: &crate::report::Summary,
+    reconciliation: &crate::report::Reconciliation,
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = summary_path(swamp_dir);
+    let mut rows: Vec<columns::StoredSummaryRow> = columns::read_summary_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    let row =
+        |metric: &str, key: &str, bytes: Option<u64>, growth: Option<i64>, count: Option<u64>| {
+            columns::StoredSummaryRow {
+                scope_key: scope_key.to_string(),
+                metric: metric.to_string(),
+                key: key.to_string(),
+                bytes,
+                growth,
+                count,
+                observed_at,
+            }
+        };
+    rows.push(row(
+        "overview",
+        "projects",
+        None,
+        None,
+        Some(summary.projects as u64),
+    ));
+    rows.push(row(
+        "overview",
+        "worktrees",
+        None,
+        None,
+        Some(summary.worktrees as u64),
+    ));
+    rows.push(row(
+        "overview",
+        "artifacts",
+        None,
+        None,
+        Some(summary.artifacts as u64),
+    ));
+    for (tag, t) in &summary.by_type {
+        rows.push(row(
+            "by_type",
+            tag,
+            Some(t.bytes),
+            t.growth_bytes,
+            Some(t.artifacts as u64),
+        ));
+    }
+    rows.push(row(
+        "reconciliation",
+        "attributed",
+        Some(reconciliation.attributed),
+        None,
+        None,
+    ));
+    rows.push(row(
+        "reconciliation",
+        "unowned",
+        Some(reconciliation.unowned),
+        None,
+        None,
+    ));
+    rows.push(row(
+        "reconciliation",
+        "walked_total",
+        Some(reconciliation.walked_total),
+        None,
+        None,
+    ));
+    rows.push(row(
+        "reconciliation",
+        "docker_attributed",
+        Some(reconciliation.docker_attributed),
+        None,
+        None,
+    ));
+    rows.push(row(
+        "reconciliation",
+        "docker_unowned",
+        Some(reconciliation.docker_unowned),
+        None,
+        None,
+    ));
+    if let Some(du) = reconciliation.du_total {
+        rows.push(row("reconciliation", "du_total", Some(du), None, None));
+    }
+    columns::write_summary_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.report.summary`/`.reconciliation` from
+/// `summary.parquet`. A no-op when this scope has no summary rows yet.
+fn rebuild_summary_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
+    let Ok(rows) = columns::read_summary_rows(&summary_path(swamp_dir)) else {
+        return;
+    };
+    let rows: Vec<columns::StoredSummaryRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let mut summary = crate::report::Summary::default();
+    let mut reconciliation = crate::report::Reconciliation {
+        attributed: 0,
+        unowned: 0,
+        walked_total: 0,
+        du_total: None,
+        docker_attributed: 0,
+        docker_unowned: 0,
+    };
+    for r in &rows {
+        match (r.metric.as_str(), r.key.as_str()) {
+            ("overview", "projects") => summary.projects = r.count.unwrap_or(0) as usize,
+            ("overview", "worktrees") => summary.worktrees = r.count.unwrap_or(0) as usize,
+            ("overview", "artifacts") => summary.artifacts = r.count.unwrap_or(0) as usize,
+            ("by_type", tag) => {
+                let e = summary.by_type.entry(tag.to_string()).or_default();
+                e.name = crate::ecosystem::name_for(tag).unwrap_or(tag).to_string();
+                e.artifacts = r.count.unwrap_or(0) as usize;
+                e.bytes = r.bytes.unwrap_or(0);
+                e.growth_bytes = r.growth;
+            }
+            ("reconciliation", "attributed") => reconciliation.attributed = r.bytes.unwrap_or(0),
+            ("reconciliation", "unowned") => reconciliation.unowned = r.bytes.unwrap_or(0),
+            ("reconciliation", "walked_total") => {
+                reconciliation.walked_total = r.bytes.unwrap_or(0)
+            }
+            ("reconciliation", "docker_attributed") => {
+                reconciliation.docker_attributed = r.bytes.unwrap_or(0)
+            }
+            ("reconciliation", "docker_unowned") => {
+                reconciliation.docker_unowned = r.bytes.unwrap_or(0)
+            }
+            ("reconciliation", "du_total") => reconciliation.du_total = r.bytes,
+            _ => {}
+        }
+    }
+    // `by_type`'s `projects` count is not carried by CHUNK_R17's column
+    // list (only `bytes`/`growth`/`count` per key) -- recount it from the
+    // already-rebuilt project list, same source `report::summarize` uses.
+    let mut projects_by_tag: HashMap<String, usize> = HashMap::new();
+    for p in &snapshot.report.projects {
+        for tag in &p.ecosystems {
+            *projects_by_tag.entry(tag.clone()).or_default() += 1;
+        }
+    }
+    for (tag, count) in projects_by_tag {
+        summary.by_type.entry(tag).or_default().projects = count;
+    }
+    snapshot.report.summary = summary;
+    snapshot.report.reconciliation = reconciliation;
+}
+
+/// Writes `notes.parquet` for `scope_key`: `Report.notes`, order
+/// preserved via `seq`.
+pub fn write_notes_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    notes: &[String],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = notes_path(swamp_dir);
+    let mut rows: Vec<columns::StoredNoteRow> = columns::read_note_rows(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for (seq, note) in notes.iter().enumerate() {
+        rows.push(columns::StoredNoteRow {
+            scope_key: scope_key.to_string(),
+            seq: seq as u32,
+            note: note.clone(),
+            observed_at,
+        });
+    }
+    columns::write_note_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
+}
+
+/// Rebuilds `snapshot.report.notes` from `notes.parquet`, in `seq` order.
+/// A no-op when this scope has no note rows yet.
+fn rebuild_notes_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
+    let Ok(rows) = columns::read_note_rows(&notes_path(swamp_dir)) else {
+        return;
+    };
+    let mut rows: Vec<columns::StoredNoteRow> = rows
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|r| r.seq);
+    snapshot.report.notes = rows.into_iter().map(|r| r.note).collect();
+}
+
+/// The one entry point `report::report_scope_from_store` calls to
+/// replace `snapshot`'s coverage/series/summary/notes with what
+/// `coverage.parquet`/`series.parquet`/`summary.parquet`/`notes.parquet`
+/// hold for `scope_key` -- called after the projects/units/nested-
+/// artifact/evidence rebuilds so `rebuild_summary_from_tables`'s
+/// by-type project recount sees the final project list.
+pub(crate) fn rebuild_coverage_series_summary_notes_from_tables(
+    swamp_dir: &Path,
+    scope_key: &str,
+    snapshot: &mut ReportSnapshot,
+) {
+    rebuild_coverage_from_tables(swamp_dir, scope_key, snapshot);
+    rebuild_series_from_tables(swamp_dir, scope_key, snapshot);
+    rebuild_summary_from_tables(swamp_dir, scope_key, snapshot);
+    rebuild_notes_from_tables(swamp_dir, scope_key, snapshot);
 }
 
 // ---------------------------------------------------------------------

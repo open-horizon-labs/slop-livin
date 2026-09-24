@@ -324,26 +324,47 @@ fn report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_sn
     );
 }
 
-/// The snapshot's remaining parts (everything CHUNK_R15 left for later
-/// slices) still come from the snapshot: a tampered `unowned` row or
-/// note is reported as tampered. This pins the boundary in both
-/// directions, so the previous test cannot pass by ignoring the snapshot
-/// entirely.
+/// The snapshot's remaining parts (everything CHUNK_R15/R17 left for
+/// later slices) still come from the snapshot: a tampered `unowned` row
+/// is reported as tampered. This pins the boundary in both directions,
+/// so the previous test cannot pass by ignoring the snapshot entirely.
+///
+/// `notes`/`reconciliation` moved to `notes.parquet`/`summary.parquet`
+/// in R17 (`coverage_series_summary_notes_tables.rs` covers that
+/// boundary now), so they are no longer part of this one -- tampering
+/// them here would now be silently overwritten by the rebuild, which is
+/// the *fixed* behavior this slice adds, not a regression.
 #[test]
 fn the_remaining_parts_still_come_from_the_snapshot() {
     let fx = build();
     let observation = observe(&fx);
     let key = report::scope_snapshot_key(&fx.scope);
     let mut tampered = report::snapshot_from_observation(&observation);
-    tampered.report.notes.push("tampered-note".into());
-    tampered.report.reconciliation.walked_total += 1;
+    tampered
+        .report
+        .unowned
+        .push(swamp_core::report::UnownedRow {
+            path_or_object: "tampered-unowned-path".into(),
+            bytes: 123,
+            reason: swamp_core::report::UnownedReason::OwnedByNothing,
+            shared_bytes: None,
+            note: None,
+            docker_kind: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        });
     swamp_core::growth::write_report_snapshot(&fx.store, &key, &tampered).unwrap();
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
-    assert!(rebuilt.report.notes.iter().any(|n| n == "tampered-note"));
-    assert_eq!(
-        rebuilt.report.reconciliation.walked_total,
-        observation.merged.reconciliation.walked_total + 1
+    assert!(
+        rebuilt
+            .report
+            .unowned
+            .iter()
+            .any(|u| u.path_or_object == "tampered-unowned-path")
     );
     assert_eq!(
         serde_json::to_value(&rebuilt.report.projects).unwrap(),

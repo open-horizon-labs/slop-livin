@@ -29,7 +29,6 @@ const ALLOWED_NAMES: &[&str] = &[
     "ledger.jsonl",
     "last_run.json",
     "fsevents.json",
-    "topology.json",
     "docker_facts.json",
     "ui_state.json",
     "scope.json",
