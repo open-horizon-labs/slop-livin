@@ -4,6 +4,16 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### CI: full tier (compile-fail, mutation sweep, cost test) off the push path
+
+Split `check-full.yml` out of `ci.yml`: the two `*-check-full` jobs (60-90
+minutes each) now run only nightly, on `gh workflow run check-full.yml`,
+or on a PR labelled `full-check` -- never on an ordinary push or an
+unlabelled PR. `ci.yml` keeps the fast tier (`scripts/check.sh` on both
+OSes) plus the Linux release-archive smoke/validation on every push, as
+before. See CONTRIBUTING.md's "Checks" section and
+`.github/workflows/check-full.yml`'s own header comment.
+
 ### CI: fixed three red jobs left by the observe/report split (R12/R13)
 
 `swamp observe`'s one-line summary (`mode=`/`reason=`/`changed_dirs=`)
