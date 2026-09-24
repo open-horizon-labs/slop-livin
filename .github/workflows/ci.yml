@@ -22,11 +22,11 @@ name: CI
 # This is the fast tier only (target: under ~10 minutes per OS on a warm
 # cache). The heavy harnesses (compile-fail, mutation sweep, cost test --
 # `scripts/check-full.sh`) live in `check-full.yml`, which never runs on
-# an ordinary push: it runs nightly, on `gh workflow run check-full.yml`,
-# or on a PR labelled `full-check`. Every push still gets this workflow
-# (fast tier + the Linux archive smoke) so ordinary iteration stays quick
-# without losing the deep coverage entirely -- that just moves off the
-# push path.
+# an ordinary push: only `gh workflow run check-full.yml`, a PR labelled
+# `full-check`, or a `v*` tag push (`release.yml`, gating publish). Every
+# push still gets this workflow (fast tier + the Linux archive smoke) so
+# ordinary iteration stays quick without losing the deep coverage
+# entirely -- that just moves off the push path.
 
 on:
   push:

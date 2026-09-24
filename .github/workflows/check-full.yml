@@ -10,18 +10,19 @@ name: check-full
 # doesn't already cover on every push -- they exist to catch drift
 # between pushes, not to gate one.
 #
-# Never runs on an ordinary push or an unlabelled PR. Three ways to run
-# it: `gh workflow run check-full.yml`, the nightly schedule below (one
-# run, both OS jobs), or adding the `full-check` label to a PR (removing
-# and re-adding the label re-triggers it; a `synchronize` push to an
-# already-labelled PR does not, by design -- ask for it explicitly if a
-# later push needs another full-tier run before merge).
+# Never runs on an ordinary push, an unlabelled PR, or on a schedule.
+# Two ways to run it here: `gh workflow run check-full.yml`, or adding
+# the `full-check` label to a PR (removing and re-adding the label
+# re-triggers it; a `synchronize` push to an already-labelled PR does
+# not, by design -- ask for it explicitly if a later push needs another
+# full-tier run before merge). A third way is `release.yml`'s own
+# `check-full` job, which runs the same `scripts/check-full.sh` (not
+# this workflow -- a separate job definition, since `workflow_call`
+# would need this file restructured into reusable-workflow shape for no
+# benefit) on every `v*` tag push, gating `publish`.
 
 on:
   workflow_dispatch:
-  schedule:
-    # 06:00 UTC, both check-full jobs, once a day.
-    - cron: '0 6 * * *'
   pull_request:
     types: [labeled]
 

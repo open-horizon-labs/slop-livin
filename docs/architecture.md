@@ -1555,8 +1555,9 @@ heavy harnesses, each exactly once: the compile-fail cases and the
 mutation sweep (both `#[ignore]`d, so `cargo test --workspace` does not
 run them, and run here with `--ignored`) and the single-threaded cost
 test. CI runs the fast tier on every push (`.github/workflows/ci.yml`)
-and the full tier nightly, on demand, or on a PR labelled `full-check`
-(`.github/workflows/check-full.yml`) -- see CONTRIBUTING.md.
+and the full tier on demand, on a PR labelled `full-check`, or on a
+`v*` release tag, gating publish (`.github/workflows/check-full.yml`,
+`release.yml`) -- see CONTRIBUTING.md.
 
 **Trusted base.** What a reviewer must read, because no type or rule
 above holds it: `crates/core/src/fs_gate/` (all of it), `fs_events/macos.rs`,
