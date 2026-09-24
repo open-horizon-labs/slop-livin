@@ -955,7 +955,14 @@ fn every_mutation_is_rejected_by_its_intended_mechanism_and_legitimate_shapes_ar
         problems.join("\n")
     );
     // Re-review 4's sweep, by group: every one rejected.
-    for (group, want) in [("M", 46), ("W", 12), ("U", 7)] {
+    //
+    // 2026-09-23: M is 42 (not 46), W is 6 (not 12), U is 3 (not 7) --
+    // fixtures naming `authority.rs`/`recheck.rs` (four M, six W, four U)
+    // are deleted with the rest of the CLI/agent action path ("swamp
+    // reports; the human removes"). They are gone, not retired-in-place,
+    // because the mechanism they tested no longer exists to have a blind
+    // spot in.
+    for (group, want) in [("M", 42), ("W", 6), ("U", 3)] {
         let n = all
             .iter()
             .filter(|f| {

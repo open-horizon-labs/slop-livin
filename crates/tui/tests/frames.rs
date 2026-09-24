@@ -1146,7 +1146,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
 #[test]
 fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     use std::process::Command;
-    use swamp_tui::actions::{MarkedUnit, WorktreeTerms, confirmables, execute_plan};
+    use swamp_tui::actions::{MarkedUnit, WorktreeTerms, execute_plan};
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         assert!(
@@ -1197,9 +1197,8 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     git(&work, &["push", "-q", "-u", "origin", "HEAD"]);
 
     let unit = |path: &std::path::Path| MarkedUnit {
-        cargo_plan: None,
-        agent_plan: None,
-        reviewed: swamp_core::recheck::capture_anchor(path).ok(),
+        cargo_unit: None,
+        agent_unit: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),
@@ -1222,25 +1221,12 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     std::fs::write(work.join("secrets.env"), vec![b'k'; 2048]).unwrap();
     let mut u = unit(&work);
     u.warnings = vec!["secrets.env untracked 2.0KB".into()];
-    let store = swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap();
-    let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(
-        "human",
-        &store,
-        confirmables(std::slice::from_ref(&u), false),
-    );
-    let res = execute_plan(
-        std::slice::from_ref(&u),
-        confirmed,
-        &store,
-        &ledger,
-        &trash,
-        false,
-    );
+    let res = execute_plan(std::slice::from_ref(&u), &ledger, &trash, false);
     assert!(res[0].outcome.is_ok(), "{:?}", res[0].outcome);
     assert!(!work.exists(), "checkout moved to Trash");
     let recs = ledger.all().unwrap();
     let last = recs.last().unwrap();
-    assert!(matches!(last.verb, swamp_core::grants::Verb::Archive));
+    assert!(matches!(last.verb, swamp_core::ledger::Verb::Archive));
     assert!(
         last.evidence["recover"]
             .as_str()

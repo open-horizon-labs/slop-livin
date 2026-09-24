@@ -21,14 +21,12 @@ just similar in spirit.
 | `list_projects` (root, since) | `swamp report <root> --view projects --json [--since S]` |
 | `list_worktrees` (root, since, filter) | `swamp report <root> --view worktrees --json [--filter F]` |
 | `docker_objects` (root, unowned_only, project) | `swamp report <root> --view docker --json [--unowned-only] [--project P]` |
-| `propose` (root, since, filter, paths) | `swamp propose [root] --json [--since S] [--filter F] [--path P ...] [--external]` -- `root` is optional: omitted only when every `--path` names an agent-storage or external unit (see `agent-storage.md`, and the `external` view below) |
-| `execute` (plan_id, keep_executables) | `swamp execute <plan_id> --json [--keep-executables]` |
-| `plans` | `swamp plans --json` |
-| `grants` (read-only) | `swamp grant list --json` |
 
-There is no CLI equivalent for an MCP tool that *writes* a grant,
-because none ever existed: grant creation was always
-`swamp grant add`/human-at-CLI only. See `trust-model.md`.
+There is no `propose`/`execute`/`plans`/`grant` command any more (removed
+2026-09-23, "swamp reports; the human removes"): the CLI's only
+side-effecting command is `swamp protect add|remove` (a human keep-list).
+Nothing deletes anything except the TUI's own Trash flow, or a human's
+own shell command. See `trust-model.md`.
 
 `<root>` is now optional on `report`/`observe`/`ui`/`schedule`: omit it
 and the command resolves swamp's configured effective scope (built-in
@@ -156,7 +154,7 @@ Views:
 | `unowned` | array: `{path_or_object, bytes, reason, shared_bytes, docker_kind, note}` | |
 | `reconciliation` | object: `{attributed, unowned, walked_total, du_total, docker_attributed, docker_unowned}` | |
 | `rust` | array of nested Cargo artifacts | Inspection only; not project-scoped by `--project` yet. |
-| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Inspection only: `swamp propose --external [--path P]` (or a bare `swamp propose --path P` when `P` matches an external unit, not an agent-storage one) builds a plan naming it, but `execute` always refuses it unconditionally. |
+| `external` | object: `{units: [{detector_id, detector_name, category, provenance, path, bytes, growth_bytes, regrowth_count, consumers, note}], total_bytes}` | Storage with no containing project (Cargo registry, rustup, Homebrew, ...). `total_bytes` is separate from `reconciliation` above -- never sum the two. Shown for review only, never markable in the TUI and never actionable through any command: removing one means the manager that owns it fetches or rebuilds it again next time. |
 
 `--view grown` additionally has a top-level `coverage` block:
 
@@ -188,63 +186,17 @@ top-level `projects` array with no `--view`). Both are only consulted
 with `--json`. A truncated page still reports the true `total`; never
 treat a `--limit`-bounded call as an exhaustive inventory.
 
-## `swamp propose [root] --json`
+## There is no propose/execute/plans/grant command
 
-```json
-{
-  "id": "...", "root": "...", "created_at": 0, "expires_at": 0,
-  "status": "Proposed", "units": [ {"kind": "...", "path": "...", "bytes": 0,
-    "growth_bytes": null, "recovery": "local_rebuild", "verb": "delete",
-    "warnings": ["dirty"], "...": "..."} ],
-  "refused": [ {"path": "...", "cause": "..."} ],
-  "selection": {"naive_sum_bytes": 0, "deduplicated_bytes": 0,
-    "double_counted_bytes": 0, "unknown_sharing": false},
-  "state": "awaiting-authorization",
-  "planned_bytes": 0,
-  "next_step": "a human authorizes with `swamp approve <id>` (this plan) or a standing `swamp grant add ...`; then run `swamp execute <id>` (add --json for machine output). Proposing never authorizes removal.",
-  "observed_at": 1234567890
-}
-```
-
-Proposing never deletes or authorizes anything, ever -- `state` is
-always `awaiting-authorization` on a fresh plan. Plans expire (default
-30 minutes) and are single-use.
-
-`planned_bytes` is the plain per-unit sum -- the figure a grant budget
-is spent against. `selection` reconciles that sum against shared
-storage: `deduplicated_bytes` has bytes charged to an inode an earlier
-unit already accounted for removed, `double_counted_bytes` is the
-difference, and `unknown_sharing` is `true` when a selected unit may
-hardlink files whose other links were never enumerated (so
-`deduplicated_bytes` is a lower bound on double-counting removed, not a
-guarantee none remains). Never read any of these as promised free
-space; see `cleanup-and-recovery.md`.
-
-## `swamp execute <plan_id> --json`
-
-Returns `ExecuteResult`: `state` (`executed` | `awaiting-authorization`
-| `expired` | `already-executed`), `next_step`, `outcomes` (per-unit
-`status`: `completed` | `refused` | `failed`, with `cause` when not
-completed), `planned_bytes`, `trashed_bytes`,
-`removed_permanently_bytes`, `freed_measured`, and `evidence` -- the
-`free_before`/`free_after` reading as a sourced `reclaimability`
-/`observed-freed` fact (`source: "statvfs"`), carrying the note that a
-Trash move on the same volume, an open file, a snapshot or a concurrent
-writer can each keep the change from matching what was planned. It is
-`unknown` rather than `0` when either reading was unavailable, and it is
-deliberately a different fact from a plan's `estimated-reclaimable`
-figure: one was measured, the other estimated. An unauthorized plan
-executes with `state: "awaiting-authorization"`, an empty `outcomes`
-array and no `evidence` -- nothing is touched and nothing is measured.
-See `cleanup-and-recovery.md` for refusal causes and Trash recovery.
-
-## `swamp plans --json` / `swamp grant list --json`
-
-```json
-{"plans": [ /* Plan objects, newest first */ ], "total": 3}
-{"grants": [ /* Grant objects */ ], "total": 1,
- "note": "grants are minted only by a human running `swamp approve <plan_id>` or `swamp grant add ...`; no command reads standing authorization into existence on its own"}
-```
+Removed 2026-09-23 ("swamp reports; the human removes"): there is no
+plan, no grant, no `swamp propose`/`execute`/`plans`/`grant`. A row's
+facts (bytes, growth, recovery cost, warnings) are exactly what
+`report`'s views already show; nothing produces a separate "plan"
+object, and nothing authorizes or executes anything. The only thing
+that moves a path to the Trash is a human in the TUI (Space marks,
+Backspace shows current facts, Enter moves it) or at a shell. See
+`cleanup-and-recovery.md` for where a TUI move went and how to restore
+it, and `trust-model.md` for the full statement of what changed.
 
 ## Exit codes and error semantics
 

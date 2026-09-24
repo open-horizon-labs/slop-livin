@@ -74,11 +74,7 @@ fn fixture_report_carries_at_least_one_real_fact_of_each_kind() {
     // boundaries -- see actions::plan_unit_evidence); confirm that
     // seam produces a real CurrentUse fact instead.
     let plan = swamp_core::actions::propose(&r, None, &[], "test").expect("plan");
-    let plan_evidence: Vec<&Evidence> = plan
-        .units()
-        .iter()
-        .flat_map(|u| u.evidence().iter())
-        .collect();
+    let plan_evidence: Vec<&Evidence> = plan.iter().flat_map(|u| u.evidence().iter()).collect();
     assert!(
         plan_evidence.iter().any(|e| e.kind == FactKind::CurrentUse),
         "no CurrentUse fact anywhere in the proposal path"

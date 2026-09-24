@@ -224,14 +224,11 @@ No `CurrentUse` fact that requires a *live* query is attached during a
 passive report (a process, lock, container-state or booted-device check
 is short-lived, and one query per detected unit on every report is a
 cost identification must not pay): `actions::plan_unit_evidence` takes
-the `lsof` reading fresh at proposal time, `actions::unit_from_external`
-takes an external unit's manager-lock and simulator-booted readings
-there too, and `execute_with_trash_opts` takes occupancy fresh *again*
-immediately before acting, so a fact that changes between propose and
-execute is always caught rather than compared against a possibly-stale
-snapshot. `execute_with_trash_opts` also records the one *measured*
-reclaimability number, `reclaimability::observed_free_space_change`
-over its own `statvfs` before/after readings, on `ExecuteResult`.
+the `lsof` reading fresh when a `PlanUnit` is built,
+`actions::unit_from_external` takes an external unit's manager-lock and
+simulator-booted readings there too. This reading is shown on the TUI's
+confirm banner as a fact, never as a veto (2026-09-23: there is no
+execute-time recheck any more to take it "again"; see below).
 
 `consumer_wiring::attach_associations(report, external_units, swamp_dir)`
 is called once per call site that has *both* a computed `Report` and a
@@ -405,34 +402,20 @@ Before this, running them in sequence over an unchanged filesystem had
 each tombstoning the other's rows, and the next pass reported the
 resurrection as regrowth. Coverage changes are not storage changes.
 
-### The recheck model at destructive sinks
+### There is no recheck model at a destructive sink any more (retired 2026-09-23)
 
-`crate::recheck` is the one live-state recheck every sink shares.
-`run_all(&Authorized)` runs all three below and is the only way to get
-the `RecheckProof` a destructive call needs; every input it checks --
-the anchor, the reviewed identity, each sidecar member's identity
-recorded at proposal, the store whose protect list applies -- comes from
-the authorization, never from the sink:
-
-- `reviewed_snapshot(path, reviewed)` recomputes the anchor's `(device,
-  inode)` and its membership and refuses on any drift. Membership is
-  exact (one entry per member with size, mtime and inode) up to
-  `EXACT_MEMBER_LIMIT`, and above it a bounded summary -- entry count,
-  allocated bytes, newest mtime -- plus a blake3 fingerprint of the
-  sorted metadata tuples. Ordinary filesystem artifact rows record an
-  anchor-only identity instead, so proposal stays a `stat` rather than a
-  traversal per matched row. Nothing here reads file contents.
-- `live_protection(store_dir, paths)` loads human keep/protect intent
-  from disk at the moment of the call and tests both directions.
-- `member_occupancy(paths)` probes with `lsof +D` for directories, so
-  the answer covers descendants, and returns
-  `OccupancyState::{Free, Occupied, Unknown}`. `Unknown` refuses.
-
-Strength differs by domain; the model does not. `cargo_cleanup`
-additionally digests its members' *contents* under a held Cargo build
-lock, which is affordable for small build outputs and would be both
-unaffordable and a privacy violation for a model cache or a transcript
-directory.
+`crate::recheck` and `crate::authority` are deleted along with the CLI
+action path. `fs_gate::destroy::trash_move`/`Envelope` take a plain
+path or member list and move it; the only refusal is an OS-level error.
+Human keep/protect intent is still checked, but at mark time, in the
+TUI (`app.rs`'s `mark_row`, which reloads `agents::load_protect` fresh
+before adding anything to `self.marked`) -- not re-checked again before
+Enter. Occupancy (`occupancy::probe_path`/`probe_paths`) is still
+computed and shown on the confirm banner as a fact, never as a gate.
+`cargo_cleanup::move_group` still holds the Cargo build lock for the
+duration of its move (mutual exclusion with a concurrent `cargo build`,
+not a "did anything change" check) but no longer digests members'
+contents or refuses on a changed fingerprint.
 
 ### Incremental measurement, and what is still a full pass
 
@@ -1200,15 +1183,57 @@ Plain `report` reads cached GitHub information. `observe` and `report --enrich` 
 
 Merge status is combined with clean/unpushed terms in `merge-complete`; it is evidence a user can inspect, not a permission to delete. The current `tip_reachable` term is derived from the merged result rather than a separate reachability proof.
 
-## Actions and extension points
-
-A report supplies the context for a plan. CLI `propose` plans (whether run interactively or via `--json` by an agent) carry selected units, observations, recovery information, and warnings. Approval supplies a one-shot grant or execution uses a matching standing grant. Execution records outcomes and recovery locations in a ledger. TUI confirmation creates its own short-lived plan and grant and uses core execution primitives.
-
-These action paths share concepts and lower-level code but do not have identical validation. Do not infer a universal guarantee from a check present in only one path. Docker removal is delegated to the daemon; filesystem moves go to Trash. Grant-writing (`swamp approve`, `swamp grant add`) is reserved by convention for a human to invoke, but a shell-capable agent still has the operating-system permissions of its account and could invoke those same commands -- see `skills/swamp/references/trust-model.md` and `.oh/guardrails/human-only-authorization.md` for what actually enforces safety at the sink.
+## Extension points
 
 To add a fact source, implement a consumer and register it before dispatch. If it introduces a new event payload or report field, also update the event definitions, assembly gate or final assembler, serialization, and relevant interfaces. Registration alone is sufficient only when the existing contracts already express the new fact.
 
 To add artifact recognition, update the ecosystem rules and fixtures. Classification changes must invalidate old observations through the rules version. An upstream ignore entry is research input; inspect what a directory can contain before classifying it.
+
+## Reporting and removal (2026-09-23: swamp reports; the human removes)
+
+There is no action pipeline any more. `crates/core/src/actions.rs` turns
+report rows (a folded artifact, a Cargo purpose group, an agent-storage
+unit, a worktree/checkout) into `PlanUnit`s -- the facts a human needs
+and the exact member paths that would move -- but a `PlanUnit` is built
+fresh in memory, never persisted, never signed, and never compared
+against a later re-derivation. There is no `Plan`/`Grant` store, no
+authority key, no confirmation token, and no CLI command
+(`propose`/`propose-agents`/`approve`/`execute`/`grant`/`plans`/
+`cleanup-check`) that writes or deletes anything. `swamp report` and its
+views, and `swamp protect` (a human keep-list the TUI's mark step
+consults), are the entire CLI surface with side effects, and `protect`
+only ever adds or removes a path from that list -- it never touches
+user data.
+
+The only thing that moves a path to the Trash is the TUI:
+
+- **Space** marks a row, building its `PlanUnit`(s) from the current
+  report (and reloading `swamp protect`'s list fresh, so a protection
+  added mid-session is honoured immediately).
+- **Backspace** opens the confirm banner, which renders each marked
+  unit's current facts: path, size, what it is, the plain-language
+  consequence of deleting it (rebuild, redownload, lost session
+  history, unpushed commits, no remote…), and whether anything has it
+  open right now.
+- **Enter** calls `fs_gate::destroy::trash_move`/`Envelope` directly on
+  exactly the marked paths (`crates/tui/src/actions.rs::execute_one`)
+  and appends one ledger line per unit (path, recovery location, bytes,
+  time) to `~/.local/share/swamp/ledger.jsonl`.
+
+There is deliberately **no** re-derivation between marking and moving:
+no "changed since you looked" refusal, no occupancy veto. The only
+refusals left are ordinary OS-level errors -- the path is gone,
+permission denied, or the Trash is on a different device with no
+permanent-delete fallback. Docker removal still goes through the
+daemon (`docker::remove`/`still_removable`), permanently, with no
+Trash behind it; the daemon's own refusal text is the only "no" it can
+give.
+
+See `skills/swamp/references/trust-model.md` for the equivalent
+statement aimed at an agent reading this tool's output, and
+`.oh/guardrails/human-only-authorization.md` /
+`.oh/guardrails/execution-sinks-recheck-live-state.md` for the retired
+guardrails this replaced.
 
 ## Capability gates
 
@@ -1234,41 +1259,21 @@ typed capabilities, one submodule each:
 |---|---|
 | `fs_gate::read::bounded_read(path, BoundedCap)` | a named cap; the only read of user content |
 | `fs_gate::store::write_json(JsonFile, ..)`, `write_text(TextFile, ..)`, `append_line(LogFile, ..)` | a variant of the enum that *is* the allow-list of swamp's own files, each a fixed name inside a typed `StoreDir`; the ledger, observation log and LaunchAgent plist are resolved or name-checked in the gate; the atomic writer is private |
-| `fs_gate::key::authority_key(&StoreDir)` | the store's 32-byte key that binds plans and grants (`actions`, `authority`, `recheck` only) |
 | `fs_gate::columns::write_parquet_atomic(.., zstd_level)` | a zstd level; no codec parameter |
 | `fs_gate::spawn::run(Program, ..)` | a `Program` variant **and** one of that program's allow-listed argument shapes; counts the spawn, returns a finished `RunOutput` |
 | `fs_gate::git::{Repo, IgnoreLens}` | read-only gitoxide queries (HEAD, status, upstream, lock, ignore rules); no index, ref, lock or temp-file write |
-| `fs_gate::destroy::{trash_move, Envelope, docker_remove, copy_preserved}` | a `RecheckProof` **and** an `Authorized`; arguments (Docker id, copy destination) come from them |
-| `fs_gate::destroy::git_worktree_prune` | the `Trashed` receipt of the licensed move it follows, **and** an `Authorized` |
+| `fs_gate::destroy::{trash_move, Envelope, docker_remove, copy_preserved}` | a plain path (or, for Docker, a `Removal`); no proof, no authorization token -- swamp reports, the human decides, and these functions just move what they were told to (2026-09-23) |
+| `fs_gate::destroy::git_worktree_prune` | the linked worktree's `.git` common dir, read by the caller before the move |
 | `fs_gate::symlink_metadata` / `metadata_following` | the caller says which; there is no plain `metadata` |
 
-The tokens are minted in exactly one place each, with private fields:
+There is no authority key, no `Plan`/`Grant` persistence, and no
+`RecheckProof`/`Authorized` token any more (retired 2026-09-23 with the
+CLI action path; see `.oh/guardrails/human-only-authorization.md` and
+`.oh/guardrails/execution-sinks-recheck-live-state.md`). The tokens that
+remain are minted in exactly one place each, with private fields:
 
-- `recheck::RecheckProof` -- only `recheck::run_all(&Authorized)`
-  (reviewed snapshot, each sidecar member's recorded identity, live
-  protection in both directions from the authorization's store, member
-  occupancy; for a Docker object, the daemon asked about exactly the
-  authorized removal; fail closed). Every input comes from the token,
-  none from the sink. Not `Clone`, `#[must_use]`, consumed by the
-  destructive call, refused when older than `MAX_PROOF_AGE` or when it
-  does not cover the path.
-- `authority::Authorized` -- only `authorize` (crate-private: a stored
-  grant, verified, covering the unit of a verified plan whose content
-  digest the grant recorded, within its budget) or `authorize_confirmed`
-  (one TUI confirmation, for the one path it names). It carries the
-  anchor, reviewed identity, sidecar member identities, store, Docker
-  removal, linked-worktree flag and preserve destination -- what the
-  human saw, copied from the plan or the confirmation.
-- `authority::HumanConfirmed` -- only `cli_approve(actor, &plan)`,
-  `cli_grant(actor, terms)`, `cli_protect(actor, change)` and
-  `tui_dialog(actor, store, items)`, each binding a **subject** (a
-  plan's id and content digest, standing-grant terms, one keep-list
-  change, one TUI unit). Spent by value (`approve_confirmed`,
-  `add_standing_grant_confirmed`, `protect_{add,remove}_confirmed`,
-  `authorize_confirmed`), refused when the subject or site is not
-  exactly what the consumer does.
-- `fs_gate::destroy::Trashed` -- only `trash_move`: the receipt `git
-  worktree prune` needs.
+- `fs_gate::destroy::Trashed` -- only `trash_move`: the receipt naming
+  where a move went.
 - `bus::Stage` -- only `EventBus::run`; the walk and every pipeline stage
   take one, and `EventBus::new`/`register` are private to the registrar.
 - `report::DiscoveryPass` -- only `observe_scope`; external and agent
@@ -1289,47 +1294,23 @@ prints) is display-only; `OccupancyState` is `#[must_use]` with no boolean
 view; `CandidateAgentUnit`'s deciding fields are private to its builder;
 `DetectorSummary`'s raw candidates are private to `scope`.
 
-### Provenance: what makes a plan or grant authorization
+### Provenance (retired 2026-09-23)
 
-Re-review 5 (2026-09-23) found the tokens sound and their *inputs* not:
-`authorize` accepted any `Plan`, `PlanUnit` and `Grant`, all three
-`pub`-field `Deserialize` structs, so a hand-built or hand-edited grant
-was as good as one a human minted; an approval covered a plan *id*,
-whatever the file under that id later held; and `run_all` rechecked a
-store, path, identity and member list the caller chose. Now:
-
-- **Records are bound.** `Plan` and `Grant` have fields private to
-  `actions` and are not `Deserialize`. On disk each record carries a
-  keyed blake3 MAC under the store's authority key
-  (`<store>/authority.key`, 32 random bytes, mode 0600, created on first
-  use). `load_plan` and `list_grants` -- the only code that builds one
-  from bytes -- recompute it and refuse an edited, copied or hand-written
-  record; one bad grant refuses the whole grants file (fail closed, as a
-  corrupt protect list does). A plan copied into another store does not
-  load there, so an execution always reads protection from the store its
-  plan and grant came from.
-- **Approvals bind content.** `Plan::content_digest` covers the id, root,
-  times, proposer and every unit (canonical JSON). `cli_approve` binds it
-  when the plan is shown; `approve_confirmed` refuses unless the stored
-  plan still has it; the one-shot grant records it; `authorize` refuses a
-  plan that no longer has it. Re-saving different content under an
-  approved id (the one public field, `Plan::id`, kept for the reviewers'
-  suites) is therefore not covered.
-- **Sidecars are reviewed.** A plan unit records the identity of every
-  member outside its anchor (a session's companion files, a Cargo
-  group's `.d`/`.dSYM`); `run_all` compares each one exactly as it does
-  the anchor. `recheck::capture` is crate-private.
-- **Limit, stated.** The key is readable by the user swamp runs as. A
-  process with that user's filesystem access that reimplements the MAC
-  can forge a record. The binding rules out every path that does not go
-  through swamp's own code: a hand edit, a JSON writer, a file from
-  another store, a helper that builds a record.
+Through re-review 5 this section described the keyed binding that made
+a `Plan`/`Grant` record trustworthy: a blake3 MAC under a store's
+`authority.key`, content-digest-bound approvals, sidecar identity
+rechecks. All of it is deleted along with the CLI action path it
+protected -- there is no plan, no grant, no authority key, and nothing
+left to forge. What used to require that machinery (a human-only
+approval that a shell-capable process could still technically invoke)
+is now: there is no command left to invoke that would delete anything,
+only `swamp report`, `swamp protect`, and the TUI's own Trash move. See
+`.oh/guardrails/human-only-authorization.md` for the full retirement
+note.
 
 Test-only entry points (`fs_events::testing`, `DiscoveryPass::for_tests`,
-`Stage::for_tests`, the string-actor `approve`/`add_standing_grant`,
-`protect_add`/`protect_remove`/`protect_list`, `recheck::capture` and
-`reviewed_snapshot`, `Plan::with_times_for_tests`, `From<&str> for
-Reason`) exist only under swamp-core's `testing` feature. The feature is
+`Stage::for_tests`, `protect_list`,
+`From<&str> for Reason`) exist only under swamp-core's `testing` feature. The feature is
 enabled by the workspace's own dev-dependencies and by nothing a release
 builds: the gate audit rejects any non-dev dependency that enables it,
 and `scripts/check.sh` and the release workflow refuse a `swamp` build
@@ -1367,22 +1348,21 @@ resolved through `use` (globs, renames, `pub use`), `crate`/`super`/
 - `gate_paths_only_inside_gates` -- the gated paths above appear only in
   gate modules (as a `Path` method named as a path, too); each gate group
   (`read_dir`, `store`, `columns`, `destroy`, `sys`, each `Program`
-  variant, the token mint sites, `OccupancyState`, a new
-  `ObservationOwnership`, `revoke_grant`) only in the modules allowed to
-  hold it, and `DiscoveryPass::begin`/`Stage::mint` only in their one
-  function each; the TUI names only the scope-aware report entry points;
-  no `unsafe` or `extern` outside the gate; no production dependency
-  enabling `testing`. Since re-review 5 it also: loads every product
-  crate's build script as a module of its crate (and rejects one in a
-  crate it does not model); follows `include!` targets into the including
-  module and rejects a computed target or one outside the crate's
-  `src/`; rejects `#[allow]`/`#[expect]`/`#[warn]` of a gate lint
+  variant, `OccupancyState`, a new `ObservationOwnership`) only in the
+  modules allowed to hold it, and `DiscoveryPass::begin`/`Stage::mint`
+  only in their one function each; the TUI names only the scope-aware
+  report entry points; no `unsafe` or `extern` outside the gate; no
+  production dependency enabling `testing`. Since re-review 5 it also:
+  loads every product crate's build script as a module of its crate
+  (and rejects one in a crate it does not model); follows `include!`
+  targets into the including module and rejects a computed target or
+  one outside the crate's `src/`; rejects
+  `#[allow]`/`#[expect]`/`#[warn]` of a gate lint
   (`disallowed_methods`/`types`/`macros`, the `style`/`all` groups,
   `unsafe_code`, `warnings`) outside the gate and the TUI's `worker`;
-  pins each `HumanConfirmed` constructor, `authorize` and
-  `authorize_confirmed` to one function by resolved path; and pins the
-  struct literals of `Plan`, `PlanUnit`, `Grant`, `Authorized`,
-  `HumanConfirmed`, `RecheckProof` and `Trashed` to their constructors.
+  and pins the struct literal of `Trashed` to `trash_move`. (2026-09-23:
+  the `HumanConfirmed`/`authorize`/`authorize_confirmed`/`Plan`/`Grant`/
+  `Authorized`/`RecheckProof` pins are retired along with those types.)
 - `adapters_do_not_reach_gates` -- agent adapters reach I/O only through
   `IdentifyCtx`; never the environment (nor a path built from an absolute
   literal), detectors, actions or another tool's adapter; never print or
@@ -1442,17 +1422,14 @@ run them, and run here with `--ignored`) and the single-threaded cost
 test. CI runs the full tier (`.github/workflows/check-full.yml`).
 
 **Trusted base.** What a reviewer must read, because no type or rule
-above holds it: `crates/core/src/fs_gate/` (all of it, `git` and `key`
-included), `fs_events/macos.rs`, the TUI's `worker.rs`, the constructor
-functions the audit pins (`actions::{propose, propose_external,
-propose_agents, unit_from_row, unit_from_external, unit_from_agent,
-plan_from_record, approve_confirmed, add_standing_grant_confirmed,
-list_grants, execute_with_trash_opts}`, `authority::{mint, authorize,
-authorize_confirmed}`, `recheck::run_all`, `destroy::trash_move`), the
-four confirmation handlers (`cmd_approve`, `cmd_grant_add`,
-`cmd_protect`, `start_delete`), and the audit and its clippy
-configuration themselves. Everything else is held by the compiler, the
-audit or a runtime test.
+above holds it: `crates/core/src/fs_gate/` (all of it), `fs_events/macos.rs`,
+the TUI's `worker.rs`, the constructor functions the audit pins
+(`actions::{propose, propose_external, propose_agents, unit_from_row,
+unit_from_external, unit_from_agent}`, `destroy::trash_move`), the TUI's
+`app.rs::mark_row`/`start_delete` and `crates/tui/src/actions.rs::execute_one`
+(the only place a Trash move is actually invoked), and the audit and
+its clippy configuration themselves. Everything else is held by the
+compiler, the audit or a runtime test.
 
 **Limits.** Inside `growth`, the history module, the directory and file
 tables' Parquet writers are `pub(super)`: their current-plus-delta

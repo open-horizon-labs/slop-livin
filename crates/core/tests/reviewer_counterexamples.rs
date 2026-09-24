@@ -1,3 +1,14 @@
+//! Independent-review counterexamples that are not about the CLI/agent
+//! action path (deleted 2026-09-23, "swamp reports; the human removes").
+//! The three counterexamples this file used to also carry --
+//! `protection_added_after_approval_must_stop_execution`,
+//! `replacement_directory_must_not_spend_old_approval`,
+//! `open_cache_member_must_stop_parent_removal` -- asserted an
+//! execute-time recheck refusal that the product decision explicitly
+//! removes (no re-derivation between marking and moving; only OS errors
+//! refuse). They are deleted, not adapted, because the behavior they
+//! required no longer exists by design.
+
 use std::{collections::HashMap, fs};
 use swamp_core::{
     actions, agents, external,
@@ -79,68 +90,6 @@ fn unchanged_combined_observation_must_not_invent_regrowth() {
                 .collect::<Vec<_>>()
         );
     }
-}
-
-#[test]
-fn protection_added_after_approval_must_stop_execution() {
-    let (_tmp, home, scope) = fixture();
-    let store = tempfile::tempdir().unwrap();
-    let trash = tempfile::tempdir().unwrap();
-    let units = agents::discover_and_measure(
-        &scope,
-        &[],
-        Some(store.path()),
-        false,
-        1000,
-        30,
-        3600,
-        &swamp_core::fs_events::EventCoverage::untrusted(),
-    )
-    .unwrap();
-    let path = home.join("debug");
-    let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
-    actions::save_plan(store.path(), &plan).unwrap();
-    actions::approve(store.path(), &plan.id, "human:fixture").unwrap();
-    agents::protect_add(store.path(), &path).unwrap();
-    let result =
-        actions::execute_with_trash(store.path(), &plan.id, "human:fixture", trash.path()).unwrap();
-    assert!(
-        path.exists(),
-        "protected data was moved: {:?}",
-        result.outcomes
-    );
-}
-
-#[test]
-fn replacement_directory_must_not_spend_old_approval() {
-    let (_tmp, home, scope) = fixture();
-    let store = tempfile::tempdir().unwrap();
-    let trash = tempfile::tempdir().unwrap();
-    let units = agents::discover_and_measure(
-        &scope,
-        &[],
-        None,
-        false,
-        1000,
-        30,
-        3600,
-        &swamp_core::fs_events::EventCoverage::untrusted(),
-    )
-    .unwrap();
-    let path = home.join("debug");
-    let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
-    actions::save_plan(store.path(), &plan).unwrap();
-    actions::approve(store.path(), &plan.id, "human:fixture").unwrap();
-    fs::rename(&path, home.join("old-debug")).unwrap();
-    fs::create_dir(&path).unwrap();
-    fs::write(path.join("unapproved.txt"), b"new unrelated content").unwrap();
-    let result =
-        actions::execute_with_trash(store.path(), &plan.id, "human:fixture", trash.path()).unwrap();
-    assert!(
-        path.exists(),
-        "replacement data was moved: {:?}",
-        result.outcomes
-    );
 }
 
 #[test]
@@ -234,39 +183,5 @@ fn defaults_false_must_mean_explicit_only() {
         scope.roots.is_empty(),
         "defaults=false still inferred {} roots",
         scope.roots.len()
-    );
-}
-
-#[test]
-fn open_cache_member_must_stop_parent_removal() {
-    let (_tmp, home, scope) = fixture();
-    let store = tempfile::tempdir().unwrap();
-    let trash = tempfile::tempdir().unwrap();
-    let path = home.join("debug");
-    let units = agents::discover_and_measure(
-        &scope,
-        &[],
-        None,
-        false,
-        1000,
-        30,
-        3600,
-        &swamp_core::fs_events::EventCoverage::untrusted(),
-    )
-    .unwrap();
-    let plan = actions::propose_agents(&units, &[path.clone()], "review-fixture").unwrap();
-    actions::save_plan(store.path(), &plan).unwrap();
-    actions::approve(store.path(), &plan.id, "human:fixture").unwrap();
-    let _open = fs::File::open(path.join("log.txt")).unwrap();
-    assert!(
-        agents::is_active(&path.join("log.txt")),
-        "fixture must have an observable open file"
-    );
-    let result =
-        actions::execute_with_trash(store.path(), &plan.id, "human:fixture", trash.path()).unwrap();
-    assert!(
-        path.exists(),
-        "actively open member moved: {:?}",
-        result.outcomes
     );
 }

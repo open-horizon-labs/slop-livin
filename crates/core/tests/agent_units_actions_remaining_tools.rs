@@ -87,12 +87,19 @@ fn units_for(
 fn execute_one(units: &[swamp_core::agents::AgentUnit], path: &Path, store: &Path) -> String {
     let plan =
         actions::propose_agents(units, std::slice::from_ref(&path.to_path_buf()), "test").unwrap();
-    actions::save_plan(store, &plan).unwrap();
-    actions::approve(store, &plan.id, "human:test").unwrap();
+    let unit = &plan[0];
+    let meta = unit.agent_meta().unwrap();
     let trash = store.join("trash");
     fs::create_dir_all(&trash).unwrap();
-    let result = actions::execute_with_trash(store, &plan.id, "human:test", &trash).unwrap();
-    result.outcomes[0].status.clone()
+    let at = swamp_core::entities::now();
+    let result = match &meta.session_members {
+        Some(members) => actions::trash_agent_session(meta, unit.path(), members, &trash, at),
+        None => actions::trash_agent_cache(unit.path(), &trash, at),
+    };
+    match result {
+        Ok(_) => "completed".to_string(),
+        Err(_) => "failed".to_string(),
+    }
 }
 
 fn assert_refused(units: &[swamp_core::agents::AgentUnit], path: &Path) {
@@ -100,7 +107,9 @@ fn assert_refused(units: &[swamp_core::agents::AgentUnit], path: &Path) {
         .unwrap_err();
     assert!(
         format!("{err}").to_lowercase().contains("protected")
-            || format!("{err}").to_lowercase().contains("no supported"),
+            || format!("{err}")
+                .to_lowercase()
+                .contains("swamp has no trash move"),
         "{err}"
     );
 }

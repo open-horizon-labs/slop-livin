@@ -13,7 +13,6 @@
 //! (`crates/core/tests/compile_fail/protect_list_*.rs`). That replaces
 //! the `protection_fails_closed` call-graph audit.
 
-use crate::authority::{HumanConfirmed, ProtectChange};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -227,29 +226,9 @@ fn save_protect(swamp_dir: &Path, paths: &[PathBuf]) -> Result<()> {
 /// Idempotent; a not-yet-observed path can still be protected in
 /// advance.
 ///
-/// **Human-only** (re-review 5, finding 7): takes the
-/// [`HumanConfirmed`] the CLI's `cmd_protect` minted for exactly this
-/// change, and spends it. A keep-list change is as consequential as a
-/// grant -- removing an entry is what lets an approved plan move what it
-/// protected -- so no other code path may make one.
-pub fn protect_add_confirmed(
-    swamp_dir: &Path,
-    path: &Path,
-    confirmed: HumanConfirmed,
-) -> Result<()> {
-    if !confirmed.confirms_protect(&ProtectChange::Add(path.to_path_buf())) {
-        anyhow::bail!(
-            "refused: this confirmation is not `swamp protect add {}`",
-            path.display()
-        );
-    }
-    protect_add_unchecked(swamp_dir, path)
-}
-
-/// The test-fixture spelling of [`protect_add_confirmed`] (`testing`
-/// only; no production build has it). The reviewers' counterexample files
-/// call it by this name.
-#[cfg(feature = "testing")]
+/// **Human-only by convention, not by a technical wall**: this is
+/// `swamp protect add`'s handler, and the TUI never calls it -- it only
+/// reads the list this writes.
 pub fn protect_add(swamp_dir: &Path, path: &Path) -> Result<()> {
     protect_add_unchecked(swamp_dir, path)
 }
@@ -275,26 +254,8 @@ fn protect_add_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Removes `path` from the human keep list. Human-only, like
-/// [`protect_add_confirmed`]: it spends the CLI's confirmation for exactly
-/// this removal.
-pub fn protect_remove_confirmed(
-    swamp_dir: &Path,
-    path: &Path,
-    confirmed: HumanConfirmed,
-) -> Result<()> {
-    if !confirmed.confirms_protect(&ProtectChange::Remove(path.to_path_buf())) {
-        anyhow::bail!(
-            "refused: this confirmation is not `swamp protect remove {}`",
-            path.display()
-        );
-    }
-    protect_remove_unchecked(swamp_dir, path)
-}
-
-/// The test-fixture spelling of [`protect_remove_confirmed`] (`testing`
-/// only).
-#[cfg(feature = "testing")]
+/// Removes `path` from the human keep list. `swamp protect remove`'s
+/// handler.
 pub fn protect_remove(swamp_dir: &Path, path: &Path) -> Result<()> {
     protect_remove_unchecked(swamp_dir, path)
 }

@@ -14,7 +14,6 @@ runtime_tests:
   - crates/core/tests/reviewer_counterexamples.rs::excluded_agent_home_must_not_be_scanned
   - crates/core/src/scope.rs::tests::authorized_roots_drops_excluded_and_explains_missing
   - crates/core/src/scope.rs::tests::explicit_roots_do_not_authorize_detector_paths_outside_them
-  - crates/core/tests/reviewer_counterexamples_stack2.rs::an_excluded_home_must_stay_excluded_under_an_explicit_root
   - crates/core/tests/explicit_root_scope_exclusions.rs
 ---
 
@@ -48,9 +47,12 @@ Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-aud
 - `crates/core/tests/reviewer_counterexamples.rs::excluded_agent_home_must_not_be_scanned`
 - `crates/core/src/scope.rs::tests::authorized_roots_drops_excluded_and_explains_missing`
 - `crates/core/src/scope.rs::tests::explicit_roots_do_not_authorize_detector_paths_outside_them`
-- `crates/core/tests/reviewer_counterexamples_stack2.rs::an_excluded_home_must_stay_excluded_under_an_explicit_root`
-  — the CE1 case the prior test could not see, because it passed `&[]`
-  for explicit roots.
+  (2026-09-23: this section used to also cite
+  `crates/core/tests/reviewer_counterexamples_stack2.rs::an_excluded_home_must_stay_excluded_under_an_explicit_root`,
+  the CE1 case the prior test could not see because it passed `&[]` for
+  explicit roots -- that file is gone from this branch with no deletion
+  commit in its history; discovered as a stale reference during
+  stack/27's verification, unrelated to this chunk's own changes.)
 - `crates/core/tests/explicit_root_scope_exclusions.rs` — every
   exclusion case (an excluded home, an excluded nested location, a
   disabled detector, a protected path in either spelling) under an

@@ -1,41 +1,35 @@
 ---
 id: occupancy-is-tristate-at-sinks
-severity: hard
-statement: "A sink never consumes a boolean occupancy answer. Occupancy is OccupancyState::{Free, Occupied(path), Unknown(reason)}; a probe that could not run, timed out, or was denied permission is Unknown, and Unknown refuses. Directories are probed so every member is covered, not just the anchor: lsof +D on macOS, a procfs scan of every open file, cwd and mapping on Linux (#86)."
+severity: retired
+statement: "Retired 2026-09-23 by product decision: swamp reports, the human removes. There is no sink-side occupancy veto any more -- `crate::recheck` (which consumed OccupancyState to refuse a move) is deleted along with the rest of the CLI action path. Occupancy is still computed tri-state (`occupancy::OccupancyState::{Free, Occupied(path), Unknown(reason)}`) and still shown to the human on the TUI's confirm banner as a fact, but nothing gates a Trash move on it: `Unknown` is displayed, never a refusal."
 outcome: decision-relevant-storage-evidence
-audit: gate_paths_only_inside_gates
-compile_fail:
-  - occupancy_has_no_bool
-  - occupancy_does_not_convert_to_bool
-runtime_tests:
-  - crates/core/tests/reviewer_counterexamples.rs::open_cache_member_must_stop_parent_removal
-  - crates/core/tests/execution_rechecks.rs
-  - crates/core/src/recheck.rs::tests::member_occupancy_probes_a_descendant_not_only_the_anchor
 ---
 
-## Rationale
+## Why this was retired
 
-`open_cache_member_must_stop_parent_removal`: with `debug/log.txt` held
-open, removing `debug/` still completed. Two causes, one shape — the
-sink asked a boolean question about the anchor path only. A boolean
-cannot distinguish "checked, nothing open" from "could not check", and
-`lsof -- <dir>` says nothing about the directory's contents.
+`open_cache_member_must_stop_parent_removal` (the 2026-09-21 review's
+counterexample this guardrail was written for) asserted that a sink
+must refuse to move a directory while a member inside it is open. That
+assertion is no longer true by design: the product decision removes
+every automated veto in front of a Trash move, including this one. A
+human who presses Enter with a file open somewhere inside what they
+marked gets the move -- the open-file fact was shown on the confirm
+banner first, and it is their call.
+
+`OccupancyState` itself (`Free`/`Occupied`/`Unknown`, no boolean
+conversion) is unchanged and still used by `occupancy::probe_path`/
+`probe_paths` to build the evidence shown on that banner --
+`.oh/guardrails/occupancy-gaps-are-unknown-never-free.md` (if present)
+or the general facts-not-verdicts discipline still applies to how it is
+*worded*. What is retired is only the refusal that used to sit between
+the reading and the move.
 
 ## Detection
 
-Mechanism: type, gate audit, runtime test.
-
-**Type.** `OccupancyState` (`Free | Occupied | Unknown`) is `#[must_use]`, has no `is_free` and no conversion to `bool`; its one consumer on the destructive path is the private `recheck::member_occupancy`, where `Unknown` is a refusal, reached only through `run_all` (proposal time gets a refusal string from `recheck::occupancy_refusal`). The boolean `is_active` view exists only under the `testing` feature.
-
-**Gate audit.** `gate_paths_only_inside_gates`: `OccupancyState` may be named only in `occupancy` and `recheck`, so no other module can match on it, collapse it or read `Unknown` as free.
-
-Retired 2026-09-22: the `occupancy_is_tristate_at_sinks` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
-
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `occupancy_has_no_bool`, `occupancy_does_not_convert_to_bool`.
-
-## Runtime tests that complete it
-
-- `crates/core/tests/reviewer_counterexamples.rs::open_cache_member_must_stop_parent_removal`
-- `crates/core/tests/execution_rechecks.rs` — an occupancy probe forced
-  to `Unknown` refuses and moves nothing.
-- `crates/core/src/recheck.rs::tests::member_occupancy_probes_a_descendant_not_only_the_anchor`
+Mechanism: type. There is no runtime check left, and none is needed:
+the veto this guardrail described is deleted, not replaced. What
+remains true -- `OccupancyState` has no boolean view, so nothing can
+collapse `Unknown` into "free" by accident when it *is* consulted for
+display -- is enforced the same way it always was (the type itself),
+just no longer at a destructive sink, because there is no destructive
+sink left that consults it.

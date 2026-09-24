@@ -3,8 +3,8 @@
 //! `.oh/guardrails/json-persistence-is-allowlisted.md`).
 //!
 //! The AST audits check the *code*. This checks the disk: it runs a full
-//! observe -> report -> propose -> approve -> execute cycle over a
-//! multi-ecosystem fixture and then walks the store, asserting every
+//! observe -> report -> Trash-move cycle over a multi-ecosystem fixture
+//! and then walks the store, asserting every
 //! file matches exactly one allow-listed pattern. A new JSON data cache
 //! fails here even if it is assembled from fragments the audits cannot
 //! see, and a growing JSON file fails on size alone -- a control file
@@ -26,10 +26,6 @@ const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 /// Exact basenames allowed anywhere under the store.
 const ALLOWED_NAMES: &[&str] = &[
     "config.toml",
-    "grants.json",
-    // 32 random bytes binding plans and grants to swamp's own
-    // propose/approve paths (`fs_gate::key`); not JSON, not data.
-    "authority.key",
     "ledger.jsonl",
     "last_run.json",
     "fsevents.json",
@@ -54,10 +50,6 @@ fn allowed(rel: &Path) -> bool {
     }
     // Columnar tables, wherever the store puts them.
     if name.ends_with(".parquet") {
-        return true;
-    }
-    // One plan per file, named by its id.
-    if rel.components().any(|c| c.as_os_str() == "plans") && name.ends_with(".json") {
         return true;
     }
     // The per-root/per-scope report cache is one compressed file named
@@ -226,7 +218,7 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
         swamp_core::scope::persist_effective_scope(&fx.store, &scope).unwrap();
     }
 
-    // propose -> approve -> execute one agent cache unit.
+    // Trash-move one agent cache unit, exactly as the TUI would on Enter.
     let observation = swamp_core::report::observe_scope(
         &scope,
         swamp_core::report::ObservationParts::ALL,
@@ -245,22 +237,16 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
     )
     .expect("scope observation");
     let cache = fx.claude_home.join("debug");
-    let plan = swamp_core::actions::propose_agents(
+    let units = swamp_core::actions::propose_agents(
         &observation.agent_units,
         std::slice::from_ref(&cache),
         "test:store-contents",
     )
-    .expect("the fixture's agent cache unit must be proposable");
-    swamp_core::actions::save_plan(&fx.store, &plan).unwrap();
-    swamp_core::actions::approve(&fx.store, &plan.id, "human:test").unwrap();
-    let result =
-        swamp_core::actions::execute_with_trash(&fx.store, &plan.id, "human:test", &fx.trash)
-            .expect("execute");
-    assert_eq!(
-        result.outcomes[0].status, "completed",
-        "the fixture must actually execute so the Trash envelope exists: {:?}",
-        result.outcomes[0].cause
-    );
+    .expect("the fixture's agent cache unit must be listable");
+    assert!(units[0].agent_meta().is_some());
+    let (_dest, _bytes) =
+        swamp_core::actions::trash_agent_cache(&cache, &fx.trash, swamp_core::entities::now())
+            .expect("trash move");
 
     // One more report after the action.
     let _ = swamp_core::report::observe_scope(
@@ -302,7 +288,7 @@ fn a_full_cycle_leaves_only_allowlisted_files_in_the_store() {
         })
         .collect();
     listed.sort();
-    println!("store after observe/report/propose/approve/execute: {total} bytes total");
+    println!("store after observe/report/trash-move: {total} bytes total");
     for (rel, size) in &listed {
         println!("  {size:>9}  {rel}");
     }

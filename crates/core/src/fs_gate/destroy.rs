@@ -1,40 +1,17 @@
-//! Every operation that moves, removes or rewrites data swamp does not
-//! own. Each one takes a [`RecheckProof`] (by value: spent once; or by
-//! reference for the copy that precedes a move) -- or the [`Trashed`]
-//! receipt of the move a proof licensed -- and an [`Authorized`] (by
-//! reference), checks that the authorization names the proof's anchor
-//! and that the proof is fresh, and only then acts. Every argument a
-//! subprocess gets here is built from the proof, never passed in.
-//!
-//! There is no `rename`, `remove_*` or `write` here that takes a bare
-//! path. That is the compile-time form of
-//! `.oh/guardrails/execution-sinks-recheck-live-state.md`: the
-//! `crates/core/tests/compile_fail/` cases show a sink without a proof,
-//! a proof forged outside `recheck`, and a raw `std::fs::rename` in a
-//! sink module each fail to build (the last one in the gate audit too).
+//! The Trash mover: swamp reports, the human decides. This module does
+//! exactly one authorized-by-the-human-keyboard thing -- move a path (or
+//! a bounded, named set of paths) into the platform Trash -- and nothing
+//! resembling an automated recheck-then-veto gate. There is no stored
+//! "grant", no plan-approval token and no drift refusal: a human marked
+//! this in the TUI (or ran a shell command directly) and pressed Enter,
+//! having just been shown the current facts. The only way any of these
+//! functions refuse is an ordinary OS-level failure -- permission
+//! denied, the path is gone, or a cross-device rename with no
+//! permanent-delete fallback.
 
-use crate::authority::Authorized;
-use crate::recheck::RecheckProof;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-fn licensed(proof: &RecheckProof, auth: &Authorized) -> Result<()> {
-    if !auth.covers(proof.anchor()) {
-        bail!(
-            "refused: the authorization does not name {}",
-            proof.anchor().display()
-        );
-    }
-    if !proof.is_fresh() {
-        bail!(
-            "refused: the live recheck of {} is older than {}s; propose again",
-            proof.anchor().display(),
-            crate::recheck::MAX_PROOF_AGE.as_secs()
-        );
-    }
-    Ok(())
-}
 
 fn plain_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
@@ -43,18 +20,22 @@ fn plain_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// What a licensed Trash move did: the anchor it moved and where it
-/// went. The one input `git_worktree_prune` takes besides the
-/// authorization, so a prune only ever follows a move of that worktree.
+/// What a Trash move did: the anchor it moved and where it went. The one
+/// input `git_worktree_prune` takes besides the linked worktree's common
+/// dir, so a prune only ever follows a move of that worktree.
 #[must_use = "a Trash move's receipt says where the unit went"]
 #[derive(Debug)]
 pub struct Trashed {
     anchor: PathBuf,
     dest: PathBuf,
-    linked_common: Option<PathBuf>,
 }
 
 impl Trashed {
+    /// What was moved, at its original path.
+    pub fn anchor(&self) -> &Path {
+        &self.anchor
+    }
+
     /// Where the unit went.
     pub fn path(&self) -> &Path {
         &self.dest
@@ -83,7 +64,7 @@ fn items_dir(trash_root: &Path) -> PathBuf {
 /// (`$trash/info/<name>.trashinfo`, next to `$trash/files/<name>`
 /// [`items_dir`] just moved into). Best-effort -- a trash manager that
 /// cannot find this sidecar still sees the file under `files/`, so a
-/// failure here does not undo an already-licensed move.
+/// failure here does not undo an already-completed move.
 #[cfg(target_os = "linux")]
 fn write_trashinfo_sidecar(trash_root: &Path, dest_name: &str, original: &Path) -> Result<()> {
     let info_dir = trash_root.join("info");
@@ -150,28 +131,21 @@ fn trashinfo_iso8601(unix_secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}")
 }
 
-/// Moves the proof's anchor to the Trash (one `rename`, same volume):
+/// Moves `anchor` to the Trash (one `rename`, same volume):
 /// `trash_root/dest_name` on macOS; on Linux, `trash_root/files/dest_name`
 /// with a `trash_root/info/dest_name.trashinfo` sidecar (the freedesktop
 /// Trash spec), so a desktop file manager's own Trash view finds it.
-/// Returns where the moved item went.
-pub fn trash_move(
-    proof: RecheckProof,
-    auth: &Authorized,
-    trash_root: &Path,
-    dest_name: &str,
-) -> Result<Trashed> {
-    licensed(&proof, auth)?;
-    if proof.identity().is_none() {
-        bail!("refused: a Docker object is removed in the daemon, never moved to the Trash");
-    }
+/// Returns where the moved item went. The only refusals are OS-level:
+/// the path is gone, permission denied, or the Trash is on a different
+/// device with no permanent-delete fallback.
+pub fn trash_move(anchor: &Path, trash_root: &Path, dest_name: &str) -> Result<Trashed> {
     plain_name(dest_name)?;
     // Checked before anything is created under `trash_root`: a
     // cross-device `trash_root` has no permanent-delete fallback here,
     // and creating the freedesktop `files/` subdirectory only to have
     // the rename itself fail with EXDEV would leave an empty directory
     // behind as if something had been copied there.
-    if let Ok(anchor_meta) = std::fs::symlink_metadata(proof.anchor())
+    if let Ok(anchor_meta) = std::fs::symlink_metadata(anchor)
         && let Ok(trash_meta) = std::fs::metadata(trash_root)
     {
         use std::os::unix::fs::MetadataExt;
@@ -180,7 +154,7 @@ pub fn trash_move(
                 "refused: {} is on a different filesystem than {}; cross-device link (no \
                  permanent-delete fallback)",
                 trash_root.display(),
-                proof.anchor().display()
+                anchor.display()
             );
         }
     }
@@ -190,49 +164,41 @@ pub fn trash_move(
     if std::fs::symlink_metadata(&dest).is_ok() {
         bail!("refused: {} already exists in the Trash", dest.display());
     }
-    let anchor = proof.anchor().to_path_buf();
-    std::fs::rename(&anchor, &dest)
+    std::fs::rename(anchor, &dest)
         .with_context(|| format!("rename to Trash failed for {}", anchor.display()))?;
     #[cfg(target_os = "linux")]
     {
-        // Best-effort: the move already happened and is licensed; a
-        // sidecar that could not be written does not undo it.
-        let _ = write_trashinfo_sidecar(trash_root, dest_name, &anchor);
+        // Best-effort: the move already happened; a sidecar that could
+        // not be written does not undo it.
+        let _ = write_trashinfo_sidecar(trash_root, dest_name, anchor);
     }
     Ok(Trashed {
-        anchor,
+        anchor: anchor.to_path_buf(),
         dest,
-        linked_common: proof.linked_common().map(Path::to_path_buf),
     })
 }
 
 /// A recovery envelope: one directory inside the Trash that receives a
 /// multi-member unit (a session and its sidecars, a Cargo group) member
 /// by member, next to its own `restore.json`.
-///
-/// Opened from a proof and an authorization; every member moved must be
-/// one the proof covers.
 #[derive(Debug)]
 pub struct Envelope {
     dir: PathBuf,
-    proof: RecheckProof,
+    anchor: PathBuf,
     moved: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Envelope {
     /// Creates `trash_root/name` (or reuses it if a previous attempt in
-    /// the same second created it). When
-    /// `same_device_as` is given, refuses a Trash on another volume:
-    /// a cross-device move would be a copy plus a delete, and there is no
-    /// permanent-delete fallback.
+    /// the same second created it). When `same_device_as` is given,
+    /// refuses a Trash on another volume: a cross-device move would be a
+    /// copy plus a delete, and there is no permanent-delete fallback.
     pub fn open(
-        proof: RecheckProof,
-        auth: &Authorized,
+        anchor: &Path,
         trash_root: &Path,
         name: &str,
         same_device_as: Option<u64>,
     ) -> Result<Envelope> {
-        licensed(&proof, auth)?;
         plain_name(name)?;
         std::fs::create_dir_all(trash_root).context("could not create the Trash directory")?;
         if let Some(dev) = same_device_as {
@@ -251,17 +217,21 @@ impl Envelope {
             // the multi-member unit's own anchor (the session path, the
             // Cargo group's selected member) -- one sidecar for the
             // envelope, not one per moved member.
-            let _ = write_trashinfo_sidecar(trash_root, name, proof.anchor());
+            let _ = write_trashinfo_sidecar(trash_root, name, anchor);
         }
         Ok(Envelope {
             dir,
-            proof,
+            anchor: anchor.to_path_buf(),
             moved: Vec::new(),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn anchor(&self) -> &Path {
+        &self.anchor
     }
 
     /// Writes (or rewrites) the envelope's own `restore.json`, synced.
@@ -273,21 +243,14 @@ impl Envelope {
         Ok(())
     }
 
-    /// Moves one covered member into the envelope as `dest_name`.
+    /// Moves one member into the envelope as `dest_name`. The only
+    /// refusal is an OS-level rename failure (the member is gone, or a
+    /// name collision inside the envelope).
     pub fn move_member(&mut self, member: &Path, dest_name: &str) -> Result<PathBuf> {
-        if !self.proof.covers(member) {
-            bail!(
-                "refused: {} is not a member the live recheck covered",
-                member.display()
-            );
-        }
-        if !self.proof.is_fresh() {
-            bail!("refused: the live recheck is too old; propose again");
-        }
         plain_name(dest_name)?;
         let to = self.dir.join(dest_name);
         std::fs::rename(member, &to)
-            .map_err(|e| anyhow!("rename to Trash failed for {}: {e}", member.display()))?;
+            .with_context(|| format!("rename to Trash failed for {}", member.display()))?;
         self.moved.push((member.to_path_buf(), to.clone()));
         Ok(to)
     }
@@ -307,30 +270,11 @@ impl Envelope {
     }
 }
 
-/// Copies one compiled output out of an authorized unit into the
-/// authorized worktree's `bin/` (or `bin/<sub>/`) before the unit is
-/// trashed (`--keep-executables`). Writes into the user's worktree, so it
-/// is a destroy-group operation: `from` must lie under the anchor a fresh
-/// recheck proof covers, and the destination is the one the
-/// authorization recorded -- never a directory the caller names.
-pub fn copy_preserved(
-    proof: &RecheckProof,
-    auth: &Authorized,
-    from: &Path,
-    sub: Option<&str>,
-) -> Result<PathBuf> {
-    licensed(proof, auth)?;
-    if !crate::scope::under(from, proof.anchor()) || from == proof.anchor() {
-        bail!(
-            "refused: {} is not inside the rechecked unit {}",
-            from.display(),
-            proof.anchor().display()
-        );
-    }
-    let Some(worktree) = &auth.target().preserve_into else {
-        bail!("refused: this authorization records no worktree to preserve executables into");
-    };
-    let mut dest_dir = worktree.join("bin");
+/// Copies one compiled output out of `from` into `dest_dir` (or
+/// `dest_dir/sub`) before the unit it belongs to is trashed
+/// (`--keep-executables`).
+pub fn copy_preserved(from: &Path, dest_dir: &Path, sub: Option<&str>) -> Result<PathBuf> {
+    let mut dest_dir = dest_dir.to_path_buf();
     if let Some(sub) = sub {
         plain_name(sub)?;
         dest_dir = dest_dir.join(sub);
@@ -344,24 +288,12 @@ pub fn copy_preserved(
 }
 
 /// `docker image rm <id>` / `docker volume rm <name>`: permanent, in the
-/// daemon. The proof is the one `recheck::run_all` took by asking the
-/// daemon about exactly the removal the authorization names; the
-/// arguments are built from it here. Returns the daemon's own refusal
-/// text when it declines.
-pub fn docker_remove(proof: RecheckProof, auth: &Authorized) -> std::result::Result<(), String> {
-    licensed(&proof, auth).map_err(|e| e.to_string())?;
-    let (kind, id) = match (proof.docker(), &auth.target().docker) {
-        (Some(p), Some(a)) if p == a => match p {
-            crate::docker::Removal::Image { id } => ("image", id.clone()),
-            crate::docker::Removal::Volume { name } => ("volume", name.clone()),
-            crate::docker::Removal::Refused(why) => return Err((*why).to_string()),
-        },
-        _ => {
-            return Err(format!(
-                "refused: the recheck of {} was not a Docker recheck of the authorized object",
-                proof.anchor().display()
-            ));
-        }
+/// daemon. Returns the daemon's own refusal text when it declines.
+pub fn docker_remove(removal: &crate::docker::Removal) -> std::result::Result<(), String> {
+    let (kind, id) = match removal {
+        crate::docker::Removal::Image { id } => ("image", id.clone()),
+        crate::docker::Removal::Volume { name } => ("volume", name.clone()),
+        crate::docker::Removal::Refused(why) => return Err((*why).to_string()),
     };
     if !crate::fs_gate::spawn::is_docker_ref(&id) {
         return Err(format!("refused: `{id}` is not a Docker object reference"));
@@ -384,23 +316,11 @@ pub fn docker_remove(proof: RecheckProof, auth: &Authorized) -> std::result::Res
     })
 }
 
-/// `git -C <repo> worktree prune`, after the linked worktree `moved`
-/// names went to the Trash. The repository is the common dir the
-/// recheck read from the worktree's own `.git` pointer, not a caller's
-/// choice. Best-effort; the move already happened.
-pub fn git_worktree_prune(moved: Trashed, auth: &Authorized) -> Result<()> {
-    if !auth.covers(&moved.anchor) {
-        bail!(
-            "refused: the authorization does not name {}",
-            moved.anchor.display()
-        );
-    }
-    let Some(common) = &moved.linked_common else {
-        bail!(
-            "refused: {} was not rechecked as a linked worktree",
-            moved.anchor.display()
-        );
-    };
+/// `git -C <repo> worktree prune`, after the linked worktree at `common`'s
+/// owning checkout went to the Trash. `common` is the `.git` common dir
+/// the caller read from the worktree before moving it. Best-effort; the
+/// move already happened.
+pub fn git_worktree_prune(common: &Path) -> Result<()> {
     let repo = common.parent().unwrap_or(common);
     let args: Vec<std::ffi::OsString> = vec![
         "-C".into(),
@@ -440,14 +360,9 @@ mod linux_trashinfo_tests {
     }
 
     /// A multi-member unit (a Cargo group, an agent session) goes into
-    /// one envelope, member by member; every member the proof recorded
+    /// one envelope, member by member; every member the caller names
     /// moves, and the envelope itself -- not each member -- gets the one
-    /// `.trashinfo` sidecar. `authority::for_tests` is the only public
-    /// (crate-internal) way to mint an `Authorized` whose proof covers
-    /// members outside the anchor, so this lives beside the gate it
-    /// exercises rather than in the external `linux_trash.rs` spec-reader
-    /// suite, which only has the TUI's single-unit `authorize_confirmed`
-    /// available to it.
+    /// `.trashinfo` sidecar.
     #[test]
     fn a_multi_member_envelope_moves_every_member_and_gets_one_sidecar() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,16 +373,11 @@ mod linux_trashinfo_tests {
         for m in &members {
             std::fs::write(m, b"fixture content").unwrap();
         }
-        let store = root.join("store");
-        std::fs::create_dir_all(&store).unwrap();
         let trash_root = root.join("Trash");
 
-        let auth = crate::authority::for_tests(&session, &store, &members);
-        let proof = crate::recheck::run_all(&auth).unwrap();
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(&session).unwrap().dev();
-        let mut envelope =
-            Envelope::open(proof, &auth, &trash_root, "session-1", Some(dev)).unwrap();
+        let mut envelope = Envelope::open(&session, &trash_root, "session-1", Some(dev)).unwrap();
         for (i, m) in members.iter().enumerate() {
             envelope.move_member(m, &i.to_string()).unwrap();
         }

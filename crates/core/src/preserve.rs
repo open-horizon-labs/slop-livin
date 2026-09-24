@@ -1,14 +1,9 @@
 //! `--keep-executables`: copy the compiled outputs a build directory
 //! holds to `<worktree>/bin/` before the directory is trashed, the way
-//! clean-dev-dirs' `--keep-executables` does. Runs only inside an
-//! authorized execution: every copy goes through
-//! [`crate::fs_gate::destroy::copy_preserved`], which takes the unit's
-//! fresh [`RecheckProof`] and the [`Authorized`] naming it (and the
-//! worktree whose `bin/` receives the copies).
+//! clean-dev-dirs' `--keep-executables` does. Every copy goes through
+//! [`crate::fs_gate::destroy::copy_preserved`].
 
-use crate::authority::Authorized;
 use crate::fs_gate::{self, Metadata, PermissionsExt};
-use crate::recheck::RecheckProof;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -25,13 +20,12 @@ fn is_executable_file(meta: &Metadata) -> bool {
 }
 
 fn copy_into(
-    proof: &RecheckProof,
-    auth: &Authorized,
     from: &Path,
+    dest_dir: &Path,
     sub: Option<&str>,
     out: &mut Vec<Preserved>,
 ) -> Result<()> {
-    let to = fs_gate::destroy::copy_preserved(proof, auth, from, sub)?;
+    let to = fs_gate::destroy::copy_preserved(from, dest_dir, sub)?;
     out.push(Preserved {
         from: from.to_path_buf(),
         to,
@@ -51,13 +45,10 @@ fn copy_into(
 ///   no-op: nothing in them is an output worth keeping.
 ///
 /// Returns what was copied. An empty list is a valid answer, never an error.
-///
-/// Runs between the unit's live recheck and its Trash move: it borrows
-/// the same [`RecheckProof`] the move then spends, and copies only into
-/// the worktree the [`Authorized`] recorded.
-pub fn preserve_executables(proof: &RecheckProof, auth: &Authorized) -> Result<Vec<Preserved>> {
+/// `unit_path` is the build directory about to be trashed; `worktree_bin`
+/// is the destination `bin/` directory to copy into.
+pub fn preserve_executables(unit_path: &Path, worktree_bin: &Path) -> Result<Vec<Preserved>> {
     let mut out = Vec::new();
-    let unit_path = proof.anchor();
     let base = unit_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     const SKIP_EXT: &[&str] = &["d", "rlib", "rmeta", "a", "so", "dylib", "dll", "pdb"];
     match base {
@@ -72,7 +63,7 @@ pub fn preserve_executables(proof: &RecheckProof, auth: &Authorized) -> Result<V
                     let p = e.path();
                     let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
                     if is_executable_file(&meta) && !SKIP_EXT.contains(&ext) {
-                        copy_into(proof, auth, &p, Some(profile), &mut out)?;
+                        copy_into(&p, worktree_bin, Some(profile), &mut out)?;
                     }
                 }
             }
@@ -85,7 +76,7 @@ pub fn preserve_executables(proof: &RecheckProof, auth: &Authorized) -> Result<V
                 let p = e.path();
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.ends_with(".whl") || name.ends_with(".tar.gz") {
-                    copy_into(proof, auth, &p, None, &mut out)?;
+                    copy_into(&p, worktree_bin, None, &mut out)?;
                 }
             }
         }
@@ -108,7 +99,7 @@ pub fn preserve_executables(proof: &RecheckProof, auth: &Authorized) -> Result<V
                     } else if ft.is_file() {
                         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
                         if ext == "so" || ext == "pyd" {
-                            copy_into(proof, auth, &p, None, &mut out)?;
+                            copy_into(&p, worktree_bin, None, &mut out)?;
                         }
                     }
                 }

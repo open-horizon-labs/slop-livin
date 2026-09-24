@@ -7,15 +7,9 @@ audit: sinks_have_no_path_predicates
 compile_fail:
   - protect_list_has_only_conflict
   - protect_list_has_no_default
-  - protect_changes_are_human_only
   - protect_listing_is_display_only
 runtime_tests:
-  - crates/core/tests/token_binding.rs::a_protect_confirmation_names_one_change
-  - crates/core/tests/token_binding.rs::protection_is_read_from_the_authorizations_store
-  - protection_comes_from_the_confirmations_store_not_the_ledger_directory
-  - crates/core/tests/reviewer_counterexamples.rs::protected_descendant_must_prevent_parent_cache_proposal
-  - crates/core/tests/execution_rechecks.rs
-  - crates/core/tests/evidence_action_recheck.rs::ordinary_unit_containing_protected_descendant_is_refused_at_proposal
+  - crates/tui/src/app.rs::tests::agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message
   - crates/tui/tests/scope_preserving_refresh.rs::marking_an_ordinary_row_that_contains_a_protected_file_is_refused_with_the_reason
 ---
 
@@ -59,7 +53,7 @@ Mechanism: type, gate audit, runtime test.
 
 **Type.** `protection::ProtectList` is opaque: its only query is `conflict(candidate)` (both directions), and a corrupt or unreadable protect file is an error, never an empty list -- the type has no `Default`, so `.unwrap_or_default()` on it does not compile.
 
-**Type (re-review 5, finding 7).** A keep-list change is human-only: `protect_add_confirmed`/`protect_remove_confirmed` spend a `HumanConfirmed::cli_protect` bound to exactly that change (minted only in the CLI's `cmd_protect`). The production listing, `ProtectListing`, is display-only (`Display`/`Serialize`, `len`, `is_empty`): no entries, no iterator, no containment query; the raw path list exists only under the `testing` feature. Protection at the sink is read from the store the `Authorized` token carries (the plan's store, or the TUI confirmation's resolved store) -- never from the ledger's directory, which is where the TUI used to look.
+**Type (re-review 5, finding 7; 2026-09-23 update).** A keep-list change is `swamp protect add|remove`'s own handler (`protection::protect_add`/`protect_remove`) -- human-only by convention (it is the CLI's job, and the TUI never calls it, only reads what it wrote), not by a spent token: there is no `HumanConfirmed`/`Authorized` machinery left to bind it to. The production listing, `ProtectListing`, is display-only (`Display`/`Serialize`, `len`, `is_empty`): no entries, no iterator, no containment query; the raw path list exists only under the `testing` feature. The TUI's mark step reloads the list fresh from the report's own store directory before every mark -- never a cached copy -- so a protection added mid-session is honoured immediately.
 
 **Gate audit.** `sinks_have_no_path_predicates`: the execution sinks call no path containment method (`starts_with`, `strip_prefix`, `ancestors`) of their own, so a second, one-directional protection predicate cannot be written there. `HumanConfirmed::cli_protect` is pinned to `cmd_protect`.
 

@@ -221,7 +221,7 @@ pub struct CheckResult {
 /// Explicit bounded review; no approval, execution, or automatic scope expansion.
 pub fn check(
     report: &crate::report::Report,
-    store: &Path,
+    _store: &Path,
     paths: &[PathBuf],
     role: Option<&str>,
     limit: usize,
@@ -292,27 +292,22 @@ pub fn check(
                 std::slice::from_ref(&unit.path),
                 "cleanup-check",
             ) {
-                Ok(plan) => {
-                    crate::actions::save_plan(store, &plan)?;
-                    result.members = plan
-                        .units()
+                Ok(units) => {
+                    result.members = units
                         .iter()
                         .filter_map(|u| u.cargo_group())
                         .flat_map(|g| g.members.iter().map(|m| m.path.clone()))
                         .collect();
-                    result.recovery = plan.units().first().map(|u| u.recovery().to_string());
-                    result.warnings = plan
-                        .units()
+                    result.recovery = units.first().map(|u| u.recovery().to_string());
+                    result.warnings = units
                         .iter()
                         .flat_map(|u| u.warnings().iter().cloned())
                         .collect();
                     result.check_status = "ready_for_review";
                     result.reason_code = "checks_passed";
-                    result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
-                    result.next_action = "review_plan";
-                    result.next_command = vec!["swamp".into(), "plans".into(), "--json".into()];
-                    result.allocated_bytes = plan.planned_bytes();
-                    result.plan_id = Some(plan.id);
+                    result.message = "Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences before deleting; swamp does not delete anything itself.".into();
+                    result.next_action = "review_members";
+                    result.allocated_bytes = units.iter().map(|u| u.bytes()).sum();
                 }
                 Err(error) => {
                     result.check_status = "blocked";
@@ -406,10 +401,6 @@ fn snapshot(path: &Path) -> Result<Member> {
 /// Authorization identity for a selected path. Link counts and allocation
 /// accounting are observations, not safety facts: aliases outside the
 /// selection may change without changing the selected content or membership.
-fn same_safety(a: &Member, b: &Member) -> bool {
-    a.path == b.path && a.device == b.device && a.inode == b.inode && a.digest == b.digest
-}
-
 fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member> {
     *visited += 1;
     if depth > 128 || *visited > 100_000 {
@@ -657,74 +648,18 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     })
 }
 
-/// Execute only behind the caller's existing explicit authorization. All group
-/// members are checked before the first move. Failure rolls back completed
-/// moves where possible, with the recovery envelope retained on disk.
-pub(crate) fn move_reviewed(
-    group: &CargoGroup,
-    trash: &Path,
-    auth: &crate::authority::Authorized,
-) -> Result<PathBuf> {
-    if !auth.covers(&group.selected) {
-        bail!(
-            "refused: the authorization does not name {}",
-            group.selected.display()
-        );
-    }
-    if locks(&group.profile)? != group.lock_paths {
-        bail!("Cargo lock set changed; propose again");
-    }
+/// Moves a Cargo group's exact member list into one Trash envelope. Holds
+/// the group's advisory Cargo lock for the duration of the move so a
+/// concurrent `cargo build` does not write into a directory mid-rename;
+/// this is a mutual-exclusion measure, not a "did anything change"
+/// refusal -- swamp reports the group, the human decided to trash it, and
+/// the only way this refuses is an OS-level rename failure (a member
+/// already gone, a name collision). Failure rolls back completed moves
+/// where possible, with the recovery envelope retained on disk.
+pub(crate) fn move_group(group: &CargoGroup, trash: &Path) -> Result<PathBuf> {
     let _held = acquire(&group.lock_paths)?;
-    for evidence in &group.evidence {
-        if !same_safety(&snapshot(&evidence.path)?, evidence) {
-            bail!("Cargo role/evidence changed; propose again");
-        }
-    }
-    let paths: Vec<_> = group.evidence.iter().map(|e| e.path.clone()).collect();
-    let (role, is_dir) =
-        crate::cargo_artifacts::reviewed_role(&group.container, &group.selected, &paths)?;
-    if role != group.role {
-        bail!("Cargo role/evidence changed; propose again");
-    }
-    let mut expected = vec![group.selected.clone()];
-    let dep = group.selected.with_extension("d");
-    if !is_dir && fs::exists(&dep) && dep != group.selected {
-        expected.push(dep);
-    }
-    if !is_dir && fs::exists(group.selected.with_extension("dSYM")) {
-        expected.push(group.selected.with_extension("dSYM"));
-    }
-    if expected
-        != group
-            .members
-            .iter()
-            .map(|m| m.path.clone())
-            .collect::<Vec<_>>()
-    {
-        bail!("companion membership changed; propose again");
-    }
-    for m in &group.members {
-        if !same_safety(&snapshot(&m.path)?, m) {
-            bail!(
-                "Cargo member {} changed since review; propose again",
-                m.path.display()
-            );
-        }
-    }
-    // The shared live-state recheck, after the Cargo-specific checks so
-    // their more precise messages come first
-    // (`.oh/guardrails/execution-sinks-recheck-live-state.md`). The
-    // selected path's own identity is re-confirmed against what was
-    // reviewed; human keep/protect intent is loaded *fresh* here, in
-    // both directions, which it never was before; and occupancy is
-    // tri-state over every member, so a probe that could not run refuses
-    // instead of reading as "nothing open".
-    // Every input from the authorization: the selected path's reviewed
-    // identity and each companion's, as the plan recorded them.
-    let proof = crate::recheck::run_all(auth)?;
     let mut envelope = fs::destroy::Envelope::open(
-        proof,
-        auth,
+        &group.selected,
         trash,
         &format!("swamp-cargo-{}", crate::entities::new_id()),
         Some(group.members[0].device),

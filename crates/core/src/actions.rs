@@ -1,52 +1,38 @@
-//! The action layer for the agent operator (R7, #26): a **plan** is
-//! proposed from report rows; a **grant** is written only by a human at
-//! the CLI (`approve <plan>` for one plan, or a standing predicate grant);
-//! **execute** re-derives every fact at the sink, moves to Trash, measures
-//! the volume's free space before and after, and appends to the ledger.
+//! swamp reports; the human decides. This module turns report rows (a
+//! folded artifact, a Cargo purpose group, an agent-storage unit, a
+//! worktree/checkout) into [`PlanUnit`]s: the facts a human needs before
+//! marking something for the Trash, and the exact member paths that get
+//! moved when they press Enter in the TUI (or run the equivalent shell
+//! command by hand).
 //!
-//! What is structurally impossible here, on purpose:
-//! - the functions that write a grant (`approve`, `add_standing_grant`,
-//!   `revoke_grant`) are called only from the CLI's own approve/grant
-//!   command handling or the TUI's confirmed-execution path -- see
-//!   `.oh/guardrails/human-only-authorization.md` for the transport-
-//!   independent statement of what that boundary actually is;
-//! - a plan can only contain folded artifact rows (dependency trees, build
-//!   outputs, caches) — never a checkout, worktree, `.git`, Source tree,
-//!   unowned path or Docker object; a "prune Docker" plan cannot be built;
-//! - a plan is single-use and expires; a grant expires and has a byte budget;
-//! - the tool never speaks in the verdict register: refusals name a fact.
+//! There is no plan store, no grant, no confirmation token and no
+//! execute-time re-derivation that refuses on drift: swamp's job stops at
+//! reporting the facts. A `PlanUnit` is built fresh whenever the caller
+//! needs it and lives only in memory; moving it is a direct call to
+//! `fs_gate::destroy` with no gate in front of it beyond an ordinary OS
+//! error (permission denied, path gone, cross-device).
 
-use crate::authority::{Authorized, HumanConfirmed};
-use crate::filter::{Filter, Predicate};
-use crate::fs_gate::{self, Metadata, MetadataExt, read::read_owned_string, store};
-use crate::ledger::{ActionRecord, Ledger};
+use crate::filter::Filter;
+use crate::fs_gate::{self, Metadata, MetadataExt};
 use crate::report::{ArtifactKind, ArtifactRow, ProjectRow, Report, WorktreeRow};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-/// Plans expire 30 minutes after proposal: long enough for a human to
-/// read and approve, short enough that the facts they rest on are recent.
-pub const PLAN_TTL_SECS: u64 = 30 * 60;
 
 fn now() -> u64 {
     crate::entities::now()
 }
 
 // ---------------------------------------------------------------------
-// Plans
+// Plan units: the facts, built fresh, never persisted
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PlanStatus {
-    Proposed,
-    Executed,
-}
-
-/// One unit of action: exactly one folded artifact row, with the facts a
-/// human needs to authorize it and the sink needs to re-derive it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One unit of action: exactly one folded artifact row (or Cargo group,
+/// agent-storage unit, worktree/checkout), with the facts a human needs
+/// before marking it and the exact paths that move if they press Enter.
+/// Built fresh by `propose*`/`unit_from_*`; never written to disk, never
+/// signed, never compared against a later re-derivation.
+#[derive(Debug, Clone, Serialize)]
 pub struct PlanUnit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cargo_group: Option<crate::cargo_cleanup::CargoGroup>,
@@ -77,198 +63,45 @@ pub struct PlanUnit {
     /// git tracking status of the path, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     track: Option<crate::ignore::TrackState>,
-    /// Facts the human must see before authorizing (dirty, unpushed,
-    /// untracked content, no remote, git store). Stated, never enforced —
-    /// the same line the TUI shows on its confirm prompt.
+    /// The plain-language consequence of deleting this unit (dirty,
+    /// unpushed, untracked content, no remote, git store, unique history
+    /// lost…). Shown before Enter; never a verdict ("safe"/"unused") and
+    /// never a veto -- the human decides.
     #[serde(default)]
     warnings: Vec<String>,
-    /// Set only for a unit built from `external::ExternalUnit` (#43): the
-    /// unit's storage category, stated so a plan can *name* an external
-    /// unit for inspection/review without ever authorizing its removal.
-    /// `execute` refuses every unit with this set, unconditionally,
-    /// before grant/budget checks even run — registry/detector output
-    /// is identification, never authorization, and this chunk ships no
-    /// supported selective action for any external category.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    external_category: Option<String>,
     /// Set only for a unit built from `agents::AgentUnit` (#101): the
-    /// facts `execute` needs to recheck occupancy/references and
-    /// perform the one or two supported agent-storage actions (a
-    /// single-path cache/log Trash move, or a multi-member session
-    /// removal). Every other agent-storage unit (protected categories,
-    /// unsupported categories, and anything reachable only via
-    /// inspection) never reaches a `Plan` at all -- see
-    /// `propose_agents`, which refuses those at proposal time rather
-    /// than naming them here as inspection-only.
+    /// facts a Trash move needs -- a single-path cache/log move, or a
+    /// multi-member session removal, where every listed member moves
+    /// together into one Trash envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_meta: Option<AgentPlanMeta>,
     /// Decision evidence (#61): the exact activity/consumer/reclaimability
     /// facts this unit's report row already carried
     /// (`report::attach_decision_evidence`), plus a fresh current-use
-    /// fact taken at proposal time. `execute` re-takes current-use fresh
-    /// rather than trusting this snapshot -- see the occupancy recheck
-    /// immediately before every rename/removal below.
+    /// fact taken when this unit was built.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<crate::evidence::Evidence>,
-    /// What a human actually reviewed about this unit's storage: the
-    /// anchor's `(device, inode)` plus its membership -- exactly for a
-    /// bounded member set, a bounded summary plus a metadata fingerprint
-    /// for a large cache. `execute` recomputes it and refuses on any
-    /// drift, so an approval buys the *reviewed* bytes rather than
-    /// whatever now occupies that path
-    /// (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
-    ///
-    /// `None` on a unit whose kind is never actionable (an external unit
-    /// named for inspection). A `None` here on an actionable unit is
-    /// itself a refusal at execution: a plan with no reviewed identity
-    /// was never reviewed against live state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reviewed: Option<crate::recheck::ReviewedIdentity>,
-    /// The identities of a unit's sidecar members that lie outside its
-    /// anchor (a session's companion files, a Cargo group's `.d`/`.dSYM`),
-    /// captured at proposal. The recheck compares each one exactly as it
-    /// compares the anchor, so a member that was swapped, grown or
-    /// replaced after review refuses the unit (re-review 5, finding 3).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    reviewed_members: Vec<crate::recheck::ReviewedIdentity>,
 }
 
 /// See `PlanUnit::agent_meta`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPlanMeta {
     pub tool_id: String,
-    /// The tool's home directory, rechecked for occupancy immediately
-    /// before acting (never assumed unchanged from proposal time).
     pub tool_home: PathBuf,
     pub category: String,
     /// `None`: a single-path Trash move of the unit's own `path` (a
-    /// cache/log category directory). `Some`: a session removal --
-    /// every listed member is moved together into one Trash envelope,
-    /// after `execute` re-verifies each member still exists and belongs
-    /// only to this session (see `crate::agents::claude_code`'s
-    /// grouping rules, re-run fresh at execution rather than trusted
-    /// from the plan).
+    /// cache/log category directory). `Some`: a session removal -- every
+    /// listed member is moved together into one Trash envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_members: Option<Vec<PathBuf>>,
 }
 
-/// A proposed plan.
-///
-/// **Provenance** (re-review 5, finding 1): a `Plan` exists only as a
-/// propose path built it or as [`load_plan`] verified it. Its fields are
-/// private to `actions`; it is not `Deserialize` (the store loader parses
-/// a private mirror *after* checking the record's keyed binding); and on
-/// disk it carries a MAC under the store's authority key over its whole
-/// record, so an edited, copied or hand-written plan file does not load.
-/// `id` stays a public field (the reviewers' counterexample files read
-/// `plan.id`): renaming a plan changes its content digest, which every
-/// approval is bound to.
-#[derive(Debug, Clone, Serialize)]
-pub struct Plan {
-    pub id: String,
-    root: PathBuf,
-    created_at: u64,
-    expires_at: u64,
-    proposed_by: String,
-    status: PlanStatus,
-    units: Vec<PlanUnit>,
-    /// Rows the proposer asked for that were refused, with the fact that
-    /// refused them. Kept on the plan so the human sees what was *not*
-    /// proposed and why.
-    refused: Vec<Refused>,
-    /// Selection-set byte accounting (#59): this plan's naive per-unit
-    /// sum next to the figure with storage already charged to an
-    /// earlier-counted inode removed, plus whether any selected unit
-    /// might share inodes whose membership was never enumerated. Carried
-    /// on the plan (and so in the plan JSON a human or agent reads)
-    /// because `planned_bytes` is deliberately the naive sum -- the
-    /// number a grant budget is spent against -- and #59's whole point is
-    /// that the same physical storage must not silently count twice in
-    /// what a selection claims it would free.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    selection: Option<crate::reclaimability::SelectionEstimate>,
-    /// [`Plan::content_digest`], computed once (the units never change
-    /// after a propose path returns the plan).
-    #[serde(skip)]
-    digest: std::sync::OnceLock<String>,
-}
-
+/// A row the human/agent asked for that has no supported action, with the
+/// fact that names why -- never silently dropped from the response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Refused {
     pub path: PathBuf,
     pub cause: String,
-}
-
-impl Plan {
-    pub fn planned_bytes(&self) -> u64 {
-        self.units.iter().map(|u| u.bytes).sum()
-    }
-    pub fn is_expired(&self, at: u64) -> bool {
-        at > self.expires_at
-    }
-    pub fn units(&self) -> &[PlanUnit] {
-        &self.units
-    }
-    pub fn refused(&self) -> &[Refused] {
-        &self.refused
-    }
-    pub fn status(&self) -> &PlanStatus {
-        &self.status
-    }
-    pub fn created_at(&self) -> u64 {
-        self.created_at
-    }
-    pub fn expires_at(&self) -> u64 {
-        self.expires_at
-    }
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-    pub fn selection(&self) -> Option<&crate::reclaimability::SelectionEstimate> {
-        self.selection.as_ref()
-    }
-
-    /// This plan with its creation and expiry times replaced, for
-    /// integration-test fixtures that need an old or expired plan
-    /// (`testing` only: no production build can rewrite a plan).
-    #[cfg(feature = "testing")]
-    pub fn with_times_for_tests(mut self, created_at: u64, expires_at: u64) -> Plan {
-        self.created_at = created_at;
-        self.expires_at = expires_at;
-        self.digest = std::sync::OnceLock::new();
-        self
-    }
-
-    /// The digest of what a human approves: the plan's id, root, times,
-    /// proposer and every unit, as canonical JSON. A one-shot grant
-    /// records it, and [`crate::authority::authorize`] refuses a plan
-    /// whose content no longer has it -- so an approval covers exactly
-    /// the units that were shown, not whatever a later edit (or a
-    /// re-save under the same id) put there.
-    pub fn content_digest(&self) -> String {
-        self.digest
-            .get_or_init(|| self.compute_content_digest())
-            .clone()
-    }
-
-    fn compute_content_digest(&self) -> String {
-        let mut h = blake3::Hasher::new();
-        h.update(b"swamp-plan-content-v1\0");
-        let head = serde_json::json!({
-            "id": self.id,
-            "root": self.root,
-            "created_at": self.created_at,
-            "expires_at": self.expires_at,
-            "proposed_by": self.proposed_by,
-        });
-        h.update(&canonical_json(&head));
-        for u in &self.units {
-            h.update(&canonical_json(
-                &serde_json::to_value(u).unwrap_or(serde_json::Value::Null),
-            ));
-        }
-        h.finalize().to_hex().to_string()
-    }
 }
 
 impl PlanUnit {
@@ -290,17 +123,11 @@ impl PlanUnit {
     pub fn evidence(&self) -> &[crate::evidence::Evidence] {
         &self.evidence
     }
-    pub fn external_category(&self) -> Option<&str> {
-        self.external_category.as_deref()
-    }
     pub fn agent_meta(&self) -> Option<&AgentPlanMeta> {
         self.agent_meta.as_ref()
     }
     pub fn cargo_group(&self) -> Option<&crate::cargo_cleanup::CargoGroup> {
         self.cargo_group.as_ref()
-    }
-    pub fn reviewed(&self) -> Option<&crate::recheck::ReviewedIdentity> {
-        self.reviewed.as_ref()
     }
     pub fn project(&self) -> &str {
         &self.project
@@ -325,195 +152,6 @@ impl PlanUnit {
     }
     pub fn worktree_id(&self) -> &str {
         &self.worktree_id
-    }
-}
-
-/// `v` as JSON with every object's keys sorted: one byte string per
-/// value, whatever map order `serde_json` was built with.
-fn canonical_json(v: &serde_json::Value) -> Vec<u8> {
-    fn write(v: &serde_json::Value, out: &mut Vec<u8>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                out.push(b'{');
-                for (i, k) in keys.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    out.extend(serde_json::to_vec(k).unwrap_or_default());
-                    out.push(b':');
-                    write(&map[*k], out);
-                }
-                out.push(b'}');
-            }
-            serde_json::Value::Array(items) => {
-                out.push(b'[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    write(item, out);
-                }
-                out.push(b']');
-            }
-            other => out.extend(serde_json::to_vec(other).unwrap_or_default()),
-        }
-    }
-    let mut out = Vec::new();
-    write(v, &mut out);
-    out
-}
-
-/// The keyed MAC binding one stored record (`domain` separates plans
-/// from grants) to the store's authority key.
-fn record_binding(key: &[u8; 32], domain: &str, record: &serde_json::Value) -> String {
-    let mut bytes = domain.as_bytes().to_vec();
-    bytes.push(0);
-    bytes.extend(canonical_json(record));
-    blake3::keyed_hash(key, &bytes).to_hex().to_string()
-}
-
-/// `record` with its `binding` field removed, verified against `key`.
-/// `Err` names what is wrong in terms a human can act on.
-fn verified_record(
-    key: &[u8; 32],
-    domain: &str,
-    mut record: serde_json::Value,
-    what: &str,
-) -> Result<serde_json::Value> {
-    let binding = record
-        .as_object_mut()
-        .and_then(|m| m.remove("binding"))
-        .and_then(|b| b.as_str().map(str::to_string));
-    let Some(binding) = binding else {
-        bail!(
-            "{what} carries no swamp binding: it was not written by swamp's own propose/approve \
-             paths (or predates them); refused"
-        );
-    };
-    let expected = record_binding(key, domain, &record);
-    // `blake3::Hash` equality is constant-time.
-    let same = blake3::Hash::from_hex(&binding)
-        .ok()
-        .zip(blake3::Hash::from_hex(&expected).ok())
-        .is_some_and(|(a, b)| a == b);
-    if !same {
-        bail!(
-            "{what} does not match its swamp binding: it was edited, or copied from another \
-             store, after swamp wrote it; refused"
-        );
-    }
-    Ok(record)
-}
-
-const PLAN_DOMAIN: &str = "swamp-plan-record-v1";
-const GRANT_DOMAIN: &str = "swamp-grant-record-v1";
-
-/// The on-disk mirror of [`Plan`], parsed only by [`load_plan`] after the
-/// record's binding checked out.
-#[derive(Deserialize)]
-struct StoredPlan {
-    id: String,
-    root: PathBuf,
-    created_at: u64,
-    expires_at: u64,
-    proposed_by: String,
-    status: PlanStatus,
-    units: Vec<PlanUnit>,
-    refused: Vec<Refused>,
-    #[serde(default)]
-    selection: Option<crate::reclaimability::SelectionEstimate>,
-}
-
-fn plan_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join("plans").join(format!("{id}.json"))
-}
-
-/// Writes `plan` into the store at `dir`, bound to that store's
-/// authority key.
-pub fn save_plan(dir: &Path, plan: &Plan) -> Result<()> {
-    let store = store::StoreDir::at(dir)?;
-    let key = crate::fs_gate::key::authority_key(&store)?;
-    let mut record = serde_json::to_value(plan)?;
-    let binding = record_binding(&key, PLAN_DOMAIN, &record);
-    if let Some(m) = record.as_object_mut() {
-        m.insert("binding".into(), serde_json::Value::String(binding));
-    }
-    store::write_json(
-        store::JsonFile::Plan {
-            store: &store,
-            id: &plan.id,
-        },
-        &record,
-    )?;
-    Ok(())
-}
-
-/// The store loader: the only place a [`Plan`] is built from bytes.
-/// Refuses a record without a valid binding under this store's key.
-pub fn load_plan(dir: &Path, id: &str) -> Result<Plan> {
-    let p = plan_path(dir, id);
-    let text =
-        read_owned_string(&p).with_context(|| format!("no plan {id} under {}", p.display()))?;
-    let store = store::StoreDir::at(dir)?;
-    plan_from_record(&store, serde_json::from_str(&text)?, &format!("plan {id}"))
-}
-
-fn plan_from_record(
-    store: &store::StoreDir,
-    record: serde_json::Value,
-    what: &str,
-) -> Result<Plan> {
-    if !crate::fs_gate::key::has_authority_key(store) {
-        bail!(
-            "{what}: {} holds no swamp authority key, so nothing in it was written by swamp's \
-             propose path; refused",
-            store.path().display()
-        );
-    }
-    let key = crate::fs_gate::key::authority_key(store)?;
-    let record = verified_record(&key, PLAN_DOMAIN, record, what)?;
-    let p: StoredPlan = serde_json::from_value(record)?;
-    Ok(Plan {
-        id: p.id,
-        root: p.root,
-        created_at: p.created_at,
-        expires_at: p.expires_at,
-        proposed_by: p.proposed_by,
-        status: p.status,
-        units: p.units,
-        refused: p.refused,
-        selection: p.selection,
-        digest: std::sync::OnceLock::new(),
-    })
-}
-
-/// Every plan in the store that loads (a record with a bad binding is
-/// skipped here and refused by name at `approve`/`execute`).
-pub fn list_plans(dir: &Path) -> Result<Vec<Plan>> {
-    let store = store::StoreDir::at(dir)?;
-    let mut out = Vec::new();
-    for path in store::list_plan_files(&store) {
-        if let Ok(text) = read_owned_string(&path)
-            && let Ok(record) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Ok(p) = plan_from_record(&store, record, &path.display().to_string())
-        {
-            out.push(p);
-        }
-    }
-    out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-    Ok(out)
-}
-
-/// The daemon-side removal for a Docker unit, or `None` for a unit that
-/// is an ordinary path. The unit's "path" is the object's id or name.
-fn docker_target(kind: &ArtifactKind, path: &Path) -> Option<crate::docker::Removal> {
-    let id = path.display().to_string();
-    match kind {
-        ArtifactKind::DockerImage => Some(crate::docker::Removal::Image { id }),
-        ArtifactKind::DockerVolume => Some(crate::docker::Removal::Volume { name: id }),
-        _ => None,
     }
 }
 
@@ -625,7 +263,7 @@ pub fn propose(
     filter: Option<&Filter>,
     paths: &[PathBuf],
     proposed_by: &str,
-) -> Result<Plan> {
+) -> Result<Vec<PlanUnit>> {
     let mut units = Vec::new();
     let mut refused = Vec::new();
     for project in &report.projects {
@@ -683,18 +321,6 @@ pub fn propose(
                             .unwrap();
                         let mut unit = unit_from_row(project, wt, row);
                         unit.path = p.clone();
-                        // `unit_from_row` anchored the reviewed identity
-                        // on the container (`target/`); the selection is
-                        // this exact group path.
-                        unit.reviewed = crate::recheck::capture_anchor(p).ok();
-                        // The group's companions (`.d`, `.dSYM`), each
-                        // with its identity, for the shared recheck.
-                        unit.reviewed_members = group
-                            .members
-                            .iter()
-                            .filter(|m| &m.path != p)
-                            .filter_map(|m| crate::recheck::capture_anchor(&m.path).ok())
-                            .collect();
                         unit.rel_path = crate::scope::relative_to(p, &wt.path)
                             .unwrap_or(p)
                             .display()
@@ -795,19 +421,8 @@ pub fn propose(
         }
     }
     units.sort_by_key(|a| std::cmp::Reverse(a.bytes));
-    let created_at = now();
-    Ok(Plan {
-        id: crate::entities::new_id(),
-        root: report.root.clone(),
-        created_at,
-        expires_at: created_at + PLAN_TTL_SECS,
-        proposed_by: proposed_by.to_string(),
-        status: PlanStatus::Proposed,
-        selection: Some(selection_estimate(&units)),
-        units,
-        refused,
-        digest: std::sync::OnceLock::new(),
-    })
+    let _ = proposed_by;
+    Ok(units)
 }
 
 /// Same as [`propose`], additionally refusing any matched unit whose
@@ -823,7 +438,7 @@ pub fn propose_checking_protection(
     paths: &[PathBuf],
     proposed_by: &str,
     protected: &[PathBuf],
-) -> Result<Plan> {
+) -> Result<Vec<PlanUnit>> {
     propose_refusing_protected(
         report,
         filter,
@@ -834,19 +449,6 @@ pub fn propose_checking_protection(
     )
 }
 
-/// [`propose_checking_protection`] against the protect list in
-/// `store_dir`, loaded fresh (an unreadable list refuses). What the CLI
-/// calls: it has no raw copy of the list to pass, and needs none.
-pub fn propose_checking_store_protection(
-    report: &Report,
-    filter: Option<&Filter>,
-    paths: &[PathBuf],
-    proposed_by: &str,
-    store_dir: &Path,
-) -> Result<Plan> {
-    propose_refusing_protected(report, filter, paths, proposed_by, Some(store_dir), &[])
-}
-
 fn propose_refusing_protected(
     report: &Report,
     filter: Option<&Filter>,
@@ -854,8 +456,8 @@ fn propose_refusing_protected(
     proposed_by: &str,
     store_dir: Option<&Path>,
     protected: &[PathBuf],
-) -> Result<Plan> {
-    let mut plan = propose(report, filter, paths, proposed_by)?;
+) -> Result<Vec<PlanUnit>> {
+    let units = propose(report, filter, paths, proposed_by)?;
     // The caller's list is a convenience, never the authority. The PR
     // #123 review's counterexample: an unreadable `agent_protect.json`
     // reached this function as an *empty* list through the CLI's
@@ -869,14 +471,15 @@ fn propose_refusing_protected(
     };
     let protected = live.including(protected);
     if protected.is_empty() {
-        return Ok(plan);
+        return Ok(units);
     }
     let mut kept = Vec::new();
-    for u in plan.units {
+    let mut refused = Vec::new();
+    for u in units {
         // Both directions, as everywhere else: a unit beneath a
         // protected path, and a unit that *contains* one.
         if protected.conflict(&u.path).is_some() {
-            plan.refused.push(Refused {
+            refused.push(Refused {
                 path: u.path.clone(),
                 cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
             });
@@ -884,90 +487,23 @@ fn propose_refusing_protected(
             kept.push(u);
         }
     }
-    plan.units = kept;
-    plan.digest = std::sync::OnceLock::new();
-    if plan.units.is_empty() {
+    if kept.is_empty() {
         bail!(
             "nothing to propose: every matched unit is human-protected ({} refused: {})",
-            plan.refused.len(),
-            plan.refused
+            refused.len(),
+            refused
                 .iter()
                 .map(|r| format!("{} — {}", r.path.display(), r.cause))
                 .collect::<Vec<_>>()
                 .join("; ")
         );
     }
-    Ok(plan)
+    Ok(kept)
 }
 
-/// Builds an inspection-only plan naming selected external units (#43).
-/// Every resulting unit carries `external_category`, so `execute` refuses
-/// all of them unconditionally: this exists so a human/agent can review
-/// external storage through the same plan/ledger surface as everything
-/// else, never to make it actionable. Mirrors `propose`'s "nothing
-/// matched is an error, never a silent empty plan" contract.
-pub fn propose_external(
-    units: &[crate::external::ExternalUnit],
-    paths: &[PathBuf],
-    proposed_by: &str,
-) -> Result<Plan> {
-    let mut plan_units = Vec::new();
-    let mut refused = Vec::new();
-    for u in units {
-        if !paths.is_empty() && !paths.iter().any(|p| p == &u.path) {
-            continue;
-        }
-        plan_units.push(unit_from_external(u));
-    }
-    for p in paths {
-        if !plan_units.iter().any(|u| &u.path == p) {
-            refused.push(Refused {
-                path: p.clone(),
-                cause: "no external unit at this exact path in the current scope".to_string(),
-            });
-        }
-    }
-    if plan_units.is_empty() {
-        bail!(
-            "nothing to propose: no external unit matched{}",
-            if refused.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({} refused: {})",
-                    refused.len(),
-                    refused
-                        .iter()
-                        .map(|r| format!("{} — {}", r.path.display(), r.cause))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                )
-            }
-        );
-    }
-    let created_at = now();
-    Ok(Plan {
-        id: crate::entities::new_id(),
-        root: PathBuf::new(),
-        created_at,
-        expires_at: created_at + PLAN_TTL_SECS,
-        proposed_by: proposed_by.to_string(),
-        status: PlanStatus::Proposed,
-        selection: Some(selection_estimate(&plan_units)),
-        units: plan_units,
-        refused,
-        digest: std::sync::OnceLock::new(),
-    })
-}
-
-/// A proposal's evidence snapshot (#61): the report row's already-known
-/// facts (Activity/Consumer/Recovery/Reclaimability, from
-/// `report::attach_decision_evidence`) plus one fresh current-use
-/// reading taken right now, at proposal time. `execute` never trusts
-/// this snapshot's current-use entry -- it re-takes its own immediately
-/// before acting (see the occupancy recheck in the rename/removal path
-/// below), so a change between propose and execute is always caught
-/// fresh rather than compared against a possibly-stale copy.
+/// A unit's evidence, plus one fresh current-use (open-file) reading
+/// taken when this unit is built -- shown on the TUI's confirm banner as
+/// a fact, never re-taken or enforced at Enter.
 fn plan_unit_evidence(
     existing: &[crate::evidence::Evidence],
     path: &Path,
@@ -977,67 +513,6 @@ fn plan_unit_evidence(
     evidence
 }
 
-/// Turns this plan's units into selection members for
-/// `reclaimability::estimate_selection` (#59), supplying the physical
-/// inode identities the plan *already reviewed* where it has them.
-///
-/// An ordinary filesystem artifact row records
-/// `ReviewedMembership::Anchor`: one `stat` of the directory, no member
-/// listing (enumerating a `target/` tree per matched row at proposal
-/// time is exactly the cost `recheck::capture_anchor` exists to avoid).
-/// A directory's own inode says nothing about which inodes hold its
-/// bytes, so that unit contributes `inodes: None` -- summed as if
-/// exclusive and flagged through `SelectionEstimate::unknown_sharing`
-/// when the unit might hardlink, never quietly deduplicated against an
-/// inode set nobody looked at. Agent and external units, whose member
-/// sets are bounded by construction and recorded exactly, contribute
-/// their real inodes and so are genuinely deduplicated.
-fn selection_estimate(units: &[PlanUnit]) -> crate::reclaimability::SelectionEstimate {
-    use crate::recheck::ReviewedMembership as M;
-    let members: Vec<crate::reclaimability::SelectionMember> = units
-        .iter()
-        .map(|u| {
-            let inodes = u.reviewed.as_ref().and_then(|r| match &r.membership {
-                M::Exact { members } => Some(members.iter().map(|m| (r.device, m.inode)).collect()),
-                // A single file's own inode *is* where its bytes live.
-                M::File { .. } => Some(vec![(r.device, r.inode)]),
-                // A directory anchor's inode is not; a bounded summary
-                // deliberately did not record members.
-                M::Anchor { .. } | M::Summary(_) => None,
-            });
-            crate::reclaimability::SelectionMember {
-                label: u.rel_path.clone(),
-                allocated_bytes: u.bytes,
-                hardlinked: u.dedup_stale
-                    || u.cargo_group.as_ref().is_some_and(|g| g.shared_storage),
-                inodes,
-            }
-        })
-        .collect();
-    crate::reclaimability::estimate_selection(&members)
-}
-
-// ---------------------------------------------------------------------
-// External-unit evidence at the proposal sink (#55, #58, #59)
-//
-// An external unit is identification-only until a human names it in a
-// `propose`. That is deliberately where the live, per-unit checks below
-// run: an occupancy/lock/device-state probe on every detected unit of
-// every ordinary report would spawn processes during identification,
-// which the occupancy discipline (and the TUI's non-blocking event path)
-// forbid. Everything here is bounded -- fixed candidate filenames, one
-// single-level `locations::shallow_list`, allow-listed read-only
-// queries -- and none of it traverses.
-// ---------------------------------------------------------------------
-
-/// Lock-file names package and version managers conventionally create
-/// *while they are working*, checked only as direct children of a
-/// unit's own directory: Cargo's `$CARGO_HOME/.package-cache`, a generic
-/// manager `.lock`, Gradle's cache journal and daemon registry locks,
-/// and pnpm's store lock. This is a list of *conventions*, not a
-/// detector table: a unit gets whichever of them actually exists in its
-/// own directory, so a new detector for a tool that uses one of these
-/// needs no change here.
 const MANAGER_LOCK_FILENAMES: &[&str] = &[
     ".package-cache",
     ".lock",
@@ -1287,6 +762,52 @@ fn sparse_byte_accounting_facts(
     )
 }
 
+/// The deep, live per-unit evidence (#55/#58/#59) for one external unit:
+/// manager-lock and simulator-booted current-use readings, recovery
+/// facts by storage category, and sparse-file byte accounting -- none of
+/// it taken during identification (a live probe on every detected unit
+/// on every ordinary report would spawn a process per unit); only when
+/// something -- a human reviewing `--view external`, or an agent
+/// explaining what a unit is -- asks about this exact one.
+pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
+    let category = format!("{:?}", unit.category);
+    let mut evidence = unit.evidence.clone();
+    evidence.extend(manager_lock_facts(unit));
+    evidence.extend(simulator_booted_facts(unit));
+    evidence.extend(external_recovery_facts(unit));
+    evidence.extend(sparse_byte_accounting_facts(unit));
+    PlanUnit {
+        cargo_group: None,
+        path: unit.path.clone(),
+        rel_path: ".".into(),
+        project: format!("(external: {})", unit.detector_name),
+        project_id: format!("external:{}", unit.detector_id),
+        worktree_id: format!("external:{}", unit.detector_id),
+        worktree_path: unit.path.clone(),
+        kind: ArtifactKind::Unknown,
+        bytes: unit.bytes,
+        dedup_stale: false,
+        growth_bytes: unit.growth_bytes,
+        regrowth_count: unit.regrowth_count,
+        observed_at: unit.observed_at,
+        recovery: format!(
+            "shared {category} storage; removing it means the manager that owns it fetches or \
+             rebuilds it again the next time it is needed"
+        ),
+        idle_secs: None,
+        merge_complete: false,
+        signals: Vec::new(),
+        verb: "external".into(),
+        track: None,
+        warnings: vec![format!(
+            "external unit ({category}): shown here for review; act on it with the manager's \
+             own tools, not swamp"
+        )],
+        evidence,
+        agent_meta: None,
+    }
+}
+
 fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> PlanUnit {
     let rel = crate::scope::relative_to(&a.path, &wt.path)
         .map(|p| p.display().to_string())
@@ -1313,74 +834,15 @@ fn unit_from_row(project: &ProjectRow, wt: &WorktreeRow, a: &ArtifactRow) -> Pla
         track: a.track,
         warnings: warnings_for(wt, a, None),
         evidence: plan_unit_evidence(&a.evidence, &a.path),
-        external_category: None,
         agent_meta: None,
-        reviewed: crate::recheck::capture_anchor(&a.path).ok(),
-        reviewed_members: Vec::new(),
-    }
-}
-
-/// A unit built from an `external::ExternalUnit` (#43): inspection-only,
-/// by construction. There is no project/worktree to attribute it to (an
-/// external unit's identity is independent of any project); the
-/// placeholder fields below are stated honestly rather than borrowing a
-/// real project/worktree identity that would misattribute it. `execute`
-/// refuses every such unit unconditionally on `external_category`, so
-/// none of the recovery/verb/grant machinery below is ever reachable for
-/// it -- they are filled with inert, self-explanatory values only so the
-/// plan is legible if a human inspects its JSON.
-pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
-    let category = format!("{:?}", unit.category);
-    // Live per-unit evidence, taken now because a human named this unit
-    // (#55/#58/#59) -- see the module section above for why none of it
-    // runs during identification.
-    let mut evidence = unit.evidence.clone();
-    evidence.extend(manager_lock_facts(unit));
-    evidence.extend(simulator_booted_facts(unit));
-    evidence.extend(external_recovery_facts(unit));
-    evidence.extend(sparse_byte_accounting_facts(unit));
-    PlanUnit {
-        cargo_group: None,
-        path: unit.path.clone(),
-        rel_path: ".".into(),
-        project: format!("(external: {})", unit.detector_name),
-        project_id: format!("external:{}", unit.detector_id),
-        worktree_id: format!("external:{}", unit.detector_id),
-        worktree_path: unit.path.clone(),
-        kind: ArtifactKind::Unknown,
-        bytes: unit.bytes,
-        dedup_stale: false,
-        growth_bytes: unit.growth_bytes,
-        regrowth_count: unit.regrowth_count,
-        observed_at: unit.observed_at,
-        recovery: format!("inspection only: no supported selective action for {category}"),
-        idle_secs: None,
-        merge_complete: false,
-        signals: Vec::new(),
-        verb: "inspect".into(),
-        track: None,
-        warnings: vec![format!(
-            "external unit ({category}): identification only, never authorization"
-        )],
-        evidence,
-        external_category: Some(category),
-        agent_meta: None,
-        // An external unit is refused unconditionally at execution, but
-        // it still records what was reviewed: a later chunk that adds a
-        // supported external action inherits the identity contract
-        // rather than having to remember to add it.
-        reviewed: crate::recheck::capture(&unit.path).ok(),
-        reviewed_members: Vec::new(),
     }
 }
 
 // ---------------------------------------------------------------------
 // Agent-storage actions (#101): cache/log Trash moves and explicit
-// session removal, both through this same plan/grant/ledger/Trash path.
-// Unlike `propose_external`, a supported unit here becomes a real,
-// actionable `PlanUnit` -- but only after `agent_refusal` clears it, and
-// `execute` re-derives occupancy/references/identity fresh rather than
-// trusting anything set at proposal time.
+// session removal, both through this same plan/ledger/Trash path.
+// A supported unit becomes a real, markable `PlanUnit` only after
+// `agent_refusal` clears it.
 // ---------------------------------------------------------------------
 
 /// A file whose name suggests a SQLite database or one of its sidecar
@@ -1404,9 +866,9 @@ fn is_sqlite_like(path: &Path) -> bool {
 }
 
 /// Why `unit` cannot be proposed as an actionable agent-storage plan
-/// unit, or `None` if it can. Checked again, independently, at
-/// `execute` (occupancy and reference/identity re-derivation) -- this
-/// function is the proposal-time gate, not a substitute for that recheck.
+/// unit, or `None` if it can be listed for the Trash. Occupancy is never
+/// checked here: it is shown as a fact at mark/confirm time, never a
+/// veto against building the row at all.
 fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
     if u.protected {
         let reason = u
@@ -1417,7 +879,7 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
     }
     if u.action == crate::agents::AgentActionCapability::None {
         return Some(format!(
-            "no supported selective action for {} yet",
+            "{}: swamp has no Trash move for this category; remove it yourself if you want it gone",
             u.category.label()
         ));
     }
@@ -1429,27 +891,17 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
             "touches a database-like (SQLite/WAL/SHM) file; never deleted individually".into(),
         );
     }
-    // Proposal-time occupancy uses the same tri-state, descendant-aware
-    // probe the sink uses, not a boolean on the anchor: a session whose
-    // transcript is open *inside* a directory unit must not reach a plan
-    // in the first place, and a probe that could not run must not read
-    // as "nothing open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`).
-    let mut paths: Vec<PathBuf> = vec![u.path.clone()];
-    paths.extend(u.members.iter().map(|m| m.path.clone()));
-    crate::recheck::occupancy_refusal(&paths)
+    None
 }
 
-/// Builds a real, actionable plan from selected `AgentUnit`s (#101).
-/// Every unit that reaches the plan carries `agent_meta`; anything
-/// `agent_refusal` names is refused here, at proposal time, never
-/// silently downgraded to an inspection-only row (that would be
-/// `propose_external`'s contract, not this one's -- an agent-storage
-/// plan either names a real, supported action or refuses).
+/// Builds a list of Trash-able units from selected `AgentUnit`s (#101).
+/// Every unit that reaches the list carries `agent_meta`; anything
+/// `agent_refusal` names is refused here, never silently downgraded.
 pub fn propose_agents(
     units: &[crate::agents::AgentUnit],
     paths: &[PathBuf],
     proposed_by: &str,
-) -> Result<Plan> {
+) -> Result<Vec<PlanUnit>> {
     let mut plan_units = Vec::new();
     let mut refused = Vec::new();
     for u in units {
@@ -1511,29 +963,8 @@ pub fn propose_agents(
             }
         }
     }
-    let created_at = now();
-    // `Plan.root` is one path; an agent-storage plan can in principle
-    // span more than one tool home once a second adapter exists. Each
-    // unit's own `agent_meta.tool_home` is the authoritative value
-    // `execute` uses -- this field is informational (free-space
-    // before/after) and set from the first matched unit's home.
-    let root = plan_units
-        .first()
-        .and_then(|u: &PlanUnit| u.agent_meta.as_ref())
-        .map(|m| m.tool_home.clone())
-        .unwrap_or_default();
-    Ok(Plan {
-        id: crate::entities::new_id(),
-        root,
-        created_at,
-        expires_at: created_at + PLAN_TTL_SECS,
-        proposed_by: proposed_by.to_string(),
-        status: PlanStatus::Proposed,
-        selection: Some(selection_estimate(&plan_units)),
-        units: plan_units,
-        refused,
-        digest: std::sync::OnceLock::new(),
-    })
+    let _ = proposed_by;
+    Ok(plan_units)
 }
 
 fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
@@ -1594,7 +1025,7 @@ fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
             AgentActionCapability::SessionRemoval => {
                 "irrecoverable outside Trash: unique conversation/checkpoint history".to_string()
             }
-            AgentActionCapability::None => "inspection only".to_string(),
+            AgentActionCapability::None => "no swamp Trash move for this category".to_string(),
         },
         idle_secs: None,
         merge_complete: false,
@@ -1603,44 +1034,23 @@ fn unit_from_agent(u: &crate::agents::AgentUnit) -> PlanUnit {
         track: None,
         warnings,
         evidence: plan_unit_evidence(&u.evidence, &u.path),
-        external_category: None,
         agent_meta: Some(AgentPlanMeta {
             tool_id: u.tool_id.clone(),
             tool_home: u.tool_home.clone(),
             category,
             session_members,
         }),
-        reviewed: crate::recheck::capture(&u.path).ok(),
-        // Every session member outside the anchor, with its own
-        // identity: the recheck compares each one, so a sidecar swapped
-        // or rewritten after review refuses the removal.
-        reviewed_members: u
-            .members
-            .iter()
-            .filter(|m| m.path != u.path)
-            .filter_map(|m| crate::recheck::capture(&m.path).ok())
-            .collect(),
     }
 }
 
-/// A single-path Trash move of a cache/log category directory.
-///
-/// Before the move it runs the full live-state recheck
-/// (`.oh/guardrails/execution-sinks-recheck-live-state.md`): the
-/// directory must still be the one that was reviewed, with the exact
-/// membership that was reviewed (`reviewed_snapshot`); no human
-/// keep/protect entry may cover it or anything under it, loaded fresh
-/// (`live_protection`); and nothing may hold any member open, where an
-/// unanswerable probe refuses (`member_occupancy`). `is_dir()` alone was
-/// what let a replaced directory spend an old approval.
-fn execute_agent_cache_trash(
-    path: &Path,
-    trash: &Path,
-    at: u64,
-    auth: &Authorized,
-) -> Result<(PathBuf, u64)> {
-    let proof = crate::recheck::run_all(auth)?;
-    if !proof.identity().is_some_and(|i| i.is_dir) {
+/// A single-path Trash move of a cache/log category directory. The only
+/// refusal is an OS-level error (the directory is gone, or is now a
+/// symlink where a directory was reviewed) -- there is no re-derivation
+/// gate in front of this: the human was shown this unit's facts before
+/// pressing Enter.
+pub fn trash_agent_cache(path: &Path, trash: &Path, at: u64) -> Result<(PathBuf, u64)> {
+    let meta = fs_gate::symlink_metadata(path).context("path no longer exists")?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
         bail!("path is no longer a directory (or is a symlink)");
     }
     let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
@@ -1648,8 +1058,7 @@ fn execute_agent_cache_trash(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("agent-cache");
-    let dest =
-        fs_gate::destroy::trash_move(proof, auth, trash, &format!("agent-cache-{basename}-{at}"))?;
+    let dest = fs_gate::destroy::trash_move(path, trash, &format!("agent-cache-{basename}-{at}"))?;
     Ok((dest.into_path(), bytes))
 }
 
@@ -1716,66 +1125,24 @@ impl std::fmt::Display for PartialAgentRemoval {
 
 impl std::error::Error for PartialAgentRemoval {}
 
-/// Moves a session's exact member set into one Trash envelope, after
-/// re-deriving the session's current membership from scratch (never
-/// trusting `planned_members`) and refusing on any drift: a member now
-/// missing, a new member the plan did not know about, or membership
-/// that no longer matches at all (the session was already removed,
-/// re-created, or reclassified since the plan was proposed).
-fn execute_agent_session_removal(
+/// Moves a session's exact member set (exactly what was reviewed) into
+/// one Trash envelope. Nothing here is re-derived or compared against
+/// live state first: a member that vanished in the meantime is just an
+/// ordinary rename failure, reported like any other OS error, and the
+/// members already moved stay recorded in `restore.json`.
+pub fn trash_agent_session(
     meta: &AgentPlanMeta,
     session_path: &Path,
-    planned_members: &[PathBuf],
+    members: &[PathBuf],
     trash: &Path,
     at: u64,
-    auth: &Authorized,
 ) -> Result<(PathBuf, u64)> {
-    // One registry dispatch, never a second fourteen-arm tool-id match:
-    // this used to be its own copy of `agents::identify_for_tool`'s
-    // table, and a tool added to one and not the other identified fine
-    // and then refused to re-verify here
-    // (`.oh/guardrails/agent-adapters-are-pluggable.md`).
-    //
-    // The registry's recheck path runs with the identification cache
-    // disabled, so this is live state rather than a cached derivation.
-    let fresh = crate::agents::reidentify_for_tool(&meta.tool_id, &meta.tool_home, at).ok_or_else(
-        || {
-            anyhow!(
-                "no session-removal re-identification implemented for tool {}",
-                meta.tool_id
-            )
-        },
-    )?;
-    let current = fresh
-        .iter()
-        .find(|c| c.path() == session_path)
-        .ok_or_else(|| anyhow!("session no longer identifiable at this path; propose again"))?;
-    let mut current_members: Vec<PathBuf> =
-        current.members().iter().map(|m| m.path.clone()).collect();
-    let mut planned: Vec<PathBuf> = planned_members.to_vec();
-    current_members.sort();
-    planned.sort();
-    if current_members != planned {
-        bail!(
-            "session membership changed since the plan was proposed (references drifted); \
-             propose again"
-        );
-    }
-    // The shared live-state recheck, over the session's anchor *and*
-    // every member (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
-    // The membership comparison above catches references drifting; this
-    // catches the anchor being replaced, a protect entry added after
-    // approval in either direction, and anything holding a member open
-    // -- including an unanswerable occupancy probe, which refuses. Every
-    // member outside the anchor is rechecked against the identity the
-    // plan recorded for it, and the member list is the plan's, from the
-    // authorization, not this function's.
-    let proof = crate::recheck::run_all(auth)?;
+    let current_members: Vec<PathBuf> = members.to_vec();
 
     // Pre-flight: stat every member *before* moving any of them, so the
-    // common failure (a member vanished between proposal and execution)
-    // is caught before this session is left half-moved. This does not
-    // make the multi-file move fully atomic (a concurrent deletion or a
+    // common failure (a member vanished since it was reviewed) is caught
+    // before this session is left half-moved. This does not make the
+    // multi-file move fully atomic (a concurrent deletion or a
     // cross-device rename can still fail mid-loop), but it removes the
     // most likely partial-failure cause outright.
     let mut sized_members: Vec<(PathBuf, u64, bool)> = Vec::with_capacity(current_members.len());
@@ -1796,8 +1163,7 @@ fn execute_agent_session_removal(
         .and_then(|s| s.to_str())
         .unwrap_or("session");
     let mut envelope = fs_gate::destroy::Envelope::open(
-        proof,
-        auth,
+        session_path,
         trash,
         &format!("agent-session-{slug}-{at}"),
         None,
@@ -1945,503 +1311,14 @@ fn unit_from_dir(project: &ProjectRow, wt: &WorktreeRow, d: &crate::report::DirR
     unit_from_row(project, wt, &pseudo)
 }
 
-// ---------------------------------------------------------------------
-// Grants — minted only from the reviewed CLI approve/grant command
-// handling or the TUI's confirmed-execution path (human_only_authorization).
-// ---------------------------------------------------------------------
+pub use crate::preserve::{Preserved, preserve_executables};
 
-/// A grant a human minted: a one-shot approval of one plan's exact
-/// content, or a standing predicate grant with a budget and an expiry.
-///
-/// **Provenance** (re-review 5, finding 1): built only by
-/// [`approve_confirmed`] / [`add_standing_grant_confirmed`] (each spends
-/// the [`HumanConfirmed`] its site minted for exactly this subject, and
-/// records that confirmation's id and site) and by [`list_grants`], the
-/// store loader, which checks every record's keyed binding. Not
-/// `Deserialize`; fields private to `actions`.
-#[derive(Debug, Clone, Serialize)]
-pub struct Grant {
-    id: String,
-    verb: String,
-    /// Empty for a one-shot approval. Otherwise a `filter` expression
-    /// restricted to unit predicates: `kind:`, `project:`, `idle > `,
-    /// `merge-complete`.
-    predicate: String,
-    /// A one-shot approval covers exactly this plan and nothing else.
-    plan_id: Option<String>,
-    /// ... and only while the plan still has the content that was shown
-    /// ([`Plan::content_digest`] at approval).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan_digest: Option<String>,
-    budget_bytes: Option<u64>,
-    spent_bytes: u64,
-    max_units: Option<u32>,
-    used_units: u32,
-    created_at: u64,
-    expires_at: u64,
-    actor: String,
-    revoked: bool,
-    /// The [`HumanConfirmed`] this grant spent, and where it was minted.
-    confirmation: String,
-    site: String,
-}
-
-impl Grant {
-    fn live(&self, at: u64) -> bool {
-        !self.revoked && at <= self.expires_at
-    }
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-    pub fn predicate(&self) -> &str {
-        &self.predicate
-    }
-    pub fn plan_id(&self) -> Option<&str> {
-        self.plan_id.as_deref()
-    }
-    pub fn budget_bytes(&self) -> Option<u64> {
-        self.budget_bytes
-    }
-    pub fn spent_bytes(&self) -> u64 {
-        self.spent_bytes
-    }
-    pub fn max_units(&self) -> Option<u32> {
-        self.max_units
-    }
-    pub fn used_units(&self) -> u32 {
-        self.used_units
-    }
-    pub fn expires_at(&self) -> u64 {
-        self.expires_at
-    }
-    pub fn actor(&self) -> &str {
-        &self.actor
-    }
-    pub fn revoked(&self) -> bool {
-        self.revoked
-    }
-}
-
-/// The on-disk mirror of [`Grant`], parsed only by [`list_grants`] after
-/// the record's binding checked out.
-#[derive(Deserialize)]
-struct StoredGrant {
-    id: String,
-    verb: String,
-    predicate: String,
-    plan_id: Option<String>,
-    #[serde(default)]
-    plan_digest: Option<String>,
-    budget_bytes: Option<u64>,
-    spent_bytes: u64,
-    max_units: Option<u32>,
-    used_units: u32,
-    created_at: u64,
-    expires_at: u64,
-    actor: String,
-    revoked: bool,
-    confirmation: String,
-    site: String,
-}
-
-/// Whether `g` is live at `at` and covers `unit` of `plan` -- for a
-/// one-shot approval, only while `plan` has the content it was approved
-/// with: the grant half of [`crate::authority::authorize`].
-pub(crate) fn grant_is_live_and_covers(
-    g: &Grant,
-    plan: &Plan,
-    plan_digest: &str,
-    unit: &PlanUnit,
-    at: u64,
-) -> bool {
-    g.live(at) && grant_covers(g, plan, plan_digest, unit)
-}
-
-/// What [`crate::authority::authorize`] copies into an `Authorized`: the
-/// unit's anchor and everything the recheck compares, as the plan
-/// recorded it.
-pub(crate) fn target_of(unit: &PlanUnit) -> crate::authority::Target {
-    crate::authority::Target {
-        anchor: unit.path.clone(),
-        reviewed: unit.reviewed.clone(),
-        members: unit.reviewed_members.clone(),
-        docker: docker_target(&unit.kind, &unit.path),
-        linked_worktree: unit.verb == "remove-worktree",
-        preserve_into: (unit.verb == "delete").then(|| unit.worktree_path.clone()),
-    }
-}
-
-fn grants_path(dir: &Path) -> PathBuf {
-    dir.join("grants.json")
-}
-
-/// The store loader for grants: every record's binding is checked under
-/// the store's authority key, and **one** bad record refuses the whole
-/// file (fail closed, as a corrupt protect list does): a grant that was
-/// widened by hand, or appended by anything but swamp, must not sit next
-/// to real ones and be skipped quietly.
-pub fn list_grants(dir: &Path) -> Result<Vec<Grant>> {
-    let text = match read_owned_string(grants_path(dir)) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e.into()),
-    };
-    let store = store::StoreDir::at(dir)?;
-    let file: serde_json::Value = serde_json::from_str(&text)?;
-    let records = file
-        .get("grants")
-        .and_then(|g| g.as_array())
-        .cloned()
-        .ok_or_else(|| anyhow!("{} has no `grants` list", grants_path(dir).display()))?;
-    if records.is_empty() {
-        return Ok(vec![]);
-    }
-    if !crate::fs_gate::key::has_authority_key(&store) {
-        bail!(
-            "{} holds grants but no swamp authority key: they were not minted by swamp's \
-             approve/grant paths; every execution is refused until the file is removed",
-            store.path().display()
-        );
-    }
-    let key = crate::fs_gate::key::authority_key(&store)?;
-    let mut out = Vec::with_capacity(records.len());
-    for (i, record) in records.into_iter().enumerate() {
-        let id = record
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let record = verified_record(&key, GRANT_DOMAIN, record, &format!("grant {id} (#{i})"))
-            .map_err(|e| {
-                anyhow!(
-                    "{e}; every execution is refused until {} is repaired (revoke by hand-removing \
-                     the record, then `swamp approve`/`swamp grant add` again)",
-                    grants_path(dir).display()
-                )
-            })?;
-        let g: StoredGrant = serde_json::from_value(record)?;
-        out.push(Grant {
-            id: g.id,
-            verb: g.verb,
-            predicate: g.predicate,
-            plan_id: g.plan_id,
-            plan_digest: g.plan_digest,
-            budget_bytes: g.budget_bytes,
-            spent_bytes: g.spent_bytes,
-            max_units: g.max_units,
-            used_units: g.used_units,
-            created_at: g.created_at,
-            expires_at: g.expires_at,
-            actor: g.actor,
-            revoked: g.revoked,
-            confirmation: g.confirmation,
-            site: g.site,
-        });
-    }
-    Ok(out)
-}
-
-fn write_grants(dir: &Path, grants: &[Grant]) -> Result<()> {
-    let store = store::StoreDir::at(dir)?;
-    let key = crate::fs_gate::key::authority_key(&store)?;
-    let mut records = Vec::with_capacity(grants.len());
-    for g in grants {
-        let mut record = serde_json::to_value(g)?;
-        let binding = record_binding(&key, GRANT_DOMAIN, &record);
-        if let Some(m) = record.as_object_mut() {
-            m.insert("binding".into(), serde_json::Value::String(binding));
-        }
-        records.push(record);
-    }
-    store::write_json(
-        store::JsonFile::Grants { store: &store },
-        &serde_json::json!({ "grants": records }),
-    )?;
-    Ok(())
-}
-
-/// Validates a standing-grant predicate: only facts about the *unit*
-/// (kind, project, idle, merge-complete). Growth windows and PR state are
-/// report-time filters, not authorization terms.
-pub fn validate_grant_predicate(expr: &str) -> Result<Filter> {
-    let f = crate::filter::parse(expr)?;
-    for p in &f.predicates {
-        match p {
-            Predicate::Kind(_)
-            | Predicate::Project(_)
-            | Predicate::Type(_)
-            | Predicate::Size { .. }
-            | Predicate::AgeGreaterThan(_)
-            | Predicate::IdleGreaterThan(_)
-            | Predicate::MergeComplete => {}
-            Predicate::Growth { .. } => bail!(
-                "grant predicates cannot use growth windows; use kind:/project:/idle >/merge-complete"
-            ),
-            Predicate::Pr(_) => {
-                bail!("grant predicates cannot use pr:; use kind:/project:/idle >/merge-complete")
-            }
-        }
-    }
-    if f.predicates.is_empty() {
-        bail!(
-            "a standing grant needs at least one predicate (kind:, project:, idle > <dur>, merge-complete); a blank grant is a blank check"
-        );
-    }
-    Ok(f)
-}
-
-/// Human-at-CLI: a standing grant. `expires_in_secs` and `budget_bytes`
-/// are required so a grant can neither live forever nor be unbounded.
-///
-/// Spends the [`HumanConfirmed`] the CLI's `cmd_grant_add` minted for
-/// exactly these terms: a caller that does not hold one does not compile,
-/// and one minted for different terms (or at another site) refuses
-/// (`.oh/guardrails/human-only-authorization.md`).
-pub fn add_standing_grant_confirmed(
-    dir: &Path,
-    predicate: &str,
-    budget_bytes: u64,
-    max_units: Option<u32>,
-    expires_in_secs: u64,
-    confirmed: HumanConfirmed,
-) -> Result<Grant> {
-    let terms = crate::authority::StandingTerms {
-        predicate: predicate.to_string(),
-        budget_bytes,
-        max_units,
-        expires_in_secs,
-    };
-    if !confirmed.confirms_terms(&terms) {
-        bail!("refused: this confirmation is not for a standing grant with these terms");
-    }
-    validate_grant_predicate(predicate)?;
-    if budget_bytes == 0 {
-        bail!("--budget is required and must be > 0");
-    }
-    if expires_in_secs == 0 {
-        bail!("--expires is required and must be > 0");
-    }
-    let mut grants = list_grants(dir)?;
-    let g = Grant {
-        id: crate::entities::new_id(),
-        verb: "delete".into(),
-        predicate: predicate.trim().to_string(),
-        plan_id: None,
-        plan_digest: None,
-        budget_bytes: Some(budget_bytes),
-        spent_bytes: 0,
-        max_units,
-        used_units: 0,
-        created_at: now(),
-        expires_at: now() + expires_in_secs,
-        actor: confirmed.actor().to_string(),
-        revoked: false,
-        confirmation: confirmed.id().to_string(),
-        site: confirmed.site().label().to_string(),
-    };
-    grants.push(g.clone());
-    write_grants(dir, &grants)?;
-    Ok(g)
-}
-
-/// The test-fixture spelling of [`add_standing_grant_confirmed`], for
-/// integration tests only: exists only with the `testing` feature, which
-/// no production build enables (`crates/core/Cargo.toml`).
-#[cfg(feature = "testing")]
-pub fn add_standing_grant(
-    dir: &Path,
-    predicate: &str,
-    budget_bytes: u64,
-    max_units: Option<u32>,
-    expires_in_secs: u64,
-    actor: &str,
-) -> Result<Grant> {
-    add_standing_grant_confirmed(
-        dir,
-        predicate,
-        budget_bytes,
-        max_units,
-        expires_in_secs,
-        HumanConfirmed::cli_grant(
-            actor,
-            crate::authority::StandingTerms {
-                predicate: predicate.to_string(),
-                budget_bytes,
-                max_units,
-                expires_in_secs,
-            },
-        ),
-    )
-}
-
-/// The test-fixture spelling of [`approve_confirmed`]; `testing` only,
-/// like [`add_standing_grant`]. The reviewers' counterexample files call
-/// it by this name.
-#[cfg(feature = "testing")]
-pub fn approve(dir: &Path, plan_id: &str, actor: &str) -> Result<Grant> {
-    let plan = load_plan(dir, plan_id)?;
-    approve_confirmed(dir, plan_id, HumanConfirmed::cli_approve(actor, &plan))
-}
-
-/// Human-at-CLI (or the TUI's confirm dialog): approve one plan. The
-/// grant is scoped to that plan id **and its content digest**, and
-/// expires with the plan.
-///
-/// Spends the [`HumanConfirmed`] its site minted when it showed the
-/// human this plan: refused unless the confirmation names this plan id
-/// with the content the stored plan has now (a plan edited between being
-/// shown and being approved, or a confirmation for another plan, is
-/// refused), and unless the stored plan's own binding checks out.
-pub fn approve_confirmed(dir: &Path, plan_id: &str, confirmed: HumanConfirmed) -> Result<Grant> {
-    let plan = load_plan(dir, plan_id)?;
-    let digest = plan.content_digest();
-    if !confirmed.confirms_plan(plan_id, &digest) {
-        bail!(
-            "refused: this confirmation is not for plan {plan_id} as it is stored now (a \
-             different plan, or its content changed after it was shown); review it again"
-        );
-    }
-    if plan.is_expired(now()) {
-        bail!(
-            "plan {plan_id} expired at {}; propose again",
-            plan.expires_at
-        );
-    }
-    if plan.status == PlanStatus::Executed {
-        bail!("plan {plan_id} was already executed");
-    }
-    let mut grants = list_grants(dir)?;
-    let g = Grant {
-        id: crate::entities::new_id(),
-        verb: "delete".into(),
-        predicate: String::new(),
-        plan_id: Some(plan_id.to_string()),
-        plan_digest: Some(digest),
-        budget_bytes: Some(plan.planned_bytes()),
-        spent_bytes: 0,
-        max_units: Some(plan.units.len() as u32),
-        used_units: 0,
-        created_at: now(),
-        expires_at: plan.expires_at,
-        actor: confirmed.actor().to_string(),
-        revoked: false,
-        confirmation: confirmed.id().to_string(),
-        site: confirmed.site().label().to_string(),
-    };
-    grants.push(g.clone());
-    write_grants(dir, &grants)?;
-    Ok(g)
-}
-
-pub fn revoke_grant(dir: &Path, grant_id: &str) -> Result<()> {
-    let mut grants = list_grants(dir)?;
-    let g = grants
-        .iter_mut()
-        .find(|g| g.id == grant_id)
-        .ok_or_else(|| anyhow!("no grant {grant_id}"))?;
-    g.revoked = true;
-    write_grants(dir, &grants)
-}
-
-/// Does this grant's predicate cover this unit? (Budget/unit caps are
-/// checked separately at execution, cumulatively.)
-fn grant_covers(g: &Grant, plan: &Plan, plan_digest: &str, unit: &PlanUnit) -> bool {
-    if let Some(pid) = &g.plan_id {
-        // A one-shot approval covers the whole plan -- the plan it was
-        // given for, with the content it had then.
-        return pid == &plan.id && g.plan_digest.as_deref() == Some(plan_digest);
-    }
-    if unit.cargo_group.is_some() || unit.dedup_stale {
-        return false;
-    } // explicit per-plan approval only
-    if g.verb != unit.verb {
-        return false;
-    }
-    let Ok(f) = crate::filter::parse(&g.predicate) else {
-        return false;
-    };
-    f.predicates.iter().all(|p| match p {
-        Predicate::Kind(k) => format!("{:?}", unit.kind).eq_ignore_ascii_case(k),
-        Predicate::Project(name) => unit.project.eq_ignore_ascii_case(name),
-        Predicate::Type(_) => true, // not carried on a unit; scope by project: instead
-        Predicate::IdleGreaterThan(secs) => unit.idle_secs.is_some_and(|i| i > *secs),
-        Predicate::MergeComplete => unit.merge_complete,
-        Predicate::Size { greater, bytes } => {
-            if *greater {
-                unit.bytes > *bytes
-            } else {
-                unit.bytes < *bytes
-            }
-        }
-        // Age is re-derived at the sink (`newest_mtime`), not trusted from
-        // the plan: the grant covers the unit only if it is still that old.
-        Predicate::AgeGreaterThan(secs) => crate::recheck::newest_mtime(&unit.path, 2_000_000)
-            .is_some_and(|m| crate::entities::now().saturating_sub(m) > *secs),
-        Predicate::Growth { .. } | Predicate::Pr(_) => false,
-    })
-}
-
-/// The exact command a human runs to authorize this plan. Printed in every
-/// `awaiting-authorization` refusal so the agent can relay it verbatim.
-pub fn approve_command(plan_id: &str) -> String {
-    format!("swamp approve {plan_id}")
-}
-
-// ---------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnitOutcome {
-    pub path: PathBuf,
-    pub kind: ArtifactKind,
-    pub planned_bytes: u64,
-    /// `completed` | `refused` | `failed`
-    pub status: String,
-    pub cause: Option<String>,
-    pub grant_id: Option<String>,
-    pub recovery_location: Option<PathBuf>,
-    /// Compiled outputs copied to `<worktree>/bin/` before the unit went to
-    /// Trash (`keep_executables`); empty when nothing applied.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub preserved: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecuteResult {
-    pub plan_id: String,
-    /// `executed` | `awaiting-authorization` | `expired` | `already-executed`
-    pub state: String,
-    pub next_step: Option<String>,
-    pub outcomes: Vec<UnitOutcome>,
-    pub planned_bytes: u64,
-    /// Bytes moved to Trash, which is to say recoverable.
-    pub trashed_bytes: u64,
-    /// Bytes removed with no Trash behind them: Docker objects, which the
-    /// daemon deletes outright. Reported apart from `trashed_bytes`
-    /// because the two mean opposite things to whoever has to undo this.
-    #[serde(default)]
-    pub removed_permanently_bytes: u64,
-    pub free_before: Option<u64>,
-    pub free_after: Option<u64>,
-    /// Measured (free_after - free_before). Trash keeps the bytes on the
-    /// volume, so this is expected to be ~0 until Trash is emptied; it is
-    /// reported so nobody mistakes "trashed" for "freed".
-    pub freed_measured: Option<i64>,
-    /// Outcome evidence (#59): the one *measured* reclaimability number
-    /// in this pipeline -- a real `statvfs`/`df` reading taken before
-    /// and after this execution, carrying its own limits (a move to
-    /// Trash on the same volume, an open file another process still
-    /// holds, a filesystem snapshot or a concurrent writer can each
-    /// suppress the change). Deliberately a separate fact from the
-    /// plan's `EstimatedReclaimable`: an estimate and an observation are
-    /// different things, and collapsing them is how a scan comes to
-    /// promise exact reclaimed bytes. Empty when nothing was executed --
-    /// an expired, already-executed or unauthorized plan measures
-    /// nothing rather than reporting a fabricated zero.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<crate::evidence::Evidence>,
-    pub actor: String,
+/// Moves a Cargo purpose group's exact member list to the Trash.
+pub fn trash_cargo_group(
+    group: &crate::cargo_cleanup::CargoGroup,
+    trash: &Path,
+) -> Result<PathBuf> {
+    crate::cargo_cleanup::move_group(group, trash)
 }
 
 /// The Trash root `fs_gate::destroy::trash_move`/`Envelope::open` write
@@ -2474,6 +1351,9 @@ pub fn trash_root() -> PathBuf {
     }
 }
 
+/// Free space on the volume containing `path`, in bytes, via `df -k`.
+/// Returns `None` if `df` cannot be read (advisory only: a missing
+/// measurement never blocks or fakes the reported result).
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
     let out = crate::fs_gate::spawn::run(
         crate::fs_gate::spawn::Program::Df,
@@ -2488,518 +1368,6 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
     let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
     let available_kb: u64 = fields.get(3)?.parse().ok()?;
     Some(available_kb * 1024)
-}
-
-fn ledger_path(dir: &Path) -> PathBuf {
-    dir.join("ledger.jsonl")
-}
-
-/// Executes a plan. Every unit is checked independently; one refusal never
-/// aborts the rest. Without a covering grant for any unit the plan is not
-/// executed at all and the result names the command a human runs.
-pub fn execute(dir: &Path, plan_id: &str, actor: &str) -> Result<ExecuteResult> {
-    execute_with_trash(dir, plan_id, actor, &trash_root())
-}
-
-/// `execute`, first copying compiled outputs out of each unit into
-/// `<worktree>/bin/` (see [`preserve_executables`]).
-pub fn execute_keeping_executables(
-    dir: &Path,
-    plan_id: &str,
-    actor: &str,
-) -> Result<ExecuteResult> {
-    execute_with_trash_opts(dir, plan_id, actor, &trash_root(), true)
-}
-
-pub use crate::preserve::{Preserved, preserve_executables};
-
-/// `execute` with an explicit Trash root (tests; never process-global state).
-pub fn execute_with_trash(
-    dir: &Path,
-    plan_id: &str,
-    actor: &str,
-    trash: &Path,
-) -> Result<ExecuteResult> {
-    execute_with_trash_opts(dir, plan_id, actor, trash, false)
-}
-
-pub fn execute_with_trash_opts(
-    dir: &Path,
-    plan_id: &str,
-    actor: &str,
-    trash: &Path,
-    keep_executables: bool,
-) -> Result<ExecuteResult> {
-    let mut plan = load_plan(dir, plan_id)?;
-    let at = now();
-    let planned = plan.planned_bytes();
-    let base = |state: &str, next: Option<String>| ExecuteResult {
-        plan_id: plan_id.to_string(),
-        state: state.into(),
-        next_step: next,
-        outcomes: vec![],
-        planned_bytes: planned,
-        trashed_bytes: 0,
-        removed_permanently_bytes: 0,
-        free_before: None,
-        free_after: None,
-        freed_measured: None,
-        evidence: Vec::new(),
-        actor: actor.to_string(),
-    };
-    if plan.status == PlanStatus::Executed {
-        return Ok(base("already-executed", Some("propose a new plan".into())));
-    }
-    if plan.is_expired(at) {
-        return Ok(base(
-            "expired",
-            Some("propose again; plans live 30 minutes".into()),
-        ));
-    }
-    let mut grants = list_grants(dir)?;
-    let store_dir = store::StoreDir::at(dir)?;
-    let digest = plan.content_digest();
-    // Authorization first, for every unit, before touching anything.
-    let mut chosen: Vec<Option<usize>> = Vec::with_capacity(plan.units.len());
-    for unit in &plan.units {
-        let idx = grants
-            .iter()
-            .position(|g| g.live(at) && grant_covers(g, &plan, &digest, unit));
-        chosen.push(idx);
-    }
-    if chosen.iter().all(|c| c.is_none()) {
-        return Ok(base(
-            "awaiting-authorization",
-            Some(format!(
-                "no grant covers this plan; a human runs `{}` (this plan only) or `swamp grant add '<kind:/project:/idle >/merge-complete>' --budget <size> --expires <dur>` (standing)",
-                approve_command(plan_id)
-            )),
-        ));
-    }
-
-    let ledger = Ledger::open(ledger_path(dir))?;
-    let free_before = free_space_bytes(&plan.root);
-    let mut outcomes = Vec::new();
-    let mut trashed = 0u64;
-    let mut removed_permanently = 0u64;
-    let mut spent_by_grant: HashMap<usize, (u64, u32)> = HashMap::new();
-
-    for (index, (unit, choice)) in plan.units.iter().zip(chosen.iter()).enumerate() {
-        let mut outcome = UnitOutcome {
-            path: unit.path.clone(),
-            kind: unit.kind.clone(),
-            planned_bytes: unit.bytes,
-            status: "refused".into(),
-            cause: None,
-            grant_id: None,
-            recovery_location: None,
-            preserved: Vec::new(),
-        };
-        if let Some(category) = &unit.external_category {
-            outcome.cause = Some(format!(
-                "no supported selective action for {category}: external units are inspection-only"
-            ));
-            outcomes.push(outcome);
-            continue;
-        }
-        let Some(gi) = *choice else {
-            outcome.cause = Some(format!(
-                "no grant covers this unit; `{}`",
-                approve_command(plan_id)
-            ));
-            outcomes.push(outcome);
-            continue;
-        };
-        let g = &grants[gi];
-        outcome.grant_id = Some(g.id.clone());
-        // Budget and unit caps, cumulative across this execution.
-        let (spent, used) = spent_by_grant
-            .get(&gi)
-            .copied()
-            .unwrap_or((g.spent_bytes, g.used_units));
-        if let Some(b) = g.budget_bytes
-            && spent + unit.bytes > b
-        {
-            outcome.cause = Some(format!(
-                "grant budget exceeded: {} spent + {} unit > {} budget",
-                spent, unit.bytes, b
-            ));
-            outcomes.push(outcome);
-            continue;
-        }
-        if let Some(mu) = g.max_units
-            && used + 1 > mu
-        {
-            outcome.cause = Some(format!("grant unit cap reached ({mu})"));
-            outcomes.push(outcome);
-            continue;
-        }
-        // The value every destructive step below borrows: this grant,
-        // live, covering this unit, within budget. Minted only here.
-        let Some(auth) =
-            crate::authority::authorize(&plan, &digest, index, g, &store_dir, spent, used, at)
-        else {
-            outcome.cause = Some(format!(
-                "no live grant covers this unit; `{}`",
-                approve_command(plan_id)
-            ));
-            outcomes.push(outcome);
-            continue;
-        };
-        // Agent-storage action (#101): occupancy, reference and identity
-        // are all rechecked fresh here, never trusted from the plan.
-        if let Some(meta) = &unit.agent_meta {
-            let agent_result = match &meta.session_members {
-                Some(planned_members) => execute_agent_session_removal(
-                    meta,
-                    &unit.path,
-                    planned_members,
-                    trash,
-                    at,
-                    &auth,
-                ),
-                None => execute_agent_cache_trash(&unit.path, trash, at, &auth),
-            };
-            match agent_result {
-                Ok((dest, moved_bytes)) => {
-                    outcome.status = "completed".into();
-                    outcome.recovery_location = Some(dest);
-                    trashed += moved_bytes;
-                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
-                }
-                Err(e) => {
-                    outcome.status = "failed".into();
-                    // A partial session removal (some members already
-                    // physically moved before a later rename failed)
-                    // still names its Trash envelope and the bytes that
-                    // really did move -- `restore.json` inside that
-                    // envelope has the exact per-member account. Never
-                    // silently drop where partially-moved content went.
-                    if let Some(partial) = e.downcast_ref::<PartialAgentRemoval>() {
-                        outcome.recovery_location = Some(partial.envelope.clone());
-                        trashed += partial.moved_bytes;
-                    }
-                    outcome.cause = Some(e.to_string());
-                }
-            }
-            ledger.append(&ActionRecord {
-                id: crate::entities::new_id(),
-                verb: crate::grants::Verb::Delete,
-                entity_id: crate::entities::id_for(&unit.path.display().to_string()),
-                evidence: serde_json::json!({
-                    "plan_id": plan.id,
-                    "tool_id": meta.tool_id,
-                    "category": meta.category,
-                    "session_removal": meta.session_members.is_some(),
-                    "member_count": meta.session_members.as_ref().map(|m| m.len()),
-                    "bytes": unit.bytes,
-                    "recovery": unit.recovery,
-                    "cause": outcome.cause,
-                }),
-                grant_id: g.id.clone(),
-                actor: actor.into(),
-                outcome: outcome.status.clone(),
-                recovery_location: outcome.recovery_location.clone(),
-                measured_free_space_delta: None,
-                observed_path_state: Some(if outcome.status == "completed" {
-                    "trashed".into()
-                } else {
-                    "unchanged".into()
-                }),
-                recorded_at: at,
-            })?;
-            outcomes.push(outcome);
-            continue;
-        }
-        // A Docker object is not a path: it lives in the daemon, and it
-        // is removed there, permanently. Same discipline — re-derived at
-        // the sink, refused with the daemon's own words — but no Trash
-        // and so no recovery location.
-        if let Some(target) = docker_target(&unit.kind, &unit.path) {
-            // The recheck asks the daemon about exactly the object the
-            // authorization names (`still_removable`), and the removal's
-            // arguments are built from that proof.
-            let proof = match crate::recheck::run_all(&auth) {
-                Ok(proof) => proof,
-                Err(e) => {
-                    outcome.cause = Some(e.to_string());
-                    outcomes.push(outcome);
-                    continue;
-                }
-            };
-            match crate::docker::remove(proof, &auth) {
-                Ok(()) => {
-                    outcome.status = "completed".into();
-                    removed_permanently += unit.bytes;
-                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
-                    ledger.append(&crate::ledger::ActionRecord {
-                        id: crate::entities::new_id(),
-                        verb: crate::grants::Verb::Delete,
-                        entity_id: crate::entities::id_for(&unit.path.display().to_string()),
-                        evidence: serde_json::json!({
-                            "plan_id": plan_id,
-                            "kind": format!("{:?}", unit.kind),
-                            "bytes": unit.bytes,
-                            "recovery": unit.recovery,
-                            "docker": format!("{target:?}"),
-                            "permanent": true,
-                        }),
-                        grant_id: g.id.clone(),
-                        actor: actor.to_string(),
-                        outcome: "completed".to_string(),
-                        recovery_location: None,
-                        measured_free_space_delta: None,
-                        observed_path_state: Some("removed via docker".to_string()),
-                        recorded_at: at,
-                    })?;
-                }
-                Err(why) => outcome.cause = Some(why),
-            }
-            outcomes.push(outcome);
-            continue;
-        }
-        // Sink re-derivation: the path must still be the artifact it was.
-        if let Some(group) = &unit.cargo_group {
-            if keep_executables {
-                outcome.cause =
-                    Some("keep-executables conflicts with selective executable removal".into());
-                outcomes.push(outcome);
-                continue;
-            }
-            // The Cargo group's own recheck lives in
-            // `cargo_cleanup::move_reviewed`, next to the rename it
-            // guards: role, fingerprint, membership, identity and member
-            // *contents* under a held Cargo build lock -- a stronger
-            // identity check than the shared one, affordable because
-            // these are small build outputs with no privacy constraint.
-            // The two thirds it was missing (protection loaded fresh in
-            // both directions, tri-state occupancy) moved in there too,
-            // so one function owns the whole gate.
-            ledger.append(&ActionRecord {
-                id: crate::entities::new_id(),
-                verb: crate::grants::Verb::Delete,
-                entity_id: crate::entities::id_for(&unit.path.display().to_string()),
-                evidence: serde_json::json!({"plan_id":plan.id,"cargo_group":group}),
-                grant_id: g.id.clone(),
-                actor: actor.into(),
-                outcome: "intent".into(),
-                recovery_location: None,
-                measured_free_space_delta: None,
-                observed_path_state: Some("preflight".into()),
-                recorded_at: at,
-            })?;
-            match crate::cargo_cleanup::move_reviewed(group, trash, &auth) {
-                Ok(dest) => {
-                    outcome.status = "completed".into();
-                    outcome.recovery_location = Some(dest);
-                    trashed += unit.bytes;
-                    spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
-                }
-                Err(e) => {
-                    outcome.status = "failed".into();
-                    outcome.cause = Some(e.to_string());
-                }
-            }
-            ledger.append(&ActionRecord {
-                id:crate::entities::new_id(),verb:crate::grants::Verb::Delete,entity_id:crate::entities::id_for(&unit.path.display().to_string()),
-                evidence:serde_json::json!({"plan_id":plan.id,"cargo_group":group,"cause":outcome.cause}),
-                grant_id:g.id.clone(),actor:actor.into(),outcome:outcome.status.clone(),recovery_location:outcome.recovery_location.clone(),
-                measured_free_space_delta:None,observed_path_state:Some("see recovery manifest and outcome".into()),recorded_at:at,
-            })?;
-            outcomes.push(outcome);
-            continue;
-        }
-        let Ok(meta) = fs_gate::symlink_metadata(&unit.path) else {
-            outcome.cause = Some("path no longer exists".into());
-            outcomes.push(outcome);
-            continue;
-        };
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            outcome.cause = Some("path is no longer a directory (or is a symlink)".into());
-            outcomes.push(outcome);
-            continue;
-        }
-        let basename = unit.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if refusal_for_kind(&unit.kind).is_some() || basename.is_empty() {
-            outcome.cause = Some("unit kind is not actionable".into());
-            outcomes.push(outcome);
-            continue;
-        }
-        match crate::recheck::newest_mtime(&unit.path, 2_000_000) {
-            None => {
-                outcome.cause = Some("could not re-observe the tree before acting".into());
-                outcomes.push(outcome);
-                continue;
-            }
-            // Strictly `>`, and the same-second case is *not* this
-            // gate's job.
-            //
-            // The 2026-09-22 re-review's CE2 is a rewrite inside the
-            // same whole second as plan creation, which `>` reads as
-            // "nothing changed". The first repair made this `>=`, and
-            // that over-refuses catastrophically: `plan.created_at` is
-            // whole seconds, so an ordinary propose-then-execute on a
-            // tree written moments earlier -- the normal case --
-            // refused itself. Two existing tests caught it
-            // (`evidence_action_recheck.rs`), and a user would have
-            // caught it the first time they used the tool.
-            //
-            // The review named the alternative and it is the right one:
-            // resolve the same second where the resolution exists. Every
-            // member carries `recheck::ReviewedMember`'s nanosecond
-            // fingerprint (`mtime_ns`, `ctime_ns`, inode, len), and the
-            // recheck below compares it before anything is moved, so a
-            // same-second in-place rewrite is caught there -- precisely,
-            // rather than by refusing every plan that shares a second
-            // with its own tree.
-            Some(m) if m > plan.created_at => {
-                outcome.cause = Some(format!(
-                    "activity changed since plan: newest mtime {} > plan {} — propose again",
-                    m, plan.created_at
-                ));
-                outcomes.push(outcome);
-                continue;
-            }
-            Some(_) => {}
-        }
-        // The shared live-state recheck, on the ordinary filesystem path
-        // too (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
-        //
-        // Two findings from the PR #123 review are fixed here together.
-        // The recheck this replaces refused only on `Known(Bool(true))`,
-        // so a permission-denied or unavailable occupancy answer fell
-        // through and *authorized* the removal -- a fail-open gate
-        // replacing a fail-closed one. And human keep/protect intent was
-        // enforced at proposal only, so `swamp protect` added after
-        // approval did not stop an ordinary artifact row being moved.
-        let proof = match crate::recheck::run_all(&auth) {
-            Ok(proof) => proof,
-            Err(e) => {
-                outcome.cause = Some(e.to_string());
-                outcomes.push(outcome);
-                continue;
-            }
-        };
-        if keep_executables && unit.verb == "delete" {
-            match preserve_executables(&proof, &auth) {
-                Ok(kept) => outcome.preserved = kept.into_iter().map(|k| k.to).collect(),
-                Err(e) => {
-                    outcome.status = "failed".into();
-                    outcome.cause = Some(format!("could not preserve executables: {e}"));
-                    outcomes.push(outcome);
-                    continue;
-                }
-            }
-        }
-        let dest_name = format!("{}-{}-{}", basename, unit.project.replace('/', "_"), at);
-        match fs_gate::destroy::trash_move(proof, &auth, trash, &dest_name) {
-            Ok(moved) => {
-                outcome.status = "completed".into();
-                outcome.recovery_location = Some(moved.path().to_path_buf());
-                trashed += unit.bytes;
-                spent_by_grant.insert(gi, (spent + unit.bytes, used + 1));
-                // A linked worktree's `.git` is a file (gitdir pointer);
-                // the recheck read its common dir, and the prune runs
-                // there, after the move it follows.
-                if unit.verb == "remove-worktree" {
-                    let _ = fs_gate::destroy::git_worktree_prune(moved, &auth);
-                }
-            }
-            Err(e) => {
-                outcome.status = "failed".into();
-                outcome.cause = Some(format!("rename to Trash failed: {e}"));
-            }
-        }
-        ledger.append(&ActionRecord {
-            id: crate::entities::new_id(),
-            verb: match unit.verb.as_str() {
-                "archive" => crate::grants::Verb::Archive,
-                "remove-worktree" => crate::grants::Verb::RemoveWorktree,
-                _ => crate::grants::Verb::Delete,
-            },
-            entity_id: crate::entities::id_for(&unit.path.display().to_string()),
-            evidence: serde_json::json!({
-                "plan_id": plan.id,
-                "project": unit.project,
-                "worktree": unit.worktree_path,
-                "kind": format!("{:?}", unit.kind),
-                "bytes": unit.bytes,
-                "growth_bytes": unit.growth_bytes,
-                "regrowth_count": unit.regrowth_count,
-                "observed_at": unit.observed_at,
-                "recovery": unit.recovery,
-                "idle_secs": unit.idle_secs,
-                "signals": unit.signals,
-                "verb": unit.verb,
-                "track": unit.track,
-                "warnings_shown": unit.warnings,
-            }),
-            grant_id: g.id.clone(),
-            actor: actor.to_string(),
-            outcome: outcome.status.clone(),
-            recovery_location: outcome.recovery_location.clone(),
-            measured_free_space_delta: None,
-            observed_path_state: Some(if outcome.status == "completed" {
-                "trashed".into()
-            } else {
-                "unchanged".into()
-            }),
-            recorded_at: now(),
-        })?;
-        outcomes.push(outcome);
-    }
-
-    for (gi, (spent, used)) in spent_by_grant {
-        grants[gi].spent_bytes = spent;
-        grants[gi].used_units = used;
-    }
-    write_grants(dir, &grants)?;
-    plan.status = PlanStatus::Executed;
-    save_plan(dir, &plan)?;
-
-    let free_after = free_space_bytes(&plan.root);
-    Ok(ExecuteResult {
-        plan_id: plan_id.to_string(),
-        state: "executed".into(),
-        next_step: match (
-            outcomes.iter().any(|o| o.status == "completed"),
-            trashed,
-            removed_permanently,
-        ) {
-            (false, _, _) => Some("every unit was refused; read each cause".into()),
-            (true, 0, _) => Some(
-                "re-observe the affected worktrees; what the daemon removed is gone, not in Trash"
-                    .into(),
-            ),
-            (true, _, 0) => {
-                Some("re-observe the affected worktrees; bytes are in Trash until it is emptied".into())
-            }
-            (true, _, _) => Some(
-                "re-observe the affected worktrees; the paths are in Trash until it is emptied, what the daemon removed is gone"
-                    .into(),
-            ),
-        },
-        outcomes,
-        planned_bytes: planned,
-        trashed_bytes: trashed,
-        removed_permanently_bytes: removed_permanently,
-        free_before,
-        free_after,
-        freed_measured: match (free_before, free_after) {
-            (Some(b), Some(a)) => Some(a as i64 - b as i64),
-            _ => None,
-        },
-        // The observed free-space change as a sourced fact, not just a
-        // bare signed integer: `Statvfs` provenance, an explicit
-        // `Unknown` when either reading was unavailable (never a
-        // fabricated zero), and the note that names why the number can
-        // legitimately differ from what was planned.
-        evidence: vec![crate::reclaimability::observed_free_space_change(
-            free_before,
-            free_after,
-        )],
-        actor: actor.to_string(),
-    })
 }
 
 #[cfg(test)]
@@ -3127,16 +1495,8 @@ mod agent_partial_removal_tests {
             category: "sessions".to_string(),
             session_members: Some(members.clone()),
         };
-        let store = tempfile::tempdir().unwrap();
-        let err = execute_agent_session_removal(
-            &meta,
-            &session_path,
-            &members,
-            trash.path(),
-            at,
-            &crate::authority::for_tests(&session_path, store.path(), &members),
-        )
-        .expect_err("the last member's rename was deliberately blocked");
+        let err = trash_agent_session(&meta, &session_path, &members, trash.path(), at)
+            .expect_err("the last member's rename was deliberately blocked");
         let partial = err
             .downcast_ref::<PartialAgentRemoval>()
             .unwrap_or_else(|| panic!("expected PartialAgentRemoval, got: {err:#}"));

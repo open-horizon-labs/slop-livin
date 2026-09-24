@@ -17,7 +17,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use swamp_core::authority::{Confirmable, HumanConfirmed, SelectedUnit, authorize_confirmed};
 use swamp_core::fs_gate::destroy::{self, Trashed};
 use swamp_core::fs_gate::store::StoreDir;
 
@@ -80,34 +79,13 @@ fn listed(data: &Path, original: &Path) -> Vec<trash::TrashItem> {
     })
 }
 
-/// A live recheck proof and authorization for `path`, exactly as a
-/// human's TUI confirmation would mint one
-/// (`.oh/guardrails/human-only-authorization.md`).
-fn authorize(store_dir: &StoreDir, path: &Path) -> swamp_core::authority::Authorized {
-    let confirmed = HumanConfirmed::tui_dialog(
-        "human:test",
-        store_dir,
-        vec![Confirmable::Unit(SelectedUnit {
-            path: path.to_path_buf(),
-            reviewed: swamp_core::recheck::capture_anchor(path).ok(),
-            docker: None,
-            linked_worktree: false,
-            preserve_into: None,
-        })],
-    )
-    .remove(0);
-    authorize_confirmed(confirmed, path).unwrap()
-}
-
 fn trash_move(
-    store_dir: &StoreDir,
+    _store_dir: &StoreDir,
     path: &Path,
     trash_root: &Path,
     name: &str,
 ) -> anyhow::Result<Trashed> {
-    let auth = authorize(store_dir, path);
-    let proof = swamp_core::recheck::run_all(&auth)?;
-    destroy::trash_move(proof, &auth, trash_root, name)
+    destroy::trash_move(path, trash_root, name)
 }
 
 /// The core promise: an item swamp moved is where a file manager looks,
@@ -201,10 +179,8 @@ fn a_cross_device_trash_root_is_refused_not_copied() {
 
     let src = fx.root.join("p/target");
     tree(&src);
-    let auth = authorize(&fx.store_dir, &src);
-    let proof = swamp_core::recheck::run_all(&auth).unwrap();
-    let err = swamp_core::fs_gate::destroy::trash_move(proof, &auth, other_trash.path(), "target")
-        .unwrap_err();
+    let err =
+        swamp_core::fs_gate::destroy::trash_move(&src, other_trash.path(), "target").unwrap_err();
     // The kernel's own EXDEV, surfaced (in the error chain, under the
     // sink's own context message) rather than papered over with a copy;
     // the unit must still be exactly where it was.
@@ -223,9 +199,4 @@ fn a_cross_device_trash_root_is_refused_not_copied() {
 // The multi-member-envelope test (`Envelope::open`'s `same_device_as`,
 // `move_member` moving every declared member, one sidecar for the whole
 // envelope) lives in `crates/core/src/fs_gate/destroy.rs`'s own test
-// module instead of here: building a proof whose coverage extends past
-// a single anchor to named sidecar members needs
-// `authority::for_tests`, which is crate-internal (`pub(crate)`) and so
-// unavailable to this external integration-test crate. The TUI's own
-// `authorize_confirmed`, which this file's `authorize()` helper uses,
-// only ever authorizes a bare single-path unit.
+// module instead of here.

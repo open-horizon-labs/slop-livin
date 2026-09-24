@@ -1347,7 +1347,7 @@ impl App {
         warnings.extend(swamp_core::render::evidence_warnings(&row.evidence));
         let label = row.label.trim().to_string();
         let unit_path = PathBuf::from(&unit_id.0);
-        let cargo_plan = if self
+        let cargo_unit = if self
             .report
             .nested_artifacts
             .iter()
@@ -1373,13 +1373,9 @@ impl App {
                 "human:tui",
                 &[],
             ) {
-                Ok(plan) => {
-                    warnings.extend(
-                        plan.units()
-                            .iter()
-                            .flat_map(|u| u.warnings().iter().cloned()),
-                    );
-                    Some(plan)
+                Ok(units) => {
+                    warnings.extend(units.iter().flat_map(|u| u.warnings().iter().cloned()));
+                    units.into_iter().next()
                 }
                 Err(e) => {
                     self.set_refusal(&e.to_string());
@@ -1402,19 +1398,15 @@ impl App {
             .iter()
             .find(|u| u.path == unit_path)
             .map(|u| u.observed_at);
-        let agent_plan = if agent_unit_observed_at.is_some() {
+        let agent_unit = if agent_unit_observed_at.is_some() {
             match swamp_core::actions::propose_agents(
                 &self.agent_units,
                 std::slice::from_ref(&unit_path),
                 "human:tui",
             ) {
-                Ok(plan) => {
-                    warnings.extend(
-                        plan.units()
-                            .iter()
-                            .flat_map(|u| u.warnings().iter().cloned()),
-                    );
-                    Some(plan)
+                Ok(units) => {
+                    warnings.extend(units.iter().flat_map(|u| u.warnings().iter().cloned()));
+                    units.into_iter().next()
                 }
                 Err(e) => {
                     self.set_refusal(&e.to_string());
@@ -1440,22 +1432,16 @@ impl App {
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default()
             });
-        let selected_bytes = cargo_plan
+        let selected_bytes = cargo_unit
             .as_ref()
-            .or(agent_plan.as_ref())
-            .map(|p| p.planned_bytes())
+            .or(agent_unit.as_ref())
+            .map(|u| u.bytes())
             .unwrap_or(row.bytes);
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
-                cargo_plan,
-                agent_plan,
-                // One `stat` at mark time, on the path the human just
-                // selected: what the sink re-checks against. Not a walk
-                // -- `capture_anchor` never lists a directory, so this
-                // stays off the blocking-scan list the TUI event path
-                // depends on (`.oh/guardrails/tui-actions-off-event-thread.md`).
-                reviewed: swamp_core::recheck::capture_anchor(&unit_path).ok(),
+                cargo_unit,
+                agent_unit,
                 path: unit_path,
                 docker,
                 worktree_path,
@@ -1682,16 +1668,10 @@ impl App {
         // A report started before these moves must not resurrect deleted rows.
         self.pending = None;
         self.observing = None;
-        // The one reviewed TUI confirmation site: this keypress, on the
-        // summary the human just read, is what authorizes these units --
-        // one confirmation per listed unit, each bound to exactly what
-        // was listed (`.oh/guardrails/human-only-authorization.md`).
+        // This keypress, on the summary the human just read (current
+        // facts, shown a moment ago) is the human decision. There is no
+        // token to mint: Enter just moves what was listed.
         let keep = self.keep_executables;
-        let confirmed = swamp_core::authority::HumanConfirmed::tui_dialog(
-            &self.actor,
-            &store,
-            actions::confirmables(&units, keep),
-        );
         let total = units.len();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1714,8 +1694,6 @@ impl App {
             let free_before = actions::free_space_bytes(&trash);
             let results = actions::execute_plan_progress(
                 &units,
-                confirmed,
-                &store,
                 &ledger,
                 &trash,
                 keep,
@@ -2251,9 +2229,8 @@ mod tests {
             app.marked.insert(
                 path.display().to_string(),
                 MarkedUnit {
-                    cargo_plan: None,
-                    agent_plan: None,
-                    reviewed: swamp_core::recheck::capture_anchor(&path).ok(),
+                    cargo_unit: None,
+                    agent_unit: None,
                     path,
                     docker: None,
                     worktree_path: PathBuf::new(),
@@ -2309,9 +2286,8 @@ mod tests {
         app.marked.insert(
             path.display().to_string(),
             MarkedUnit {
-                cargo_plan: None,
-                agent_plan: None,
-                reviewed: swamp_core::recheck::capture_anchor(&path).ok(),
+                cargo_unit: None,
+                agent_unit: None,
                 path: path.clone(),
                 docker: None,
                 worktree_path: tmp.path().into(),
@@ -2430,7 +2406,7 @@ mod tests {
             .marked
             .get(&cache_path.display().to_string())
             .expect("cache unit marked");
-        assert!(marked.agent_plan.is_some(), "agent_plan must be built");
+        assert!(marked.agent_unit.is_some(), "agent_plan must be built");
         assert!(
             cache_path.exists(),
             "marking alone must not delete anything"

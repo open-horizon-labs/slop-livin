@@ -622,26 +622,6 @@ pub fn what_grew_payload(r: &Report, only_project: Option<&str>) -> Value {
     })
 }
 
-/// Wraps a freshly proposed plan the way a noninteractive caller needs
-/// it: the plan itself, plus `state`, `planned_bytes` and the exact
-/// `next_step` command a human runs to authorize it. `propose` never
-/// authorizes anything; this wrapper never claims otherwise.
-pub fn propose_envelope(
-    plan: &crate::actions::Plan,
-    observed_at: u64,
-) -> serde_json::Result<Value> {
-    let mut v = serde_json::to_value(plan)?;
-    v["state"] = json!("awaiting-authorization");
-    v["planned_bytes"] = json!(plan.planned_bytes());
-    v["next_step"] = json!(format!(
-        "a human authorizes with `{}` (this plan) or a standing `swamp grant add ...`; then run `swamp execute {}` (add --json for machine output). Proposing never authorizes removal.",
-        crate::actions::approve_command(&plan.id),
-        plan.id
-    ));
-    v["observed_at"] = json!(observed_at);
-    Ok(v)
-}
-
 /// Bounds a JSON array in place to `limit` items starting at `offset`.
 /// Non-array values are left untouched (`None`). `total` is the array's
 /// length before bounding; `truncated` is whether this page dropped any

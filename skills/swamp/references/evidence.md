@@ -13,9 +13,9 @@ every view: the default report view, `--view external`/`--view agents`
 (whole structs), and `--view kinds`/`--view builds`/`--view deps`/
 `--view unowned`/`--view worktrees`/`--view docker` (each row's own
 evidence; a `kinds` row is a bucket aggregating many artifact rows, so
-its `evidence` is the concatenation of all of theirs). `swamp propose
---json` includes the same array per plan unit, plus one fresh
-current-use reading taken at proposal time. The interactive CLI's
+its `evidence` is the concatenation of all of theirs). The TUI takes
+one fresh current-use reading when a row is marked, shown on its
+confirm banner. The interactive CLI's
 `report --view external` text output prints one line per fact under
 each unit; the TUI's selected-row detail area does the same (ordered
 activity/consumer/current-use/recovery/reclaimability), and its
@@ -52,9 +52,10 @@ consumer, current use, or an uncertain recovery/reclaimability fact.
   underlying thing happened. A modification observed today with
   `event_at` a year ago is not "modified today".
 - **`freshness.expires_after_secs`**: present only on short-lived facts
-  (current-use checks). Treat an expired fact as needing a recheck, not
-  as still true -- `swamp execute` always rechecks these itself
-  immediately before acting, regardless of what a plan's snapshot says.
+  (current-use checks). Treat an expired fact as needing a fresh look,
+  not as still true -- the TUI takes it fresh when a row is marked, and
+  does not re-take it at Enter (there is no execute-time recheck any
+  more).
 - **`freshness.coverage_note`**: a stated scope limit, e.g. "only
   measured children the folded walk recorded" -- read this before
   treating a fact as exhaustive.
@@ -97,12 +98,11 @@ lands on a filesystem row, and vice versa.
 | `activity`/`accessed` | every filesystem artifact row (never a Docker row, whose "path" is a repo tag or volume name) | every report -- one `stat` plus one `statfs` per row. `unavailable`, naming the mount option, on a `noatime`/`relatime` volume |
 | `activity`/`tool-reported-use` | Docker build-cache rows (the daemon's own `LastUsedAt`) | whenever Docker facts are read |
 | `current-use`/`running-container` | Docker image and volume rows | whenever Docker facts are read |
-| `current-use`/`open-file` | any unit reaching a proposal | `swamp propose` (bounded `lsof +D`), re-taken by `swamp execute` |
-| `current-use`/`lock`, `current-use`/`booted` | an external unit reaching a proposal: a manager lock file in the unit's own directory; each CoreSimulator device directory in a device store | `swamp propose` only -- never during identification, so an ordinary report spawns no process per detected unit |
-| `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | report (artifact rows), proposal (external units) |
-| `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | report / proposal |
-| `reclaimability`/`estimated-reclaimable` | every unit. A bounded range, not an exact figure, when hardlink membership is unresolved or the volume is copy-on-write (APFS extents can be retained by a clone or snapshot outside the unit) | report / proposal |
-| `reclaimability`/`observed-freed` | the `ExecuteResult` of a real execution | `swamp execute` (`statvfs` before and after) |
+| `current-use`/`open-file` | any unit the TUI marks | taken once, when the row is marked (bounded `lsof +D`); shown on the confirm banner, never re-taken at Enter |
+| `current-use`/`lock`, `current-use`/`booted` | an external unit, when its deep facts are pulled up (`actions::unit_from_external`): a manager lock file in the unit's own directory; each CoreSimulator device directory in a device store | on demand only -- never during identification, so an ordinary report spawns no process per detected unit |
+| `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | every report |
+| `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | every report |
+| `reclaimability`/`estimated-reclaimable` | every unit. A bounded range, not an exact figure, when hardlink membership is unresolved or the volume is copy-on-write (APFS extents can be retained by a clone or snapshot outside the unit) | every report |
 
 ## Acting on it
 

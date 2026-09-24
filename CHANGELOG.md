@@ -4,6 +4,34 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Swamp no longer performs CLI cleanup
+
+Product decision: swamp reports, the human removes (in its TUI, or by
+hand). The entire CLI/agent action path is removed:
+`propose`/`propose-agents`/`approve`/`execute`/`grant add|list|revoke`/
+`plans`/`cleanup-check` no longer exist; neither does the plan/grant
+store, the `authority.key`, or the live recheck-then-veto gate
+(`crate::recheck`/`crate::authority`) that used to sit in front of a
+destructive call. `swamp report`'s views and `swamp protect` (a human
+keep-list) are the entire CLI surface with any effect on disk or state.
+
+The TUI's Trash flow stays, simplified: Space marks a row, Backspace
+shows its **current** facts (path, size, what it is, what deleting it
+costs, whether anything has it open), Enter moves it to the Trash and
+appends one ledger line. There is no re-derivation between marking and
+moving -- no "changed since you looked" refusal, no occupancy veto. The
+only refusals left are ordinary OS errors (permission denied, path
+gone, cross-device). Cargo purpose groups and agent-storage units
+remain markable rows; a group's/session's member list moves together
+into one Trash envelope, unchanged.
+
+Every place that used to say "inspection only" or "no supported
+selective action" for something the TUI can now mark instead states the
+plain consequence of deleting it. `skills/swamp/references/trust-model.md`
+is rewritten: there is no swamp-enforced authorization boundary any
+more, because there is no command left that deletes anything except a
+human's own keypress in the TUI.
+
 ### Linux track ported onto the capability gates
 
 The Linux work below (inotify, `swamp collect`, `systemd --user`, the

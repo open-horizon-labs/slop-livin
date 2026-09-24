@@ -317,21 +317,6 @@ impl ObserveLock<'_> {
     }
 }
 
-/// The plan files in `<store>/plans/`, sorted. Empty when there are none.
-/// Not a walk and never used on a user tree.
-pub fn list_plan_files(store: &StoreDir) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(store.0.join("plans")) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
-    out.sort();
-    out
-}
-
 /// Atomic write: sibling temp file + `fsync` + rename + parent `fsync`.
 /// Private: callers name a [`JsonFile`] or [`TextFile`].
 ///

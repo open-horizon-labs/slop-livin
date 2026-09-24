@@ -260,11 +260,11 @@ a stale plan.
   id): identified and linked where possible, never offered a selective
   action -- removing a snapshot loses `/undo` history, and parts cannot
   be safely correlated to one session without reading message content.
-- An active session: `swamp propose-agents`/`execute` both check
-  occupancy (an `lsof`-style check on the session's transcript file,
-  via the same `crate::occupancy` seam existing actions use) and refuse
-  while a process holds it open.
 - Anything a human protected with `swamp protect add <path>`.
+
+(2026-09-23: occupancy of an active session is still computed and
+shown on the TUI's confirm banner as a fact, but no longer refuses a
+move -- see `.oh/guardrails/occupancy-is-tristate-at-sinks.md`.)
 
 ## Project linkage
 
@@ -808,10 +808,9 @@ tools this chunk added.
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
 | TUI (read) | `v` (cycle) reaches the Agents view; no dedicated digit (`0` is "clear filter") |
-| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every actionable row in the Agents view the same way, skipping protected/unsupported/active ones and naming the skip in the footer; `Enter` executes through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected/unsupported row cannot be marked; the footer names `propose_agents`'s own refusal reason. |
+| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every markable row in the Agents view the same way, skipping protected/unmarkable ones and naming the skip in the footer; `Enter` moves it to the Trash through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected row, or one whose category has no Trash move, cannot be marked; the footer names `propose_agents`'s own refusal reason. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
-| Propose | `swamp propose --path <unit-path> [--json]` (no `root`) -- the unified entry point (#101): routes to the agent-storage proposer when a path matches a discovered agent unit, else to the external-unit proposer, else (only with a `root`) the ordinary filesystem proposer. `swamp propose --external [--path <unit-path>] [--json]` forces the inspection-only external-unit route explicitly. `swamp propose-agents --path <unit-path> [--json]` still works, as a thin, deprecated alias into the exact same code path (prints a one-line deprecation note to stderr). |
-| Approve/execute | `swamp approve <plan-id>` / `swamp execute <plan-id> [--json]` (unchanged -- already generic over any plan) |
+| Removal | TUI only (2026-09-23: there is no `propose`/`propose-agents`/`approve`/`execute` command any more). |
 | Skill | `skills/swamp/references/agent-storage.md` |
 | Project tree | `swamp report --project <name>` (text) and `--project <name> --json` (no `--view` needed) both include this project's linked agent storage: a collapsed "Agent storage (linked)" row per contributing tool in the text tree (`crate::tree::agent_rows_for_project`, shared by the CLI drill and the TUI's own Tree view), and an `agent_storage: {units, total_bytes}` object in the JSON envelope. |
 

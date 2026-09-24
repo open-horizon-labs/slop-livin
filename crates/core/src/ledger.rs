@@ -1,14 +1,31 @@
 use crate::fs_gate::store::{LogFile, StoreDir};
-use crate::grants::Verb;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// What one ledger line records happened.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Verb {
+    Delete,
+    Archive,
+    /// Remove a linked git worktree (directory to Trash, then
+    /// `git worktree prune`).
+    RemoveWorktree,
+}
+
+/// Written into every [`ActionRecord::grant_id`]: there is no grant any
+/// more, and this says so plainly rather than fabricating an id.
+pub const NO_GRANT: &str = "human-marked";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRecord {
     pub id: String,
     pub verb: Verb,
     pub entity_id: String,
     pub evidence: serde_json::Value,
+    /// Historical field name; there is no grant any more. Kept so a
+    /// ledger written by an older swamp still deserializes, and set to
+    /// the constant below by every writer now.
     pub grant_id: String,
     pub actor: String,
     pub outcome: String,

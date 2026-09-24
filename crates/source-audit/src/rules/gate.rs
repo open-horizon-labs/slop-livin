@@ -114,7 +114,6 @@ const WALKERS: &[(Krate, &[&str])] = &[
     (Krate::Core, &["compose"]),
     (Krate::Core, &["cargo_artifacts"]),
     (Krate::Core, &["cargo_cleanup"]),
-    (Krate::Core, &["recheck"]),
     (Krate::Core, &["preserve"]),
     (Krate::Core, &["growth"]),
     (Krate::Core, &["locations"]),
@@ -156,16 +155,6 @@ const GROUPS: &[Group] = &[
         allowed: STORE_MODULES,
         why: "a store directory is built from a caller's path only by the store modules; \
               everything else uses the resolved swamp dir (`StoreDir::resolved`)",
-    },
-    Group {
-        path: "@core::fs_gate::key",
-        allowed: &[
-            (Krate::Core, &["actions"]),
-            (Krate::Core, &["authority"]),
-            (Krate::Core, &["recheck"]),
-        ],
-        why: "the authority key binds plans and grants to swamp's own propose/approve paths; \
-              only those paths and the recheck read it",
     },
     Group {
         path: "@core::fs_gate::git",
@@ -313,39 +302,10 @@ const GROUPS: &[Group] = &[
         why: "session state (Linger) belongs to the systemd scheduling module",
     },
     Group {
-        path: "@core::recheck::capture_anchor",
-        allowed: &[
-            (Krate::Core, &["actions"]),
-            (Krate::Core, &["recheck"]),
-            (Krate::Tui, &["app"]),
-        ],
-        why: "a reviewed identity is recorded when a unit is proposed (actions) or marked (the \
-              TUI), never taken at execution time and handed to the recheck",
-    },
-    Group {
-        path: "@core::authority::authorize",
-        allowed: &[(Krate::Core, &["actions"])],
-        why: "a grant becomes an authorization only in the plan executor",
-    },
-    Group {
-        path: "@core::authority::authorize_confirmed",
-        allowed: &[(Krate::Tui, &["actions"])],
-        why: "a TUI confirmation becomes an authorization only in the TUI sink",
-    },
-    Group {
-        path: "@core::recheck::run_all",
-        allowed: &[
-            (Krate::Core, &["actions"]),
-            (Krate::Core, &["cargo_cleanup"]),
-            (Krate::Tui, &["actions"]),
-        ],
-        why: "a recheck proof is taken only by an execution sink",
-    },
-    Group {
         path: "@core::occupancy::OccupancyState",
-        allowed: &[(Krate::Core, &["occupancy"]), (Krate::Core, &["recheck"])],
-        why: "an occupancy answer is consumed only by the recheck, where `Unknown` refuses; \
-              everywhere else it is a refusal string or evidence (occupancy-is-tristate-at-sinks)",
+        allowed: &[(Krate::Core, &["occupancy"])],
+        why: "an occupancy answer is shown as a fact (evidence, or a refusal string); nothing \
+              gates a Trash move on it any more (2026-09-23)",
     },
     Group {
         path: "@core::growth::ObservationOwnership::new",
@@ -359,11 +319,6 @@ const GROUPS: &[Group] = &[
               BuildStore key family the same way external and agents own theirs",
     },
     Group {
-        path: "@core::actions::revoke_grant",
-        allowed: &[(Krate::Cli, &[])],
-        why: "grant state changes only through the reviewed CLI command (human-only-authorization)",
-    },
-    Group {
         path: "@core::evidence::Reason::__from_checked_format",
         allowed: &[(Krate::Core, &["evidence"])],
         why: "only the `reason!` macro, which checks the template is not blank, may build a \
@@ -375,42 +330,6 @@ const GROUPS: &[Group] = &[
 /// unreviewed caller: each may be called only from the named functions.
 type MintSite = (Krate, &'static [&'static str], &'static str);
 const MINT_SITES: &[(&str, &[MintSite], &str)] = &[
-    (
-        "@core::authority::HumanConfirmed::cli_approve",
-        &[(Krate::Cli, &[], "cmd_approve")],
-        "a plan approval is confirmed only by `cmd_approve`, which has just shown the human that \
-         plan's units (human-only-authorization)",
-    ),
-    (
-        "@core::authority::HumanConfirmed::cli_grant",
-        &[(Krate::Cli, &[], "cmd_grant_add")],
-        "a standing grant is confirmed only by `cmd_grant_add`, from the terms the human typed \
-         (human-only-authorization)",
-    ),
-    (
-        "@core::authority::HumanConfirmed::cli_protect",
-        &[(Krate::Cli, &[], "cmd_protect")],
-        "a keep-list change is confirmed only by `cmd_protect`, from the path the human typed \
-         (protection-fails-closed)",
-    ),
-    (
-        "@core::authority::HumanConfirmed::tui_dialog",
-        &[(Krate::Tui, &["app"], "start_delete")],
-        "the TUI confirms only in `start_delete`, the Enter on the summary the human just read \
-         (human-only-authorization)",
-    ),
-    (
-        "@core::authority::authorize",
-        &[(Krate::Core, &["actions"], "execute_with_trash_opts")],
-        "a stored grant becomes an authorization only in the plan executor \
-         (human-only-authorization)",
-    ),
-    (
-        "@core::authority::authorize_confirmed",
-        &[(Krate::Tui, &["actions"], "execute_one")],
-        "a TUI confirmation becomes an authorization only in the TUI sink, one unit at a time \
-         (human-only-authorization)",
-    ),
     (
         "@core::report::pass::DiscoveryPass::begin",
         &[
@@ -438,16 +357,6 @@ const MINT_SITES: &[(&str, &[MintSite], &str)] = &[
 /// approve and loader paths).
 const LITERAL_SITES: &[(&str, &[MintSite], &str)] = &[
     (
-        "@core::actions::Plan",
-        &[
-            (Krate::Core, &["actions"], "propose"),
-            (Krate::Core, &["actions"], "propose_external"),
-            (Krate::Core, &["actions"], "propose_agents"),
-            (Krate::Core, &["actions"], "plan_from_record"),
-        ],
-        "a plan is built by a propose path or by the store loader that verified its binding",
-    ),
-    (
         "@core::actions::PlanUnit",
         &[
             (Krate::Core, &["actions"], "unit_from_row"),
@@ -455,34 +364,6 @@ const LITERAL_SITES: &[(&str, &[MintSite], &str)] = &[
             (Krate::Core, &["actions"], "unit_from_agent"),
         ],
         "a plan unit is built from a report row, an external unit or an agent unit",
-    ),
-    (
-        "@core::actions::Grant",
-        &[
-            (Krate::Core, &["actions"], "approve_confirmed"),
-            (Krate::Core, &["actions"], "add_standing_grant_confirmed"),
-            (Krate::Core, &["actions"], "list_grants"),
-        ],
-        "a grant is built only where a human confirmation is spent, or by the store loader that \
-         verified its binding (human-only-authorization)",
-    ),
-    (
-        "@core::authority::Authorized",
-        &[
-            (Krate::Core, &["authority"], "authorize"),
-            (Krate::Core, &["authority"], "authorize_confirmed"),
-        ],
-        "an authorization is minted only from a verified grant or one TUI confirmation",
-    ),
-    (
-        "@core::authority::HumanConfirmed",
-        &[(Krate::Core, &["authority"], "mint")],
-        "a confirmation is built only by its site constructors",
-    ),
-    (
-        "@core::recheck::RecheckProof",
-        &[(Krate::Core, &["recheck"], "run_all")],
-        "a recheck proof comes only from the live recheck",
     ),
     (
         "@core::fs_gate::destroy::Trashed",
@@ -1004,7 +885,6 @@ fn is_sink(m: &Module) -> bool {
     m.is_within(Krate::Core, &["actions"])
         || m.is_within(Krate::Core, &["cargo_cleanup"])
         || m.is_within(Krate::Core, &["preserve"])
-        || m.is_within(Krate::Core, &["recheck"])
         || m.is_within(Krate::Core, &["fs_gate", "destroy"])
         || m.is_within(Krate::Tui, &["actions"])
 }

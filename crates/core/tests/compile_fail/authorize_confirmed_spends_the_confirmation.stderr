@@ -1,9 +1,0 @@
-error[E0382]: use of moved value: `confirmed`
- --> $WORKSPACE/crates/core/tests/compile_fail/authorize_confirmed_spends_the_confirmation.rs
-  |
-  | fn widen(confirmed: HumanConfirmed) {
-  |          --------- move occurs because `confirmed` has type `HumanConfirmed`, which does not implement the `Copy` trait
-  |     let _a = authorize_confirmed(confirmed, Path::new("/w/target"));
-  |                                  --------- value moved here
-  |     let _b = authorize_confirmed(confirmed, Path::new("/w/src"));
-  |                                  ^^^^^^^^^ value used here after move

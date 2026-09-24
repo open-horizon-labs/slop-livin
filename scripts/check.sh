@@ -52,8 +52,6 @@ cargo test --workspace --locked ${target[@]+"${target[@]}"} -- \
 # every guardrail's runtime tests exist, run and assert.)
 step named-targets
 for t in \
-  core/tests/reviewer_counterexamples \
-  core/tests/reviewer_counterexamples_123 \
   core/tests/reviewer_counterexamples_stack2 \
   core/tests/reviewer_counterexamples_stack3 \
   core/tests/reviewer_counterexamples_stack4 \
@@ -62,8 +60,6 @@ for t in \
   core/tests/explicit_root_scope_exclusions \
   core/tests/nested_artifact_evidence_is_delivered \
   core/tests/upstream_citations_are_checked \
-  core/tests/execution_rechecks \
-  core/tests/token_binding \
   core/tests/shared_history_ownership \
   core/tests/store_contents_are_allowlisted \
   core/tests/incremental_external_and_agent_measurement \

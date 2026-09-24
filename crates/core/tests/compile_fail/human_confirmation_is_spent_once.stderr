@@ -1,9 +1,0 @@
-error[E0382]: use of moved value: `confirmed`
- --> $WORKSPACE/crates/core/tests/compile_fail/human_confirmation_is_spent_once.rs
-  |
-  | fn twice(dir: &Path, confirmed: HumanConfirmed) {
-  |                      --------- move occurs because `confirmed` has type `HumanConfirmed`, which does not implement the `Copy` trait
-  |     let _ = swamp_core::actions::approve_confirmed(dir, "plan-a", confirmed);
-  |                                                                   --------- value moved here
-  |     let _ = swamp_core::actions::approve_confirmed(dir, "plan-b", confirmed);
-  |                                                                   ^^^^^^^^^ value used here after move

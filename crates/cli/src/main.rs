@@ -10,7 +10,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use swamp_core::{
-    artifact::{ArtifactRole, NestedArtifact},
     filter,
     render::{
         OverviewSort, render_kinds, render_overview_sorted, render_project_tree_with_agents,
@@ -52,8 +51,8 @@ enum View {
     /// External/shared storage units (#43): Cargo registry, rustup
     /// toolchains, Homebrew, and other detector-resolved locations with
     /// no containing project. Identity, category, size/growth/regrowth
-    /// history and declared consumers. Inspection only -- see `propose
-    /// --external`.
+    /// history and declared consumers. Read-only: this view never
+    /// removes anything, in this command or any other.
     External,
     /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
     /// checkpoints and protected config for every named coding-agent
@@ -62,10 +61,9 @@ enum View {
     /// Continue), grouped tool → category → unit with size/growth/age
     /// and project linkage. `--project` filters to units linked to that
     /// project. Redaction-aware by construction (this view never has
-    /// session content to print). Inspection only from this command;
-    /// supported cleanup actions go through `swamp propose-agents` (see
-    /// below) -- see `swamp protect` for the human-keep-intent surface
-    /// this view respects.
+    /// session content to print). Read-only from this command; removal
+    /// is TUI-only (Space/Backspace/Enter) -- see `swamp protect` for
+    /// the human-keep-intent surface this view respects.
     Agents,
 }
 
@@ -118,28 +116,6 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Review Cargo cleanup groups, oldest modified first, then largest. Creates unapproved plans;
-    /// never authorizes or deletes. Reports blocked groups without widening scope.
-    CleanupCheck {
-        root: PathBuf,
-        /// Exact Cargo group paths from a Rust report. Categories are not expanded.
-        #[arg(long = "path")]
-        paths: Vec<PathBuf>,
-        /// Restrict to one role, for example test-executable or incremental.
-        #[arg(long, value_parser = ["test-executable", "example", "incremental", "build-script-output"])]
-        role: Option<String>,
-        /// Maximum groups to check (1–20). This is not an exhaustive cleanup search.
-        #[arg(long, default_value_t = 5)]
-        limit: usize,
-        /// Skip this many age-ranked candidates. Pages may shift after a rebuild.
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-        /// Review individual groups within this directory, never the directory itself.
-        #[arg(long)]
-        within: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
     /// Diffstat-ledger terminal UI (ratatui). Default when no
     /// subcommand is given.
     Ui {
@@ -306,66 +282,6 @@ enum Command {
         collector: bool,
         roots: Vec<PathBuf>,
     },
-    /// Propose cleanup: the one entry point for artifact/Cargo-group/
-    /// worktree paths (with `root`), agent-storage units, or external
-    /// units (with `--path` and no `root`) -- see `--path`'s own help
-    /// for exactly how a bare path is routed. Review paths, sizes,
-    /// warnings and recovery before authorizing. Use report --view
-    /// worktrees for worktree signals; for individual Cargo builds,
-    /// start with cleanup-check. Nothing is deleted by this command.
-    #[command(
-        after_help = "Whole-worktree example:\n  swamp report ~/src --view worktrees\n  swamp propose ~/src --path /absolute/path/to/a-worktree\n\nAgent-storage or external-unit example (no root needed):\n  swamp report --view agents\n  swamp propose --path /absolute/path/to/a/session/or/unit\n\nExternal-unit inspection (never actionable; refused at execution):\n  swamp propose --external --path /absolute/path/to/an/external/unit\n\nReview the plan; proposing never authorizes removal."
-    )]
-    Propose {
-        /// A walked report's root. Omit it entirely when every `--path`
-        /// names an agent-storage unit (`report --view agents`) or an
-        /// external unit (`report --view external`) instead of a
-        /// filesystem artifact/worktree -- those are detector-resolved,
-        /// not root-relative, and this command finds them the same way
-        /// `report --view agents|external` does, without a root.
-        root: Option<PathBuf>,
-        /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
-        /// Only meaningful with a `root` (filesystem artifacts).
-        #[arg(long)]
-        filter: Option<String>,
-        /// Exact artifact/Cargo-group/worktree path (with `root`), or an
-        /// exact agent-storage/external unit path (without `root`) --
-        /// routed automatically: an agent-storage unit match takes
-        /// priority, then an external unit, then (only with `root`) a
-        /// filesystem artifact/Cargo-group/worktree. Use `--external` to
-        /// force the external-unit route explicitly.
-        #[arg(long = "path")]
-        paths: Vec<PathBuf>,
-        #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        json: bool,
-        /// Force the external-unit route (never agent-storage or
-        /// filesystem): every resulting unit is inspection-only and
-        /// `execute` refuses it unconditionally -- this exists to
-        /// review external storage through the plan/ledger surface,
-        /// never to make it actionable (#43/#101). With no `--path`,
-        /// proposes every discovered external unit.
-        #[arg(long, conflicts_with = "root")]
-        external: bool,
-    },
-    /// Human authorization for ONE plan: writes a one-shot grant scoped to
-    /// that plan id. Only a human at this keyboard should run this.
-    Approve { plan_id: String },
-    /// Execute an approved plan: sink re-derivation, Trash, ledger,
-    /// measured free space. Refuses per unit with the fact that refused it.
-    Execute {
-        plan_id: String,
-        #[arg(long, default_value = "human:cli")]
-        actor: String,
-        #[arg(long)]
-        json: bool,
-        /// Before trashing a build directory, copy compiled outputs to
-        /// `<worktree>/bin/`: Rust `target/{release,debug}` executables,
-        /// Python `dist/*.whl` and `build/**/*.so`. Other kinds: no-op.
-        #[arg(long, short = 'k')]
-        keep_executables: bool,
-    },
     /// The configuration file: `config show` prints effective values,
     /// `config path` where it lives, `config init` writes one with every
     /// key and its meaning (never overwrites an existing file).
@@ -390,41 +306,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List plans (newest first).
-    Plans {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Standing grants: `grant add '<predicate>' --budget 5GB --expires 7d`,
-    /// `grant list [--json]`, `grant revoke <id>`. Predicates: kind:,
-    /// project:, idle > <dur>, merge-complete. Reserved for a human at
-    /// this keyboard by convention, not by a technical wall: see
-    /// `.oh/guardrails/human-only-authorization.md`.
-    Grant {
-        #[command(subcommand)]
-        cmd: GrantCmd,
-    },
-    /// Deprecated alias for `swamp propose --path <unit>` (no `root`)
-    /// (#101 unification): kept only so existing scripts/muscle memory
-    /// keep working. Propose cleanup for exact agent-storage unit paths:
-    /// a cache/log category directory, or an individual session's own
-    /// transcript path from `report --view agents`. Every match becomes
-    /// a real action or a named refusal (protected, unsupported
-    /// category, database-like file, active session) -- never a
-    /// silent inspection-only row. Approve/execute the resulting plan
-    /// with the same `swamp approve`/`swamp execute` used for every
-    /// other plan. Nothing is deleted by this command.
-    ProposeAgents {
-        /// Exact agent-storage unit paths from `report --view agents`.
-        #[arg(long = "path", required = true)]
-        paths: Vec<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
     /// Human keep/protect intent for agent-storage paths (#100/#101):
-    /// survives refresh, blocks `propose-agents`/`execute` for any unit
-    /// under a protected path, and is never itself inferred from
-    /// observation -- only this command changes it.
+    /// survives refresh and is never itself inferred from observation --
+    /// only this command changes it. The TUI's mark step refuses to
+    /// queue anything under a protected path for the Trash.
     Protect {
         #[command(subcommand)]
         cmd: ProtectCmd,
@@ -443,76 +328,6 @@ enum ProtectCmd {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum GrantCmd {
-    Add {
-        predicate: String,
-        /// Total bytes this grant may ever authorize, e.g. 5GB.
-        #[arg(long)]
-        budget: String,
-        /// Lifetime, e.g. 7d.
-        #[arg(long)]
-        expires: String,
-        /// Maximum number of units this grant may authorize.
-        #[arg(long)]
-        max_units: Option<u32>,
-    },
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    Revoke {
-        grant_id: String,
-    },
-}
-
-fn parse_size_arg(s: &str) -> Result<u64> {
-    // The one size parser (`filter::parse_size`): decimal and binary
-    // units, the same base the formatter prints in.
-    swamp_core::filter::parse_size(s).ok_or_else(|| anyhow::anyhow!("bad size {s:?}"))
-}
-
-fn print_plan(plan: &swamp_core::actions::Plan) {
-    println!(
-        "plan {}  {} units  {}  expires in {}s",
-        plan.id,
-        plan.units().len(),
-        swamp_core::render::human_bytes_pub(plan.planned_bytes()),
-        plan.expires_at()
-            .saturating_sub(swamp_core::entities::now())
-    );
-    for u in plan.units() {
-        println!(
-            "  {:<14} {:>10}  {:>+10}  {}  {}  [{}]  {}",
-            format!("{:?}", u.kind()).to_lowercase(),
-            swamp_core::render::human_bytes_pub(u.bytes()),
-            u.growth_bytes()
-                .map(swamp_core::render::human_bytes_signed)
-                .unwrap_or_else(|| "—".into()),
-            u.project(),
-            u.path().display(),
-            u.recovery(),
-            u.signals().join(" · ")
-        );
-        if let Some(t) = u.track() {
-            print!("    [{}]", t.label());
-        }
-        if !u.warnings().is_empty() {
-            print!("  ⚠ {}", u.warnings().join(" · "));
-        }
-        if u.track().is_some() || !u.warnings().is_empty() {
-            println!();
-        }
-    }
-    for r in plan.refused() {
-        println!("  refused  {}  — {}", r.path.display(), r.cause);
-    }
-    println!(
-        "authorize (human only): {}",
-        swamp_core::actions::approve_command(&plan.id)
-    );
 }
 
 /// The resolved swamp dir (`$SWAMP_DIR`, else `~/.local/share/swamp`):
@@ -757,100 +572,10 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope) -> String {
     out
 }
 
-/// Human authorization for one plan: prints every unit with its facts,
-/// then writes a one-shot grant scoped to that plan id.
-///
-/// This is one of exactly two call sites in the whole workspace allowed
-/// to reach `swamp_core::actions::approve`/`add_standing_grant`/
-/// `revoke_grant` (the other is the TUI's confirmed-execution path,
-/// `crates/tui/src/actions.rs`'s `execute_one`) -- enforced by the
-/// `human_only_authorization` source audit, which is transport-
-/// independent by construction: it does not matter that this function
-/// happens to live in the CLI binary, only that authorization is minted
-/// from exactly this reviewed call site and no other. Any shell-capable
-/// process can invoke `swamp approve`/`swamp grant add`; the boundary
-/// this enforces is "authorization is minted from one reviewed code
-/// path", not "only a human process can reach this binary". See
-/// `.oh/guardrails/human-only-authorization.md`.
-fn cmd_approve(plan_id: &str) -> Result<()> {
-    let plan = swamp_core::actions::load_plan(&swamp_dir(), plan_id)?;
-    for u in plan.units() {
-        println!(
-            "  {:<16} {:>10}  {}{}",
-            u.verb(),
-            swamp_core::render::human_bytes_pub(u.bytes()),
-            u.path().display(),
-            if u.warnings().is_empty() {
-                String::new()
-            } else {
-                format!("  ⚠ {}", u.warnings().join(" · "))
-            }
-        );
-    }
-    // The human typed `swamp approve <plan>` and was shown exactly these
-    // units: the reviewed CLI confirmation site, bound to this plan's id
-    // and content digest (`.oh/guardrails/human-only-authorization.md`).
-    let confirmed = swamp_core::authority::HumanConfirmed::cli_approve("human:cli", &plan);
-    let g = swamp_core::actions::approve_confirmed(&swamp_dir(), plan_id, confirmed)?;
-    println!(
-        "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
-        plan_id,
-        g.id(),
-        swamp_core::render::human_bytes_pub(g.budget_bytes().unwrap_or(0)),
-        g.max_units().unwrap_or(0),
-        g.expires_at()
-    );
-    println!("execute with: swamp execute {plan_id}");
-    Ok(())
-}
-
-/// Human authorization for a standing grant. See `cmd_approve`'s doc for
-/// why this call site's identity matters to the `human_only_authorization`
-/// audit.
-fn cmd_grant_add(
-    dir: &Path,
-    predicate: &str,
-    budget: &str,
-    expires: &str,
-    max_units: Option<u32>,
-) -> Result<()> {
-    let budget_bytes = parse_size_arg(budget)?;
-    let expires_secs = swamp_core::growth::parse_duration_secs(expires)
-        .ok_or_else(|| anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)"))?;
-    // The human typed `swamp grant add …`: the reviewed CLI confirmation
-    // site, bound to exactly these terms
-    // (`.oh/guardrails/human-only-authorization.md`).
-    let confirmed = swamp_core::authority::HumanConfirmed::cli_grant(
-        "human:cli",
-        swamp_core::authority::StandingTerms {
-            predicate: predicate.to_string(),
-            budget_bytes,
-            max_units,
-            expires_in_secs: expires_secs,
-        },
-    );
-    let g = swamp_core::actions::add_standing_grant_confirmed(
-        dir,
-        predicate,
-        budget_bytes,
-        max_units,
-        expires_secs,
-        confirmed,
-    )?;
-    println!(
-        "grant {} added: delete where {} · budget {} · expires {}",
-        g.id(),
-        g.predicate(),
-        budget,
-        expires
-    );
-    Ok(())
-}
-
-/// `swamp protect add|remove|list`. A keep-list change is human-only
-/// (re-review 5, finding 7): this is the one reviewed site that mints the
-/// confirmation for it, bound to exactly the change the human typed, and
-/// `protect_{add,remove}_confirmed` spend it.
+/// `swamp protect add|remove|list`: the human keep list. Read-only
+/// otherwise, this is the one CLI surface that still writes state, since
+/// it never deletes anything -- it only ever keeps a path out of the
+/// TUI's Trash.
 fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
     let store_dir = swamp_dir();
     match cmd {
@@ -858,20 +583,16 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
             // Resolve a relative argument against the cwd before
             // storing, rather than printing "protected: debug" for an
             // entry that protects nothing (the 2026-09-22 re-review's
-            // CE5). `protect_add_confirmed` refuses a non-absolute path
-            // outright; doing the join here means `swamp protect add
-            // debug` from inside a tool home does the obvious thing and
-            // *says* which path it protected.
+            // CE5). `protect_add` refuses a non-absolute path outright;
+            // doing the join here means `swamp protect add debug` from
+            // inside a tool home does the obvious thing and *says* which
+            // path it protected.
             let resolved = if path.is_absolute() {
                 path.clone()
             } else {
                 std::env::current_dir()?.join(&path)
             };
-            let confirmed = swamp_core::authority::HumanConfirmed::cli_protect(
-                "human:cli",
-                swamp_core::authority::ProtectChange::Add(resolved.clone()),
-            );
-            swamp_core::agents::protect_add_confirmed(&store_dir, &resolved, confirmed)?;
+            swamp_core::agents::protect_add(&store_dir, &resolved)?;
             println!("protected: {}", resolved.display());
         }
         ProtectCmd::Remove { path } => {
@@ -880,11 +601,7 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
             } else {
                 std::env::current_dir()?.join(&path)
             };
-            let confirmed = swamp_core::authority::HumanConfirmed::cli_protect(
-                "human:cli",
-                swamp_core::authority::ProtectChange::Remove(resolved.clone()),
-            );
-            swamp_core::agents::protect_remove_confirmed(&store_dir, &resolved, confirmed)?;
+            swamp_core::agents::protect_remove(&store_dir, &resolved)?;
             println!("no longer protected: {}", resolved.display());
         }
         ProtectCmd::List { json } => {
@@ -901,88 +618,6 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
     Ok(())
 }
 
-/// Human revocation of a standing or one-shot grant. See `cmd_approve`'s
-/// doc for why this call site's identity matters to the
-/// `human_only_authorization` audit.
-fn cmd_grant_revoke(dir: &Path, grant_id: &str) -> Result<()> {
-    swamp_core::actions::revoke_grant(dir, grant_id)?;
-    println!("grant {grant_id} revoked");
-    Ok(())
-}
-
-const CLEANUP_COVERAGE_DETAIL_ROWS: usize = 20;
-const CLEANUP_COVERAGE_DETAIL_LIMITS: usize = 8;
-
-#[derive(Debug, PartialEq, Eq)]
-struct CleanupCoverageDetail {
-    path: PathBuf,
-    limits: Vec<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CleanupScopeSummary {
-    nested_row_count: usize,
-    coverage_limited_count: usize,
-    unknown_or_residual_count: usize,
-    coverage_limited_details: Vec<CleanupCoverageDetail>,
-}
-
-fn cleanup_path_in_scope(path: &Path, within: Option<&Path>) -> bool {
-    within.is_none_or(|scope| path != scope && path.starts_with(scope))
-}
-
-fn cleanup_path_at_or_below_scope(path: &Path, within: Option<&Path>) -> bool {
-    within.is_none_or(|scope| path == scope || path.starts_with(scope))
-}
-
-fn cleanup_scope_summary(
-    nested_artifacts: &[NestedArtifact],
-    within: Option<&Path>,
-) -> CleanupScopeSummary {
-    let mut summary = CleanupScopeSummary {
-        nested_row_count: 0,
-        coverage_limited_count: 0,
-        unknown_or_residual_count: 0,
-        coverage_limited_details: Vec::new(),
-    };
-    for unit in nested_artifacts {
-        let in_scope = cleanup_path_at_or_below_scope(&unit.path, within);
-        // An incomplete Cargo container above `within` limits what can be
-        // established inside the requested scope, so retain that evidence
-        // without counting the ancestor as a row inside the scope.
-        let relevant_ancestor = within.is_some_and(|scope| {
-            unit.path != scope
-                && scope.starts_with(&unit.path)
-                && (!unit.coverage.complete || !unit.coverage.supported)
-        });
-        if in_scope {
-            summary.nested_row_count += 1;
-            if matches!(unit.role, ArtifactRole::Unknown | ArtifactRole::Residual) {
-                summary.unknown_or_residual_count += 1;
-            }
-        }
-        if (in_scope || relevant_ancestor) && (!unit.coverage.complete || !unit.coverage.supported)
-        {
-            summary.coverage_limited_count += 1;
-            if summary.coverage_limited_details.len() < CLEANUP_COVERAGE_DETAIL_ROWS {
-                summary
-                    .coverage_limited_details
-                    .push(CleanupCoverageDetail {
-                        path: unit.path.clone(),
-                        limits: unit
-                            .coverage
-                            .limits
-                            .iter()
-                            .take(CLEANUP_COVERAGE_DETAIL_LIMITS)
-                            .cloned()
-                            .collect(),
-                    });
-            }
-        }
-    }
-    summary
-}
-
 /// Whether `u`'s project linkage names `project` (case-insensitive,
 /// matching this codebase's other `--project` matching): only a
 /// `Linked` unit can match; every other linkage state (unresolved,
@@ -996,46 +631,6 @@ fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option
         swamp_core::agents::ProjectLinkState::Linked { project_name, .. }
             if project_name.eq_ignore_ascii_case(project)
     )
-}
-
-// ---------------------------------------------------------------------
-// Unified `propose` entry point (#101): a single CLI command that
-// routes `--path` to the right proposer -- agent-storage unit,
-// external unit, or (only with an explicit `root`) a filesystem
-// artifact/Cargo-group/worktree -- so a human never has to know in
-// advance which of three subsystems a path belongs to. `propose-agents`
-// is kept only as a thin, deprecated alias into the same code (see
-// `Command::ProposeAgents`'s handler below).
-// ---------------------------------------------------------------------
-
-/// Agent-storage units for the unified `propose --path` route (no
-/// `root`): a real report walk, exactly like `report --view agents`
-/// computes, so every known project worktree is available to supply
-/// Aider's per-repo units (#96) -- never the narrower "walk upward from
-/// each requested path" fast path `propose-agents` used before this
-/// chunk, which could not discover an Aider unit whose worktree root
-/// was not itself derivable from the requested path (chunk E's
-/// follow-up). This costs a full scope walk instead of a handful of
-/// `stat`s, which is the deliberate trade #101's correctness
-/// requirement makes: `propose` without a `root` is not a hot path.
-fn discover_agent_units_for_propose(
-    store_dir: &Path,
-) -> Result<Vec<swamp_core::agents::AgentUnit>> {
-    // Through the one observation that owns discovery, never a second
-    // pass of the CLI's own
-    // (`.oh/guardrails/discovery-owned-by-report-pipeline.md`). It walks
-    // for the worktree roots Aider's per-repo units need and runs the
-    // agent pass with the same ownership window, so nothing here can
-    // tombstone a row the walk did not cover.
-    Ok(observe_for_cli(
-        &resolve_scope(&[])?,
-        swamp_core::report::ObservationParts::AGENTS,
-        None,
-        store_dir,
-        true,
-        3600,
-    )?
-    .agent_units)
 }
 
 /// The CLI's one route into `report::observe_scope`, with this binary's
@@ -1065,140 +660,6 @@ fn observe_for_cli(
         swamp_core::growth::load_config(store_dir).retention_days,
         since_secs,
     )
-}
-
-/// External units for the unified `propose` route: the same
-/// detector-resolved discovery `report --view external` uses, with the
-/// same live tool-version/dependency association wiring (#56/#57) --
-/// a proposed external unit's `PlanUnit.evidence` (#61) should carry the
-/// same consumer facts the `report --view external` text/JSON path
-/// does, not a narrower answer just because this route takes a
-/// different code path to get there.
-fn discover_external_units_for_propose(
-    store_dir: &Path,
-) -> Result<Vec<swamp_core::external::ExternalUnit>> {
-    // One observation, which also attaches the live tool-version and
-    // dependency associations (#56/#57) -- so a proposed external unit's
-    // evidence carries the same consumer facts `report --view external`
-    // shows, rather than a narrower answer for taking a different route.
-    Ok(observe_for_cli(
-        &resolve_scope(&[])?,
-        swamp_core::report::ObservationParts::EXTERNAL,
-        None,
-        store_dir,
-        true,
-        24 * 3600,
-    )?
-    .external_units)
-}
-
-/// Saves `plan` and prints it (JSON envelope or the plain-text form),
-/// the identical tail every `propose`/`propose-agents` branch used to
-/// duplicate.
-fn save_and_print_plan(
-    store_dir: &Path,
-    plan: &swamp_core::actions::Plan,
-    observed_at: u64,
-    json: bool,
-) -> Result<()> {
-    swamp_core::actions::save_plan(store_dir, plan)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&swamp_core::agent_json::propose_envelope(
-                plan,
-                observed_at
-            )?)?
-        );
-    } else {
-        print_plan(plan);
-    }
-    Ok(())
-}
-
-/// The unified `propose` entry point's full routing logic, shared
-/// verbatim between `Command::Propose` and the deprecated
-/// `Command::ProposeAgents` alias.
-#[allow(clippy::too_many_arguments)]
-fn propose_unified(
-    root: Option<PathBuf>,
-    filter: Option<String>,
-    paths: Vec<PathBuf>,
-    since: Option<String>,
-    json: bool,
-    external: bool,
-) -> Result<()> {
-    let store_dir = swamp_dir();
-    if external {
-        anyhow::ensure!(
-            root.is_none(),
-            "--external is only valid without a root: external units are detector-resolved, independent of any walked root"
-        );
-        let units = discover_external_units_for_propose(&store_dir)?;
-        let observed_at = swamp_core::entities::now();
-        let plan = swamp_core::actions::propose_external(&units, &paths, "human:cli")?;
-        return save_and_print_plan(&store_dir, &plan, observed_at, json);
-    }
-    if let Some(root) = root {
-        let r = report_full_mode(
-            &root,
-            None,
-            false,
-            Some(&store_dir),
-            since.as_deref(),
-            true,
-            false,
-            false,
-            false,
-        )?;
-        let parsed = match filter.as_deref().map(filter::parse) {
-            Some(Ok(f)) => Some(f),
-            Some(Err(e)) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-            None => None,
-        };
-        // Fail closed: unreadable or malformed protection state is
-        // *unknown*, and proposing against an empty keep list would
-        // silently unprotect every artifact row
-        // (`.oh/guardrails/protection-fails-closed.md`).
-        let plan = swamp_core::actions::propose_checking_store_protection(
-            &r,
-            parsed.as_ref(),
-            &paths,
-            "human:cli",
-            &store_dir,
-        )?;
-        return save_and_print_plan(&store_dir, &plan, r.observed_at, json);
-    }
-    anyhow::ensure!(
-        !paths.is_empty(),
-        "either a root (for a filesystem artifact/Cargo-group/worktree) or at least one --path (for an agent-storage or external unit) is required"
-    );
-    let agent_units = discover_agent_units_for_propose(&store_dir)?;
-    let agent_hit = paths
-        .iter()
-        .any(|p| agent_units.iter().any(|u| &u.path == p));
-    if agent_hit {
-        let observed_at = swamp_core::entities::now();
-        let plan = swamp_core::actions::propose_agents(&agent_units, &paths, "human:cli")?;
-        return save_and_print_plan(&store_dir, &plan, observed_at, json);
-    }
-    let external_units = discover_external_units_for_propose(&store_dir)?;
-    let external_hit = paths
-        .iter()
-        .any(|p| external_units.iter().any(|u| &u.path == p));
-    if external_hit {
-        let observed_at = swamp_core::entities::now();
-        let plan = swamp_core::actions::propose_external(&external_units, &paths, "human:cli")?;
-        return save_and_print_plan(&store_dir, &plan, observed_at, json);
-    }
-    anyhow::bail!(
-        "no agent-storage or external unit matched any given --path (checked {} agent-storage unit(s), {} external unit(s)); pass a root to propose a filesystem artifact/Cargo group/worktree instead, or run `swamp report --view agents|external --json` to find the exact unit path",
-        agent_units.len(),
-        external_units.len()
-    );
 }
 
 /// The bounded, documented JSON contract behind `report --json` (see
@@ -1719,210 +1180,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::CleanupCheck {
-            root,
-            paths,
-            role,
-            limit,
-            offset,
-            within,
-            json,
-        } => {
-            anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
-            let root = swamp_core::fs_gate::canonicalize(root)?;
-            anyhow::ensure!(
-                paths.is_empty() || (offset == 0 && within.is_none()),
-                "--path is an exact selection; do not combine it with --offset or --within"
-            );
-            let within = within.map(swamp_core::fs_gate::canonicalize).transpose()?;
-            if let Some(within) = &within {
-                anyhow::ensure!(
-                    swamp_core::fs_gate::is_dir(within) && within.starts_with(&root),
-                    "--within must be a directory inside the scan root"
-                );
-            }
-            let store = swamp_dir();
-            let start = std::time::Instant::now();
-            let report = report_full_mode(
-                &root,
-                None,
-                false,
-                Some(&store),
-                None,
-                true,
-                false,
-                false,
-                false,
-            )?;
-            let report_ms = start.elapsed().as_millis();
-            let scope_summary = cleanup_scope_summary(&report.nested_artifacts, within.as_deref());
-            let mut candidates: Vec<_> = report
-                .nested_artifacts
-                .iter()
-                .filter(|u| {
-                    swamp_core::cargo_cleanup::candidate(u)
-                        && role.as_deref().is_none_or(|r| u.role.label() == r)
-                        && cleanup_path_in_scope(&u.path, within.as_deref())
-                })
-                .collect();
-            candidates
-                .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, report.observed_at));
-            let candidate_count = candidates.len();
-            let candidate_allocated_bytes: u64 = candidates.iter().map(|u| u.bytes).sum();
-            let selected: Vec<_> = if paths.is_empty() {
-                candidates
-                    .iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|u| u.path.clone())
-                    .collect()
-            } else {
-                paths.clone()
-            };
-            let next_offset = (paths.is_empty()
-                && offset.saturating_add(selected.len()) < candidate_count)
-                .then_some(offset.saturating_add(selected.len()));
-            let next_page = next_offset.map(|next| {
-                let mut args = vec![
-                    "swamp".to_string(),
-                    "cleanup-check".into(),
-                    root.display().to_string(),
-                    "--offset".into(),
-                    next.to_string(),
-                    "--limit".into(),
-                    limit.to_string(),
-                ];
-                if let Some(role) = &role {
-                    args.extend(["--role".into(), role.clone()]);
-                }
-                if let Some(within) = &within {
-                    args.extend(["--within".into(), within.display().to_string()]);
-                }
-                if json {
-                    args.push("--json".into());
-                }
-                args
-            });
-            if !json {
-                eprintln!(
-                    "{} candidate groups in scope ({} allocated, not reclaimable space). Checking {} on this page; checks read group contents.",
-                    candidate_count,
-                    swamp_core::render::human_bytes_pub(candidate_allocated_bytes),
-                    selected.len()
-                );
-            }
-            // Empty pages must not silently restart the default selection.
-            let results = if selected.is_empty() {
-                Vec::new()
-            } else {
-                swamp_core::cargo_cleanup::check(
-                    &report,
-                    &store,
-                    &selected,
-                    role.as_deref(),
-                    limit,
-                )?
-            };
-            let considered = candidates
-                .iter()
-                .filter(|u| results.iter().any(|r| r.path == u.path))
-                .count();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "root": root, "store": store, "report_ms": report_ms,
-                        "limit": limit, "checked_count": results.len(), "exhaustive": false,
-                        "offset": offset, "within": within,
-                        "observed_candidate_count": candidate_count,
-                        "candidate_allocated_bytes": candidate_allocated_bytes,
-                        "scoped_nested_row_count": scope_summary.nested_row_count,
-                        "coverage_limited_count": scope_summary.coverage_limited_count,
-                        "unknown_or_residual_count": scope_summary.unknown_or_residual_count,
-                        "coverage_limited_details": scope_summary.coverage_limited_details.iter().map(|d| serde_json::json!({
-                            "path": d.path,
-                            "limits": d.limits,
-                        })).collect::<Vec<_>>(),
-                        "not_checked_in_this_run": candidate_count.saturating_sub(considered),
-                        "next_offset": next_offset, "next_page": next_page,
-                        "note": "This is a bounded review of candidate groups, not a measure of total cleanup opportunity. A zero candidate count does not mean no cleanup opportunity; coverage-limited rows affecting the scope, including relevant ancestors, and noncandidate rows are reported separately. Allocated bytes are not guaranteed reclaimable. Checks are not evidence of disuse. No cleanup authorized or executed.",
-                        "results": results
-                    }))?
-                );
-            } else {
-                println!(
-                    "Cargo cleanup review · {} groups · report {report_ms} ms",
-                    results.len()
-                );
-                for r in results {
-                    println!("{} · {}", r.recommendation, r.consequence);
-                    println!(
-                        "{} · {} allocated · {} ms\n  {}\n  {}",
-                        r.check_status,
-                        swamp_core::render::human_bytes_pub(r.allocated_bytes),
-                        r.elapsed_ms,
-                        r.path.display(),
-                        r.message
-                    );
-                    for warning in r.warnings {
-                        println!("  {warning}");
-                    }
-                    if let Some(id) = r.plan_id {
-                        println!("  Unapproved plan: {id} (store {})", store.display());
-                    }
-                    println!("  Next (arguments): {:?}", r.next_command);
-                }
-                println!(
-                    "Bounded review, not an exhaustive search. Use --role test-executable or --path <exact-group> to narrow it. Allocated bytes are not guaranteed free space. Nothing approved or deleted."
-                );
-                println!(
-                    "{} of {candidate_count} candidate groups were not checked in this run.",
-                    candidate_count.saturating_sub(considered)
-                );
-                println!(
-                    "Scope contains {} nested Cargo rows: {} coverage-limited rows affecting scope (including ancestors) and {} unknown/residual non-candidates.",
-                    scope_summary.nested_row_count,
-                    scope_summary.coverage_limited_count,
-                    scope_summary.unknown_or_residual_count
-                );
-                if scope_summary.coverage_limited_count > 0 {
-                    println!(
-                        "Coverage-limited rows are not cleanup evidence; refresh before treating this scope as complete."
-                    );
-                    println!("Coverage-limited details (bounded):");
-                    for detail in &scope_summary.coverage_limited_details {
-                        let limits = if detail.limits.is_empty() {
-                            "limits not recorded".to_string()
-                        } else {
-                            detail.limits.join(" · ")
-                        };
-                        println!("  {} — {limits}", detail.path.display());
-                    }
-                }
-                if let Some(args) = next_page {
-                    println!("Next page (same SWAMP_DIR, arguments): {args:?}");
-                }
-            }
-        }
-        Command::Propose {
-            root,
-            filter,
-            paths,
-            since,
-            json,
-            external,
-        } => {
-            propose_unified(root, filter, paths, since, json, external)?;
-        }
-        Command::ProposeAgents { paths, json } => {
-            anyhow::ensure!(!paths.is_empty(), "--path is required (at least one)");
-            eprintln!(
-                "note: `propose-agents` is a deprecated alias; use `swamp propose --path <unit>` (no root needed) instead."
-            );
-            propose_unified(None, None, paths, None, json, false)?;
-        }
         Command::Protect { cmd } => cmd_protect(cmd)?,
-        Command::Approve { plan_id } => cmd_approve(&plan_id)?,
         Command::Config { action } => {
             let dir = swamp_dir();
             let path = dir.join("config.toml");
@@ -1966,131 +1224,6 @@ fn main() -> Result<()> {
                         "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."
                     );
                 }
-            }
-        }
-        Command::Execute {
-            plan_id,
-            actor,
-            json,
-            keep_executables,
-        } => {
-            let res = if keep_executables {
-                swamp_core::actions::execute_keeping_executables(&swamp_dir(), &plan_id, &actor)?
-            } else {
-                swamp_core::actions::execute(&swamp_dir(), &plan_id, &actor)?
-            };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
-            } else {
-                println!("plan {}: {}", res.plan_id, res.state);
-                for o in &res.outcomes {
-                    println!(
-                        "  {:<9} {:>10}  {}{}",
-                        o.status,
-                        swamp_core::render::human_bytes_pub(o.planned_bytes),
-                        o.path.display(),
-                        o.cause
-                            .as_ref()
-                            .map(|c| format!("  — {c}"))
-                            .unwrap_or_default()
-                    );
-                    for kept in &o.preserved {
-                        println!("            kept {}", kept.display());
-                    }
-                }
-                let permanent = if res.removed_permanently_bytes > 0 {
-                    format!(
-                        " · removed permanently {}",
-                        swamp_core::render::human_bytes_pub(res.removed_permanently_bytes)
-                    )
-                } else {
-                    String::new()
-                };
-                println!(
-                    "planned {} · trashed {}{permanent} · free space measured {}",
-                    swamp_core::render::human_bytes_pub(res.planned_bytes),
-                    swamp_core::render::human_bytes_pub(res.trashed_bytes),
-                    res.freed_measured
-                        .map(swamp_core::render::human_bytes_signed)
-                        .unwrap_or_else(|| "n/a".into())
-                );
-                if let Some(n) = &res.next_step {
-                    println!("next: {n}");
-                }
-            }
-        }
-        Command::Plans { json } => {
-            let plans = swamp_core::actions::list_plans(&swamp_dir())?;
-            if json {
-                let total = plans.len();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"plans": plans, "total": total})
-                    )?
-                );
-            } else if plans.is_empty() {
-                println!("no plans");
-            } else {
-                for p in plans {
-                    println!(
-                        "{}  {:?}  {} units  {}  created {}  expires {}",
-                        p.id,
-                        p.status(),
-                        p.units().len(),
-                        swamp_core::render::human_bytes_pub(p.planned_bytes()),
-                        p.created_at(),
-                        p.expires_at()
-                    );
-                }
-            }
-        }
-        Command::Grant { cmd } => {
-            let dir = swamp_dir();
-            match cmd {
-                GrantCmd::Add {
-                    predicate,
-                    budget,
-                    expires,
-                    max_units,
-                } => cmd_grant_add(&dir, &predicate, &budget, &expires, max_units)?,
-                GrantCmd::List { json } => {
-                    let gs = swamp_core::actions::list_grants(&dir)?;
-                    if json {
-                        let total = gs.len();
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "grants": gs,
-                                "total": total,
-                                "note": "grants are minted only by a human running `swamp approve <plan_id>` or `swamp grant add ...`; no command reads standing authorization into existence on its own",
-                            }))?
-                        );
-                    } else if gs.is_empty() {
-                        println!("no grants");
-                    } else {
-                        for g in gs {
-                            println!(
-                                "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
-                                g.id(),
-                                if g.revoked() { "revoked" } else { "live" },
-                                g.plan_id()
-                                    .as_ref()
-                                    .map(|p| format!("plan {p}"))
-                                    .unwrap_or_else(|| format!("where {}", g.predicate())),
-                                swamp_core::render::human_bytes_pub(g.budget_bytes().unwrap_or(0)),
-                                swamp_core::render::human_bytes_pub(g.spent_bytes()),
-                                g.used_units(),
-                                g.max_units()
-                                    .map(|m| m.to_string())
-                                    .unwrap_or_else(|| "∞".into()),
-                                g.expires_at(),
-                                g.actor()
-                            );
-                        }
-                    }
-                }
-                GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&dir, &grant_id)?,
             }
         }
         Command::Observe { roots, full } => {
@@ -2343,138 +1476,5 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
     ProgressLine {
         stop,
         handle: Some(handle),
-    }
-}
-
-#[cfg(test)]
-mod cleanup_check_tests {
-    use super::{
-        ArtifactRole, CLEANUP_COVERAGE_DETAIL_LIMITS, CLEANUP_COVERAGE_DETAIL_ROWS, Path, PathBuf,
-        cleanup_scope_summary,
-    };
-    use swamp_core::artifact::{ArtifactCoverage, Membership, NestedArtifact};
-
-    fn synthetic(
-        path: impl Into<PathBuf>,
-        role: ArtifactRole,
-        supported: bool,
-        complete: bool,
-        limits: Vec<String>,
-    ) -> NestedArtifact {
-        let path = path.into();
-        NestedArtifact {
-            id: path.display().to_string(),
-            relative_path: path.display().to_string(),
-            path,
-            parent_id: None,
-            container_id: None,
-            role,
-            membership: Membership::Unknown,
-            is_dir: false,
-            device: 0,
-            inode: 0,
-            logical_bytes: 1,
-            bytes: 1,
-            physical_bytes: 1,
-            physical_total: 1,
-            mtime_max: 0,
-            variant: Default::default(),
-            producer_evidence: Vec::new(),
-            consumer_evidence: Vec::new(),
-            coverage: ArtifactCoverage {
-                supported,
-                complete,
-                limits,
-            },
-            action_group: None,
-            present: true,
-            growth_bytes: None,
-            regrowth_count: 0,
-            decision_evidence: Vec::new(),
-            adapter: None,
-            basis: Default::default(),
-            time_source: Default::default(),
-            action: Default::default(),
-            consequence: None,
-            reported_by: None,
-            writer_lock: None,
-        }
-    }
-
-    #[test]
-    fn cleanup_scope_summary_keeps_unknown_coverage_visible_and_bounded() {
-        let mut rows = vec![
-            synthetic(
-                "/root/target",
-                ArtifactRole::Container,
-                false,
-                false,
-                vec!["root coverage".into()],
-            ),
-            synthetic(
-                "/root/target/debug/deps/unknown",
-                ArtifactRole::Unknown,
-                false,
-                false,
-                vec!["unknown coverage".into()],
-            ),
-            synthetic(
-                "/root/target/debug/deps/residual",
-                ArtifactRole::Residual,
-                true,
-                true,
-                Vec::new(),
-            ),
-            synthetic(
-                "/root/target/debug/incremental/group",
-                ArtifactRole::Incremental,
-                true,
-                true,
-                Vec::new(),
-            ),
-            synthetic(
-                "/root/target/debug/incremental/group/child",
-                ArtifactRole::Residual,
-                true,
-                true,
-                Vec::new(),
-            ),
-        ];
-        for index in 0..25 {
-            rows.push(synthetic(
-                format!("/root/target/debug/deps/unknown-{index}"),
-                ArtifactRole::Unknown,
-                false,
-                false,
-                (0..10).map(|n| format!("limit-{n}")).collect(),
-            ));
-        }
-
-        let summary = cleanup_scope_summary(&rows, Some(Path::new("/root/target/debug")));
-        assert_eq!(summary.nested_row_count, rows.len() - 1);
-        assert_eq!(summary.coverage_limited_count, 27);
-        assert_eq!(summary.unknown_or_residual_count, 28);
-        assert_eq!(
-            summary.coverage_limited_details.len(),
-            CLEANUP_COVERAGE_DETAIL_ROWS
-        );
-        assert!(
-            summary
-                .coverage_limited_details
-                .iter()
-                .all(|detail| detail.limits.len() <= CLEANUP_COVERAGE_DETAIL_LIMITS)
-        );
-
-        let group_scope = cleanup_scope_summary(
-            &rows,
-            Some(Path::new("/root/target/debug/incremental/group")),
-        );
-        assert_eq!(group_scope.nested_row_count, 2);
-        assert_eq!(group_scope.coverage_limited_count, 1);
-        assert_eq!(
-            group_scope.coverage_limited_details[0].path,
-            PathBuf::from("/root/target")
-        );
-        assert_eq!(group_scope.unknown_or_residual_count, 1);
     }
 }

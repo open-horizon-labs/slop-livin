@@ -4,8 +4,6 @@ severity: hard
 statement: "Cleanup review and execution must not run synchronously on the TUI event/render path; workers report progress and stop between groups."
 outcome: disk-growth-by-project
 audit: tui_event_thread_has_no_gate_calls
-compile_fail:
-  - human_confirmation_is_not_a_struct_literal
 runtime_tests:
   - crates/tui/src/app.rs::tests::background_delete_finishes_and_worker_failure_is_visible
 ---
@@ -22,11 +20,9 @@ Mechanism: type, gate audit, runtime test.
 
 **Gate audit.** `tui_event_thread_has_no_gate_calls`: from the TUI's `event_loop` (and every workspace impl of a trait the compiler calls implicitly -- `Drop`, `Display`, `Deref`, operators), over every path, UFCS and method-name edge except those inside `worker::spawn` closures, nothing reaches a blocking gate capability (`destroy`, `spawn`, bounded reads, `read_dir`); a call whose callee is not a path is rejected.
 
-**Type.** The TUI's sinks take a `HumanConfirmed`, minted only by its confirm dialog.
-
 Retired 2026-09-22: the `tui_actions_off_event_thread` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
 
-Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `human_confirmation_is_not_a_struct_literal`.
+(2026-09-23: this section's `Type.` line and its `human_confirmation_is_not_a_struct_literal` compile-fail case described `HumanConfirmed`, which is deleted along with the rest of the CLI action path -- see `.oh/guardrails/human-only-authorization.md`. What this guardrail is actually about, the TUI's worker/event-thread boundary, is unaffected: `execute_one`/`execute_plan_progress` still run only inside `worker::spawn`, never on the render/event thread.)
 
 ## Limits and runtime checks
 

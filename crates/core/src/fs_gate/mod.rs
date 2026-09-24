@@ -23,13 +23,11 @@
 //!   pointers; the audit sees code clippy never compiles (`cfg`'d-out
 //!   blocks, uninvoked `macro_rules!`, orphan files) and whole crates
 //!   (`libc::*`).
-//! * **Destructive operations take proofs.** [`destroy::trash_move`] and
-//!   [`destroy::Envelope`] consume a [`crate::recheck::RecheckProof`]
-//!   (constructible only by [`crate::recheck::run_all`]) and borrow an
-//!   [`crate::authority::Authorized`] (constructible only by
-//!   [`crate::authority::authorize`] from a live grant, or from a
-//!   [`crate::authority::HumanConfirmed`] the reviewed confirmation
-//!   sites mint). A sink that skips a recheck does not compile.
+//! * **Destructive operations are plain functions.** [`destroy::trash_move`]
+//!   and [`destroy::Envelope`] take an ordinary path: swamp reports, the
+//!   human decides, and there is no plan/grant/confirmation token in
+//!   front of the move any more. The only refusals left are OS-level
+//!   (permission denied, path gone, cross-device).
 //! * **Spawns name a [`spawn::Program`].** The enum is the allow-list;
 //!   there is no `Command` outside this module and no way to run a
 //!   program that is not a variant. Every run is counted.
@@ -49,7 +47,6 @@ pub mod fs_space;
 pub mod git;
 #[cfg(target_os = "linux")]
 pub mod inotify;
-pub mod key;
 // Not target-gated: the fail-closed rules are pure over a fixture tree
 // and are tested on both platforms (`occupancy::tests`'s `FakeProc`);
 // only `occupancy::probe_paths`'s call into it is Linux-only.

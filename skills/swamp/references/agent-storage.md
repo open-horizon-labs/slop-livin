@@ -31,15 +31,14 @@ Each unit has a `category` (`sessions`, `caches`, `logs`, `checkpoints`,
 (true for credentials/config/skills/automation by default, or anything
 a human added with `swamp protect`).
 
-Only two categories have a supported action in this release:
-**caches/logs** (a whole category directory, recoverable Trash move --
-regenerated automatically by the tool) and **sessions** (the exact
-transcript + its linked recovery material, moved together -- this
-discards unique resume/rewind/checkpoint history, never the linked
-project's own files). Everything else -- protected config, plugins
-outside their own `.trash` staging area, attachments, unclassified --
-has no supported action; `swamp propose --path <unit-path>` refuses it
-by name, never silently.
+Only two categories are markable in the TUI: **caches/logs** (a whole
+category directory, recoverable Trash move -- regenerated automatically
+by the tool) and **sessions** (the exact transcript + its linked
+recovery material, moved together -- this discards unique
+resume/rewind/checkpoint history, never the linked project's own
+files). Everything else -- protected config, plugins outside their own
+`.trash` staging area, attachments, unclassified -- has no Trash move
+at all; the TUI refuses to mark it and names why.
 
 A project's linked agent storage is also visible from the project tree
 itself, not only `--view agents`: `swamp report --project <name>` (text
@@ -50,45 +49,25 @@ or `--json`, no `--view` needed) shows a collapsed "Agent storage
 
 ```sh
 swamp protect list --json
-swamp protect add <path>       # survives refresh; blocks propose/execute for anything under it
+swamp protect add <path>       # survives refresh; blocks the TUI from marking anything under it
 swamp protect remove <path>
 ```
 
-## Proposing agent-storage cleanup
+## Removing agent-storage units: TUI only
 
-Same rule as everywhere else in this skill: you may inspect and
-propose, you must never approve or execute yourself.
+There is no CLI command that removes an agent-storage unit -- explain
+what a unit is and what removing it would cost, and point the human at
+the TUI: open `report --view agents`'s TUI equivalent, mark the unit
+(Space), read its current facts on the confirm banner (Backspace,
+naming the linked project and what history is lost), and press Enter.
+A session removal that partially fails (some members moved, then a
+later one could not be) leaves a `restore.json` manifest inside its
+Trash envelope naming exactly which member moved where.
 
-```sh
-swamp propose --path <unit-path> --json
-# -> {"state": "awaiting-authorization", "id": "...", "next_step": "a human authorizes with `swamp approve <id>` ..."}
-```
-
-`swamp propose` is the one entry point for every proposal kind: with no
-`root`, a `--path` that matches a discovered agent-storage unit routes
-here automatically (an external unit, or `--external` to force that
-route explicitly, routes to inspection-only review instead -- see
-`references/cleanup-and-recovery.md`). `swamp propose-agents --path
-<unit-path>` still works too, as a deprecated alias into the identical
-code path -- prefer `swamp propose` in new usage.
-
-`<unit-path>` is a unit's own `path` field from `--view agents`'
-output -- an exact selection, never a category or the whole tool home.
-Then the same lifecycle as every other plan:
-`references/cleanup-and-recovery.md`'s propose -> approve -> execute
-sequence, `swamp approve <id>` / `swamp execute <id> [--json]`, applies
-unchanged (they are already generic over any plan). A session removal
-that partially fails (some members moved, then a later one could not
-be) still names the Trash envelope and moved-byte count in the execute
-result; a `restore.json` manifest inside that envelope records exactly
-which member moved where, for manual recovery.
-
-If `propose` refuses, the refusal names the exact reason
-(`protected: ...`, `no supported selective action for <category> yet`,
-`touches a database-like (SQLite/WAL/SHM) file`, `refused: an active
-process holds this path open`, or `overlapping agent-storage
-selections: ...` for two selected units that nest) -- relay it
-verbatim, never as "unsafe" or "can't be deleted".
+If a unit cannot be marked, the TUI's footer names the exact reason
+(`protected: ...`, `swamp has no Trash move for this category`,
+`touches a database-like (SQLite/WAL/SHM) file`) -- relay it verbatim,
+never as "unsafe" or "can't be deleted".
 
 ## Full reference
 

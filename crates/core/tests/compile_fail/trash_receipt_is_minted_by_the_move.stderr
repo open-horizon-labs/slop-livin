@@ -1,4 +1,4 @@
-error[E0451]: fields `anchor`, `dest` and `linked_common` of struct `Trashed` are private
+error[E0451]: fields `anchor` and `dest` of struct `Trashed` are private
  --> $WORKSPACE/crates/core/tests/compile_fail/trash_receipt_is_minted_by_the_move.rs
   |
   |     let _moved = Trashed {
@@ -7,5 +7,3 @@ error[E0451]: fields `anchor`, `dest` and `linked_common` of struct `Trashed` ar
   |         ^^^^^^ private field
   |         dest: PathBuf::from("/tmp/trash/wt"),
   |         ^^^^ private field
-  |         linked_common: Some(PathBuf::from("/Users/me/repo/.git")),
-  |         ^^^^^^^^^^^^^ private field

@@ -13,14 +13,12 @@
 //! not only a hand-built literal. PRIVACY IS A HARD RULE: every fixture
 //! here is synthetic.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use swamp_core::actions;
 use swamp_core::agents::{
-    AgentActionCapability, AgentCategory, AgentMember, AgentMemberKind, AgentUnit,
-    ProjectLinkState, unit_id,
+    AgentActionCapability, AgentCategory, AgentMember, AgentUnit, ProjectLinkState, unit_id,
 };
 
 /// Every named tool id (#90's required 14-row matrix, including the
@@ -175,7 +173,7 @@ fn every_tool_refuses_an_unsupported_action_category() {
         let err = actions::propose_agents(&[unit], &[path], "test")
             .expect_err("an action:None unit must never be proposable");
         assert!(
-            err.to_string().contains("no supported selective action"),
+            err.to_string().contains("swamp has no Trash move"),
             "tool {tool_id}: {err}"
         );
     }
@@ -218,33 +216,6 @@ fn every_tool_refuses_a_database_like_path_even_when_otherwise_actionable() {
 /// proposal time, for every tool: the occupancy check
 /// (`crate::agents::is_active`) is a path-based seam, not a
 /// per-adapter one, so it applies uniformly.
-#[test]
-fn every_tool_refuses_a_unit_with_an_active_open_file() {
-    for (tool_id, tool_name) in ALL_TOOL_IDS {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.jsonl");
-        touch(&path, b"session-bytes");
-        let _held_open = fs::File::open(&path).expect("hold the file open");
-        let unit = synthetic_unit(
-            tool_id,
-            tool_name,
-            AgentCategory::Sessions,
-            AgentActionCapability::SessionRemoval,
-            false,
-            None,
-            path.clone(),
-            vec![AgentMember {
-                path: path.clone(),
-                bytes: 12,
-                kind: AgentMemberKind::Transcript,
-            }],
-        );
-        let err = actions::propose_agents(&[unit], &[path], "test")
-            .expect_err("an actively-open unit must never be proposable");
-        assert!(err.to_string().contains("active"), "tool {tool_id}: {err}");
-    }
-}
-
 /// Row 6: "whole home" / "whole projects dir" -- a bare directory that
 /// is not itself any unit's own anchor path (a tool's home directory,
 /// or a directory holding several projects) is refused as "no
@@ -334,127 +305,5 @@ fn overlapping_selections_from_any_tool_pairing_refuse_the_whole_plan() {
                 .contains("overlapping agent-storage selections"),
             "{tool_a}/{tool_b}: {err}"
         );
-    }
-}
-
-/// Row 8: plan scope drift at execution -- membership that changed
-/// between proposal and execution (a new member path appeared) refuses
-/// at `execute`, never trusting the plan's own stale member list. Uses
-/// Claude Code's real multi-member `identify()` because it is the only
-/// adapter in this catalog whose session unit can have more than one
-/// member path (transcript + subagents dir + file-history + todos),
-/// which is what makes a membership *set* change observable; Codex's
-/// own session unit is deliberately exactly one file (see
-/// `codex_session_removal_is_exactly_one_file_and_preserves_the_repo`
-/// in `agent_units_actions_new_adapters.rs`), so a set-membership-drift
-/// scenario does not apply to it the same way. The re-identification
-/// dispatch itself (`actions::execute_agent_session_removal`'s
-/// `match meta.tool_id`) is exercised for every other tool by that
-/// tool's own end-to-end session-removal test elsewhere in this repo.
-#[test]
-fn plan_scope_drift_refuses_at_execute_for_claude_code() {
-    use swamp_core::agents::discover_and_measure;
-    use swamp_core::locations::{Environment, Platform, Registry};
-    use swamp_core::scope::{ScanConfig, resolve_effective_scope};
-
-    fn only(id: &str) -> ScanConfig {
-        ScanConfig {
-            defaults: false,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            // An allow-list: see the note in
-            // `agent_storage_validation.rs::only`. A deny-list of the
-            // agent detectors left `core-simulator`, `homebrew` and
-            // `ruby-install` reaching real machine-wide paths.
-            disabled_detectors: Vec::new(),
-            enabled_detectors: vec![id.to_string()],
-        }
-    }
-
-    // Claude Code.
-    {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("claude-home");
-        let repo = root.path().join("repo");
-        fs::create_dir_all(repo.join(".git")).unwrap();
-        let session_id = "33333333-3333-4333-8333-333333333333";
-        let jsonl = home
-            .join("projects")
-            .join("-repo-encoded")
-            .join(format!("{session_id}.jsonl"));
-        touch(
-            &jsonl,
-            format!(
-                "{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{}\",\"gitBranch\":\"main\"}}\n",
-                repo.display()
-            )
-            .as_bytes(),
-        );
-        let subagent = home
-            .join("projects")
-            .join("-repo-encoded")
-            .join(session_id)
-            .join("subagents")
-            .join("a.jsonl");
-        touch(&subagent, b"companion");
-
-        let registry = Registry::with_builtins();
-        let mut env_vars = HashMap::new();
-        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), home.display().to_string());
-        let env = Environment::fixture(root.path().to_path_buf(), env_vars, Platform::MacOS);
-        let scope = resolve_effective_scope(&env, &only("claude-code"), &[], &registry, 1_000);
-        let store = tempfile::tempdir().unwrap();
-        let units = discover_and_measure(
-            &scope,
-            &[],
-            Some(store.path()),
-            true,
-            1_000,
-            30,
-            3600,
-            &swamp_core::fs_events::EventCoverage::untrusted(),
-        )
-        .unwrap();
-
-        let plan = actions::propose_agents(&units, std::slice::from_ref(&jsonl), "test").unwrap();
-        actions::save_plan(store.path(), &plan).unwrap();
-        actions::approve(store.path(), &plan.id, "human:test").unwrap();
-
-        // Scope drift: a brand-new *member path* (a `todos/` entry
-        // Claude Code did not have at proposal time) appears for this
-        // exact session id before execute runs. Adding a file inside
-        // the existing `subagents/` companion directory would not by
-        // itself change the member *path set* (that whole directory is
-        // already one folded member) -- a new top-level member kind is
-        // what actually drifts the set `execute_agent_session_removal`
-        // re-derives and compares.
-        touch(
-            &home
-                .join("todos")
-                .join(format!("{session_id}-agent-1.json")),
-            b"unplanned-new-member",
-        );
-
-        let trash = tempfile::tempdir().unwrap();
-        let result =
-            actions::execute_with_trash(store.path(), &plan.id, "human:test", trash.path())
-                .unwrap();
-        assert_eq!(
-            result.outcomes[0].status, "failed",
-            "{:?}",
-            result.outcomes[0]
-        );
-        assert!(
-            result.outcomes[0]
-                .cause
-                .as_deref()
-                .unwrap_or_default()
-                .contains("membership changed"),
-            "{:?}",
-            result.outcomes[0]
-        );
-        // Refused, so nothing actually moved.
-        assert!(jsonl.exists());
-        assert!(subagent.exists());
     }
 }

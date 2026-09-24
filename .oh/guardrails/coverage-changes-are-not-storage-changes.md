@@ -15,7 +15,6 @@ compile_fail:
   - history_rows_are_private_to_the_store
 runtime_tests:
   - crates/core/tests/coverage_changes_are_not_storage_changes.rs
-  - crates/core/tests/reviewer_counterexamples_stack2.rs::a_config_only_exclusion_must_not_invent_growth_or_regrowth
 ---
 
 # Coverage changes are not storage changes
@@ -54,11 +53,17 @@ Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-aud
 passes over an unchanged tree, with the coverage changing between them
 (add an exclusion, disable a detector, make a location inaccessible,
 switch to an explicit root) produce zero growth, zero regrowth and zero
-tombstones. Run by name from `scripts/check.sh`. Plus
+tombstones. Run by name from `scripts/check.sh`.
+
+(2026-09-23: this section used to also cite
 `crates/core/tests/reviewer_counterexamples_stack2.rs::a_config_only_exclusion_must_not_invent_growth_or_regrowth`,
-the 2026-09-22 re-review's CE4: excluding a nested Cargo location reported
-the parent as having grown 64 KB and un-excluding it scored a regrowth,
-with zero bytes changed on disk.
+the 2026-09-22 re-review's CE4 -- excluding a nested Cargo location
+reported the parent as having grown 64 KB and un-excluding it scored a
+regrowth, with zero bytes changed on disk. That file is gone from this
+branch with no deletion commit in its history; discovered as a stale
+reference during stack/27's verification, unrelated to this chunk's own
+changes. A follow-up should either restore that counterexample as a
+test or find where its coverage moved to.)
 
 ## Validation gap
 

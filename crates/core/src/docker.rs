@@ -845,37 +845,10 @@ pub enum Removal {
 /// Runs a removal, permanently, in the daemon. Returns the daemon's own
 /// refusal text when it declines (an image still referenced by a
 /// container, a volume still mounted), because that reason is the fact
-/// the human needs. Takes the recheck proof `recheck::run_all` took for
-/// the [`crate::authority::Authorized`] unit (which asked the daemon
-/// about exactly this object): `docker … rm` is reachable only through
-/// [`crate::fs_gate::destroy::docker_remove`], which builds its
-/// arguments from that proof.
-pub fn remove(
-    proof: crate::recheck::RecheckProof,
-    auth: &crate::authority::Authorized,
-) -> Result<(), String> {
-    crate::fs_gate::destroy::docker_remove(proof, auth)
-}
-
-/// Is this object still present, and still unused? Re-derived at the sink
-/// immediately before removal, never trusted from the report.
-pub fn still_removable(target: &Removal) -> Result<(), String> {
-    let (kind, id) = match target {
-        Removal::Image { id } => ("image", id.as_str()),
-        Removal::Volume { name } => ("volume", name.as_str()),
-        Removal::Refused(why) => return Err((*why).to_string()),
-    };
-    let out = crate::fs_gate::spawn::run(
-        crate::fs_gate::spawn::Program::Docker,
-        [kind, "inspect", id],
-        Duration::from_secs(30),
-    )
-    .map_err(|e| format!("docker: {e}"))?;
-    if out.success() {
-        Ok(())
-    } else {
-        Err("object is no longer present".to_string())
-    }
+/// the human needs. The daemon's own answer is the only refusal here:
+/// there is no separate recheck-and-veto step in front of it.
+pub fn remove(target: &Removal) -> Result<(), String> {
+    crate::fs_gate::destroy::docker_remove(target)
 }
 
 /// How many buildx builders besides the daemon's own get a `du` query.

@@ -136,15 +136,9 @@ detector-resolved location (mise's `installs`/`downloads` inside its
 own data dir, Hugging Face's `hub` cache inside `HF_HOME`) is excluded
 from that outer location's own measurement, so summing every unit in
 `--view external` never double-counts a nested one.
-They are inspection-only by contract: `swamp propose --external
-[--path P]` (or a bare `swamp propose --path P` when `P` matches an
-external unit and not an agent-storage one) builds a plan naming it --
-useful to see exactly what a plan would say about it -- but `execute`
-always refuses every external unit unconditionally with "no supported
-selective action for `<category>`", before any grant/budget check
-runs. Never treat an external unit as deletable through any path this
-tool exposes; `propose --external` is inspection, not a second
-authorization route.
+They are shown for review only: never markable in the TUI, and no
+command deletes one. Never treat an external unit as deletable through
+any path this tool exposes -- act on it with the manager's own tools.
 
 ## Filesystem vs. Docker accounting
 

@@ -9,6 +9,5 @@ fn main() {
     let _moved = Trashed {
         anchor: PathBuf::from("/w/wt"),
         dest: PathBuf::from("/tmp/trash/wt"),
-        linked_common: Some(PathBuf::from("/Users/me/repo/.git")),
     };
 }

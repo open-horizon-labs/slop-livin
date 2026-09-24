@@ -25,7 +25,7 @@ Retired 2026-09-23: the derived-call-graph AST audit `trash_backend_owns_every_m
 - **Inside the backend, `std::fs` is inverted**: only reads, `create_dir(_all)`, `set_permissions`, `rename`, `remove_file` and `OpenOptions` are allowed; `copy`, `remove_dir_all`, `remove_dir`, `hard_link`, `write` (anything unlisted) fail closed, as does `std::io::copy`.
 - **A move's result is honoured** — `let _ = rename_no_replace(..)` fails — and **a function that moves a path never removes that same path** (the permanent-deletion fallback).
 
-`execution_sinks_recheck_live_state` complements it: a call into a backend definition that moves or removes is treated as a destructive call *at the caller*, which must carry the full honoured rechecks before it.
+(2026-09-23: `execution-sinks-recheck-live-state.md`, the guardrail that used to complement this one by requiring a live re-derivation before every destructive call, is retired -- there is no recheck-then-veto gate any more, only this one: every move goes through `fs_gate::destroy`, one function, or it does not compile clean of the gate audit.)
 
 Six fixtures in `crates/source-audit/tests/mutations/trash_backend_owns_every_move/`: a sink renaming into a trash directory itself, the same through `use std::fs::rename as shift` (alias), through a helper one call away, a copy + `remove_dir_all` EXDEV fallback, a discarded move result, and the source removed when the move fails. (The retired rule's seventh, accepted fixture -- a write-then-rename publish of a control file reachable from a sink -- is no longer a legitimate shape: the gate model has no exception for "this rename only publishes what the same function just wrote", so it is rejected too and was removed rather than kept with a false `expect: accept`.)
 

@@ -185,16 +185,13 @@ broadened scope.
 `swamp protect add <path>` records that you want a path kept. It blocks
 in **both** directions:
 
-- anything at or beneath a protected path is never proposed or removed; and
-- anything that *contains* a protected path is never proposed or removed
-  either. Protecting `~/.claude/debug/log.txt` therefore also stops
-  `~/.claude/debug/` being removed, because removing the parent would
+- anything at or beneath a protected path is refused when you try to mark it in the TUI; and
+- anything that *contains* a protected path is refused too. Protecting `~/.claude/debug/log.txt` therefore also stops
+  `~/.claude/debug/` being marked, because removing the parent would
   destroy exactly what you asked to keep.
 
-Protection is re-read from disk at the moment an action executes, not
-captured when the plan was proposed: adding a protection after approving
-a plan stops that plan. If the protect list cannot be read or parsed,
-protection state is **unknown**, and every action refuses with that
+The TUI reloads the protect list from disk fresh every time you mark a row, so a protection added mid-session is honoured immediately. If the protect list cannot be read or parsed,
+protection state is **unknown**, and marking refuses with that
 reason until the file is repaired or removed -- `swamp protect list`
 reports the same error rather than printing an empty list. The file is
 written atomically (temp file plus rename), so an interrupted write
@@ -311,26 +308,20 @@ never collapsed into "cache", and a unit is measured whether or not any
 project currently references it (removing the last consumer never
 deletes the unit or its history).
 
-External units are **inspection-only**: `actions::propose_external`/
-`unit_from_external` can build a plan naming one for review, and
-`swamp execute` refuses every such unit unconditionally with "no
-supported selective action for `<category>`" -- registry/detector
-output identifies storage, it never authorizes removing it. `swamp
-propose`'s CLI does not yet expose a `--external` selection mode (it
-still expects a walked report root); today this plan/refusal contract
-is reachable through the core API and is exercised end to end by
-`crates/core/tests/external_units_actions.rs`, not yet through a
-dedicated CLI flag. The `--view
-external` total is deliberately kept separate from `reconciliation`
-above it: external units are never folded into `walked_total`/
-`attributed`/`unowned`, so there is nothing to double-count, but the two
-bases (a walked root vs. a detector-resolved location) are different
-enough that summing them would be misleading.
+External units are shown for review only, never markable in the TUI and
+never actionable through any command: registry/detector output
+identifies shared storage (a package manager's cache, a toolchain
+install), it never deletes it. Removing one means the manager that owns
+it fetches or rebuilds it again the next time it is needed. The
+`--view external` total is deliberately kept separate from
+`reconciliation` above it: external units are never folded into
+`walked_total`/`attributed`/`unowned`, so there is nothing to
+double-count, but the two bases (a walked root vs. a detector-resolved
+location) are different enough that summing them would be misleading.
 
 The TUI has a dedicated, read-only External view (`v`/`9`): the same
-one-row-per-unit facts as `--view external`, never markable (the same
-"execute refuses every one unconditionally" contract applies; the TUI
-never offers a delete affordance the action layer would refuse anyway).
+one-row-per-unit facts as `--view external`, never markable -- act on
+what it shows with the manager's own tools, not swamp.
 
 ## Agent-tool storage
 
@@ -365,44 +356,36 @@ today vs. named-and-planned). In short:
 - **Categories carry different consequences.** Cache/log categories
   (`shell-snapshots`, `debug`, plugin/skill `.trash`) are regenerated
   automatically and are, with the legacy directories below, the only
-  categories with a supported action this release. A few directories are
+  categories the TUI can mark for the Trash. A few directories are
   neither: Claude Code's `statsig/`, `logs/` and unmatched `todos/`
   entries are documented upstream as legacy and **no longer written**, so
   removing them costs nothing and nothing comes back. Removing a session
   means losing its resume/rewind/checkpoint history -- the linked
   project's own files are never touched. Credentials, settings, skills, commands and
-  similar automation definitions are protected by default and have no
-  supported action at all.
+  similar automation definitions are protected by default and cannot be
+  marked at all.
 - **A tool whose layout is not confirmed against its own source gets
   identification and nothing else.** `swamp report --view agents` still
-  measures Cursor's and Windsurf's storage, but offers no action and
-  reports linkage as unresolved, because acting on a layout nobody has
-  verified is not a size question. The same now applies, narrowly, to
-  GitHub Copilot CLI's `session-state/`: the *directory names* are
-  documented by GitHub, what is inside them is not, so those units are
-  measured and never proposed. `docs/agent-storage.md`'s matrix says
-  which is which, and every "supported" row's citation is pinned to an
-  upstream commit and checked by CI.
+  measures Cursor's and Windsurf's storage, but the TUI offers no mark
+  affordance and reports linkage as unresolved, because acting on a
+  layout nobody has verified is not a size question. The same now
+  applies, narrowly, to GitHub Copilot CLI's `session-state/`: the
+  *directory names* are documented by GitHub, what is inside them is
+  not, so those units are measured and never markable.
+  `docs/agent-storage.md`'s matrix says which is which, and every row's
+  citation is pinned to an upstream commit and checked by CI.
 - **Human keep/protect intent survives refresh:**
   `swamp protect add <path>` / `swamp protect list [--json]` /
   `swamp protect remove <path>` -- independent of, and never overridden
-  by, anything observation infers.
-- **Supported actions:** `swamp propose --path <unit-path> [--json]`
-  (no `root`) builds a real plan (or a named refusal) for a selected
-  unit, then the same `swamp approve <plan-id>` / `swamp execute
-  <plan-id>` every other plan uses. `swamp propose` is the one entry
-  point for every proposal kind: with no `root`, a `--path` routes
-  automatically to the agent-storage proposer or the external-unit
-  proposer (`--external` forces the latter, inspection-only route
-  explicitly); only a filesystem artifact/Cargo-group/worktree needs a
-  `root`. `swamp propose-agents --path <unit-path>` still works too, as
-  a deprecated alias into the identical code path. Nothing wider than
-  the exact selected unit is ever affected; occupancy, references and
-  identity are all re-checked at execution, not assumed from the plan.
-  A session removal that partially fails (some members moved, then a
-  later one could not be) leaves a `restore.json` recovery manifest
-  inside its Trash envelope, and the execute result names the envelope
-  and the bytes that really did move.
+  by, anything observation infers. The TUI's mark step refuses a
+  protected unit, or one containing a protected path.
+- **Removal is TUI-only.** Space marks a session/cache row, Backspace
+  shows its current facts (what member files exist, what removing them
+  costs), Enter moves it to the Trash and appends one ledger line.
+  Nothing wider than the exact marked unit is ever affected. A session
+  removal that partially fails (some members moved, then a later one
+  could not be) leaves a `restore.json` recovery manifest inside its
+  Trash envelope naming exactly what moved and what did not.
 - **Project-linked view:** `swamp report --project <name>` (text or
   `--json`, no `--view` needed) includes this project's own linked
   agent storage -- a collapsed "Agent storage (linked)" summary row per
@@ -413,12 +396,13 @@ The TUI has a dedicated Agents view (`v`, no digit -- `0` is "clear
 filter"): the same per-unit facts as `--view agents`. `Space`/
 `Backspace` mark the selected unit and open the confirm banner showing
 its real consequences (session-removal loss warnings, the linked
-project); `Enter` executes through the same background-worker path
-every other TUI deletion uses -- never blocking the event/render
-thread. A protected or unsupported row cannot be marked; the footer
-names the exact reason. Bulk marking (`Shift+A`) reaches the Agents
-view too: it marks every actionable row on screen the same way,
-skipping protected/unsupported/active ones and naming the skip in the
+project); `Enter` moves it to the Trash through the same
+background-worker path every other TUI deletion uses -- never blocking
+the event/render thread. A protected row, or one whose category has no
+Trash move at all (credentials, settings, an unconfirmed layout), cannot
+be marked; the footer names the exact reason. Bulk marking (`Shift+A`)
+reaches the Agents view too: it marks every markable row on screen the
+same way, skipping protected/unmarkable ones and naming the skip in the
 footer. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
@@ -428,10 +412,10 @@ unit still happens in the Agents view).
 Age is a cleanup signal, not a proof requirement. Supported Cargo cleanup groups
 are ranked oldest-modified first, then largest when ages match. Missing or future
 timestamps sort last. There is no minimum-age gate: recent builds remain reviewable.
-The project tree and `cleanup-check` show modification age and rebuilding cost.
+The project tree shows modification age and rebuilding cost.
 Modification age is not last execution or access time. Existing project/worktree
 activity signals provide additional context; they are not required to suggest a
-build cleanup candidate. Exact-selection checks and human approval still apply.
+build cleanup candidate. Old is a reason to look, never a verdict -- the human still decides.
 
 ## Terminal controls
 
@@ -558,27 +542,11 @@ Trash; refused and unattempted selections remain marked for explicit review or
 retry. Cancelling review preserves the selection you had before review started
 and does not delete anything. Ctrl-C exits when no operation is running.
 
-### Review exact build groups from the CLI
+### Reviewing Cargo build groups
 
-The Rust text view shows the largest 30 rows by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. `unchecked` means checks have not run, not that the group is unused. Report JSON includes the same guidance under each nested row's `cleanup` field.
+The Rust text view shows the largest 30 rows by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. Report JSON includes the same guidance under each nested row's `cleanup` field.
 
-Review a bounded selection before deciding what to remove:
-
-```sh
-swamp cleanup-check ~/src/my-project --role test-executable --limit 3
-swamp cleanup-check ~/src/my-project --role incremental --limit 5 --json
-swamp cleanup-check ~/src/my-project --role incremental --limit 5 --offset 5 --json
-swamp cleanup-check ~/src --within ~/src/my-project/target --role incremental --limit 5
-swamp cleanup-check ~/src/my-project --path /absolute/path/to/target/debug/incremental/crate-group
-```
-
-This command observes the root, then checks selected groups (five by default, at most twenty). Checks can read the group's contents and create **unapproved** plans; they never authorize or execute cleanup. Results distinguish `blocked`, `unchecked`, and `ready_for_review`, with reason codes, exact members for successful checks, recovery details and timings. A reviewed group is not confirmed unused. A failed group never expands into removal of its parent.
-
-The result shows the number and allocated size of all observed candidates in scope, how many were not checked in this run, and arguments for the next age-ranked page. It also counts coverage-limited and unidentified Cargo rows separately; zero candidates does not establish that there is no cleanup opportunity. These coverage counts ignore `--role`, because an unknown row cannot reliably match a requested role. Pages can shift if builds change between calls. `--within` narrows candidate discovery to groups strictly below a directory; use `--path` to review that exact directory if it is a selectable group. A five-group result is not a measure of the total cleanup opportunity, and candidate bytes are not a promise of reclaimable space.
-
-Hardlinked groups can be reviewed and moved to Trash. Links outside the selected group remain intact; reclaimable space is unknown. Lock failures distinguish unavailable locks from missing lock files; retry after builds finish, not by widening scope. Allocated bytes are not promised free space, and moving files to Trash does not free those bytes immediately. JSON `next_command` and `next_page` are argument arrays, not shell strings; retain the same `SWAMP_DIR` to find the created plans.
-
-Cleanup rechecks the group under Cargo's existing profile locks and moves it to a same-filesystem Trash envelope with a restore manifest. Changes since review require a new plan. Stop manual build writers first: Cargo locks are advisory. Missing locks, uncertain occupancy, incomplete scans, and unsupported layouts refuse cleanup. Shared dependency groups remain inspection-only; age alone never makes a group eligible.
+There is no `swamp cleanup-check` command any more: the CLI is entirely read-only. To act on a Cargo purpose group, open the TUI's Rust view, mark the group (Space), read its current facts on the confirm banner (Backspace), and press Enter -- the group's exact member list (selected build output plus its `.d`/`.dSYM` companions) moves together into one Trash envelope with a restore manifest. Cargo's advisory lock is held for the duration of the move (so a concurrent `cargo build` does not race it), not as a "did anything change" check.
 
 The CLI's *text* rendering applies `--filter` only to the root `--view worktrees` output; it does not filter the builds view, project drill-down, or overview text. For a filter that narrows every row, add `--json`: see below and [the agent interface](#agent-interface).
 
@@ -635,53 +603,24 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 ## Cleanup and recovery
 
-In the UI, Space marks and Backspace asks for confirmation. Checkouts and linked worktrees can be selected as well as artifacts. Dirty, unpushed, and untracked warnings are shown for judgment; they do not universally block removal.
+**Swamp reports; the human removes.** The CLI (`swamp report`/its views, and `swamp protect`) is entirely read-only. The only thing that deletes anything is the TUI: Space marks a row, Backspace shows its current facts, Enter moves it to the Trash. Checkouts and linked worktrees can be selected as well as artifacts and Cargo groups. Dirty, unpushed, and untracked facts are shown on the confirm banner for judgment; they do not block removal.
 
 A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
-The CLI separates proposal, approval, and execution:
-
-```bash
-swamp propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
-swamp propose ~/src --path /absolute/path/to/a-worktree
-```
-
-For a worktree, first inspect `swamp report <root> --view worktrees` for dirty, unpushed and merge evidence. Use its exact reported path in `propose --path`; the scan root must cover that worktree. You can use the same store when switching between a project root and a parent containing related worktrees.
-
-Inspect the printed units and warnings, then use the returned ID:
-
-```text
-swamp approve <plan-id>
-swamp execute <plan-id> --keep-executables
-```
-
-Proposing does not remove anything. Plans expire after 30 minutes and are single-use. Execution returns per-unit results; inspect refusals and failures as well as successful units.
-
-An approval covers the plan exactly as `swamp approve` printed it: the grant records the plan's content digest, and execution refuses a plan whose units changed since. Plans and grants are stored with a binding under the store's `authority.key`; a plan or grant file that was edited by hand, copied from another store, or written by an older swamp is refused by name (propose again, or re-add the standing grant). A `grants.json` with one such record refuses every execution until the record is removed.
-
-The plan's `created_at` is its review time. A unit's `observed_at` can be older when incremental replay reused an unchanged measurement; it is not restamped to pretend the data was remeasured.
-
-For repeated work, a human can create and revoke a bounded standing grant:
-
-```bash
-swamp grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d
-swamp grant list
-swamp plans
-```
-
-`swamp grant revoke <grant-id>` revokes it. Standing grants accept unit predicates, with required byte budget and expiry and optional `--max-units`. They reject growth-window and PR-state predicates.
+There is no re-check between marking and pressing Enter: no "this changed since you looked" refusal, and no veto based on whether something has a file open (that fact is shown, not enforced). The only way Enter refuses is an ordinary OS-level error -- the path is already gone, permission is denied, or the Trash is on a different filesystem with no permanent-delete fallback.
 
 | Unit | Removal and recovery |
 |---|---|
 | Filesystem path | Moved to Trash; swamp records its recovery location. Bytes remain on disk until the trashed data is removed. macOS: `~/.Trash`. Linux: the freedesktop Trash your file manager shows (`~/.local/share/Trash`, or the mount's own `.Trash-$uid`), with a `.trashinfo` record of the original path and deletion time, so the file manager's Restore works. A move that is not a rename on one filesystem is refused, never copied. |
-| Linked worktree or checkout | Can be moved to Trash through its specific action path. Inspect warnings about local work and repository context. |
-| Docker image | Removed by Docker. Pulling or rebuilding depends on the image still being available or reproducible. |
-| Docker volume | Removed by Docker. Swamp creates no copy of its contents. |
-| Docker build-cache record | Reported, but individual removal is refused. |
+| Cargo purpose group | The selected build output and its `.d`/`.dSYM` companions move together into one Trash envelope, with a `restore.json` manifest naming each member's original path. |
+| Linked worktree or checkout | Moved to Trash; `git worktree prune`/`git worktree repair` follow for a linked worktree. Inspect warnings about local work and repository context first. |
+| Docker image | Removed by Docker, permanently -- no Trash. Pulling or rebuilding depends on the image still being available or reproducible. |
+| Docker volume | Removed by Docker, permanently. Swamp creates no copy of its contents. |
+| Docker build-cache record | Reported, but individual removal is refused (Docker has no per-entry API for it). |
 
-`--keep-executables` copies supported Rust executables from `target/{release,debug}` and Python wheels/shared libraries from `dist` or `build` into the worktree's `bin/` before removal. It is not a backup of everything in the selected directory.
+`--keep-executables` (a TUI toggle) copies supported Rust executables from `target/{release,debug}` and Python wheels/shared libraries from `dist` or `build` into the worktree's `bin/` before removal. It is not a backup of everything in the selected directory.
 
-On Linux, whether something holds a unit open is read from `/proc` for every process running with your credentials; a process the kernel does not let you read (another user's, a more privileged one, one marked non-dumpable) is outside what swamp can see, as it is for `lsof` without root. A process of yours that cannot be read for any other reason makes the answer *unknown*, and unknown refuses the action.
+The ledger lives at `~/.local/share/swamp/ledger.jsonl`: one line per Trash move, naming the path, recovery location, bytes and time. Trashed bytes and freed disk space are different quantities -- moving to Trash does not free space until the Trash itself is emptied. Consult the reported recovery location for restoration; swamp has no general undo command.
 
 The ledger lives at `~/.local/share/swamp/ledger.jsonl`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
 
@@ -724,11 +663,10 @@ recovery/reclaimability so a narrow terminal shows the most
 decision-relevant facts first, and the TUI's inline delete-confirmation
 row adds a short warning for a declared consumer, current use, or an
 uncertain recovery/reclaimability fact next to the existing git-status
-warnings. `swamp propose` snapshots a unit's report-row evidence plus a
-fresh current-use reading at proposal time; `swamp execute` re-takes
-current-use fresh immediately before acting rather than trusting that
-snapshot, so something that started using a unit between proposal and
-execution is still caught.
+warnings. Marking a row in the TUI snapshots its report-row evidence
+plus a fresh current-use reading at that moment; the confirm banner
+shows that reading as a fact, and Enter does not re-take it -- there is
+no second check between marking and moving.
 
 Tool-version declarations (#56) and dependency-lockfile/shared-store
 associations (#57) are wired live into the report/external-unit
@@ -833,9 +771,6 @@ contract: `skills/swamp/references/commands-and-json.md`.
 | `report <root> --view projects --json` | `--since` | Ranked project summaries |
 | `report <root> --view worktrees --json` | `--filter` | Worktree and GitHub facts |
 | `report <root> --view docker --json` | `--project`, `--unowned-only` | Docker objects and attribution |
-| `propose <root> --json` | `--filter`, `--path`, `--since` | Persisted action plan, `awaiting-authorization` |
-| `execute <plan_id> --json` | `--keep-executables` | Execution results for an authorized plan |
-| `plans --json`, `grant list --json` | None | Existing plans and grants |
 
 `report --json` can record new observations (skip with `--no-observe`).
 It uses cached GitHub facts and may refresh Docker's cache. Result
@@ -849,14 +784,13 @@ swamp report /Users/you/src --view grown --json --since 7d
 swamp report /Users/you/src --view builds --json --filter 'type:rust size > 1GB'
 ```
 
-There is no CLI command that both an agent and a human can use to mint
-authorization silently -- `swamp approve`/`swamp grant add` exist for a
-human to run. An agent with unrestricted shell access can invoke those
-same commands, so this is a followed convention, not an
-operating-system security boundary. See
-[the trust model](../skills/swamp/references/trust-model.md) for what
-actually enforces safety (sink re-derivation, scoped/budgeted/expiring
-grants, the ledger).
+There is no CLI command, for an agent or a human, that deletes or moves
+anything -- `swamp report`'s views and `swamp protect` are the whole
+CLI surface with any effect, and `protect` only ever changes a
+keep-list. See
+[the trust model](../skills/swamp/references/trust-model.md) for the
+full statement of what swamp is now and what actually removes data (the
+TUI's own Trash move, or a human's own shell command).
 
 ## Configuration
 

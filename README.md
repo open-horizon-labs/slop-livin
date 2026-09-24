@@ -110,18 +110,17 @@ Space marks rows in the UI. Backspace opens a confirmation for the selected row 
 
 Filesystem removals move paths to Trash. Docker images and volumes are removed through Docker and have no Trash recovery; swamp does not make a backup. Build-cache entries are reported but cannot be removed individually through swamp. Moving files to Trash does not itself reclaim their disk space.
 
-The CLI also supports proposals, human approval, and execution. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery) before using it.
+Swamp reports; the human removes. There is no CLI command for propose/approve/execute/grant any more -- the TUI's Space/Backspace/Enter is the only removal path, and there is no re-check between marking a row and pressing Enter. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery) for where a Trash move went and how to get it back.
 
 ## Use it from an agent
 
-There is no separate server process. `swamp report --json`, `--view <name> --json`, `propose --json`, and `execute --json` print one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
+There is no separate server process, and no CLI command that deletes anything. `swamp report --json` and `--view <name> --json` print one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
 
 ```bash
 swamp report ~/src --view grown --json --since 24h
-swamp propose ~/src --filter 'kind:BuildOutput idle > 30d' --json
 ```
 
-Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands, the JSON schema, and the authorization rule: an agent may propose a plan, but grant creation and plan approval (`swamp approve`, `swamp grant add`) are reserved for a human's explicit instruction. That rule is followed, not enforced by any wall between "agent" and "human" processes -- a shell-capable agent could type the same command. The real safety boundary is in swamp itself: every execution re-derives its units against the live filesystem, grants are scoped/budgeted/expiring, and every action is ledgered. See [the trust model](skills/swamp/references/trust-model.md).
+Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands and JSON schema. The skill and the CLI are entirely read-only: an agent can gather evidence and explain what removing something would cost, but there is no command left for it (or anyone) to run that would delete anything -- only a human, in the TUI or at a shell, does that. See [the trust model](skills/swamp/references/trust-model.md).
 
 ## How updates stay small
 

@@ -94,10 +94,10 @@ chunk; all three now ship:
 - **External rows.** `ViewKind::External` (`'9'`) lists `ExternalUnit`s
   the same shape as `ViewKind::Unowned` lists unowned rows: path,
   category, size, growth, consumer count. The row is never markable
-  (`Row.unit: None`) rather than markable-then-refused: the action
-  layer (`actions::execute`) already refuses every
-  `PlanUnit::external_category` unit unconditionally, so there is no
-  delete affordance to offer in the first place. A unit that is a
+  (`Row.unit: None`): an external unit is shared, detector-resolved
+  storage (a package manager's cache, a toolchain install), shown for
+  review, and there is no delete affordance to offer -- act on it with
+  the manager's own tools, not swamp. A unit that is a
   machine-wide build store (a Maven repository, Go's module cache,
   DerivedData, the Android SDK, ...) is expandable: `Enter`/`→` opens it
   onto the **same** family groups a project container shows (closed
@@ -109,27 +109,28 @@ chunk; all three now ship:
 - **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
   "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
   same way: tool/category/relative-path/project-link facts. Every row
-  carries `Row.unit: Some(...)` (protected/unsupported ones included):
+  carries `Row.unit: Some(...)` (protected/unmarkable ones included):
   `Space`/`Backspace` mark the selected unit through
-  `actions::propose_agents` (the same function `swamp propose-agents`
-  uses) and open the confirm banner with its real consequences
-  (session-removal loss warnings, the linked project); `Enter` executes
-  through the ordinary background-worker path
-  (`actions::execute_plan_progress`) every other markable view already
-  uses -- never a new blocking call on the event/render thread. A
-  protected/unsupported row cannot be marked: `propose_agents`'s own
-  refusal (protected category, no supported action yet, active session)
-  becomes the footer text, never a generic "nothing to delete." Bulk
-  marking (`Shift+A`, `mark_all_in_view`) reaches agent rows too: since
-  `model::agent_rows` sets `Row.unit` but never `Row.kind` (there is no
-  `ArtifactKind` for an agent-storage unit), `mark_all_in_view` has a
-  third branch alongside its `row.kind`/`ArtifactKind` and projects-view
+  `actions::propose_agents` and open the confirm banner with its
+  current facts (session-removal loss warnings, the linked project);
+  `Enter` moves it to the Trash through the ordinary background-worker
+  path (`actions::execute_plan_progress`) every other markable view
+  already uses -- never a new blocking call on the event/render thread,
+  and with no re-check between marking and moving. A protected row, or
+  one whose category has no Trash move at all, cannot be marked:
+  `propose_agents`'s own refusal (protected category, no Trash move for
+  this category, database-like file) becomes the footer text, never a
+  generic "nothing to delete." Bulk marking (`Shift+A`,
+  `mark_all_in_view`) reaches agent rows too: since `model::agent_rows`
+  sets `Row.unit` but never `Row.kind` (there is no `ArtifactKind` for
+  an agent-storage unit), `mark_all_in_view` has a third branch
+  alongside its `row.kind`/`ArtifactKind` and projects-view
   `row.project` ones -- when a row has neither but does carry `unit`, it
-  reuses `mark_row`'s own per-row refusal (`propose_agents`'s protected/
-  unsupported/active reasons) rather than duplicating that logic, and
-  counts a skip instead of a hard stop. The footer names how many agent
-  rows were skipped and why whenever at least one row *was* marked,
-  never silently proceeding as if the skipped rows were not on screen.
+  reuses `mark_row`'s own per-row refusal rather than duplicating that
+  logic, and counts a skip instead of a hard stop. The footer names how
+  many agent rows were skipped and why whenever at least one row *was*
+  marked, never silently proceeding as if the skipped rows were not on
+  screen.
 - **Project tree's collapsed "Agent storage (linked)" row (#100
   completion).** `ViewKind::Tree`'s own drill (`model::tree_rows_with_agents`,
   built from the same `crate::tree::build_project_tree` the CLI's

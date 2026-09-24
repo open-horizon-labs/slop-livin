@@ -434,23 +434,38 @@ fn canary_never_leaks_across_render_text_json_plan_execute_or_ledger() {
     let plan_json = serde_json::to_string(&plan).unwrap();
     assert!(!plan_json.contains(CANARY));
 
-    // 4. Execute result.
-    actions::save_plan(store.path(), &plan).unwrap();
-    actions::approve(store.path(), &plan.id, "human:test").unwrap();
+    // 4. Trash move (what the TUI's Enter does directly, no plan/grant
+    // store any more): one move per unit, straight from the built plan.
     let trash = tempfile::tempdir().unwrap();
-    let result =
-        actions::execute_with_trash(store.path(), &plan.id, "human:test", trash.path()).unwrap();
-    assert_eq!(
-        result
-            .outcomes
-            .iter()
-            .filter(|o| o.status == "completed")
-            .count(),
-        2,
-        "{result:?}"
-    );
-    let result_json = serde_json::to_string(&result).unwrap();
-    assert!(!result_json.contains(CANARY));
+    let mut completed = 0;
+    let ledger = swamp_core::ledger::Ledger::open(store.path().join("ledger.jsonl")).unwrap();
+    for unit in &plan {
+        let meta = unit.agent_meta().unwrap();
+        let at = swamp_core::entities::now();
+        let (dest, bytes) = match &meta.session_members {
+            Some(members) => {
+                actions::trash_agent_session(meta, unit.path(), members, trash.path(), at).unwrap()
+            }
+            None => actions::trash_agent_cache(unit.path(), trash.path(), at).unwrap(),
+        };
+        ledger
+            .append(&swamp_core::ledger::ActionRecord {
+                id: swamp_core::entities::new_id(),
+                verb: swamp_core::ledger::Verb::Delete,
+                entity_id: swamp_core::entities::id_for(&unit.path().display().to_string()),
+                evidence: serde_json::json!({"tool_id": meta.tool_id, "bytes": bytes}),
+                grant_id: swamp_core::ledger::NO_GRANT.to_string(),
+                actor: "human:test".into(),
+                outcome: "completed".into(),
+                recovery_location: Some(dest),
+                measured_free_space_delta: None,
+                observed_path_state: Some("trashed".into()),
+                recorded_at: at,
+            })
+            .unwrap();
+        completed += 1;
+    }
+    assert_eq!(completed, 2);
 
     // 5. Ledger.
     let ledger_text = fs::read_to_string(store.path().join("ledger.jsonl")).unwrap();

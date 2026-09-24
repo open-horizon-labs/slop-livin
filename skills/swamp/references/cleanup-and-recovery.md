@@ -1,121 +1,50 @@
-# Cleanup and recovery lifecycle
+# Finding and restoring what the TUI trashed
 
-Swamp separates four steps, each a separate command, each independently
-inspectable:
+There is no `propose`/`approve`/`execute`/`grant`/`cleanup-check`
+command any more, and no CLI command deletes anything. Deletion happens
+only in the TUI (Space marks, Backspace shows current facts, Enter
+moves the marked paths to the Trash) or by a human running a shell
+command directly. This reference is for the read-only half of that
+lifecycle: how to find what went where, and how to get it back.
 
-1. **Propose** (`swamp propose`) -- build a plan from report rows.
-   Deletes nothing. Always returns `awaiting-authorization`.
-2. **Approve** (`swamp approve <plan_id>`) -- a human writes a one-shot
-   grant scoped to exactly that plan. **You never run this on the
-   human's behalf** -- see `../SKILL.md` and `trust-model.md`.
-3. **Execute** (`swamp execute <plan_id>`) -- re-derives every unit at
-   the sink (still an artifact directory, no activity since the plan,
-   not occupied) before acting. Per-unit outcomes name the fact behind
-   any refusal.
-4. **Recover** -- filesystem removals go to Trash with a restore
-   manifest; Docker removals do not (see the table below).
+## Where things went
 
-## `swamp propose [root] [--filter F] [--path P ...] [--since S] [--json] [--external]`
+Every Trash move appends one line to `~/.local/share/swamp/ledger.jsonl`
+(a `LogFile`; override with `$SWAMP_LEDGER_PATH` for tests/CI, never for
+a real move):
 
-```sh
-swamp propose ~/src --filter 'kind:BuildOutput type:rust age > 30d'
-swamp propose ~/src --path /absolute/path/to/a-worktree
-
-# No root: --path is resolved as an agent-storage unit (see
-# references/agent-storage.md), then as an external unit, in that
-# order. Neither matched is refused by name, never guessed as a
-# filesystem path without a root.
-swamp propose --path /absolute/path/to/a/session/or/agent-cache
-swamp propose --external --path /absolute/path/to/an/external/unit
+```json
+{"id":"...","verb":"Delete","entity_id":"...","evidence":{"label":"...","bytes":123,"observed_at":...,"warnings_shown":[...]},"grant_id":"human-marked","actor":"human:tui","outcome":"completed","recovery_location":"/Users/you/.Trash/target-1700000000","measured_free_space_delta":null,"observed_path_state":"trashed","recorded_at":...}
 ```
 
-`root` is optional: omit it only when every `--path` names an
-agent-storage or external unit, never a filesystem artifact/Cargo
-group/worktree (those always need a `root` to have been walked at
-all). `--external` forces the external-unit route explicitly --
-inspection only, `execute` always refuses it (see
-`references/commands-and-json.md`'s `external` view). `swamp
-propose-agents --path <unit-path>` still works as a deprecated alias
-into the same agent-storage route `propose --path` (no root) uses.
+`recovery_location` is where it went; `None` there means it was removed
+permanently (a Docker image or volume -- Docker has no Trash, so this
+is the one case with nothing to restore). `grant_id` is a historical
+field name kept for ledger compatibility; it carries no authorization
+any more, just the constant `human-marked`.
 
-For a worktree, first inspect `swamp report <root> --view worktrees
---json` for dirty/unpushed/merge evidence, then pass its exact reported
-`path`. The scan root must cover that worktree.
+For a Cargo group or an agent-storage session, several original paths
+moved together into one **envelope** (a directory under the Trash root
+holding each member plus a `restore.json` manifest: original path,
+where it landed inside the envelope, byte count, and `"moved"` /
+`"pending"` status per member -- `"pending"` only if a later member's
+move failed partway through).
 
-Units carry `kind`, `bytes`, `growth_bytes`, `recovery` (`local_rebuild`
-| `network_fetch` | `irrecoverable` | Docker-specific permanent
-warnings), `signals`, `verb` (`delete` | `remove-worktree` | `archive`),
-`track` (git tracking status when known), and `warnings` (dirty,
-unpushed, untracked content, no remote, git store) -- present them to
-the human verbatim; they are the facts a human weighs before approving,
-not something swamp pre-judges. Docker build-cache entries cannot be
-planned: Docker exposes no per-entry removal for build cache, only
-`docker builder prune`, which acts on everything at once.
+## Getting it back
 
-Plans expire (default 30 minutes) and are single-use; `created_at` is
-the review time, not restamped on reuse.
+- **macOS**: the Trash is `~/.Trash`, a plain rename target. Move the
+  item (or the envelope's members, using `restore.json` to match each
+  one back to its original path) back where it came from. For a
+  removed linked worktree, also run `git worktree repair` in the
+  checkout afterward (swamp does not re-run this for you).
+- **Linux**: swamp lays out the freedesktop Trash spec
+  (`$XDG_DATA_HOME/Trash`, defaulting to `~/.local/share/Trash`):
+  `files/<name>` next to `info/<name>.trashinfo` (the original path and
+  deletion time, in the spec's own format). Any spec-compliant desktop
+  file manager, or the `trash` crate's `os_limited::restore_all`, reads
+  and restores it correctly -- swamp's own move is exactly what such a
+  reader expects, nothing bespoke.
 
-## `swamp approve <plan_id>` (human only)
-
-Prints every unit with its facts again, then writes a one-shot grant
-scoped to that plan id and its expiry. This is the human's confirm
-step. For repeated work, a human can instead create a bounded standing
-grant:
-
-```sh
-swamp grant add 'kind:BuildOutput idle > 30d' --budget 5GB --expires 7d [--max-units N]
-swamp grant list --json
-swamp grant revoke <grant-id>
-```
-
-Standing-grant predicates are unit-level only (see `filters.md`);
-budget and expiry are required so a grant can neither live forever nor
-be unbounded.
-
-## `swamp execute <plan_id> [--keep-executables] [--json]`
-
-Refuses per unit with the specific fact, not a generic denial: no grant
-covers it (`awaiting-authorization`), activity changed since the plan
-was proposed, the grant's budget or unit cap is exhausted, the plan
-expired, or the plan already executed. Nothing is touched when refused.
-
-`--keep-executables` copies supported build outputs to `<worktree>/bin/`
-before trashing the build directory (Rust `target/{release,debug}`
-executables, Python `dist/*.whl` and `build/**/*.so`) -- it is not a
-backup of everything in the directory, only those specific outputs.
-
-| Unit | Removal and recovery |
-|---|---|
-| Filesystem path | Moved to Trash; swamp records the recovery location. Bytes remain on disk until Trash itself is emptied. |
-| Linked worktree or checkout | Moved to Trash through its specific action path; inspect warnings about local work and repository context first. |
-| Docker image | Removed by Docker. Recovery depends on the image still being pullable or reproducible -- no Trash. |
-| Docker volume | Removed by Docker; swamp makes no copy of its contents -- irrecoverable. |
-| Docker build-cache record | Reported, but individual removal is refused (see above). |
-
-The ledger (`~/.local/share/swamp/ledger.jsonl`) records every executed
-outcome with its actor string, grant id, and evidence -- independent of
-the index, and never deleted by ordinary operation. Trashed bytes,
-permanently-removed bytes, and measured free-space change are three
-different numbers; do not conflate them.
-
-## Reviewing Cargo build groups: `swamp cleanup-check`
-
-A bounded, paginated review of Cargo build/incremental/test-executable
-groups distinct from the general propose/execute flow:
-
-```sh
-swamp cleanup-check ~/src/my-project --role incremental --limit 5 --json
-swamp cleanup-check ~/src/my-project --role incremental --limit 5 --offset 5 --json
-swamp cleanup-check ~/src --within ~/src/my-project/target --role incremental --limit 5
-swamp cleanup-check ~/src/my-project --path /absolute/path/to/target/debug/incremental/crate-group
-```
-
-Checks read group contents and create **unapproved** plans; they never
-authorize or execute. Results distinguish `blocked`, `unchecked`, and
-`ready_for_review` with reason codes. `next_page`/`next_command` in the
-JSON are argument arrays, not shell strings -- keep the same
-`SWAMP_DIR` across pages so plans it creates stay visible to
-`swamp plans`. A five-group result, or a zero-candidate result, is
-never a measure of the total cleanup opportunity -- see the
-`coverage_limited_count`/`unknown_or_residual_count` fields in its JSON
-output.
+Bytes moved to Trash stay on the same volume until the Trash itself is
+emptied -- "trashed" and "freed" are different facts; do not conflate
+them.

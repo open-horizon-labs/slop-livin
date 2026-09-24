@@ -1,9 +1,7 @@
 # Filter grammar
 
-Shared by the CLI's `--filter`, `propose --filter`, and standing-grant
-predicates (`swamp grant add '<predicate>'`) -- one parser, applied to
-each surface's own row types. Combine predicates with spaces (implicit
-AND).
+Used by the CLI's `--filter` (`report`). Combine predicates with spaces
+(implicit AND).
 
 | Expression | Meaning |
 |---|---|
@@ -30,11 +28,9 @@ Durations: `30m`, `48h`, `7d`, `1w`. Sizes are decimal by default
   output actually consults `--filter` today; other text views and the
   overview do not narrow by it. Use `--json` for a filter that must
   apply everywhere.
-- `propose --filter`: narrows which report rows become plan units.
-- `swamp grant add '<predicate>'`: restricted to unit-level predicates
-  only (`kind:`, `project:`, `idle >`, `merge-complete`) -- growth
-  windows and PR state are report-time filters, not authorization
-  terms, and are rejected if you try to use them in a grant.
+There is no `propose --filter` or `swamp grant add` any more
+(removed 2026-09-23): `--filter` narrows what `report` prints, nothing
+else.
 
 ## Invalid filters
 
