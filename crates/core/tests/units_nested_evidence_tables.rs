@@ -1,26 +1,29 @@
-//! R16 (tables 1-3 of this slice's part of the JSON-in-the-store
+//! R16/R18a-2 (tables 1-3 of this slice's part of the JSON-in-the-store
 //! decomposition): `external_units.parquet`/`agent_units.parquet` (+
-//! `unit_consumers.parquet`) and `nested_artifacts.parquet` are what
-//! `swamp report` builds `ReportSnapshot.external_units`/`.agent_units`
-//! and `Report.nested_artifacts`/`ReportSnapshot.store_interiors` from --
-//! not the snapshot's `report_json`/`external_units_json`/
-//! `agent_units_json` cells. (`evidence.parquet`'s exhaustive
-//! per-variant round trip is `growth::tests::
-//! evidence_table_round_trips_every_status_and_source_variant`; this
-//! file's job is proving the *wiring* -- `observe_scope` writes these
-//! tables from a real discovery pass, and `report_scope_from_store`
-//! rebuilds from them -- not re-proving every `FactValue`/
-//! `EvidenceSource` variant a second time.)
+//! `unit_consumers.parquet`) and `nested_artifacts.parquet` (+
+//! `nested_artifact_lists.parquet`/`nested_artifact_evidence.parquet`)
+//! are what `swamp report` builds `ReportSnapshot.external_units`/
+//! `.agent_units` and `Report.nested_artifacts`/`ReportSnapshot.
+//! store_interiors` from. As of R18a-2 there is no JSON cell for any of
+//! these left to fall back to at all -- `external_units_json`/
+//! `agent_units_json`/`store_interiors_json` are deleted from
+//! `StoredReportSnapshotRow`; `report_json` is the only JSON-encoded
+//! cell remaining, and it no longer carries these fields either.
+//! (`evidence.parquet`'s exhaustive per-variant round trip is
+//! `growth::tests::evidence_table_round_trips_every_status_and_source_
+//! variant`; this file's job is proving the *wiring* -- `observe_scope`
+//! writes these tables from a real discovery pass, and
+//! `report_scope_from_store` rebuilds from them -- not re-proving every
+//! `FactValue`/`EvidenceSource` variant a second time.)
 //!
 //! Adversarial claims, not a happy path:
 //!
 //! 1. After `observe_scope`, all four files exist under the store.
 //! 2. `report_scope_from_store`'s `external_units`/`agent_units`/
 //!    `nested_artifacts` equal the observed ones field for field, even
-//!    after the snapshot's own JSON copies of them are tampered with.
-//!    The tempting shortcut this fails is "keep deserializing the
-//!    snapshot's unit/nested-artifact JSON and merely also write the
-//!    tables".
+//!    after the snapshot's own remaining `report_json` copy is
+//!    tampered with. The tempting shortcut this fails is "keep a JSON
+//!    fallback around and merely also write the tables".
 //!
 //! Disposable `tempfile` fixtures only; the fixture Claude Code home is
 //! synthetic (PRIVACY IS A HARD RULE) -- adapted from
@@ -215,11 +218,14 @@ fn observe_writes_the_four_tables_and_report_rebuilds_units_and_nested_artifacts
     );
 }
 
-/// Tampering with the snapshot's own copies of these fields (the
-/// `report_json`/unit-list JSON cells `write_report_snapshot` still
-/// writes for the not-yet-migrated boundary) must not change what
-/// `report_scope_from_store` returns for the fields R16 migrated:
-/// proof this reads the tables, not the snapshot's JSON.
+/// Tampering with the snapshot's own in-memory copies of these fields
+/// (`write_report_snapshot` no longer persists `external_units`/
+/// `agent_units`/`store_interiors` anywhere at all -- R18a-2 deleted
+/// their JSON cells; only `nested_artifacts` survives into `report_json`
+/// as part of the untouched `Report` struct, cleared for other fields
+/// but not this one) must not change what `report_scope_from_store`
+/// returns for these fields: proof this reads the tables, never a JSON
+/// fallback.
 #[test]
 fn report_reads_units_and_nested_artifacts_from_the_tables_not_the_snapshot_json() {
     let fx = build();

@@ -323,6 +323,20 @@ impl TimeSource {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The inverse of [`Self::label`]. Exhaustive by construction (R18a
+    /// nested-artifact typed columns): an unrecognized label is
+    /// [`Self::Unknown`], never a silently dropped fact, since
+    /// `Unknown` is already this type's own "no timestamp could be
+    /// established" state.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "file-modification" => Self::FileModification,
+            "folded-directory-modification" => Self::FoldedDirectoryModification,
+            "tool-recorded" => Self::ToolRecorded,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// What, if anything, swamp can do to a unit -- carried separately from
@@ -352,6 +366,20 @@ impl NestedActionCapability {
             Self::Unsupported { .. } => "unsupported",
         }
     }
+
+    /// The inverse of [`Self::label`], taking the `Unsupported` reason
+    /// separately since a column stores the tag and the reason in two
+    /// cells (R18a nested-artifact typed columns). An unrecognized tag
+    /// is [`Self::InspectionOnly`] ("no action offered"), the safer
+    /// reading -- never a claimed capability nothing behind it granted.
+    pub fn from_label(label: &str, reason: Option<String>) -> Self {
+        match label {
+            "unsupported" => Self::Unsupported {
+                reason: reason.unwrap_or_default(),
+            },
+            _ => Self::InspectionOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,6 +388,30 @@ pub enum Membership {
     SharedHardlink,
     Residual,
     Unknown,
+}
+
+impl Membership {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::SharedHardlink => "shared-hardlink",
+            Self::Residual => "residual",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The inverse of [`Self::label`]. Exhaustive by construction (R18a):
+    /// an unrecognized label is [`Self::Unknown`], never a silently
+    /// dropped fact, since `Unknown` is already this type's own
+    /// "membership could not be established" state.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "exclusive" => Self::Exclusive,
+            "shared-hardlink" => Self::SharedHardlink,
+            "residual" => Self::Residual,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

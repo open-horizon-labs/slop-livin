@@ -9,6 +9,27 @@ pub enum Confidence {
     Low,
 }
 
+impl Confidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    /// The inverse of [`Self::label`]. Exhaustive by construction (R18a
+    /// nested-artifact typed columns): an unrecognized label falls back
+    /// to [`Self::Low`], the least trusting reading, never a panic.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            _ => Self::Low,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RecoveryContract {
     LocalRebuild,

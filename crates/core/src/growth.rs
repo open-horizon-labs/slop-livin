@@ -1567,9 +1567,6 @@ pub fn write_report_snapshot(
         scope_key: scope_key.to_string(),
         observed_at: snapshot.observed_at,
         report_json: serde_json::to_string(&slim_report_for_snapshot_json(&snapshot.report))?,
-        external_units_json: serde_json::to_string(&snapshot.external_units)?,
-        agent_units_json: serde_json::to_string(&snapshot.agent_units)?,
-        store_interiors_json: serde_json::to_string(&snapshot.store_interiors)?,
     });
     columns::write_report_snapshot_rows(&path, &rows)
         .with_context(|| format!("write {}", path.display()))
@@ -1586,10 +1583,13 @@ pub fn write_report_snapshot(
 /// always calls `rebuild_coverage_series_summary_notes_from_tables` right
 /// after this to fill it in. `report`'s own `notes`/`summary`/
 /// `reconciliation`/series fields come back at their defaults for the
-/// same reason. `external_units`/`agent_units`/`store_interiors` still
-/// come back from this cell (R16): `rebuild_units_from_tables`/
-/// `rebuild_nested_artifacts_from_tables` need them as the merge
-/// fallback for fields their own tables do not carry yet.
+/// same reason. `external_units`/`agent_units`/`store_interiors` also
+/// come back empty (R18a-2: their own tables --
+/// `external_units.parquet`/`agent_units.parquet`/`nested_artifacts.parquet`
+/// -- are now fully typed, so `rebuild_units_from_tables`/
+/// `rebuild_nested_artifacts_from_tables` no longer need a JSON merge
+/// fallback and always overwrite these fields from those tables right
+/// after this call.
 pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportSnapshot> {
     let path = report_snapshot_path(swamp_dir);
     let row = columns::read_report_snapshot_rows(&path)
@@ -1600,9 +1600,9 @@ pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportS
         observed_at: row.observed_at,
         report: serde_json::from_str(&row.report_json).ok()?,
         coverage: Vec::new(),
-        external_units: serde_json::from_str(&row.external_units_json).ok()?,
-        agent_units: serde_json::from_str(&row.agent_units_json).ok()?,
-        store_interiors: serde_json::from_str(&row.store_interiors_json).ok()?,
+        external_units: Vec::new(),
+        agent_units: Vec::new(),
+        store_interiors: Vec::new(),
     })
 }
 
@@ -2996,25 +2996,21 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
 }
 
 /// Rebuilds one `ExternalUnit` from its stored row and its consumers.
-/// `provenance`/`hardlinked` are read from `stored`'s own typed columns
-/// (R18a); `old` (the pre-R18a snapshot copy) is kept only as the
-/// fallback for a store written before those columns existed, so an
-/// older store's next `report` still shows a value rather than
-/// silently reverting to the always-safe default. `evidence` is
-/// intentionally left empty here -- the caller fills it from
-/// `evidence.parquet` by this same id.
+/// Every field is read from `stored`'s own typed columns (R18a); there
+/// is no JSON merge fallback -- `provenance_kind`/`hardlinked` are
+/// always written together with the rest of the row, so a row that
+/// exists at all always carries them. `evidence` is intentionally left
+/// empty here -- the caller fills it from `evidence.parquet` by this
+/// same id.
 pub(crate) fn external_unit_from_stored(
     stored: &columns::StoredUnitRow,
     consumers: Vec<crate::external::ExternalConsumer>,
-    old: Option<&crate::external::ExternalUnit>,
 ) -> crate::external::ExternalUnit {
     let category = crate::external::category_from_str(&stored.category)
         .unwrap_or(crate::locations::StorageCategory::Unclassified);
     let provenance = match &stored.provenance_kind {
         Some(kind) => provenance_from_columns(kind, stored.provenance_value.as_deref()),
-        None => old
-            .map(|o| o.provenance.clone())
-            .unwrap_or(crate::locations::Provenance::BuiltinConvention),
+        None => crate::locations::Provenance::BuiltinConvention,
     };
     crate::external::ExternalUnit {
         detector_id: stored.source_id.clone(),
@@ -3024,10 +3020,7 @@ pub(crate) fn external_unit_from_stored(
         path: PathBuf::from(&stored.path),
         bytes: stored.bytes,
         mtime_max: stored.mtime_max,
-        hardlinked: stored
-            .hardlinked
-            .or_else(|| old.map(|o| o.hardlinked))
-            .unwrap_or(true),
+        hardlinked: stored.hardlinked.unwrap_or(true),
         growth_bytes: stored.growth_bytes,
         regrowth_count: stored.regrowth_count,
         observed_at: stored.observed_at,
@@ -3037,17 +3030,16 @@ pub(crate) fn external_unit_from_stored(
     }
 }
 
-/// Rebuilds one `AgentUnit` from its stored row, its `agent_unit_members.
-/// parquet` rows, and its previous snapshot copy. `tool_home`/
-/// `relative_path`/`hardlinked`/`action` are read from `stored`'s own
-/// typed columns and `members` from `member_rows` (R18a); `old` is kept
-/// only as the fallback for a store written before this slice, same
-/// discipline as `external_unit_from_stored`. `evidence` is left empty
-/// for the same reason as `external_unit_from_stored`.
+/// Rebuilds one `AgentUnit` from its stored row and its
+/// `agent_unit_members.parquet` rows. Every field is read from
+/// `stored`'s own typed columns (`tool_home`/`relative_path`/
+/// `hardlinked`/`action`) and `members` from `member_rows` (R18a); there
+/// is no JSON merge fallback, same discipline as
+/// `external_unit_from_stored`. `evidence` is left empty for the same
+/// reason as `external_unit_from_stored`.
 pub(crate) fn agent_unit_from_stored(
     stored: &columns::StoredUnitRow,
     member_rows: &[&columns::StoredAgentMemberRow],
-    old: Option<&crate::agents::AgentUnit>,
 ) -> crate::agents::AgentUnit {
     let category = crate::agents::AgentCategory::from_label(&stored.category)
         .unwrap_or(crate::agents::AgentCategory::Unclassified);
@@ -3061,15 +3053,10 @@ pub(crate) fn agent_unit_from_stored(
                 stored.project_id.as_deref(),
             )
         })
-        .or_else(|| old.map(|o| o.project_link.clone()))
         .unwrap_or(crate::agents::ProjectLinkState::Unresolved {
             reason: "no stored linkage state".to_string(),
         });
-    let members = if member_rows.is_empty() {
-        old.map(|o| o.members.clone()).unwrap_or_default()
-    } else {
-        agent_members_from_stored(member_rows)
-    };
+    let members = agent_members_from_stored(member_rows);
     crate::agents::AgentUnit {
         tool_id: stored.source_id.clone(),
         tool_name: stored.source_name.clone(),
@@ -3077,22 +3064,14 @@ pub(crate) fn agent_unit_from_stored(
             .tool_home
             .as_deref()
             .map(PathBuf::from)
-            .or_else(|| old.map(|o| o.tool_home.clone()))
             .unwrap_or_default(),
         category,
         id: stored.id.clone(),
-        relative_path: stored
-            .relative_path
-            .clone()
-            .or_else(|| old.map(|o| o.relative_path.clone()))
-            .unwrap_or_default(),
+        relative_path: stored.relative_path.clone().unwrap_or_default(),
         path: PathBuf::from(&stored.path),
         members,
         bytes: stored.bytes,
-        hardlinked: stored
-            .hardlinked
-            .or_else(|| old.map(|o| o.hardlinked))
-            .unwrap_or(true),
+        hardlinked: stored.hardlinked.unwrap_or(true),
         complete: stored.complete.unwrap_or(true),
         growth_bytes: stored.growth_bytes,
         regrowth_count: stored.regrowth_count,
@@ -3105,7 +3084,6 @@ pub(crate) fn agent_unit_from_stored(
             .action
             .as_deref()
             .and_then(crate::agents::AgentActionCapability::from_label)
-            .or_else(|| old.map(|o| o.action))
             .unwrap_or(crate::agents::AgentActionCapability::None),
         note: stored.consequence.clone(),
         evidence: Vec::new(),
@@ -3128,23 +3106,56 @@ fn stored_row_from_nested_artifact(
     origin: &str,
     n: &crate::artifact::NestedArtifact,
 ) -> columns::StoredNestedArtifactRow {
+    let (action_capability, action_unsupported_reason) = match &n.action {
+        crate::artifact::NestedActionCapability::InspectionOnly => {
+            (n.action.label().to_string(), None)
+        }
+        crate::artifact::NestedActionCapability::Unsupported { reason } => {
+            (n.action.label().to_string(), Some(reason.clone()))
+        }
+    };
     columns::StoredNestedArtifactRow {
         scope_key: scope_key.to_string(),
         origin: origin.to_string(),
         id: n.id.clone(),
+        relative_path: n.relative_path.clone(),
+        parent_id: n.parent_id.clone(),
         container_id: n.container_id.clone(),
         adapter: n.adapter.clone(),
         family: n.role.family().label().to_string(),
         role: n.role.label().to_string(),
         path: n.path.display().to_string(),
+        membership: n.membership.label().to_string(),
+        is_dir: n.is_dir,
+        device: n.device,
+        inode: n.inode,
+        logical_bytes: n.logical_bytes,
         bytes: n.bytes,
+        physical_bytes: n.physical_bytes,
+        physical_total: n.physical_total,
         basis: n.basis.label().to_string(),
         mtime: Some(n.mtime_max),
+        time_source: n.time_source.label().to_string(),
+        coverage_supported: n.coverage.supported,
+        coverage_complete: n.coverage.complete,
+        action_group: n.action_group.clone(),
+        present: n.present,
+        growth_bytes: n.growth_bytes,
+        regrowth_count: n.regrowth_count,
+        action_capability,
+        action_unsupported_reason,
         consequence: n.consequence.clone(),
+        reported_by: n.reported_by.clone(),
+        writer_lock: n.writer_lock.as_ref().map(|p| p.display().to_string()),
         variant_profile: n.variant.profile.clone(),
         variant_configuration: n.variant.configuration.clone(),
         variant_target: n.variant.target.clone(),
         variant_arch: n.variant.architecture.clone(),
+        variant_package: n.variant.package.clone(),
+        variant_version: n.variant.version.clone(),
+        variant_toolchain: n.variant.toolchain.clone(),
+        variant_features: n.variant.features.clone(),
+        variant_generation: n.variant.generation.clone(),
         guidance_recommendation: Some(n.guidance.recommendation.clone()),
         guidance_modified_age_secs: n.guidance.modified_age_secs,
         guidance_consequence: Some(n.guidance.consequence.clone()),
@@ -3156,9 +3167,90 @@ fn stored_row_from_nested_artifact(
     }
 }
 
-/// Writes `nested_artifacts.parquet` for `scope_key`, replacing that
-/// scope's rows wholesale, from the two already-measured lists this
-/// same pass produced (`Report.nested_artifacts` and
+const NESTED_LIST_KIND_COVERAGE_LIMIT: &str = "coverage-limit";
+const NESTED_LIST_KIND_VARIANT_UNKNOWN: &str = "variant-unknown";
+const NESTED_EVIDENCE_KIND_PRODUCER: &str = "producer";
+const NESTED_EVIDENCE_KIND_CONSUMER: &str = "consumer";
+
+/// `nested_artifact_lists.parquet` rows for one `NestedArtifact`'s two
+/// list-valued fields (`coverage.limits`, `variant.unknowns`) -- R18a-2.
+fn nested_artifact_list_rows(
+    scope_key: &str,
+    origin: &str,
+    n: &crate::artifact::NestedArtifact,
+) -> Vec<columns::StoredNestedArtifactListRow> {
+    let mut rows = Vec::new();
+    for (seq, value) in n.coverage.limits.iter().enumerate() {
+        rows.push(columns::StoredNestedArtifactListRow {
+            scope_key: scope_key.to_string(),
+            origin: origin.to_string(),
+            artifact_id: n.id.clone(),
+            list_kind: NESTED_LIST_KIND_COVERAGE_LIMIT.to_string(),
+            seq: seq as u32,
+            value: value.clone(),
+        });
+    }
+    for (seq, value) in n.variant.unknowns.iter().enumerate() {
+        rows.push(columns::StoredNestedArtifactListRow {
+            scope_key: scope_key.to_string(),
+            origin: origin.to_string(),
+            artifact_id: n.id.clone(),
+            list_kind: NESTED_LIST_KIND_VARIANT_UNKNOWN.to_string(),
+            seq: seq as u32,
+            value: value.clone(),
+        });
+    }
+    rows
+}
+
+/// `nested_artifact_evidence.parquet` rows for one `NestedArtifact`'s
+/// `producer_evidence`/`consumer_evidence` (the narrower
+/// `ArtifactEvidence` shape, distinct from `decision_evidence`) -- R18a-2.
+fn nested_artifact_evidence_rows(
+    scope_key: &str,
+    origin: &str,
+    n: &crate::artifact::NestedArtifact,
+) -> Vec<columns::StoredNestedArtifactEvidenceRow> {
+    let mut rows = Vec::new();
+    for (seq, e) in n.producer_evidence.iter().enumerate() {
+        rows.push(columns::StoredNestedArtifactEvidenceRow {
+            scope_key: scope_key.to_string(),
+            origin: origin.to_string(),
+            artifact_id: n.id.clone(),
+            kind: NESTED_EVIDENCE_KIND_PRODUCER.to_string(),
+            seq: seq as u32,
+            source: e.source.clone(),
+            detail: e.detail.clone(),
+            confidence: e.confidence.label().to_string(),
+        });
+    }
+    for (seq, e) in n.consumer_evidence.iter().enumerate() {
+        rows.push(columns::StoredNestedArtifactEvidenceRow {
+            scope_key: scope_key.to_string(),
+            origin: origin.to_string(),
+            artifact_id: n.id.clone(),
+            kind: NESTED_EVIDENCE_KIND_CONSUMER.to_string(),
+            seq: seq as u32,
+            source: e.source.clone(),
+            detail: e.detail.clone(),
+            confidence: e.confidence.label().to_string(),
+        });
+    }
+    rows
+}
+
+fn nested_artifact_lists_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("nested_artifact_lists.parquet")
+}
+
+fn nested_artifact_evidence_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("nested_artifact_evidence.parquet")
+}
+
+/// Writes `nested_artifacts.parquet` (+ `nested_artifact_lists.parquet`/
+/// `nested_artifact_evidence.parquet` for the list-valued fields),
+/// replacing that scope's rows wholesale, from the two already-measured
+/// lists this same pass produced (`Report.nested_artifacts` and
 /// `ReportSnapshot.store_interiors`) -- no second pass over either.
 pub fn write_nested_artifact_table(
     swamp_dir: &Path,
@@ -3184,18 +3276,76 @@ pub fn write_nested_artifact_table(
             .map(|n| stored_row_from_nested_artifact(scope_key, NESTED_ORIGIN_STORE_INTERIOR, n)),
     );
     columns::write_nested_artifact_rows(&file, &rows)
-        .with_context(|| format!("write {}", file.display()))
+        .with_context(|| format!("write {}", file.display()))?;
+
+    let lists_file = nested_artifact_lists_path(swamp_dir);
+    let mut list_rows: Vec<columns::StoredNestedArtifactListRow> =
+        columns::read_nested_artifact_list_rows(&lists_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for n in report_nested {
+        list_rows.extend(nested_artifact_list_rows(
+            scope_key,
+            NESTED_ORIGIN_REPORT,
+            n,
+        ));
+    }
+    for n in store_interiors {
+        list_rows.extend(nested_artifact_list_rows(
+            scope_key,
+            NESTED_ORIGIN_STORE_INTERIOR,
+            n,
+        ));
+    }
+    columns::write_nested_artifact_list_rows(&lists_file, &list_rows)
+        .with_context(|| format!("write {}", lists_file.display()))?;
+
+    let evidence_file = nested_artifact_evidence_path(swamp_dir);
+    let mut evidence_rows: Vec<columns::StoredNestedArtifactEvidenceRow> =
+        columns::read_nested_artifact_evidence_rows(&evidence_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for n in report_nested {
+        evidence_rows.extend(nested_artifact_evidence_rows(
+            scope_key,
+            NESTED_ORIGIN_REPORT,
+            n,
+        ));
+    }
+    for n in store_interiors {
+        evidence_rows.extend(nested_artifact_evidence_rows(
+            scope_key,
+            NESTED_ORIGIN_STORE_INTERIOR,
+            n,
+        ));
+    }
+    columns::write_nested_artifact_evidence_rows(&evidence_file, &evidence_rows)
+        .with_context(|| format!("write {}", evidence_file.display()))
 }
 
+/// One `nested_artifacts.parquet` row plus its `nested_artifact_lists.
+/// parquet`/`nested_artifact_evidence.parquet` child rows (keyed by
+/// `(origin, artifact_id)`).
+pub(crate) type NestedArtifactStoredWithChildren = (
+    columns::StoredNestedArtifactRow,
+    Vec<columns::StoredNestedArtifactListRow>,
+    Vec<columns::StoredNestedArtifactEvidenceRow>,
+);
+
 /// Every stored `nested_artifacts.parquet` row for `scope_key`, split
-/// back into the two lists it was written from (`origin`). `None` when
-/// there are no rows yet (an older store).
+/// back into the two lists it was written from (`origin`), each paired
+/// with its child rows. `None` when there are no rows yet (an older
+/// store).
 pub(crate) fn read_nested_artifact_table(
     swamp_dir: &Path,
     scope_key: &str,
 ) -> Option<(
-    Vec<columns::StoredNestedArtifactRow>,
-    Vec<columns::StoredNestedArtifactRow>,
+    Vec<NestedArtifactStoredWithChildren>,
+    Vec<NestedArtifactStoredWithChildren>,
 )> {
     let all: Vec<columns::StoredNestedArtifactRow> =
         columns::read_nested_artifact_rows(&nested_artifacts_path(swamp_dir))
@@ -3206,75 +3356,146 @@ pub(crate) fn read_nested_artifact_table(
     if all.is_empty() {
         return None;
     }
-    let (report, store_interior) = all
+    let list_rows: Vec<columns::StoredNestedArtifactListRow> =
+        columns::read_nested_artifact_list_rows(&nested_artifact_lists_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    let evidence_rows: Vec<columns::StoredNestedArtifactEvidenceRow> =
+        columns::read_nested_artifact_evidence_rows(&nested_artifact_evidence_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+
+    let attach = |row: columns::StoredNestedArtifactRow| {
+        let lists: Vec<columns::StoredNestedArtifactListRow> = list_rows
+            .iter()
+            .filter(|l| l.origin == row.origin && l.artifact_id == row.id)
+            .cloned()
+            .collect();
+        let evidence: Vec<columns::StoredNestedArtifactEvidenceRow> = evidence_rows
+            .iter()
+            .filter(|e| e.origin == row.origin && e.artifact_id == row.id)
+            .cloned()
+            .collect();
+        (row, lists, evidence)
+    };
+
+    let (report, store_interior): (
+        Vec<columns::StoredNestedArtifactRow>,
+        Vec<columns::StoredNestedArtifactRow>,
+    ) = all
         .into_iter()
         .partition(|r| r.origin == NESTED_ORIGIN_REPORT);
-    Some((report, store_interior))
+    Some((
+        report.into_iter().map(attach).collect(),
+        store_interior.into_iter().map(attach).collect(),
+    ))
 }
 
-/// Rebuilds one `NestedArtifact` from its stored row and its previous
-/// snapshot copy, for the fields this slice does not migrate
-/// (`parent_id`, `membership`, `is_dir`, `device`, `inode`,
-/// `logical_bytes`, `physical_bytes`, `physical_total`, `coverage`,
-/// `producer_evidence`/`consumer_evidence`, `action_group`, `present`,
-/// `growth_bytes`, `regrowth_count`, `action`, `reported_by`,
-/// `writer_lock`, and the variant's `package`/`version`/`toolchain`/
-/// `features`/`generation`/`unknowns`). `decision_evidence` is left
-/// empty for `rebuild_evidence_from_table` to fill.
+/// Rebuilds one `NestedArtifact` from its stored row and its
+/// `nested_artifact_lists.parquet`/`nested_artifact_evidence.parquet`
+/// child rows. Every field is read from typed storage (R18a-2); there is
+/// no JSON merge fallback. `decision_evidence` is left empty for
+/// `rebuild_evidence_from_table` to fill.
 pub(crate) fn nested_artifact_from_stored(
     stored: &columns::StoredNestedArtifactRow,
-    old: Option<&crate::artifact::NestedArtifact>,
+    lists: &[columns::StoredNestedArtifactListRow],
+    evidence: &[columns::StoredNestedArtifactEvidenceRow],
 ) -> crate::artifact::NestedArtifact {
     let role = crate::artifact::ArtifactRole::from_label(&stored.role)
         .unwrap_or(crate::artifact::ArtifactRole::Unknown);
     let basis = crate::artifact::AccountingBasis::from_label(&stored.basis)
         .unwrap_or(crate::artifact::AccountingBasis::Unknown);
+
+    let mut coverage_limits: Vec<&columns::StoredNestedArtifactListRow> = lists
+        .iter()
+        .filter(|l| l.list_kind == NESTED_LIST_KIND_COVERAGE_LIMIT)
+        .collect();
+    coverage_limits.sort_by_key(|l| l.seq);
+    let mut variant_unknowns: Vec<&columns::StoredNestedArtifactListRow> = lists
+        .iter()
+        .filter(|l| l.list_kind == NESTED_LIST_KIND_VARIANT_UNKNOWN)
+        .collect();
+    variant_unknowns.sort_by_key(|l| l.seq);
+
+    let mut producer_evidence: Vec<&columns::StoredNestedArtifactEvidenceRow> = evidence
+        .iter()
+        .filter(|e| e.kind == NESTED_EVIDENCE_KIND_PRODUCER)
+        .collect();
+    producer_evidence.sort_by_key(|e| e.seq);
+    let mut consumer_evidence: Vec<&columns::StoredNestedArtifactEvidenceRow> = evidence
+        .iter()
+        .filter(|e| e.kind == NESTED_EVIDENCE_KIND_CONSUMER)
+        .collect();
+    consumer_evidence.sort_by_key(|e| e.seq);
+
+    let to_artifact_evidence =
+        |e: &columns::StoredNestedArtifactEvidenceRow| crate::artifact::ArtifactEvidence {
+            source: e.source.clone(),
+            detail: e.detail.clone(),
+            confidence: crate::entities::Confidence::from_label(&e.confidence),
+        };
+
     let variant = crate::artifact::ArtifactVariant {
         profile: stored.variant_profile.clone(),
         configuration: stored.variant_configuration.clone(),
         target: stored.variant_target.clone(),
         architecture: stored.variant_arch.clone(),
-        package: old.and_then(|o| o.variant.package.clone()),
-        version: old.and_then(|o| o.variant.version.clone()),
-        toolchain: old.and_then(|o| o.variant.toolchain.clone()),
-        features: old.and_then(|o| o.variant.features.clone()),
-        generation: old.and_then(|o| o.variant.generation.clone()),
-        unknowns: old.map(|o| o.variant.unknowns.clone()).unwrap_or_default(),
+        package: stored.variant_package.clone(),
+        version: stored.variant_version.clone(),
+        toolchain: stored.variant_toolchain.clone(),
+        features: stored.variant_features.clone(),
+        generation: stored.variant_generation.clone(),
+        unknowns: variant_unknowns.iter().map(|l| l.value.clone()).collect(),
     };
     crate::artifact::NestedArtifact {
         id: stored.id.clone(),
         path: PathBuf::from(&stored.path),
-        relative_path: old.map(|o| o.relative_path.clone()).unwrap_or_default(),
-        parent_id: old.and_then(|o| o.parent_id.clone()),
+        relative_path: stored.relative_path.clone(),
+        parent_id: stored.parent_id.clone(),
         container_id: stored.container_id.clone(),
         role,
-        membership: old
-            .map(|o| o.membership.clone())
-            .unwrap_or(crate::artifact::Membership::Unknown),
-        is_dir: old.map(|o| o.is_dir).unwrap_or(false),
-        device: old.map(|o| o.device).unwrap_or(0),
-        inode: old.map(|o| o.inode).unwrap_or(0),
-        logical_bytes: old.map(|o| o.logical_bytes).unwrap_or(0),
+        membership: crate::artifact::Membership::from_label(&stored.membership),
+        is_dir: stored.is_dir,
+        device: stored.device,
+        inode: stored.inode,
+        logical_bytes: stored.logical_bytes,
         bytes: stored.bytes,
-        physical_bytes: old.map(|o| o.physical_bytes).unwrap_or(0),
-        physical_total: old.map(|o| o.physical_total).unwrap_or(0),
+        physical_bytes: stored.physical_bytes,
+        physical_total: stored.physical_total,
         mtime_max: stored.mtime.unwrap_or(0),
         variant,
-        producer_evidence: old.map(|o| o.producer_evidence.clone()).unwrap_or_default(),
-        consumer_evidence: old.map(|o| o.consumer_evidence.clone()).unwrap_or_default(),
-        coverage: old.map(|o| o.coverage.clone()).unwrap_or_default(),
-        action_group: old.and_then(|o| o.action_group.clone()),
-        present: old.map(|o| o.present).unwrap_or(true),
-        growth_bytes: old.and_then(|o| o.growth_bytes),
-        regrowth_count: old.map(|o| o.regrowth_count).unwrap_or(0),
+        producer_evidence: producer_evidence
+            .into_iter()
+            .map(to_artifact_evidence)
+            .collect(),
+        consumer_evidence: consumer_evidence
+            .into_iter()
+            .map(to_artifact_evidence)
+            .collect(),
+        coverage: crate::artifact::ArtifactCoverage {
+            supported: stored.coverage_supported,
+            complete: stored.coverage_complete,
+            limits: coverage_limits.iter().map(|l| l.value.clone()).collect(),
+        },
+        action_group: stored.action_group.clone(),
+        present: stored.present,
+        growth_bytes: stored.growth_bytes,
+        regrowth_count: stored.regrowth_count,
         decision_evidence: Vec::new(),
         adapter: stored.adapter.clone(),
         basis,
-        time_source: old.map(|o| o.time_source).unwrap_or_default(),
-        action: old.map(|o| o.action.clone()).unwrap_or_default(),
+        time_source: crate::artifact::TimeSource::from_label(&stored.time_source),
+        action: crate::artifact::NestedActionCapability::from_label(
+            &stored.action_capability,
+            stored.action_unsupported_reason.clone(),
+        ),
         consequence: stored.consequence.clone(),
-        reported_by: old.and_then(|o| o.reported_by.clone()),
-        writer_lock: old.and_then(|o| o.writer_lock.clone()),
+        reported_by: stored.reported_by.clone(),
+        writer_lock: stored.writer_lock.as_ref().map(PathBuf::from),
         guidance: match &stored.guidance_recommendation {
             Some(recommendation) => crate::cargo_cleanup::Guidance {
                 recommendation: recommendation.clone(),
@@ -3286,11 +3507,12 @@ pub(crate) fn nested_artifact_from_stored(
                 message: stored.guidance_message.clone().unwrap_or_default(),
                 next_action: stored.guidance_next_action.clone().unwrap_or_default(),
             },
-            // An older store, written before R18a added these columns:
-            // never recompute from a live clock here (that is exactly
-            // the bug this slice fixed) -- fall back to the snapshot's
-            // last-known value, or a bare default if there is none.
-            None => old.map(|o| o.guidance.clone()).unwrap_or_default(),
+            // Never recompute from a live clock here (that is exactly
+            // the bug R18a's first session fixed) -- a row written by
+            // this slice's writer always carries a recommendation, so
+            // this is only reachable for a row from a store older than
+            // that fix, where a bare default is the honest answer.
+            None => crate::cargo_cleanup::Guidance::default(),
         },
     }
 }
@@ -7156,8 +7378,7 @@ mod tests {
                 note: c.basis.clone(),
             })
             .collect();
-        let rebuilt_external =
-            external_unit_from_stored(&tables.external[0], rebuilt_consumers, None);
+        let rebuilt_external = external_unit_from_stored(&tables.external[0], rebuilt_consumers);
         assert_eq!(
             serde_json::to_value(&rebuilt_external).unwrap(),
             serde_json::to_value(&external).unwrap(),
@@ -7170,7 +7391,7 @@ mod tests {
                 .iter()
                 .filter(|m| m.unit_id == stored.id)
                 .collect();
-            let rebuilt = agent_unit_from_stored(stored, &member_rows, None);
+            let rebuilt = agent_unit_from_stored(stored, &member_rows);
             assert_eq!(
                 serde_json::to_value(&rebuilt).unwrap(),
                 serde_json::to_value(original).unwrap(),
@@ -7264,20 +7485,29 @@ mod tests {
         assert!(rebuilt2[0].containers.is_empty() && rebuilt2[0].evidence.is_empty());
     }
 
-    /// R16 item 2: a `NestedArtifact`'s `container_id`/`adapter`/`family`/
-    /// `role`/`path`/`bytes`/`basis`/`mtime`/`consequence`/variant
-    /// scalars round-trip, and `nested_artifacts.parquet` splits a
-    /// `Report.nested_artifacts` row back out from a
+    /// R18a-2: every `NestedArtifact` field -- including the ones this
+    /// slice adds typed columns for (`relative_path`, `parent_id`,
+    /// `membership`, `is_dir`, `device`, `inode`, `logical_bytes`,
+    /// `physical_bytes`, `physical_total`, `time_source`, `coverage`
+    /// (with non-empty `limits`), `action_group`, `present`,
+    /// `growth_bytes`, `regrowth_count`, `action` (the `Unsupported`
+    /// variant, to prove the reason string round-trips), `reported_by`,
+    /// `writer_lock`, the variant's `package`/`version`/`toolchain`/
+    /// `features`/`generation`/`unknowns`, and non-empty
+    /// `producer_evidence`/`consumer_evidence`) -- round-trips with NO
+    /// JSON merge fallback of any kind, and `nested_artifacts.parquet`
+    /// splits a `Report.nested_artifacts` row back out from a
     /// `ReportSnapshot.store_interiors` row by `origin`, never mixing
-    /// the two lists. R18a adds `guidance` (the cargo-cleanup
-    /// recommendation) as its own typed columns, round-tripped with no
-    /// snapshot fallback at all.
+    /// the two lists. This fails the shortcut "still secretly reading a
+    /// snapshot fallback" outright: `nested_artifact_from_stored` no
+    /// longer takes a fallback value to fall back to at all.
     #[test]
     fn nested_artifact_table_round_trips_every_field_and_splits_by_origin() {
         use crate::artifact::{
-            AccountingBasis, ArtifactRole, ArtifactVariant, Membership, NestedActionCapability,
-            NestedArtifact, TimeSource,
+            AccountingBasis, ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant,
+            Membership, NestedActionCapability, NestedArtifact, TimeSource,
         };
+        use crate::entities::Confidence;
 
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path();
@@ -7310,9 +7540,31 @@ mod tests {
                 generation: None,
                 unknowns: vec!["extra".into()],
             },
-            producer_evidence: Vec::new(),
-            consumer_evidence: Vec::new(),
-            coverage: Default::default(),
+            producer_evidence: vec![ArtifactEvidence {
+                source: "cargo-metadata".into(),
+                detail: "target-dir declared by workspace manifest".into(),
+                confidence: Confidence::High,
+            }],
+            consumer_evidence: vec![
+                ArtifactEvidence {
+                    source: "lockfile".into(),
+                    detail: "package a v0.1.0 depends on this target".into(),
+                    confidence: Confidence::Medium,
+                },
+                ArtifactEvidence {
+                    source: "open-file".into(),
+                    detail: "rustc holds a file open under this path".into(),
+                    confidence: Confidence::Low,
+                },
+            ],
+            coverage: ArtifactCoverage {
+                supported: true,
+                complete: false,
+                limits: vec![
+                    "profile detection needs cargo-metadata".into(),
+                    "workspace member count unknown".into(),
+                ],
+            },
             action_group: Some("group-1".into()),
             present: true,
             growth_bytes: Some(100),
@@ -7367,28 +7619,180 @@ mod tests {
         assert_eq!(report_rows.len(), 1);
         assert_eq!(interior_rows.len(), 1);
 
-        // Most fields here still come from `old` (the pre-R16/R18a
-        // snapshot fallback) -- this test's whole point. `guidance`
-        // (R18a) is the exception: a second assertion below rebuilds
-        // with `old: None` to prove it comes back from its own typed
-        // columns, not this fallback.
-        let rebuilt_report = nested_artifact_from_stored(&report_rows[0], Some(&report_one));
+        // Every field comes back from typed storage alone --
+        // `nested_artifact_from_stored` takes no snapshot/JSON fallback
+        // value at all, so this is the only way these assertions could
+        // pass.
+        let (report_stored, report_lists, report_evidence) = &report_rows[0];
+        let rebuilt_report =
+            nested_artifact_from_stored(report_stored, report_lists, report_evidence);
         assert_eq!(
             serde_json::to_value(&rebuilt_report).unwrap(),
             serde_json::to_value(&report_one).unwrap()
         );
-        let rebuilt_interior = nested_artifact_from_stored(&interior_rows[0], Some(&interior_one));
+        let (interior_stored, interior_lists, interior_evidence) = &interior_rows[0];
+        let rebuilt_interior =
+            nested_artifact_from_stored(interior_stored, interior_lists, interior_evidence);
         assert_eq!(
             serde_json::to_value(&rebuilt_interior).unwrap(),
             serde_json::to_value(&interior_one).unwrap()
         );
-        let rebuilt_report_no_fallback = nested_artifact_from_stored(&report_rows[0], None);
-        assert_eq!(
-            rebuilt_report_no_fallback.guidance, report_one.guidance,
-            "guidance must round-trip through its own typed columns with no snapshot fallback"
-        );
 
         assert!(read_nested_artifact_table(store, "missing").is_none());
+    }
+
+    /// R18a-2 tamper test: editing `nested_artifacts.parquet`'s row and
+    /// `nested_artifact_lists.parquet`/`nested_artifact_evidence.
+    /// parquet`'s child rows directly on disk (never touching
+    /// `report_one`/`interior_one` in memory) and reading back through
+    /// `read_nested_artifact_table`/`nested_artifact_from_stored` must
+    /// reflect exactly the edit -- proof the rebuild is driven by these
+    /// tables' own bytes, not any leftover in-memory/JSON copy. Also
+    /// asserts the tampered scalar and the tampered list values do not
+    /// leak onto the *other* artifact's row (`interior_one` must stay
+    /// exactly as written), so a bug that keyed a table read only by
+    /// `list_kind`/`kind` without also filtering by `artifact_id` would
+    /// fail this.
+    #[test]
+    fn nested_artifact_tables_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        use crate::artifact::{
+            AccountingBasis, ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant,
+            Membership, NestedActionCapability, NestedArtifact, TimeSource,
+        };
+        use crate::entities::Confidence;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let report_one = NestedArtifact {
+            id: "n1".into(),
+            path: PathBuf::from("/src/one/target/debug"),
+            relative_path: "target/debug".into(),
+            parent_id: None,
+            container_id: None,
+            role: ArtifactRole::Profile,
+            membership: Membership::Exclusive,
+            is_dir: true,
+            device: 5,
+            inode: 99,
+            logical_bytes: 4000,
+            bytes: 3000,
+            physical_bytes: 3000,
+            physical_total: 3000,
+            mtime_max: 555,
+            variant: ArtifactVariant {
+                unknowns: vec!["extra".into()],
+                ..Default::default()
+            },
+            producer_evidence: vec![ArtifactEvidence {
+                source: "cargo-metadata".into(),
+                detail: "original detail".into(),
+                confidence: Confidence::High,
+            }],
+            consumer_evidence: Vec::new(),
+            coverage: ArtifactCoverage {
+                supported: true,
+                complete: true,
+                limits: vec!["original limit".into()],
+            },
+            action_group: None,
+            present: true,
+            growth_bytes: None,
+            regrowth_count: 0,
+            decision_evidence: Vec::new(),
+            adapter: None,
+            basis: AccountingBasis::Allocated,
+            time_source: TimeSource::FileModification,
+            action: NestedActionCapability::InspectionOnly,
+            consequence: None,
+            reported_by: None,
+            writer_lock: None,
+            guidance: crate::cargo_cleanup::Guidance::default(),
+        };
+        let interior_one = NestedArtifact {
+            id: "n2".into(),
+            path: PathBuf::from("/store/pnpm/pkg@1.0.0"),
+            ..report_one.clone()
+        };
+
+        write_nested_artifact_table(
+            store,
+            "k",
+            std::slice::from_ref(&report_one),
+            std::slice::from_ref(&interior_one),
+        )
+        .unwrap();
+
+        // Directly rewrite the three files on disk, bypassing every
+        // production writer, exactly like a corrupted/hand-edited store
+        // -- only `report_one`'s row/list/evidence rows are touched.
+        let rows_file = nested_artifacts_path(store);
+        let mut rows = columns::read_nested_artifact_rows(&rows_file).unwrap();
+        for r in &mut rows {
+            if r.id == "n1" {
+                r.bytes = 999_999;
+            }
+        }
+        columns::write_nested_artifact_rows(&rows_file, &rows).unwrap();
+
+        let lists_file = nested_artifact_lists_path(store);
+        let mut lists = columns::read_nested_artifact_list_rows(&lists_file).unwrap();
+        for l in &mut lists {
+            if l.artifact_id == "n1" {
+                l.value = format!("TAMPERED-{}", l.value);
+            }
+        }
+        columns::write_nested_artifact_list_rows(&lists_file, &lists).unwrap();
+
+        let evidence_file = nested_artifact_evidence_path(store);
+        let mut evidence = columns::read_nested_artifact_evidence_rows(&evidence_file).unwrap();
+        for e in &mut evidence {
+            if e.artifact_id == "n1" {
+                e.detail = format!("TAMPERED-{}", e.detail);
+            }
+        }
+        columns::write_nested_artifact_evidence_rows(&evidence_file, &evidence).unwrap();
+
+        let (report_rows, interior_rows) =
+            read_nested_artifact_table(store, "k").expect("rows for k");
+        let (report_stored, report_lists, report_evidence) = &report_rows[0];
+        let rebuilt_report =
+            nested_artifact_from_stored(report_stored, report_lists, report_evidence);
+        assert_eq!(
+            rebuilt_report.bytes, 999_999,
+            "the rebuild must reflect the tampered row's own bytes, not the original in-memory value"
+        );
+        assert!(
+            rebuilt_report.coverage.limits[0].starts_with("TAMPERED-"),
+            "the rebuild must reflect the tampered coverage-limit list row"
+        );
+        assert!(
+            rebuilt_report.variant.unknowns[0].starts_with("TAMPERED-"),
+            "a variant-unknown list row keyed by list_kind must not be conflated with a \
+             coverage-limit row for the same artifact"
+        );
+        assert!(
+            rebuilt_report.producer_evidence[0]
+                .detail
+                .starts_with("TAMPERED-"),
+            "the rebuild must reflect the tampered evidence row"
+        );
+
+        let (interior_stored, interior_lists, interior_evidence) = &interior_rows[0];
+        let rebuilt_interior =
+            nested_artifact_from_stored(interior_stored, interior_lists, interior_evidence);
+        assert_eq!(
+            rebuilt_interior.bytes, interior_one.bytes,
+            "n2's row must be untouched by n1's tamper"
+        );
+        assert_eq!(
+            rebuilt_interior.coverage.limits, interior_one.coverage.limits,
+            "n2's coverage-limit list must not pick up n1's tampered value"
+        );
+        assert_eq!(
+            rebuilt_interior.producer_evidence, interior_one.producer_evidence,
+            "n2's evidence must not pick up n1's tampered value"
+        );
     }
 
     /// R16 item 3: every `FactStatus` (`Known` with every `FactValue`

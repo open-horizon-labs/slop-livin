@@ -1306,11 +1306,14 @@ pub(super) fn compact_external_deltas(dir: &Path, files: &[PathBuf], horizon: u6
 // key, replaced wholesale by every `observe` that covers that scope --
 // like `unowned.parquet`/`folded.parquet`, this is a measurement cache,
 // not reverse-delta history. The rendered `Report` (evidence, tracking
-// and Docker joins already attached by the pipeline that produced it),
-// per-root coverage, external units, agent units and store interiors
-// are each JSON-encoded into their own Parquet `Utf8` cell -- a cell
-// encoding, not a JSON file on disk, exactly like `unowned.parquet`'s
-// `evidence_json`/`containers_json` columns.
+// and Docker joins already attached by the pipeline that produced it)
+// is JSON-encoded into its own Parquet `Utf8` cell -- a cell encoding,
+// not a JSON file on disk. Per-root coverage, external units, agent
+// units and store interiors each moved to their own typed tables (R17
+// item 1, R18a items 1 and 2); `report_json` is the only JSON-encoded
+// cell left in this row, and after this table itself the only `_json`
+// field left anywhere in this module (R18a-3 deletes it and this whole
+// table).
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1325,19 +1328,6 @@ pub struct StoredReportSnapshotRow {
     /// -- those tables are authoritative, and this cell no longer
     /// duplicates them.
     pub report_json: String,
-    /// JSON-encoded `Vec<crate::external::ExternalUnit>`: R16's own copy,
-    /// kept (not removed by R17) because `rebuild_units_from_tables`
-    /// still reads it as the merge fallback for the fields
-    /// `external_units.parquet` does not carry yet (`provenance`,
-    /// `hardlinked`) -- unlike `coverage`, this is not pure duplication.
-    pub external_units_json: String,
-    /// JSON-encoded `Vec<crate::agents::AgentUnit>`: same reason
-    /// (`tool_home`/`relative_path`/`members`/`action`).
-    pub agent_units_json: String,
-    /// JSON-encoded `Vec<crate::artifact::NestedArtifact>`: same reason
-    /// (the fields `rebuild_nested_artifact_from_stored` still carries
-    /// over by id).
-    pub store_interiors_json: String,
 }
 
 fn report_snapshot_schema() -> Arc<Schema> {
@@ -1345,9 +1335,6 @@ fn report_snapshot_schema() -> Arc<Schema> {
         Field::new("scope_key", DataType::Utf8, false),
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("report_json", DataType::Utf8, false),
-        Field::new("external_units_json", DataType::Utf8, false),
-        Field::new("agent_units_json", DataType::Utf8, false),
-        Field::new("store_interiors_json", DataType::Utf8, false),
     ]))
 }
 
@@ -1359,15 +1346,6 @@ pub(super) fn write_report_snapshot_rows(
     let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
     let report_json: Vec<&str> = rows.iter().map(|r| r.report_json.as_str()).collect();
-    let external_units_json: Vec<&str> = rows
-        .iter()
-        .map(|r| r.external_units_json.as_str())
-        .collect();
-    let agent_units_json: Vec<&str> = rows.iter().map(|r| r.agent_units_json.as_str()).collect();
-    let store_interiors_json: Vec<&str> = rows
-        .iter()
-        .map(|r| r.store_interiors_json.as_str())
-        .collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1375,9 +1353,6 @@ pub(super) fn write_report_snapshot_rows(
             Arc::new(StringArray::from(scope_key)) as ArrayRef,
             Arc::new(UInt64Array::from(observed_at)),
             Arc::new(StringArray::from(report_json)),
-            Arc::new(StringArray::from(external_units_json)),
-            Arc::new(StringArray::from(agent_units_json)),
-            Arc::new(StringArray::from(store_interiors_json)),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -1404,17 +1379,11 @@ pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportS
         let scope_key = downcast_str(&batch, "scope_key")?;
         let observed_at = downcast_u64(&batch, "observed_at")?;
         let report_json = downcast_str(&batch, "report_json")?;
-        let external_units_json = downcast_str(&batch, "external_units_json")?;
-        let agent_units_json = downcast_str(&batch, "agent_units_json")?;
-        let store_interiors_json = downcast_str(&batch, "store_interiors_json")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredReportSnapshotRow {
                 scope_key: scope_key.value(i).to_string(),
                 observed_at: observed_at.value(i),
                 report_json: report_json.value(i).to_string(),
-                external_units_json: external_units_json.value(i).to_string(),
-                agent_units_json: agent_units_json.value(i).to_string(),
-                store_interiors_json: store_interiors_json.value(i).to_string(),
             });
         }
     }
@@ -2908,19 +2877,44 @@ pub(crate) struct StoredNestedArtifactRow {
     pub(crate) scope_key: String,
     pub(crate) origin: String,
     pub(crate) id: String,
+    pub(crate) relative_path: String,
+    pub(crate) parent_id: Option<String>,
     pub(crate) container_id: Option<String>,
     pub(crate) adapter: Option<String>,
     pub(crate) family: String,
     pub(crate) role: String,
     pub(crate) path: String,
+    pub(crate) membership: String,
+    pub(crate) is_dir: bool,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) logical_bytes: u64,
     pub(crate) bytes: u64,
+    pub(crate) physical_bytes: u64,
+    pub(crate) physical_total: u64,
     pub(crate) basis: String,
     pub(crate) mtime: Option<u64>,
+    pub(crate) time_source: String,
+    pub(crate) coverage_supported: bool,
+    pub(crate) coverage_complete: bool,
+    pub(crate) action_group: Option<String>,
+    pub(crate) present: bool,
+    pub(crate) growth_bytes: Option<i64>,
+    pub(crate) regrowth_count: u32,
+    pub(crate) action_capability: String,
+    pub(crate) action_unsupported_reason: Option<String>,
     pub(crate) consequence: Option<String>,
+    pub(crate) reported_by: Option<String>,
+    pub(crate) writer_lock: Option<String>,
     pub(crate) variant_profile: Option<String>,
     pub(crate) variant_configuration: Option<String>,
     pub(crate) variant_target: Option<String>,
     pub(crate) variant_arch: Option<String>,
+    pub(crate) variant_package: Option<String>,
+    pub(crate) variant_version: Option<String>,
+    pub(crate) variant_toolchain: Option<String>,
+    pub(crate) variant_features: Option<String>,
+    pub(crate) variant_generation: Option<String>,
     /// `cargo_cleanup::Guidance`, computed once at observe time from
     /// this report's own `observed_at` and stored here (R18a) so a
     /// later `report_scope_from_store` rebuild never recomputes it from
@@ -2943,19 +2937,44 @@ fn nested_artifacts_schema() -> Arc<Schema> {
         Field::new("scope_key", DataType::Utf8, false),
         Field::new("origin", DataType::Utf8, false),
         Field::new("id", DataType::Utf8, false),
+        Field::new("relative_path", DataType::Utf8, false),
+        Field::new("parent_id", DataType::Utf8, true),
         Field::new("container_id", DataType::Utf8, true),
         Field::new("adapter", DataType::Utf8, true),
         Field::new("family", DataType::Utf8, false),
         Field::new("role", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
+        Field::new("membership", DataType::Utf8, false),
+        Field::new("is_dir", DataType::Boolean, false),
+        Field::new("device", DataType::UInt64, false),
+        Field::new("inode", DataType::UInt64, false),
+        Field::new("logical_bytes", DataType::UInt64, false),
         Field::new("bytes", DataType::UInt64, false),
+        Field::new("physical_bytes", DataType::UInt64, false),
+        Field::new("physical_total", DataType::UInt64, false),
         Field::new("basis", DataType::Utf8, false),
         Field::new("mtime", DataType::UInt64, true),
+        Field::new("time_source", DataType::Utf8, false),
+        Field::new("coverage_supported", DataType::Boolean, false),
+        Field::new("coverage_complete", DataType::Boolean, false),
+        Field::new("action_group", DataType::Utf8, true),
+        Field::new("present", DataType::Boolean, false),
+        Field::new("growth_bytes", DataType::Int64, true),
+        Field::new("regrowth_count", DataType::UInt32, false),
+        Field::new("action_capability", DataType::Utf8, false),
+        Field::new("action_unsupported_reason", DataType::Utf8, true),
         Field::new("consequence", DataType::Utf8, true),
+        Field::new("reported_by", DataType::Utf8, true),
+        Field::new("writer_lock", DataType::Utf8, true),
         Field::new("variant_profile", DataType::Utf8, true),
         Field::new("variant_configuration", DataType::Utf8, true),
         Field::new("variant_target", DataType::Utf8, true),
         Field::new("variant_arch", DataType::Utf8, true),
+        Field::new("variant_package", DataType::Utf8, true),
+        Field::new("variant_version", DataType::Utf8, true),
+        Field::new("variant_toolchain", DataType::Utf8, true),
+        Field::new("variant_features", DataType::Utf8, true),
+        Field::new("variant_generation", DataType::Utf8, true),
         Field::new("guidance_recommendation", DataType::Utf8, true),
         Field::new("guidance_modified_age_secs", DataType::UInt64, true),
         Field::new("guidance_consequence", DataType::Utf8, true),
@@ -2986,6 +3005,12 @@ pub(crate) fn write_nested_artifact_rows(
             Arc::new(StringArray::from(
                 rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.relative_path.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, parent_id),
             opt_str_col!(rows, container_id),
             opt_str_col!(rows, adapter),
             Arc::new(StringArray::from(
@@ -2997,18 +3022,75 @@ pub(crate) fn write_nested_artifact_rows(
             Arc::new(StringArray::from(
                 rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.membership.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.is_dir).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.device).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.inode).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.logical_bytes).collect::<Vec<_>>(),
+            )),
             Arc::new(UInt64Array::from(
                 rows.iter().map(|r| r.bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.physical_bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.physical_total).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
                 rows.iter().map(|r| r.basis.as_str()).collect::<Vec<_>>(),
             )),
             opt_u64_col!(rows, mtime),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.time_source.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter()
+                    .map(|r| r.coverage_supported)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.coverage_complete).collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, action_group),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.present).collect::<Vec<_>>(),
+            )),
+            opt_i64_col!(rows, growth_bytes),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.regrowth_count).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.action_capability.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            opt_str_col!(rows, action_unsupported_reason),
             opt_str_col!(rows, consequence),
+            opt_str_col!(rows, reported_by),
+            opt_str_col!(rows, writer_lock),
             opt_str_col!(rows, variant_profile),
             opt_str_col!(rows, variant_configuration),
             opt_str_col!(rows, variant_target),
             opt_str_col!(rows, variant_arch),
+            opt_str_col!(rows, variant_package),
+            opt_str_col!(rows, variant_version),
+            opt_str_col!(rows, variant_toolchain),
+            opt_str_col!(rows, variant_features),
+            opt_str_col!(rows, variant_generation),
             opt_str_col!(rows, guidance_recommendation),
             opt_u64_col!(rows, guidance_modified_age_secs),
             opt_str_col!(rows, guidance_consequence),
@@ -3043,29 +3125,68 @@ pub(crate) fn read_nested_artifact_rows(path: &Path) -> Result<Vec<StoredNestedA
         let scope_key = downcast_str(&batch, "scope_key")?;
         let origin = downcast_str(&batch, "origin")?;
         let id = downcast_str(&batch, "id")?;
+        let relative_path = downcast_str(&batch, "relative_path")?;
         let family = downcast_str(&batch, "family")?;
         let role = downcast_str(&batch, "role")?;
         let path_col = downcast_str(&batch, "path")?;
+        let membership = downcast_str(&batch, "membership")?;
+        let is_dir = downcast_bool(&batch, "is_dir")?;
+        let device = downcast_u64(&batch, "device")?;
+        let inode = downcast_u64(&batch, "inode")?;
+        let logical_bytes = downcast_u64(&batch, "logical_bytes")?;
         let bytes = downcast_u64(&batch, "bytes")?;
+        let physical_bytes = downcast_u64(&batch, "physical_bytes")?;
+        let physical_total = downcast_u64(&batch, "physical_total")?;
         let basis = downcast_str(&batch, "basis")?;
+        let time_source = downcast_str(&batch, "time_source")?;
+        let coverage_supported = downcast_bool(&batch, "coverage_supported")?;
+        let coverage_complete = downcast_bool(&batch, "coverage_complete")?;
+        let present = downcast_bool(&batch, "present")?;
+        let regrowth_count = downcast_u32(&batch, "regrowth_count")?;
+        let action_capability = downcast_str(&batch, "action_capability")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredNestedArtifactRow {
                 scope_key: scope_key.value(i).to_string(),
                 origin: origin.value(i).to_string(),
                 id: id.value(i).to_string(),
+                relative_path: relative_path.value(i).to_string(),
+                parent_id: opt_str(&batch, "parent_id", i)?,
                 container_id: opt_str(&batch, "container_id", i)?,
                 adapter: opt_str(&batch, "adapter", i)?,
                 family: family.value(i).to_string(),
                 role: role.value(i).to_string(),
                 path: path_col.value(i).to_string(),
+                membership: membership.value(i).to_string(),
+                is_dir: is_dir.value(i),
+                device: device.value(i),
+                inode: inode.value(i),
+                logical_bytes: logical_bytes.value(i),
                 bytes: bytes.value(i),
+                physical_bytes: physical_bytes.value(i),
+                physical_total: physical_total.value(i),
                 basis: basis.value(i).to_string(),
                 mtime: opt_u64(&batch, "mtime", i)?,
+                time_source: time_source.value(i).to_string(),
+                coverage_supported: coverage_supported.value(i),
+                coverage_complete: coverage_complete.value(i),
+                action_group: opt_str(&batch, "action_group", i)?,
+                present: present.value(i),
+                growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
+                regrowth_count: regrowth_count.value(i),
+                action_capability: action_capability.value(i).to_string(),
+                action_unsupported_reason: opt_str(&batch, "action_unsupported_reason", i)?,
                 consequence: opt_str(&batch, "consequence", i)?,
+                reported_by: opt_str(&batch, "reported_by", i)?,
+                writer_lock: opt_str(&batch, "writer_lock", i)?,
                 variant_profile: opt_str(&batch, "variant_profile", i)?,
                 variant_configuration: opt_str(&batch, "variant_configuration", i)?,
                 variant_target: opt_str(&batch, "variant_target", i)?,
                 variant_arch: opt_str(&batch, "variant_arch", i)?,
+                variant_package: opt_str(&batch, "variant_package", i)?,
+                variant_version: opt_str(&batch, "variant_version", i)?,
+                variant_toolchain: opt_str(&batch, "variant_toolchain", i)?,
+                variant_features: opt_str(&batch, "variant_features", i)?,
+                variant_generation: opt_str(&batch, "variant_generation", i)?,
                 guidance_recommendation: opt_str(&batch, "guidance_recommendation", i)?,
                 guidance_modified_age_secs: opt_u64(&batch, "guidance_modified_age_secs", i)?,
                 guidance_consequence: opt_str(&batch, "guidance_consequence", i)?,
@@ -3074,6 +3195,223 @@ pub(crate) fn read_nested_artifact_rows(path: &Path) -> Result<Vec<StoredNestedA
                 guidance_reason_code: opt_str(&batch, "guidance_reason_code", i)?,
                 guidance_message: opt_str(&batch, "guidance_message", i)?,
                 guidance_next_action: opt_str(&batch, "guidance_next_action", i)?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// nested_artifact_lists.parquet (R18a-2): one row per
+// `NestedArtifact::coverage.limits` entry or `ArtifactVariant::unknowns`
+// entry, disambiguated by `list_kind` (`"coverage-limit"` |
+// `"variant-unknown"`). Keyed by `(scope_key, origin, artifact_id)` --
+// the same origin split as `nested_artifacts.parquet` itself, since the
+// two origins' id spaces are not guaranteed disjoint.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredNestedArtifactListRow {
+    pub(crate) scope_key: String,
+    pub(crate) origin: String,
+    pub(crate) artifact_id: String,
+    pub(crate) list_kind: String,
+    pub(crate) seq: u32,
+    pub(crate) value: String,
+}
+
+fn nested_artifact_list_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("origin", DataType::Utf8, false),
+        Field::new("artifact_id", DataType::Utf8, false),
+        Field::new("list_kind", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("value", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_nested_artifact_list_rows(
+    path: &Path,
+    rows: &[StoredNestedArtifactListRow],
+) -> Result<()> {
+    let schema = nested_artifact_list_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.origin.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.artifact_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.list_kind.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_nested_artifact_list_rows(
+    path: &Path,
+) -> Result<Vec<StoredNestedArtifactListRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let origin = downcast_str(&batch, "origin")?;
+        let artifact_id = downcast_str(&batch, "artifact_id")?;
+        let list_kind = downcast_str(&batch, "list_kind")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let value = downcast_str(&batch, "value")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredNestedArtifactListRow {
+                scope_key: scope_key.value(i).to_string(),
+                origin: origin.value(i).to_string(),
+                artifact_id: artifact_id.value(i).to_string(),
+                list_kind: list_kind.value(i).to_string(),
+                seq: seq.value(i),
+                value: value.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// nested_artifact_evidence.parquet (R18a-2): one row per
+// `NestedArtifact::producer_evidence`/`::consumer_evidence` entry (the
+// narrower `ArtifactEvidence { source, detail, confidence }` shape,
+// distinct from `evidence.parquet`'s `crate::evidence::Evidence`
+// contract -- see the `nested_artifacts.parquet` header comment above).
+// Disambiguated by `kind` (`"producer"` | `"consumer"`); keyed by
+// `(scope_key, origin, artifact_id)` like `nested_artifact_lists.parquet`.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredNestedArtifactEvidenceRow {
+    pub(crate) scope_key: String,
+    pub(crate) origin: String,
+    pub(crate) artifact_id: String,
+    pub(crate) kind: String,
+    pub(crate) seq: u32,
+    pub(crate) source: String,
+    pub(crate) detail: String,
+    pub(crate) confidence: String,
+}
+
+fn nested_artifact_evidence_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("origin", DataType::Utf8, false),
+        Field::new("artifact_id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("detail", DataType::Utf8, false),
+        Field::new("confidence", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_nested_artifact_evidence_rows(
+    path: &Path,
+    rows: &[StoredNestedArtifactEvidenceRow],
+) -> Result<()> {
+    let schema = nested_artifact_evidence_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.origin.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.artifact_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.confidence.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_nested_artifact_evidence_rows(
+    path: &Path,
+) -> Result<Vec<StoredNestedArtifactEvidenceRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let origin = downcast_str(&batch, "origin")?;
+        let artifact_id = downcast_str(&batch, "artifact_id")?;
+        let kind = downcast_str(&batch, "kind")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let source = downcast_str(&batch, "source")?;
+        let detail = downcast_str(&batch, "detail")?;
+        let confidence = downcast_str(&batch, "confidence")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredNestedArtifactEvidenceRow {
+                scope_key: scope_key.value(i).to_string(),
+                origin: origin.value(i).to_string(),
+                artifact_id: artifact_id.value(i).to_string(),
+                kind: kind.value(i).to_string(),
+                seq: seq.value(i),
+                source: source.value(i).to_string(),
+                detail: detail.value(i).to_string(),
+                confidence: confidence.value(i).to_string(),
             });
         }
     }

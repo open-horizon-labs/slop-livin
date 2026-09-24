@@ -3069,38 +3069,17 @@ fn rebuild_projects_from_tables(
 /// subprocess -- see `.oh/sessions/2026-09-24-report-is-a-pure-read.md`.
 /// R16 item 1: overwrites `snapshot.external_units`/`.agent_units` with
 /// `write_unit_tables`'s rows for `key` -- `external_units.parquet`/
-/// `agent_units.parquet` are the source for each unit's own scalars and
-/// `unit_consumers.parquet` for an external unit's declared-consumer
-/// list. Fields the tables do not carry (an `ExternalUnit`'s
-/// `provenance`; an `AgentUnit`'s `tool_home`/`relative_path`/`members`/
-/// `action`) are carried over from the snapshot's own list by `id`, and
-/// each unit's `evidence` is left empty here for
+/// `agent_units.parquet` are the source for every field of each unit
+/// (R18a-2: `provenance`, `hardlinked`, `tool_home`, `relative_path`,
+/// `action`, `members` are all typed columns now, no JSON merge
+/// fallback) and `unit_consumers.parquet` for an external unit's
+/// declared-consumer list. Each unit's `evidence` is left empty here for
 /// `rebuild_evidence_from_table` to fill. A no-op when this scope has no
 /// unit-table rows yet (an older store).
 fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportSnapshot) {
     let Some(tables) = crate::growth::read_unit_tables(store_dir, key) else {
         return;
     };
-
-    let old_external: std::collections::HashMap<String, &crate::external::ExternalUnit> = snapshot
-        .external_units
-        .iter()
-        .map(|u| {
-            (
-                crate::growth::external_unit_table_id(
-                    &u.detector_id,
-                    crate::external::category_str(u.category),
-                    &u.path,
-                ),
-                u,
-            )
-        })
-        .collect();
-    let old_agent: std::collections::HashMap<String, &crate::agents::AgentUnit> = snapshot
-        .agent_units
-        .iter()
-        .map(|u| (u.id.clone(), u))
-        .collect();
 
     let mut consumers_by_unit: std::collections::HashMap<
         String,
@@ -3139,11 +3118,7 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
                     note: c.basis.clone(),
                 })
                 .collect();
-            crate::growth::external_unit_from_stored(
-                stored,
-                consumers,
-                old_external.get(&stored.id).copied(),
-            )
+            crate::growth::external_unit_from_stored(stored, consumers)
         })
         .collect();
 
@@ -3152,20 +3127,18 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
         .iter()
         .map(|stored| {
             let members = members_by_unit.get(&stored.id).cloned().unwrap_or_default();
-            crate::growth::agent_unit_from_stored(
-                stored,
-                &members,
-                old_agent.get(&stored.id).copied(),
-            )
+            crate::growth::agent_unit_from_stored(stored, &members)
         })
         .collect();
 }
 
-/// R16 item 2: overwrites `snapshot.report.nested_artifacts` and
+/// R18a-2: overwrites `snapshot.report.nested_artifacts` and
 /// `snapshot.store_interiors` with `nested_artifacts.parquet`'s two
-/// origin-split lists for `key`, overlaying each row's not-yet-migrated
-/// fields from the snapshot's own matching entry by `id`. A no-op when
-/// this scope has no nested-artifact rows yet (an older store).
+/// origin-split lists for `key`, each row's `nested_artifact_lists.
+/// parquet`/`nested_artifact_evidence.parquet` child rows attached.
+/// Every `NestedArtifact` field is typed now -- no JSON merge fallback.
+/// A no-op when this scope has no nested-artifact rows yet (an older
+/// store).
 fn rebuild_nested_artifacts_from_tables(
     store_dir: &Path,
     key: &str,
@@ -3176,20 +3149,17 @@ fn rebuild_nested_artifacts_from_tables(
     else {
         return;
     };
-    let old_by_id: std::collections::HashMap<String, crate::artifact::NestedArtifact> = snapshot
-        .report
-        .nested_artifacts
-        .iter()
-        .chain(snapshot.store_interiors.iter())
-        .map(|n| (n.id.clone(), n.clone()))
-        .collect();
     let new_report_nested = report_rows
         .iter()
-        .map(|stored| crate::growth::nested_artifact_from_stored(stored, old_by_id.get(&stored.id)))
+        .map(|(stored, lists, evidence)| {
+            crate::growth::nested_artifact_from_stored(stored, lists, evidence)
+        })
         .collect();
     let new_store_interiors = interior_rows
         .iter()
-        .map(|stored| crate::growth::nested_artifact_from_stored(stored, old_by_id.get(&stored.id)))
+        .map(|(stored, lists, evidence)| {
+            crate::growth::nested_artifact_from_stored(stored, lists, evidence)
+        })
         .collect();
     snapshot.report.nested_artifacts = new_report_nested;
     snapshot.store_interiors = new_store_interiors;
