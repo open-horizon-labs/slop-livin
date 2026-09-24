@@ -126,7 +126,10 @@ pub fn unit_key(detector_id: &str, category: StorageCategory, device: u64, path:
     )
 }
 
-fn category_str(c: StorageCategory) -> &'static str {
+/// The stable label for a [`StorageCategory`], used both for the
+/// external row key and (item 3, `render.rs`) for rendering: no user
+/// surface prints `{:?}` on this enum.
+pub(crate) fn category_str(c: StorageCategory) -> &'static str {
     match c {
         StorageCategory::Installation => "installation",
         StorageCategory::Downloads => "downloads",

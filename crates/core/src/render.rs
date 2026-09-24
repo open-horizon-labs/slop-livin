@@ -695,7 +695,7 @@ pub fn render_text(report: &Report) -> String {
                     project.name,
                     &worktree.worktree_id[..worktree.worktree_id.len().min(10)],
                     kind,
-                    format!("{:?}", artifact.kind),
+                    kind_label(&artifact.kind),
                     artifact.path.display(),
                     artifact.bytes,
                     artifact
@@ -1605,10 +1605,10 @@ pub fn render_view_external_with(
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:<10} {:>+10}  {:?}  {}  ({})  {}{note}",
+            "{:<10} {:>+10}  {}  {}  ({})  {}{note}",
             human_bytes(u.bytes),
             growth,
-            u.category,
+            crate::external::category_str(u.category),
             u.path.display(),
             u.detector_id,
             consumers,
@@ -1694,6 +1694,26 @@ pub fn evidence_subtype_label(subtype: crate::evidence::FactSubtype) -> &'static
     }
 }
 
+/// A human-readable label for an [`EvidenceSource`], with its detail
+/// text where it has one -- never `{:?}`, which used to print the
+/// struct literally (`FilesystemMetadata { detail: "…" }`, `Inferred {
+/// basis: "…" }`) on this exact user-facing evidence line (item 3).
+fn evidence_source_label(source: &crate::evidence::EvidenceSource) -> String {
+    use crate::evidence::EvidenceSource as ES;
+    match source {
+        ES::FilesystemMetadata { detail } => format!("filesystem metadata ({detail})"),
+        ES::ToolReported { tool, detail } => format!("{tool} ({detail})"),
+        ES::ProcessQuery { tool } => format!("{tool} process query"),
+        ES::ManagerLock { tool, path } => format!("{tool} lock ({path})"),
+        ES::ConfigDeclaration { path } => format!("config declaration ({path})"),
+        ES::Lockfile { ecosystem, path } => format!("{ecosystem} lockfile ({path})"),
+        ES::BuildMetadata { path } => format!("build metadata ({path})"),
+        ES::DockerApi { detail } => format!("Docker API ({detail})"),
+        ES::Statvfs => "statvfs".to_string(),
+        ES::Inferred { basis } => format!("inferred ({basis})"),
+    }
+}
+
 /// The order the five evidence domains are printed in, so a reader
 /// always finds the same question in the same place: what happened to
 /// it, who refers to it, whether anything holds it right now, how it
@@ -1769,7 +1789,10 @@ pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<Stri
             // what to remove most needs (the PR #123 review's
             // rendered_reclaimability counterexample).
             let subtype = evidence_subtype_label(e.subtype);
-            let source = format!("{:?}", e.source);
+            // Not `{:?}` (item 3): that printed the struct literally,
+            // e.g. `FilesystemMetadata { detail: "…" }`, on this exact
+            // user-facing evidence line.
+            let source = evidence_source_label(&e.source);
             let coverage = e
                 .freshness
                 .coverage_note

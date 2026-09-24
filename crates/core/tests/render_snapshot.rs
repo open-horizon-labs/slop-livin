@@ -566,3 +566,71 @@ fn external_view_never_renders_a_verdict_word() {
         );
     }
 }
+
+/// Item 3 (2026-09-24 aim review repairs): a rendered evidence line must
+/// never be a `{:?}` derive dump of `EvidenceSource`/`StorageCategory` --
+/// the exact bug the review found, `[source: FilesystemMetadata {
+/// detail: "…" }]` and `Inferred { basis: "…" }` on real output. Every
+/// `EvidenceSource` variant is exercised so a new variant added without a
+/// label arm fails this test (a `{:?}` fallback would pass compilation
+/// silently otherwise).
+#[test]
+fn evidence_lines_never_render_a_debug_struct_literal() {
+    use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    let sources = vec![
+        EvidenceSource::FilesystemMetadata {
+            detail: "mtime".into(),
+        },
+        EvidenceSource::ToolReported {
+            tool: "docker".into(),
+            detail: "inspect".into(),
+        },
+        EvidenceSource::ProcessQuery {
+            tool: "lsof".into(),
+        },
+        EvidenceSource::ManagerLock {
+            tool: "cargo".into(),
+            path: "/tmp/lock".into(),
+        },
+        EvidenceSource::ConfigDeclaration {
+            path: "/tmp/.tool-versions".into(),
+        },
+        EvidenceSource::Lockfile {
+            ecosystem: "npm".into(),
+            path: "/tmp/package-lock.json".into(),
+        },
+        EvidenceSource::BuildMetadata {
+            path: "/tmp/info.plist".into(),
+        },
+        EvidenceSource::DockerApi {
+            detail: "image inspect".into(),
+        },
+        EvidenceSource::Statvfs,
+        EvidenceSource::Inferred {
+            basis: "encoded project directory name".into(),
+        },
+    ];
+    let evidence: Vec<Evidence> = sources
+        .into_iter()
+        .map(|source| {
+            Evidence::known(
+                FactKind::Activity,
+                FactSubtype::Modified,
+                FactValue::Timestamp(1_000),
+                source,
+                1_000,
+            )
+        })
+        .collect();
+    let lines = swamp_core::render::render_evidence_lines(&evidence);
+    assert_eq!(lines.len(), evidence.len(), "one line per fact");
+    for line in &lines {
+        // The unmistakable shape of a struct's `{:?}` output: a
+        // capitalized-then-space-brace variant name, or a `field: "..."`
+        // pair, neither of which any hand-written label produces.
+        assert!(
+            !line.contains("{ ") && !line.contains(": \""),
+            "an evidence line looks like a Debug struct literal, not a label: {line:?}"
+        );
+    }
+}
