@@ -46,12 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Pinned (rust-toolchain.toml): -D warnings against a floating
-      # `stable` fails on a day nobody changed the code.
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+      # Floating stable (2026-09-24): a new stable release adding a
+      # lint that trips -D warnings is fixed with lint fixes and
+      # regenerated trybuild snapshots, not a version freeze.
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: x86_64-unknown-linux-gnu
           components: rustfmt, clippy
 
@@ -148,10 +148,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: x86_64-unknown-linux-gnu
           components: rustfmt, clippy
 
@@ -173,10 +172,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: x86_64-unknown-linux-gnu
 
       - name: Cargo cache
@@ -254,10 +252,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: aarch64-apple-darwin
           components: rustfmt, clippy
 
@@ -335,10 +332,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: aarch64-apple-darwin
           components: rustfmt, clippy
 

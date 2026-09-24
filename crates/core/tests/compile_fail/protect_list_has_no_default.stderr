@@ -6,3 +6,9 @@ error[E0277]: the trait bound `swamp_core::agents::ProtectList: Default` is not 
   |
 note: required by a bound in `Result::<T, E>::unwrap_or_default`
  --> $RUST/core/src/result.rs
+  |
+  |     pub const fn unwrap_or_default(self) -> T
+  |                  ----------------- required by a bound in this associated function
+  |     where
+  |         T: [const] Default + [const] Destruct,
+  |            ^^^^^^^^^^^^^^^ required by this bound in `Result::<T, E>::unwrap_or_default`

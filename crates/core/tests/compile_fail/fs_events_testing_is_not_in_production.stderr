@@ -1,4 +1,4 @@
-error[E0433]: cannot find `testing` in `fs_events`
+error[E0433]: failed to resolve: could not find `testing` in `fs_events`
  --> $WORKSPACE/crates/core/tests/compile_fail/fs_events_testing_is_not_in_production.rs
   |
   |     let _ = swamp_core::fs_events::testing::CannedSource::default();

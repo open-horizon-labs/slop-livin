@@ -1,10 +1,13 @@
-# Pinned, deliberately (owner decision, 2026-09-22). CI runs clippy with
-# `-D warnings`; against a floating `stable` that fails on a day nobody
-# changed the code, because a new release adds lints. 1.98.1 is the
-# version both CI jobs were last green on. Bump it in its own commit,
-# with the lint fixes the new version asks for, never as a side effect.
+# Floating on `stable` (owner decision, 2026-09-24, supersedes the
+# 1.98.1 pin from 2026-09-22): the machine this ships from keeps only
+# `stable` installed, and CI now resolves `stable` the same way
+# (`dtolnay/rust-toolchain@stable`). A new stable release adding a lint
+# that trips `-D warnings` is fixed by regenerating trybuild snapshots
+# (`TRYBUILD=overwrite`) and lint fixes in their own commit, same as
+# before -- the trade the original pin was protecting against, just
+# handled when it happens instead of frozen against ever happening.
 [toolchain]
-channel = "1.98.1"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 profile = "minimal"

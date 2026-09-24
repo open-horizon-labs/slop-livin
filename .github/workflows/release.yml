@@ -50,10 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned in rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: aarch64-apple-darwin
 
       - name: sccache
@@ -124,10 +123,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain (pinned in rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
           targets: x86_64-unknown-linux-gnu
 
       - name: Cargo cache
@@ -204,10 +202,9 @@ jobs:
           v="$(./scripts/release-version.sh | cut -d= -f2)"
           ./scripts/release-smoke.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" dist/smoke-newer
 
-      - name: Rust toolchain (pinned in rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.98.1"
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2

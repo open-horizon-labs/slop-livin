@@ -4,9 +4,13 @@ error[E0425]: cannot find function `metadata` in module `swamp_core::fs_gate`
   |     let _ = swamp_core::fs_gate::metadata("/tmp/link");
   |                                  ^^^^^^^^ not found in `swamp_core::fs_gate`
   |
-help: consider importing this function
+help: consider importing one of these functions
   |
 4 + use std::fs::metadata;
+  |
+4 + use std::ptr::metadata;
+  |
+4 + use core::ptr::metadata;
   |
 help: if you import `metadata`, refer to it directly
   |
