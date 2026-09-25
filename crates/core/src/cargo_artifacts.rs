@@ -7,13 +7,12 @@
 
 use crate::artifact::{
     ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant, Membership, NestedArtifact,
-    architecture_from_target, relative_path,
+    relative_path,
 };
 use crate::entities::Confidence;
+use crate::fs_gate::MetadataExt;
 use crate::report::{ArtifactKind, ProjectRow};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +58,7 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
     while let Some(dir) = cursor {
         for name in ["config", "config.toml"] {
             let p = dir.join(".cargo").join(name);
-            if p.is_file() {
+            if crate::fs_gate::is_file(&p) {
                 config = Some(p);
                 break;
             }
@@ -71,9 +70,17 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
     }
     layout.config_path = config.clone();
 
+    // Bounded, through the shared manifest reader: a `.cargo/config`
+    // is a small TOML file, and reading it whole is the same unbounded
+    // read the build-adapter guardrail forbids inside an adapter. The
+    // adapter calls this function for its container roots, so the bound
+    // has to hold here too or the guardrail is satisfied only by where
+    // the code happens to live.
     let config_values = config
         .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|p| {
+            crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::MANIFEST).ok()
+        })
         .map(|text| parse_build_paths(&text));
     if let Some((target, build)) = config_values {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
@@ -207,7 +214,7 @@ pub fn inspect_target_incremental(
             copy_tree(path, old, children, out);
             return;
         }
-        let meta = match fs::symlink_metadata(path) {
+        let meta = match crate::fs_gate::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 limits.push(format!("{}: {e}", path.display()));
@@ -215,7 +222,7 @@ pub fn inspect_target_incremental(
             }
         };
         let rel = relative_path(root, path);
-        let (role, variant) = classify_path(&rel, meta.is_dir());
+        let (role, variant) = crate::build_adapters::cargo::classify_path(&rel, meta.is_dir());
         let id = NestedArtifact::within(scope, &rel);
         let parent = if path == root {
             None
@@ -271,7 +278,7 @@ pub fn inspect_target_incremental(
         }
         out.push(u);
         if meta.is_dir() {
-            match fs::read_dir(path) {
+            match crate::fs_gate::read_dir(path) {
                 Err(e) => limits.push(format!("{}: {e}", path.display())),
                 Ok(entries) => {
                     let mut paths = Vec::new();
@@ -333,149 +340,17 @@ pub fn inspect_target_incremental(
     }
 }
 
-/// Project decision-relevant units from the existing folded directory measurements.
-/// Only fingerprint metadata and example executables receive shallow extra reads.
-pub(crate) fn folded_units(
-    root: &Path,
-    projects: &[ProjectRow],
-    dirs: &[crate::report::DirRollup],
-) -> anyhow::Result<Vec<NestedArtifact>> {
-    let scope = NestedArtifact::storage_id(root, "");
-    let worktrees: HashMap<_, _> = projects
-        .iter()
-        .flat_map(|p| &p.worktrees)
-        .map(|w| (w.worktree_id.as_str(), w.path.as_path()))
-        .collect();
-    let mut units = Vec::new();
-    let mut fingerprints = Vec::new();
-    let mut examples = Vec::new();
-    let mut profiles = Vec::new();
-    let mut measurements = Vec::new();
-    for d in dirs {
-        let Some(worktree) = worktrees.get(d.worktree_id.as_str()) else {
-            continue;
-        };
-        let path = worktree.join(&d.rel_path);
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let rel = relative.to_string_lossy();
-        measurements.push((path.clone(), d.mod_time_min.max(0) as u64 * 60, d.complete));
-        let parts: Vec<_> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let offset = usize::from(parts.first().is_some_and(|p| looks_like_target_triple(p)));
-        if parts.len() == offset + 1 {
-            profiles.push(path.clone());
-        }
-        if parts.len() == offset + 3 && parts.get(offset + 1) == Some(&".fingerprint") {
-            fingerprints.push(path.clone());
-        }
-        if parts.len() == offset + 2 && parts.get(offset + 1) == Some(&"examples") {
-            examples.push(path.clone());
-        }
-        let keep = parts.len() <= offset + 2
-            || (parts.len() == offset + 3
-                && matches!(parts.get(offset + 1), Some(&"incremental" | &"build")));
-        if !keep {
-            continue;
-        }
-        let mut u = folded_node(root, &scope, &path, true, d.allocated_total);
-        u.coverage.complete = d.complete;
-        u.mtime_max = d.mod_time_min.max(0) as u64 * 60;
-        units.push(u);
-    }
-    // A folded group's last change includes its deeper directories. Reuse their
-    // measured metadata; do not stat files to reconstruct an exact inventory.
-    let indexes: HashMap<_, _> = units
-        .iter()
-        .enumerate()
-        .map(|(i, u)| (u.path.clone(), i))
-        .collect();
-    for (path, mtime, complete) in measurements {
-        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
-            if let Some(&i) = indexes.get(ancestor) {
-                units[i].mtime_max = units[i].mtime_max.max(mtime);
-                units[i].coverage.complete &= complete;
-            }
-        }
-    }
-    // Temporary metadata nodes feed the shared parser, but are never retained.
-    // Ordinary compiler outputs in deps are not listed or statted here.
-    for dir in fingerprints {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(stem) = name.strip_suffix(".json") else {
-                continue;
-            };
-            let target = stem
-                .strip_prefix("test-lib-")
-                .or_else(|| stem.strip_prefix("test-bin-"))
-                .or_else(|| stem.strip_prefix("test-integration-test-"));
-            let Some(target) = target else { continue };
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let dir = path.parent().unwrap();
-            let Some((_, hash)) = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.rsplit_once('-'))
-            else {
-                continue;
-            };
-            let executable = dir
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("deps")
-                .join(format!("{target}-{hash}"));
-            if let Some(u) = folded_executable(root, &scope, &executable)? {
-                units.push(u);
-                units.push(folded_node(root, &scope, &path, false, 0));
-            }
-        }
-    }
-    for dir in examples {
-        for entry in fs::read_dir(dir)? {
-            if let Some(u) = folded_executable(root, &scope, &entry?.path())? {
-                units.push(u);
-            }
-        }
-    }
-    // Final outputs live immediately inside profiles, not inside deps. Keep
-    // executables and library products, but leave metadata and internal files
-    // folded. This is shallow even when the target contains millions of files.
-    for dir in profiles {
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            let library = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("rlib" | "a" | "so" | "dylib")
-            );
-            if let Some(u) = folded_output(root, &scope, &path, !library)? {
-                units.push(u);
-            }
-        }
-    }
-    enrich_fingerprints(root, &mut units);
-    units.retain(|u| {
-        u.is_dir
-            || matches!(
-                u.role,
-                ArtifactRole::TestExecutable | ArtifactRole::Example | ArtifactRole::FinalOutput
-            )
-    });
-    units.sort_by(|a, b| a.path.cmp(&b.path));
-    units.dedup_by(|a, b| a.path == b.path);
-    Ok(units)
-}
-
+/// A single directory/file node in the shape the legacy direct
+/// inspection produced, kept for the reviewed-role recheck below.
+///
+/// The folded identification that used to live here moved to
+/// `crate::build_adapters::cargo` when the adapters gained a trait and a
+/// registry; what stays is the direct `inspect_target` API (used by the
+/// TUI's own fixtures and by the cleanup rechecks), which walks a target
+/// directory on purpose rather than reading folded rows.
 fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) -> NestedArtifact {
     let rel = relative_path(root, path);
-    let (role, variant) = classify_path(&rel, is_dir);
+    let (role, variant) = crate::build_adapters::cargo::classify_path(&rel, is_dir);
     let mut u = node(
         path,
         root,
@@ -507,50 +382,13 @@ fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) 
     u
 }
 
-fn folded_executable(
-    root: &Path,
-    scope: &str,
-    path: &Path,
-) -> anyhow::Result<Option<NestedArtifact>> {
-    folded_output(root, scope, path, true)
-}
-
-fn folded_output(
-    root: &Path,
-    scope: &str,
-    path: &Path,
-    executable_required: bool,
-) -> anyhow::Result<Option<NestedArtifact>> {
-    let m = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if !m.is_file() || (executable_required && m.mode() & 0o111 == 0) {
-        return Ok(None);
-    }
-    let mut u = folded_node(root, scope, path, false, m.blocks() * 512);
-    u.device = m.dev();
-    u.inode = m.ino();
-    u.logical_bytes = m.len();
-    u.mtime_max = m.mtime().max(0) as u64;
-    if m.nlink() == 1 {
-        u.membership = Membership::Exclusive;
-        u.physical_total = u.bytes;
-        u.physical_bytes = u.bytes;
-    } else {
-        u.membership = Membership::SharedHardlink;
-    }
-    Ok(Some(u))
-}
-
 /// Recheck only the selected unit and its recorded producer evidence.
 pub(crate) fn reviewed_role(
     root: &Path,
     selected: &Path,
     fingerprints: &[PathBuf],
 ) -> anyhow::Result<(ArtifactRole, bool)> {
-    let meta = fs::symlink_metadata(selected)?;
+    let meta = crate::fs_gate::symlink_metadata(selected)?;
     let scope = NestedArtifact::storage_id(root, "");
     let mut units = vec![folded_node(root, &scope, selected, meta.is_dir(), 0)];
     for path in fingerprints {
@@ -558,42 +396,6 @@ pub(crate) fn reviewed_role(
     }
     enrich_fingerprints(root, &mut units);
     Ok((units[0].role.clone(), meta.is_dir()))
-}
-
-fn classify_path(rel: &str, is_dir: bool) -> (ArtifactRole, ArtifactVariant) {
-    if rel.is_empty() {
-        return (ArtifactRole::Container, ArtifactVariant::default());
-    }
-    let parts: Vec<_> = rel.split('/').collect();
-    let triple = looks_like_target_triple(parts[0]);
-    let offset = usize::from(triple);
-    let mut variant = profile_variant(parts.get(offset).copied().unwrap_or("unknown"));
-    if triple {
-        variant.architecture = architecture_from_target(parts[0]);
-        variant.configuration = Some(parts[0].into());
-        variant.unknowns.retain(|s| s != "architecture");
-    }
-    if parts.len() <= offset {
-        return (ArtifactRole::Container, variant);
-    }
-    if parts.len() == offset + 1 && is_dir {
-        return (ArtifactRole::Profile, variant);
-    }
-    let role = match parts.get(offset + 1).copied() {
-        Some("deps") => ArtifactRole::Dependency,
-        Some("examples") => ArtifactRole::Example,
-        Some("incremental") => ArtifactRole::Incremental,
-        Some("build") => ArtifactRole::BuildScriptOutput,
-        Some(".fingerprint") => ArtifactRole::CompanionMetadata,
-        _ if !is_dir && parts.len() == offset + 2 => ArtifactRole::FinalOutput,
-        _ => ArtifactRole::Residual,
-    };
-    let role = if !is_dir && rel.ends_with(".d") {
-        ArtifactRole::CompanionMetadata
-    } else {
-        role
-    };
-    (role, variant)
 }
 
 /// Fingerprints provide a baseline test/executable distinction without running
@@ -626,7 +428,10 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
         let Some(profile) = dir.parent().and_then(Path::parent) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(&u.path) else {
+        let Ok(text) = crate::fs_gate::read::bounded_string(
+            &u.path,
+            crate::fs_gate::read::BoundedCap::MANIFEST,
+        ) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -664,25 +469,6 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
             ));
         }
     }
-}
-
-fn profile_variant(profile: &str) -> ArtifactVariant {
-    let mut v = ArtifactVariant::default();
-    if profile != "unknown" {
-        v.profile = Some(profile.into());
-    } else {
-        v.unknowns.push("profile".into());
-    }
-    v.unknowns.extend(
-        ["architecture", "toolchain", "features", "generation"]
-            .into_iter()
-            .map(String::from),
-    );
-    v
-}
-
-fn looks_like_target_triple(name: &str) -> bool {
-    name.matches('-').count() >= 2 && !name.contains('.')
 }
 
 // Existing node-construction helper centralizes the full artifact record shape.
@@ -733,6 +519,15 @@ fn node(
         present,
         growth_bytes: None,
         regrowth_count: 0,
+        decision_evidence: Vec::new(),
+        adapter: Some("cargo".into()),
+        basis: crate::artifact::AccountingBasis::Allocated,
+        time_source: crate::artifact::TimeSource::FileModification,
+        action: crate::artifact::NestedActionCapability::InspectionOnly,
+        consequence: None,
+        reported_by: None,
+        writer_lock: None,
+        guidance: crate::cargo_cleanup::Guidance::default(),
     }
 }
 
@@ -838,20 +633,6 @@ pub fn apply_message_evidence(inspection: &mut CargoInspection, messages: &[Carg
     }
 }
 
-/// Inspect a target and apply only pre-existing Cargo JSON output. The text
-/// is supplied by the caller so observation never searches for or creates a
-/// build log and never invokes Cargo.
-pub fn inspect_target_with_json(
-    target_dir: &Path,
-    workspace_root: Option<&Path>,
-    json_text: &str,
-) -> CargoInspection {
-    let mut inspection = inspect_target(target_dir, workspace_root);
-    let messages = parse_json_messages(json_text);
-    apply_message_evidence(&mut inspection, &messages);
-    inspection
-}
-
 /// Parse existing JSON lines without executing Cargo. Unknown message kinds
 /// are ignored, as Cargo may add message variants over time.
 pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
@@ -901,16 +682,6 @@ pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
         .collect()
 }
 
-/// Finds Cargo target/build rows already discovered by the common walker and
-/// annotates them. It intentionally does not add an out-of-scope path to a
-/// report: an external shared target must be observed explicitly first.
-pub fn inspect_projects(projects: &[ProjectRow]) -> Vec<NestedArtifact> {
-    project_roots(projects)
-        .into_iter()
-        .flat_map(|(root, workspace)| inspect_target(&root, Some(&workspace)).units)
-        .collect()
-}
-
 /// Already observed Cargo build boundaries only, deduplicated across owners.
 pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
@@ -918,12 +689,12 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     for project in projects {
         for wt in &project.worktrees {
             let layout = layout_for(&wt.path);
-            let cargo_present = wt.path.join("Cargo.toml").is_file();
+            let cargo_present = crate::fs_gate::is_file(wt.path.join("Cargo.toml"));
             if !cargo_present && !project.ecosystems.iter().any(|t| t == "rs") {
                 continue;
             }
             for row in &wt.artifacts {
-                if row.kind != ArtifactKind::BuildOutput || !row.path.is_dir() {
+                if row.kind != ArtifactKind::BuildOutput || !crate::fs_gate::is_dir(&row.path) {
                     continue;
                 }
                 let matches_layout = layout.target_dir.as_ref().is_some_and(|p| p == &row.path)
@@ -932,7 +703,8 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
                 if !matches_layout {
                     continue;
                 }
-                let canonical = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+                let canonical =
+                    crate::fs_gate::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
                 if seen.insert(canonical) {
                     out.push((row.path.clone(), wt.path.clone()));
                 }
@@ -945,6 +717,7 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::tempdir;
 

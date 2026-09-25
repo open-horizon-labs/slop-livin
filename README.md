@@ -35,6 +35,19 @@ The same model supports questions at different levels:
 
 History begins with the first observation. Swamp records sizes and metadata; it does not back up file contents or identify the process that wrote them.
 
+## Platforms
+
+macOS on Apple silicon (`aarch64-apple-darwin`) and Linux on x86_64
+(`x86_64-unknown-linux-gnu`, validated on Ubuntu 24.04). CI builds and runs the
+whole test suite natively on both on every push.
+
+On Linux, a release archive is published alongside the macOS one (glibc,
+generic x86-64, built on Ubuntu 24.04). Linux has no persisted change history,
+so an observation there walks fully unless a live watch -- the TUI, or the
+opt-in `swamp collect` -- has been running since the last one; scheduling uses
+`systemd --user`, and Trash is the freedesktop one your file manager shows. The
+[platform guide](docs/platform.md) has the whole table and the reasons.
+
 ## Install
 
 On Apple silicon macOS, install with [Homebrew](https://brew.sh):
@@ -46,6 +59,16 @@ swamp --version
 
 Update with `brew upgrade swamp`. See the [installation guide](docs/usage.md#installing-a-release) if you previously installed manually.
 
+On Linux x86_64, install the release archive after checking its checksum:
+
+```bash
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
+```
+
 ### Build from source
 
 Build the current `swamp` version from source with a recent stable Rust toolchain:
@@ -53,9 +76,9 @@ Build the current `swamp` version from source with a recent stable Rust toolchai
 ```bash
 git clone https://github.com/open-horizon-labs/swamp
 cd swamp
-cargo build --release --locked -p swamp -p swamp-mcp
+cargo build --release --locked -p swamp
 mkdir -p ~/.local/bin
-install -m 755 target/release/swamp target/release/swamp-mcp ~/.local/bin/
+install -m 755 target/release/swamp ~/.local/bin/
 ~/.local/bin/swamp --version
 ```
 
@@ -63,7 +86,7 @@ install -m 755 target/release/swamp target/release/swamp-mcp ~/.local/bin/
 
 ```bash
 swamp ui ~/src
-swamp report ~/src --since 24h
+swamp observe ~/src --since 24h
 swamp report ~/src --project api
 ```
 
@@ -75,7 +98,9 @@ To collect history while the UI is closed:
 swamp schedule --every 15m ~/src
 ```
 
-This installs a per-user LaunchAgent that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
+This installs a per-user LaunchAgent (macOS) or `systemd --user` timer (Linux; add `--collector` to keep a live change list between runs) that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
+
+Every root above is explicit. Omit it and `report`/`observe`/`ui`/`schedule` resolve swamp's **effective scope** instead: built-in roots (`~/src`, `~/Library/Developer`, `~/Library/Caches`), plus detected developer-tool locations (Cargo, rustup, Homebrew, and more), plus anything you add or exclude in `config.toml`. Run `swamp scope` to see exactly what's in scope, why, and what's missing or excluded -- see [Scope and coverage](docs/usage.md#scope-and-coverage).
 
 ## Decide with context
 
@@ -85,27 +110,24 @@ Space marks rows in the UI. Backspace opens a confirmation for the selected row 
 
 Filesystem removals move paths to Trash. Docker images and volumes are removed through Docker and have no Trash recovery; swamp does not make a backup. Build-cache entries are reported but cannot be removed individually through swamp. Moving files to Trash does not itself reclaim their disk space.
 
-The CLI also supports proposals, human approval, and execution. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery) before using it.
+Swamp reports; the human removes. There is no CLI command for propose/approve/execute/grant any more -- the TUI's Space/Backspace/Enter is the only removal path, and there is no re-check between marking a row and pressing Enter. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery) for where a Trash move went and how to get it back.
 
 ## Use it from an agent
 
-`swamp-mcp` exposes the report over stdio, with tools for growth, projects, worktrees, Docker objects, and proposed actions. Configure an MCP client with the absolute path to the binary:
+There is no separate server process, and no CLI command that deletes anything. `swamp observe` is the only command that scans; `swamp report --json` and `--view <name> --json` are a pure read of what it last wrote, printing one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
 
-```json
-{
-  "mcpServers": {
-    "swamp": {
-      "command": "/Users/you/.local/bin/swamp-mcp"
-    }
-  }
-}
+```bash
+swamp observe ~/src --since 24h
+swamp report ~/src --view grown --json
 ```
 
-An agent can propose a plan and execute an approved one. Grant creation is available through the CLI and TUI confirmation, with no MCP grant-writing tool. This is an interface boundary, not isolation from an agent that also has unrestricted shell access. The [MCP reference](docs/usage.md#agent-interface) lists the tools and authorization flow.
+Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands and JSON schema. The skill and the CLI are entirely read-only: an agent can gather evidence and explain what removing something would cost, but there is no command left for it (or anyone) to run that would delete anything -- only a human, in the TUI or at a shell, does that. See [the trust model](skills/swamp/references/trust-model.md).
 
 ## How updates stay small
 
-After the initial walk, swamp uses macOS FSEvents to find changed directories and reuses the stored measurements elsewhere. It retains directory detail inside grouped artifacts so a small change can often be measured without walking the whole artifact again. Hardlinks and incomplete event history require broader walks.
+After the initial walk, swamp asks the platform what changed and reuses the stored measurements elsewhere. It retains directory detail inside grouped artifacts so a small change can often be measured without walking the whole artifact again. Hardlinks and incomplete event history require broader walks.
+
+On macOS that question is answered by FSEvents, which replays a log the kernel kept while swamp was not running. Linux has no equivalent: inotify reports only what happens while a watch is open, so an observation there walks fully and reports `reason=no_persisted_change_history` rather than treating an unwatched period as a quiet one. [#81](https://github.com/open-horizon-labs/swamp/issues/81) adds a live watcher, which narrows that gap for a running swamp and does not close it. See [Platforms](docs/platform.md).
 
 The history store uses zstd-compressed Parquet, directory summaries, selected large-file rows, and reverse deltas containing previous values. These choices reduce repeated traversal and history storage. Actual work depends on the changed directories, hardlinks, and enrichment caches; the repository does not establish a general latency or storage-size guarantee.
 
@@ -113,7 +135,8 @@ The [architecture guide](docs/architecture.md) explains observation, history, en
 
 ## Documentation
 
-- [Usage](docs/usage.md): installation, keys, commands, filters, configuration, MCP, and recovery.
+- [Usage](docs/usage.md): installation, keys, commands, filters, configuration, the agent interface, and recovery.
+- [Platforms](docs/platform.md): supported targets, what each platform can and cannot do, where swamp keeps its files on each, and the library reuse decisions behind that.
 - [Architecture](docs/architecture.md): data flow, incremental updates, storage, and implementation limits.
 - [Contributing](CONTRIBUTING.md): code map, checks, and documentation maintenance.
 - [Changelog](CHANGELOG.md): behavior introduced in each release.
