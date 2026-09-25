@@ -17,9 +17,27 @@ checkout, the session is now linked with `source: inferred` (text:
 scratch store: 29 declared / **119 inferred** / 2 unresolved (8.1 MB) /
 8 missing / 10 not-a-project; cold observe 11.2-11.9 s before vs
 11.8-12.8 s after (three samples each; the `~/src` walk dominates),
-2.7 s replayed. Codex sessions are unchanged (3,450 unresolved): their
-directories are date-partitioned and their bounded headers carry no
-`cwd`, so there is nothing to infer from.
+2.7 s replayed. Codex sessions carry no folder signal (date-partitioned
+directories); their linkage comes from the declared `cwd` -- see the
+next entry, which is what had made all 3,450 of them `unresolved`.
+
+### Codex sessions link again: the `cwd` is taken from the bounded prefix
+
+Every current Codex rollout's first record -- `session_meta` with
+`payload.cwd` a few hundred bytes in -- is longer than the 8 KiB read
+bound, because the same record carries `payload.base_instructions.text`
+(the project's instructions file; 22 KB median, 48 KB max on a
+structural probe of the 100 most recent local rollouts). The parser
+required the whole line to parse, so it found no `cwd` in any Codex
+session (3,450 `unresolved`, 1.5 GB, on the owner's machine). The
+adapter now takes exactly the supported `session_meta` `cwd` from the
+prefix that was read, with a tokenizer that decodes two strings (`type`
+and the `cwd` at its supported path) and skips everything else; a
+`cwd` the bound cuts through is never a partial path, and a `cwd` in
+any other record kind is not evidence. The read bound is unchanged and
+the >8 KiB canary tests pin that nothing past the `cwd` reaches a unit.
+Not used, on purpose: `payload.git.*` sits after the instructions text
+(18-48 KB in) and `forked_from_id` names a session, not a project.
 
 What it never does: decode the slug (the encoding is lossy -- `/a/b-c`
 and `/a-b/c` share one), match a basename, overrule a declared `cwd`

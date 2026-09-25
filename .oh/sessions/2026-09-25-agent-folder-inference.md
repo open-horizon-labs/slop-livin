@@ -33,7 +33,7 @@ one `discover_and_measure_in` already receives.
 | Claude sessions linked/inferred | 0 | **119 (191.3 MB)** |
 | Claude sessions unresolved | 121 (199.3 MB) | 2 (8.1 MB): "no cwd field in the session's first records" (slug matched no known worktree) |
 | Claude missing / not-a-project | 8 (105.6) / 10 (319.5) | same |
-| Codex sessions unresolved | 3,450 (1,487.5 MB) | same (no folder signal, no cwd in bounded header) |
+| Codex sessions unresolved | 3,450 (1,487.5 MB) | same at this commit -- corrected the same day: the header *does* carry `cwd`; the parser lost it (see `2026-09-25-codex-early-cwd.md`) |
 | observe cold (3 samples each, fresh scratch stores) | 11.5 / 11.2 / 11.9 s | 12.8 / 12.0 / 11.8 s |
 | observe replayed (unchanged second pass) | -- | 2.7 s |
 

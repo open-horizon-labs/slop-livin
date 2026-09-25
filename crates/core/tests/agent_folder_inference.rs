@@ -442,8 +442,10 @@ fn a_codex_session_has_no_folder_signal_and_stays_unresolved() {
     let (home, store) = (root.join("codex-home"), root.join("store"));
     let repo = root.join("src").join("repo");
     checkout(&repo);
-    // Codex keys sessions by date, not by workspace; a transcript with
-    // no cwd in its bounded header has nothing to infer from.
+    // Codex keys sessions by date, not by workspace, so there is no
+    // folder slug to infer from; its linkage is the declared `cwd` in
+    // the `session_meta` record (read from the bounded prefix). This
+    // transcript has none, so it must stay unresolved -- not guessed.
     let jsonl = home
         .join("sessions")
         .join("2026")

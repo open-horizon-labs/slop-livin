@@ -71,3 +71,25 @@ build or expose this epic's adapters through. Every domain requirement above
 (project linkage, direct/derived relationships, unresolved/moved/deleted
 references, no basename-inferred ownership, no double-counting, no
 history-rewrite on relink) is unchanged; only the transport changed.
+
+## Reconciliation, 2026-09-25
+
+Codex linkage (#93) was not delivering: on the owner's machine all 3,450
+Codex session units were `unresolved`. Cause: the rollout's first
+`session_meta` record is longer than the adapter's 8 KiB read bound
+(current Codex writes `payload.base_instructions.text`, the project's
+instructions file, into that record -- 22 KB median, 48 KB max on a
+structural probe of the 100 most recent rollouts), and the parser
+required the whole line to parse. The `cwd` was at 220-334 bytes in
+every one of them. Fixed by bounded early extraction of exactly the
+supported `session_meta` `payload.cwd` (or `payload.meta.cwd`) from the
+prefix; the bound is unchanged, nothing past the `cwd` is decoded or
+retained, and >8 KiB canary tests pin it. Corroboration candidates
+recorded, none adopted: `payload.git.{branch,commit_hash,
+repository_url}` (92/100 records, 18-48 KB in -- beyond the bound),
+`payload.forked_from_id` (9/100; a session id, not a project),
+`turn_context.cwd` per turn (9/100 within 64 KB; beyond the first
+line). Claude Code linkage gained folder-name inference the same day
+(`2026-09-25-agent-folder-inference.md`): 121 -> 2 unresolved, labelled
+`inferred`, re-derived every pass. Evidence in
+`.oh/sessions/2026-09-25-codex-early-cwd.md`.
