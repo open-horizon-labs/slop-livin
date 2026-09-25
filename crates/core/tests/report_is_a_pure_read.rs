@@ -12,8 +12,8 @@
 //!    documented shape (`report::NoObservation`) rather than silently
 //!    falling back to a walk.
 //! 3. What `report_scope_from_store` returns is byte-for-byte the same
-//!    `Report` `observe_scope` produced (a round trip through
-//!    `report_rows.parquet`, not a re-derivation).
+//!    `Report` `observe_scope` produced (a round trip through stored
+//!    Parquet tables, not a re-derivation).
 //!
 //! Disposable `tempfile` fixtures only.
 
@@ -130,7 +130,7 @@ fn report_scope_from_store_does_no_io_after_observe() {
          stats, header-byte reads or subprocess spawns: {work:?}"
     );
 
-    // Round trip: what came back through `report_rows.parquet` is
+    // Round trip: what came back through the stored tables is
     // byte-for-byte (field-for-field: `serde_json::Value`'s map is a
     // `BTreeMap`, so key order in a `HashMap`-backed field like
     // `series_by_key` cannot hide a real difference or fake one) what

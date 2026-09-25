@@ -26,8 +26,8 @@ use swamp_core::schedule::{
 /// walk, project grouping, signals, enrichment, external + agent
 /// discovery, evidence, store interiors -- persists everything
 /// `swamp report`/the TUI need as stored Parquet current rows
-/// (including the rendered snapshot in `report_rows.parquet`,
-/// written by `observe_scope` itself). `swamp report` never runs any
+/// (typed Parquet tables only, R18a-3b: no JSON render-cache row),
+/// written by `observe_scope` itself. `swamp report` never runs any
 /// of this; it only reads what this call leaves behind.
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_observe(

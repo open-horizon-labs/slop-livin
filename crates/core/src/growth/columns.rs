@@ -1307,60 +1307,141 @@ pub(super) fn compact_external_deltas(dir: &Path, files: &[PathBuf], horizon: u6
 }
 
 // ---------------------------------------------------------------------
-// report_rows.parquet -- the rendered-row data `swamp report` and the
-// TUI need to render without walking anything (R12: `swamp report` is a
-// pure read; `swamp observe` is the only scanner). One row per scope
-// key, replaced wholesale by every `observe` that covers that scope --
-// like `unowned.parquet`/`folded.parquet`, this is a measurement cache,
-// not reverse-delta history. The rendered `Report` (evidence, tracking
-// and Docker joins already attached by the pipeline that produced it)
-// is JSON-encoded into its own Parquet `Utf8` cell -- a cell encoding,
-// not a JSON file on disk. Per-root coverage, external/agent units,
-// nested artifacts, notes/summary/series/coverage and (R18a-3)
-// unowned/dirs_by_worktree/files_by_worktree/schedule_line/
-// github_enrichment each moved to their own typed tables; `report_json`
-// still carries the rest of `Report` -- most importantly a project's
-// worktree's artifact list's full shape (`kind`/`path`/`track`/
-// `confidence`/`source`/`note`/`created_at`/`containers`/`shared_with`/
-// `dangling`/`allocated_bytes`/`allocated_growth_bytes`), which R15 item
-// 3 never typed anywhere else. See `growth::ReportSnapshot`'s header
-// comment for why this slice keeps this cell instead of deleting it.
+// artifact_shape.parquet / artifact_shape_lists.parquet (R18a-3b): the
+// last fields of a project's worktree's artifact list that used to
+// exist only in the now-deleted JSON render-cache row -- `kind`/
+// `path` (as `rel_path`, joined to the worktree path at read time, same
+// discipline as `worktree_entries.parquet`)/`track`/`confidence`/
+// `source`/`note`/`created_at`/`dangling`/`allocated_bytes`/
+// `allocated_growth_bytes`/`growth_bytes`. Keyed like `artifact_row_key`
+// (`worktree_id`/`kind`/`rel_path`; `project_id` carried too, for
+// debugging, though a worktree id alone already disambiguates), scope-
+// wide like every other R15-R18 table, replaced wholesale per
+// `scope_key` by the pass that produced it. `containers`/`shared_with`
+// (list-valued) go in `artifact_shape_lists.parquet`, joined back by
+// `seq` -- same `unowned_summary.parquet`/`unowned_summary_lists.
+// parquet` split. `bytes`/`local_bytes`/`mtime_max`/`hardlinked`/
+// `dedup_stale`/`regrowth_count`/`observed_at`/`ecosystem` are NOT here:
+// R15 item 3 already typed those into the current-artifact-history
+// table (`ArtifactTableFacts`), and `evidence` reuses `evidence.parquet`
+// (entity kind `"artifact"`) like every other entity. After this table,
+// `report_json` has nothing left to carry for an `ArtifactRow`.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct StoredReportSnapshotRow {
+pub struct StoredArtifactShapeRow {
     pub scope_key: String,
+    pub project_id: String,
+    pub worktree_id: String,
+    /// This worktree's artifacts in observed order, so a rebuild can
+    /// reconstruct the list in the same order `observe_scope` produced
+    /// it (Parquet row order is not guaranteed across a read).
+    pub seq: u32,
+    pub rel_path: String,
+    pub kind: String,
+    pub track: Option<String>,
+    pub confidence: String,
+    pub source_tool: String,
+    pub note: Option<String>,
+    pub created_at: Option<String>,
+    pub dangling: bool,
+    pub allocated_bytes: Option<u64>,
+    pub allocated_growth_bytes: Option<i64>,
+    pub growth_bytes: Option<i64>,
     pub observed_at: u64,
-    /// JSON-encoded `crate::report::Report`, with the fields the tables
-    /// named above own cleared to their defaults before serializing
-    /// (`growth::slim_report_for_snapshot_json`) -- those tables are
-    /// authoritative, and this cell no longer duplicates them.
-    pub report_json: String,
 }
 
-fn report_snapshot_schema() -> Arc<Schema> {
+fn artifact_shape_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("scope_key", DataType::Utf8, false),
+        Field::new("project_id", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("rel_path", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("track", DataType::Utf8, true),
+        Field::new("confidence", DataType::Utf8, false),
+        Field::new("source_tool", DataType::Utf8, false),
+        Field::new("note", DataType::Utf8, true),
+        Field::new("created_at", DataType::Utf8, true),
+        Field::new("dangling", DataType::Boolean, false),
+        Field::new("allocated_bytes", DataType::UInt64, true),
+        Field::new("allocated_growth_bytes", DataType::Int64, true),
+        Field::new("growth_bytes", DataType::Int64, true),
         Field::new("observed_at", DataType::UInt64, false),
-        Field::new("report_json", DataType::Utf8, false),
     ]))
 }
 
-pub(super) fn write_report_snapshot_rows(
+pub(crate) fn write_artifact_shape_rows(
     path: &Path,
-    rows: &[StoredReportSnapshotRow],
+    rows: &[StoredArtifactShapeRow],
 ) -> Result<()> {
-    let schema = report_snapshot_schema();
-    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-    let report_json: Vec<&str> = rows.iter().map(|r| r.report_json.as_str()).collect();
-
+    let schema = artifact_shape_schema();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from(scope_key)) as ArrayRef,
-            Arc::new(UInt64Array::from(observed_at)),
-            Arc::new(StringArray::from(report_json)),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.project_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.worktree_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.track.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.confidence.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.source_tool.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.note.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.created_at.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.dangling).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.allocated_bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|r| r.allocated_growth_bytes)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.growth_bytes).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            )),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -1371,7 +1452,7 @@ pub(super) fn write_report_snapshot_rows(
     )
 }
 
-pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportSnapshotRow>> {
+pub(crate) fn read_artifact_shape_rows(path: &Path) -> Result<Vec<StoredArtifactShapeRow>> {
     let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
         format!(
             "read {} (delete it; the next `swamp observe` rebuilds it)",
@@ -1385,13 +1466,127 @@ pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportS
     for batch in reader {
         let batch = batch?;
         let scope_key = downcast_str(&batch, "scope_key")?;
+        let project_id = downcast_str(&batch, "project_id")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let rel_path = downcast_str(&batch, "rel_path")?;
+        let kind = downcast_str(&batch, "kind")?;
+        let confidence = downcast_str(&batch, "confidence")?;
+        let source_tool = downcast_str(&batch, "source_tool")?;
+        let dangling = downcast_bool(&batch, "dangling")?;
         let observed_at = downcast_u64(&batch, "observed_at")?;
-        let report_json = downcast_str(&batch, "report_json")?;
         for i in 0..batch.num_rows() {
-            rows.push(StoredReportSnapshotRow {
+            rows.push(StoredArtifactShapeRow {
                 scope_key: scope_key.value(i).to_string(),
+                project_id: project_id.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                seq: seq.value(i),
+                rel_path: rel_path.value(i).to_string(),
+                kind: kind.value(i).to_string(),
+                track: opt_str(&batch, "track", i)?,
+                confidence: confidence.value(i).to_string(),
+                source_tool: source_tool.value(i).to_string(),
+                note: opt_str(&batch, "note", i)?,
+                created_at: opt_str(&batch, "created_at", i)?,
+                dangling: dangling.value(i),
+                allocated_bytes: opt_u64(&batch, "allocated_bytes", i)?,
+                allocated_growth_bytes: opt_i64(&batch, "allocated_growth_bytes", i)?,
+                growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
                 observed_at: observed_at.value(i),
-                report_json: report_json.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredArtifactShapeListRow {
+    pub scope_key: String,
+    pub worktree_id: String,
+    /// Joins back to the parent `StoredArtifactShapeRow.seq` for the
+    /// same `worktree_id`.
+    pub seq: u32,
+    pub list_kind: String,
+    pub item_seq: u32,
+    pub value: String,
+}
+
+fn artifact_shape_list_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("list_kind", DataType::Utf8, false),
+        Field::new("item_seq", DataType::UInt32, false),
+        Field::new("value", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_artifact_shape_list_rows(
+    path: &Path,
+    rows: &[StoredArtifactShapeListRow],
+) -> Result<()> {
+    let schema = artifact_shape_list_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.worktree_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.list_kind.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.item_seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_artifact_shape_list_rows(
+    path: &Path,
+) -> Result<Vec<StoredArtifactShapeListRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let list_kind = downcast_str(&batch, "list_kind")?;
+        let item_seq = downcast_u32(&batch, "item_seq")?;
+        let value = downcast_str(&batch, "value")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredArtifactShapeListRow {
+                scope_key: scope_key.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                seq: seq.value(i),
+                list_kind: list_kind.value(i).to_string(),
+                item_seq: item_seq.value(i),
+                value: value.value(i).to_string(),
             });
         }
     }
@@ -1404,8 +1599,8 @@ pub(super) fn read_report_snapshot_rows(path: &Path) -> Result<Vec<StoredReportS
 // (`crate::coverage::RootCoverage`) and `class = "detector"` for an
 // authorized unit root's own FSEvents replay outcome
 // (`crate::coverage::UnitRootCoverage`). Replaces `ReportSnapshot`'s
-// `coverage_json` cell. Replaced wholesale per scope key, like
-// `report_rows.parquet` itself -- a measurement cache, not history.
+// `coverage_json` cell. Replaced wholesale per scope key, like every
+// other scope-keyed table -- a measurement cache, not history.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1527,7 +1722,7 @@ pub(super) fn read_coverage_rows(path: &Path) -> Result<Vec<StoredCoverageRow>> 
 // series.parquet (R17 item 1) -- one row per (series key, bucket
 // index): `Report.series_by_key`/`total_series` (the reserved key
 // `__total__`)/`series_window_secs`. Replaces the corresponding fields
-// inside `report_rows.parquet`'s `report_json` cell.
+// the now-deleted JSON render-cache row used to carry.
 // ---------------------------------------------------------------------
 
 /// The reserved `series.parquet` key for `Report.total_series` (never a
@@ -1976,23 +2171,20 @@ pub(crate) fn read_protect_rows(path: &Path) -> Result<Vec<StoredProtectRow>> {
 // projects.parquet / worktrees.parquet / worktree_facts.parquet -- R15
 // item 2/~10 of the JSON-in-the-store decomposition begun by R14 item A
 // (`protect.parquet`). One row per `ProjectRow`/`WorktreeRow`, scope-wide
-// (top-level `swamp_dir`, keyed by `scope_key` exactly like
-// `report_rows.parquet`, since one scope can span several volumes) and
+// (top-level `swamp_dir`, keyed by `scope_key` exactly like every
+// other scope-wide table, since one scope can span several volumes) and
 // rewritten wholesale for that key by every `observe` that covers it --
-// a measurement cache, not reverse-delta history, like
-// `report_rows.parquet` itself. `worktree_facts.parquet` is the child
+// a measurement cache, not reverse-delta history. `worktree_facts.parquet`
+// is the child
 // table for the two list-valued facts a `WorktreeRow` carries
 // (`signals`, `merge_complete.terms`): one row per list entry, ordered
 // by `seq` so the original `Vec` order is recoverable exactly.
 //
 // What is deliberately NOT here: a `WorktreeRow`'s `artifacts` (their
 // own table, extended in this same slice -- see the `ecosystem` column
-// added to `StoredRow` above) and everything CHUNK_R15 named as later
-// slices (nested artifacts, evidence, external/agent units, coverage,
-// series, summary) -- those stay in `report_rows.parquet`'s JSON cell
-// for now; `report::report_scope_from_store` reads this table for a
-// `WorktreeRow`'s own scalars and overlays the remaining fields from
-// that snapshot by key.
+// added to `StoredRow` above), each typed into its own table by a
+// later slice (R16-R18); `report::report_scope_from_store` reads this
+// table for a `WorktreeRow`'s own scalars.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2523,7 +2715,7 @@ pub(crate) struct StoredUnitRow {
     /// [`crate::locations::Provenance`]'s variant tag
     /// (`"builtin"`/`"env-var"`/`"config-field"`/`"tool-query"`),
     /// external-unit-only. R18a: was the merge-fallback's
-    /// `old.provenance`, read from `report_rows.parquet`'s JSON cell.
+    /// `old.provenance`, read from the now-deleted JSON render-cache row.
     pub(crate) provenance_kind: Option<String>,
     /// The variant's own payload (env var name / config field name /
     /// query description); empty for `BuiltinConvention`.
@@ -3625,8 +3817,8 @@ pub(crate) fn read_evidence_rows(path: &Path) -> Result<Vec<StoredEvidenceRow>> 
 // aggregation `report::observe_scope` assembles, distinct from the
 // per-root/per-volume `unowned.parquet` `growth::write_unowned`/
 // `read_unowned` already own (that one folds a single root's walk into
-// `unowned.parquet`; this one is the scope-keyed render cache
-// `report_rows.parquet`'s `report_json` used to carry, keyed like every
+// `unowned.parquet`; this one is the scope-keyed aggregation the
+// now-deleted JSON render-cache row used to carry, keyed like every
 // other R15-R18 table by `scope_key`). `path_or_object` can repeat
 // across a multi-root scope's merged rows (two roots can each contribute
 // an unowned row with the same shared-cache basename), so identity here

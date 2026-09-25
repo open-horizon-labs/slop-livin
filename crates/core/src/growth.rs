@@ -1493,55 +1493,25 @@ fn write_unowned(dir: &Path, unowned: &[UnownedRow]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// report_rows.parquet -- the rendered-row data `swamp report` reads
-// instead of walking (R12: `swamp report` is a pure read; `swamp
-// observe` is the only scanner). One file at the top of the store
-// (scope-wide, not per-volume): a scope can span several roots/volumes,
-// and this is the *coherent* observation over all of them, exactly what
-// `report::report_scope`/`report::observe_scope` already assemble.
-//
-// R18a-3 note: this row's `report_json` cell was *not* deleted this
-// slice, despite CHUNK_R18a-3's text asking for it. Mid-slice, deleting
-// it and switching `report_scope_from_store` to a from-scratch
-// `Report::default()`-shaped bootstrap broke
-// `project_worktree_tables.rs`'s `observe_writes_the_three_tables_and_
-// every_view_renders_identically_from_them` test: `rebuild_projects_
-// from_tables` seeds its artifact list's *shape* (`ArtifactRow::kind`/
-// `path`/`track`/`confidence`/`source`/`note`/`created_at`/`containers`/
-// `shared_with`/`dangling`/`allocated_bytes`/`allocated_growth_bytes`)
-// from `old_artifacts_by_worktree`, built from whatever
-// `snapshot.report.projects` already held *before* the rebuild runs --
-// which, before this slice, was always this cell's deserialized value.
-// R15 item 3 only ever typed `bytes`/`local_bytes`/`mtime_max`/
-// `hardlinked`/`dedup_stale`/`regrowth_count`/`observed_at`/`ecosystem`/
-// `present` into `ArtifactTableFacts` (the current-artifact-history
-// table), documenting the rest as "explicitly later slices" -- a debt
-// this slice did not create and does not have a table for. Deleting
-// `report_json` today would silently blank every one of those fields on
-// the next report read after a store write, which is a real data-loss
-// regression, not a cosmetic one; see this slice's session note
-// (`.oh/sessions/2026-09-24-r18a3-snapshot-deleted.md`) for the full
-// account and the exact list of what a follow-up slice needs to type
-// before this cell can go.
-//
-// What *did* move this slice: `Report.unowned`/`dirs_by_worktree`/
-// `files_by_worktree`/`schedule_line`/`github_enrichment` are now typed
-// (`unowned_summary.parquet`+children, `worktree_entries.parquet`, a
-// `summary.parquet` row, `github_enrichment.parquet`) and cleared from
-// this cell before it is serialized, same discipline R17 already
-// applied to `notes`/`summary`/`reconciliation`/series -- the tables are
-// authoritative, and the JSON no longer duplicates them.
+// The scope-wide JSON-encoded render cache this store used to keep is
+// gone (R18a-3b: `artifact_shape.parquet` typed the last fields a
+// project's worktree's artifact list needed -- see the header comment
+// on `columns::StoredArtifactShapeRow`). `report::report_scope_from_store`
+// assembles the whole `Report` from tables only; no cell anywhere holds
+// a serialized `Report`. `ReportSnapshot` below is only ever an
+// in-memory assembly of one call's result -- a return type shared by
+// `report::report_scope_from_store` and `report::observe_scope`'s
+// caller, never itself written to disk.
 // ---------------------------------------------------------------------
-
-fn report_snapshot_path(swamp_dir: &Path) -> PathBuf {
-    swamp_dir.join("report_rows.parquet")
-}
 
 /// One scope's whole rendered observation, kept exactly as
 /// `report::observe_scope` produced it: the assembled [`Report`]
 /// (evidence, tracking and Docker joins already attached -- nothing
 /// here needs a fresh `stat` to render), its per-root coverage, and the
-/// external/agent unit families discovered in the same pass.
+/// external/agent unit families discovered in the same pass. Purely an
+/// in-memory container -- every field is rebuilt from its own typed
+/// table by `report::report_scope_from_store`, never deserialized from
+/// a stored cell.
 #[derive(Debug, Clone)]
 pub struct ReportSnapshot {
     pub observed_at: u64,
@@ -1552,102 +1522,11 @@ pub struct ReportSnapshot {
     pub store_interiors: Vec<crate::artifact::NestedArtifact>,
 }
 
-/// Replaces `report_rows.parquet`'s row for `scope_key` wholesale --
-/// like `unowned.parquet`/`folded.parquet`, a measurement cache with no
-/// growth/regrowth semantics, rewritten whole by the observation that
-/// produced it. Every other scope key's row is untouched, so several
-/// distinct scopes (or explicit-root invocations) sharing one store
-/// each keep their own snapshot.
-/// Clears the `Report` fields `coverage.parquet`/`series.parquet`/
-/// `summary.parquet`/`notes.parquet` now own (R17), plus (R18a-3)
-/// `unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
-/// `github_enrichment`, before `snapshot.report` is serialized into
-/// `report_json`. These fields are rebuilt from their own tables on
-/// every read, so keeping them in the JSON cell too would be silent
-/// duplication -- the tables are authoritative, not a cache of what the
-/// JSON already said.
-fn slim_report_for_snapshot_json(report: &Report) -> Report {
-    let mut r = report.clone();
-    r.notes = Vec::new();
-    r.summary = crate::report::Summary::default();
-    r.reconciliation = crate::report::Reconciliation {
-        attributed: 0,
-        unowned: 0,
-        walked_total: 0,
-        du_total: None,
-        docker_attributed: 0,
-        docker_unowned: 0,
-    };
-    r.series_by_key = HashMap::new();
-    r.total_series = Vec::new();
-    r.series_window_secs = 0;
-    // R18a-3:
-    r.unowned = Vec::new();
-    r.dirs_by_worktree = None;
-    r.files_by_worktree = None;
-    r.schedule_line = None;
-    r.github_enrichment = None;
-    r
-}
-
-pub fn write_report_snapshot(
-    swamp_dir: &Path,
-    scope_key: &str,
-    snapshot: &ReportSnapshot,
-) -> Result<()> {
-    store::StoreDir::at(swamp_dir)?.create()?;
-    let path = report_snapshot_path(swamp_dir);
-    let mut rows: Vec<columns::StoredReportSnapshotRow> = columns::read_report_snapshot_rows(&path)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.scope_key != scope_key)
-        .collect();
-    rows.push(columns::StoredReportSnapshotRow {
-        scope_key: scope_key.to_string(),
-        observed_at: snapshot.observed_at,
-        report_json: serde_json::to_string(&slim_report_for_snapshot_json(&snapshot.report))?,
-    });
-    columns::write_report_snapshot_rows(&path, &rows)
-        .with_context(|| format!("write {}", path.display()))
-}
-
-/// Reads back the stored snapshot for `scope_key`. `None` when this
-/// scope has never been observed, or the table is missing/unreadable/
-/// corrupt/from a stale schema -- a cache miss (the caller's "no
-/// observation yet" path), never a hard error, same discipline as
-/// `folded_rows_for`.
-///
-/// `coverage` comes back empty (R17 moved it to `coverage.parquet`), and
-/// `report`'s own `notes`/`summary`/`reconciliation`/series/(R18a-3)
-/// `unowned`/`dirs_by_worktree`/`files_by_worktree`/`schedule_line`/
-/// `github_enrichment` fields come back at their JSON defaults for the
-/// same reason -- `report::report_scope_from_store` always calls the
-/// matching `rebuild_*_from_tables` right after this to fill each one
-/// in from its own table. `external_units`/`agent_units`/
-/// `store_interiors` also come back empty (R18a-2: their own tables are
-/// now fully typed, so the rebuild always overwrites these fields
-/// regardless of what this cell says).
-pub fn read_report_snapshot(swamp_dir: &Path, scope_key: &str) -> Option<ReportSnapshot> {
-    let path = report_snapshot_path(swamp_dir);
-    let row = columns::read_report_snapshot_rows(&path)
-        .ok()?
-        .into_iter()
-        .find(|r| r.scope_key == scope_key)?;
-    Some(ReportSnapshot {
-        observed_at: row.observed_at,
-        report: serde_json::from_str(&row.report_json).ok()?,
-        coverage: Vec::new(),
-        external_units: Vec::new(),
-        agent_units: Vec::new(),
-        store_interiors: Vec::new(),
-    })
-}
-
 // ---------------------------------------------------------------------
 // coverage.parquet / series.parquet / summary.parquet / notes.parquet
 // (R17 item 1 of the JSON-in-the-store decomposition -- see
-// `.oh/sessions/2026-09-24-r17-tables.md`). Scope-wide, keyed by the same
-// `scope_key` as `report_rows.parquet`, written by the same
+// `.oh/sessions/2026-09-24-r17-tables.md`). Scope-wide, keyed by
+// `scope_key` like every other scope-wide table, written by the same
 // `observe_scope` call and read back by `report::report_scope_from_store`.
 // ---------------------------------------------------------------------
 
@@ -1757,8 +1636,8 @@ pub fn write_coverage_table(
 /// and, when at least one row was walked, `snapshot.report.root` from the
 /// first walked row in scope-root order -- the same value
 /// `report::merge_root_report_into` would have set. A no-op (leaves
-/// `snapshot` exactly as `read_report_snapshot` returned it) when this
-/// scope has no coverage rows yet (an older store).
+/// `snapshot` untouched) when this scope has no coverage rows yet (an
+/// older store).
 fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mut ReportSnapshot) {
     let Ok(rows) = columns::read_coverage_rows(&coverage_path(swamp_dir)) else {
         return;
@@ -1999,6 +1878,34 @@ pub fn write_summary_table(
         rows.push(row("reconciliation", "du_total", Some(du), None, None));
     }
     columns::write_summary_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
+}
+
+/// Whether `scope_key` has ever been observed: `summary.parquet` always
+/// gets at least its three `overview` rows from every full `observe`
+/// pass (`write_summary_table`, unconditionally, even when the count is
+/// zero) -- unlike `projects.parquet`, whose row *count* for a scope
+/// with genuinely zero discovered projects (a scope of external/agent
+/// units only, no git checkouts) is indistinguishable from "never
+/// observed". `report::report_scope_from_store` uses this, not an empty
+/// `projects.parquet` filter, to answer "has this scope ever been
+/// observed" -- R18a-3b: the deleted JSON render cache used to still
+/// carry a row for a project-less scope (e.g. a Claude-Code-only
+/// fixture: it serialized an empty `projects: []` just as validly as a
+/// populated one); losing that once `projects.parquet`'s row *count*
+/// became the only signal would have been a real "no_observation"
+/// regression for every such scope, not a cosmetic one.
+/// `Some(observed_at)` (from whichever row for `scope_key` this pass
+/// wrote, they all share one `observed_at`) when this scope has ever
+/// been observed, `None` otherwise. `report::report_scope_from_store`
+/// uses this both as its "no observation yet" gate and as the source of
+/// `ReportSnapshot.observed_at`/`Report.observed_at` -- the latter
+/// because a scope with genuinely zero discovered projects never gets a
+/// `projects.parquet` row to read that timestamp from either.
+pub(crate) fn scope_observed_at(swamp_dir: &Path, scope_key: &str) -> Option<u64> {
+    let rows = columns::read_summary_rows(&summary_path(swamp_dir)).ok()?;
+    rows.iter()
+        .find(|r| r.scope_key == scope_key)
+        .map(|r| r.observed_at)
 }
 
 /// Rebuilds `snapshot.report.summary`/`.reconciliation` from
@@ -2492,8 +2399,8 @@ pub(crate) fn rebuild_unowned_worktree_entries_github_from_tables(
 // projects.parquet / worktrees.parquet / worktree_facts.parquet (R15
 // item 2/~10 of the JSON-in-the-store decomposition; see
 // `.oh/sessions/2026-09-24-r14-json-decomposition.md` for item 1,
-// `protect.parquet`). Scope-wide, keyed by the same `scope_key` as
-// `report_rows.parquet`, written by the same `observe_scope` call and
+// `protect.parquet`). Scope-wide, keyed by `scope_key` like every
+// other scope-wide table, written by the same `observe_scope` call and
 // read back by `report::report_scope_from_store`, which uses these
 // tables as the source of a `WorktreeRow`'s/`ProjectRow`'s own scalars
 // and overlays the fields this slice does not migrate (an
@@ -2651,9 +2558,9 @@ fn build_stored_worktree_row(
 
 /// Writes `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`
 /// for `scope_key`, replacing that scope's rows wholesale (same
-/// per-scope-key replace semantics as `write_report_snapshot`). Called
-/// from `observe_scope` alongside the snapshot write, on the same
-/// already-merged multi-root `projects` tree -- no second walk.
+/// per-scope-key replace semantics as `write_artifact_shape_table`).
+/// Called from `observe_scope` on the same already-merged multi-root
+/// `projects` tree -- no second walk.
 pub fn write_project_worktree_tables(
     swamp_dir: &Path,
     scope_key: &str,
@@ -2747,8 +2654,7 @@ pub fn write_project_worktree_tables(
 /// Every stored row of `projects.parquet`/`worktrees.parquet`/
 /// `worktree_facts.parquet` for `scope_key`. `None` when no table exists
 /// yet (an older store, or a scope never observed under this build) --
-/// same cache-miss discipline as [`read_report_snapshot`]; the caller
-/// falls back to the snapshot's own `report.projects` in that case.
+/// same cache-miss discipline as every other scope-wide table read.
 pub(crate) struct StoredProjectWorktreeTables {
     pub(crate) projects: Vec<columns::StoredProjectRow>,
     pub(crate) worktrees: Vec<columns::StoredWorktreeRow>,
@@ -2785,6 +2691,208 @@ pub(crate) fn read_project_worktree_tables(
         worktrees,
         worktree_facts,
     })
+}
+
+fn artifact_shape_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("artifact_shape.parquet")
+}
+fn artifact_shape_lists_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("artifact_shape_lists.parquet")
+}
+
+/// Writes `artifact_shape.parquet`/`artifact_shape_lists.parquet` for
+/// `scope_key`, replacing that scope's rows wholesale from this pass's
+/// already-merged `projects` tree (same per-scope-key replace semantics
+/// as `write_project_worktree_tables`, called alongside it from
+/// `observe_scope`) -- no second pass. See the header comment on
+/// `columns::StoredArtifactShapeRow` for exactly which `ArtifactRow`
+/// fields land here.
+pub fn write_artifact_shape_table(
+    swamp_dir: &Path,
+    scope_key: &str,
+    projects: &[ProjectRow],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let shape_file = artifact_shape_path(swamp_dir);
+    let mut rows: Vec<columns::StoredArtifactShapeRow> =
+        columns::read_artifact_shape_rows(&shape_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    let lists_file = artifact_shape_lists_path(swamp_dir);
+    let mut list_rows: Vec<columns::StoredArtifactShapeListRow> =
+        columns::read_artifact_shape_list_rows(&lists_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+
+    for project in projects {
+        for wt in &project.worktrees {
+            for (seq, a) in wt.artifacts.iter().enumerate() {
+                let seq = seq as u32;
+                let rel_path = a
+                    .path
+                    .strip_prefix(&wt.path)
+                    .unwrap_or(&a.path)
+                    .display()
+                    .to_string();
+                rows.push(columns::StoredArtifactShapeRow {
+                    scope_key: scope_key.to_string(),
+                    project_id: project.project_id.clone(),
+                    worktree_id: wt.worktree_id.clone(),
+                    seq,
+                    rel_path,
+                    kind: format!("{:?}", a.kind),
+                    track: a.track.map(|t| t.label().to_string()),
+                    confidence: a.confidence.label().to_string(),
+                    source_tool: a.source.tool.clone(),
+                    note: a.note.clone(),
+                    created_at: a.created_at.clone(),
+                    dangling: a.dangling,
+                    allocated_bytes: a.allocated_bytes,
+                    allocated_growth_bytes: a.allocated_growth_bytes,
+                    growth_bytes: a.growth_bytes,
+                    observed_at,
+                });
+                for (item_seq, value) in a.containers.iter().enumerate() {
+                    list_rows.push(columns::StoredArtifactShapeListRow {
+                        scope_key: scope_key.to_string(),
+                        worktree_id: wt.worktree_id.clone(),
+                        seq,
+                        list_kind: "containers".to_string(),
+                        item_seq: item_seq as u32,
+                        value: value.clone(),
+                    });
+                }
+                for (item_seq, value) in a.shared_with.iter().enumerate() {
+                    list_rows.push(columns::StoredArtifactShapeListRow {
+                        scope_key: scope_key.to_string(),
+                        worktree_id: wt.worktree_id.clone(),
+                        seq,
+                        list_kind: "shared-with".to_string(),
+                        item_seq: item_seq as u32,
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    columns::write_artifact_shape_rows(&shape_file, &rows)
+        .with_context(|| format!("write {}", shape_file.display()))?;
+    columns::write_artifact_shape_list_rows(&lists_file, &list_rows)
+        .with_context(|| format!("write {}", lists_file.display()))
+}
+
+/// Rebuilds every worktree's artifact list *shape* from
+/// `artifact_shape.parquet`/`artifact_shape_lists.parquet` for
+/// `scope_key`, grouped by `worktree_id` and ordered by the stored
+/// `seq` (Parquet row order is not guaranteed across a read). Each
+/// `ArtifactRow`'s facts fields (`bytes`/`local_bytes`/`mtime_max`/
+/// `hardlinked`/`dedup_stale`/`regrowth_count`/`observed_at`/
+/// `ecosystem`) are left at their zero/default value here --
+/// `report::rebuild_projects_from_tables` overlays those from
+/// `ArtifactTableFacts` right after calling this, same as it always
+/// has. `evidence` is left empty for `rebuild_evidence_from_tables`.
+/// Empty (never missing) map when this scope has no artifact-shape rows
+/// yet (an older store) -- the caller's existing "no rows yet" handling
+/// on the empty per-worktree list already covers that case, matching
+/// what an empty `old_artifacts_by_worktree` used to mean.
+pub(crate) fn artifact_shape_rows_by_worktree(
+    swamp_dir: &Path,
+    scope_key: &str,
+) -> HashMap<String, Vec<ArtifactRow>> {
+    let Ok(shape_rows) = columns::read_artifact_shape_rows(&artifact_shape_path(swamp_dir)) else {
+        return HashMap::new();
+    };
+    let Ok(list_rows) =
+        columns::read_artifact_shape_list_rows(&artifact_shape_lists_path(swamp_dir))
+    else {
+        return HashMap::new();
+    };
+
+    let mut lists_by_worktree_seq: HashMap<
+        (String, u32),
+        Vec<&columns::StoredArtifactShapeListRow>,
+    > = HashMap::new();
+    for r in &list_rows {
+        if r.scope_key != scope_key {
+            continue;
+        }
+        lists_by_worktree_seq
+            .entry((r.worktree_id.clone(), r.seq))
+            .or_default()
+            .push(r);
+    }
+
+    let mut by_worktree: HashMap<String, Vec<(u32, columns::StoredArtifactShapeRow)>> =
+        HashMap::new();
+    for r in shape_rows {
+        if r.scope_key != scope_key {
+            continue;
+        }
+        by_worktree
+            .entry(r.worktree_id.clone())
+            .or_default()
+            .push((r.seq, r));
+    }
+
+    let mut out = HashMap::new();
+    for (worktree_id, mut rows) in by_worktree {
+        rows.sort_by_key(|(seq, _)| *seq);
+        let artifacts = rows
+            .into_iter()
+            .map(|(seq, r)| {
+                let mut lists = lists_by_worktree_seq
+                    .get(&(worktree_id.clone(), seq))
+                    .cloned()
+                    .unwrap_or_default();
+                lists.sort_by_key(|l| l.item_seq);
+                let containers = lists
+                    .iter()
+                    .filter(|l| l.list_kind == "containers")
+                    .map(|l| l.value.clone())
+                    .collect();
+                let shared_with = lists
+                    .iter()
+                    .filter(|l| l.list_kind == "shared-with")
+                    .map(|l| l.value.clone())
+                    .collect();
+                ArtifactRow {
+                    kind: parse_artifact_kind(&r.kind),
+                    path: PathBuf::from(&r.rel_path),
+                    bytes: 0,
+                    mtime_max: 0,
+                    ecosystem: None,
+                    hardlinked: true,
+                    dedup_stale: false,
+                    allocated_bytes: r.allocated_bytes,
+                    allocated_growth_bytes: r.allocated_growth_bytes,
+                    local_bytes: 0,
+                    track: r
+                        .track
+                        .as_deref()
+                        .map(crate::ignore::TrackState::from_label),
+                    growth_bytes: r.growth_bytes,
+                    regrowth_count: 0,
+                    observed_at: 0,
+                    confidence: Confidence::from_label(&r.confidence),
+                    source: crate::report::Source::new(r.source_tool.clone()),
+                    note: r.note.clone(),
+                    created_at: r.created_at.clone(),
+                    containers,
+                    shared_with,
+                    dangling: r.dangling,
+                    evidence: Vec::new(),
+                }
+            })
+            .collect();
+        out.insert(worktree_id, artifacts);
+    }
+    out
 }
 
 /// The current-artifact-table facts `report_scope_from_store` needs per
@@ -3166,9 +3274,8 @@ fn project_link_state_from_columns(
 }
 
 /// `Provenance`'s variant tag plus its own payload, flattened to two
-/// columns (R18a: replaces the `report_rows.parquet` JSON merge
-/// fallback `external_unit_from_stored` used to read `old.provenance`
-/// from).
+/// columns (R18a: replaces the JSON merge fallback
+/// `external_unit_from_stored` used to read `old.provenance` from).
 fn provenance_to_columns(p: &crate::locations::Provenance) -> (&'static str, Option<String>) {
     use crate::locations::Provenance as P;
     match p {
@@ -7605,6 +7712,188 @@ mod tests {
             serde_json::to_value(&projects).unwrap()
         );
         assert!(read_project_worktree_tables(store, "missing").is_none());
+    }
+
+    /// R18a-3b: `artifact_shape.parquet`/`artifact_shape_lists.parquet`
+    /// round-trip every `ArtifactRow` shape field
+    /// (`kind`/`path`/`track`/`confidence`/`source`/`note`/`created_at`/
+    /// `containers`/`shared_with`/`dangling`/`allocated_bytes`/
+    /// `allocated_growth_bytes`/`growth_bytes`), keep list order, keep
+    /// artifact order within a worktree, and a second scope's rows do
+    /// not disturb the first's.
+    #[test]
+    fn artifact_shape_table_round_trips_every_field_and_keeps_order() {
+        use crate::ignore::TrackState;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let full = ArtifactRow {
+            kind: ArtifactKind::BuildOutput,
+            path: PathBuf::from("/src/w1/target"),
+            bytes: 0,
+            mtime_max: 0,
+            ecosystem: None,
+            hardlinked: true,
+            dedup_stale: false,
+            allocated_bytes: Some(4096),
+            allocated_growth_bytes: Some(-128),
+            local_bytes: 0,
+            track: Some(TrackState::Ignored),
+            growth_bytes: Some(256),
+            regrowth_count: 0,
+            observed_at: 0,
+            confidence: Confidence::Medium,
+            source: crate::report::Source::new("cargo.layout"),
+            note: Some("nested-id=abc123".into()),
+            created_at: Some("2026-09-01T00:00:00Z".into()),
+            containers: vec!["c1".into(), "c2".into()],
+            shared_with: vec!["img-a".into(), "img-b".into()],
+            dangling: true,
+            evidence: Vec::new(),
+        };
+        let sparse = ArtifactRow {
+            kind: ArtifactKind::Source,
+            path: PathBuf::from("/src/w1"),
+            bytes: 0,
+            mtime_max: 0,
+            ecosystem: None,
+            hardlinked: true,
+            dedup_stale: false,
+            allocated_bytes: None,
+            allocated_growth_bytes: None,
+            local_bytes: 0,
+            track: None,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 0,
+            confidence: Confidence::High,
+            source: crate::report::Source::new("git"),
+            note: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        };
+        let wt = crate::report::WorktreeRow {
+            worktree_id: "w1".into(),
+            path: PathBuf::from("/src/w1"),
+            kind: crate::report::WorktreeKind::Main,
+            artifacts: vec![full.clone(), sparse.clone()],
+            signals: Vec::new(),
+            branch: None,
+            github: None,
+            merge_complete: None,
+            idle_secs: None,
+        };
+        let projects = vec![ProjectRow {
+            project_id: "p1".into(),
+            name: "one".into(),
+            worktrees: vec![wt],
+            ecosystems: Vec::new(),
+            remote: None,
+        }];
+
+        write_artifact_shape_table(store, "k", &projects, 9).unwrap();
+        // A second scope's rows must not disturb the first's.
+        write_artifact_shape_table(store, "other", &projects, 10).unwrap();
+
+        let by_worktree = artifact_shape_rows_by_worktree(store, "k");
+        let rebuilt = by_worktree.get("w1").expect("rows for w1").clone();
+        assert_eq!(rebuilt.len(), 2, "artifact order must be kept");
+        // Mirrors `report::rebuild_projects_from_tables`'s own join,
+        // including its empty-relative-path special case (the
+        // worktree-root row) -- see that call site's comment.
+        let join = |rel: &Path| -> PathBuf {
+            if rel.as_os_str().is_empty() {
+                PathBuf::from("/src/w1")
+            } else {
+                PathBuf::from("/src/w1").join(rel)
+            }
+        };
+        let mut rebuilt_full = rebuilt[0].clone();
+        rebuilt_full.path = join(&rebuilt_full.path);
+        let mut rebuilt_sparse = rebuilt[1].clone();
+        rebuilt_sparse.path = join(&rebuilt_sparse.path);
+        assert_eq!(
+            serde_json::to_value(&rebuilt_full).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&rebuilt_sparse).unwrap(),
+            serde_json::to_value(&sparse).unwrap()
+        );
+        assert!(artifact_shape_rows_by_worktree(store, "missing").is_empty());
+    }
+
+    /// A direct on-disk tamper of `artifact_shape.parquet`/
+    /// `artifact_shape_lists.parquet` (edit the table, read back through
+    /// `artifact_shape_rows_by_worktree`) is what the rebuild reflects,
+    /// not the value the artifacts were first written with.
+    #[test]
+    fn artifact_shape_tables_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let a = ArtifactRow {
+            kind: ArtifactKind::Cache,
+            path: PathBuf::from("/src/w1/.cache"),
+            bytes: 0,
+            mtime_max: 0,
+            ecosystem: None,
+            hardlinked: true,
+            dedup_stale: false,
+            allocated_bytes: Some(1),
+            allocated_growth_bytes: Some(1),
+            local_bytes: 0,
+            track: None,
+            growth_bytes: Some(1),
+            regrowth_count: 0,
+            observed_at: 0,
+            confidence: Confidence::Low,
+            source: crate::report::Source::new("filesystem"),
+            note: None,
+            created_at: None,
+            containers: vec!["original".into()],
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        };
+        let wt = crate::report::WorktreeRow {
+            worktree_id: "w1".into(),
+            path: PathBuf::from("/src/w1"),
+            kind: crate::report::WorktreeKind::Main,
+            artifacts: vec![a],
+            signals: Vec::new(),
+            branch: None,
+            github: None,
+            merge_complete: None,
+            idle_secs: None,
+        };
+        let projects = vec![ProjectRow {
+            project_id: "p1".into(),
+            name: "one".into(),
+            worktrees: vec![wt],
+            ecosystems: Vec::new(),
+            remote: None,
+        }];
+        write_artifact_shape_table(store, "k", &projects, 1).unwrap();
+
+        // Tamper the table directly, as if a hand-edit had happened.
+        let shape_file = artifact_shape_path(store);
+        let mut rows = columns::read_artifact_shape_rows(&shape_file).unwrap();
+        rows[0].dangling = true;
+        rows[0].allocated_bytes = Some(999);
+        columns::write_artifact_shape_rows(&shape_file, &rows).unwrap();
+        let lists_file = artifact_shape_lists_path(store);
+        let mut lists = columns::read_artifact_shape_list_rows(&lists_file).unwrap();
+        lists[0].value = "tampered".into();
+        columns::write_artifact_shape_list_rows(&lists_file, &lists).unwrap();
+
+        let rebuilt = artifact_shape_rows_by_worktree(store, "k");
+        let rebuilt = rebuilt.get("w1").expect("rows for w1");
+        assert!(rebuilt[0].dangling);
+        assert_eq!(rebuilt[0].allocated_bytes, Some(999));
+        assert_eq!(rebuilt[0].containers, vec!["tampered".to_string()]);
     }
 
     /// R15 table 4: the current-artifact table carries `ecosystem`, keeps

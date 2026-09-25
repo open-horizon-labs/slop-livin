@@ -2565,13 +2565,12 @@ pub fn observe_scope(
         store_interiors,
     };
 
-    // R12: persist the scope-wide render cache `swamp report` reads
-    // instead of walking. Gated exactly like `unit_replay.commit()`
-    // above and for the same reason -- only a pass that persisted
-    // (`observe`), covered both unit families (`want == ALL`, so the
-    // stored snapshot is not missing a family the caller never asked
-    // for) and did not error measuring either one gets to replace what
-    // the last full observation wrote.
+    // R12: persist the scope-wide tables `swamp report` reads instead
+    // of walking. Gated exactly like `unit_replay.commit()` above and
+    // for the same reason -- only a pass that persisted (`observe`),
+    // covered both unit families (`want == ALL`, so no table is missing
+    // a family the caller never asked for) and did not error measuring
+    // either one gets to replace what the last full observation wrote.
     if observe
         && want == ObservationParts::ALL
         && external_ok
@@ -2579,17 +2578,22 @@ pub fn observe_scope(
         && let Some(store_dir) = store_dir
     {
         let key = scope_snapshot_key(scope);
-        crate::growth::write_report_snapshot(
+        // R15 item 2/~10 of the JSON-in-the-store decomposition:
+        // `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`.
+        // Same gate, same already-merged `projects` tree -- no second
+        // pass.
+        crate::growth::write_project_worktree_tables(
             store_dir,
             &key,
-            &snapshot_from_observation(&observation),
+            &observation.merged.projects,
+            observation.merged.observed_at,
         )?;
-        // R15 item 2/~10 of the JSON-in-the-store decomposition:
-        // `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`,
-        // typed columns for what was otherwise only recoverable from
-        // this snapshot's `report_json` cell. Same gate, same already-
-        // merged `projects` tree -- no second pass.
-        crate::growth::write_project_worktree_tables(
+        // R18a-3b: `artifact_shape.parquet`/`artifact_shape_lists.
+        // parquet` -- the last fields a project's worktree's artifact
+        // list needed, from this same already-merged `projects` tree.
+        // After this, the old JSON render-cache row (now deleted) has
+        // nothing left it would have needed to carry.
+        crate::growth::write_artifact_shape_table(
             store_dir,
             &key,
             &observation.merged.projects,
@@ -2737,8 +2741,8 @@ pub fn observe_scope(
         )?;
         // R18a-3: `unowned_summary.parquet` (+ `unowned_summary_lists.
         // parquet`), `worktree_entries.parquet`, `github_enrichment.
-        // parquet` -- the last of `report_rows.parquet`'s `report_json`
-        // fields, from this same pass's already-assembled
+        // parquet` -- the last fields the old JSON render cache used to
+        // carry, from this same pass's already-assembled
         // `observation.merged`.
         crate::growth::write_unowned_summary_table(
             store_dir,
@@ -2951,21 +2955,21 @@ fn merge_summary_into(acc: &mut Summary, add: &Summary) {
 
 // ---------------------------------------------------------------------
 // R12: `swamp report` is a pure read of stored Parquet rows; `swamp
-// observe` is the only scanner. `crate::growth::ReportSnapshot`
-// (`report_rows.parquet`) is what `observe_scope` persists and this
-// module reads back -- never a filesystem walk, a `stat`, or a
-// subprocess.
+// observe` is the only scanner. `crate::growth::ReportSnapshot` is
+// assembled from those tables (R18a-3b: no JSON cell backs it anymore)
+// and this module reads it back -- never a filesystem walk, a `stat`,
+// or a subprocess.
 // ---------------------------------------------------------------------
 
 /// Re-exported so `report::ReportSnapshot` names the one type both
 /// `observe` (which builds one from a [`ScopeObservation`]) and
-/// `report` (which reads one back) deal in; it is stored by
+/// `report` (which reads one back) deal in; it is assembled by
 /// `crate::growth` because that is where every other current-state
 /// table lives (`unowned.parquet`, `external/folded.parquet`, ...).
 pub use crate::growth::ReportSnapshot;
 
-/// The stable key `swamp report`/`swamp observe` use to find/store a
-/// scope's snapshot in `report_rows.parquet`: the sorted set of this
+/// The stable key `swamp report`/`swamp observe` use to find/write a
+/// scope's tables: the sorted set of this
 /// scope's candidate root paths, hashed. An explicit root (a scope of
 /// one, #42) and the configured multi-root scope therefore key
 /// differently by construction -- neither caller has to say which one
@@ -3018,35 +3022,24 @@ fn describe_scope_for_error(scope: &crate::scope::EffectiveScope) -> String {
     }
 }
 
-/// Builds the snapshot `swamp observe` persists from one
-/// [`ScopeObservation`] -- the same value `observe_scope` already
-/// returns, so persisting it is the last step of `observe`, not a
-/// second pass over anything it measured.
-pub fn snapshot_from_observation(o: &ScopeObservation) -> ReportSnapshot {
-    ReportSnapshot {
-        observed_at: o.merged.observed_at,
-        report: o.merged.clone(),
-        coverage: o.coverage.clone(),
-        external_units: o.external_units.clone(),
-        agent_units: o.agent_units.clone(),
-        store_interiors: o.store_interiors.clone(),
-    }
-}
-
-/// R15 item 4: overwrites `snapshot.report.projects` with the tree
-/// [`crate::growth::write_project_worktree_tables`] wrote for `key` --
-/// `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet` are
-/// the source for a project's/worktree's own scalars (identity,
-/// ecosystems, remote, branch, GitHub facts, merge-complete, signals)
-/// and for the artifact-render columns R15 item 3 moved (bytes,
-/// local_bytes, mtime_max, hardlinked, dedup_stale, regrowth_count,
-/// observed_at, ecosystem). Everything else CHUNK_R15 named as a later
-/// slice (evidence, confidence, source, track, containers, shared_with,
-/// dangling, note, created_at, allocated_bytes, allocated_growth_bytes,
-/// growth_bytes) is carried over from the snapshot's own tree by key --
-/// "leave those in `ReportSnapshot`", per the chunk. A no-op when this
-/// scope has no table rows yet (an older store), leaving `snapshot`
-/// exactly as `read_report_snapshot` returned it.
+/// R15 item 4 / R18a-3b: overwrites `snapshot.report.projects` with the
+/// tree [`crate::growth::write_project_worktree_tables`] wrote for `key`
+/// -- `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`
+/// are the source for a project's/worktree's own scalars (identity,
+/// ecosystems, remote, branch, GitHub facts, merge-complete, signals).
+/// An artifact row's *shape* (`kind`/`path`/`track`/`confidence`/
+/// `source`/`note`/`created_at`/`containers`/`shared_with`/`dangling`/
+/// `allocated_bytes`/`allocated_growth_bytes`/`growth_bytes`) comes from
+/// `artifact_shape.parquet`/`artifact_shape_lists.parquet`
+/// (`growth::artifact_shape_rows_by_worktree`), ordered exactly as
+/// `observe_scope` produced it; its facts columns (`bytes`/
+/// `local_bytes`/`mtime_max`/`hardlinked`/`dedup_stale`/
+/// `regrowth_count`/`observed_at`/`ecosystem`) are then overlaid from
+/// the current-artifact-history table (`ArtifactTableFacts`), same as
+/// before this slice. No field is left to a JSON fallback -- there is no
+/// JSON cell left to fall back to. A no-op when this scope has no
+/// `projects.parquet` rows yet (an older store), leaving `snapshot`
+/// untouched.
 fn rebuild_projects_from_tables(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
@@ -3057,13 +3050,7 @@ fn rebuild_projects_from_tables(
         return;
     };
 
-    let mut old_artifacts_by_worktree: std::collections::HashMap<String, Vec<ArtifactRow>> =
-        std::collections::HashMap::new();
-    for p in &snapshot.report.projects {
-        for wt in &p.worktrees {
-            old_artifacts_by_worktree.insert(wt.worktree_id.clone(), wt.artifacts.clone());
-        }
-    }
+    let mut shape_by_worktree = crate::growth::artifact_shape_rows_by_worktree(store_dir, key);
 
     let roots: Vec<PathBuf> = scope.roots.iter().map(|r| r.path.clone()).collect();
     let facts = crate::growth::artifact_table_facts_for_roots(store_dir, &roots);
@@ -3079,10 +3066,26 @@ fn rebuild_projects_from_tables(
         {
             let mut wt = crate::growth::worktree_row_from_stored(stored_wt, &tables.worktree_facts);
             let worktree_path = wt.path.clone();
-            let mut artifacts = old_artifacts_by_worktree
+            let mut artifacts = shape_by_worktree
                 .remove(&stored_wt.worktree_id)
                 .unwrap_or_default();
             for a in artifacts.iter_mut() {
+                // `artifact_shape_rows_by_worktree` returns `path` as the
+                // stored relative path (it has no worktree path to join
+                // against) -- join it here, before the facts lookup,
+                // which strips this same prefix back off. The worktree
+                // root's own row (a `Source`/`Ignored`/`Untracked`
+                // remainder) stores an empty relative path;
+                // `Path::join("")` appends a trailing separator
+                // (`/w1/`, not `/w1`), so that case keeps
+                // `worktree_path` unjoined rather than round-tripping a
+                // path that differs from what was observed only by a
+                // trailing slash.
+                if !a.path.as_os_str().is_empty() {
+                    a.path = worktree_path.join(&a.path);
+                } else {
+                    a.path = worktree_path.clone();
+                }
                 let k = crate::growth::artifact_row_key(
                     &stored_project.project_id,
                     &stored_wt.worktree_id,
@@ -3271,15 +3274,67 @@ fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut Repo
     }
 }
 
+/// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
+/// whole thing from typed tables, starting from an empty [`ReportSnapshot`]
+/// and running every `rebuild_*_from_tables` function in the same order
+/// as before (each one either fills in its own fields or is a no-op, so
+/// running them against an empty starting value is exactly as safe as
+/// running them against a stored one). "Has this scope ever been
+/// observed" is answered by `growth::scope_observed_at`
+/// (`summary.parquet` having a row for `key`), not by `projects.parquet`
+/// having one: a scope with genuinely zero discovered projects (external
+/// / agent units only, no git checkouts) still gets a `summary.parquet`
+/// row every full observe, but never gets a `projects.parquet` row at
+/// all, which would make "zero projects" indistinguishable from "never
+/// observed" -- and would leave `observed_at` at its default too, since
+/// that timestamp would otherwise only ever come from a `projects.parquet`
+/// row.
 pub fn report_scope_from_store(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
 ) -> std::result::Result<ReportSnapshot, NoObservation> {
     let key = scope_snapshot_key(scope);
-    let mut snapshot =
-        crate::growth::read_report_snapshot(store_dir, &key).ok_or_else(|| NoObservation {
+    let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
+        return Err(NoObservation {
             scope_description: describe_scope_for_error(scope),
-        })?;
+        });
+    };
+    let mut snapshot = ReportSnapshot {
+        observed_at,
+        report: Report {
+            observed_at,
+            root: PathBuf::new(),
+            projects: Vec::new(),
+            unowned: Vec::new(),
+            reconciliation: Reconciliation {
+                attributed: 0,
+                unowned: 0,
+                walked_total: 0,
+                du_total: None,
+                docker_attributed: 0,
+                docker_unowned: 0,
+            },
+            series_by_key: std::collections::HashMap::new(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
+            notes: Vec::new(),
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+            summary: Summary::default(),
+            github_enrichment: None,
+            nested_artifacts: Vec::new(),
+            // The store this call read from -- known directly from the
+            // argument, never something that needs to survive a store
+            // round trip (`.oh/guardrails/protection-fails-closed.md`:
+            // `propose` reloads live state from this path).
+            store_dir: Some(store_dir.to_path_buf()),
+        },
+        coverage: Vec::new(),
+        external_units: Vec::new(),
+        agent_units: Vec::new(),
+        store_interiors: Vec::new(),
+    };
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);

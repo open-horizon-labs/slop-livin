@@ -1,18 +1,18 @@
-//! R15 (tables 2-4 of the JSON-in-the-store decomposition):
-//! `projects.parquet`, `worktrees.parquet` (+ `worktree_facts.parquet`)
-//! and the extended current-artifact table are what `swamp report`
-//! builds a `Report`'s `projects` tree from -- not the snapshot's
-//! `report_json` cell.
+//! R15/R18a-3b (tables 2-5 of the JSON-in-the-store decomposition):
+//! `projects.parquet`, `worktrees.parquet` (+ `worktree_facts.parquet`),
+//! `artifact_shape.parquet` (+ `artifact_shape_lists.parquet`) and the
+//! extended current-artifact table are what `swamp report` builds a
+//! `Report`'s `projects` tree from. There is no `report_json` cell left
+//! anywhere in the store -- R18a-3b deleted it entirely.
 //!
 //! Adversarial claims, not a happy path:
 //!
-//! 1. After `observe_scope`, the three tables exist under the store.
-//! 2. `report_scope_from_store` reads a project's/worktree's own scalars
-//!    and an artifact's byte/age/ecosystem facts from the tables: a
-//!    snapshot whose `report_json` has been tampered with (name, branch,
-//!    signals, bytes, ecosystem all changed) still reports the values the
-//!    tables hold. The tempting shortcut this fails is "keep
-//!    deserializing `report_json` and merely also write the tables".
+//! 1. After `observe_scope`, the tables exist under the store.
+//! 2. `report_scope_from_store` reads a project's/worktree's own scalars,
+//!    an artifact's shape fields and its byte/age/ecosystem facts from
+//!    the tables: a direct on-disk tamper of each (through the real
+//!    public writers, since there is no JSON snapshot left to tamper) is
+//!    what the next read reports.
 //! 3. Every text and JSON view renders byte-identically from the report
 //!    `observe_scope` produced and from the one `report_scope_from_store`
 //!    rebuilt.
@@ -269,18 +269,21 @@ fn observe_writes_the_three_tables_and_every_view_renders_identically_from_them(
     );
 }
 
+/// A direct on-disk tamper of `projects.parquet`/`worktrees.parquet`/
+/// `worktree_facts.parquet` (via the public `write_project_worktree_
+/// tables` writer -- there is no JSON snapshot left to tamper) is what
+/// the next `report_scope_from_store` reports: proof this reads the
+/// tables live, never a cached copy of the observation that produced
+/// them.
 #[test]
-fn report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_snapshot_json() {
+fn report_reads_projects_and_worktrees_from_a_direct_tamper_of_the_tables() {
     let fx = build();
     let observation = observe(&fx);
     let key = report::scope_snapshot_key(&fx.scope);
-    let expected = serde_json::to_value(&observation.merged).unwrap();
 
-    // Tamper with every field the tables now own, in the snapshot's
-    // JSON cell only. The tables are untouched.
-    let mut tampered = report::snapshot_from_observation(&observation);
+    let mut tampered = observation.merged.projects.clone();
     let mut tampered_fields = 0;
-    for p in &mut tampered.report.projects {
+    for p in &mut tampered {
         p.name.push_str("-TAMPERED");
         p.ecosystems.push("tampered".into());
         p.remote = Some("git@tampered:x/y.git".into());
@@ -291,89 +294,120 @@ fn report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_sn
             wt.signals.clear();
             wt.kind = swamp_core::report::WorktreeKind::Clone;
             tampered_fields += 4;
+        }
+    }
+    assert!(
+        tampered_fields >= 18,
+        "the fixture must give the tamper something to change"
+    );
+    swamp_core::growth::write_project_worktree_tables(
+        &fx.store,
+        &key,
+        &tampered,
+        observation.merged.observed_at,
+    )
+    .unwrap();
+
+    let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
+    for (p, tp) in rebuilt.report.projects.iter().zip(tampered.iter()) {
+        assert_eq!(p.name, tp.name);
+        assert_eq!(p.ecosystems, tp.ecosystems);
+        assert_eq!(p.remote, tp.remote);
+        for (wt, twt) in p.worktrees.iter().zip(tp.worktrees.iter()) {
+            assert_eq!(wt.branch, twt.branch);
+            assert_eq!(wt.idle_secs, twt.idle_secs);
+            assert!(wt.signals.is_empty());
+            assert_eq!(wt.kind, swamp_core::report::WorktreeKind::Clone);
+        }
+    }
+}
+
+/// Same claim as the test above, for the artifact-shape fields
+/// `artifact_shape.parquet` owns: a direct on-disk tamper (via the
+/// public `write_artifact_shape_table` writer) of `track`/`confidence`/
+/// `source`/`note`/`created_at`/`containers`/`shared_with`/`dangling`/
+/// `allocated_bytes`/`allocated_growth_bytes`/`growth_bytes` is what the
+/// next `report_scope_from_store` reports.
+#[test]
+fn report_reads_artifact_shape_from_a_direct_tamper_of_the_table() {
+    let fx = build();
+    let observation = observe(&fx);
+    let key = report::scope_snapshot_key(&fx.scope);
+
+    let mut tampered = observation.merged.projects.clone();
+    let mut tampered_fields = 0;
+    for p in &mut tampered {
+        for wt in &mut p.worktrees {
             for a in &mut wt.artifacts {
-                a.bytes += 1;
-                a.local_bytes += 1;
-                a.mtime_max += 1;
-                a.ecosystem = Some("tampered".into());
-                a.dedup_stale = !a.dedup_stale;
-                a.hardlinked = !a.hardlinked;
-                a.regrowth_count += 7;
-                tampered_fields += 7;
+                a.confidence = swamp_core::entities::Confidence::Low;
+                a.source = swamp_core::report::Source::new("tampered.tool");
+                a.note = Some("tampered-note".into());
+                a.created_at = Some("2000-01-01T00:00:00Z".into());
+                a.containers = vec!["tampered-container".into()];
+                a.shared_with = vec!["tampered-shared".into()];
+                a.dangling = !a.dangling;
+                a.allocated_bytes = Some(a.allocated_bytes.unwrap_or(0) + 999);
+                a.allocated_growth_bytes = Some(a.allocated_growth_bytes.unwrap_or(0) + 999);
+                a.growth_bytes = Some(a.growth_bytes.unwrap_or(0) + 999);
+                tampered_fields += 10;
             }
         }
     }
     assert!(
-        tampered_fields > 20,
+        tampered_fields > 0,
         "the fixture must give the tamper something to change"
     );
-    swamp_core::growth::write_report_snapshot(&fx.store, &key, &tampered).unwrap();
-    assert_ne!(
-        serde_json::to_value(&tampered.report).unwrap(),
-        expected,
-        "the tamper must actually change the snapshot"
-    );
+    swamp_core::growth::write_artifact_shape_table(
+        &fx.store,
+        &key,
+        &tampered,
+        observation.merged.observed_at,
+    )
+    .unwrap();
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
-    assert_eq!(
-        serde_json::to_value(&rebuilt.report).unwrap(),
-        expected,
-        "names, ecosystems, remotes, branches, kinds, idle time, signals and artifact \
-         bytes/age/ecosystem/hardlinked/dedup/regrowth must come from the tables, not \
-         from report_json"
-    );
+    for (p, tp) in rebuilt.report.projects.iter().zip(tampered.iter()) {
+        for (wt, twt) in p.worktrees.iter().zip(tp.worktrees.iter()) {
+            for (a, ta) in wt.artifacts.iter().zip(twt.artifacts.iter()) {
+                assert_eq!(a.confidence, ta.confidence);
+                assert_eq!(a.source, ta.source);
+                assert_eq!(a.note, ta.note);
+                assert_eq!(a.created_at, ta.created_at);
+                assert_eq!(a.containers, ta.containers);
+                assert_eq!(a.shared_with, ta.shared_with);
+                assert_eq!(a.dangling, ta.dangling);
+                assert_eq!(a.allocated_bytes, ta.allocated_bytes);
+                assert_eq!(a.allocated_growth_bytes, ta.allocated_growth_bytes);
+                assert_eq!(a.growth_bytes, ta.growth_bytes);
+            }
+        }
+    }
 }
 
-/// `Report.unowned` moved off `report_json` in R18a-3
-/// (`unowned_summary.parquet` -- see
-/// `unowned_worktree_entries_schedule_github_wiring.rs`), which flips
-/// this test's old direction: it used to pin "`unowned` still comes
-/// from the snapshot's JSON cell" as the boundary the previous test's
-/// pass must not blur. Now the opposite is true and matters just as
-/// much -- a JSON-only tamper of `.report.unowned` (never persisted to
-/// `unowned_summary.parquet`) must **not** leak into the rebuilt report,
-/// proving `rebuild_unowned_from_tables` always replaces this field
-/// rather than falling back to whatever the (now further-slimmed)
-/// snapshot cell says.
+/// R18a-3b deleted `report_rows.parquet`/`report_json`/`ReportSnapshot`'s
+/// old JSON-backed persistence entirely -- `artifact_shape.parquet`
+/// typed the last `ArtifactRow` fields that used to live only there (see
+/// the header comment on `columns::StoredArtifactShapeRow`). This
+/// replaces the old "the remaining parts still come from the snapshot"
+/// test, whose premise (a `report_json` cell to tamper) no longer
+/// exists: proof now is that no such file is ever written, and that a
+/// plain read-back still equals the observed report exactly, with
+/// nothing left over in any snapshot cell to have supplied it.
 #[test]
-fn the_remaining_parts_still_come_from_the_snapshot() {
+fn no_report_json_snapshot_remains_and_the_report_still_rebuilds_exactly() {
     let fx = build();
     let observation = observe(&fx);
-    let key = report::scope_snapshot_key(&fx.scope);
-    let mut tampered = report::snapshot_from_observation(&observation);
-    tampered
-        .report
-        .unowned
-        .push(swamp_core::report::UnownedRow {
-            path_or_object: "tampered-unowned-path".into(),
-            bytes: 123,
-            reason: swamp_core::report::UnownedReason::OwnedByNothing,
-            shared_bytes: None,
-            note: None,
-            docker_kind: None,
-            created_at: None,
-            containers: Vec::new(),
-            shared_with: Vec::new(),
-            dangling: false,
-            evidence: Vec::new(),
-        });
-    swamp_core::growth::write_report_snapshot(&fx.store, &key, &tampered).unwrap();
+
+    assert!(
+        !fx.store.join("report_rows.parquet").exists(),
+        "observe_scope must never write report_rows.parquet again"
+    );
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
-    assert!(
-        !rebuilt
-            .report
-            .unowned
-            .iter()
-            .any(|u| u.path_or_object == "tampered-unowned-path"),
-        "unowned_summary.parquet must win over a JSON-only tamper of Report.unowned"
-    );
     assert_eq!(
-        serde_json::to_value(&rebuilt.report.unowned).unwrap(),
-        serde_json::to_value(&observation.merged.unowned).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&rebuilt.report.projects).unwrap(),
-        serde_json::to_value(&observation.merged.projects).unwrap()
+        serde_json::to_value(&observation.merged).unwrap(),
+        serde_json::to_value(&rebuilt.report).unwrap(),
+        "the rebuilt Report must equal the observed one field for field with no JSON snapshot \
+         anywhere in the store"
     );
 }

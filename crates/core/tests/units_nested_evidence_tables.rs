@@ -4,11 +4,10 @@
 //! `nested_artifact_lists.parquet`/`nested_artifact_evidence.parquet`)
 //! are what `swamp report` builds `ReportSnapshot.external_units`/
 //! `.agent_units` and `Report.nested_artifacts`/`ReportSnapshot.
-//! store_interiors` from. As of R18a-2 there is no JSON cell for any of
-//! these left to fall back to at all -- `external_units_json`/
-//! `agent_units_json`/`store_interiors_json` are deleted from
-//! `StoredReportSnapshotRow`; `report_json` is the only JSON-encoded
-//! cell remaining, and it no longer carries these fields either.
+//! store_interiors` from. There is no JSON cell for any of these left
+//! to fall back to at all -- R18a-3b deleted the last one
+//! (`report_json`/`StoredReportSnapshotRow`/`report_rows.parquet`)
+//! entirely.
 //! (`evidence.parquet`'s exhaustive per-variant round trip is
 //! `growth::tests::evidence_table_round_trips_every_status_and_source_
 //! variant`; this file's job is proving the *wiring* -- `observe_scope`
@@ -218,28 +217,28 @@ fn observe_writes_the_four_tables_and_report_rebuilds_units_and_nested_artifacts
     );
 }
 
-/// Tampering with the snapshot's own in-memory copies of these fields
-/// (`write_report_snapshot` no longer persists `external_units`/
-/// `agent_units`/`store_interiors` anywhere at all -- R18a-2 deleted
-/// their JSON cells; only `nested_artifacts` survives into `report_json`
-/// as part of the untouched `Report` struct, cleared for other fields
-/// but not this one) must not change what `report_scope_from_store`
-/// returns for these fields: proof this reads the tables, never a JSON
-/// fallback.
+/// A direct on-disk tamper of `external_units.parquet`/
+/// `agent_units.parquet` (via the public `write_unit_tables` writer --
+/// there is no JSON snapshot left to tamper) is what the next
+/// `report_scope_from_store` reports: proof this reads the tables live,
+/// never a cached copy of the observation that produced them.
+/// (`nested_artifacts.parquet`'s own field-exhaustive round-trip/tamper
+/// coverage is `growth::tests::nested_artifact_table_round_trips_every_
+/// field_and_splits_by_origin`/`..._tables_rebuild_reflects_a_direct_
+/// tamper_not_the_original_value` -- this fixture's Cargo home cache
+/// file does not itself produce a nested artifact, so it cannot prove
+/// that table's wiring the same way it proves external/agent units'.)
 #[test]
-fn report_reads_units_and_nested_artifacts_from_the_tables_not_the_snapshot_json() {
+fn report_reads_units_from_a_direct_tamper_of_the_tables() {
     let fx = build();
     let observation = observe(&fx);
     assert!(!observation.external_units.is_empty());
     assert!(!observation.agent_units.is_empty());
 
     let key = report::scope_snapshot_key(&fx.scope);
-    let expected_external = serde_json::to_value(&observation.external_units).unwrap();
-    let expected_agent = serde_json::to_value(&observation.agent_units).unwrap();
-    let expected_nested = serde_json::to_value(&observation.merged.nested_artifacts).unwrap();
 
-    let mut tampered = report::snapshot_from_observation(&observation);
-    for u in &mut tampered.external_units {
+    let mut tampered_external = observation.external_units.clone();
+    for u in &mut tampered_external {
         u.bytes += 1;
         u.detector_name.push_str("-TAMPERED");
         u.mtime_max += 1;
@@ -247,42 +246,35 @@ fn report_reads_units_and_nested_artifacts_from_the_tables_not_the_snapshot_json
             c.label.push_str("-TAMPERED");
         }
     }
-    for u in &mut tampered.agent_units {
+    let mut tampered_agent = observation.agent_units.clone();
+    for u in &mut tampered_agent {
         u.bytes += 1;
         u.tool_name.push_str("-TAMPERED");
         u.protected = !u.protected;
     }
-    for n in &mut tampered.report.nested_artifacts {
-        n.bytes += 1;
-        n.path = PathBuf::from("/tampered");
-    }
     assert_ne!(
-        serde_json::to_value(&tampered.external_units).unwrap(),
-        expected_external,
-        "the tamper must actually change the snapshot's external_units"
+        serde_json::to_value(&tampered_external).unwrap(),
+        serde_json::to_value(&observation.external_units).unwrap(),
+        "the tamper must actually change external_units"
     );
     assert_ne!(
-        serde_json::to_value(&tampered.agent_units).unwrap(),
-        expected_agent,
-        "the tamper must actually change the snapshot's agent_units"
+        serde_json::to_value(&tampered_agent).unwrap(),
+        serde_json::to_value(&observation.agent_units).unwrap(),
+        "the tamper must actually change agent_units"
     );
-    swamp_core::growth::write_report_snapshot(&fx.store, &key, &tampered).unwrap();
+
+    swamp_core::growth::write_unit_tables(&fx.store, &key, &tampered_external, &tampered_agent)
+        .unwrap();
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
     assert_eq!(
         serde_json::to_value(&rebuilt.external_units).unwrap(),
-        expected_external,
-        "external_units must come from external_units.parquet/unit_consumers.parquet, not \
-         the tampered snapshot"
+        serde_json::to_value(&tampered_external).unwrap(),
+        "external_units must come from the current external_units.parquet/unit_consumers.parquet"
     );
     assert_eq!(
         serde_json::to_value(&rebuilt.agent_units).unwrap(),
-        expected_agent,
-        "agent_units must come from agent_units.parquet, not the tampered snapshot"
-    );
-    assert_eq!(
-        serde_json::to_value(&rebuilt.report.nested_artifacts).unwrap(),
-        expected_nested,
-        "nested_artifacts must come from nested_artifacts.parquet, not the tampered snapshot"
+        serde_json::to_value(&tampered_agent).unwrap(),
+        "agent_units must come from the current agent_units.parquet"
     );
 }

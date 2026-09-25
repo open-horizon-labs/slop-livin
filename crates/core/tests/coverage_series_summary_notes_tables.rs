@@ -2,11 +2,11 @@
 //! `coverage.parquet`, `series.parquet`, `summary.parquet` and
 //! `notes.parquet` are what `swamp report` builds a `Report`'s
 //! `coverage`/`series_by_key`/`total_series`/`series_window_secs`/
-//! `summary`/`reconciliation`/`notes` from -- not `report_rows.parquet`'s
-//! `report_json` cell (R16 already moved `coverage_json`/
-//! `external_units_json`/`agent_units_json`/`store_interiors_json` off
-//! that row entirely; this slice removes the remaining duplication for
-//! the fields named above).
+//! `summary`/`reconciliation`/`notes` from -- not any JSON cell (R16
+//! already moved `coverage_json`/`external_units_json`/
+//! `agent_units_json`/`store_interiors_json` off the old render-cache
+//! row entirely; this slice removes the remaining duplication for the
+//! fields named above; R18a-3b later deletes that row's JSON entirely).
 //!
 //! Adversarial claims, not a happy path:
 //!
@@ -213,68 +213,44 @@ fn observe_writes_the_four_tables_and_report_rebuilds_coverage_series_summary_re
     );
 }
 
-/// A snapshot whose `report_json` cell has been tampered with in every
-/// coverage/series/summary/reconciliation/notes field still reports the
-/// values `coverage.parquet`/`series.parquet`/`summary.parquet`/
-/// `notes.parquet` hold, not the tampered JSON. Fails a rebuild that
-/// merely writes the new tables without also using them to replace what
-/// `report_json` said.
+/// A direct on-disk tamper of `summary.parquet`/`notes.parquet` (via
+/// the public `write_summary_table`/`write_notes_table` writers --
+/// there is no JSON snapshot left to tamper) is what the next
+/// `report_scope_from_store` reports: proof this reads the tables live,
+/// not a cached `Report` built once and reused.
 #[test]
-fn report_reads_coverage_series_summary_and_notes_from_the_tables_not_the_snapshot_json() {
+fn report_reads_summary_and_notes_from_a_direct_tamper_of_the_tables() {
     let fx = build();
     let observation = observe(&fx);
     let key = report::scope_snapshot_key(&fx.scope);
 
-    let mut tampered = report::snapshot_from_observation(&observation);
-    tampered.report.notes = vec!["TAMPERED-NOTE".to_string()];
-    tampered.report.summary.projects = 999_999;
-    tampered.report.summary.worktrees = 999_999;
-    tampered.report.summary.artifacts = 999_999;
-    for t in tampered.report.summary.by_type.values_mut() {
-        t.bytes += 1;
-        t.artifacts += 1;
-        t.growth_bytes = Some(t.growth_bytes.unwrap_or(0) + 1);
-    }
-    tampered.report.reconciliation.attributed += 1;
-    tampered.report.reconciliation.unowned += 1;
-    tampered.report.reconciliation.walked_total += 1;
-    tampered.report.reconciliation.docker_attributed += 1;
-    tampered.report.reconciliation.docker_unowned += 1;
-    tampered.report.reconciliation.du_total = Some(
-        tampered
-            .report
-            .reconciliation
-            .du_total
-            .map(|v| v + 1)
-            .unwrap_or(1),
-    );
-    tampered.report.series_window_secs += 1;
-    tampered.report.total_series = vec![Some(999_999)];
-    tampered.coverage = Vec::new();
-    swamp_core::growth::write_report_snapshot(&fx.store, &key, &tampered).unwrap();
-    assert_ne!(
-        serde_json::to_value(&tampered.report).unwrap(),
-        serde_json::to_value(&observation.merged).unwrap(),
-        "the tamper must actually change the snapshot"
-    );
+    swamp_core::growth::write_notes_table(
+        &fx.store,
+        &key,
+        &["TAMPERED-NOTE".to_string()],
+        observation.merged.observed_at,
+    )
+    .unwrap();
+    let mut reconciliation = observation.merged.reconciliation.clone();
+    reconciliation.attributed += 1;
+    swamp_core::growth::write_summary_table(
+        &fx.store,
+        &key,
+        &observation.merged.summary,
+        &reconciliation,
+        Some("TAMPERED-SCHEDULE-LINE"),
+        observation.merged.observed_at,
+    )
+    .unwrap();
 
     let rebuilt = report::report_scope_from_store(&fx.scope, &fx.store).expect("stored");
-    assert_eq!(rebuilt.report.notes, observation.merged.notes);
+    assert_eq!(rebuilt.report.notes, vec!["TAMPERED-NOTE".to_string()]);
     assert_eq!(
-        rebuilt.report.summary.projects,
-        observation.merged.summary.projects
+        rebuilt.report.reconciliation.attributed,
+        observation.merged.reconciliation.attributed + 1
     );
     assert_eq!(
-        serde_json::to_value(&rebuilt.report.reconciliation).unwrap(),
-        serde_json::to_value(&observation.merged.reconciliation).unwrap()
-    );
-    assert_eq!(
-        rebuilt.report.series_window_secs,
-        observation.merged.series_window_secs
-    );
-    assert_eq!(
-        serde_json::to_value(&rebuilt.coverage).unwrap(),
-        serde_json::to_value(&observation.coverage).unwrap(),
-        "coverage must come back from coverage.parquet even though the snapshot's own coverage list was emptied"
+        rebuilt.report.schedule_line.as_deref(),
+        Some("TAMPERED-SCHEDULE-LINE")
     );
 }

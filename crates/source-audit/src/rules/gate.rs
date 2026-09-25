@@ -378,9 +378,9 @@ const TUI_REPORT_API: &[&str] = &[
     "@core::report::observe_scope",
     "@core::report::load_last_report",
     "@core::report::merge_reports",
-    // R12: reads the stored scope-wide snapshot back (`report_rows.parquet`)
-    // by the same `EffectiveScope` the caller already resolved -- no bare
-    // root, no walk.
+    // R12: reads the stored scope-wide tables back by the same
+    // `EffectiveScope` the caller already resolved -- no bare root, no
+    // walk.
     "@core::report::report_scope_from_store",
 ];
 

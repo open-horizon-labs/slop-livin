@@ -195,8 +195,8 @@ pub fn run(root: &Path) -> Result<()> {
     // (`.oh/guardrails/tui-refresh-preserves-scope.md`).
     let scope = resolved_scope(&store, std::slice::from_ref(&root));
     // Paint the last stored observation immediately (milliseconds, a
-    // read of `report_rows.parquet` -- no walk); observe in the
-    // background and swap the result in. With no stored snapshot yet,
+    // read of stored Parquet tables -- no walk); observe in the
+    // background and swap the result in. With no stored observation yet,
     // the first observation has to happen before there is anything to
     // show (R12: the TUI never walks to produce its own instant paint,
     // same discipline as `swamp report`).
