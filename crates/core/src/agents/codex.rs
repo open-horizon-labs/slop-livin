@@ -119,26 +119,18 @@ impl AgentAdapter for Adapter {
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     let session_index = SessionIndex::load(home, ctx);
-    let mut units = Vec::new();
-    let mut containers_used = 0usize;
-    identify_sessions(
+    let mut walk = SessionWalk {
         home,
-        "sessions",
-        false,
+        archived: false,
         ctx,
-        &session_index,
-        &mut units,
-        &mut containers_used,
-    );
-    identify_sessions(
-        home,
-        "archived_sessions",
-        true,
-        ctx,
-        &session_index,
-        &mut units,
-        &mut containers_used,
-    );
+        session_index: &session_index,
+        units: Vec::new(),
+        containers_used: 0,
+    };
+    walk.collect(&home.join("sessions"), 0);
+    walk.archived = true;
+    walk.collect(&home.join("archived_sessions"), 0);
+    let mut units = walk.units;
     identify_sqlite_stores(home, ctx, &mut units);
     identify_static_categories(home, ctx, &mut units);
     units
@@ -149,28 +141,6 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
 // companion directory is documented or found in this chunk's source
 // research, so a session's `members` is always exactly the one file.
 // ---------------------------------------------------------------------
-
-fn identify_sessions(
-    home: &Path,
-    subdir: &str,
-    archived: bool,
-    ctx: &IdentifyCtx,
-    session_index: &SessionIndex,
-    out: &mut Vec<CandidateAgentUnit>,
-    containers_used: &mut usize,
-) {
-    let base = home.join(subdir);
-    collect_sessions(
-        &base,
-        0,
-        home,
-        archived,
-        ctx,
-        session_index,
-        out,
-        containers_used,
-    );
-}
 
 /// One rollout file's unit. Factored out so the same code produces it
 /// whether it was found inside a container or directly under a session
@@ -235,56 +205,61 @@ fn session_unit(
 /// owns outright, plus a pass-level cap on how many containers are
 /// identified at all ([`MAX_CONTAINERS`]). Both are deterministic from
 /// the tree alone; neither depends on what a sibling produced.
-fn collect_sessions(
-    dir: &Path,
-    depth: usize,
-    home: &Path,
+struct SessionWalk<'home, 'ctx, 'index, 'data> {
+    home: &'home Path,
     archived: bool,
-    ctx: &IdentifyCtx,
-    session_index: &SessionIndex,
-    out: &mut Vec<CandidateAgentUnit>,
-    containers_used: &mut usize,
-) {
-    if depth > MAX_WALK_DEPTH {
-        return;
-    }
-    for entry in ctx.list(dir) {
-        let path = dir.join(&entry.name);
-        if entry.is_dir {
-            if depth + 1 == CONTAINER_DEPTH {
-                if *containers_used >= MAX_CONTAINERS {
-                    return;
+    ctx: &'ctx IdentifyCtx<'data>,
+    session_index: &'index SessionIndex,
+    units: Vec<CandidateAgentUnit>,
+    containers_used: usize,
+}
+
+impl SessionWalk<'_, '_, '_, '_> {
+    fn collect(&mut self, dir: &Path, depth: usize) {
+        if depth > MAX_WALK_DEPTH {
+            return;
+        }
+        for entry in self.ctx.list(dir) {
+            let path = dir.join(&entry.name);
+            if entry.is_dir {
+                if depth + 1 == CONTAINER_DEPTH {
+                    if self.containers_used >= MAX_CONTAINERS {
+                        return;
+                    }
+                    self.containers_used += 1;
+                    let home = self.home;
+                    let archived = self.archived;
+                    let ctx = self.ctx;
+                    let session_index = self.session_index;
+                    let units = ctx.container(CODEX_TOOL_ID, &path, &|| {
+                        let mut files = Vec::new();
+                        collect_jsonl_files(&path, depth + 1, ctx, &mut files);
+                        files
+                            .into_iter()
+                            .filter_map(|jsonl| {
+                                session_unit(home, jsonl, archived, ctx, session_index)
+                            })
+                            .collect()
+                    });
+                    self.units.extend(units.into_iter().map(|mut unit| {
+                        refresh_project_link(&mut unit, session_index, ctx);
+                        unit
+                    }));
+                } else {
+                    self.collect(&path, depth + 1);
                 }
-                *containers_used += 1;
-                let units = ctx.container(CODEX_TOOL_ID, &path, &|| {
-                    let mut files = Vec::new();
-                    collect_jsonl_files(&path, depth + 1, ctx, &mut files);
-                    files
-                        .into_iter()
-                        .filter_map(|jsonl| session_unit(home, jsonl, archived, ctx, session_index))
-                        .collect()
-                });
-                out.extend(units.into_iter().map(|mut unit| {
-                    refresh_project_link(&mut unit, session_index, ctx);
-                    unit
-                }));
-            } else {
-                collect_sessions(
-                    &path,
-                    depth + 1,
-                    home,
-                    archived,
-                    ctx,
-                    session_index,
-                    out,
-                    containers_used,
-                );
+            } else if is_rollout(&entry.name) {
+                // A rollout file sitting above the day level (an older or
+                // hand-moved layout) is identified inline: it belongs to no
+                // container, so it is never replayed.
+                self.units.extend(session_unit(
+                    self.home,
+                    path,
+                    self.archived,
+                    self.ctx,
+                    self.session_index,
+                ));
             }
-        } else if is_rollout(&entry.name) {
-            // A rollout file sitting above the day level (an older or
-            // hand-moved layout) is identified inline: it belongs to no
-            // container, so it is never replayed.
-            out.extend(session_unit(home, path, archived, ctx, session_index));
         }
     }
 }

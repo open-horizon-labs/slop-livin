@@ -61,16 +61,10 @@ impl SessionIndex {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 struct CodexConfig {
     sqlite_home: Option<String>,
-}
-
-impl Default for CodexConfig {
-    fn default() -> Self {
-        Self { sqlite_home: None }
-    }
 }
 
 enum ConfigHome {
