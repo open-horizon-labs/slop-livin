@@ -74,12 +74,6 @@ impl StoreDir {
         }
     }
 
-    /// A subdirectory swamp owns (a root's history volume, `external/`):
-    /// one plain name, never a path.
-    pub fn subdir(&self, name: &str) -> io::Result<StoreDir> {
-        Ok(StoreDir(self.0.join(plain(name)?)))
-    }
-
     pub fn path(&self) -> &Path {
         &self.0
     }
@@ -88,24 +82,6 @@ impl StoreDir {
     pub fn create(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.0)
     }
-}
-
-/// A store-internal name: one path component, nothing that could climb
-/// out of the store.
-fn plain(id: &str) -> io::Result<&str> {
-    if id.is_empty()
-        || id == "."
-        || id == ".."
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{id:?} is not a store-internal name"),
-        ));
-    }
-    Ok(id)
 }
 
 /// The one JSON file swamp persists: the TUI's remembered filter and

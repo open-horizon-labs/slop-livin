@@ -147,6 +147,21 @@ pub const REQUIRED_ADAPTER_TESTS: &[&str] = &[
     "project_link_is_declared_or_unresolved_never_basename_guess",
 ];
 
+fn adapter_test_contract(module_file: &str) -> Vec<&'static str> {
+    REQUIRED_ADAPTER_TESTS
+        .iter()
+        .map(|name| {
+            if *name == "identification_reads_no_more_than_header_cap"
+                && module_file == "crates/core/src/agents/codex.rs"
+            {
+                "identification_reads_no_rollout_header_bytes"
+            } else {
+                name
+            }
+        })
+        .collect()
+}
+
 pub fn guardrail_metadata(ws: &Workspace) -> Vec<String> {
     let root = &ws.root;
     let names = crate::audits::names();
@@ -276,9 +291,8 @@ pub fn guardrail_metadata(ws: &Workspace) -> Vec<String> {
         if !m.str_consts.iter().any(|(n, _, _)| n.ends_with("_TOOL_ID")) {
             continue;
         }
-        let missing: Vec<&str> = REQUIRED_ADAPTER_TESTS
-            .iter()
-            .copied()
+        let missing: Vec<&str> = adapter_test_contract(&m.file)
+            .into_iter()
             .filter(|name| {
                 !tests
                     .iter()
@@ -313,3 +327,19 @@ pub const RULES: &[Rule] = &[("guardrail_metadata", |ws| {
         guardrail_metadata(ws),
     )
 })];
+
+#[cfg(test)]
+mod tests {
+    use super::adapter_test_contract;
+
+    #[test]
+    fn codex_requires_the_stronger_zero_rollout_bytes_contract() {
+        let codex = adapter_test_contract("crates/core/src/agents/codex.rs");
+        assert!(codex.contains(&"identification_reads_no_rollout_header_bytes"));
+        assert!(!codex.contains(&"identification_reads_no_more_than_header_cap"));
+
+        let other = adapter_test_contract("crates/core/src/agents/claude_code.rs");
+        assert!(other.contains(&"identification_reads_no_more_than_header_cap"));
+        assert!(!other.contains(&"identification_reads_no_rollout_header_bytes"));
+    }
+}

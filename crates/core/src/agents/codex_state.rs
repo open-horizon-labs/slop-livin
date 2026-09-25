@@ -30,7 +30,7 @@ pub(super) enum CwdLookup<'a> {
 }
 
 impl SessionIndex {
-    pub(super) fn load(codex_home: &Path, ctx: &IdentifyCtx) -> Self {
+    pub(super) fn read_from_home(codex_home: &Path, ctx: &IdentifyCtx) -> Self {
         let Some(sqlite_home) = resolve_sqlite_home(codex_home, ctx) else {
             return Self::default();
         };

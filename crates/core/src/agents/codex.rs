@@ -63,7 +63,7 @@ const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Rollout files one session-tree **container** will identify. Per
 /// container, never shared: a bound a day directory shares with its
 /// siblings would make its stored rows mean something different from a
-/// live identification of the same directory (see [`collect_sessions`]).
+/// live identification of the same directory (see [`SessionWalk::walk`]).
 const MAX_CONTAINER_ENTRIES: usize = 20_000;
 /// Session-tree containers one pass will identify. Caps the whole pass
 /// without making any one container's contents depend on another's.
@@ -118,7 +118,7 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
-    let session_index = SessionIndex::load(home, ctx);
+    let session_index = SessionIndex::read_from_home(home, ctx);
     let mut walk = SessionWalk {
         home,
         archived: false,
@@ -127,9 +127,9 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         units: Vec::new(),
         containers_used: 0,
     };
-    walk.collect(&home.join("sessions"), 0);
+    walk.walk(&home.join("sessions"), 0);
     walk.archived = true;
-    walk.collect(&home.join("archived_sessions"), 0);
+    walk.walk(&home.join("archived_sessions"), 0);
     let mut units = walk.units;
     identify_sqlite_stores(home, ctx, &mut units);
     identify_static_categories(home, ctx, &mut units);
@@ -215,7 +215,7 @@ struct SessionWalk<'home, 'ctx, 'index, 'data> {
 }
 
 impl SessionWalk<'_, '_, '_, '_> {
-    fn collect(&mut self, dir: &Path, depth: usize) {
+    fn walk(&mut self, dir: &Path, depth: usize) {
         if depth > MAX_WALK_DEPTH {
             return;
         }
@@ -246,7 +246,7 @@ impl SessionWalk<'_, '_, '_, '_> {
                         unit
                     }));
                 } else {
-                    self.collect(&path, depth + 1);
+                    self.walk(&path, depth + 1);
                 }
             } else if is_rollout(&entry.name) {
                 // A rollout file sitting above the day level (an older or
@@ -272,7 +272,7 @@ fn is_rollout(name: &str) -> bool {
 /// explicit level at a time through the shared capped listing
 /// (`IdentifyCtx::list` never follows a symlink and never recurses on
 /// its own). The entry budget is this container's own: see
-/// [`collect_sessions`].
+/// [`SessionWalk::walk`].
 fn collect_jsonl_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Vec<PathBuf>) {
     if depth > MAX_WALK_DEPTH || out.len() >= MAX_CONTAINER_ENTRIES {
         return;
