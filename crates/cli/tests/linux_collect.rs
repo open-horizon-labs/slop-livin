@@ -36,22 +36,17 @@ fn start_collector(root: &Path, store: &Path, home: &Path) -> Collector {
     Collector(child)
 }
 
-fn checkpoint_pid(store: &Path) -> Option<u32> {
-    let dir = store.join("continuity");
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        if e.path().extension().is_some_and(|x| x == "json") {
-            let text = std::fs::read_to_string(e.path()).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-            return v["pid"].as_u64().map(|p| p as u32);
-        }
-    }
-    None
+/// The pid the root's checkpoint names (`continuity/<id>.parquet`, R18b
+/// -- read through the same reader the CLI's `collect --status` uses).
+fn checkpoint_pid(store: &Path, root: &Path) -> Option<u32> {
+    let p = swamp_core::continuity::paths(store, root);
+    swamp_core::continuity::read_checkpoint(&p).map(|c| c.pid)
 }
 
-fn wait_for_checkpoint(store: &Path, pid: u32) {
+fn wait_for_checkpoint(store: &Path, root: &Path, pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if checkpoint_pid(store) == Some(pid) {
+        if checkpoint_pid(store, root) == Some(pid) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -126,7 +121,7 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     tree(&root);
 
     let c1 = start_collector(&root, &store, &home);
-    wait_for_checkpoint(&store, c1.0.id());
+    wait_for_checkpoint(&store, &root, c1.0.id());
     std::thread::sleep(Duration::from_millis(1100));
 
     // A fresh store's first observation is full: it records the
@@ -167,7 +162,7 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     // A new collector is a new epoch: the stored observation predates
     // it, so the first run under it walks fully and says so.
     let c2 = start_collector(&root, &store, &home);
-    wait_for_checkpoint(&store, c2.0.id());
+    wait_for_checkpoint(&store, &root, c2.0.id());
     std::thread::sleep(Duration::from_millis(1100));
     let fourth = observe(&root, &store, &home, false);
     assert_eq!(field(&fourth, "reason"), "live_watch_gap", "{fourth}");
@@ -220,7 +215,7 @@ fn a_second_collector_for_the_same_root_refuses() {
     std::fs::create_dir_all(&home).unwrap();
     tree(&root);
     let c1 = start_collector(&root, &store, &home);
-    wait_for_checkpoint(&store, c1.0.id());
+    wait_for_checkpoint(&store, &root, c1.0.id());
     let out = Command::new(bin())
         .arg("collect")
         .arg(&root)

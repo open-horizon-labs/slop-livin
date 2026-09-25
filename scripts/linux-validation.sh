@@ -118,9 +118,10 @@ rm -rf "$SWAMP_DIR"
 start_collector() {
     "$bin" collect "$root" 2>>"$out/collector.log" &
     collector_pid=$!
+    # The checkpoint is a Parquet table (R18b): ask the CLI what it says.
     for _ in $(seq 200); do
-        [ -n "$(ls "$SWAMP_DIR"/continuity/*.json 2>/dev/null)" ] &&
-            grep -q "\"pid\":$collector_pid" "$SWAMP_DIR"/continuity/*.json && return 0
+        "$bin" collect --status "$root" --json 2>/dev/null |
+            grep -Eq "\"pid\": ?$collector_pid\b" && return 0
         sleep 0.05
     done
     echo "collector did not start" >&2; exit 1
