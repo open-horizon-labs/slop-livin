@@ -4319,3 +4319,270 @@ pub(crate) fn read_github_enrichment_rows(path: &Path) -> Result<Vec<StoredGithu
     }
     Ok(rows)
 }
+
+// ---------------------------------------------------------------------
+// git_signals.parquet / git_signals_values.parquet (R18a-4). Replaces
+// the git-activity slice of `last_report-<key>.json.zst`
+// (`consumers/signals.rs`'s previous-pass replay for an unchanged
+// worktree). Keyed by `root_key` -- the per-root identity
+// `growth::root_key` derives from the canonicalized root, the same key
+// space the deleted `report::last_report_key` used -- never a scope
+// key: the per-root incremental walk must work from a single-root,
+// scope-less call exactly as it always has, and must never wait on a
+// scope-wide table another root's pass might not have written yet.
+// Wholesale-replaced per `root_key`, like every other current-state
+// table; this is a one-worktree-deep replay cache, not history.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredGitSignalRow {
+    pub root_key: String,
+    pub worktree_id: String,
+    pub branch: Option<String>,
+    /// The four `RawSignals` fields `age_signals` needs to age or carry
+    /// forward unchanged (`crate::signals::RawSignals`); `last_commit_age_secs`
+    /// and `idle_for_secs` age by the elapsed gap, `dirty`/`unpushed`/
+    /// `locked` carry through unchanged until the next real walk.
+    pub last_commit_age_secs: Option<u64>,
+    pub dirty: Option<bool>,
+    pub unpushed: Option<u32>,
+    pub locked: Option<bool>,
+    pub idle_for_secs: Option<u64>,
+    pub observed_at: u64,
+}
+
+fn git_signals_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("root_key", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("branch", DataType::Utf8, true),
+        Field::new("last_commit_age_secs", DataType::UInt64, true),
+        Field::new("dirty", DataType::Boolean, true),
+        Field::new("unpushed", DataType::UInt32, true),
+        Field::new("locked", DataType::Boolean, true),
+        Field::new("idle_for_secs", DataType::UInt64, true),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+pub(crate) fn write_git_signal_rows(path: &Path, rows: &[StoredGitSignalRow]) -> Result<()> {
+    let schema = git_signals_schema();
+    let root_key: Vec<&str> = rows.iter().map(|r| r.root_key.as_str()).collect();
+    let worktree_id: Vec<&str> = rows.iter().map(|r| r.worktree_id.as_str()).collect();
+    let branch: Vec<Option<&str>> = rows.iter().map(|r| r.branch.as_deref()).collect();
+    let last_commit_age_secs: Vec<Option<u64>> =
+        rows.iter().map(|r| r.last_commit_age_secs).collect();
+    let dirty: Vec<Option<bool>> = rows.iter().map(|r| r.dirty).collect();
+    let unpushed: Vec<Option<u32>> = rows.iter().map(|r| r.unpushed).collect();
+    let locked: Vec<Option<bool>> = rows.iter().map(|r| r.locked).collect();
+    let idle_for_secs: Vec<Option<u64>> = rows.iter().map(|r| r.idle_for_secs).collect();
+    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(root_key)) as ArrayRef,
+            Arc::new(StringArray::from(worktree_id)),
+            Arc::new(StringArray::from(branch)),
+            Arc::new(UInt64Array::from(last_commit_age_secs)),
+            Arc::new(BooleanArray::from(dirty)),
+            Arc::new(UInt32Array::from(unpushed)),
+            Arc::new(BooleanArray::from(locked)),
+            Arc::new(UInt64Array::from(idle_for_secs)),
+            Arc::new(UInt64Array::from(observed_at)),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_git_signal_rows(path: &Path) -> Result<Vec<StoredGitSignalRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let root_key = downcast_str(&batch, "root_key")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredGitSignalRow {
+                root_key: root_key.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                branch: opt_str(&batch, "branch", i)?,
+                last_commit_age_secs: opt_u64(&batch, "last_commit_age_secs", i)?,
+                dirty: opt_bool(&batch, "dirty", i)?,
+                unpushed: opt_u32(&batch, "unpushed", i)?,
+                locked: opt_bool(&batch, "locked", i)?,
+                idle_for_secs: opt_u64(&batch, "idle_for_secs", i)?,
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// One rendered `crate::report::Signal` (name/value) previously shown
+/// for a worktree -- `git_signals_values.parquet`'s child rows, joined
+/// back to `StoredGitSignalRow` by `(root_key, worktree_id)` and ordered
+/// by `seq`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredGitSignalValueRow {
+    pub root_key: String,
+    pub worktree_id: String,
+    pub seq: u32,
+    pub name: String,
+    pub value: String,
+}
+
+fn git_signal_values_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("root_key", DataType::Utf8, false),
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("seq", DataType::UInt32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn write_git_signal_value_rows(
+    path: &Path,
+    rows: &[StoredGitSignalValueRow],
+) -> Result<()> {
+    let schema = git_signal_values_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.root_key.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.worktree_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_git_signal_value_rows(path: &Path) -> Result<Vec<StoredGitSignalValueRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let root_key = downcast_str(&batch, "root_key")?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let seq = downcast_u32(&batch, "seq")?;
+        let name = downcast_str(&batch, "name")?;
+        let value = downcast_str(&batch, "value")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredGitSignalValueRow {
+                root_key: root_key.value(i).to_string(),
+                worktree_id: worktree_id.value(i).to_string(),
+                seq: seq.value(i),
+                name: name.value(i).to_string(),
+                value: value.value(i).to_string(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// cargo_replay_cache_meta.parquet (R18a-4). One row per `root_key`: the
+// observation time the same root_key's rows in `cargo_replay_cache.parquet`
+// -- reused wholesale for `cargo_replay_cache.parquet`/
+// `cargo_replay_cache_lists.parquet`/`cargo_replay_cache_evidence.parquet`,
+// the exact `StoredNestedArtifactRow`/`StoredNestedArtifactListRow`/
+// `StoredNestedArtifactEvidenceRow` shapes (R16/R18a-2 already typed
+// every `NestedArtifact` field into them) written to a *different*,
+// root-keyed file instead of the scope-keyed `nested_artifacts.parquet`
+// -- were measured at. `consumers/cargo.rs`'s `ContainerCache::from_previous`
+// needs a `stored_at` alongside the units; nothing else in the reused
+// row shapes carries a pass timestamp (`nested_artifacts.parquet` needs
+// none, since its own scope-wide `observed_at` lives in `summary.parquet`).
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCargoReplayMetaRow {
+    pub root_key: String,
+    pub observed_at: u64,
+}
+
+fn cargo_replay_meta_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("root_key", DataType::Utf8, false),
+        Field::new("observed_at", DataType::UInt64, false),
+    ]))
+}
+
+pub(crate) fn write_cargo_replay_meta_rows(
+    path: &Path,
+    rows: &[StoredCargoReplayMetaRow],
+) -> Result<()> {
+    let schema = cargo_replay_meta_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.root_key.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(crate) fn read_cargo_replay_meta_rows(path: &Path) -> Result<Vec<StoredCargoReplayMetaRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let root_key = downcast_str(&batch, "root_key")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredCargoReplayMetaRow {
+                root_key: root_key.value(i).to_string(),
+                observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}

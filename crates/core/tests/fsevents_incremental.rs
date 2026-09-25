@@ -25,8 +25,8 @@ use swamp_core::actions;
 use swamp_core::fs_events::{
     FsEventsPlan, FsEventsRequest, FsEventsSource, RefreshRefusal, testing::CannedSource,
 };
-use swamp_core::growth::volume_store_dir;
-use swamp_core::report::{ArtifactKind, load_last_report, report_full_mode_with_source};
+use swamp_core::growth::{root_key, volume_store_dir};
+use swamp_core::report::{ArtifactKind, report_full_mode_with_source};
 
 /// Disables the `TooSoon` floor for this process. Idempotent and safe to
 /// call from every test regardless of thread-parallel execution: every
@@ -574,16 +574,11 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
     .expect("baseline");
     let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
     let before = fs::read(&sidecar).unwrap();
-    let cache = fs::read_dir(store.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("last_report-")
-        })
-        .unwrap();
+    // `git_signals.parquet` is `consumers::signals`'s per-root replay
+    // cache (R18a-4's replacement for `last_report-<key>.json.zst`):
+    // written, like every table, every pass this call observes.
+    let cache = store.path().join("git_signals.parquet");
+    assert!(cache.exists(), "baseline observe must write {cache:?}");
     // The cache write publishes by renaming a sibling temp file over the
     // cache path; a non-empty directory sitting at that path makes the
     // rename fail, which is the failure this test needs.
@@ -656,9 +651,14 @@ fn switching_roots_preserves_history_and_alias_replay_namespace() {
     )
     .expect("parent baseline");
     assert_eq!(parent.root, std::fs::canonicalize(&fx.root).unwrap());
+    // R18a-4: there is no single whole-`Report` cache left to load: the
+    // per-root replay tables are keyed by `growth::root_key`, which
+    // canonicalizes before hashing, so the alias and the canonical root
+    // must resolve to the same key and the same stored replay cache.
+    assert_eq!(root_key(&alias), root_key(&fx.root));
     assert!(
-        load_last_report(store.path(), &alias).is_some(),
-        "alias and canonical root must load the same cached report"
+        swamp_core::growth::read_cargo_replay_cache(store.path(), &root_key(&alias)).is_some(),
+        "alias and canonical root must load the same cached replay state"
     );
 
     // A child/root switch uses the same physical store but must select a

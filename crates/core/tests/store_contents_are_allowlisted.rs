@@ -24,6 +24,14 @@ use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 
 /// Exact basenames allowed anywhere under the store.
+///
+/// `last_report.json`/`last_report.json.zst`/`last_report-<key>.json.zst`
+/// (the whole-`Report` replay cache) are gone as of R18a-4: the two
+/// lower-level replay caches they served are now root-keyed Parquet
+/// tables (`git_signals.parquet`/`git_signals_values.parquet`,
+/// `cargo_replay_cache.parquet`/`cargo_replay_cache_lists.parquet`/
+/// `cargo_replay_cache_evidence.parquet`/`cargo_replay_cache_meta.parquet`),
+/// covered by the `.parquet` rule below like every other table.
 const ALLOWED_NAMES: &[&str] = &[
     "config.toml",
     "ledger.jsonl",
@@ -33,8 +41,6 @@ const ALLOWED_NAMES: &[&str] = &[
     "ui_state.json",
     "scope.json",
     "restore.json",
-    "last_report.json",
-    "last_report.json.zst",
 ];
 
 fn allowed(rel: &Path) -> bool {
@@ -47,11 +53,6 @@ fn allowed(rel: &Path) -> bool {
     }
     // Columnar tables, wherever the store puts them.
     if name.ends_with(".parquet") {
-        return true;
-    }
-    // The per-root/per-scope report cache is one compressed file named
-    // from a hash of what it covers.
-    if name.starts_with("last_report-") && name.ends_with(".json.zst") {
         return true;
     }
     // A Linux collector's checkpoint and an observation's sync request

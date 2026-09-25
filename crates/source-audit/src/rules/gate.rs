@@ -372,11 +372,12 @@ const LITERAL_SITES: &[(&str, &[MintSite], &str)] = &[
     ),
 ];
 
-/// The report functions the TUI may name: the scope-aware observation,
-/// loading a stored report back, and the pure merge of per-root reports.
+/// The report functions the TUI may name: the scope-aware observation
+/// and the pure merge of per-root reports (`load_last_report` was one
+/// of these until R18a-4 deleted it along with the JSON cache it read;
+/// nothing in the TUI ever called it).
 const TUI_REPORT_API: &[&str] = &[
     "@core::report::observe_scope",
-    "@core::report::load_last_report",
     "@core::report::merge_reports",
     // R12: reads the stored scope-wide tables back by the same
     // `EffectiveScope` the caller already resolved -- no bare root, no

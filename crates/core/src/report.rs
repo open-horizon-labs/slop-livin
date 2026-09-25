@@ -1298,11 +1298,6 @@ pub fn annotate_tracking(
     }
 }
 
-fn last_report_key(root: &Path) -> String {
-    let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    crate::entities::id_for(&root.display().to_string())[..16].to_string()
-}
-
 /// (worktree_id, rel_path) of every folded artifact row, for
 /// `aggregate_dir_totals` and for keeping interior rows out of the report.
 pub(crate) fn artifact_roots(
@@ -1339,34 +1334,6 @@ pub(crate) fn dir_inside_artifact(
             None => return false,
         }
     }
-}
-
-pub(crate) fn write_last_report(store_dir: &Path, report: &Report) -> Result<()> {
-    let mut slim = report.clone();
-    slim.dirs_by_worktree = None;
-    slim.files_by_worktree = None;
-    crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::LastReport {
-            store: &crate::fs_gate::store::StoreDir::at(store_dir)?,
-            key: &last_report_key(&report.root),
-        },
-        &slim,
-    )?;
-    Ok(())
-}
-
-/// The last report written for `root` by any observation (CLI, scheduled
-/// run, TUI), without walking anything. `None` when no observation of
-/// this root has been cached yet.
-pub fn load_last_report(store_dir: &Path, root: &Path) -> Option<Report> {
-    let store = crate::fs_gate::store::StoreDir::at(store_dir).ok()?;
-    let bytes =
-        crate::fs_gate::store::read_json_bytes(crate::fs_gate::store::JsonFile::LastReport {
-            store: &store,
-            key: &last_report_key(root),
-        })
-        .ok()??;
-    serde_json::from_slice(&bytes).ok()
 }
 
 /// Rolls `own_allocated` up into `allocated_total` bottom-up: deepest

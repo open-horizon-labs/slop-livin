@@ -10,7 +10,6 @@ futures-util.workspace = true
 anyhow.workspace = true
 libc = "0.2"
 toml.workspace = true
-zstd = "0.13"
 arrow-array.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true

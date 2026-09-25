@@ -68,11 +68,19 @@ impl Consumer for CargoConsumer {
         let artifact_roots = crate::report::artifact_roots(&draft.projects);
         crate::report::aggregate_dir_totals(&mut draft.dirs, &artifact_roots);
 
+        // The previous pass's nested-artifact units, from
+        // `cargo_replay_cache.parquet` (R18a-4) -- root-keyed, never
+        // scope-keyed, so this replay decision is available on this
+        // root's own bus pass whether it is a single-root, scope-less
+        // call or one root inside a multi-root scope (unlike
+        // `nested_artifacts.parquet`, which is scope-wide and only
+        // written once, at the end of `observe_scope`, after every
+        // root's pass -- including this one -- has already run).
+        let root_key = crate::growth::root_key(&ctx.root);
         let previous = ctx
             .store_dir
             .as_deref()
-            .and_then(|d| crate::report::load_last_report(d, &ctx.root))
-            .map(|r| (r.observed_at, r.nested_artifacts));
+            .and_then(|d| crate::growth::read_cargo_replay_cache(d, &root_key));
 
         // The replay gate. A root this pass replayed successfully leaves
         // a trusted window here; a full walk, a refusal or a store-less
@@ -100,6 +108,16 @@ impl Consumer for CargoConsumer {
         let shared = shared_containers(&self.adapters, facts.as_deref());
         let nested =
             crate::build_adapters::identify_all(&self.adapters, &projects, &shared, &build_ctx);
+
+        // Persist this pass's units as the next pass's replay cache.
+        // Gated on `ctx.observe` like every other current-state table
+        // write -- a pure-read call must never advance what a later
+        // real observation replays from.
+        if ctx.observe
+            && let Some(store) = ctx.store_dir.as_deref()
+        {
+            crate::growth::write_cargo_replay_cache(store, &root_key, &nested, ctx.observed_at)?;
+        }
 
         draft.nested_artifacts = Arc::new(nested);
         Ok(vec![Event::CargoAnnotated(Arc::new(draft))])

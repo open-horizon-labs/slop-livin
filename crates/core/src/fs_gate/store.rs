@@ -109,27 +109,30 @@ pub enum JsonFile<'a> {
     UiState { store: &'a StoreDir },
     /// `<volume>/fsevents.json`: the FSEvents cursor for one root.
     FsEventsCursor { volume: &'a StoreDir },
-    /// `<store>/last_report-<key>.json.zst`: the last report, zstd
-    /// compressed, so a `--no-observe` or TUI start never re-walks.
-    ///
-    /// The unowned/remainder rows of a volume are **not** here any more
-    /// (#R10 item 1): `<volume>/unowned.json` used to scale with the
-    /// unowned *file* count (473 MB on a real default-scope store) --
-    /// exactly the giant JSON artifact cache the handoff forbids. They
-    /// now live in `<volume>/unowned.parquet`
-    /// (`growth::{read_unowned, write_unowned}` /
-    /// `growth::columns::{read_unowned_rows, write_unowned_rows}`),
-    /// folded per directory by `walk.rs`, and are not written through
-    /// this gate at all -- like every other history table, only through
-    /// `crate::fs_gate::columns::write_parquet_atomic`.
-    LastReport { store: &'a StoreDir, key: &'a str },
 }
 
 /// How a [`JsonFile`] is encoded on disk.
+///
+/// The unowned/remainder rows of a volume are **not** JSON any more
+/// (#R10 item 1): `<volume>/unowned.json` used to scale with the
+/// unowned *file* count (473 MB on a real default-scope store) --
+/// exactly the giant JSON artifact cache the handoff forbids. They now
+/// live in `<volume>/unowned.parquet` (`growth::{read_unowned,
+/// write_unowned}` / `growth::columns::{read_unowned_rows,
+/// write_unowned_rows}`), folded per directory by `walk.rs`, and are not
+/// written through this gate at all -- like every other history table,
+/// only through `crate::fs_gate::columns::write_parquet_atomic`. The
+/// last JSON file that *was* written through this gate compressed
+/// (`LastReport`, the whole-`Report` replay cache `last_report-<key>
+/// .json.zst`) was deleted in R18a-4: the two lower-level replay caches
+/// it served (`consumers/signals.rs`'s previous git signals,
+/// `consumers/cargo.rs`'s previous nested-artifacts cache) are now their
+/// own root-keyed Parquet tables (`growth::write_git_signals_table`/
+/// `growth::write_cargo_replay_cache`), so nothing here needs zstd any
+/// more either.
 enum Encoding {
     Pretty,
     Compact,
-    CompactZstd,
 }
 
 fn plain(id: &str) -> io::Result<&str> {
@@ -155,9 +158,6 @@ impl JsonFile<'_> {
             JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
             JsonFile::UiState { store } => store.0.join("ui_state.json"),
             JsonFile::FsEventsCursor { volume } => volume.0.join("fsevents.json"),
-            JsonFile::LastReport { store, key } => store
-                .0
-                .join(format!("last_report-{}.json.zst", plain(key)?)),
         })
     }
 
@@ -166,7 +166,6 @@ impl JsonFile<'_> {
             JsonFile::Plan { .. } | JsonFile::Grants { .. } | JsonFile::Scope { .. } => {
                 Encoding::Pretty
             }
-            JsonFile::LastReport { .. } => Encoding::CompactZstd,
             _ => Encoding::Compact,
         }
     }
@@ -178,24 +177,19 @@ pub fn write_json<T: Serialize + ?Sized>(file: JsonFile<'_>, value: &T) -> io::R
     let bytes = match file.encoding() {
         Encoding::Pretty => serde_json::to_vec_pretty(value)?,
         Encoding::Compact => serde_json::to_vec(value)?,
-        Encoding::CompactZstd => zstd::stream::encode_all(&serde_json::to_vec(value)?[..], 3)?,
     };
     write_atomic(&path, &bytes)
 }
 
 /// Reads `file` back: `Ok(None)` when it does not exist. The bytes are
-/// the JSON text (decompressed for [`JsonFile::LastReport`]).
+/// the JSON text.
 pub fn read_json_bytes(file: JsonFile<'_>) -> io::Result<Option<Vec<u8>>> {
     let path = file.path()?;
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    Ok(Some(match file.encoding() {
-        Encoding::CompactZstd => zstd::stream::decode_all(&bytes[..])?,
-        _ => bytes,
-    }))
+    match std::fs::read(&path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Every non-JSON text file swamp writes.

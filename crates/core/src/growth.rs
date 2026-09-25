@@ -24,14 +24,16 @@
 //! A no-change observation (no row's bytes/presence changed) appends no
 //! delta file at all.
 
+use crate::bus::WorktreeSignals;
 use crate::entities::Confidence;
 use crate::fs_events::{FsEventsRequest, FsEventsState};
 use crate::fs_gate::{MetadataExt, read::read_owned_string, store};
 use crate::git::DiscoveredWorktree;
 use crate::report::{
-    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Report, Source, UnownedReason,
-    UnownedRow, WorktreeRow,
+    ArtifactKind, ArtifactRow, DirRollup, FileRow, ProjectRow, Report, Signal, Source,
+    UnownedReason, UnownedRow, WorktreeRow,
 };
+use crate::signals::RawSignals;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -247,6 +249,22 @@ pub fn root_scoped_volume_id(root: &Path) -> u64 {
             .expect("blake3 digest is 32 bytes"),
     )
 }
+/// The stable per-root key `git_signals.parquet`/`cargo_replay_cache*.parquet`
+/// partition on: the canonicalized root's id, the same key space
+/// `report::last_report_key` used before R18a-4 deleted it (this is its
+/// direct replacement -- moved here because every other current-state
+/// table's key derivation lives in `growth`, not `report`). Deliberately
+/// *not* [`root_scoped_volume_id`]: that one folds in the device, to
+/// name a distinct on-disk subdirectory per volume, which these tables
+/// do not need (they are ordinary rows filtered by a string column, not
+/// directories); adding the device here would also make an alias whose
+/// device id changes (a remounted volume) needlessly lose its replay
+/// cache, which the path-only key does not.
+pub fn root_key(root: &Path) -> String {
+    let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    crate::entities::id_for(&root.display().to_string())[..16].to_string()
+}
+
 fn current_path(dir: &Path) -> PathBuf {
     dir.join("current.parquet")
 }
@@ -4051,6 +4069,323 @@ pub(crate) fn nested_artifact_from_stored(
             None => crate::cargo_cleanup::Guidance::default(),
         },
     }
+}
+
+// ---------------------------------------------------------------------
+// git_signals.parquet (R18a-4). `consumers/signals.rs`'s per-root
+// replay cache: what an unchanged worktree's git activity was last
+// measured as, so an incremental pass ages it forward (`crate::signals
+// ::age_signals`) instead of re-opening the repository. Replaces the
+// git-activity slice of `last_report-<key>.json.zst`. Root-keyed
+// (`root_key`, above), wholesale-replaced per root -- never scope-keyed,
+// so a single-root, scope-less call (every pre-#42 entry point, plus
+// every per-root pass inside a scope) reads and writes this exactly the
+// same way.
+// ---------------------------------------------------------------------
+
+fn git_signals_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("git_signals.parquet")
+}
+
+fn git_signal_values_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("git_signals_values.parquet")
+}
+
+/// Writes this root's per-worktree git signals, replacing every row this
+/// `root_key` owns in both tables. Called from `consumers::signals`
+/// itself, once per pass, right after `by_worktree` is complete (both
+/// the worktrees this pass replayed from the previous table and the
+/// ones it re-walked) -- deliberately *before* `gate.rs` appends
+/// `merge_complete`/`pull_request` to a `WorktreeRow`'s signals from the
+/// GitHub facts this same pass fetched: those two are re-derived fresh
+/// every pass regardless of replay, so storing pre-enrichment rows means
+/// a replay never needs to filter them back out (the JSON cache this
+/// replaces did, because it persisted the fully merged `Report`).
+pub(crate) fn write_git_signals_table(
+    swamp_dir: &Path,
+    root_key: &str,
+    observed_at: u64,
+    by_worktree: &HashMap<String, WorktreeSignals>,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let file = git_signals_path(swamp_dir);
+    let mut rows: Vec<columns::StoredGitSignalRow> = columns::read_git_signal_rows(&file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.root_key != root_key)
+        .collect();
+    rows.extend(
+        by_worktree
+            .iter()
+            .map(|(id, w)| columns::StoredGitSignalRow {
+                root_key: root_key.to_string(),
+                worktree_id: id.clone(),
+                branch: w.branch.clone(),
+                last_commit_age_secs: w.raw.last_commit_age_secs,
+                dirty: w.raw.dirty,
+                unpushed: w.raw.unpushed,
+                locked: w.raw.locked,
+                idle_for_secs: w.raw.idle_for_secs,
+                observed_at,
+            }),
+    );
+    columns::write_git_signal_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))?;
+
+    let values_file = git_signal_values_path(swamp_dir);
+    let mut value_rows: Vec<columns::StoredGitSignalValueRow> =
+        columns::read_git_signal_value_rows(&values_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.root_key != root_key)
+            .collect();
+    for (id, w) in by_worktree {
+        for (seq, s) in w.rows.iter().enumerate() {
+            value_rows.push(columns::StoredGitSignalValueRow {
+                root_key: root_key.to_string(),
+                worktree_id: id.clone(),
+                seq: seq as u32,
+                name: s.name.clone(),
+                value: s.value.clone(),
+            });
+        }
+    }
+    columns::write_git_signal_value_rows(&values_file, &value_rows)
+        .with_context(|| format!("write {}", values_file.display()))
+}
+
+/// One worktree's previously stored git signals: `branch` plus the raw
+/// and rendered forms `crate::signals::age_signals` needs.
+pub(crate) struct StoredWorktreeGitSignals {
+    pub branch: Option<String>,
+    pub raw: RawSignals,
+    pub rows: Vec<Signal>,
+}
+
+/// This root's previous git-signals pass: `(observed_at, by_worktree)`,
+/// or `None` when nothing has ever been stored for this root (a fresh
+/// store, or a root observed for the first time).
+pub(crate) fn read_git_signals_table(
+    swamp_dir: &Path,
+    root_key: &str,
+) -> Option<(u64, HashMap<String, StoredWorktreeGitSignals>)> {
+    let rows: Vec<columns::StoredGitSignalRow> =
+        columns::read_git_signal_rows(&git_signals_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.root_key == root_key)
+            .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let observed_at = rows.iter().map(|r| r.observed_at).max()?;
+    let value_rows: Vec<columns::StoredGitSignalValueRow> =
+        columns::read_git_signal_value_rows(&git_signal_values_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.root_key == root_key)
+            .collect();
+    let mut by_worktree = HashMap::new();
+    for r in rows {
+        let mut values: Vec<&columns::StoredGitSignalValueRow> = value_rows
+            .iter()
+            .filter(|v| v.worktree_id == r.worktree_id)
+            .collect();
+        values.sort_by_key(|v| v.seq);
+        let signal_rows: Vec<Signal> = values
+            .into_iter()
+            .map(|v| Signal {
+                name: v.name.clone(),
+                value: v.value.clone(),
+            })
+            .collect();
+        by_worktree.insert(
+            r.worktree_id.clone(),
+            StoredWorktreeGitSignals {
+                branch: r.branch,
+                raw: RawSignals {
+                    last_commit_age_secs: r.last_commit_age_secs,
+                    dirty: r.dirty,
+                    unpushed: r.unpushed,
+                    locked: r.locked,
+                    idle_for_secs: r.idle_for_secs,
+                },
+                rows: signal_rows,
+            },
+        );
+    }
+    Some((observed_at, by_worktree))
+}
+
+// ---------------------------------------------------------------------
+// cargo_replay_cache.parquet / cargo_replay_cache_lists.parquet /
+// cargo_replay_cache_evidence.parquet (R18a-4). `consumers/cargo.rs`'s
+// per-root replay cache for `build_adapters::ContainerCache::from_previous`:
+// the previous pass's `NestedArtifact` units for this root, root-keyed
+// exactly like `git_signals.parquet` above, replacing the
+// nested-artifacts slice of `last_report-<key>.json.zst`.
+//
+// This reuses `nested_artifacts.parquet`'s own row shapes and
+// stored<->domain conversions (`stored_row_from_nested_artifact`,
+// `nested_artifact_list_rows`, `nested_artifact_evidence_rows`,
+// `nested_artifact_from_stored`) verbatim -- every `NestedArtifact`
+// field this cache needs was already typed there (R16/R18a-2) -- but
+// writes them to their own, root-keyed files rather than extending
+// `nested_artifacts.parquet` itself. `nested_artifacts.parquet` is
+// scope-keyed and wholesale-replaced exactly once, at the end of
+// `observe_scope`, after every root's bus pass has already run and
+// merged (`report::observe_scope`'s `write_nested_artifact_table` call);
+// it is also never written at all for a plain single-root,
+// scope-less call (`report_full_mode_with_source` et al., which have no
+// `ObservationParts::ALL`/scope-wide unit discovery to gate it on). A
+// per-root incremental pass's replay decision must be available *during*
+// that same root's own bus run, for both kinds of caller -- exactly the
+// "never scope-keyed" requirement `git_signals.parquet` above states --
+// so this is a second, root-keyed file, not a new column on the first.
+// ---------------------------------------------------------------------
+
+const CARGO_REPLAY_ORIGIN: &str = "cargo-replay-cache";
+
+fn cargo_replay_cache_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("cargo_replay_cache.parquet")
+}
+
+fn cargo_replay_cache_lists_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("cargo_replay_cache_lists.parquet")
+}
+
+fn cargo_replay_cache_evidence_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("cargo_replay_cache_evidence.parquet")
+}
+
+fn cargo_replay_cache_meta_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("cargo_replay_cache_meta.parquet")
+}
+
+/// Writes this root's nested-artifact replay cache, replacing every row
+/// this `root_key` owns across all four files. Called from
+/// `consumers::cargo` after this pass's `NestedArtifact` identification
+/// finishes, so the *next* pass over this root -- unless it force-full
+/// walks -- replays from exactly what this pass measured.
+pub(crate) fn write_cargo_replay_cache(
+    swamp_dir: &Path,
+    root_key: &str,
+    units: &[crate::artifact::NestedArtifact],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+
+    let file = cargo_replay_cache_path(swamp_dir);
+    let mut rows: Vec<columns::StoredNestedArtifactRow> = columns::read_nested_artifact_rows(&file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != root_key)
+        .collect();
+    rows.extend(
+        units
+            .iter()
+            .map(|n| stored_row_from_nested_artifact(root_key, CARGO_REPLAY_ORIGIN, n)),
+    );
+    columns::write_nested_artifact_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))?;
+
+    let lists_file = cargo_replay_cache_lists_path(swamp_dir);
+    let mut list_rows: Vec<columns::StoredNestedArtifactListRow> =
+        columns::read_nested_artifact_list_rows(&lists_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != root_key)
+            .collect();
+    for n in units {
+        list_rows.extend(nested_artifact_list_rows(root_key, CARGO_REPLAY_ORIGIN, n));
+    }
+    columns::write_nested_artifact_list_rows(&lists_file, &list_rows)
+        .with_context(|| format!("write {}", lists_file.display()))?;
+
+    let evidence_file = cargo_replay_cache_evidence_path(swamp_dir);
+    let mut evidence_rows: Vec<columns::StoredNestedArtifactEvidenceRow> =
+        columns::read_nested_artifact_evidence_rows(&evidence_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != root_key)
+            .collect();
+    for n in units {
+        evidence_rows.extend(nested_artifact_evidence_rows(
+            root_key,
+            CARGO_REPLAY_ORIGIN,
+            n,
+        ));
+    }
+    columns::write_nested_artifact_evidence_rows(&evidence_file, &evidence_rows)
+        .with_context(|| format!("write {}", evidence_file.display()))?;
+
+    let meta_file = cargo_replay_cache_meta_path(swamp_dir);
+    let mut meta_rows: Vec<columns::StoredCargoReplayMetaRow> =
+        columns::read_cargo_replay_meta_rows(&meta_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.root_key != root_key)
+            .collect();
+    meta_rows.push(columns::StoredCargoReplayMetaRow {
+        root_key: root_key.to_string(),
+        observed_at,
+    });
+    columns::write_cargo_replay_meta_rows(&meta_file, &meta_rows)
+        .with_context(|| format!("write {}", meta_file.display()))
+}
+
+/// This root's previous nested-artifact pass: `(observed_at, units)`, or
+/// `None` when this root has never been observed. Presence is decided
+/// by the meta row, not by `units` being non-empty -- a root that
+/// genuinely had zero nested artifacts last pass is still a real
+/// previous observation, not "never observed".
+pub fn read_cargo_replay_cache(
+    swamp_dir: &Path,
+    root_key: &str,
+) -> Option<(u64, Vec<crate::artifact::NestedArtifact>)> {
+    let meta_rows =
+        columns::read_cargo_replay_meta_rows(&cargo_replay_cache_meta_path(swamp_dir)).ok()?;
+    let observed_at = meta_rows
+        .iter()
+        .find(|r| r.root_key == root_key)?
+        .observed_at;
+
+    let rows: Vec<columns::StoredNestedArtifactRow> =
+        columns::read_nested_artifact_rows(&cargo_replay_cache_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == root_key)
+            .collect();
+    let list_rows: Vec<columns::StoredNestedArtifactListRow> =
+        columns::read_nested_artifact_list_rows(&cargo_replay_cache_lists_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == root_key)
+            .collect();
+    let evidence_rows: Vec<columns::StoredNestedArtifactEvidenceRow> =
+        columns::read_nested_artifact_evidence_rows(&cargo_replay_cache_evidence_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == root_key)
+            .collect();
+
+    let units = rows
+        .iter()
+        .map(|r| {
+            let lists: Vec<columns::StoredNestedArtifactListRow> = list_rows
+                .iter()
+                .filter(|l| l.artifact_id == r.id)
+                .cloned()
+                .collect();
+            let evidence: Vec<columns::StoredNestedArtifactEvidenceRow> = evidence_rows
+                .iter()
+                .filter(|e| e.artifact_id == r.id)
+                .cloned()
+                .collect();
+            nested_artifact_from_stored(r, &lists, &evidence)
+        })
+        .collect();
+    Some((observed_at, units))
 }
 
 // ---------------------------------------------------------------------
@@ -7894,6 +8229,373 @@ mod tests {
         assert!(rebuilt[0].dangling);
         assert_eq!(rebuilt[0].allocated_bytes, Some(999));
         assert_eq!(rebuilt[0].containers, vec!["tampered".to_string()]);
+    }
+
+    /// R18a-4: `git_signals.parquet`/`git_signals_values.parquet` round-trip
+    /// every `RawSignals` field, `branch`, and the rendered `Signal` rows
+    /// in order, root-keyed (not scope-keyed): a second root's rows do
+    /// not disturb the first's, and a missing root reads back `None`,
+    /// not an empty map (the meta/presence distinction
+    /// `read_cargo_replay_cache` also relies on).
+    #[test]
+    fn git_signals_table_round_trips_every_field_and_keeps_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let mut by_worktree = HashMap::new();
+        by_worktree.insert(
+            "w1".to_string(),
+            WorktreeSignals {
+                path: PathBuf::from("/src/w1"),
+                branch: Some("main".into()),
+                raw: RawSignals {
+                    last_commit_age_secs: Some(3_600),
+                    dirty: Some(true),
+                    unpushed: Some(2),
+                    locked: Some(false),
+                    idle_for_secs: Some(7_200),
+                },
+                rows: vec![
+                    Signal {
+                        name: "last_commit".into(),
+                        value: "1h ago".into(),
+                    },
+                    Signal {
+                        name: "dirty".into(),
+                        value: "dirty".into(),
+                    },
+                ],
+            },
+        );
+        by_worktree.insert(
+            "w2".to_string(),
+            WorktreeSignals {
+                path: PathBuf::from("/src/w2"),
+                branch: None,
+                raw: RawSignals {
+                    last_commit_age_secs: None,
+                    dirty: None,
+                    unpushed: None,
+                    locked: None,
+                    idle_for_secs: None,
+                },
+                rows: Vec::new(),
+            },
+        );
+        write_git_signals_table(store, "root-a", 100, &by_worktree).unwrap();
+        // A second root's rows must not disturb the first's.
+        write_git_signals_table(store, "root-b", 200, &by_worktree).unwrap();
+
+        let (observed_at, rebuilt) = read_git_signals_table(store, "root-a").expect("root-a rows");
+        assert_eq!(observed_at, 100);
+        assert_eq!(rebuilt.len(), 2);
+        let w1 = &rebuilt["w1"];
+        assert_eq!(w1.branch.as_deref(), Some("main"));
+        assert_eq!(w1.raw.last_commit_age_secs, Some(3_600));
+        assert_eq!(w1.raw.dirty, Some(true));
+        assert_eq!(w1.raw.unpushed, Some(2));
+        assert_eq!(w1.raw.locked, Some(false));
+        assert_eq!(w1.raw.idle_for_secs, Some(7_200));
+        assert_eq!(
+            w1.rows.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["last_commit", "dirty"],
+            "signal row order must be kept"
+        );
+        let w2 = &rebuilt["w2"];
+        assert!(w2.branch.is_none());
+        assert!(w2.rows.is_empty());
+
+        assert!(read_git_signals_table(store, "missing").is_none());
+    }
+
+    /// A direct on-disk tamper of `git_signals.parquet`/
+    /// `git_signals_values.parquet` is what `read_git_signals_table`
+    /// reflects, not the value the signals were first written with.
+    #[test]
+    fn git_signals_table_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let mut by_worktree = HashMap::new();
+        by_worktree.insert(
+            "w1".to_string(),
+            WorktreeSignals {
+                path: PathBuf::from("/src/w1"),
+                branch: Some("main".into()),
+                raw: RawSignals {
+                    last_commit_age_secs: Some(10),
+                    dirty: Some(false),
+                    unpushed: Some(0),
+                    locked: Some(false),
+                    idle_for_secs: Some(10),
+                },
+                rows: vec![Signal {
+                    name: "dirty".into(),
+                    value: "clean".into(),
+                }],
+            },
+        );
+        write_git_signals_table(store, "root-a", 1, &by_worktree).unwrap();
+
+        let mut rows = columns::read_git_signal_rows(&git_signals_path(store)).unwrap();
+        rows[0].branch = Some("tampered-branch".into());
+        rows[0].dirty = Some(true);
+        columns::write_git_signal_rows(&git_signals_path(store), &rows).unwrap();
+        let mut values =
+            columns::read_git_signal_value_rows(&git_signal_values_path(store)).unwrap();
+        values[0].value = "tampered".into();
+        columns::write_git_signal_value_rows(&git_signal_values_path(store), &values).unwrap();
+
+        let (_, rebuilt) = read_git_signals_table(store, "root-a").unwrap();
+        let w1 = &rebuilt["w1"];
+        assert_eq!(w1.branch.as_deref(), Some("tampered-branch"));
+        assert_eq!(w1.raw.dirty, Some(true));
+        assert_eq!(w1.rows[0].value, "tampered");
+    }
+
+    /// R18a-4: a second observe of an unchanged worktree ages the stored
+    /// signals forward (`crate::signals::age_signals`) rather than
+    /// recomputing them -- the same claim the deleted
+    /// `last_report-<key>.json.zst` cache used to support, now proven
+    /// against `git_signals.parquet` directly: `last_commit_age_secs`/
+    /// `idle_for_secs` grow by exactly the elapsed gap between the two
+    /// writes, and `dirty`/`unpushed`/`locked` (never aged) carry
+    /// through unchanged, which is only possible if the second write
+    /// read the first's stored values back rather than recomputing
+    /// fresh (all-`None`) `RawSignals` for an unwalked worktree.
+    #[test]
+    fn an_unchanged_worktree_ages_stored_signals_instead_of_recomputing_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let mut first = HashMap::new();
+        first.insert(
+            "w1".to_string(),
+            WorktreeSignals {
+                path: PathBuf::from("/src/w1"),
+                branch: Some("main".into()),
+                raw: RawSignals {
+                    last_commit_age_secs: Some(100),
+                    dirty: Some(true),
+                    unpushed: Some(3),
+                    locked: Some(false),
+                    idle_for_secs: Some(100),
+                },
+                rows: vec![
+                    Signal {
+                        name: "last_commit".into(),
+                        // `age_signals` re-renders `last_commit`/`idle_for`
+                        // from `raw` regardless of this stored text, so a
+                        // placeholder is enough here.
+                        value: "100s ago".into(),
+                    },
+                    Signal {
+                        name: "idle_for".into(),
+                        value: "idle 100s".into(),
+                    },
+                ],
+            },
+        );
+        write_git_signals_table(store, "root-a", 1_000, &first).unwrap();
+
+        // Simulate the incremental replay `consumers::signals` performs
+        // for a worktree FSEvents reported nothing under: read the
+        // stored previous pass back and age it by the elapsed gap,
+        // never recompute a fresh `RawSignals`.
+        let (prev_observed_at, prev_by_worktree) =
+            read_git_signals_table(store, "root-a").expect("previous pass");
+        let elapsed = 1_500u64.saturating_sub(prev_observed_at);
+        assert_eq!(elapsed, 500);
+        let prev_w1 = &prev_by_worktree["w1"];
+        let (aged_rows, aged_raw) =
+            crate::signals::age_signals(&prev_w1.rows, &prev_w1.raw, elapsed);
+
+        assert_eq!(
+            aged_raw.last_commit_age_secs,
+            Some(600),
+            "last_commit_age_secs must grow by exactly the elapsed gap"
+        );
+        assert_eq!(
+            aged_raw.idle_for_secs,
+            Some(600),
+            "idle_for_secs must grow by exactly the elapsed gap"
+        );
+        assert_eq!(
+            aged_raw.dirty,
+            Some(true),
+            "dirty is never aged -- it must carry through from the stored value unchanged"
+        );
+        assert_eq!(aged_raw.unpushed, Some(3));
+        assert_eq!(aged_raw.locked, Some(false));
+
+        let mut second = HashMap::new();
+        second.insert(
+            "w1".to_string(),
+            WorktreeSignals {
+                path: PathBuf::from("/src/w1"),
+                branch: prev_w1.branch.clone(),
+                raw: aged_raw,
+                rows: aged_rows,
+            },
+        );
+        write_git_signals_table(store, "root-a", 1_500, &second).unwrap();
+        let (observed_at, rebuilt) = read_git_signals_table(store, "root-a").unwrap();
+        assert_eq!(observed_at, 1_500);
+        assert_eq!(rebuilt["w1"].raw.last_commit_age_secs, Some(600));
+    }
+
+    /// R18a-4: `cargo_replay_cache.parquet` (+ its list/evidence/meta
+    /// tables) round-trips every `NestedArtifact` field via the exact
+    /// `nested_artifacts.parquet` conversions, root-keyed instead of
+    /// scope-keyed. Presence is decided by the meta row, not by the
+    /// units list being non-empty: a root with genuinely zero nested
+    /// artifacts this pass is still a real previous observation.
+    #[test]
+    fn cargo_replay_cache_round_trips_every_field_and_distinguishes_never_observed_from_empty() {
+        use crate::artifact::{
+            AccountingBasis, ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant,
+            Membership, NestedActionCapability, NestedArtifact, TimeSource,
+        };
+        use crate::entities::Confidence;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+
+        let unit = NestedArtifact {
+            id: "n1".into(),
+            path: PathBuf::from("/src/one/target/debug"),
+            relative_path: "target/debug".into(),
+            parent_id: None,
+            container_id: Some("n0".into()),
+            role: ArtifactRole::Profile,
+            membership: Membership::Exclusive,
+            is_dir: true,
+            device: 5,
+            inode: 99,
+            logical_bytes: 4000,
+            bytes: 3000,
+            physical_bytes: 3000,
+            physical_total: 3000,
+            mtime_max: 555,
+            variant: ArtifactVariant {
+                profile: Some("debug".into()),
+                ..ArtifactVariant::default()
+            },
+            producer_evidence: vec![ArtifactEvidence {
+                source: "cargo-metadata".into(),
+                detail: "target-dir declared by workspace manifest".into(),
+                confidence: Confidence::High,
+            }],
+            consumer_evidence: Vec::new(),
+            coverage: ArtifactCoverage {
+                supported: true,
+                complete: true,
+                limits: Vec::new(),
+            },
+            action_group: None,
+            present: true,
+            growth_bytes: Some(100),
+            regrowth_count: 0,
+            decision_evidence: Vec::new(),
+            adapter: Some("cargo".into()),
+            basis: AccountingBasis::Allocated,
+            time_source: TimeSource::FoldedDirectoryModification,
+            action: NestedActionCapability::InspectionOnly,
+            consequence: Some("rebuild with `cargo build`".into()),
+            reported_by: None,
+            writer_lock: None,
+            guidance: crate::cargo_cleanup::Guidance::default(),
+        };
+
+        write_cargo_replay_cache(store, "root-a", std::slice::from_ref(&unit), 42).unwrap();
+        // A root genuinely observed with zero nested artifacts is a real
+        // previous observation, distinct from a root never observed.
+        write_cargo_replay_cache(store, "root-b", &[], 43).unwrap();
+
+        let (observed_at, units) = read_cargo_replay_cache(store, "root-a").expect("root-a rows");
+        assert_eq!(observed_at, 42);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&units[0]).unwrap(),
+            serde_json::to_value(&unit).unwrap()
+        );
+
+        let (empty_observed_at, empty_units) =
+            read_cargo_replay_cache(store, "root-b").expect("root-b was observed, just empty");
+        assert_eq!(empty_observed_at, 43);
+        assert!(empty_units.is_empty());
+
+        assert!(
+            read_cargo_replay_cache(store, "root-never-observed").is_none(),
+            "a root with no meta row must read back None, not Some(empty)"
+        );
+    }
+
+    /// A direct on-disk tamper of `cargo_replay_cache.parquet`'s row (and
+    /// its list/evidence children) is what `read_cargo_replay_cache`
+    /// reflects, not the value the unit was first written with -- the
+    /// same claim `nested_artifact_tables_rebuild_reflects_a_direct_tamper_
+    /// not_the_original_value` proves for the scope-keyed table, proven
+    /// here for the root-keyed replay cache instead.
+    #[test]
+    fn cargo_replay_cache_rebuild_reflects_a_direct_tamper_not_the_original_value() {
+        use crate::artifact::{
+            AccountingBasis, ArtifactCoverage, ArtifactRole, ArtifactVariant, Membership,
+            NestedActionCapability, NestedArtifact, TimeSource,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let unit = NestedArtifact {
+            id: "n1".into(),
+            path: PathBuf::from("/src/one/target/debug"),
+            relative_path: "target/debug".into(),
+            parent_id: None,
+            container_id: None,
+            role: ArtifactRole::Profile,
+            membership: Membership::Exclusive,
+            is_dir: true,
+            device: 0,
+            inode: 0,
+            logical_bytes: 0,
+            bytes: 10,
+            physical_bytes: 10,
+            physical_total: 10,
+            mtime_max: 1,
+            variant: ArtifactVariant::default(),
+            producer_evidence: Vec::new(),
+            consumer_evidence: Vec::new(),
+            coverage: ArtifactCoverage {
+                supported: true,
+                complete: true,
+                limits: vec!["original".into()],
+            },
+            action_group: None,
+            present: true,
+            growth_bytes: None,
+            regrowth_count: 0,
+            decision_evidence: Vec::new(),
+            adapter: None,
+            basis: AccountingBasis::Allocated,
+            time_source: TimeSource::FoldedDirectoryModification,
+            action: NestedActionCapability::InspectionOnly,
+            consequence: None,
+            reported_by: None,
+            writer_lock: None,
+            guidance: crate::cargo_cleanup::Guidance::default(),
+        };
+        write_cargo_replay_cache(store, "root-a", std::slice::from_ref(&unit), 1).unwrap();
+
+        let file = cargo_replay_cache_path(store);
+        let mut rows = columns::read_nested_artifact_rows(&file).unwrap();
+        rows[0].bytes = 999;
+        columns::write_nested_artifact_rows(&file, &rows).unwrap();
+        let lists_file = cargo_replay_cache_lists_path(store);
+        let mut lists = columns::read_nested_artifact_list_rows(&lists_file).unwrap();
+        lists[0].value = "tampered".into();
+        columns::write_nested_artifact_list_rows(&lists_file, &lists).unwrap();
+
+        let (_, units) = read_cargo_replay_cache(store, "root-a").unwrap();
+        assert_eq!(units[0].bytes, 999);
+        assert_eq!(units[0].coverage.limits, vec!["tampered".to_string()]);
     }
 
     /// R15 table 4: the current-artifact table carries `ecosystem`, keeps
