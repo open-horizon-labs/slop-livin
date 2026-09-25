@@ -754,7 +754,8 @@ narrow this slice's scope):
   most one row per `scope_key` (zero rows when a pass ran no live
   enrichment, wholesale-replaced like every other scope-keyed table).
 
-**Why `report_rows.parquet` stays**: `report_scope_from_store`'s
+**Why `report_rows.parquet` stayed through R18a-3** (resolved in
+R18a-3b, next): `report_scope_from_store`'s
 `rebuild_projects_from_tables` seeds its rebuilt artifact list's *shape*
 -- `ArtifactRow::kind`/`path`/`track`/`confidence`/`source`/`note`/
 `created_at`/`containers`/`shared_with`/`dangling`/`allocated_bytes`/
@@ -776,6 +777,35 @@ it before serializing, same as `notes`/`summary`/`reconciliation`/series
 already were) and flags the remaining gap for the next slice instead of
 deleting blind. `crates/core/src/growth.rs`'s `ReportSnapshot`/
 `StoredReportSnapshotRow` doc comments carry the same account inline.
+
+R18a-3b (2026-09-24) resolves the gap the paragraph above names:
+`artifact_shape.parquet` (+ `artifact_shape_lists.parquet` for the two
+list-valued fields, `containers`/`shared_with`) types the last
+`ArtifactRow` shape fields (`kind`/`path` as `rel_path`, joined back to
+the worktree path at read time/`track`/`confidence`/`source`/`note`/
+`created_at`/`dangling`/`allocated_bytes`/`allocated_growth_bytes`, plus
+`growth_bytes`, which the R15-era `ArtifactTableFacts` table never
+carried either), keyed by `(scope_key, worktree_id, seq)` with `seq`
+preserving each worktree's artifact order across the read (Parquet row
+order is not guaranteed). `report_rows.parquet`, `report_json`,
+`StoredReportSnapshotRow`, `write_report_snapshot`, `read_report_snapshot`,
+`slim_report_for_snapshot_json` and the now-dead
+`snapshot_from_observation` helper are all deleted. `report_scope_from_store`
+no longer starts from a deserialized snapshot at all: it assembles an
+empty `ReportSnapshot`/`Report` and runs every `rebuild_*_from_tables`
+function over it, gated by a new `growth::scope_observed_at` (a
+`summary.parquet` row for the scope key) rather than `projects.parquet`
+having a row -- a scope with genuinely zero discovered projects
+(external/agent units only, no git checkouts) always gets a
+`summary.parquet` row from every full observe but never gets a
+`projects.parquet` row at all, so gating on the latter would have made
+"zero projects" indistinguishable from "never observed" (a real
+regression this slice caught with the CLI's own `agent_storage_cli.rs`
+fixture, not a hypothetical). `ReportSnapshot` itself is not deleted as
+a type -- it is the one place `report_scope_from_store`'s result and
+`observe_scope`'s composed value share a name -- but it now carries no
+JSON persistence machinery at all, only an in-memory assembly. See
+`.oh/sessions/2026-09-24-r18a3b-snapshot-deleted.md`.
 
 `last_report-*.json.zst`/`growth::write_last_report`/`load_last_report`
 are untouched (R18a-4): `consumers/signals.rs`/`consumers/cargo.rs` read

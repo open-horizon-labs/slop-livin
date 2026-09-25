@@ -83,15 +83,15 @@ unowned rows come from `unowned_summary.parquet` (+
 opt-in per-worktree directory/large-file drill-down comes from
 `worktree_entries.parquet`; the scheduled-observation status line is a
 `summary.parquet` row; and live GitHub-enrichment call stats come from
-`github_enrichment.parquet`. The rest of the report (mainly a project's
-worktree's artifact rows' own shape -- kind, path, git tracking,
-confidence, containers, and similar render-only fields no table types
-yet) still comes from `report_rows.parquet` until the remaining
-tables land (see `docs/architecture.md`). Every table is rewritten by
-`observe`; delete
-one and the next `observe` recreates it. There is no migration for a
-store written before a table existed -- `report` simply reads what the
-last `observe` wrote.
+`github_enrichment.parquet`; and a project's worktree's artifact rows'
+own shape -- kind, path, git tracking, confidence, source, note,
+created-at, containers/shared-with, dangling, allocated bytes/growth --
+comes from `artifact_shape.parquet` (+ `artifact_shape_lists.parquet`
+for the two list-valued fields). There is no JSON render-cache row
+anywhere in the store any more (see `docs/architecture.md`). Every
+table is rewritten by `observe`; delete one and the next `observe`
+recreates it. There is no migration for a store written before a table
+existed -- `report` simply reads what the last `observe` wrote.
 
 ```bash
 swamp observe ~/src

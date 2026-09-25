@@ -4,6 +4,27 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: the render-cache row is gone (R18a-3b)
+
+The last JSON cell the store held for a scope's report, `report_json`
+on the scope-wide render-cache row (`report_rows.parquet`), is deleted,
+along with the row/table itself, `ReportSnapshot`'s stored-JSON
+machinery (`StoredReportSnapshotRow`, `write_report_snapshot`,
+`read_report_snapshot`, `slim_report_for_snapshot_json`) and the
+now-dead `snapshot_from_observation` helper. The one gap the previous
+slice left open -- a project's worktree's artifact rows' own shape
+(kind, path, git tracking, confidence, source, note, created-at,
+containers/shared-with, dangling, allocated bytes/growth, growth
+bytes) -- is now typed into `artifact_shape.parquet` (+
+`artifact_shape_lists.parquet` for the two list-valued fields), keyed
+the same way the current-artifact-history table already keys a row
+(`project_id`/`worktree_id`/`kind`/`rel_path`).
+`report::report_scope_from_store` assembles the whole `Report` from
+typed tables only, with no JSON fallback anywhere; the TUI's and CLI's
+stored-report open path is unchanged (it reads `ReportSnapshot`, now an
+in-memory assembly rather than a deserialized cell). See
+`.oh/sessions/2026-09-24-r18a3b-snapshot-deleted.md`.
+
 ### No JSON in the store: unowned, worktree drill-down, schedule line and GitHub enrichment typed (R18a-3)
 
 `Report.unowned`, `.dirs_by_worktree`/`.files_by_worktree`,
