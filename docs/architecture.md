@@ -897,7 +897,16 @@ ordinary artifact row:
     container re-resolves it live, memoised per distinct declared path --
     one resolution per project rather than one per session. A unit whose
     link can neither be recomputed nor go stale makes its whole container
-    unpersistable rather than replaying a stale answer.
+    unpersistable rather than replaying a stale answer. The same holds
+    for the folder-name inference (`agents::KnownWorktrees`, 2026-09-25):
+    a Claude Code unit records its `projects/<slug>` folder name beside
+    the declared path (`LinkBasis::Declared::folder_slug`, container
+    format `agent-container/2026-09-25.1`), and `ContainerCache::
+    finish_link` -- the one resolution path for identified and replayed
+    units alike -- infers a link only when nothing was declared and the
+    slug re-encodes exactly one of *this pass's* known worktrees. The
+    known set is the worktree list project discovery already hands agent
+    discovery; nothing is listed or walked for it.
   - The reuse is therefore as fresh as the observation that stored it,
     and never fresher. A replay can report a stale fact only if the pass
     that wrote it did, and the window refuses to vouch for rows older

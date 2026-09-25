@@ -270,6 +270,10 @@ fn identify_one_project(
     todos: &[PathBuf],
 ) -> Vec<CandidateAgentUnit> {
     let mut out: Vec<CandidateAgentUnit> = Vec::new();
+    let folder_slug = project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     ctx.watch(todos_dir);
     for sibling in ["file-history", "image-cache", "uploads"] {
         ctx.watch(&home.join(sibling));
@@ -378,9 +382,13 @@ fn identify_one_project(
                     // container replayed from the store re-resolves it
                     // live, once per distinct project rather than once
                     // per session (`crate::agents::LinkBasis`).
-                    .project_link_declared(
+                    // ... and the `projects/<slug>` folder name beside
+                    // it, for the shared layer's bounded inference when
+                    // no record carried a `cwd` (`KnownWorktrees`).
+                    .project_link_declared_or_folder(
                         read_header_cwd(&jsonl, ctx),
                         "no cwd field in the session's first records",
+                        folder_slug.clone(),
                     )
                     .action(AgentActionCapability::SessionRemoval)
                     .build(),

@@ -4,6 +4,31 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### Claude Code sessions without a `cwd` are linked by folder name, labelled as inferred
+
+On the owner's machine, 120 of 195 Claude Code session units (200 MB)
+were `unresolved`: their transcripts' first records carry no `cwd`. Each
+sits in a `projects/<slug>` folder Claude Code named by encoding the
+workspace path (`[^A-Za-z0-9]` -> `-`). When exactly one of this pass's
+known worktree paths re-encodes to that slug and still resolves to a
+checkout, the session is now linked with `source: inferred` (text:
+`[inferred from the tool's project folder name, not declared]`; TUI:
+`(inferred)`; JSON: `"source":"inferred"`). Measured on the same
+scratch store: 29 declared / **119 inferred** / 2 unresolved (8.1 MB) /
+8 missing / 10 not-a-project; observe 11.5 -> 12.8 s cold (noise), 2.7 s
+replayed. Codex sessions are unchanged (3,450 unresolved): their
+directories are date-partitioned and their bounded headers carry no
+`cwd`, so there is nothing to infer from.
+
+What it never does: decode the slug (the encoding is lossy -- `/a/b-c`
+and `/a-b/c` share one), match a basename, overrule a declared `cwd`
+(a missing declared path stays `missing`), claim a `moved` link, or
+replay an inferred link from the store -- it is re-derived against the
+current known worktrees on every pass, and a slug that re-encodes two
+known paths stays `unresolved` saying so. Container rows are versioned
+(`agent-container/2026-09-25.1`); older rows re-identify once.
+Adversarial cases in `crates/core/tests/agent_folder_inference.rs`.
+
 ### An unchanged `observe` is seconds, not minutes (R19)
 
 Measured on the owner's machine (73 detector roots, three installed

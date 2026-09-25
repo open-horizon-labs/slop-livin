@@ -2155,9 +2155,16 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
         .iter()
         .map(|u| {
             let link = match &u.project_link {
-                swamp_core::agents::ProjectLinkState::Linked { project_name, .. } => {
-                    format!("project: {project_name}")
-                }
+                swamp_core::agents::ProjectLinkState::Linked {
+                    project_name,
+                    source: swamp_core::agents::LinkSource::Declared,
+                    ..
+                } => format!("project: {project_name}"),
+                swamp_core::agents::ProjectLinkState::Linked {
+                    project_name,
+                    source: swamp_core::agents::LinkSource::Inferred,
+                    ..
+                } => format!("project: {project_name} (inferred)"),
                 swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
                 other => format!("{other:?}"),
             };

@@ -1920,8 +1920,18 @@ fn agent_link_label(link: &crate::agents::ProjectLinkState) -> String {
         L::Linked {
             project_name,
             project_path,
+            source,
             ..
-        } => format!("project: {project_name} ({})", project_path.display()),
+        } => match source {
+            crate::agents::LinkSource::Declared => {
+                format!("project: {project_name} ({})", project_path.display())
+            }
+            crate::agents::LinkSource::Inferred => format!(
+                "project: {project_name} ({}) [inferred from the tool's project folder name, \
+                 not declared]",
+                project_path.display()
+            ),
+        },
         L::Unresolved { reason } => format!("project: unresolved ({reason})"),
         L::Missing { path } => format!("project: missing ({})", path.display()),
         L::NotAProject { path } => format!("project: not a project ({})", path.display()),

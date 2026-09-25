@@ -326,6 +326,30 @@ impl AgentUnitBuilder {
             declared,
             additional,
             missing_reason: missing_reason.to_string(),
+            folder_slug: None,
+        };
+        self
+    }
+
+    /// [`Self::project_link_declared`] for a tool that keys its storage
+    /// by an encoding of the workspace path (Claude Code's
+    /// `projects/<slug>`). The slug is recorded beside the declared
+    /// path; when nothing was declared, the shared layer may infer the
+    /// link from it -- exactly one known worktree re-encoding to the
+    /// slug -- and says so ([`super::LinkSource::Inferred`]). The
+    /// adapter never decodes the slug and never matches a basename.
+    pub fn project_link_declared_or_folder(
+        mut self,
+        declared: Option<String>,
+        missing_reason: &str,
+        folder_slug: String,
+    ) -> Self {
+        self.unit.project_link = resolve_declared_workspace(&declared, &[], missing_reason);
+        self.unit.link_basis = LinkBasis::Declared {
+            declared,
+            additional: Vec::new(),
+            missing_reason: missing_reason.to_string(),
+            folder_slug: Some(folder_slug),
         };
         self
     }

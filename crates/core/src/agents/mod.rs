@@ -166,11 +166,14 @@ pub enum LinkSource {
     /// header's `cwd` field, a per-project directory's declared path).
     /// Never a basename guess.
     Declared,
-    /// Derived from declared evidence plus a bounded inference step
-    /// (e.g. corroborating one session's declared cwd against another's
-    /// when the two disagree). Not currently produced by the Claude
-    /// Code adapter; kept in the shared model for adapters where the
-    /// only available evidence needs this weaker label.
+    /// Derived by a bounded inference step, never claimed as declared.
+    /// Produced today for one case only: a Claude Code session whose
+    /// transcript carries no `cwd`, whose `projects/<slug>` folder name
+    /// re-encodes exactly one of this pass's known worktree paths
+    /// ([`KnownWorktrees`]). The slug encoding is lossy, so a name that
+    /// re-encodes two known paths is left unresolved, and the link is
+    /// re-derived against the current known set on every pass -- never
+    /// replayed from the store.
     Inferred,
 }
 
@@ -421,6 +424,13 @@ pub enum LinkBasis {
         /// whose own metadata names two.
         additional: Vec<String>,
         missing_reason: String,
+        /// The tool's own per-project folder name, when the tool keys
+        /// its storage by an encoding of the workspace path (Claude
+        /// Code's `projects/<slug>`). Used only when `declared` is
+        /// absent, to look for exactly one known worktree whose path
+        /// re-encodes to it ([`KnownWorktrees::infer`]); the result is
+        /// [`LinkSource::Inferred`] and recomputed every pass.
+        folder_slug: Option<String>,
     },
     /// Nothing to recompute. Only a state that cannot go stale --
     /// [`ProjectLinkState::NotApplicable`] and
@@ -563,7 +573,7 @@ fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
 /// Bumped whenever the *encoding* of a container's persisted units
 /// changes, so rows written by an older binary are a miss rather than a
 /// misread. Part of every container's stored shape key.
-const CONTAINER_VERSION: &str = "agent-container/2026-09-22.2";
+const CONTAINER_VERSION: &str = "agent-container/2026-09-25.1";
 
 /// The memo that makes an unchanged container cost `stat`s instead of a
 /// listing and a `stat` per file.
@@ -619,6 +629,11 @@ const CONTAINER_VERSION: &str = "agent-container/2026-09-22.2";
 /// (`reidentify_for_tool`, which runs with both caches disabled).
 pub struct ContainerCache {
     entries: std::cell::RefCell<HashMap<String, crate::assoc_store::CachedRows>>,
+    /// This pass's known worktrees, for folder-name inference
+    /// ([`LinkBasis::Declared::folder_slug`]). Empty for a caller with
+    /// no project discovery (a bare adapter test): inference then
+    /// never fires and a slug-only session stays unresolved.
+    known: KnownWorktrees,
     /// Live re-resolution of declared paths, memoised per distinct
     /// declared path for this pass: see [`LinkBasis`].
     links: std::cell::RefCell<HashMap<(String, String), ProjectLinkState>>,
@@ -676,6 +691,7 @@ impl ContainerCache {
     pub fn disabled() -> Self {
         Self {
             entries: std::cell::RefCell::new(HashMap::new()),
+            known: KnownWorktrees::default(),
             links: std::cell::RefCell::new(HashMap::new()),
             coverage: crate::fs_events::EventCoverage::untrusted(),
             enabled: false,
@@ -691,9 +707,40 @@ impl ContainerCache {
             entries: std::cell::RefCell::new(
                 crate::assoc_store::ContainerTable::open(swamp_dir).load(),
             ),
+            known: KnownWorktrees::default(),
             links: std::cell::RefCell::new(HashMap::new()),
             coverage,
             enabled: true,
+        }
+    }
+
+    /// The worktrees this pass's project discovery found -- the bounded
+    /// candidate set folder-name inference matches against. Nothing
+    /// else is ever consulted for an inferred link.
+    pub fn with_known_worktrees(mut self, worktrees: &[PathBuf]) -> Self {
+        self.known = KnownWorktrees::from_paths(worktrees);
+        self
+    }
+
+    /// Resolves a unit's link exactly as a replayed one is resolved:
+    /// the declared path live, then folder-name inference against this
+    /// pass's known worktrees when nothing was declared. Called for
+    /// every freshly identified unit too, so an identified and a
+    /// replayed session cannot disagree about the same evidence.
+    pub fn finish_link(&self, unit: &mut CandidateAgentUnit) {
+        if let LinkBasis::Declared {
+            declared,
+            additional,
+            missing_reason,
+            folder_slug,
+        } = unit.link_basis().clone()
+        {
+            unit.set_resolved_link(self.resolve_memoised(
+                &declared,
+                &additional,
+                &missing_reason,
+                folder_slug.as_deref(),
+            ));
         }
     }
 
@@ -714,12 +761,14 @@ impl ContainerCache {
         declared: &Option<String>,
         additional: &[String],
         reason: &str,
+        folder_slug: Option<&str>,
     ) -> ProjectLinkState {
         let key = (
             format!(
-                "{}{DECLARED_SEP}{}",
+                "{}{DECLARED_SEP}{}{FOLDER_SEP}{}",
                 declared.clone().unwrap_or_default(),
-                additional.join(&DECLARED_SEP.to_string())
+                additional.join(&DECLARED_SEP.to_string()),
+                folder_slug.unwrap_or_default()
             ),
             reason.to_string(),
         );
@@ -727,6 +776,14 @@ impl ContainerCache {
             return hit.clone();
         }
         let resolved = resolve_declared_workspace(declared, additional, reason);
+        // Inference only where the declared evidence said nothing at
+        // all. A declared path that is missing or not a project is an
+        // answer about *that* path and stands; the folder name cannot
+        // overrule it.
+        let resolved = match (&resolved, folder_slug) {
+            (ProjectLinkState::Unresolved { reason }, Some(slug)) => self.known.infer(slug, reason),
+            _ => resolved,
+        };
         self.links.borrow_mut().insert(key, resolved.clone());
         resolved
     }
@@ -946,18 +1003,7 @@ impl<'a> IdentifyCtx<'a> {
             units
                 .into_iter()
                 .map(|mut u| {
-                    if let LinkBasis::Declared {
-                        declared,
-                        additional,
-                        missing_reason,
-                    } = u.link_basis().clone()
-                    {
-                        u.set_resolved_link(store.resolve_memoised(
-                            &declared,
-                            &additional,
-                            &missing_reason,
-                        ));
-                    }
+                    store.finish_link(&mut u);
                     u
                 })
                 .collect(),
@@ -1162,20 +1208,123 @@ fn decode_opt(value: &str) -> Option<String> {
 /// before this existed carry no separator and decode to an empty
 /// `additional`.
 const DECLARED_SEP: char = '\u{1}';
+/// Separates the declared-path list from the folder slug in the memo
+/// key and the stored `link_declared` cell.
+const FOLDER_SEP: char = '\u{2}';
 
-fn encode_declared(declared: &Option<String>, additional: &[String]) -> String {
+/// This pass's known worktree paths, indexed by their Claude Code
+/// folder slug, for [`LinkBasis::Declared::folder_slug`] inference.
+///
+/// The slug encoding ([`claude_folder_slug`]) maps every character that
+/// is not ASCII alphanumeric to `-`, so it is not injective: `/a/b-c`
+/// and `/a-b/c` both become `-a-b-c`. A slug is therefore only ever
+/// *matched* against known paths, never decoded, and a slug two known
+/// paths share resolves nothing. What "known" means is exactly the
+/// worktree list project discovery handed this pass -- no filesystem
+/// listing, no basename, no memory of paths that were once known.
+#[derive(Debug, Default, Clone)]
+pub struct KnownWorktrees {
+    by_slug: HashMap<String, Vec<PathBuf>>,
+}
+
+/// Claude Code's `projects/<slug>` encoding of a workspace path: every
+/// character that is not ASCII alphanumeric becomes `-`. Lossy by
+/// construction (`/`, `-`, `.`, `_` and every non-ASCII character all
+/// map to the same byte), which is why it is only ever compared, never
+/// inverted.
+pub fn claude_folder_slug(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+impl KnownWorktrees {
+    pub fn from_paths(paths: &[PathBuf]) -> Self {
+        let mut by_slug: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for p in paths {
+            let entry = by_slug.entry(claude_folder_slug(p)).or_default();
+            // The same worktree listed twice (two projects sharing a
+            // path row, a re-fold) is one candidate, not an ambiguity.
+            if !entry.contains(p) {
+                entry.push(p.clone());
+            }
+        }
+        Self { by_slug }
+    }
+
+    /// The link a session with no declared path gets from its folder
+    /// name: [`LinkSource::Inferred`] when exactly one known worktree
+    /// re-encodes to `slug` *and* that path still resolves to a
+    /// checkout; otherwise [`ProjectLinkState::Unresolved`] with the
+    /// original reason extended by what the folder name did say.
+    pub fn infer(&self, slug: &str, unresolved_reason: &str) -> ProjectLinkState {
+        let Some(candidates) = self.by_slug.get(slug) else {
+            return ProjectLinkState::Unresolved {
+                reason: unresolved_reason.to_string(),
+            };
+        };
+        if candidates.len() != 1 {
+            return ProjectLinkState::Unresolved {
+                reason: format!(
+                    "{unresolved_reason}; the projects folder name re-encodes {} known \
+                     worktree paths, which the lossy encoding cannot tell apart",
+                    candidates.len()
+                ),
+            };
+        }
+        let candidate = &candidates[0];
+        match resolve_declared_path(Some(candidate.display().to_string()), unresolved_reason) {
+            ProjectLinkState::Linked {
+                project_id,
+                project_name,
+                project_path,
+                worktree_kind,
+                ..
+            } => ProjectLinkState::Linked {
+                project_id,
+                project_name,
+                project_path,
+                source: LinkSource::Inferred,
+                worktree_kind,
+            },
+            _ => ProjectLinkState::Unresolved {
+                reason: format!(
+                    "{unresolved_reason}; the projects folder name re-encodes the known \
+                     worktree {} but that path is no longer a git checkout",
+                    candidate.display()
+                ),
+            },
+        }
+    }
+}
+
+fn encode_declared(
+    declared: &Option<String>,
+    additional: &[String],
+    folder_slug: &Option<String>,
+) -> String {
     let mut out = encode_opt(declared);
     for extra in additional {
         out.push(DECLARED_SEP);
         out.push_str(extra);
     }
+    if let Some(slug) = folder_slug {
+        out.push(FOLDER_SEP);
+        out.push_str(slug);
+    }
     out
 }
 
-fn decode_declared(value: &str) -> (Option<String>, Vec<String>) {
-    let mut parts = value.split(DECLARED_SEP);
+fn decode_declared(value: &str) -> (Option<String>, Vec<String>, Option<String>) {
+    let (paths, slug) = match value.split_once(FOLDER_SEP) {
+        Some((paths, slug)) => (paths, Some(slug.to_string())),
+        None => (value, None),
+    };
+    let mut parts = paths.split(DECLARED_SEP);
     let declared = decode_opt(parts.next().unwrap_or_default());
-    (declared, parts.map(str::to_string).collect())
+    (declared, parts.map(str::to_string).collect(), slug)
 }
 
 /// Resolves a unit's declared workspace: its primary path, widened to
@@ -1262,11 +1411,12 @@ fn encode_container(
                         declared,
                         additional,
                         missing_reason,
+                        folder_slug,
                     },
                     _,
                 ) => (
                     "declared",
-                    encode_declared(declared, additional),
+                    encode_declared(declared, additional, folder_slug),
                     missing_reason.clone(),
                 ),
                 (LinkBasis::Fixed, ProjectLinkState::NotApplicable) => {
@@ -1326,7 +1476,7 @@ fn decode_container(
             "unit" => {
                 let category = AgentCategory::from_label(col(row, 2))?;
                 let action = AgentActionCapability::from_label(col(row, 6))?;
-                let (link_declared, link_additional) = decode_declared(col(row, 11));
+                let (link_declared, link_additional, link_slug) = decode_declared(col(row, 11));
                 let link_reason = col(row, 12).to_string();
                 let (project_link, link_basis) = match col(row, 10) {
                     "declared" => (
@@ -1339,6 +1489,7 @@ fn decode_container(
                             declared: link_declared,
                             additional: link_additional,
                             missing_reason: link_reason,
+                            folder_slug: link_slug,
                         },
                     ),
                     "not-applicable" => (ProjectLinkState::NotApplicable, LinkBasis::Fixed),
@@ -1763,7 +1914,8 @@ pub fn discover_and_measure_in(
     let containers = match swamp_dir {
         Some(dir) => ContainerCache::load(dir, coverage.clone()),
         None => ContainerCache::disabled(),
-    };
+    }
+    .with_known_worktrees(project_worktrees);
     let ctx = IdentifyCtx::with_containers(observed_at, &cache, &containers);
 
     // Authorized scope only: a tool home the user excluded, or whose
@@ -1775,7 +1927,13 @@ pub fn discover_and_measure_in(
         let Some(adapter) = adapters.get(&tool_id) else {
             continue;
         };
-        let units = adapter.identify(&home, &ctx);
+        let mut units = adapter.identify(&home, &ctx);
+        // One resolution path for identified and replayed units alike:
+        // the declared path live, then folder-name inference against
+        // this pass's known worktrees (`ContainerCache::finish_link`).
+        for cand in units.iter_mut() {
+            containers.finish_link(cand);
+        }
         covered_roots.push(home.clone());
         let device = device_of(&home);
         for cand in units {
