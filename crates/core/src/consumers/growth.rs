@@ -27,7 +27,13 @@ impl Consumer for GrowthConsumer {
         let Event::CargoAnnotated(draft) = event else {
             return Ok(vec![]);
         };
+        let trace_all = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+        let t0 = std::time::Instant::now();
         let mut d: Draft = (**draft).clone();
+        if trace_all {
+            eprintln!("[trace] growth: clone draft: {:?}", t0.elapsed());
+        }
+        let t0 = std::time::Instant::now();
         // CargoAnnotated carries directory totals already aggregated once.
         let roots = crate::report::artifact_roots(&d.projects);
         let nested_shadow_paths =
@@ -36,6 +42,12 @@ impl Consumer for GrowthConsumer {
         // so it has to be known before the store is written, not one
         // stage later in tracking.
         crate::report::annotate_artifact_ecosystems(&mut d.projects);
+        if trace_all {
+            eprintln!(
+                "[trace] growth: nested rows + ecosystems: {:?}",
+                t0.elapsed()
+            );
+        }
         if let Some(dir) = &ctx.store_dir {
             // The store is scoped to the canonical requested root, not just
             // the device. Multiple roots on one volume must never share
@@ -126,13 +138,22 @@ impl Consumer for GrowthConsumer {
                     since_secs,
                 )?;
             }
+            let t = std::time::Instant::now();
             d.schedule_line = Some(crate::schedule::header_line(
                 dir,
                 &ctx.root,
                 ctx.observed_at,
             ));
+            if trace_all {
+                eprintln!("[trace] growth: schedule line: {:?}", t.elapsed());
+            }
         }
+        let t0 = std::time::Instant::now();
         crate::report::attach_allocated_from_dirs(&mut d.projects, &d.dirs, &roots);
+        if trace_all {
+            eprintln!("[trace] growth: allocated from dirs: {:?}", t0.elapsed());
+        }
+        let t0 = std::time::Instant::now();
         // Interior rows of folded artifacts live in the store only: the
         // report shows an artifact as one unit.
         d.dirs
@@ -157,6 +178,12 @@ impl Consumer for GrowthConsumer {
             crate::report::sort_drill_down(&mut by_dir, &mut by_file);
             d.dirs_by_worktree = Some(by_dir);
             d.files_by_worktree = Some(by_file);
+        }
+        if trace_all {
+            eprintln!(
+                "[trace] growth: retain/nested/group/sort: {:?}",
+                t0.elapsed()
+            );
         }
         Ok(vec![Event::GrowthAnnotated(Arc::new(d))])
     }

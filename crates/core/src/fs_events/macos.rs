@@ -292,6 +292,12 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
 
     let mut plans: Vec<Option<FsEventsPlan>> = vec![None; requests.len()];
     let mut groups: Vec<Group> = Vec::new();
+    // `FSEventsGetLastEventIdForDeviceBeforeTime` asks fseventsd about
+    // the device, not the root, and costs ~30 ms a call: once per
+    // device, not once per root (R19: 56 unit roots on one device were
+    // 1.7 s of an unchanged pass).
+    let mut last_known_by_dev: std::collections::HashMap<u64, u64> =
+        std::collections::HashMap::new();
 
     for (i, request) in requests.iter().enumerate() {
         let root = &request.root;
@@ -316,12 +322,12 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
         // retained).
         // SAFETY: `dev` came from a real `stat`;
         // `CFAbsoluteTimeGetCurrent` takes no arguments.
-        let last_known = unsafe {
+        let last_known = *last_known_by_dev.entry(dev).or_insert_with(|| unsafe {
             fs::FSEventsGetLastEventIdForDeviceBeforeTime(
                 dev,
                 core_foundation_sys::date::CFAbsoluteTimeGetCurrent(),
             )
-        };
+        });
 
         if let Some(stored_device) = since.device
             && stored_device != dev
@@ -378,20 +384,60 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
         }
     }
 
-    for group in groups {
-        let roots: Vec<PathBuf> = group
-            .members
+    // One stream per device, all at once: each waits on fseventsd for
+    // its own history to drain (up to `replay_budget`), and the waits
+    // are independent -- serially, four devices cost four waits (R19:
+    // 2.4 s of an unchanged pass). Every stream runs its own CFRunLoop
+    // on its own thread, as the live watch already does.
+    let group_roots: Vec<Vec<PathBuf>> = groups
+        .iter()
+        .map(|group| {
+            group
+                .members
+                .iter()
+                .map(|&i| requests[i].root.clone())
+                .collect()
+        })
+        .collect();
+    let results: Vec<Result<Vec<PathBuf>, RefreshRefusal>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = groups
             .iter()
-            .map(|&i| requests[i].root.clone())
+            .zip(group_roots.iter())
+            .map(|(group, roots)| {
+                let since_id = group.since_id;
+                let dev = group.dev;
+                scope.spawn(move || {
+                    let started = Instant::now();
+                    let result = run_stream(roots, since_id);
+                    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                        eprintln!(
+                            "[xtrace] fsevents group dev={dev} roots={} since={since_id} current={current} ok={} elapsed={:?}",
+                            roots.len(),
+                            result.is_ok(),
+                            started.elapsed()
+                        );
+                    }
+                    result
+                })
+            })
             .collect();
-        match run_stream(&roots, group.since_id) {
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or(Err(RefreshRefusal::FseventsdUnavailable))
+            })
+            .collect()
+    });
+    for ((group, roots), result) in groups.iter().zip(group_roots.iter()).zip(results) {
+        match result {
             Err(reason) => {
                 for &i in &group.members {
                     plans[i] = Some(FsEventsPlan::refuse(reason, current, Some(group.dev)));
                 }
             }
             Ok(changes) => {
-                let per_root = super::partition_changes(&roots, &changes);
+                let per_root = super::partition_changes(roots, &changes);
                 for (&i, changed) in group.members.iter().zip(per_root) {
                     plans[i] = Some(FsEventsPlan::ok(changed, current, Some(group.dev)));
                 }

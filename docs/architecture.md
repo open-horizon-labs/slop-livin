@@ -513,7 +513,8 @@ root-scoped volume id) and are replaced or appended per root.
 | `<volume>/docker_unowned.parquet` (+ `_lists`, `_evidence`) | Docker object no project claims | the rows the gate joined after the walk's checkpoint, same three-file shape. |
 | `<volume>/dir_tracks.parquet` | top-level worktree directory | its git tracking state as the walk read it. |
 | `<volume>/topology.parquet` | worktree | the incremental walk's own topology comparison (`worktree_id`, `project_id`, `path`, `kind`, `remote_url`, `device`). |
-| `<volume>/folded.parquet` | folded file of an external unit | the external measurement cache an unchanged root reuses. |
+| `external/folded/<id>.parquet` | directory of one external unit (one file per unit, `entities::id_for(unit_path)`) | the folded measurement cache an unchanged root reuses under an event window. |
+| `external/volume_stamps.parquet` | read-only filesystem mounted under a unit root | its `statfs` stamp (device, block totals) and what the last walk found -- reused without a walk or a window while the stamp holds (sealed simulator runtime volumes; R19). |
 | `<volume>/enrich.parquet` | worktree | the GitHub enrichment fetch cache. |
 | `git_signals.parquet` (+ `_values`), `cargo_replay_cache.parquet` (+ `_lists`, `_evidence`, `_meta`) | root | the per-root replay caches (`consumers/signals.rs`, `consumers/cargo.rs`) for an unchanged worktree/container, keyed by `growth::root_key`. |
 | `build_stores.parquet`, `xcode_derived_data.parquet`, `declarations.parquet`, `dependency_identities.parquet`, `external_consumers.parquet`, `agent_identifications.parquet`, `agent_containers.parquet` | store / product / declaration / identity / consumer / session | the association caches (`assoc_store.rs`) the consumers join on. |

@@ -411,12 +411,29 @@ fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
     if incomplete.is_empty() {
         return;
     }
-    let summary = incomplete
-        .iter()
-        .map(|c| format!("{} ({})", c.path.display(), c.status.label()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("scope coverage: {summary}");
+    // Missing/excluded/detector-only paths are the usual state of a
+    // machine that has fewer tools installed than the catalog knows:
+    // one count, `swamp scope` for the list. Only a root that *should*
+    // have been walked and was not (partial, inaccessible) is named.
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut named = Vec::new();
+    for c in &incomplete {
+        match &c.status {
+            RegionStatus::Partial { .. } | RegionStatus::Inaccessible { .. } => {
+                named.push(format!("{} ({})", c.path.display(), c.status.label()))
+            }
+            RegionStatus::Missing => *counts.entry("missing").or_default() += 1,
+            RegionStatus::Excluded => *counts.entry("excluded").or_default() += 1,
+            RegionStatus::DetectorOnly => *counts.entry("detector-only").or_default() += 1,
+            RegionStatus::Complete => {}
+        }
+    }
+    let mut parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    parts.extend(named);
+    eprintln!(
+        "scope coverage: {} (swamp scope for the list)",
+        parts.join(", ")
+    );
 }
 
 fn render_scope_text(scope: &swamp_core::scope::EffectiveScope, verbose: bool) -> String {
@@ -449,7 +466,11 @@ fn render_scope_text(scope: &swamp_core::scope::EffectiveScope, verbose: bool) -
                     detector_id,
                     category,
                     provenance,
-                } => format!("detector:{detector_id} ({category:?}, {provenance:?})"),
+                } => format!(
+                    "detector:{detector_id} ({}, {})",
+                    swamp_core::external::category_label(*category),
+                    swamp_core::locations::provenance_label(provenance)
+                ),
                 swamp_core::scope::RootReason::Included => "include".to_string(),
                 swamp_core::scope::RootReason::ExplicitCommand => "explicit".to_string(),
                 swamp_core::scope::RootReason::NestedFrom { path } => {

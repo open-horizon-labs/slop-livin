@@ -380,7 +380,7 @@ fn identify_one_project(
                     // per session (`crate::agents::LinkBasis`).
                     .project_link_declared(
                         read_header_cwd(&jsonl, ctx),
-                        "no cwd field found in the session's first line",
+                        "no cwd field in the session's first records",
                     )
                     .action(AgentActionCapability::SessionRemoval)
                     .build(),
@@ -450,13 +450,21 @@ fn read_header_cwd(jsonl: &Path, ctx: &IdentifyCtx) -> Option<String> {
         jsonl,
         HEADER_READ_BYTES,
         &|text| {
-            let first_line = text.lines().next()?;
-            let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
-            value
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
+            // The first record that carries a `cwd` -- real transcripts
+            // open with `queue-operation`/summary records that have none
+            // (the 2026-09-23 aim review: every one of 163 sessions read
+            // "unresolved (no cwd field found)"). Still within the one
+            // capped header read: only the lines that fit in
+            // `HEADER_READ_BYTES` are seen, and only the `cwd` field of
+            // each is used.
+            text.lines().find_map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                value
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
         },
     )
 }
@@ -837,6 +845,37 @@ mod tests {
             "{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{cwd}\",\"gitBranch\":\"main\",\
              \"message\":{{\"role\":\"user\",\"content\":\"{canary}\"}}}}\n"
         )
+    }
+
+    /// The 2026-09-23 aim review on a real machine: every session's first
+    /// record was a `queue-operation` with no `cwd`, so all 163 rendered
+    /// "unresolved". The link comes from the first record that carries
+    /// one, within the same capped header read.
+    #[test]
+    fn cwd_is_taken_from_the_first_record_that_carries_one() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let repo = home.join("real-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let id = "14141414-1414-4141-8141-141414141414";
+        let jsonl = home
+            .join("projects")
+            .join("-real-repo")
+            .join(format!("{id}.jsonl"));
+        let body = format!(
+            "{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"sessionId\":\"s\"}}\n\
+             {{\"type\":\"summary\",\"summary\":\"x\"}}\n{}",
+            session_line(&repo.display().to_string(), "canary-body")
+        );
+        touch(&jsonl, body.as_bytes());
+        let units = run(home);
+        let unit = units.iter().find(|u| u.path == jsonl).unwrap();
+        match &unit.project_link() {
+            ProjectLinkState::Linked { source, .. } => {
+                assert_eq!(*source, crate::agents::LinkSource::Declared)
+            }
+            other => panic!("the third record's cwd must link the session, got {other:?}"),
+        }
     }
 
     #[test]

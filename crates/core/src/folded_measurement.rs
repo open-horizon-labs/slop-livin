@@ -91,6 +91,206 @@ pub struct FoldedUnit {
     pub complete: bool,
 }
 
+// ---------------------------------------------------------------------
+// Sealed mounts (R19). A read-only filesystem mounted directly under a
+// unit root -- `/Library/Developer/CoreSimulator/Volumes/<runtime>`, a
+// sealed APFS volume per installed simulator runtime, 17 GB and 600k
+// files each -- is outside every FSEvents window (events are per
+// volume), so the event-keyed reuse above never vouched for it and every
+// pass re-walked it: 482k listings and 1.77M stats on an unchanged
+// machine (2026-09-24 measurement). A read-only filesystem cannot change
+// under us; its `statfs` stamp (device, block totals) is the proof. Each
+// such mount is measured as its own part, its stamp and result stored,
+// and reused without a walk while the stamp holds. The unit's own walk
+// excludes the mounts, so the folded rows and their event-keyed reuse
+// describe the writable part only.
+// ---------------------------------------------------------------------
+
+struct SealedMount {
+    path: PathBuf,
+    stamp: crate::fs_gate::fs_space::VolumeStamp,
+}
+
+/// The read-only filesystems mounted directly under `path` (one listing
+/// of the unit root, one `statfs` per child directory).
+fn sealed_mounts_under(path: &Path) -> Vec<SealedMount> {
+    let Some(root) = crate::fs_gate::fs_space::volume_stamp(path) else {
+        return Vec::new();
+    };
+    let Ok(entries) = crate::fs_gate::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SealedMount> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| crate::fs_gate::is_dir(p))
+        .filter_map(|p| {
+            let stamp = crate::fs_gate::fs_space::volume_stamp(&p)?;
+            (stamp.read_only && stamp.device != root.device)
+                .then_some(SealedMount { path: p, stamp })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// One sealed mount's contribution, replayed from its stored stamp or
+/// walked.
+struct SealedPart {
+    bytes: u64,
+    hardlinked: bool,
+    mtime_max: u64,
+    complete: bool,
+    reused: bool,
+    dirs: Vec<crate::report::DirRollup>,
+}
+
+/// The stored result for `mount` if its stamp still holds.
+fn reuse_sealed(
+    stored: &[crate::growth::columns::StoredVolumeStampRow],
+    mount: &SealedMount,
+) -> Option<SealedPart> {
+    let row = stored
+        .iter()
+        .find(|r| r.mount_path == mount.path.display().to_string())?;
+    let same = row.device == mount.stamp.device
+        && row.total_blocks == mount.stamp.total_blocks
+        && row.root_ino == mount.stamp.root_ino
+        && row.root_mtime == mount.stamp.root_mtime;
+    same.then(|| SealedPart {
+        bytes: row.bytes,
+        hardlinked: row.hardlinked,
+        mtime_max: row.mtime_max,
+        complete: row.complete,
+        reused: true,
+        dirs: Vec::new(),
+    })
+}
+
+/// Walks one sealed mount as part of `unit` (directory rows relative to
+/// the unit, like the unit's own walk produces them).
+fn walk_sealed(
+    unit: &Path,
+    mount: &SealedMount,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    stamp_dirs: bool,
+) -> SealedPart {
+    // The unit's exclusions that fall inside this mount -- never the
+    // mount itself, which the unit's own walk excludes and this one is.
+    let nested: Vec<PathBuf> = exclusions
+        .iter()
+        .filter(|e| *e != &mount.path && e.starts_with(&mount.path))
+        .cloned()
+        .collect();
+    let (row, dirs, _stamps, complete) = crate::walk::resize_artifact_stamped(
+        &mount.path,
+        ArtifactKind::Unknown,
+        observed_at,
+        Some((STORE_WORKTREE_ID, unit)),
+        &nested,
+        stamp_dirs,
+    );
+    SealedPart {
+        bytes: row.bytes,
+        hardlinked: row.hardlinked,
+        mtime_max: row.mtime_max,
+        complete,
+        reused: false,
+        dirs,
+    }
+}
+
+/// Every sealed mount under `path`: reused where the stamp holds, walked
+/// otherwise (or always, with `walk_all`, when the caller needs every
+/// directory row). Records the stamps of what was walked and complete.
+fn sealed_parts(
+    store: Option<&Path>,
+    path: &Path,
+    mounts: &[SealedMount],
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    walk_all: bool,
+) -> Vec<SealedPart> {
+    if mounts.is_empty() {
+        return Vec::new();
+    }
+    let unit_path = path.display().to_string();
+    let stored = store
+        .map(|dir| crate::growth::volume_stamps_for(dir, &unit_path))
+        .unwrap_or_default();
+    let mut parts = Vec::with_capacity(mounts.len());
+    let mut rows: Vec<crate::growth::columns::StoredVolumeStampRow> = Vec::new();
+    for mount in mounts {
+        let reusable = reuse_sealed(&stored, mount);
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            eprintln!(
+                "[xtrace] sealed {} stamp={:?} stored={} walk_all={walk_all} reused={}",
+                mount.path.display(),
+                mount.stamp,
+                stored
+                    .iter()
+                    .any(|r| r.mount_path == mount.path.display().to_string()),
+                !walk_all && reusable.is_some()
+            );
+        }
+        let part = match (walk_all, reusable) {
+            (false, Some(part)) => {
+                crate::work_counters::record_cache_hit();
+                part
+            }
+            _ => {
+                crate::work_counters::record_cache_miss();
+                walk_sealed(path, mount, exclusions, observed_at, store.is_some())
+            }
+        };
+        // Stored complete or not: a sealed volume's unreadable corners
+        // are the same unreadable corners next pass (an Xcode runtime
+        // has root-only directories), and the stamp says nothing moved.
+        // The `complete` flag travels with the row so the unit reports
+        // the lower bound as such.
+        rows.push(crate::growth::columns::StoredVolumeStampRow {
+            unit_path: unit_path.clone(),
+            mount_path: mount.path.display().to_string(),
+            device: mount.stamp.device,
+            total_blocks: mount.stamp.total_blocks,
+            root_ino: mount.stamp.root_ino,
+            root_mtime: mount.stamp.root_mtime,
+            bytes: part.bytes,
+            hardlinked: part.hardlinked,
+            mtime_max: part.mtime_max,
+            complete: part.complete,
+            observed_at,
+        });
+        parts.push(part);
+    }
+    if let Some(dir) = store {
+        // A stamp write that fails is a reuse that will miss next time.
+        let _ = crate::growth::store_volume_stamps(dir, &unit_path, &rows);
+    }
+    parts
+}
+
+fn add_sealed(folded: &mut FoldedUnit, parts: &[SealedPart]) {
+    for p in parts {
+        folded.bytes += p.bytes;
+        folded.hardlinked |= p.hardlinked;
+        folded.mtime_max = folded.mtime_max.max(p.mtime_max);
+        folded.complete &= p.complete;
+        folded.reused &= p.reused;
+    }
+}
+
+/// The unit's exclusions plus its sealed mounts: what the unit's own
+/// walk (and its stored measurement) must leave out.
+fn with_sealed(exclusions: &[PathBuf], mounts: &[SealedMount]) -> Vec<PathBuf> {
+    let mut all = exclusions.to_vec();
+    all.extend(mounts.iter().map(|m| m.path.clone()));
+    all.sort();
+    all.dedup();
+    all
+}
+
 /// Measures `path`, reusing the previous pass's folded rows when this
 /// pass can show they still describe the tree.
 ///
@@ -104,8 +304,15 @@ pub fn measure(
     observed_at: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> FoldedUnit {
-    if let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage) {
+    let mounts = sealed_mounts_under(path);
+    let exclusions = with_sealed(exclusions, &mounts);
+    let exclusions = exclusions.as_slice();
+    if let Some(mut folded) = reuse_folded_measurement(store, path, exclusions, coverage) {
         crate::work_counters::record_cache_hit();
+        add_sealed(
+            &mut folded,
+            &sealed_parts(store, path, &mounts, exclusions, observed_at, false),
+        );
         return folded;
     }
     let (row, _dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
@@ -140,6 +347,11 @@ pub fn measure(
     {
         record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
     }
+    let mut folded = folded;
+    add_sealed(
+        &mut folded,
+        &sealed_parts(store, path, &mounts, exclusions, observed_at, false),
+    );
     folded
 }
 
@@ -286,7 +498,14 @@ pub fn observe_unit(
     observed_at: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> UnitObservation {
-    if let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage) {
+    // `measure` handles both the event-keyed reuse and the sealed
+    // mounts; the readability probe is skipped only when nothing under
+    // the unit needs listing at all.
+    let mounts = sealed_mounts_under(path);
+    let all = with_sealed(exclusions, &mounts);
+    if mounts.is_empty()
+        && let Some(folded) = reuse_folded_measurement(store, path, &all, coverage)
+    {
         crate::work_counters::record_cache_hit();
         return UnitObservation::Unit(folded);
     }
@@ -323,16 +542,41 @@ pub fn observe_unit_with_dirs(
     coverage: &crate::fs_events::EventCoverage,
     allow_reuse: bool,
 ) -> (UnitObservation, Option<Vec<crate::report::DirRollup>>) {
-    if allow_reuse && let Some(folded) = reuse_folded_measurement(store, path, exclusions, coverage)
+    let mounts = sealed_mounts_under(path);
+    let exclusions = with_sealed(exclusions, &mounts);
+    let exclusions = exclusions.as_slice();
+    if allow_reuse
+        && let Some(mut folded) = reuse_folded_measurement(store, path, exclusions, coverage)
     {
-        crate::work_counters::record_cache_hit();
-        return (UnitObservation::Unit(folded), None);
+        // The store's identified units are replayed as a whole, so every
+        // sealed mount must replay too; one changed mount walks them all
+        // (the adapter needs their directory rows again).
+        let unit_path = path.display().to_string();
+        let stored = store
+            .map(|dir| crate::growth::volume_stamps_for(dir, &unit_path))
+            .unwrap_or_default();
+        let all_sealed_reusable = mounts.iter().all(|m| reuse_sealed(&stored, m).is_some());
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            eprintln!(
+                "[xtrace] unit {} root_rows=reused sealed={} all_sealed_reusable={all_sealed_reusable}",
+                path.display(),
+                mounts.len()
+            );
+        }
+        if all_sealed_reusable {
+            crate::work_counters::record_cache_hit();
+            add_sealed(
+                &mut folded,
+                &sealed_parts(store, path, &mounts, exclusions, observed_at, false),
+            );
+            return (UnitObservation::Unit(folded), None);
+        }
     }
     match access(path) {
         UnitAccess::Absent => (UnitObservation::Absent, None),
         UnitAccess::Unreadable(why) => (UnitObservation::Unreadable(why), None),
         UnitAccess::Measurable => {
-            let (row, dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
+            let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
                 path,
                 ArtifactKind::Unknown,
                 observed_at,
@@ -341,7 +585,7 @@ pub fn observe_unit_with_dirs(
                 store.is_some(),
             );
             crate::work_counters::record_cache_miss();
-            let folded = FoldedUnit {
+            let mut folded = FoldedUnit {
                 reused: false,
                 bytes: row.bytes,
                 hardlinked: row.hardlinked,
@@ -359,6 +603,15 @@ pub fn observe_unit_with_dirs(
             {
                 record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
             }
+            // The sealed mounts come after the unit's own rows are
+            // recorded: the stored root row is the writable part only,
+            // and the parts are added on every read (a row that already
+            // held them would be doubled on the next reuse).
+            let parts = sealed_parts(store, path, &mounts, exclusions, observed_at, true);
+            for part in &parts {
+                dirs.extend(part.dirs.iter().cloned());
+            }
+            add_sealed(&mut folded, &parts);
             (UnitObservation::Unit(folded), Some(dirs))
         }
     }
@@ -525,6 +778,110 @@ mod tests {
         assert!(folded.bytes >= 5);
         assert!(counted.identification_cache_misses >= 1);
     }
+
+    /// R19: a read-only filesystem mounted under the unit is reused
+    /// from its `statfs` stamp alone -- no event window, no listing --
+    /// and re-walked the moment the stamp moves. Staged through the
+    /// `fs_space::testing` seam: the temp dir's `sealed/` child answers
+    /// as a read-only mount on another device.
+    #[test]
+    fn a_sealed_read_only_mount_is_reused_from_its_stamp_without_a_window() {
+        use crate::fs_events::EventCoverage;
+        use crate::fs_gate::fs_space::{VolumeStamp, testing};
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = crate::fs_gate::canonicalize(tmp.path())
+            .unwrap()
+            .join("unit");
+        let sealed = unit.join("sealed");
+        std::fs::create_dir_all(sealed.join("a/b")).unwrap();
+        std::fs::write(sealed.join("a/b/big"), vec![b'x'; 65_536]).unwrap();
+        std::fs::write(sealed.join("top"), vec![b'y'; 1024]).unwrap();
+        std::fs::write(unit.join("loose"), vec![b'z'; 512]).unwrap();
+        testing::set(
+            &unit,
+            VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 2,
+                root_mtime: 1,
+            },
+        );
+        let stamp = VolumeStamp {
+            device: 2,
+            read_only: true,
+            total_blocks: 4_000,
+            root_ino: 2,
+            root_mtime: 1_000,
+        };
+        testing::set(&sealed, stamp);
+
+        // First pass: everything is walked, the sealed part is stamped.
+        let (first, counted) = crate::work_counters::measured(|| {
+            measure(
+                Some(store.path()),
+                &unit,
+                &[],
+                1_000,
+                &EventCoverage::untrusted(),
+            )
+        });
+        assert!(first.bytes >= 65_536 + 1024 + 512, "{}", first.bytes);
+        assert!(counted.files_statted >= 3, "{counted:?}");
+        let stamps = crate::growth::volume_stamps_for(store.path(), &unit.display().to_string());
+        assert_eq!(stamps.len(), 1, "{stamps:?}");
+        assert_eq!(stamps[0].mount_path, sealed.display().to_string());
+
+        // Second pass, no event window: the writable part is re-walked
+        // (one file), the sealed part is not listed at all.
+        let (second, counted) = crate::work_counters::measured(|| {
+            measure(
+                Some(store.path()),
+                &unit,
+                &[],
+                2_000,
+                &EventCoverage::untrusted(),
+            )
+        });
+        assert_eq!(second.bytes, first.bytes);
+        assert!(
+            counted.files_statted < 3,
+            "the sealed mount must not be statted again: {counted:?}"
+        );
+        assert!(counted.identification_cache_hits >= 1, "{counted:?}");
+
+        // The stamp moves (a runtime was replaced in place -- a new
+        // image, a new root directory): walked again.
+        testing::set(
+            &sealed,
+            VolumeStamp {
+                root_mtime: 2_000,
+                ..stamp
+            },
+        );
+        std::fs::write(sealed.join("a/b/more"), vec![b'w'; 2048]).unwrap();
+        let (third, counted) = crate::work_counters::measured(|| {
+            measure(
+                Some(store.path()),
+                &unit,
+                &[],
+                3_000,
+                &EventCoverage::untrusted(),
+            )
+        });
+        assert!(
+            third.bytes > first.bytes,
+            "the re-walk must see the new file: {} vs {}",
+            third.bytes,
+            first.bytes
+        );
+        assert!(counted.files_statted >= 4, "{counted:?}");
+        testing::clear();
+    }
+
+    static SEALED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The reuse, end to end, and its gate: a second measurement of a
     /// tree an event window vouches for costs nothing at all, the same

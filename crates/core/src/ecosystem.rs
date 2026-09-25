@@ -519,7 +519,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
     },
 ];
 
-fn dir_names(root: &Path) -> Vec<String> {
+pub fn dir_names(root: &Path) -> Vec<String> {
     crate::fs_gate::read_dir(root)
         .map(|rd| {
             rd.flatten()
@@ -618,11 +618,26 @@ pub fn artifact_ecosystem(tags: &[String], name: &str) -> Option<&'static str> {
 /// root is a Node monorepo), then the project's own tags, then a name
 /// only one ecosystem generates.
 pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Option<&'static str> {
+    let names = dir_names(parent);
+    artifact_ecosystem_among(parent, &names, tags, name)
+}
+
+/// [`artifact_ecosystem_at`] with the parent's entry names already
+/// listed -- so a caller annotating many artifacts under one parent
+/// lists it once (R19: the growth consumer annotated every artifact row,
+/// each with its own `read_dir` of the parent, and a `target/` with
+/// thousands of identified interiors listed `target/debug/deps` thousands
+/// of times per pass -- 138 s of an unchanged `observe`).
+pub fn artifact_ecosystem_among(
+    parent: &Path,
+    names: &[String],
+    tags: &[String],
+    name: &str,
+) -> Option<&'static str> {
     if ruby_vendor_bundle(parent, name) {
         return Some("rb");
     }
-    let names = dir_names(parent);
-    if let Some(e) = detect_in(&names)
+    if let Some(e) = detect_in(names)
         .into_iter()
         .find(|e| e.cleans.iter().any(|(p, _)| cleans_name(p, name)))
     {

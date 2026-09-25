@@ -1232,6 +1232,22 @@ pub(crate) fn report_full_mode_scoped_tracked(
 /// stage before tracking), and again from [`annotate_tracking`], where
 /// it used to live, for any row a later stage added.
 pub fn annotate_artifact_ecosystems(projects: &mut [ProjectRow]) {
+    let mut listed: std::collections::HashMap<PathBuf, Vec<String>> =
+        std::collections::HashMap::new();
+    annotate_artifact_ecosystems_listing(projects, &mut listed);
+}
+
+/// [`annotate_artifact_ecosystems`] with the per-parent listings it
+/// took (or reused) exposed: one `read_dir` per distinct parent, never
+/// one per artifact, and none at all for a nested artifact's history
+/// shadow row (`source.tool == "cargo.layout"`: pushed by the growth
+/// consumer for the history store and removed again before assembly --
+/// its ecosystem is never rendered, and its parent is the interior of a
+/// build directory with thousands of entries).
+pub fn annotate_artifact_ecosystems_listing(
+    projects: &mut [ProjectRow],
+    listed: &mut std::collections::HashMap<PathBuf, Vec<String>>,
+) {
     for p in projects.iter_mut() {
         if p.ecosystems.is_empty() {
             let root = p
@@ -1249,11 +1265,20 @@ pub fn annotate_artifact_ecosystems(projects: &mut [ProjectRow]) {
                 if a.ecosystem.is_none()
                     && !a.kind.is_worktree_remainder()
                     && a.kind != ArtifactKind::Git
+                    && a.source.tool != "cargo.layout"
                     && let Some(name) = a.path.file_name().and_then(|n| n.to_str())
                 {
                     a.ecosystem = match a.path.parent() {
                         Some(parent) => {
-                            crate::ecosystem::artifact_ecosystem_at(parent, &p.ecosystems, name)
+                            let names = listed
+                                .entry(parent.to_path_buf())
+                                .or_insert_with(|| crate::ecosystem::dir_names(parent));
+                            crate::ecosystem::artifact_ecosystem_among(
+                                parent,
+                                names,
+                                &p.ecosystems,
+                                name,
+                            )
                         }
                         None => crate::ecosystem::artifact_ecosystem(&p.ecosystems, name),
                     }
@@ -2378,7 +2403,12 @@ pub fn observe_scope(
     // before this the only windows in existence could never reach the
     // units they were supposed to vouch for
     // (`.oh/sessions/2026-09-22-event-gated-reuse.md` §3).
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let phase = std::time::Instant::now();
     let unit_roots = scope.authorized_unit_roots();
+    if trace {
+        eprintln!("[xtrace] authorized_unit_roots: {:?}", phase.elapsed());
+    }
     let unit_replay = crate::growth::replay_unit_roots(
         store_dir,
         &unit_roots,
@@ -2391,6 +2421,10 @@ pub fn observe_scope(
     // its report in rather than walking a second time. It has no
     // per-root coverage to contribute, which is honest: coverage
     // describes the scope this function walked, and it did not walk one.
+    if trace {
+        eprintln!("[trace] observe: unit-root replay: {:?}", phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
     let (merged, coverage, per_root, events) = match base {
         // A handed-in report brings no *walk* window with it. The unit
         // roots' own cursors are independent evidence -- they were
@@ -2416,6 +2450,10 @@ pub fn observe_scope(
             fs_events_source,
         )?,
     };
+    if trace {
+        eprintln!("[trace] observe: project roots: {:?}", phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
     let mut events = events;
     events.merge(unit_replay.coverage.clone());
     let observed_at = merged.observed_at;
@@ -2442,6 +2480,10 @@ pub fn observe_scope(
         (Vec::new(), Vec::new())
     };
     let _ = &mut external_units;
+    if trace {
+        eprintln!("[trace] observe: external units: {:?}", phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
     // Aider's per-repository units need every known worktree root; the
     // walk above already produced them, so this costs no extra walk.
     let project_worktrees: Vec<PathBuf> = merged
@@ -2483,6 +2525,10 @@ pub fn observe_scope(
     // * a family that erred after measuring: same reasoning, and this is
     //   the `ReportCached` gate the walk's own checkpoint has -- a pass
     //   that failed to persist never gets to vouch for what it measured.
+    if trace {
+        eprintln!("[trace] observe: agent units: {:?}", phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
     let unit_root_coverage: Vec<crate::coverage::UnitRootCoverage> = unit_replay
         .outcomes
         .iter()
@@ -2531,6 +2577,10 @@ pub fn observe_scope(
     if observe && want.external && want.agents && external_ok && agents_ok {
         unit_replay.commit()?;
     }
+    if trace {
+        eprintln!("[trace] observe: commit replay: {:?}", phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
 
     let observation = ScopeObservation {
         merged,
@@ -2723,6 +2773,9 @@ pub fn observe_scope(
         )?;
     }
 
+    if trace {
+        eprintln!("[trace] observe: scope tables: {:?}", phase.elapsed());
+    }
     Ok(observation)
 }
 

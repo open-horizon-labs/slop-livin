@@ -129,6 +129,11 @@ pub fn unit_key(detector_id: &str, category: StorageCategory, device: u64, path:
 /// The stable label for a [`StorageCategory`], used both for the
 /// external row key and (item 3, `render.rs`) for rendering: no user
 /// surface prints `{:?}` on this enum.
+/// The category's label for text output (`swamp scope`).
+pub fn category_label(c: StorageCategory) -> &'static str {
+    category_str(c)
+}
+
 pub(crate) fn category_str(c: StorageCategory) -> &'static str {
     match c {
         StorageCategory::Installation => "installation",
@@ -390,6 +395,10 @@ pub fn observe_external(
     // second pass.
     let mut reused_unit_paths: Vec<String> = Vec::new();
     let mut protected_keys: HashSet<String> = HashSet::new();
+    // What an incomplete fold *did* read this pass, by key: a lower
+    // bound the unit row shows (flagged) when the store has no complete
+    // measurement to show instead. Never a growth input.
+    let mut lower_bounds: HashMap<String, crate::folded_measurement::FoldedUnit> = HashMap::new();
     let mut meta_by_key: HashMap<String, MeasuredUnit> = HashMap::new();
 
     for (idx, (candidate, canonical)) in canon_candidates.iter().enumerate() {
@@ -447,6 +456,7 @@ pub fn observe_external(
         // `stat` and not even the readability probe.
         let debug_trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
         let before = debug_trace.then(crate::work_counters::snapshot);
+        let started = std::time::Instant::now();
         let observation = match store_containers.get(&idx) {
             Some(container) => {
                 let reuse = probe.can_reuse(container);
@@ -462,10 +472,11 @@ pub fn observe_external(
                     let after = crate::work_counters::snapshot();
                     let before = before.unwrap();
                     eprintln!(
-                        "[xtrace] store {} can_reuse={reuse} dirs_delta={} files_delta={}",
+                        "[xtrace] store {} can_reuse={reuse} dirs_delta={} files_delta={} elapsed={:?}",
                         canonical.display(),
                         after.dirs_listed - before.dirs_listed,
-                        after.files_statted - before.files_statted
+                        after.files_statted - before.files_statted,
+                        started.elapsed()
                     );
                 }
                 if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
@@ -488,10 +499,11 @@ pub fn observe_external(
                     let after = crate::work_counters::snapshot();
                     let before = before.unwrap();
                     eprintln!(
-                        "[xtrace] plain  {} dirs_delta={} files_delta={}",
+                        "[xtrace] plain  {} dirs_delta={} files_delta={} elapsed={:?}",
                         canonical.display(),
                         after.dirs_listed - before.dirs_listed,
-                        after.files_statted - before.files_statted
+                        after.files_statted - before.files_statted,
+                        started.elapsed()
                     );
                 }
                 obs
@@ -519,6 +531,15 @@ pub fn observe_external(
             // for one pass is coverage shrinking, not the unit shrinking
             // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
             crate::folded_measurement::UnitObservation::Unit(row) if !row.complete => {
+                // A reused-but-incomplete unit (a sealed volume with
+                // root-only corners, replayed from its stamp) keeps its
+                // rows fresh too; otherwise the next pass's window
+                // predates them and the whole tree is walked again
+                // (R19: every other pass).
+                if row.reused {
+                    reused_unit_paths.push(canonical.display().to_string());
+                }
+                lower_bounds.insert(key.clone(), row);
                 protected_keys.insert(key);
                 continue;
             }
@@ -725,6 +746,39 @@ pub fn observe_external(
                 .transpose()?
                 .unwrap_or_default();
             let evidence = consumers_evidence(&consumers);
+            // The last complete measurement when there is one; else the
+            // lower bound this pass read, said to be one. A unit whose
+            // interior always has a root-only corner (the sealed
+            // simulator runtime volumes) used to show 0 B forever.
+            let bound = lower_bounds.get(key);
+            let (bytes, mtime_max, hardlinked, note) = match (&last, bound) {
+                // A lower bound above the last complete figure is the
+                // more current fact (the tree grew since), still a bound.
+                (Some(last), Some(b)) if b.bytes > last.0 => (
+                    b.bytes,
+                    b.mtime_max,
+                    b.hardlinked,
+                    "coverage incomplete: some directories could not be read; bytes are a lower bound",
+                ),
+                (Some(last), _) => (
+                    last.0,
+                    0,
+                    true,
+                    "coverage incomplete this pass: could not be read; last complete measurement shown",
+                ),
+                (None, Some(b)) => (
+                    b.bytes,
+                    b.mtime_max,
+                    b.hardlinked,
+                    "coverage incomplete: some directories could not be read; bytes are a lower bound",
+                ),
+                (None, None) => (
+                    0,
+                    0,
+                    true,
+                    "coverage incomplete this pass: could not be read",
+                ),
+            };
             units.push(ExternalUnit {
                 detector_id: detector_id.clone(),
                 // The authorized scope already told us this detector's
@@ -736,14 +790,14 @@ pub fn observe_external(
                 category: category_from_str(&category_s).unwrap_or(StorageCategory::Unclassified),
                 provenance: Provenance::BuiltinConvention,
                 path: path_buf,
-                bytes: last.as_ref().map(|r| r.0).unwrap_or(0),
-                mtime_max: 0,
-                hardlinked: true,
+                bytes,
+                mtime_max,
+                hardlinked,
                 growth_bytes: None,
                 regrowth_count: last.as_ref().map(|r| r.1).unwrap_or(0),
                 observed_at,
                 consumers,
-                note: Some("coverage incomplete this pass: could not be read".to_string()),
+                note: Some(note.to_string()),
                 evidence,
             });
         }

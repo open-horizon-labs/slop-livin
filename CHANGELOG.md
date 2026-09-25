@@ -4,6 +4,55 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### An unchanged `observe` is seconds, not minutes (R19)
+
+Measured on the owner's machine (73 detector roots, three installed
+simulator runtimes, ~/src walked), a second `swamp observe` with nothing
+changed took **147 s**; it now takes **6 s**, and `swamp report` 0.65 s.
+Three causes, each with a regression test:
+
+- `annotate_artifact_ecosystems` listed the parent directory of every
+  artifact row without an ecosystem -- including the thousands of
+  nested-artifact shadow rows the growth consumer pushes each pass,
+  whose parents are `target/debug/deps`-sized. 138 s of the 147.
+  Listings are now memoised per parent and shadow rows are skipped
+  (`ecosystem_annotation_lists_each_parent_once.rs`).
+- The sealed, read-only simulator runtime volumes under
+  `/Library/Developer/CoreSimulator/Volumes` (17 GB and 600k files each)
+  are separate mounts, so no FSEvents window ever vouched for them and
+  every pass re-walked all three: 482k listings, 1.77M stats. A
+  read-only filesystem mounted under a unit root is now measured as its
+  own part and reused from its `statfs` stamp (device, block totals) --
+  `external/volume_stamps.parquet`, `fs_space::volume_stamp` -- with no
+  event window and no listing while the stamp holds
+  (`folded_measurement::tests::a_sealed_read_only_mount_is_reused_from_its_stamp_without_a_window`).
+- The external measurement cache was one `external/folded.parquet` for
+  every unit; each unit's reuse check read the whole table. It is one
+  file per unit now (`external/folded/<id>.parquet`), and the per-device
+  FSEvents replays run concurrently instead of one after another.
+
+A pre-existing bug the trace surfaced: an external unit whose interior
+has a permanently unreadable corner (the sealed runtime volumes have
+root-only directories) rendered **0 B "could not be read"** on every
+pass -- the machine's 43 GB of simulator runtimes shown as nothing --
+while the adapter listed them beneath. An incomplete fold is now shown
+as a flagged lower bound when there is no complete measurement (or when
+it exceeds the last complete figure); it is still never a growth input.
+
+Also from the 2026-09-23 aim review: a Claude Code session's project
+link is read from the first transcript record that carries a `cwd`
+(real transcripts open with `queue-operation` records that have none;
+every session read "unresolved"); the agents view ranks each category
+largest-first so the capped default rows are the ones a decision hinges
+on; a tree written to during the pass no longer renders "modified in
+the future (clock skew?)"; an external unit whose declared consumers
+arrive as evidence rows says "consumers: N (from declarations, below)"
+instead of "no declared consumers" above them; a multi-root report's
+"unowned by top-level dir" groups rows outside the first root under
+their own parent instead of "/"; the coverage note on stderr is one
+count per status (`swamp scope` for the list); `swamp scope` prints
+category and provenance labels, not Debug output.
+
 ### No JSON in the store, finished (R18b)
 
 The five control files that were still JSON -- `fsevents.json` (per

@@ -4436,3 +4436,28 @@ table! {
         size: Option<u64>,
     }
 }
+
+table! {
+    /// `<store>/external/volume_stamps.parquet` (R19): for a unit root,
+    /// each read-only filesystem mounted directly under it (a sealed
+    /// simulator runtime volume) with the `fs_space::VolumeStamp` it
+    /// had when last walked and what that walk found -- reused without a
+    /// walk while the stamp holds.
+    StoredVolumeStampRow, write_volume_stamp_rows, read_volume_stamp_rows {
+        unit_path: String,
+        mount_path: String,
+        device: u64,
+        total_blocks: u64,
+        root_ino: u64,
+        root_mtime: i64,
+        bytes: u64,
+        hardlinked: bool,
+        mtime_max: u64,
+        // `complete`: whether every directory under the mount listed. A
+        // read-only filesystem gives the same (partial) answer every
+        // pass, so an incomplete fold is still reusable there -- as a
+        // lower bound, flagged, exactly as the walk reported it.
+        complete: bool,
+        observed_at: u64,
+    }
+}

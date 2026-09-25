@@ -52,7 +52,7 @@ const TABLES: &[&str] = &[
     "topology.parquet",
     "enrich.parquet",
     // external / build-store measurement caches
-    "folded.parquet",
+    "volume_stamps.parquet",
     "build_stores.parquet",
     "xcode_derived_data.parquet",
     "declarations.parquet",
@@ -113,13 +113,18 @@ fn allowed(rel: &Path) -> bool {
     if TABLES.contains(&name.as_str()) {
         return true;
     }
-    // Reverse-delta history: `<volume>/{deltas,dirs_deltas,files_deltas}/
-    // delta-<seq>.parquet`.
     let parent = rel
         .parent()
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    // The external measurement cache, one file per unit (R19):
+    // `external/folded/<id>.parquet`.
+    if parent == "folded" && name.ends_with(".parquet") {
+        return true;
+    }
+    // Reverse-delta history: `<volume>/{deltas,dirs_deltas,files_deltas}/
+    // delta-<seq>.parquet`.
     if matches!(parent.as_str(), "deltas" | "dirs_deltas" | "files_deltas")
         && name.starts_with("delta-")
         && name.ends_with(".parquet")

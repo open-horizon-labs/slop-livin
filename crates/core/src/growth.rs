@@ -4941,6 +4941,8 @@ pub fn replay_unit_roots(
         device_mismatch: bool,
     }
 
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let staging = std::time::Instant::now();
     let mut staged: Vec<Staged> = Vec::new();
     let mut requests: Vec<FsEventsRequest> = Vec::new();
     for root in roots {
@@ -4988,7 +4990,18 @@ pub fn replay_unit_roots(
         });
     }
 
+    if trace {
+        eprintln!(
+            "[xtrace] unit-root staging: {} roots in {:?}",
+            requests.len(),
+            staging.elapsed()
+        );
+    }
+    let replay = std::time::Instant::now();
     let plans = source.replay_roots(&requests);
+    if trace {
+        eprintln!("[xtrace] unit-root replay_roots: {:?}", replay.elapsed());
+    }
     for (s, plan) in staged.into_iter().zip(plans) {
         let reason = if s.device_mismatch {
             crate::fs_events::RefreshRefusal::RootMismatch
@@ -6526,15 +6539,23 @@ fn external_deltas_dir(dir: &Path) -> PathBuf {
 // external/folded.parquet -- the measurement the next pass may reuse
 // ---------------------------------------------------------------------
 
-fn folded_path(swamp_dir: &Path) -> PathBuf {
-    external_dir(swamp_dir).join("folded.parquet")
+/// `external/folded/<id>.parquet` (R19): one file per unit, keyed by
+/// `entities::id_for(unit_path)`. The former single `external/folded.parquet`
+/// held every unit's rows, so each of ~70 units' reuse check read the
+/// whole table and each walked unit rewrote it -- about a second of an
+/// unchanged pass in reads alone. A store written before R19 keeps its
+/// old file unread; each unit re-measures once and lands in its own.
+fn folded_unit_path(swamp_dir: &Path, unit_path: &str) -> PathBuf {
+    external_dir(swamp_dir)
+        .join("folded")
+        .join(format!("{}.parquet", crate::entities::id_for(unit_path)))
 }
 
 /// Every stored folded row for `unit_path`, root row first. Empty when
 /// nothing is stored, the store is unreadable, or the table is corrupt:
 /// a cache that cannot be read is a cache miss, never an error.
 pub fn folded_rows_for(swamp_dir: &Path, unit_path: &str) -> Vec<FoldedRow> {
-    let mut rows: Vec<FoldedRow> = read_folded_rows(&folded_path(swamp_dir))
+    let mut rows: Vec<FoldedRow> = read_folded_rows(&folded_unit_path(swamp_dir, unit_path))
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.unit_path == unit_path)
@@ -6543,52 +6564,66 @@ pub fn folded_rows_for(swamp_dir: &Path, unit_path: &str) -> Vec<FoldedRow> {
     rows
 }
 
-/// Replaces the stored folded rows for `unit_path` with `rows`, leaving
-/// every other unit's rows alone. A unit whose rows are dropped simply
-/// re-measures next pass.
-/// Re-stamps the stored folded rows of `unit_paths` as verified at
-/// `observed_at`, in one read and one write for the whole set.
-///
-/// A unit whose measurement was *reused* this pass writes no rows -- the
-/// point of the reuse is that there is nothing new to write -- but its
-/// rows really were re-verified, by this pass's event window. Leaving
-/// their `observed_at` at the value the last full measurement wrote
-/// would make every second pass a miss: the next window starts where
-/// this pass ended, and rows stamped before it cannot be vouched for
-/// (`crate::fs_events::EventCoverage::unchanged_since`).
+/// Re-stamps the reused units' rows to `observed_at`, so the next pass's
+/// window can still vouch for them.
 pub fn touch_folded_rows(swamp_dir: &Path, unit_paths: &[String], observed_at: u64) -> Result<()> {
-    if unit_paths.is_empty() {
-        return Ok(());
-    }
-    let dir = external_dir(swamp_dir);
-    store::StoreDir::at(&dir)?.create()?;
-    let path = folded_path(swamp_dir);
-    let wanted: std::collections::HashSet<&str> = unit_paths.iter().map(String::as_str).collect();
-    let mut all: Vec<FoldedRow> = read_folded_rows(&path).unwrap_or_default();
-    let mut touched = false;
-    for row in all.iter_mut() {
-        if wanted.contains(row.unit_path.as_str()) && row.observed_at != observed_at {
-            row.observed_at = observed_at;
-            touched = true;
+    for unit_path in unit_paths {
+        let path = folded_unit_path(swamp_dir, unit_path);
+        let mut rows: Vec<FoldedRow> = read_folded_rows(&path).unwrap_or_default();
+        let mut touched = false;
+        for row in rows.iter_mut() {
+            if row.unit_path == *unit_path && row.observed_at != observed_at {
+                row.observed_at = observed_at;
+                touched = true;
+            }
+        }
+        if touched {
+            write_folded_rows(&path, &rows)?;
         }
     }
-    if !touched {
-        return Ok(());
-    }
-    write_folded_rows(&path, &all)
+    Ok(())
 }
 
+/// Replaces `unit_path`'s folded rows wholesale.
 pub fn store_folded_rows(swamp_dir: &Path, unit_path: &str, rows: &[FoldedRow]) -> Result<()> {
+    let dir = external_dir(swamp_dir).join("folded");
+    store::StoreDir::at(&dir)?.create()?;
+    write_folded_rows(&folded_unit_path(swamp_dir, unit_path), rows)
+}
+
+// ---------------------------------------------------------------------
+// external/volume_stamps.parquet (R19) -- see `columns::StoredVolumeStampRow`
+// ---------------------------------------------------------------------
+
+fn volume_stamps_path(swamp_dir: &Path) -> PathBuf {
+    external_dir(swamp_dir).join("volume_stamps.parquet")
+}
+
+/// The stored sealed-mount stamps for `unit_path`; empty on a miss.
+pub fn volume_stamps_for(swamp_dir: &Path, unit_path: &str) -> Vec<columns::StoredVolumeStampRow> {
+    columns::read_volume_stamp_rows(&volume_stamps_path(swamp_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.unit_path == unit_path)
+        .collect()
+}
+
+/// Replaces `unit_path`'s sealed-mount stamps wholesale.
+pub fn store_volume_stamps(
+    swamp_dir: &Path,
+    unit_path: &str,
+    rows: &[columns::StoredVolumeStampRow],
+) -> Result<()> {
     let dir = external_dir(swamp_dir);
     store::StoreDir::at(&dir)?.create()?;
-    let path = folded_path(swamp_dir);
-    let mut all: Vec<FoldedRow> = read_folded_rows(&path)
+    let path = volume_stamps_path(swamp_dir);
+    let mut all: Vec<columns::StoredVolumeStampRow> = columns::read_volume_stamp_rows(&path)
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.unit_path != unit_path)
         .collect();
     all.extend(rows.iter().cloned());
-    write_folded_rows(&path, &all)
+    columns::write_volume_stamp_rows(&path, &all)
 }
 
 /// Which family of rows in the shared external current table an

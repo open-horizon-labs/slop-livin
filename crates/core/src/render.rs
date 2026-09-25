@@ -404,11 +404,20 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
         let rel = Path::new(&row.path_or_object)
             .strip_prefix(&report.root)
             .unwrap_or_else(|_| Path::new(&row.path_or_object));
-        let top_dir = rel
-            .components()
-            .next()
-            .map(|c| c.as_os_str().to_string_lossy().to_string())
-            .unwrap_or_else(|| row.path_or_object.clone());
+        // Under the first root: its top-level directory. Under another
+        // root of a multi-root scope (`strip_prefix` failed, `rel` is the
+        // whole path): the row's own parent directory -- never "/", which
+        // the aim review saw as a meaningless 94 GB row.
+        let top_dir = if rel.is_absolute() {
+            rel.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| row.path_or_object.clone())
+        } else {
+            rel.components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .unwrap_or_else(|| row.path_or_object.clone())
+        };
         *by_dir.entry(top_dir).or_insert(0) += row.bytes;
         *by_reason.entry(reason_label(&row.reason)).or_insert(0) += row.bytes;
     }
@@ -1586,7 +1595,21 @@ pub fn render_view_external_with(
             .growth_bytes
             .map(human_bytes_signed)
             .unwrap_or_else(|| "—".to_string());
-        let consumers = if u.consumers.is_empty() {
+        let consumer_facts = u
+            .evidence
+            .iter()
+            .filter(|e| {
+                e.kind == crate::evidence::FactKind::Consumer
+                    && matches!(e.status, crate::evidence::FactStatus::Known(_))
+            })
+            .count();
+        let consumers = if u.consumers.is_empty() && consumer_facts > 0 {
+            // The declarations are attached as evidence rows (rendered
+            // just below), not as the unit's own consumer list: say so
+            // rather than contradicting them (the aim review's "no
+            // declared consumers" above three declared consumers).
+            format!("consumers: {consumer_facts} (from declarations, below)")
+        } else if u.consumers.is_empty() {
             "no declared consumers".to_string()
         } else {
             format!(
@@ -1645,10 +1668,16 @@ fn age_label(mtime_max: u64, now: u64) -> String {
     if mtime_max == 0 {
         return "age unknown".to_string();
     }
-    if mtime_max > now {
+    // A tree written to while the pass ran carries an mtime a little
+    // after `now` (the observation's own timestamp, taken at its start):
+    // that is "just now", not a clock problem. Only an hour or more
+    // ahead is worth calling out (R19; the aim review saw `~/.claude`,
+    // `~/.codex` and `/opt/homebrew` labelled "clock skew?" on every
+    // pass).
+    if mtime_max > now + 3600 {
         return "modified in the future (clock skew?)".to_string();
     }
-    let secs = now - mtime_max;
+    let secs = now.saturating_sub(mtime_max);
     if secs < 3600 {
         format!("{}m ago", (secs / 60).max(1))
     } else if secs < 86_400 {
@@ -1970,13 +1999,21 @@ pub fn render_view_agents(
                 if cat_units.len() == 1 { "" } else { "s" }
             );
             let mut sorted = cat_units.clone();
-            // Oldest-modified first; units with an unknown age (0) sort
-            // last, never masquerading as the oldest.
-            sorted.sort_by(|a, b| match (a.mtime_max, b.mtime_max) {
-                (0, 0) => std::cmp::Ordering::Equal,
-                (0, _) => std::cmp::Ordering::Greater,
-                (_, 0) => std::cmp::Ordering::Less,
-                (x, y) => x.cmp(&y),
+            // Largest first, then oldest-modified: the capped default
+            // view has to show the rows a decision hinges on (the aim
+            // review: oldest-first buried a 900 MB category's large
+            // members under twenty 40 KB files). Units with an unknown
+            // age (0) sort after known ages at equal size, never
+            // masquerading as the oldest.
+            sorted.sort_by(|a, b| {
+                b.bytes
+                    .cmp(&a.bytes)
+                    .then_with(|| match (a.mtime_max, b.mtime_max) {
+                        (0, 0) => std::cmp::Ordering::Equal,
+                        (0, _) => std::cmp::Ordering::Greater,
+                        (_, 0) => std::cmp::Ordering::Less,
+                        (x, y) => x.cmp(&y),
+                    })
             });
             let limit = if all {
                 sorted.len()

@@ -125,6 +125,133 @@ fn space(path: &Path) -> Option<Space> {
     })
 }
 
+/// The identity of the filesystem a path is on, as a stamp: the device
+/// number (unique per mount), whether it is mounted read-only, its
+/// total size, and the root directory's inode and mtime. A read-only
+/// filesystem whose stamp has not moved holds exactly the bytes it held
+/// last pass -- a sealed simulator runtime volume, a mounted disk image
+/// -- so a tree under it can be reused without a walk and without an
+/// event window (R19; `.oh/guardrails/no-second-traversal-on-report-path.md`).
+/// Deliberately not the used/available block count: on APFS a volume's
+/// free space is the shared container's, which moves every second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeStamp {
+    pub device: u64,
+    pub read_only: bool,
+    pub total_blocks: u64,
+    pub root_ino: u64,
+    pub root_mtime: i64,
+}
+
+pub fn volume_stamp(path: &Path) -> Option<VolumeStamp> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(stamp) = testing::override_for(path) {
+        return Some(stamp);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let (space, read_only) = space_and_flag(path)?;
+    Some(VolumeStamp {
+        device: meta.dev(),
+        read_only,
+        total_blocks: space.total_blocks,
+        root_ino: meta.ino(),
+        root_mtime: meta.mtime(),
+    })
+}
+
+/// `MNT_RDONLY` from `<sys/mount.h>`.
+#[cfg(target_os = "macos")]
+const MNT_RDONLY: u32 = 0x0000_0001;
+
+#[cfg(target_os = "macos")]
+fn space_and_flag(path: &Path) -> Option<(Space, bool)> {
+    let cpath = cpath(path)?;
+    let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: as in `space`.
+    let stat = unsafe {
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init()
+    };
+    let block_size = u64::from(stat.f_bsize);
+    if block_size == 0 {
+        return None;
+    }
+    Some((
+        Space {
+            available_blocks: stat.f_bavail,
+            total_blocks: stat.f_blocks,
+            block_size,
+        },
+        stat.f_flags & MNT_RDONLY != 0,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn space_and_flag(path: &Path) -> Option<(Space, bool)> {
+    let cpath = cpath(path)?;
+    let mut buf: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: as in `space`.
+    let stat = unsafe {
+        if libc::statvfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init()
+    };
+    let block_size = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    if block_size == 0 {
+        return None;
+    }
+    Some((
+        Space {
+            available_blocks: stat.f_bavail,
+            total_blocks: stat.f_blocks,
+            block_size,
+        },
+        stat.f_flag & libc::ST_RDONLY != 0,
+    ))
+}
+
+/// Test seam: a stamp to answer for a path instead of asking the kernel,
+/// so a sealed read-only mount can be staged in a temp dir.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::VolumeStamp;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OVERRIDES: Mutex<Option<HashMap<PathBuf, VolumeStamp>>> = Mutex::new(None);
+
+    pub fn override_for(path: &Path) -> Option<VolumeStamp> {
+        OVERRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .get(path)
+            .copied()
+    }
+
+    /// Answers `stamp` for `path` until [`clear`].
+    pub fn set(path: &Path, stamp: VolumeStamp) {
+        OVERRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), stamp);
+    }
+
+    pub fn clear() {
+        *OVERRIDES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -279,6 +279,17 @@ pub enum Provenance {
     ToolQuery(String),
 }
 
+/// How a location was resolved, as text output says it (never the
+/// variant's Debug form).
+pub fn provenance_label(p: &Provenance) -> String {
+    match p {
+        Provenance::BuiltinConvention => "built-in convention".to_string(),
+        Provenance::EnvVar(v) => format!("env {v}"),
+        Provenance::ConfigField(v) => format!("config {v}"),
+        Provenance::ToolQuery(v) => format!("queried {v}"),
+    }
+}
+
 /// Whether a detector actually produced a usable path for this candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
