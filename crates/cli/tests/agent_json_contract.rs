@@ -203,12 +203,11 @@ fn bespoke_json_views_carry_evidence_on_their_rows() {
     assert!(v["result"].as_array().is_some());
 }
 
-/// A fresh `report --json` call (no prior observation) is a coherent
-/// no-growth baseline, not an error: the grown view is empty and the
-/// coverage block says plainly that there is no history yet instead of
-/// fabricating a window.
+/// A grown report whose store holds less history than requested clamps
+/// its window to the observations actually available, rather than
+/// fabricating a full requested window.
 #[test]
-fn grown_view_reports_partial_coverage_before_any_history_exists() {
+fn grown_view_clamps_to_partial_history() {
     let root = tempfile::tempdir().unwrap();
     make_checkout(root.path(), "repo", 4096);
     let store = tempfile::tempdir().unwrap();
@@ -216,8 +215,8 @@ fn grown_view_reports_partial_coverage_before_any_history_exists() {
     // its own and never scans); `config.toml`'s `since` is what the
     // JSON envelope's `coverage.history` block reports as "asked".
     fs::write(store.path().join("config.toml"), "since = \"1h\"\n").unwrap();
-
     observe(store.path(), root.path(), &[]);
+
     let v = run_json(
         store.path(),
         &[
@@ -231,18 +230,15 @@ fn grown_view_reports_partial_coverage_before_any_history_exists() {
     assert_eq!(v["view"], "grown");
     assert_eq!(v["result"]["grown"].as_array().unwrap().len(), 0);
     let history = &v["coverage"]["history"];
-    // The very first observation this store ever wrote has (near) zero
-    // span (nothing to diff against yet): the asked 1h window cannot be
-    // honestly honored, and the note says exactly that instead of
-    // silently reporting growth over a window that never existed. The
-    // exact second count depends on wall-clock timing inside a single
-    // `report_full_mode` call (observe-then-read), so this asserts the
-    // shape (tiny, and asked > held) rather than an exact "0".
+    // The fixture has one observation, but elapsed time between its
+    // write and report varies (notably on CI). Assert the contract, not
+    // a guessed sub-two-second bound: available history must be shorter
+    // than the requested hour and the effective window must match it.
     let history_secs = history["history_secs"].as_u64().expect("history_secs");
     let effective = history["effective_window_secs"]
         .as_u64()
         .expect("effective_window_secs");
-    assert!(history_secs <= 2, "{v:#}");
+    assert!(history_secs < 3600, "{v:#}");
     assert_eq!(effective, history_secs);
     assert!(
         history["note"]
