@@ -4,6 +4,51 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### The store holds facts; a report is computed from them (R20)
+
+R17 through R18a-3b replaced the JSON render cache with typed Parquet
+tables one `Report` field at a time -- and gave tables to fields that
+are *computed* from other tables: the by-type summary, the byte-history
+series, a copy of each volume's unowned rows, a copy of the directory/
+large-file drill-down with its growth, a second copy of the GitHub
+enrichment counters, and growth columns on the artifact-shape table.
+Each was a second source of truth, a write on every `observe`, and no
+faster to read than to compute (the whole store is a few megabytes; a
+fold over its rows costs less than opening one more file). All of them
+are deleted. `swamp report` now derives `summary`, `reconciliation`,
+`series_by_key`/`total_series`, `unowned`, `dirs_by_worktree`/
+`files_by_worktree` and each artifact's growth/allocation from the fact
+tables and the reverse-delta history, at the observation's own
+timestamp, with the same functions the observe pass used -- a read is
+byte-identical to the pass that wrote the facts.
+
+What is stored instead, because a read cannot recompute it: each walked
+root's own walk totals as columns on its `coverage.parquet` row;
+`runs.parquet` (the observation's timestamp, growth window, whether the
+drill-down was requested, the live GitHub-enrichment counters, the
+scheduler status the pass saw -- and the "this scope has been observed"
+marker); `<volume>/docker_unowned.parquet` for the Docker objects no
+project claims; `<volume>/dir_tracks.parquet` for the git tracking
+state of a walk's top-level directories (read from `.gitignore` by the
+walk, never by a report).
+
+Two determinism bugs the derivation exposed are fixed: every root of one
+`observe` now shares the observation's single timestamp (each root's
+bus used to read its own clock, so series buckets and growth windows
+drifted by seconds between roots), and read-time growth is measured
+against history strictly before the observation (a read after the pass
+that wrote a row was comparing the row with itself). The dead
+`plans/<id>.json`/`grants.json` file kinds of the removed action path
+are gone too.
+
+Guardrails: a new source audit, `parquet_writers_are_the_named_fact_tables`
+(the one Parquet writer is reached only from the named fact-table
+writers; three mutations, one accept), an exact table allow-list in
+`store_contents_are_allowlisted.rs`, `derived_views_are_computed_not_stored.rs`
+and `report_read_stays_fast.rs` (a 3,000-artifact store reads back in
+20 ms). See `.oh/guardrails/store-is-facts-report-is-views.md` and
+`.oh/sessions/2026-09-24-r20-facts-not-views.md`.
+
 ### No JSON in the store: the last per-root replay cache is gone (R18a-4)
 
 The last JSON/zstd file the store held, `last_report-<key>.json.zst`

@@ -93,10 +93,6 @@ impl StoreDir {
 /// Every JSON file swamp persists. The file name is decided here.
 #[derive(Debug, Clone, Copy)]
 pub enum JsonFile<'a> {
-    /// `<store>/plans/<id>.json`: one proposed plan.
-    Plan { store: &'a StoreDir, id: &'a str },
-    /// `<store>/grants.json`: every grant a human minted.
-    Grants { store: &'a StoreDir },
     /// `<store>/scope.json`: the last resolved scope (coverage
     /// bookkeeping only).
     Scope { store: &'a StoreDir },
@@ -149,10 +145,6 @@ impl JsonFile<'_> {
     /// Where the file lives.
     pub fn path(&self) -> io::Result<PathBuf> {
         Ok(match *self {
-            JsonFile::Plan { store, id } => {
-                store.0.join("plans").join(format!("{}.json", plain(id)?))
-            }
-            JsonFile::Grants { store } => store.0.join("grants.json"),
             JsonFile::Scope { store } => store.0.join("scope.json"),
             JsonFile::LastRun { store } => store.0.join("last_run.json"),
             JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
@@ -163,9 +155,7 @@ impl JsonFile<'_> {
 
     fn encoding(&self) -> Encoding {
         match self {
-            JsonFile::Plan { .. } | JsonFile::Grants { .. } | JsonFile::Scope { .. } => {
-                Encoding::Pretty
-            }
+            JsonFile::Scope { .. } => Encoding::Pretty,
             _ => Encoding::Compact,
         }
     }

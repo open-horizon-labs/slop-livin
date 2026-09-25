@@ -23,15 +23,11 @@ use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 /// control file's name.
 const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 
-/// Exact basenames allowed anywhere under the store.
+/// Exact basenames allowed anywhere under the store, other than tables.
 ///
-/// `last_report.json`/`last_report.json.zst`/`last_report-<key>.json.zst`
-/// (the whole-`Report` replay cache) are gone as of R18a-4: the two
-/// lower-level replay caches they served are now root-keyed Parquet
-/// tables (`git_signals.parquet`/`git_signals_values.parquet`,
-/// `cargo_replay_cache.parquet`/`cargo_replay_cache_lists.parquet`/
-/// `cargo_replay_cache_evidence.parquet`/`cargo_replay_cache_meta.parquet`),
-/// covered by the `.parquet` rule below like every other table.
+/// The JSON control files still here are R18b's to convert; the rest
+/// is what the no-JSON rule allows: `config.toml`, a tiny `ui_state.json`,
+/// lock files.
 const ALLOWED_NAMES: &[&str] = &[
     "config.toml",
     "ledger.jsonl",
@@ -43,6 +39,64 @@ const ALLOWED_NAMES: &[&str] = &[
     "restore.json",
 ];
 
+/// Every Parquet table the store may hold, by exact basename -- the
+/// runtime twin of the source audit's `TABLE_WRITERS`
+/// (`crates/source-audit/src/rules/gate.rs`) and of the table in
+/// `docs/architecture.md`. Each is a *fact* table: rows from an
+/// observation or their reverse-delta history. A table for something a
+/// read computes (`summary`, `series`, `worktree_entries`,
+/// `unowned_summary`, `github_enrichment`, `report_rows`) is not here
+/// and fails this test (store-is-facts-report-is-views, R20).
+const TABLES: &[&str] = &[
+    // per-volume current state + history (`<store>/<volume>/`)
+    "current.parquet",
+    "dirs.parquet",
+    "files.parquet",
+    "unowned.parquet",
+    "unowned_lists.parquet",
+    "unowned_evidence.parquet",
+    "docker_unowned.parquet",
+    "docker_unowned_lists.parquet",
+    "docker_unowned_evidence.parquet",
+    "dir_tracks.parquet",
+    "topology.parquet",
+    "enrich.parquet",
+    // external / build-store measurement caches
+    "folded.parquet",
+    "build_stores.parquet",
+    "xcode_derived_data.parquet",
+    "declarations.parquet",
+    "dependency_identities.parquet",
+    "external_consumers.parquet",
+    // per-root replay caches
+    "git_signals.parquet",
+    "git_signals_values.parquet",
+    "cargo_replay_cache.parquet",
+    "cargo_replay_cache_lists.parquet",
+    "cargo_replay_cache_evidence.parquet",
+    "cargo_replay_cache_meta.parquet",
+    // scope-wide observation facts (`<store>/`)
+    "runs.parquet",
+    "coverage.parquet",
+    "notes.parquet",
+    "projects.parquet",
+    "worktrees.parquet",
+    "worktree_facts.parquet",
+    "artifact_shape.parquet",
+    "artifact_shape_lists.parquet",
+    "external_units.parquet",
+    "agent_units.parquet",
+    "agent_unit_members.parquet",
+    "unit_consumers.parquet",
+    "agent_identifications.parquet",
+    "agent_containers.parquet",
+    "nested_artifacts.parquet",
+    "nested_artifact_lists.parquet",
+    "nested_artifact_evidence.parquet",
+    "evidence.parquet",
+    "protect.parquet",
+];
+
 fn allowed(rel: &Path) -> bool {
     let name = rel
         .file_name()
@@ -51,8 +105,20 @@ fn allowed(rel: &Path) -> bool {
     if ALLOWED_NAMES.contains(&name.as_str()) {
         return true;
     }
-    // Columnar tables, wherever the store puts them.
-    if name.ends_with(".parquet") {
+    if TABLES.contains(&name.as_str()) {
+        return true;
+    }
+    // Reverse-delta history: `<volume>/{deltas,dirs_deltas,files_deltas}/
+    // delta-<seq>.parquet`.
+    let parent = rel
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if matches!(parent.as_str(), "deltas" | "dirs_deltas" | "files_deltas")
+        && name.starts_with("delta-")
+        && name.ends_with(".parquet")
+    {
         return true;
     }
     // A Linux collector's checkpoint and an observation's sync request

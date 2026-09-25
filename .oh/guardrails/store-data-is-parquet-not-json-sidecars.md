@@ -69,14 +69,15 @@ from `report_rows.parquet`'s JSON cell (see
 `crates/core/tests/project_worktree_tables.rs`). `external_units.parquet`,
 `agent_units.parquet`, `unit_consumers.parquet`, `nested_artifacts.parquet`
 and `evidence.parquet` are done (R16). `coverage.parquet`,
-`series.parquet`, `summary.parquet`, `notes.parquet` and
-`<volume>/topology.parquet` (replacing `topology.json`) are done (R17,
-stack/26) -- see `crates/core/tests/coverage_series_summary_notes_tables.rs`
-and `.oh/sessions/2026-09-24-r17-tables.md`. Not yet done: `grants.json`,
-`scope.json`, `last_run.json`, `docker_facts.json`, `fsevents.json`,
-`ledger.jsonl` and `last_report*.json.zst` itself are all still JSON
-files under the store; none of them showed unbounded growth on the
-fixtures measured so far, but the 2026-09-24 hard-rule decision asks for
-the allow-list to shrink to exactly `config.toml`, `ui_state.json`
-(small) and lock files -- that full migration is in progress, table by
-table.
+`notes.parquet` and `<volume>/topology.parquet` (replacing
+`topology.json`) are done (R17, stack/26). The render-cache row itself
+(`report_rows.parquet`) and `last_report*.json.zst` are gone (R18a-3b,
+R18a-4). R20 then *deleted* the tables R17-R18a-3 had given to derived
+report fields (`summary`, `series`, `unowned_summary`,
+`worktree_entries`, `github_enrichment`) -- the store holds facts, a
+read computes the views (`store-is-facts-report-is-views`); the exact
+table list is `crates/core/tests/store_contents_are_allowlisted.rs`.
+Not yet done (R18b): `scope.json`, `last_run.json`, `docker_facts.json`,
+`fsevents.json` and `ledger.jsonl` are still JSON files under the
+store; the 2026-09-24 hard-rule decision asks for the allow-list to
+shrink to exactly `config.toml`, `ui_state.json` (small) and lock files.

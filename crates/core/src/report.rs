@@ -1153,6 +1153,7 @@ pub fn report_full_mode_scoped(
         fs_events_source,
         pruned_subtrees,
         docker_in_scope,
+        None,
     )
     .map(|(r, _)| r)
 }
@@ -1179,6 +1180,7 @@ pub(crate) fn report_full_mode_scoped_tracked(
     fs_events_source: &dyn crate::fs_events::FsEventsSource,
     pruned_subtrees: &[PathBuf],
     docker_in_scope: bool,
+    observed_at: Option<u64>,
 ) -> Result<(Report, Option<crate::fs_events::TrustedWindow>)> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
@@ -1209,6 +1211,13 @@ pub(crate) fn report_full_mode_scoped_tracked(
         &pruned_subtrees,
     );
     ctx.docker_in_scope = docker_in_scope;
+    // R20: one scope observation, one timestamp. Every root's rows,
+    // growth window and sparkline history are computed at the scope's
+    // `observed_at`, which `runs.parquet` records -- so a read derives
+    // exactly what the pass showed.
+    if let Some(observed_at) = observed_at {
+        ctx.observed_at = observed_at;
+    }
     let mut report = crate::bus::run_report(&ctx)?;
     report.store_dir = store_dir.map(Path::to_path_buf);
     let window = ctx.event_window.lock().unwrap().clone();
@@ -2199,6 +2208,7 @@ pub fn report_scope_with_parts_covered(
                     fs_events_source,
                     &pruned,
                     docker_authorized,
+                    Some(observed_at),
                 );
                 let r = match r {
                     Ok((r, window)) => {
@@ -2648,87 +2658,68 @@ pub fn observe_scope(
                 &n.decision_evidence,
             ));
         }
-        // R18a-3: an `UnownedRow`'s evidence, keyed by its position in
-        // `Report.unowned` -- the same identity
-        // `write_unowned_summary_table`/`rebuild_unowned_from_tables`
-        // use for the row itself. Folded into this same
-        // `evidence_entities` list (not a second `write_evidence_table`
-        // call) so this pass's evidence write stays the one wholesale
-        // replace for `key` -- a second call would filter out and lose
-        // the entities already pushed above.
-        let unowned_evidence_keys: Vec<String> = (0..observation.merged.unowned.len())
-            .map(|seq| crate::growth::evidence_row_key("unowned-summary", &seq.to_string()))
-            .collect();
-        for (u, row_key) in observation
-            .merged
-            .unowned
-            .iter()
-            .zip(unowned_evidence_keys.iter())
-        {
-            if u.evidence.is_empty() {
-                continue;
-            }
-            evidence_entities.push((row_key.clone(), &u.evidence));
-        }
         crate::growth::write_evidence_table(store_dir, &key, &evidence_entities)?;
-        // R17 item 1 of the JSON-in-the-store decomposition:
-        // `coverage.parquet`/`series.parquet`/`summary.parquet`/
-        // `notes.parquet`, from this same pass's already-computed
-        // coverage (`observation.coverage`/`.unit_root_coverage`) and
-        // `observation.merged`'s series/summary/notes fields -- no
-        // second pass.
+        // Coverage per root, carrying each walked root's own walk totals
+        // (R20: `Report.reconciliation` is their sum, computed on read).
+        let reconciliation_by_root: std::collections::HashMap<PathBuf, Reconciliation> =
+            observation
+                .per_root
+                .iter()
+                .map(|(root, r)| (root.clone(), r.reconciliation.clone()))
+                .collect();
         crate::growth::write_coverage_table(
             store_dir,
             &key,
             &observation.coverage,
             &observation.unit_root_coverage,
+            &reconciliation_by_root,
             observation.merged.observed_at,
         )?;
-        crate::growth::write_series_table(
-            store_dir,
-            &key,
-            &observation.merged.series_by_key,
-            &observation.merged.total_series,
-            observation.merged.series_window_secs,
-            observation.merged.observed_at,
-        )?;
-        crate::growth::write_summary_table(
-            store_dir,
-            &key,
-            &observation.merged.summary,
-            &observation.merged.reconciliation,
-            observation.merged.schedule_line.as_deref(),
-            observation.merged.observed_at,
-        )?;
+        // The run's own diagnostics: what the consumers noted while
+        // walking (fsevents mode, daemon reachability, ...).
         crate::growth::write_notes_table(
             store_dir,
             &key,
             &observation.merged.notes,
             observation.merged.observed_at,
         )?;
-        // R18a-3: `unowned_summary.parquet` (+ `unowned_summary_lists.
-        // parquet`), `worktree_entries.parquet`, `github_enrichment.
-        // parquet` -- the last fields the old JSON render cache used to
-        // carry, from this same pass's already-assembled
-        // `observation.merged`.
-        crate::growth::write_unowned_summary_table(
+        // R20: per walked root, the two fact families the walk's own
+        // checkpoint could not write -- the Docker rows the gate joined
+        // after it, and the tracking state of top-level directories.
+        // Everything else a read needs is already in the volume's
+        // tables.
+        for (root, r) in &observation.per_root {
+            let vol = crate::growth::volume_store_dir(store_dir, root);
+            let docker_rows: Vec<UnownedRow> = r
+                .unowned
+                .iter()
+                .filter(|u| u.reason == UnownedReason::DockerNoJoin)
+                .cloned()
+                .collect();
+            crate::growth::write_docker_unowned(&vol, &docker_rows)?;
+            if let Some(dirs) = &r.dirs_by_worktree {
+                crate::growth::write_dir_tracks(&vol, dirs)?;
+            }
+        }
+        // The run row: the window the pass used (so a read derives the
+        // same growth/series), the live-enrichment counters, the
+        // scheduler status it saw -- and the "observed at all" marker.
+        let config = crate::growth::load_config(store_dir);
+        let history_since_secs = since_override
+            .and_then(crate::growth::parse_duration_secs)
+            .or_else(|| crate::growth::parse_duration_secs(&config.since))
+            .unwrap_or(86_400);
+        crate::growth::write_run_row(
             store_dir,
             &key,
-            &observation.merged.unowned,
-            observation.merged.observed_at,
-        )?;
-        crate::growth::write_worktree_entries_table(
-            store_dir,
-            &key,
-            observation.merged.dirs_by_worktree.as_ref(),
-            observation.merged.files_by_worktree.as_ref(),
-            observation.merged.observed_at,
-        )?;
-        crate::growth::write_github_enrichment_table(
-            store_dir,
-            &key,
-            observation.merged.github_enrichment.as_ref(),
-            observation.merged.observed_at,
+            &crate::growth::RunFacts {
+                observed_at: observation.merged.observed_at,
+                since_secs: history_since_secs,
+                retention_days: config.retention_days,
+                include_dirs,
+                github_enrichment: observation.merged.github_enrichment.as_ref(),
+                schedule_line: observation.merged.schedule_line.as_deref(),
+            },
         )?;
     }
 
@@ -2767,24 +2758,14 @@ pub fn merge_root_report_into(merged: &mut Report, r: Report) {
             (None, None) => None,
             (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
         };
-    merged.series_by_key.extend(r.series_by_key);
-    if merged.total_series.is_empty() {
-        merged.total_series = r.total_series;
-        merged.series_window_secs = r.series_window_secs;
-    } else if merged.total_series.len() == r.total_series.len() {
-        for (a, b) in merged.total_series.iter_mut().zip(r.total_series.iter()) {
-            *a = match (*a, *b) {
-                (None, None) => None,
-                (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
-            };
-        }
-    }
-    // Multi-root series bucket windows can drift apart (each root's
-    // `report_full_mode_with_source` call reads its own wall-clock
-    // `now`); a length mismatch is left as the first root's series
-    // rather than silently interleaved -- documented as a #51 follow-up
-    // (TUI is the only current consumer of `total_series` for a live
-    // sparkline).
+    merge_series_into(
+        &mut merged.series_by_key,
+        &mut merged.total_series,
+        &mut merged.series_window_secs,
+        r.series_by_key,
+        r.total_series,
+        r.series_window_secs,
+    );
     for note in r.notes {
         merged.notes.push(format!("[{}] {note}", path.display()));
     }
@@ -2902,6 +2883,86 @@ pub fn merge_reports(
 /// -- see `docs/ADRs/001-event-bus-report-pipeline.md`): `report_scope`
 /// combines already-fully-formed single-root reports, it does not reach
 /// into the bus's own stages to recompute one from scratch.
+/// Folds one root's sparkline history into a running multi-root total:
+/// per-key series are simply unioned (keys are per-entity); the total is
+/// summed bucket by bucket when the windows line up, otherwise the first
+/// root's total is kept (a length mismatch is never silently
+/// interleaved). One function for both the observe-time merge
+/// (`merge_root_report_into`) and the read-time derivation
+/// (`growth::derive_report_views`), so the two agree by construction.
+pub(crate) fn merge_series_into(
+    series_by_key: &mut std::collections::HashMap<String, Vec<Option<u64>>>,
+    total_series: &mut Vec<Option<u64>>,
+    series_window_secs: &mut u64,
+    add_by_key: std::collections::HashMap<String, Vec<Option<u64>>>,
+    add_total: Vec<Option<u64>>,
+    add_window_secs: u64,
+) {
+    series_by_key.extend(add_by_key);
+    if total_series.is_empty() {
+        *total_series = add_total;
+        *series_window_secs = add_window_secs;
+    } else if total_series.len() == add_total.len() {
+        for (a, b) in total_series.iter_mut().zip(add_total.iter()) {
+            *a = match (*a, *b) {
+                (None, None) => None,
+                (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+            };
+        }
+    }
+}
+
+/// A folded artifact's own measured directory row is what its
+/// `allocated_bytes`/`allocated_growth_bytes` show (R4c): the row keyed
+/// by the artifact's `(worktree_id, rel_path)` among `roots`. Shared by
+/// the observe pass (`consumers/growth.rs`, from the walk's rows) and
+/// the read-time derivation (from `dirs.parquet`).
+pub(crate) fn attach_allocated_from_dirs(
+    projects: &mut [ProjectRow],
+    dirs: &[DirRollup],
+    roots: &std::collections::HashSet<(String, String)>,
+) {
+    let measured: std::collections::HashMap<(&str, &str), &DirRollup> = dirs
+        .iter()
+        .map(|row| ((row.worktree_id.as_str(), row.rel_path.as_str()), row))
+        .collect();
+    for project in projects.iter_mut() {
+        for wt in &mut project.worktrees {
+            for artifact in &mut wt.artifacts {
+                let rel = artifact
+                    .path
+                    .strip_prefix(&wt.path)
+                    .unwrap_or(&artifact.path)
+                    .to_string_lossy();
+                if !roots.contains(&(wt.worktree_id.clone(), rel.to_string())) {
+                    continue;
+                }
+                if let Some(dir) = measured.get(&(wt.worktree_id.as_str(), rel.as_ref())) {
+                    artifact.allocated_bytes = Some(dir.allocated_total);
+                    artifact.allocated_growth_bytes = dir.growth_bytes;
+                }
+            }
+        }
+    }
+}
+
+/// One order for the drill-down rows however they were gathered (the
+/// walk's rows arrive in traversal order; `dirs.parquet`'s in table
+/// order): by relative path, which also puts every parent before its
+/// children. Applied by the observe pass and the read-time derivation
+/// alike, so both give the same `Report`.
+pub(crate) fn sort_drill_down(
+    dirs_by_worktree: &mut std::collections::HashMap<String, Vec<DirRollup>>,
+    files_by_worktree: &mut std::collections::HashMap<String, Vec<FileRow>>,
+) {
+    for rows in dirs_by_worktree.values_mut() {
+        rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    }
+    for rows in files_by_worktree.values_mut() {
+        rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    }
+}
+
 fn merge_summary_into(acc: &mut Summary, add: &Summary) {
     acc.projects += add.projects;
     acc.worktrees += add.worktrees;
@@ -3231,14 +3292,6 @@ fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut Repo
         let row_key = crate::growth::evidence_row_key("nested-artifact", &n.id);
         n.decision_evidence = by_key.get(&row_key).cloned().unwrap_or_default();
     }
-    // R18a-3: keyed by the row's position in `snapshot.report.unowned`,
-    // same as `write_unowned_summary_table`'s evidence fold-in above --
-    // must run after `rebuild_unowned_from_tables` set this list's final
-    // order/length.
-    for (seq, u) in snapshot.report.unowned.iter_mut().enumerate() {
-        let row_key = crate::growth::evidence_row_key("unowned-summary", &seq.to_string());
-        u.evidence = by_key.get(&row_key).cloned().unwrap_or_default();
-    }
 }
 
 /// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
@@ -3305,23 +3358,13 @@ pub fn report_scope_from_store(
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
-    // R18a-3: `Report.unowned`/`.dirs_by_worktree`/`.files_by_worktree`/
-    // `.github_enrichment` -- run before `rebuild_evidence_from_tables`,
-    // which fills in the rebuilt `unowned` rows' evidence by position.
-    crate::growth::rebuild_unowned_worktree_entries_github_from_tables(
-        store_dir,
-        &key,
-        &mut snapshot,
-    );
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
-    // R17 item 1: last, like `rebuild_evidence_from_tables` -- the
-    // by-type project recount inside `rebuild_summary_from_tables` reads
-    // `snapshot.report.projects`, so it must see the final rebuilt list.
-    crate::growth::rebuild_coverage_series_summary_notes_from_tables(
-        store_dir,
-        &key,
-        &mut snapshot,
-    );
+    crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
+    // R20: last -- every derived field (summary, series, unowned, the
+    // drill-down, an artifact's growth/allocation) is computed from the
+    // facts rebuilt above and the volumes' history, never read from a
+    // table of its own.
+    crate::growth::derive_report_views(store_dir, &key, &mut snapshot);
     Ok(snapshot)
 }
 

@@ -16,6 +16,10 @@
 //! * `sinks_have_no_path_predicates` -- the execution sinks hold no path
 //!   containment logic of their own.
 //! * `json_writes_allowlisted` -- no JSON writer outside the gate.
+//! * `parquet_writers_are_the_named_fact_tables` -- the one Parquet
+//!   writer is reached only from the named table writers, one per fact
+//!   table: a derived view (a total, a series, a drill-down) is never
+//!   given a table of its own (store-is-facts-report-is-views).
 //! * `bus_static_registration` -- consumers never name each other.
 //! * `tui_event_thread_has_no_gate_calls` -- the TUI's event/render code
 //!   reaches no blocking gate capability except through `worker::spawn`.
@@ -963,6 +967,95 @@ pub fn json_writes_allowlisted(ws: &Workspace) -> Vec<String> {
     problems
 }
 
+/// One function per Parquet table the store holds, and nothing else may
+/// reach `fs_gate::columns::write_parquet_atomic`
+/// (`.oh/guardrails/store-is-facts-report-is-views.md`, R20). Every name
+/// here is a *fact* table: rows that come from an observation (a walk, a
+/// detector, a daemon answer, a `git` query) or the reverse-delta history
+/// of those rows. What a `Report` shows that is a function of these --
+/// `summary`, `reconciliation`, `series_by_key`/`total_series`,
+/// `dirs_by_worktree`/`files_by_worktree`, an artifact's growth -- is
+/// computed at read time (`growth::derive_report_views`) and has no
+/// entry here on purpose. Adding a table means adding it here, to
+/// `crates/core/tests/store_contents_are_allowlisted.rs`'s exact list,
+/// and to `docs/architecture.md`'s table, with the reason it is a fact.
+const TABLE_WRITERS: &[(&str, &str)] = &[
+    // growth::columns -- one row writer per table
+    ("growth::columns", "write_rows"),
+    ("growth::columns", "write_external_rows"),
+    ("growth::columns", "write_folded_rows"),
+    ("growth::columns", "write_dir_rows"),
+    ("growth::columns", "write_file_rows"),
+    ("growth::columns", "write_unowned_rows"),
+    ("growth::columns", "write_unowned_list_rows"),
+    ("growth::columns", "write_evidence_rows"),
+    ("growth::columns", "write_topology_rows"),
+    ("growth::columns", "write_protect_rows"),
+    ("growth::columns", "write_project_rows"),
+    ("growth::columns", "write_worktree_rows"),
+    ("growth::columns", "write_worktree_fact_rows"),
+    ("growth::columns", "write_artifact_shape_rows"),
+    ("growth::columns", "write_artifact_shape_list_rows"),
+    ("growth::columns", "write_unit_rows"),
+    ("growth::columns", "write_unit_consumer_rows"),
+    ("growth::columns", "write_agent_member_rows"),
+    ("growth::columns", "write_nested_artifact_rows"),
+    ("growth::columns", "write_nested_artifact_list_rows"),
+    ("growth::columns", "write_nested_artifact_evidence_rows"),
+    ("growth::columns", "write_coverage_rows"),
+    ("growth::columns", "write_note_rows"),
+    ("growth::columns", "write_run_rows"),
+    ("growth::columns", "write_dir_track_rows"),
+    ("growth::columns", "write_git_signal_rows"),
+    ("growth::columns", "write_git_signal_value_rows"),
+    ("growth::columns", "write_cargo_replay_meta_rows"),
+    // the other stores' own single writers
+    ("github", "write_cache"),
+    ("assoc_store", "write"),
+    ("store", "write"),
+];
+
+pub fn parquet_writers_are_the_named_fact_tables(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (mi, m) in ws.modules.iter().enumerate() {
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let abs = ws.resolve(mi, &r.segments).join("::");
+            if abs != "@core::fs_gate::columns::write_parquet_atomic" {
+                continue;
+            }
+            let (module, f) = match r.in_fn {
+                Some(f) => (
+                    ws.modules[ws.fns[f].module].path.join("::"),
+                    ws.fns[f].name.as_str(),
+                ),
+                None => (m.path.join("::"), ""),
+            };
+            let named = m.krate == Krate::Core
+                && TABLE_WRITERS
+                    .iter()
+                    .any(|(mod_path, name)| *mod_path == module && *name == f);
+            if !named {
+                problems.push(format!(
+                    "{}: `write_parquet_atomic` reached from `{}`, which is not one of the named \
+                     table writers: a table is a fact table, named in TABLE_WRITERS, \
+                     store_contents_are_allowlisted and docs/architecture.md -- never a stored \
+                     copy of what a read computes (store-is-facts-report-is-views)",
+                    r.site,
+                    if f.is_empty() {
+                        format!("<no function> in `{module}`")
+                    } else {
+                        format!("{module}::{f}")
+                    }
+                ));
+            }
+        }
+    }
+    problems
+}
+
 pub fn bus_static_registration(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
     let consumers: HashSet<String> = ws
@@ -1359,6 +1452,12 @@ pub const RULES: &[Rule] = &[
         verdict(
             "no JSON writer outside the gate",
             json_writes_allowlisted(ws),
+        )
+    }),
+    ("parquet_writers_are_the_named_fact_tables", |ws| {
+        verdict(
+            "the Parquet writer is reached only from the named fact-table writers",
+            parquet_writers_are_the_named_fact_tables(ws),
         )
     }),
     ("bus_static_registration", |ws| {

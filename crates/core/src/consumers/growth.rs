@@ -132,29 +132,7 @@ impl Consumer for GrowthConsumer {
                 ctx.observed_at,
             ));
         }
-        let measured: HashMap<_, _> = d
-            .dirs
-            .iter()
-            .map(|row| ((row.worktree_id.as_str(), row.rel_path.as_str()), row))
-            .collect();
-        for project in &mut d.projects {
-            for wt in &mut project.worktrees {
-                for artifact in &mut wt.artifacts {
-                    let rel = artifact
-                        .path
-                        .strip_prefix(&wt.path)
-                        .unwrap_or(&artifact.path)
-                        .to_string_lossy();
-                    if !roots.contains(&(wt.worktree_id.clone(), rel.to_string())) {
-                        continue;
-                    }
-                    if let Some(dir) = measured.get(&(wt.worktree_id.as_str(), rel.as_ref())) {
-                        artifact.allocated_bytes = Some(dir.allocated_total);
-                        artifact.allocated_growth_bytes = dir.growth_bytes;
-                    }
-                }
-            }
-        }
+        crate::report::attach_allocated_from_dirs(&mut d.projects, &d.dirs, &roots);
         // Interior rows of folded artifacts live in the store only: the
         // report shows an artifact as one unit.
         d.dirs
@@ -176,6 +154,7 @@ impl Consumer for GrowthConsumer {
                     .or_default()
                     .push(row);
             }
+            crate::report::sort_drill_down(&mut by_dir, &mut by_file);
             d.dirs_by_worktree = Some(by_dir);
             d.files_by_worktree = Some(by_file);
         }

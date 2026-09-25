@@ -325,9 +325,12 @@ fn report_reads_projects_and_worktrees_from_a_direct_tamper_of_the_tables() {
 /// Same claim as the test above, for the artifact-shape fields
 /// `artifact_shape.parquet` owns: a direct on-disk tamper (via the
 /// public `write_artifact_shape_table` writer) of `track`/`confidence`/
-/// `source`/`note`/`created_at`/`containers`/`shared_with`/`dangling`/
-/// `allocated_bytes`/`allocated_growth_bytes`/`growth_bytes` is what the
-/// next `report_scope_from_store` reports.
+/// `source`/`note`/`created_at`/`containers`/`shared_with`/`dangling` is
+/// what the next `report_scope_from_store` reports. (`allocated_bytes`/
+/// `allocated_growth_bytes`/`growth_bytes` are not in this table any
+/// more -- R20 derives them at read time from `dirs.parquet` and the
+/// artifact history; `derived_views_are_computed_not_stored.rs` covers
+/// them.)
 #[test]
 fn report_reads_artifact_shape_from_a_direct_tamper_of_the_table() {
     let fx = build();
@@ -346,10 +349,7 @@ fn report_reads_artifact_shape_from_a_direct_tamper_of_the_table() {
                 a.containers = vec!["tampered-container".into()];
                 a.shared_with = vec!["tampered-shared".into()];
                 a.dangling = !a.dangling;
-                a.allocated_bytes = Some(a.allocated_bytes.unwrap_or(0) + 999);
-                a.allocated_growth_bytes = Some(a.allocated_growth_bytes.unwrap_or(0) + 999);
-                a.growth_bytes = Some(a.growth_bytes.unwrap_or(0) + 999);
-                tampered_fields += 10;
+                tampered_fields += 7;
             }
         }
     }
@@ -376,9 +376,6 @@ fn report_reads_artifact_shape_from_a_direct_tamper_of_the_table() {
                 assert_eq!(a.containers, ta.containers);
                 assert_eq!(a.shared_with, ta.shared_with);
                 assert_eq!(a.dangling, ta.dangling);
-                assert_eq!(a.allocated_bytes, ta.allocated_bytes);
-                assert_eq!(a.allocated_growth_bytes, ta.allocated_growth_bytes);
-                assert_eq!(a.growth_bytes, ta.growth_bytes);
             }
         }
     }

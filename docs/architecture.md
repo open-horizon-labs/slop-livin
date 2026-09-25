@@ -427,486 +427,99 @@ subprocess (`du`, `gh`, `docker`). It runs the full pipeline above --
 walk, project grouping, signals, evidence, external + agent discovery,
 GitHub/Docker enrichment -- through `report::observe_scope` with
 `ObservationParts::ALL`, and, on a pass that observed and persisted both
-unit families successfully, writes everything `swamp report`/the TUI
-need as one more stored Parquet current row:
-`growth::ReportSnapshot` (`<store>/report_rows.parquet`, one row per
-scope key from `report::scope_snapshot_key`): the fully assembled
-`Report` (evidence, tracking, Docker joins and growth/regrowth already
-attached -- nothing in it needs a fresh `stat` to render), the scope's
-per-root `coverage::RootCoverage` vector, and the external/agent unit
-vectors, JSON-encoded into `Utf8` cells exactly like
-`unowned.parquet`'s `evidence_json` column (a cell encoding, not a JSON
-file on disk).
-
-Three of the snapshot's `report_json` cell's contents now have typed
-tables of their own (R15, tables 2-4 of the JSON-in-the-store
-decomposition begun with `protect.parquet`), written by the same
-`observe_scope` call under the same gate and keyed by the same scope
-key, and rebuilt from by `report_scope_from_store`:
-
-- `<store>/projects.parquet` -- one row per `ProjectRow`: `scope_key`,
-  `project_id`, `name`, `ecosystems` (`|`-joined tags, original order),
-  `remote`, `bytes`, `local_bytes`, `allocated_bytes`, `growth_bytes`
-  (nullable), `regrowth_count`, `worktree_count`, `observed_at`. The
-  byte/growth/regrowth columns are rollups over the project's artifact
-  rows; nothing renders them yet (`render.rs` still sums on the fly).
-- `<store>/worktrees.parquet` -- one row per `WorktreeRow`: `scope_key`,
-  `worktree_id`, `project_id`, `path`, `kind`, `branch`, `idle_secs`,
-  the `GithubFacts` scalars flattened under a `github_` prefix
-  (`default_branch`, `branch_exists_on_remote`, `unavailable_reason`,
-  `merged_state`/`merged_at`/`merged_pr_number`, `pr_state`/`pr_number`/
-  `pr_status`/`pr_draft`/`pr_url`/`pr_title`/`pr_review_decision`/
-  `pr_updated_at`), `merge_complete_verdict`, `observed_at`. All
-  nullable except identity/path/kind/observed_at.
-- `<store>/worktree_facts.parquet` -- the child table for a worktree's
-  two list-valued facts: `scope_key`, `worktree_id`, `fact_kind`
-  (`signal` | `merge_complete_term`), `name` (the signal's name; null for
-  a term), `value`, `seq` (list position, so order round-trips).
-- the per-volume current-artifact table (`<store>/<volume>/current.parquet`,
-  `growth::columns::StoredRow`) gained an `ecosystem` column; its
-  `kind`, `rel_path`, `bytes`, `local_bytes`, `mtime_max`, `hardlinked`,
-  `dedup_stale`, `regrowth_count` and `observed_at` were already the
-  render's artifact columns. The growth consumer now fills artifact
-  ecosystems (`report::annotate_artifact_ecosystems`, idempotent) before
-  the history is written; tracking still calls it too.
-
-`report_scope_from_store` builds `Report.projects` from these tables: a
-project's/worktree's own scalars, signals and GitHub/merge-complete facts
-come from `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`,
-an artifact's bytes/local_bytes/mtime_max/hardlinked/dedup_stale/
-regrowth_count/observed_at/ecosystem from the current-artifact table
-(keyed like the history, `growth::artifact_row_key`), and only the
-fields CHUNK_R15 left for later slices (an artifact's evidence,
-confidence, source, track, containers, shared_with, dangling, note,
-created_at, allocated bytes and growth, plus the report's unowned rows,
-reconciliation, series, notes, summary, nested artifacts, coverage and
-unit vectors) are still taken from the snapshot's cells. A store with no
-table rows for the scope (written before this) falls back to the
-snapshot's tree unchanged; there is no migration.
-`crates/core/tests/project_worktree_tables.rs` pins this in both
-directions: a snapshot whose `report_json` was tampered with still
-reports the tables' values, and a tampered note still shows.
-
-R16 migrates three more of the snapshot's cells the same way (units,
-consumers, nested artifacts, evidence -- item A of the handoff's
-remaining list):
-
-- `<store>/external_units.parquet` / `<store>/agent_units.parquet` --
-  one shared row shape, one row per `ExternalUnit`/`AgentUnit`:
-  `scope_key`, `id` (an `AgentUnit`'s own id; an `ExternalUnit`'s is
-  minted from `(detector_id, category, path)` --
-  `growth::external_unit_table_id`, independent of the growth store's
-  device-inclusive row key), `source_id`/`source_name`
-  (detector/tool id and name), `category`, `path`, `bytes`, `complete`
-  (nullable -- agent-only), `mtime_max`, `linkage_state`/
-  `linkage_basis`/`project_id` (nullable -- agent-only:
-  `ProjectLinkState`'s label and its variant detail flattened to one
-  string, plus the id when `linked`), `protected`/`protect_reason`
-  (nullable -- agent-only), `consequence` (each type's own `note`
-  field), `observed_at`, `growth_bytes` (nullable), `regrowth_count`.
-  R18a adds `provenance_kind`/`provenance_value` (`ExternalUnit`),
-  `hardlinked` (both), and `tool_home`/`relative_path`/`action`
-  (`AgentUnit`) as typed columns too, plus the `agent_unit_members.
-  parquet` child table for `members` -- see the R18a paragraph below.
-  `evidence` on both is replaced from `evidence.parquet` below, never
-  overlaid.
-- `<store>/unit_consumers.parquet` -- the child table for an
-  `ExternalUnit`'s declared-consumer list (an `AgentUnit` has no
-  consumer list -- its single `project_link` is a unit-row column
-  above): `scope_key`, `unit_id`, `consumer_label`,
-  `consumer_project_id` (nullable; nothing produces one yet),
-  `basis` (`ExternalConsumer::note`), `seq`.
-- `<store>/nested_artifacts.parquet` -- one row per `NestedArtifact`,
-  from either producer that builds them (a per-project build-artifact
-  interior, `Report.nested_artifacts`, and a shared-store interior,
-  `ReportSnapshot.store_interiors`): `scope_key`, `origin` (`report` |
-  `store-interior`, so reading splits the two lists back apart without
-  guessing from `container_id`/path overlap), `id`, `relative_path`,
-  `parent_id` (nullable), `container_id` (nullable -- the id of the
-  *container* `NestedArtifact` whose own `path` equals the owning
-  `ArtifactRow`'s path; there is no other "artifact row key" a
-  `NestedArtifact` carries), `adapter` (nullable), `family`
-  (`ArtifactRole::family`'s label), `role`, `path`, `membership`,
-  `is_dir`, `device`, `inode`, `logical_bytes`, `bytes`,
-  `physical_bytes`, `physical_total`, `basis` (`AccountingBasis`),
-  `mtime` (nullable), `time_source`, `coverage_supported`,
-  `coverage_complete`, `action_group` (nullable), `present`,
-  `growth_bytes` (nullable), `regrowth_count`, `action_capability`
-  (`NestedActionCapability`'s tag), `action_unsupported_reason`
-  (nullable -- the `Unsupported` variant's `reason`), `consequence`
-  (nullable), `reported_by` (nullable), `writer_lock` (nullable), and
-  the variant's `profile`/`configuration`/`target`/`arch`/`package`/
-  `version`/`toolchain`/`features`/`generation` (all nullable). R18a-2
-  completes this table's field list -- every `NestedArtifact` field now
-  has a typed home, no JSON fallback anywhere -- and adds two child
-  tables for the list-valued fields:
-  - `<store>/nested_artifact_lists.parquet` -- one row per
-    `coverage.limits` or `variant.unknowns` entry, disambiguated by
-    `list_kind` (`coverage-limit` | `variant-unknown`): `scope_key`,
-    `origin`, `artifact_id`, `list_kind`, `seq`, `value`.
-  - `<store>/nested_artifact_evidence.parquet` -- one row per
-    `producer_evidence`/`consumer_evidence` entry (the older, narrower
-    `ArtifactEvidence { source, detail, confidence }` shape, distinct
-    from `decision_evidence`, which stays in `evidence.parquet`),
-    disambiguated by `kind` (`producer` | `consumer`): `scope_key`,
-    `origin`, `artifact_id`, `kind`, `seq`, `source`, `detail`,
-    `confidence`.
-
-  Both child tables are keyed by `(scope_key, origin, artifact_id)`,
-  not just `artifact_id`, because the two origins' id spaces are not
-  guaranteed disjoint.
-- `<store>/evidence.parquet` -- one row per `crate::evidence::Evidence`
-  entry, across every entity kind that carries the #53 decision-evidence
-  contract (an `ArtifactRow`, keyed by `growth::artifact_row_key`; an
-  `ExternalUnit`/`AgentUnit`, keyed by the id the unit tables use; a
-  `NestedArtifact`'s `decision_evidence`, keyed by its own id):
-  `scope_key`, `row_key` (`"<entity_kind>:<id>"`), `seq`, `kind`,
-  `subtype`, `status` (`known` | `unknown` | `unavailable` |
-  `conflicting`), `value_kind` (the `FactValue` tag), `value_num`
-  (nullable f64), `value_ts` (nullable i64), `value_text` (nullable),
-  `conflicting_extra` (nullable -- every `Conflicting` candidate after
-  the first, `|`-joined; every production `Conflicting` site uses one
-  `FactValue` variant across all its candidates), `reason` (nullable --
-  `Unknown`/`Unavailable`/`Conflicting`'s message), `source`,
-  `source_detail` (nullable), `event_at` (nullable), `observed_at`,
-  `freshness_expires_after_secs`/`freshness_coverage_note` (nullable),
-  `note` (nullable). Unlike the other R16 tables this is never overlaid
-  and never a row-count no-op: an entity with no evidence at all looks
-  identical to "table not written yet" by row count alone, so
-  `growth::evidence_table_exists` (does the file exist at all) is the
-  real "has this store ever written this table" check;
-  `report::rebuild_evidence_from_tables` is a no-op only when that is
-  `false`.
-
-R17 migrates four more of the snapshot's `report_json` fields, plus the
-per-volume `topology.json` sidecar:
-
-- `<store>/coverage.parquet` -- one row per scope-wide observation's
-  per-root coverage outcome: `scope_key`, `root_path`, `class`
-  (`project` for a walked scan root's `coverage::RootCoverage`,
-  `detector` for an authorized unit root's own
-  `coverage::UnitRootCoverage`), `status` (the bare `RegionStatus`/
-  event-covered tag, independent of its reason text), `reason`
-  (nullable), `walked_total`/`projects` (nullable, `RootCoverage` only),
-  `mode` (nullable, `RootCoverage` only), `cursor_family` (`walk` for a
-  project row, `unit_root` for a detector row), `observed_at`. Replaces
-  `ReportSnapshot`'s `coverage_json` cell entirely (not overlaid --
-  `RootCoverage`'s fields are all typed columns here).
-- `<store>/series.parquet` -- one row per `(series_key, bucket_index)`:
-  `scope_key`, `series_key` (a `growth::series_key` entity key, or the
-  reserved `columns::TOTAL_SERIES_KEY` for `Report.total_series`),
-  `bucket_index`, `value` (nullable), `window_secs`, `observed_at`.
-- `<store>/summary.parquet` -- `Summary`'s overview counts and by-type
-  totals plus `Reconciliation`'s scalars, one `(metric, key)` row each:
-  `metric = overview` (`key` = `projects`/`worktrees`/`artifacts`,
-  `count`), `metric = by_type` (`key` = ecosystem tag, `bytes`/`growth`/
-  `count`; a tag's `projects` count is recounted live from the rebuilt
-  project list rather than stored, since it is derivable and CHUNK_R17's
-  column list does not name it), `metric = reconciliation` (`key` =
-  `attributed`/`unowned`/`walked_total`/`docker_attributed`/
-  `docker_unowned`/`du_total`, `bytes`; `du_total`'s row is omitted
-  entirely when `None`).
-- `<store>/notes.parquet` -- `Report.notes`, one row per note: `scope_key`,
-  `seq` (order), `note`, `observed_at`.
-- `<volume>/topology.parquet` replaces `<volume>/topology.json`: the same
-  `growth::StoredWorktree` structural fields (`worktree_id`,
-  `project_id`, `project_name`, `path`, `kind`, `remote_url`), plus
-  `device` (from this volume's own FSEvents walk anchor, nullable) and
-  `observed_at`. Still a wholesale-replace measurement cache, still read
-  only by the incremental walk's own topology comparison
-  (`growth::compute_unconfirmed_worktrees`/`apply_incremental`) -- not a
-  `report_scope_from_store` input.
-
-`report_scope_from_store` calls
-`growth::rebuild_coverage_series_summary_notes_from_tables` last (after
-projects/units/nested-artifacts/evidence, so the by-type project recount
-sees the final project list) to replace `snapshot.coverage` and
-`snapshot.report`'s `notes`/`summary`/`reconciliation`/`series_by_key`/
-`total_series`/`series_window_secs` from these four tables.
-`growth::write_report_snapshot` also stops serializing those `Report`
-fields into `report_json` at all (`slim_report_for_snapshot_json` clears
-them to their defaults first) -- the tables are authoritative, not a
-cache of what the JSON cell already said. (R16's `ReportSnapshot`
-`external_units_json`/`agent_units_json`/`store_interiors_json` cells,
-mentioned here as the merge-fallback source at the time, are gone as of
-R18a-2 below -- `report_json` is the only JSON-encoded cell left in
-`StoredReportSnapshotRow`.) `crates/core/tests/coverage_series_summary_notes_tables.rs` pins the
-new direction the same way R15/R16's tests do: a snapshot whose
-`report_json` was tampered with in every coverage/series/summary/
-reconciliation/notes field still reports the tables' values.
-
-Not attempted this slice (left for R18/R19, `.oh/sessions/
-2026-09-24-r17-tables.md` names the reasoning): `report_rows.parquet`
-itself is not deleted -- `Report.root`/`unowned`/`dirs_by_worktree`/
-`files_by_worktree`/`schedule_line`/`github_enrichment` still come from
-`report_json`, since migrating them needs either a new scope-wide
-`unowned` aggregation over the per-volume `unowned.parquet` tables or a
-larger dirs/files-by-worktree table design, neither of which CHUNK_R17
-named as this slice's four tables. `last_report-*.json.zst`/
-`growth::write_last_report`/`load_last_report` were also untouched at
-the time this paragraph was written: `consumers/signals.rs`/
-`consumers/cargo.rs` read a *per-root* previous `Report` from it
-(previous git signals; previous `nested_artifacts` + `observed_at`) for
-the incremental walk, a different, lower-level need than the scope-wide
-snapshot this section covers. R18a-4 (below) redesigned that per-root
-cache onto typed tables and deleted the JSON/zstd cache entirely.
-
-R18a (2026-09-24) migrates the `external_units.parquet`/
-`agent_units.parquet` merge fallback and `unowned.parquet`'s remaining
-JSON cells onto typed columns/child tables:
-
-- `external_units.parquet`/`agent_units.parquet` gain `provenance_kind`/
-  `provenance_value` (an `ExternalUnit`'s `locations::Provenance`
-  variant tag plus its own payload -- env var name, config field name,
-  or query description; `"builtin"` and `None` for `BuiltinConvention`),
-  `hardlinked` (both families -- a real per-unit fold fact, not the
-  conservative default), and, agent-only, `tool_home`, `relative_path`
-  and `action` (`AgentActionCapability::label`). As of R18a-2,
-  `external_unit_from_stored`/`agent_unit_from_stored` take no snapshot
-  fallback at all -- every field comes from the typed column.
-- `<store>/agent_unit_members.parquet` -- the child table for an
-  `AgentUnit::members` list: `scope_key`, `unit_id`, `seq`, `path`,
-  `bytes`, `kind` (`AgentMemberKind::label`).
-- `<volume>/unowned.parquet` drops `containers_json`/`shared_with_json`/
-  `evidence_json`. Two new per-volume tables, co-located with
-  `unowned.parquet` (no `scope_key` needed -- `path_or_object` is
-  already that table's own unique key within one volume):
-  `<volume>/unowned_lists.parquet` (`path_or_object`, `list_kind`
-  (`container` | `shared-with`), `seq`, `value`) replaces the two JSON
-  cells, and `<volume>/unowned_evidence.parquet` reuses
-  `evidence.parquet`'s own row shape and (de)serialization
-  (`stored_evidence_rows`/`evidence_from_stored_rows`) rather than a new
-  encoding, written with `scope_key = ""` (unused; the file is already
-  volume-scoped) and `row_key = path_or_object`.
-
-R18a also fixed a real "`swamp report --json` is not a pure read" bug
-(the root cause of a wall-clock flake in
-`project_worktree_tables::report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_snapshot_json`):
-`Report.nested_artifacts` used to compute its `"cleanup"` cargo-guidance
-view (`cargo_cleanup::Guidance`, including `modified_age_secs`) at
-*serialization* time via a `#[serde(serialize_with = ...)]` hook that
-called `crate::entities::now()` directly, so serializing the same
-`Report` twice a wall-clock second apart produced two different JSON
-bodies. `NestedArtifact` now carries its own `guidance` field
-(`#[serde(rename = "cleanup")]`, reproducing the old JSON shape
-exactly), computed exactly once per observe pass by
-`report::attach_cargo_guidance` (called alongside
-`attach_nested_decision_evidence` inside `attach_decision_evidence`)
-from that pass's own fixed `observed_at`. `nested_artifacts.parquet`
-gains eight matching `guidance_*` columns (`guidance_recommendation`,
-`guidance_modified_age_secs`, `guidance_consequence`, `guidance_scope`,
-`guidance_check_status`, `guidance_reason_code`, `guidance_message`,
-`guidance_next_action`) so `report_scope_from_store`'s rebuild never
-recomputes it either. `cargo_cleanup::check` (the human-initiated
-on-demand review action) is unchanged and still calls `guidance`/
-`guidance_at` live on purpose -- a bounded, explicit check is not the
-"report is a pure read" contract.
-
-R18a-2 (2026-09-24, the next slice) finishes what R18a's first session
-left open: it types every remaining `NestedArtifact` field (see the
-`nested_artifacts.parquet`/`nested_artifact_lists.parquet`/
-`nested_artifact_evidence.parquet` description above) and then deletes
-`StoredReportSnapshotRow`'s `external_units_json`/`agent_units_json`/
-`store_interiors_json` cells and every merge-fallback that read them
-(`external_unit_from_stored`/`agent_unit_from_stored`/
-`nested_artifact_from_stored` no longer take a fallback value at all --
-there is nothing left for one to carry over). `report_json` is now the
-*only* JSON-encoded cell anywhere in `crates/core/src/growth/columns.rs`.
-
-R18a-3 (2026-09-24) types the four `Report` fields R18a-2 left in
-`report_json` -- `unowned`, `dirs_by_worktree`/`files_by_worktree`,
-`schedule_line` and `github_enrichment` -- but does **not** delete
-`report_rows.parquet`/`report_json` itself; see
-`.oh/sessions/2026-09-24-r18a3-snapshot-deleted.md` for the full account
-of why (a real, pre-existing gap discovered mid-slice, not a decision to
-narrow this slice's scope):
-
-- `<store>/unowned_summary.parquet` -- the scope-wide, already-merged-
-  across-roots `Report.unowned` list `observe_scope` assembles, distinct
-  from the per-volume `unowned.parquet` R18a already typed. Keyed by
-  `(scope_key, seq)` (list position), never `path_or_object` alone --
-  two roots merged into one scope can each contribute a row with the
-  same shared-cache basename. `<store>/unowned_summary_lists.parquet`
-  carries `containers`/`shared_with` (`scope_key`, `seq`, `list_kind`,
-  `item_seq`, `value`); the rows' own evidence reuses `evidence.parquet`
-  directly (entity kind `"unowned-summary"`, id = the row's `seq`)
-  rather than a bespoke child table.
-- `<store>/worktree_entries.parquet` -- `Report.dirs_by_worktree`/
-  `.files_by_worktree` (opt-in per-worktree drill-down,
-  `report_with(.., include_dirs: true)`), one table with a `kind` column
-  (`"dir"` | `"file"`) instead of two files: `scope_key`, `worktree_id`,
-  `kind`, `seq`, `rel_path`, dirs-only `parent_rel_path`/`track`/
-  `allocated_total`/`own_allocated`/`file_count`/`entry_count`/
-  `symlink_count`/`complete`, files-only `allocated`, and
-  `mod_time_min`/`growth_bytes`/`observed_at` shared by both kinds.
-  `dirs_by_worktree`/`files_by_worktree` are always populated together
-  by the same `include_dirs` flag, so "any row exists for this
-  `scope_key`" is the one signal the rebuild needs to tell "the last
-  committing observe asked for dirs" from "it did not" -- both come back
-  `None` together, or `Some` together, never one without the other.
-- `Report.schedule_line` is now a `summary.parquet` row (`metric =
-  "schedule"`, `key = "line"`) using a new nullable `text` column added
-  to that table's schema for exactly this purpose (every other row
-  leaves it `None`) -- `write_summary_table` gained a `schedule_line:
-  Option<&str>` parameter, so the row lands in the same single wholesale
-  write as the metric/reconciliation rows instead of a second write to
-  the same file.
-- `<store>/github_enrichment.parquet` -- `Report.github_enrichment`, at
-  most one row per `scope_key` (zero rows when a pass ran no live
-  enrichment, wholesale-replaced like every other scope-keyed table).
-
-**Why `report_rows.parquet` stayed through R18a-3** (resolved in
-R18a-3b, next): `report_scope_from_store`'s
-`rebuild_projects_from_tables` seeds its rebuilt artifact list's *shape*
--- `ArtifactRow::kind`/`path`/`track`/`confidence`/`source`/`note`/
-`created_at`/`containers`/`shared_with`/`dangling`/`allocated_bytes`/
-`allocated_growth_bytes` -- from `old_artifacts_by_worktree`, built from
-whatever `snapshot.report.projects` already held *before* the rebuild
-runs. R15 item 3 only ever typed `bytes`/`local_bytes`/`mtime_max`/
-`hardlinked`/`dedup_stale`/`regrowth_count`/`observed_at`/`ecosystem`/
-`present` into `ArtifactTableFacts` (the current-artifact-history
-table), explicitly documenting the rest as "later slices" -- and no
-later slice through R18a-2 picked it up. `report_json`'s deserialized
-`Report.projects` was the only remaining source for that shape.
-Deleting `report_json` without a table for it does not fail loudly: it
-silently blanks those fields on the very next `report_scope_from_store`
-call after any store write, which is exactly the kind of fabricated-gap
-regression the worker brief's lessons section warns against, so this
-slice keeps the cell (further slimmed: `unowned`/`dirs_by_worktree`/
-`files_by_worktree`/`schedule_line`/`github_enrichment` are cleared from
-it before serializing, same as `notes`/`summary`/`reconciliation`/series
-already were) and flags the remaining gap for the next slice instead of
-deleting blind. `crates/core/src/growth.rs`'s `ReportSnapshot`/
-`StoredReportSnapshotRow` doc comments carry the same account inline.
-
-R18a-3b (2026-09-24) resolves the gap the paragraph above names:
-`artifact_shape.parquet` (+ `artifact_shape_lists.parquet` for the two
-list-valued fields, `containers`/`shared_with`) types the last
-`ArtifactRow` shape fields (`kind`/`path` as `rel_path`, joined back to
-the worktree path at read time/`track`/`confidence`/`source`/`note`/
-`created_at`/`dangling`/`allocated_bytes`/`allocated_growth_bytes`, plus
-`growth_bytes`, which the R15-era `ArtifactTableFacts` table never
-carried either), keyed by `(scope_key, worktree_id, seq)` with `seq`
-preserving each worktree's artifact order across the read (Parquet row
-order is not guaranteed). `report_rows.parquet`, `report_json`,
-`StoredReportSnapshotRow`, `write_report_snapshot`, `read_report_snapshot`,
-`slim_report_for_snapshot_json` and the now-dead
-`snapshot_from_observation` helper are all deleted. `report_scope_from_store`
-no longer starts from a deserialized snapshot at all: it assembles an
-empty `ReportSnapshot`/`Report` and runs every `rebuild_*_from_tables`
-function over it, gated by a new `growth::scope_observed_at` (a
-`summary.parquet` row for the scope key) rather than `projects.parquet`
-having a row -- a scope with genuinely zero discovered projects
-(external/agent units only, no git checkouts) always gets a
-`summary.parquet` row from every full observe but never gets a
-`projects.parquet` row at all, so gating on the latter would have made
-"zero projects" indistinguishable from "never observed" (a real
-regression this slice caught with the CLI's own `agent_storage_cli.rs`
-fixture, not a hypothetical). `ReportSnapshot` itself is not deleted as
-a type -- it is the one place `report_scope_from_store`'s result and
-`observe_scope`'s composed value share a name -- but it now carries no
-JSON persistence machinery at all, only an in-memory assembly. See
-`.oh/sessions/2026-09-24-r18a3b-snapshot-deleted.md`.
-
-`last_report-*.json.zst`/`growth::write_last_report`/`load_last_report`
-were untouched through R18a-3b; R18a-4 (2026-09-24, below) deletes them.
-
-`report_scope_from_store` extends the same rebuild to these: an
-`ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`
-come from the unit tables; a `NestedArtifact`'s own scalars come from
-`nested_artifacts.parquet`, split by `origin` back into
-`Report.nested_artifacts`/`ReportSnapshot.store_interiors`; and finally
-every entity's `evidence`/`decision_evidence` is replaced from
-`evidence.parquet`, run last so it sees the rebuilt lists. A store with
-no rows for a table (an older store) is a no-op for that table, same as
-R15. `crates/core/tests/units_nested_evidence_tables.rs` pins the units/
-nested-artifacts direction (a real Claude Code + Cargo-home fixture,
-`observe_scope` then `report_scope_from_store`, tampering the
-snapshot's copies); `growth::tests::
-evidence_table_round_trips_every_status_and_source_variant` pins every
-`FactStatus`/`FactValue`/`EvidenceSource` variant's exact round trip.
-
-`swamp report` (`report::report_scope_from_store`) does the reverse:
-resolve the scope (a config read plus one presence `stat` per candidate
-root, never a recursive walk), compute its key, and read the stored
-snapshot back. No walk, no unit discovery, no subprocess -- CLI
-rendering (`render.rs`, `agent_json.rs`) runs unchanged over the
-deserialized `Report`. A scope with no stored snapshot is not an
+unit families successfully, writes the scope-wide fact tables below
+under `report::scope_snapshot_key`. `swamp report`
+(`report::report_scope_from_store`) does the reverse: resolve the scope
+(a config read plus one presence `stat` per candidate root, never a
+recursive walk), compute its key, rebuild the facts from the tables,
+and *derive* every view from them. No walk, no unit discovery, no
+subprocess -- CLI rendering (`render.rs`, `agent_json.rs`) runs
+unchanged over the result. A scope with no `runs.parquet` row is not an
 error to paper over: text prints `no observation yet for <scope>; run
 swamp observe` and exits 2; JSON prints
-`{"error":"no_observation","scope":...}`. `--since` moved to `observe`
-entirely -- growth/regrowth are fixed at the observation that computed
-them, from whichever `since` window that pass used (CLI override, else
-`config.toml`'s `since`, else the hard-coded default); `report` has no
-`--since` of its own.
+`{"error":"no_observation","scope":...}`. `--since` belongs to
+`observe` -- growth/regrowth are fixed at the observation that computed
+them, from whichever window that pass used (`runs.parquet` records it);
+`report` has no `--since` of its own. `--no-observe` is gone from every
+command; `--full`/`--docker-facts`/`--verify-du`/`--enrich` belong to
+`observe`. The TUI's instant paint on startup reads the same tables
+(`swamp_tui::run`), and its background refresh calls `observe_scope`
+exactly as before; `observe_scope`'s narrowed per-root live-watch
+refresh (`ObservationParts::WALK_ONLY`) does not write the scope-wide
+tables -- persisting a partial pass under the whole scope's key would
+drop the unit families the last full pass had.
 
-The TUI's instant-paint-on-startup cache (`swamp_tui::run`) reads the
-same `ReportSnapshot` instead of the old `last_report-<key>.json.zst`
-cache, and its background refresh (and the live-watch's own full
-rescans) call `observe_scope` exactly as before -- which now also
-leaves a fresh snapshot behind as a side effect, so the next `swamp
-report`/TUI startup sees it too. `observe_scope`'s narrowed, per-root
-live-watch refresh (`ObservationParts::WALK_ONLY`, one root only) does
-*not* write a snapshot: persisting a partial pass under the whole
-scope's key would silently drop the external/agent vectors the last
-full pass had. `--no-observe` is gone from every command (`report`,
-`ui`); `--full`/`--docker-facts`/`--verify-du`/`--enrich` moved from
-`report` to `observe` (`report --verify-du` still exists, but only to
-print whatever `du` total the last `observe --verify-du` stored --
-`report` never spawns `du` itself).
+#### Store = facts, report = view (R20, 2026-09-24)
 
-R18a-4 (2026-09-24) deletes the internal `last_report-<key>.json.zst`
-cache (`fs_gate::store::write_json`/`JsonFile::LastReport`) entirely --
-`growth::write_last_report`/`load_last_report`,
-`report::last_report_key`, `JsonFile::LastReport` and every `.zst`
-reader/writer are gone, and `zstd` is no longer a `swamp-core`
-dependency at all (`Cargo.toml`/`Cargo.lock`; it remains only as
-`parquet`'s own transitive compression codec). It was a *different*,
-narrower thing than the scope-wide `ReportSnapshot` this section covers:
-an incremental-walk optimization two consumers used to diff against the
-previous pass's own git-signals/cargo state *during* a walk, never on
-`report`'s read path. Each is now its own root-keyed Parquet table,
-written on the per-root path (`report::observe_scope`'s per-root bus
-run, and every scope-less single-root call -- never gated on a
-scope-wide table another root's pass might not have written yet):
+`.oh/guardrails/store-is-facts-report-is-views.md`. The store holds
+observation facts and their history; every `Report` field that is a
+function of them is computed by `growth::derive_report_views`, last in
+`report_scope_from_store`, with the same functions the observe pass
+used (`report::summarize`, `growth::history_series`,
+`growth::annotate_readonly*`, `report::attach_allocated_from_dirs`,
+`report::merge_series_into`, `report::sort_drill_down`), at the
+observation's own `observed_at`. A read is therefore byte-identical to
+the pass that wrote the facts (`crates/core/tests/report_is_a_pure_read.rs`,
+`derived_views_are_computed_not_stored.rs`), and there is no second
+copy of anything to disagree. The audit
+`parquet_writers_are_the_named_fact_tables` keeps the table set closed:
+the one Parquet writer is reached only from the named fact-table
+writers, and `crates/core/tests/store_contents_are_allowlisted.rs` holds
+the same list by file name.
 
-- `<store>/git_signals.parquet` (+ `git_signals_values.parquet` for the
-  rendered `Signal` rows) -- `consumers/signals.rs`'s previous-pass
-  replay: `branch` and every `crate::signals::RawSignals` field, so an
-  unwalked worktree's `age_signals` call ages the *stored* raw values
-  forward instead of reconstructing them by parsing rendered signal
-  text (the old JSON cache's approach, since it only ever stored the
-  rendered `Signal` rows). Written by `SignalsConsumer` itself, right
-  after it computes each pass's full `by_worktree` map -- deliberately
-  *before* `consumers/gate.rs` appends `merge_complete`/`pull_request`
-  from that pass's GitHub facts, so a replay never needs to filter those
-  two back out (the deleted JSON cache persisted the fully merged
-  `Report` and had to).
-- `<store>/cargo_replay_cache.parquet` (+ `cargo_replay_cache_lists
-  .parquet`/`cargo_replay_cache_evidence.parquet`/
-  `cargo_replay_cache_meta.parquet`) -- `consumers/cargo.rs`'s previous-
-  pass `build_adapters::ContainerCache` seed. Reuses
-  `nested_artifacts.parquet`'s own row shapes and stored<->domain
-  conversions verbatim (every `NestedArtifact` field was already typed
-  there by R16/R18a-2), written to their own root-keyed files rather
-  than a new column on `nested_artifacts.parquet` itself:
-  `nested_artifacts.parquet` is scope-keyed and wholesale-replaced
-  exactly once, at the end of `observe_scope`, after every root's bus
-  pass has already run and merged, and is never written at all for a
-  plain single-root, scope-less call -- neither lifecycle matches a
-  per-root pass's own mid-run replay decision. The meta table's
-  `observed_at` is what `ContainerCache::from_previous` needs alongside
-  the units; presence is decided by its row, not by the units list being
-  non-empty, so a root with genuinely zero nested artifacts last pass
-  still replays as "observed", not "never observed".
+Derived at read time, never stored: `Report.summary` (a fold over the
+project rows), `reconciliation` (the walked roots' totals summed),
+`series_by_key`/`total_series`/`series_window_secs` (the volume
+histories bucketed at `observed_at` over the run's window), `unowned`
+(each walked root's `unowned.parquet` then `docker_unowned.parquet`, in
+scope-root order), `dirs_by_worktree`/`files_by_worktree`
+(`dirs.parquet`/`files.parquet` with growth from their history,
+tracking from `dir_tracks.parquet`, interior rows of folded artifacts
+removed, sorted by relative path), and each artifact's `growth_bytes`/
+`regrowth_count`/`allocated_bytes`/`allocated_growth_bytes` (its
+history and its measured directory row). The tables R17-R18a-3 had
+given these (`summary.parquet`, `series.parquet`,
+`unowned_summary.parquet`, `worktree_entries.parquet`,
+`github_enrichment.parquet`, growth columns on `artifact_shape.parquet`)
+are gone.
 
-Both tables are keyed by `growth::root_key` (the canonicalized root's
-id -- the same key space `report::last_report_key` used before deletion,
-moved into `growth` since every other current-state table's key
-derivation lives there), wholesale-replaced per root, and written only
-when `ctx.observe` (a `--no-observe`/pure-read call must never advance
-what a later real observation replays from). See
-`.oh/sessions/2026-09-24-r18a4-last-report-tables.md`.
+Two things are stored although they look derived, because a read cannot
+recompute them: a nested artifact's cleanup guidance (computed once from
+`observed_at`, so a stored observation renders identically -- the
+render-time clock read it replaced made `report --json`
+non-reproducible), and the git tracking state of a walk's top-level
+directories (`.gitignore` is read by the walk; a report never opens a
+file under a worktree).
+
+**The fact tables.** Scope-wide tables live at `<store>/` and are keyed
+by `scope_key`, replaced wholesale per key by the pass that produced
+them; per-volume tables live at `<store>/<volume>/` (one directory per
+root-scoped volume id) and are replaced or appended per root.
+
+| table | one row per | what it records |
+| --- | --- | --- |
+| `runs.parquet` | scope key | the last full pass: `observed_at`, `since_secs`, `retention_days`, `include_dirs`, the live GitHub-enrichment counters (nullable), `schedule_line` (nullable, the scheduler status the pass saw). Its row is the "observed at all" marker. |
+| `coverage.parquet` | scope root, or authorized unit root | `class` (`project`/`detector`), `status` (the bare `RegionStatus`/event-covered tag), `reason`, `mode`, `cursor_family`; for a walked root its own totals: `walked_total`, `projects`, `attributed`, `unowned`, `du_total`, `docker_attributed`, `docker_unowned` (all nullable). |
+| `notes.parquet` | note | the run's diagnostics (fsevents mode, daemon reachability, GitHub notes), `seq`-ordered. |
+| `projects.parquet` / `worktrees.parquet` / `worktree_facts.parquet` | project / worktree / signal or merge-complete term | a project's and worktree's own scalars (name, ecosystems, remote, path, kind, branch, idle, the `GithubFacts` scalars flattened under `github_`), and the two list-valued facts (`fact_kind` = `signal` \| `merge_complete_term`, `seq`). |
+| `artifact_shape.parquet` (+ `_lists`) | artifact of a worktree, `seq`-ordered | `kind`, `rel_path`, `track`, `confidence`, `source_tool`, `note`, `created_at`, `dangling`; `containers`/`shared_with` in the child table. Bytes/mtime/hardlink/dedup/regrowth/ecosystem come from the volume's current-artifact table. |
+| `external_units.parquet` / `agent_units.parquet` (+ `unit_consumers`, `agent_unit_members`) | external or agent-tool storage unit | the unit's identity, bytes, completeness, provenance, linkage, protection, `tool_home`/`relative_path`/`action`; declared consumers and member paths in the child tables. |
+| `nested_artifacts.parquet` (+ `_lists`, `_evidence`) | nested build-artifact unit, per `origin` (`report` \| `store-interior`) | every `NestedArtifact` field, including the variant details and the cleanup guidance computed at observe time; coverage limits/variant unknowns and producer/consumer evidence in the child tables. |
+| `evidence.parquet` | `Evidence` entry | every entity's decision evidence, keyed `"<entity_kind>:<id>"` (artifact, external/agent unit, nested artifact). |
+| `protect.parquet` | protected path | the human keep list (`path`, `added_at`). |
+| `<volume>/current.parquet` + `deltas/` | artifact row | the current-artifact table (`kind`, `rel_path`, `bytes`, `local_bytes`, `mtime_max`, `hardlinked`, `dedup_stale`, `regrowth_count`, `ecosystem`, `observed_at`) and its reverse deltas -- the growth history. |
+| `<volume>/dirs.parquet` + `dirs_deltas/`, `<volume>/files.parquet` + `files_deltas/` | directory / large file | allocation, counts, `mod_time_min`, completeness, and their history. |
+| `<volume>/unowned.parquet` (+ `_lists`, `_evidence`) | unowned/remainder row of the walk | path, bytes, reason, Docker/shared facts; containers/shared-with and evidence in the child tables. |
+| `<volume>/docker_unowned.parquet` (+ `_lists`, `_evidence`) | Docker object no project claims | the rows the gate joined after the walk's checkpoint, same three-file shape. |
+| `<volume>/dir_tracks.parquet` | top-level worktree directory | its git tracking state as the walk read it. |
+| `<volume>/topology.parquet` | worktree | the incremental walk's own topology comparison (`worktree_id`, `project_id`, `path`, `kind`, `remote_url`, `device`). |
+| `<volume>/folded.parquet` | folded file of an external unit | the external measurement cache an unchanged root reuses. |
+| `<volume>/enrich.parquet` | worktree | the GitHub enrichment fetch cache. |
+| `git_signals.parquet` (+ `_values`), `cargo_replay_cache.parquet` (+ `_lists`, `_evidence`, `_meta`) | root | the per-root replay caches (`consumers/signals.rs`, `consumers/cargo.rs`) for an unchanged worktree/container, keyed by `growth::root_key`. |
+| `build_stores.parquet`, `xcode_derived_data.parquet`, `declarations.parquet`, `dependency_identities.parquet`, `external_consumers.parquet`, `agent_identifications.parquet`, `agent_containers.parquet` | store / product / declaration / identity / consumer / session | the association caches (`assoc_store.rs`) the consumers join on. |
+
+Column-level history of how each table arrived (R14-R18a-4) is in
+`.oh/sessions/2026-09-24-r1*-*.md`; the tables are what they are today.
 
 ### There is no recheck model at a destructive sink any more (retired 2026-09-23)
 

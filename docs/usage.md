@@ -59,39 +59,34 @@ spawns a subprocess. Run `observe` first; `report` on a scope that has
 never been observed prints `no observation yet for <scope>; run swamp
 observe` (JSON: `{"error":"no_observation", ...}`) and exits 2.
 
-What `report` reads is Parquet, table by table: the project, worktree
-and artifact rows come from `projects.parquet`, `worktrees.parquet`
-(+ `worktree_facts.parquet` for signals and merge-complete terms) and
-the per-volume current-artifact table; external and agent-tool storage
-units come from `external_units.parquet`/`agent_units.parquet` (+
-`unit_consumers.parquet` for an external unit's declared consumers and
-`agent_unit_members.parquet` for an agent unit's member paths); a
-volume's unowned/remainder rows come from `unowned.parquet` (+
-`unowned_lists.parquet` for its container/shared-with lists and
-`unowned_evidence.parquet` for its per-row evidence); per-project and
-shared-store nested build-artifact units come from
-`nested_artifacts.parquet` (+ `nested_artifact_lists.parquet` for their
-coverage-limit/variant-unknown lists and `nested_artifact_evidence.parquet`
-for their producer/consumer evidence); every row's decision evidence
-(an artifact, a unit, or a nested artifact's) comes from
-`evidence.parquet`; and
-per-root coverage, byte-history series, the by-type/reconciliation
-summary and coverage notes come from `coverage.parquet`,
-`series.parquet`, `summary.parquet` and `notes.parquet`; scope-wide
-unowned rows come from `unowned_summary.parquet` (+
-`unowned_summary_lists.parquet` for their container/shared-with lists);
-opt-in per-worktree directory/large-file drill-down comes from
-`worktree_entries.parquet`; the scheduled-observation status line is a
-`summary.parquet` row; and live GitHub-enrichment call stats come from
-`github_enrichment.parquet`; and a project's worktree's artifact rows'
-own shape -- kind, path, git tracking, confidence, source, note,
-created-at, containers/shared-with, dangling, allocated bytes/growth --
-comes from `artifact_shape.parquet` (+ `artifact_shape_lists.parquet`
-for the two list-valued fields). There is no JSON render-cache row
-anywhere in the store any more (see `docs/architecture.md`). Every
-table is rewritten by `observe`; delete one and the next `observe`
-recreates it. There is no migration for a store written before a table
-existed -- `report` simply reads what the last `observe` wrote.
+What `report` reads is Parquet, and only facts. Rows that an
+observation produced: the project, worktree and artifact rows
+(`projects.parquet`, `worktrees.parquet` + `worktree_facts.parquet`,
+`artifact_shape.parquet` + `artifact_shape_lists.parquet`, and the
+per-volume current-artifact table); external and agent-tool storage
+units (`external_units.parquet`/`agent_units.parquet` +
+`unit_consumers.parquet`/`agent_unit_members.parquet`); a volume's
+unowned rows (`unowned.parquet` + lists/evidence, and
+`docker_unowned.parquet` for the Docker objects no project claims);
+nested build-artifact units (`nested_artifacts.parquet` + lists/
+evidence); every row's decision evidence (`evidence.parquet`); per-root
+coverage with each walked root's own totals (`coverage.parquet`); the
+run's notes (`notes.parquet`); the run itself (`runs.parquet`: when,
+with which growth window, whether the drill-down was asked for, the
+live GitHub-enrichment counters, the scheduler status the pass saw);
+and the tracking state of a walk's top-level directories
+(`<volume>/dir_tracks.parquet`). Everything else in a report is
+computed from those when it is read -- the by-type summary, the
+reconciliation total, the byte-history series, the per-worktree
+directory/large-file drill-down and each artifact's growth all come
+from the fact tables and the reverse-delta history at the observation's
+own timestamp, so a read is byte-identical to the pass that wrote the
+facts and there is no second copy of anything to disagree
+(`.oh/guardrails/store-is-facts-report-is-views.md`). There is no JSON
+render-cache row anywhere in the store. Every table is rewritten by
+`observe`; delete one and the next `observe` recreates it. There is no
+migration for a store written before a table existed -- `report`
+simply reads what the last `observe` wrote.
 
 ```bash
 swamp observe ~/src

@@ -206,13 +206,6 @@ pub(super) fn downcast_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a
         .with_context(|| format!("column {name} is not Int64"))
 }
 
-pub(super) fn downcast_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-        .with_context(|| format!("column {name} is not Int32"))
-}
-
 pub(super) fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
     batch
         .column_by_name(name)
@@ -1345,9 +1338,6 @@ pub struct StoredArtifactShapeRow {
     pub note: Option<String>,
     pub created_at: Option<String>,
     pub dangling: bool,
-    pub allocated_bytes: Option<u64>,
-    pub allocated_growth_bytes: Option<i64>,
-    pub growth_bytes: Option<i64>,
     pub observed_at: u64,
 }
 
@@ -1365,9 +1355,6 @@ fn artifact_shape_schema() -> Arc<Schema> {
         Field::new("note", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("dangling", DataType::Boolean, false),
-        Field::new("allocated_bytes", DataType::UInt64, true),
-        Field::new("allocated_growth_bytes", DataType::Int64, true),
-        Field::new("growth_bytes", DataType::Int64, true),
         Field::new("observed_at", DataType::UInt64, false),
     ]))
 }
@@ -1429,17 +1416,6 @@ pub(crate) fn write_artifact_shape_rows(
                 rows.iter().map(|r| r.dangling).collect::<Vec<_>>(),
             )),
             Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.allocated_bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|r| r.allocated_growth_bytes)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.growth_bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
                 rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
             )),
         ],
@@ -1489,9 +1465,6 @@ pub(crate) fn read_artifact_shape_rows(path: &Path) -> Result<Vec<StoredArtifact
                 note: opt_str(&batch, "note", i)?,
                 created_at: opt_str(&batch, "created_at", i)?,
                 dangling: dangling.value(i),
-                allocated_bytes: opt_u64(&batch, "allocated_bytes", i)?,
-                allocated_growth_bytes: opt_i64(&batch, "allocated_growth_bytes", i)?,
-                growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
                 observed_at: observed_at.value(i),
             });
         }
@@ -1617,6 +1590,16 @@ pub struct StoredCoverageRow {
     pub projects: Option<u32>,
     /// `RootCoverage` only: `"full"` / `"incremental"` / `""`.
     pub mode: Option<String>,
+    /// R20: this root's walk totals (`report::Reconciliation`), facts of
+    /// the pass that walked it -- `attributed`/`unowned`/`du_total`/
+    /// `docker_attributed`/`docker_unowned` (`walked_total` is above).
+    /// `Report.reconciliation` is their sum over the scope's walked
+    /// roots, computed at read time; nothing stores the sum.
+    pub attributed: Option<u64>,
+    pub unowned: Option<u64>,
+    pub du_total: Option<u64>,
+    pub docker_attributed: Option<u64>,
+    pub docker_unowned: Option<u64>,
     /// Which `FsEventsState` anchor this row's replay answer came from:
     /// `"walk"` for a project root, `"unit_root"` for a detector root.
     pub cursor_family: Option<String>,
@@ -1633,6 +1616,11 @@ fn coverage_schema() -> Arc<Schema> {
         Field::new("walked_total", DataType::UInt64, true),
         Field::new("projects", DataType::UInt32, true),
         Field::new("mode", DataType::Utf8, true),
+        Field::new("attributed", DataType::UInt64, true),
+        Field::new("unowned", DataType::UInt64, true),
+        Field::new("du_total", DataType::UInt64, true),
+        Field::new("docker_attributed", DataType::UInt64, true),
+        Field::new("docker_unowned", DataType::UInt64, true),
         Field::new("cursor_family", DataType::Utf8, true),
         Field::new("observed_at", DataType::UInt64, false),
     ]))
@@ -1648,6 +1636,11 @@ pub(super) fn write_coverage_rows(path: &Path, rows: &[StoredCoverageRow]) -> Re
     let walked_total: Vec<Option<u64>> = rows.iter().map(|r| r.walked_total).collect();
     let projects: Vec<Option<u32>> = rows.iter().map(|r| r.projects).collect();
     let mode: Vec<Option<&str>> = rows.iter().map(|r| r.mode.as_deref()).collect();
+    let attributed: Vec<Option<u64>> = rows.iter().map(|r| r.attributed).collect();
+    let unowned: Vec<Option<u64>> = rows.iter().map(|r| r.unowned).collect();
+    let du_total: Vec<Option<u64>> = rows.iter().map(|r| r.du_total).collect();
+    let docker_attributed: Vec<Option<u64>> = rows.iter().map(|r| r.docker_attributed).collect();
+    let docker_unowned: Vec<Option<u64>> = rows.iter().map(|r| r.docker_unowned).collect();
     let cursor_family: Vec<Option<&str>> =
         rows.iter().map(|r| r.cursor_family.as_deref()).collect();
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
@@ -1663,6 +1656,11 @@ pub(super) fn write_coverage_rows(path: &Path, rows: &[StoredCoverageRow]) -> Re
             Arc::new(UInt64Array::from(walked_total)),
             Arc::new(UInt32Array::from(projects)),
             Arc::new(StringArray::from(mode)),
+            Arc::new(UInt64Array::from(attributed)),
+            Arc::new(UInt64Array::from(unowned)),
+            Arc::new(UInt64Array::from(du_total)),
+            Arc::new(UInt64Array::from(docker_attributed)),
+            Arc::new(UInt64Array::from(docker_unowned)),
             Arc::new(StringArray::from(cursor_family)),
             Arc::new(UInt64Array::from(observed_at)),
         ],
@@ -1708,216 +1706,15 @@ pub(super) fn read_coverage_rows(path: &Path) -> Result<Vec<StoredCoverageRow>> 
                 walked_total: walked_total.is_valid(i).then(|| walked_total.value(i)),
                 projects: projects.is_valid(i).then(|| projects.value(i)),
                 mode: mode.is_valid(i).then(|| mode.value(i).to_string()),
+                attributed: opt_u64(&batch, "attributed", i)?,
+                unowned: opt_u64(&batch, "unowned", i)?,
+                du_total: opt_u64(&batch, "du_total", i)?,
+                docker_attributed: opt_u64(&batch, "docker_attributed", i)?,
+                docker_unowned: opt_u64(&batch, "docker_unowned", i)?,
                 cursor_family: cursor_family
                     .is_valid(i)
                     .then(|| cursor_family.value(i).to_string()),
                 observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------
-// series.parquet (R17 item 1) -- one row per (series key, bucket
-// index): `Report.series_by_key`/`total_series` (the reserved key
-// `__total__`)/`series_window_secs`. Replaces the corresponding fields
-// the now-deleted JSON render-cache row used to carry.
-// ---------------------------------------------------------------------
-
-/// The reserved `series.parquet` key for `Report.total_series` (never a
-/// real `growth::series_key` output, which is always an entity key).
-pub const TOTAL_SERIES_KEY: &str = "__total__";
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredSeriesRow {
-    pub scope_key: String,
-    pub series_key: String,
-    pub bucket_index: u32,
-    pub value: Option<u64>,
-    pub window_secs: u64,
-    pub observed_at: u64,
-}
-
-fn series_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("series_key", DataType::Utf8, false),
-        Field::new("bucket_index", DataType::UInt32, false),
-        Field::new("value", DataType::UInt64, true),
-        Field::new("window_secs", DataType::UInt64, false),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-pub(super) fn write_series_rows(path: &Path, rows: &[StoredSeriesRow]) -> Result<()> {
-    let schema = series_schema();
-    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
-    let series_key: Vec<&str> = rows.iter().map(|r| r.series_key.as_str()).collect();
-    let bucket_index: Vec<u32> = rows.iter().map(|r| r.bucket_index).collect();
-    let value: Vec<Option<u64>> = rows.iter().map(|r| r.value).collect();
-    let window_secs: Vec<u64> = rows.iter().map(|r| r.window_secs).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(scope_key)) as ArrayRef,
-            Arc::new(StringArray::from(series_key)),
-            Arc::new(UInt32Array::from(bucket_index)),
-            Arc::new(UInt64Array::from(value)),
-            Arc::new(UInt64Array::from(window_secs)),
-            Arc::new(UInt64Array::from(observed_at)),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(super) fn read_series_rows(path: &Path) -> Result<Vec<StoredSeriesRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
-        format!(
-            "read {} (delete it; the next `swamp observe` rebuilds it)",
-            path.display()
-        )
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let series_key = downcast_str(&batch, "series_key")?;
-        let bucket_index = downcast_u32(&batch, "bucket_index")?;
-        let value = downcast_u64(&batch, "value")?;
-        let window_secs = downcast_u64(&batch, "window_secs")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredSeriesRow {
-                scope_key: scope_key.value(i).to_string(),
-                series_key: series_key.value(i).to_string(),
-                bucket_index: bucket_index.value(i),
-                value: value.is_valid(i).then(|| value.value(i)),
-                window_secs: window_secs.value(i),
-                observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------
-// summary.parquet (R17 item 1) -- `Report.summary`'s by-type totals plus
-// the overview counts and `Report.reconciliation`'s scalars, one
-// (metric, key) row each. `metric = "by_type"` rows carry a `TypeSummary`
-// (`key` = ecosystem tag, `bytes`/`growth` = its bytes/growth_bytes,
-// `count` = its artifact count; `projects` count for that tag is not
-// named in CHUNK_R17's column list and is recomputed by
-// `report::summarize`-style counting where still needed live);
-// `metric = "overview"` rows carry `Summary.projects`/`.worktrees`/
-// `.artifacts` (`count` only); `metric = "reconciliation"` rows carry
-// `Reconciliation`'s six scalars (`bytes` for the four `u64` ones,
-// `count` unused, `growth` unused except `du_total` which is `bytes`
-// with `key = "du_total"` and a null row omitted entirely when `None`).
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredSummaryRow {
-    pub scope_key: String,
-    pub metric: String,
-    pub key: String,
-    pub bytes: Option<u64>,
-    pub growth: Option<i64>,
-    pub count: Option<u64>,
-    pub observed_at: u64,
-    /// R18a-3: free text for a row whose value is not a
-    /// bytes/growth/count number -- currently only `metric = "schedule"`,
-    /// `key = "line"`, carrying `Report.schedule_line` verbatim (the
-    /// scheduled-observation status line, e.g. "last scheduled run 12m
-    /// ago (full, 4.2 s)"). `None` for every other row.
-    pub text: Option<String>,
-}
-
-fn summary_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("metric", DataType::Utf8, false),
-        Field::new("key", DataType::Utf8, false),
-        Field::new("bytes", DataType::UInt64, true),
-        Field::new("growth", DataType::Int64, true),
-        Field::new("count", DataType::UInt64, true),
-        Field::new("observed_at", DataType::UInt64, false),
-        Field::new("text", DataType::Utf8, true),
-    ]))
-}
-
-pub(super) fn write_summary_rows(path: &Path, rows: &[StoredSummaryRow]) -> Result<()> {
-    let schema = summary_schema();
-    let scope_key: Vec<&str> = rows.iter().map(|r| r.scope_key.as_str()).collect();
-    let metric: Vec<&str> = rows.iter().map(|r| r.metric.as_str()).collect();
-    let key: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-    let bytes: Vec<Option<u64>> = rows.iter().map(|r| r.bytes).collect();
-    let growth: Vec<Option<i64>> = rows.iter().map(|r| r.growth).collect();
-    let count: Vec<Option<u64>> = rows.iter().map(|r| r.count).collect();
-    let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
-    let text: Vec<Option<&str>> = rows.iter().map(|r| r.text.as_deref()).collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(scope_key)) as ArrayRef,
-            Arc::new(StringArray::from(metric)),
-            Arc::new(StringArray::from(key)),
-            Arc::new(UInt64Array::from(bytes)),
-            Arc::new(Int64Array::from(growth)),
-            Arc::new(UInt64Array::from(count)),
-            Arc::new(UInt64Array::from(observed_at)),
-            Arc::new(StringArray::from(text)),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(super) fn read_summary_rows(path: &Path) -> Result<Vec<StoredSummaryRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
-        format!(
-            "read {} (delete it; the next `swamp observe` rebuilds it)",
-            path.display()
-        )
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let metric = downcast_str(&batch, "metric")?;
-        let key = downcast_str(&batch, "key")?;
-        let bytes = downcast_u64(&batch, "bytes")?;
-        let growth = downcast_i64(&batch, "growth")?;
-        let count = downcast_u64(&batch, "count")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredSummaryRow {
-                scope_key: scope_key.value(i).to_string(),
-                metric: metric.value(i).to_string(),
-                key: key.value(i).to_string(),
-                bytes: bytes.is_valid(i).then(|| bytes.value(i)),
-                growth: growth.is_valid(i).then(|| growth.value(i)),
-                count: count.is_valid(i).then(|| count.value(i)),
-                observed_at: observed_at.value(i),
-                text: opt_str(&batch, "text", i)?,
             });
         }
     }
@@ -1993,6 +1790,212 @@ pub(super) fn read_note_rows(path: &Path) -> Result<Vec<StoredNoteRow>> {
                 seq: seq.value(i),
                 note: note.value(i).to_string(),
                 observed_at: observed_at.value(i),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// runs.parquet (R20) -- one row per scope key: the facts of the last
+// full observe pass that are about the *run* rather than about any
+// entity it found. `observed_at` is what `report::report_scope_from_store`
+// answers "has this scope ever been observed" with (every full pass
+// writes exactly one row, even for a scope with zero projects);
+// `since_secs`/`retention_days` are the growth window the pass used, so
+// a read derives the same series/growth the pass showed; the GitHub
+// columns are the live-enrichment counters (`None` when the pass ran no
+// live enrichment); `schedule_line` is the scheduler status the pass
+// observed (launchd/systemd state is not in the store, so a read cannot
+// re-derive it). Replaces the deleted `summary.parquet`'s "schedule" row
+// and the deleted `github_enrichment.parquet`.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRunRow {
+    pub scope_key: String,
+    pub observed_at: u64,
+    pub since_secs: u64,
+    pub retention_days: u64,
+    pub include_dirs: bool,
+    pub github_calls_made: Option<u32>,
+    pub github_worktrees_enriched: Option<u32>,
+    pub github_elapsed_secs: Option<f64>,
+    pub schedule_line: Option<String>,
+}
+
+fn runs_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("scope_key", DataType::Utf8, false),
+        Field::new("observed_at", DataType::UInt64, false),
+        Field::new("since_secs", DataType::UInt64, false),
+        Field::new("retention_days", DataType::UInt64, false),
+        Field::new("include_dirs", DataType::Boolean, false),
+        Field::new("github_calls_made", DataType::UInt32, true),
+        Field::new("github_worktrees_enriched", DataType::UInt32, true),
+        Field::new("github_elapsed_secs", DataType::Float64, true),
+        Field::new("schedule_line", DataType::Utf8, true),
+    ]))
+}
+
+pub(super) fn write_run_rows(path: &Path, rows: &[StoredRunRow]) -> Result<()> {
+    let schema = runs_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.scope_key.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.since_secs).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.retention_days).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.include_dirs).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.github_calls_made).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|r| r.github_worktrees_enriched)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter()
+                    .map(|r| r.github_elapsed_secs)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.schedule_line.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(super) fn read_run_rows(path: &Path) -> Result<Vec<StoredRunRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let scope_key = downcast_str(&batch, "scope_key")?;
+        let observed_at = downcast_u64(&batch, "observed_at")?;
+        let since_secs = downcast_u64(&batch, "since_secs")?;
+        let retention_days = downcast_u64(&batch, "retention_days")?;
+        let include_dirs = downcast_bool(&batch, "include_dirs")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredRunRow {
+                scope_key: scope_key.value(i).to_string(),
+                observed_at: observed_at.value(i),
+                since_secs: since_secs.value(i),
+                retention_days: retention_days.value(i),
+                include_dirs: include_dirs.value(i),
+                github_calls_made: opt_u32(&batch, "github_calls_made", i)?,
+                github_worktrees_enriched: opt_u32(&batch, "github_worktrees_enriched", i)?,
+                github_elapsed_secs: opt_f64(&batch, "github_elapsed_secs", i)?,
+                schedule_line: opt_str(&batch, "schedule_line", i)?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// <volume>/dir_tracks.parquet (R20) -- the git tracking state
+// (`ignore::TrackState`) of one root's top-level worktree directories,
+// as the pass that walked it read it from each worktree's ignore rules
+// (`report::annotate_tracking`, which opens `.gitignore` files -- I/O a
+// read must never do). The only field of a drill-down `DirRollup` that
+// `dirs.parquet` does not already carry: everything else in
+// `Report.dirs_by_worktree`/`.files_by_worktree` is derived at read time
+// from `dirs.parquet`/`files.parquet` and their history.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StoredDirTrackRow {
+    pub worktree_id: String,
+    pub rel_path: String,
+    pub track: String,
+}
+
+fn dir_tracks_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("worktree_id", DataType::Utf8, false),
+        Field::new("rel_path", DataType::Utf8, false),
+        Field::new("track", DataType::Utf8, false),
+    ]))
+}
+
+pub(super) fn write_dir_track_rows(path: &Path, rows: &[StoredDirTrackRow]) -> Result<()> {
+    let schema = dir_tracks_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.worktree_id.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.track.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+pub(super) fn read_dir_track_rows(path: &Path) -> Result<Vec<StoredDirTrackRow>> {
+    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+        format!(
+            "read {} (delete it; the next `swamp observe` rebuilds it)",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let worktree_id = downcast_str(&batch, "worktree_id")?;
+        let rel_path = downcast_str(&batch, "rel_path")?;
+        let track = downcast_str(&batch, "track")?;
+        for i in 0..batch.num_rows() {
+            rows.push(StoredDirTrackRow {
+                worktree_id: worktree_id.value(i).to_string(),
+                rel_path: rel_path.value(i).to_string(),
+                track: track.value(i).to_string(),
             });
         }
     }
@@ -3805,515 +3808,6 @@ pub(crate) fn read_evidence_rows(path: &Path) -> Result<Vec<StoredEvidenceRow>> 
                 freshness_expires_after_secs: opt_u64(&batch, "freshness_expires_after_secs", i)?,
                 freshness_coverage_note: opt_str(&batch, "freshness_coverage_note", i)?,
                 note: opt_str(&batch, "note", i)?,
-            });
-        }
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------
-// unowned_summary.parquet / unowned_summary_lists.parquet (R18a-3):
-// `Report.unowned` -- the scope-wide, already-merged-across-roots
-// aggregation `report::observe_scope` assembles, distinct from the
-// per-root/per-volume `unowned.parquet` `growth::write_unowned`/
-// `read_unowned` already own (that one folds a single root's walk into
-// `unowned.parquet`; this one is the scope-keyed aggregation the
-// now-deleted JSON render-cache row used to carry, keyed like every
-// other R15-R18 table by `scope_key`). `path_or_object` can repeat
-// across a multi-root scope's merged rows (two roots can each contribute
-// an unowned row with the same shared-cache basename), so identity here
-// is `(scope_key, seq)` -- the list position `Report.unowned` already
-// preserves -- never `path_or_object` alone.
-//
-// `containers`/`shared_with` (list-valued) go in
-// `unowned_summary_lists.parquet`, same `list_kind` disambiguation as
-// `unowned.parquet`'s own `unowned_lists.parquet`. `evidence` reuses
-// `evidence.parquet` directly (entity kind `"unowned-summary"`, id =
-// the row's `seq`) -- one generic per-entity evidence table, not a
-// bespoke child table, exactly as external/agent units and nested
-// artifacts already do.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredUnownedSummaryRow {
-    pub scope_key: String,
-    pub seq: u32,
-    pub path_or_object: String,
-    pub bytes: u64,
-    pub reason: String,
-    pub shared_bytes: Option<u64>,
-    pub note: Option<String>,
-    pub docker_kind: Option<String>,
-    pub created_at: Option<String>,
-    pub dangling: bool,
-    pub observed_at: u64,
-}
-
-fn unowned_summary_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("seq", DataType::UInt32, false),
-        Field::new("path_or_object", DataType::Utf8, false),
-        Field::new("bytes", DataType::UInt64, false),
-        Field::new("reason", DataType::Utf8, false),
-        Field::new("shared_bytes", DataType::UInt64, true),
-        Field::new("note", DataType::Utf8, true),
-        Field::new("docker_kind", DataType::Utf8, true),
-        Field::new("created_at", DataType::Utf8, true),
-        Field::new("dangling", DataType::Boolean, false),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-pub(crate) fn write_unowned_summary_rows(
-    path: &Path,
-    rows: &[StoredUnownedSummaryRow],
-) -> Result<()> {
-    let schema = unowned_summary_schema();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.scope_key.as_str())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.path_or_object.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.reason.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.shared_bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.note.as_deref()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.docker_kind.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.created_at.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(BooleanArray::from(
-                rows.iter().map(|r| r.dangling).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(crate) fn read_unowned_summary_rows(path: &Path) -> Result<Vec<StoredUnownedSummaryRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
-        format!(
-            "read {} (delete it; the next `swamp observe` rebuilds it)",
-            path.display()
-        )
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let seq = downcast_u32(&batch, "seq")?;
-        let path_or_object = downcast_str(&batch, "path_or_object")?;
-        let bytes = downcast_u64(&batch, "bytes")?;
-        let reason = downcast_str(&batch, "reason")?;
-        let dangling = downcast_bool(&batch, "dangling")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredUnownedSummaryRow {
-                scope_key: scope_key.value(i).to_string(),
-                seq: seq.value(i),
-                path_or_object: path_or_object.value(i).to_string(),
-                bytes: bytes.value(i),
-                reason: reason.value(i).to_string(),
-                shared_bytes: opt_u64(&batch, "shared_bytes", i)?,
-                note: opt_str(&batch, "note", i)?,
-                docker_kind: opt_str(&batch, "docker_kind", i)?,
-                created_at: opt_str(&batch, "created_at", i)?,
-                dangling: dangling.value(i),
-                observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StoredUnownedSummaryListRow {
-    pub(crate) scope_key: String,
-    pub(crate) seq: u32,
-    pub(crate) list_kind: String,
-    pub(crate) item_seq: u32,
-    pub(crate) value: String,
-}
-
-fn unowned_summary_list_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("seq", DataType::UInt32, false),
-        Field::new("list_kind", DataType::Utf8, false),
-        Field::new("item_seq", DataType::UInt32, false),
-        Field::new("value", DataType::Utf8, false),
-    ]))
-}
-
-pub(crate) fn write_unowned_summary_list_rows(
-    path: &Path,
-    rows: &[StoredUnownedSummaryListRow],
-) -> Result<()> {
-    let schema = unowned_summary_list_schema();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.scope_key.as_str())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.list_kind.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.item_seq).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(crate) fn read_unowned_summary_list_rows(
-    path: &Path,
-) -> Result<Vec<StoredUnownedSummaryListRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let seq = downcast_u32(&batch, "seq")?;
-        let list_kind = downcast_str(&batch, "list_kind")?;
-        let item_seq = downcast_u32(&batch, "item_seq")?;
-        let value = downcast_str(&batch, "value")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredUnownedSummaryListRow {
-                scope_key: scope_key.value(i).to_string(),
-                seq: seq.value(i),
-                list_kind: list_kind.value(i).to_string(),
-                item_seq: item_seq.value(i),
-                value: value.value(i).to_string(),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------
-// worktree_entries.parquet (R18a-3): `Report.dirs_by_worktree`/
-// `.files_by_worktree`, opt-in per-worktree drill-down rows
-// (`report_with(.., include_dirs: true)`), one table with a `kind`
-// column (`"dir"` | `"file"`) instead of two files. `dirs_by_worktree`
-// and `files_by_worktree` are always populated together by the same
-// `include_dirs` flag (`report::observe_scope`), so "any row exists for
-// this `scope_key`" is the one signal the rebuild needs to tell "this
-// scope's last committing observe asked for dirs" from "it did not" --
-// see `report::rebuild_worktree_entries_from_tables`.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredWorktreeEntryRow {
-    pub scope_key: String,
-    pub worktree_id: String,
-    pub kind: String,
-    pub seq: u32,
-    pub rel_path: String,
-    /// Dirs only (`DirRollup::parent_rel_path`); `None` for a file row
-    /// and for a worktree-root dir row.
-    pub parent_rel_path: Option<String>,
-    /// Dirs only (`DirRollup::track.map(TrackState::label)`).
-    pub track: Option<String>,
-    pub allocated_total: Option<u64>,
-    pub own_allocated: Option<u64>,
-    pub file_count: Option<u32>,
-    pub entry_count: Option<u32>,
-    pub symlink_count: Option<u32>,
-    pub complete: Option<bool>,
-    /// Files only (`FileRow::allocated`).
-    pub allocated: Option<u64>,
-    pub mod_time_min: i32,
-    pub growth_bytes: Option<i64>,
-    pub observed_at: u64,
-}
-
-fn worktree_entries_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("worktree_id", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("seq", DataType::UInt32, false),
-        Field::new("rel_path", DataType::Utf8, false),
-        Field::new("parent_rel_path", DataType::Utf8, true),
-        Field::new("track", DataType::Utf8, true),
-        Field::new("allocated_total", DataType::UInt64, true),
-        Field::new("own_allocated", DataType::UInt64, true),
-        Field::new("file_count", DataType::UInt32, true),
-        Field::new("entry_count", DataType::UInt32, true),
-        Field::new("symlink_count", DataType::UInt32, true),
-        Field::new("complete", DataType::Boolean, true),
-        Field::new("allocated", DataType::UInt64, true),
-        Field::new("mod_time_min", DataType::Int32, false),
-        Field::new("growth_bytes", DataType::Int64, true),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-pub(crate) fn write_worktree_entry_rows(
-    path: &Path,
-    rows: &[StoredWorktreeEntryRow],
-) -> Result<()> {
-    let schema = worktree_entries_schema();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.scope_key.as_str())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.worktree_id.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.parent_rel_path.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.track.as_deref()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.allocated_total).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.own_allocated).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.file_count).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.entry_count).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.symlink_count).collect::<Vec<_>>(),
-            )),
-            Arc::new(BooleanArray::from(
-                rows.iter().map(|r| r.complete).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.allocated).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int32Array::from(
-                rows.iter().map(|r| r.mod_time_min).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.growth_bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(crate) fn read_worktree_entry_rows(path: &Path) -> Result<Vec<StoredWorktreeEntryRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
-        format!(
-            "read {} (delete it; the next `swamp observe` rebuilds it)",
-            path.display()
-        )
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let worktree_id = downcast_str(&batch, "worktree_id")?;
-        let kind = downcast_str(&batch, "kind")?;
-        let seq = downcast_u32(&batch, "seq")?;
-        let rel_path = downcast_str(&batch, "rel_path")?;
-        let mod_time_min = downcast_i32(&batch, "mod_time_min")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredWorktreeEntryRow {
-                scope_key: scope_key.value(i).to_string(),
-                worktree_id: worktree_id.value(i).to_string(),
-                kind: kind.value(i).to_string(),
-                seq: seq.value(i),
-                rel_path: rel_path.value(i).to_string(),
-                parent_rel_path: opt_str(&batch, "parent_rel_path", i)?,
-                track: opt_str(&batch, "track", i)?,
-                allocated_total: opt_u64(&batch, "allocated_total", i)?,
-                own_allocated: opt_u64(&batch, "own_allocated", i)?,
-                file_count: opt_u32(&batch, "file_count", i)?,
-                entry_count: opt_u32(&batch, "entry_count", i)?,
-                symlink_count: opt_u32(&batch, "symlink_count", i)?,
-                complete: opt_bool(&batch, "complete", i)?,
-                allocated: opt_u64(&batch, "allocated", i)?,
-                mod_time_min: mod_time_min.value(i),
-                growth_bytes: opt_i64(&batch, "growth_bytes", i)?,
-                observed_at: observed_at.value(i),
-            });
-        }
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------
-// github_enrichment.parquet (R18a-3): `Report.github_enrichment`, at
-// most one row per `scope_key` (only written when the pass that
-// committed the scope's snapshot actually ran live enrichment --
-// `observation.merged.github_enrichment.is_some()`; wholesale-replaced
-// like every other scope-keyed table, so a later commit with no live
-// enrichment leaves this scope with zero rows, same as the JSON cell it
-// replaces going back to `None` when nothing in that pass re-serialized
-// a `Some`).
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredGithubEnrichmentRow {
-    pub scope_key: String,
-    pub calls_made: u32,
-    pub worktrees_enriched: u32,
-    pub elapsed_secs: f64,
-    pub observed_at: u64,
-}
-
-fn github_enrichment_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("scope_key", DataType::Utf8, false),
-        Field::new("calls_made", DataType::UInt32, false),
-        Field::new("worktrees_enriched", DataType::UInt32, false),
-        Field::new("elapsed_secs", DataType::Float64, false),
-        Field::new("observed_at", DataType::UInt64, false),
-    ]))
-}
-
-pub(crate) fn write_github_enrichment_rows(
-    path: &Path,
-    rows: &[StoredGithubEnrichmentRow],
-) -> Result<()> {
-    let schema = github_enrichment_schema();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.scope_key.as_str())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.calls_made).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter()
-                    .map(|r| r.worktrees_enriched)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                rows.iter().map(|r| r.elapsed_secs).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    crate::fs_gate::columns::write_parquet_atomic(
-        path,
-        schema,
-        std::iter::once(Ok(batch)),
-        super::ARTIFACT_ZSTD_LEVEL,
-    )
-}
-
-pub(crate) fn read_github_enrichment_rows(path: &Path) -> Result<Vec<StoredGithubEnrichmentRow>> {
-    let Some(reader) = crate::fs_gate::columns::open_parquet(path)? else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let scope_key = downcast_str(&batch, "scope_key")?;
-        let calls_made = downcast_u32(&batch, "calls_made")?;
-        let worktrees_enriched = downcast_u32(&batch, "worktrees_enriched")?;
-        let elapsed_secs = batch
-            .column_by_name("elapsed_secs")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-            .with_context(|| "column elapsed_secs is not Float64")?;
-        let observed_at = downcast_u64(&batch, "observed_at")?;
-        for i in 0..batch.num_rows() {
-            rows.push(StoredGithubEnrichmentRow {
-                scope_key: scope_key.value(i).to_string(),
-                calls_made: calls_made.value(i),
-                worktrees_enriched: worktrees_enriched.value(i),
-                elapsed_secs: elapsed_secs.value(i),
-                observed_at: observed_at.value(i),
             });
         }
     }
