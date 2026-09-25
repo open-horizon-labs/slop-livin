@@ -1257,8 +1257,10 @@ struct StoredWorktree {
     remote_url: Option<String>,
 }
 
-fn fsevents_state_path(dir: &Path) -> PathBuf {
-    dir.join("fsevents.json")
+/// `<volume>/cursors.parquet` (R18b): the FSEvents replay anchors,
+/// one row per family. Replaces `fsevents.json`.
+fn cursors_path(dir: &Path) -> PathBuf {
+    dir.join("cursors.parquet")
 }
 fn topology_path(dir: &Path) -> PathBuf {
     dir.join("topology.parquet")
@@ -1281,10 +1283,62 @@ fn worktree_kind_from_label(label: &str) -> crate::report::WorktreeKind {
 }
 
 fn read_fsevents_state(dir: &Path) -> FsEventsState {
-    read_owned_string(fsevents_state_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let mut state = FsEventsState::default();
+    for r in columns::read_cursor_rows(&cursors_path(dir)).unwrap_or_default() {
+        match r.family.as_str() {
+            "walk" => {
+                state.event_id = r.event_id;
+                state.device = r.device;
+                state.last_observed_at = r.observed_at;
+                state.rules_version = r.rules_version.unwrap_or(0);
+            }
+            "unit_root" => {
+                state.unit_root = Some(crate::fs_events::UnitRootCursor {
+                    event_id: r.event_id,
+                    device: r.device,
+                    observed_at: r.observed_at,
+                });
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+/// The volume's replay anchors as stored (`cursors.parquet`), default
+/// when there are none yet.
+pub fn read_fsevents_anchor(volume_dir: &Path) -> FsEventsState {
+    read_fsevents_state(volume_dir)
+}
+
+/// Replaces the volume's replay anchors wholesale with `state` -- both
+/// families exactly as given. The observation paths use the two
+/// merging writers below; this is for a caller that owns the whole
+/// anchor (tests aging a rules version, tooling).
+pub fn write_fsevents_anchor(volume_dir: &Path, state: &FsEventsState) -> Result<()> {
+    write_cursor_table(volume_dir, state)
+}
+
+fn write_cursor_table(dir: &Path, state: &FsEventsState) -> Result<()> {
+    store::StoreDir::at(dir)?.create()?;
+    let mut rows = vec![columns::StoredCursorRow {
+        family: "walk".to_string(),
+        event_id: state.event_id,
+        device: state.device,
+        observed_at: state.last_observed_at,
+        rules_version: Some(state.rules_version),
+    }];
+    if let Some(u) = &state.unit_root {
+        rows.push(columns::StoredCursorRow {
+            family: "unit_root".to_string(),
+            event_id: u.event_id,
+            device: u.device,
+            observed_at: u.observed_at,
+            rules_version: None,
+        });
+    }
+    let path = cursors_path(dir);
+    columns::write_cursor_rows(&path, &rows).with_context(|| format!("write {}", path.display()))
 }
 
 /// Publishes the walk's half of this dir's replay anchor, carrying the
@@ -1297,35 +1351,21 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
 /// other's, and the visible symptom would be a unit that re-measures
 /// every pass for no stated reason.
 fn write_fsevents_state(dir: &Path, state: &FsEventsState) -> Result<()> {
-    store::StoreDir::at(dir)?.create()?;
     let merged = FsEventsState {
         unit_root: read_fsevents_state(dir).unit_root,
         ..state.clone()
     };
-    store::write_json(
-        store::JsonFile::FsEventsCursor {
-            volume: &store::StoreDir::at(dir)?,
-        },
-        &merged,
-    )
-    .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+    write_cursor_table(dir, &merged)
 }
 
 /// The mirror of [`write_fsevents_state`]: publishes one unit root's
 /// anchor, carrying the walk's scalars through untouched.
 fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor) -> Result<()> {
-    store::StoreDir::at(dir)?.create()?;
     let merged = FsEventsState {
         unit_root: Some(cursor.clone()),
         ..read_fsevents_state(dir)
     };
-    store::write_json(
-        store::JsonFile::FsEventsCursor {
-            volume: &store::StoreDir::at(dir)?,
-        },
-        &merged,
-    )
-    .with_context(|| format!("write {}", fsevents_state_path(dir).display()))
+    write_cursor_table(dir, &merged)
 }
 
 fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {

@@ -275,7 +275,7 @@ cannot turn your keep list into an empty one.
 Coverage is not storage: adding a root, excluding one, or a detector
 newly resolving a path is a change in what swamp *looks at*, not a
 change in what exists on disk. `report`/`observe` persist the resolved
-scope (`scope.json` under `SWAMP_DIR`) and print a one-line note on
+scope (`scope_roots.parquet` and its sibling scope tables under `SWAMP_DIR`) and print a one-line note on
 stderr when it changes since the last observation, e.g. `coverage
 changed since last observation: +root /Users/you/.cargo (detector
 cargo-home), -root /Users/you/old-project (excluded)`. This note never
@@ -698,9 +698,9 @@ There is no re-check between marking and pressing Enter: no "this changed since 
 
 `--keep-executables` (a TUI toggle) copies supported Rust executables from `target/{release,debug}` and Python wheels/shared libraries from `dist` or `build` into the worktree's `bin/` before removal. It is not a backup of everything in the selected directory.
 
-The ledger lives at `~/.local/share/swamp/ledger.jsonl`: one line per Trash move, naming the path, recovery location, bytes and time. Trashed bytes and freed disk space are different quantities -- moving to Trash does not free space until the Trash itself is emptied. Consult the reported recovery location for restoration; swamp has no general undo command.
+The ledger lives at `~/.local/share/swamp/ledger.parquet` (+ `ledger_facts.parquet`, the facts shown on the confirm line): one row per Trash move, naming the path, recovery location, bytes and time. Trashed bytes and freed disk space are different quantities -- moving to Trash does not free space until the Trash itself is emptied. Consult the reported recovery location for restoration; swamp has no general undo command.
 
-The ledger lives at `~/.local/share/swamp/ledger.jsonl`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
+The ledger lives at `~/.local/share/swamp/ledger.parquet`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
 
 ## Decision evidence
 

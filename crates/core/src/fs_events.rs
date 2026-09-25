@@ -207,7 +207,7 @@ impl RefreshRefusal {
 
 /// The two scalars a caller persists alongside whatever it publishes, and
 /// passes back in on the next call. Mirrors mole's `fswatch.Request`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FsEventsState {
     /// The `current_event_id` from the plan that accompanied the last
     /// observation. `None` means "nothing stored", always a full refresh.

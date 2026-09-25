@@ -1218,7 +1218,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
             remote: Some("github.com/o/r".into()),
         }),
     };
-    let ledger = swamp_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
+    let ledger = swamp_core::ledger::Ledger::open(tmp.path().join("ledger.parquet")).unwrap();
 
     // Untracked content present: no longer a bar — the human saw it on
     // the confirm line. The sink moves the checkout and the ledger keeps
@@ -1232,14 +1232,18 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     let recs = ledger.all().unwrap();
     let last = recs.last().unwrap();
     assert!(matches!(last.verb, swamp_core::ledger::Verb::Archive));
-    assert!(
-        last.evidence["recover"]
-            .as_str()
-            .unwrap()
-            .contains("git clone")
-    );
+    let fact = |key: &str| -> String {
+        last.evidence
+            .iter()
+            .find(|f| f.key == key)
+            .unwrap_or_else(|| panic!("ledger fact {key} in {:?}", last.evidence))
+            .value
+            .clone()
+    };
+    assert!(fact("recover").contains("git clone"));
     assert_eq!(
-        last.evidence["warnings_shown"][0], "secrets.env untracked 2.0KB",
+        fact("warnings_shown"),
+        "secrets.env untracked 2.0KB",
         "the confirm-line facts travel into the ledger"
     );
 }

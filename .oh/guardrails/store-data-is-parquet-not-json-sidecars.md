@@ -77,7 +77,14 @@ report fields (`summary`, `series`, `unowned_summary`,
 `worktree_entries`, `github_enrichment`) -- the store holds facts, a
 read computes the views (`store-is-facts-report-is-views`); the exact
 table list is `crates/core/tests/store_contents_are_allowlisted.rs`.
-Not yet done (R18b): `scope.json`, `last_run.json`, `docker_facts.json`,
-`fsevents.json` and `ledger.jsonl` are still JSON files under the
-store; the 2026-09-24 hard-rule decision asks for the allow-list to
-shrink to exactly `config.toml`, `ui_state.json` (small) and lock files.
+R18b (2026-09-24) converted the last control files: `cursors.parquet`
+(per volume; was `fsevents.json`), the `docker_*` tables (was
+`docker_facts.json`), the `scope*` tables (was `scope.json`),
+`scheduled_runs.parquet` (was `last_run.json`), `ledger.parquet` +
+`ledger_facts.parquet` (was `ledger.jsonl`, and its `evidence` JSON
+blob is now typed key/value rows) and the Linux collector's
+`continuity/<id>.parquet` + `<id>_entries.parquet` (was `<id>.json`).
+`fs_gate::store::JsonFile` has exactly one variant left, `UiState`
+(`ui_state.json`, the TUI's remembered filter/view), and the allow-list
+is exactly `config.toml`, `ui_state.json`, lock files and the
+scheduled-observation text log.

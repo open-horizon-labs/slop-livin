@@ -1284,22 +1284,215 @@ fn status_label(status: &RootStatus) -> String {
     }
 }
 
-/// Persists the resolved scope as small JSON under `<store_dir>/scope.json`
-/// so the next invocation can compute [`coverage_changes`] against it.
-/// This file is coverage bookkeeping only -- never byte history, never
-/// consulted by the growth store.
+/// Persists the resolved scope's roots (and its scalars/lists) as
+/// `<store_dir>/scope.parquet` + `scope_values.parquet` +
+/// `scope_roots.parquet` + `scope_root_reasons.parquet`, so the next
+/// invocation can compute [`coverage_changes`] against it. Coverage
+/// bookkeeping only -- never byte history, never consulted by the
+/// growth store. The detector summaries and prune notes are not
+/// persisted: nothing reads them back, and the next resolution
+/// recomputes them.
 pub fn persist_effective_scope(store_dir: &Path, scope: &EffectiveScope) -> std::io::Result<()> {
-    crate::fs_gate::store::write_json(
-        crate::fs_gate::store::JsonFile::Scope {
-            store: &crate::fs_gate::store::StoreDir::at(store_dir)?,
-        },
-        scope,
+    use crate::growth::columns as c;
+    let io = |e: anyhow::Error| std::io::Error::other(e.to_string());
+    crate::fs_gate::store::StoreDir::at(store_dir)?.create()?;
+    c::write_scope_rows(
+        &store_dir.join("scope.parquet"),
+        &[c::StoredScopeRow {
+            catalog_version: scope.catalog_version.clone(),
+            platform: platform_label(scope.platform).to_string(),
+            generated_at: scope.generated_at,
+            defaults_enabled: scope.defaults_enabled,
+            explicit: scope.explicit,
+        }],
     )
+    .map_err(io)?;
+    let mut values = Vec::new();
+    for (kind, list) in [
+        ("disabled_detector", &scope.disabled_detectors),
+        ("default_off_detector", &scope.default_off_detectors),
+        ("include", &scope.configured_include),
+        ("exclude", &scope.configured_exclude),
+    ] {
+        for (seq, v) in list.iter().enumerate() {
+            values.push(c::StoredScopeValueRow {
+                list_kind: kind.to_string(),
+                seq: seq as u32,
+                value: v.clone(),
+            });
+        }
+    }
+    c::write_scope_value_rows(&store_dir.join("scope_values.parquet"), &values).map_err(io)?;
+    let mut roots = Vec::new();
+    let mut reasons = Vec::new();
+    for (seq, r) in scope.roots.iter().enumerate() {
+        let (status, status_detail) = match &r.status {
+            RootStatus::Present => ("present", None),
+            RootStatus::Missing => ("missing", None),
+            RootStatus::Unreadable { reason } => ("unreadable", Some(reason.clone())),
+            RootStatus::SkippedAsNested { parent } => {
+                ("skipped-as-nested", Some(parent.display().to_string()))
+            }
+            RootStatus::Excluded { pattern } => ("excluded", Some(pattern.clone())),
+        };
+        roots.push(c::StoredScopeRootRow {
+            seq: seq as u32,
+            path: r.path.display().to_string(),
+            status: status.to_string(),
+            status_detail,
+        });
+        for (rseq, reason) in r.reasons.iter().enumerate() {
+            let mut row = c::StoredScopeRootReasonRow {
+                root_seq: seq as u32,
+                seq: rseq as u32,
+                source: String::new(),
+                detector_id: None,
+                category: None,
+                provenance_kind: None,
+                provenance_value: None,
+                path: None,
+            };
+            match reason {
+                RootReason::BuiltinDefault => row.source = "builtin-default".into(),
+                RootReason::Included => row.source = "included".into(),
+                RootReason::ExplicitCommand => row.source = "explicit-command".into(),
+                RootReason::NestedFrom { path } => {
+                    row.source = "nested-from".into();
+                    row.path = Some(path.display().to_string());
+                }
+                RootReason::Detector {
+                    detector_id,
+                    category,
+                    provenance,
+                } => {
+                    row.source = "detector".into();
+                    row.detector_id = Some(detector_id.clone());
+                    row.category = Some(crate::external::category_str(*category).to_string());
+                    let (kind, value) = provenance_columns(provenance);
+                    row.provenance_kind = Some(kind.to_string());
+                    row.provenance_value = value;
+                }
+            }
+            reasons.push(row);
+        }
+    }
+    c::write_scope_root_rows(&store_dir.join("scope_roots.parquet"), &roots).map_err(io)?;
+    c::write_scope_root_reason_rows(&store_dir.join("scope_root_reasons.parquet"), &reasons)
+        .map_err(io)?;
+    Ok(())
 }
 
 pub fn load_last_effective_scope(store_dir: &Path) -> Option<EffectiveScope> {
-    let text = crate::fs_gate::read::read_owned_string(store_dir.join("scope.json")).ok()?;
-    serde_json::from_str(&text).ok()
+    use crate::growth::columns as c;
+    let head = c::read_scope_rows(&store_dir.join("scope.parquet"))
+        .ok()?
+        .into_iter()
+        .next()?;
+    let values = c::read_scope_value_rows(&store_dir.join("scope_values.parquet")).ok()?;
+    let list = |kind: &str| -> Vec<String> {
+        let mut v: Vec<&c::StoredScopeValueRow> =
+            values.iter().filter(|r| r.list_kind == kind).collect();
+        v.sort_by_key(|r| r.seq);
+        v.into_iter().map(|r| r.value.clone()).collect()
+    };
+    let mut root_rows = c::read_scope_root_rows(&store_dir.join("scope_roots.parquet")).ok()?;
+    root_rows.sort_by_key(|r| r.seq);
+    let mut reason_rows =
+        c::read_scope_root_reason_rows(&store_dir.join("scope_root_reasons.parquet")).ok()?;
+    reason_rows.sort_by_key(|r| (r.root_seq, r.seq));
+    let roots = root_rows
+        .into_iter()
+        .map(|r| ScopeRoot {
+            path: PathBuf::from(&r.path),
+            status: match (r.status.as_str(), r.status_detail) {
+                ("missing", _) => RootStatus::Missing,
+                ("unreadable", d) => RootStatus::Unreadable {
+                    reason: d.unwrap_or_default(),
+                },
+                ("skipped-as-nested", d) => RootStatus::SkippedAsNested {
+                    parent: PathBuf::from(d.unwrap_or_default()),
+                },
+                ("excluded", d) => RootStatus::Excluded {
+                    pattern: d.unwrap_or_default(),
+                },
+                _ => RootStatus::Present,
+            },
+            reasons: reason_rows
+                .iter()
+                .filter(|x| x.root_seq == r.seq)
+                .map(|x| match x.source.as_str() {
+                    "included" => RootReason::Included,
+                    "explicit-command" => RootReason::ExplicitCommand,
+                    "nested-from" => RootReason::NestedFrom {
+                        path: PathBuf::from(x.path.clone().unwrap_or_default()),
+                    },
+                    "detector" => RootReason::Detector {
+                        detector_id: x.detector_id.clone().unwrap_or_default(),
+                        category: x
+                            .category
+                            .as_deref()
+                            .and_then(crate::external::category_from_str)
+                            .unwrap_or(StorageCategory::Unclassified),
+                        provenance: provenance_from_columns(
+                            x.provenance_kind.as_deref().unwrap_or(""),
+                            x.provenance_value.as_deref(),
+                        ),
+                    },
+                    _ => RootReason::BuiltinDefault,
+                })
+                .collect(),
+        })
+        .collect();
+    Some(EffectiveScope {
+        catalog_version: head.catalog_version,
+        platform: platform_from_label(&head.platform),
+        generated_at: head.generated_at,
+        defaults_enabled: head.defaults_enabled,
+        disabled_detectors: list("disabled_detector"),
+        default_off_detectors: list("default_off_detector"),
+        configured_include: list("include"),
+        configured_exclude: list("exclude"),
+        explicit: head.explicit,
+        roots,
+        detectors: Vec::new(),
+        not_applicable_detectors: Vec::new(),
+        pruned_subtrees: Vec::new(),
+        external_pruned_subtrees: Vec::new(),
+        normalized_exclude: list("exclude").into_iter().map(PathBuf::from).collect(),
+    })
+}
+
+fn platform_label(p: Platform) -> &'static str {
+    match p {
+        Platform::MacOS => "macos",
+        Platform::Linux => "linux",
+    }
+}
+
+fn platform_from_label(s: &str) -> Platform {
+    match s {
+        "linux" => Platform::Linux,
+        _ => Platform::MacOS,
+    }
+}
+
+fn provenance_columns(p: &Provenance) -> (&'static str, Option<String>) {
+    match p {
+        Provenance::BuiltinConvention => ("builtin-convention", None),
+        Provenance::EnvVar(v) => ("env-var", Some(v.clone())),
+        Provenance::ConfigField(v) => ("config-field", Some(v.clone())),
+        Provenance::ToolQuery(v) => ("tool-query", Some(v.clone())),
+    }
+}
+
+fn provenance_from_columns(kind: &str, value: Option<&str>) -> Provenance {
+    let v = value.unwrap_or("").to_string();
+    match kind {
+        "env-var" => Provenance::EnvVar(v),
+        "config-field" => Provenance::ConfigField(v),
+        "tool-query" => Provenance::ToolQuery(v),
+        _ => Provenance::BuiltinConvention,
+    }
 }
 
 #[cfg(test)]

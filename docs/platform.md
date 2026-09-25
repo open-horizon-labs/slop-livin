@@ -177,7 +177,7 @@ Cargo enforces the dependency half: Apple framework crates (`core-foundation`, `
 | Scheduled-run log | `~/Library/Logs/swamp` | `$XDG_STATE_HOME/swamp`, default `~/.local/state/swamp` |
 | Trash | `~/.Trash` | `$XDG_DATA_HOME/Trash` (`files/` + `info/`), or the mount's `.Trash/$uid` / `.Trash-$uid` |
 | Scheduling | `~/Library/LaunchAgents` | `$XDG_CONFIG_HOME/systemd/user` (default `~/.config/systemd/user`); `SWAMP_SYSTEMD_UNIT_DIR` overrides |
-| Collector checkpoint | not applicable | `<growth store>/continuity/<root id>.json` (+ `.lock`, `.dirty.lock`, `.sync`) |
+| Collector checkpoint | not applicable | `<growth store>/continuity/<root id>.parquet` (+ `<root id>_entries.parquet`, `.lock`, `.dirty.lock`, `.sync`) |
 
 The macOS growth store path is deliberately unchanged, including its XDG-shaped spelling: existing installs keep their history where it is, and this work moves no user data.
 

@@ -124,7 +124,7 @@ pub fn paths(store: &Path, root: &Path) -> Paths {
     let id = crate::growth::root_scoped_volume_id(root);
     let dir = store.join("continuity");
     Paths {
-        checkpoint: dir.join(format!("{id}.json")),
+        checkpoint: dir.join(format!("{id}.parquet")),
         alive: dir.join(format!("{id}.lock")),
         dirty_lock: dir.join(format!("{id}.dirty.lock")),
         sync: dir.join(format!("{id}.sync")),
@@ -132,19 +132,117 @@ pub fn paths(store: &Path, root: &Path) -> Paths {
     }
 }
 
-pub fn read_checkpoint(p: &Paths) -> Option<Checkpoint> {
-    let text = crate::fs_gate::continuity::read_text(&p.checkpoint).ok()?;
-    serde_json::from_str(&text).ok()
+fn entries_path(checkpoint: &Path) -> PathBuf {
+    let stem = checkpoint
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    checkpoint.with_file_name(format!("{stem}_entries.parquet"))
 }
 
-/// Writes the checkpoint atomically (temp + rename): a reader sees the
-/// old one or the new one, never half of either.
+/// The collector's checkpoint for one root (`<id>.parquet`, one row,
+/// with its dirty/excluded paths in `<id>_entries.parquet`) -- R18b,
+/// replacing `<id>.json`.
+pub fn read_checkpoint(p: &Paths) -> Option<Checkpoint> {
+    use crate::growth::columns as c;
+    let row = c::read_checkpoint_rows(&p.checkpoint)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let mut entries = c::read_checkpoint_entry_rows(&entries_path(&p.checkpoint)).ok()?;
+    entries.sort_by_key(|e| e.seq);
+    let loss = |reason: Option<String>, detail: Option<String>, at: Option<u64>| {
+        reason.map(|reason| LossRecord {
+            reason,
+            detail: detail.unwrap_or_default(),
+            at: at.unwrap_or(0),
+        })
+    };
+    Some(Checkpoint {
+        root: PathBuf::from(row.root),
+        device: row.device,
+        root_ino: row.root_ino,
+        boot_id: row.boot_id,
+        epoch_id: row.epoch_id,
+        opened_at: row.opened_at,
+        pid: row.pid,
+        lost: loss(row.lost_reason, row.lost_detail, row.lost_at),
+        previous_loss: loss(
+            row.previous_loss_reason,
+            row.previous_loss_detail,
+            row.previous_loss_at,
+        ),
+        seq: row.seq,
+        dirty: entries
+            .iter()
+            .filter(|e| e.kind == "dirty")
+            .map(|e| DirtyEntry {
+                p: e.path.clone(),
+                s: e.size.unwrap_or(0),
+            })
+            .collect(),
+        excluded: entries
+            .iter()
+            .filter(|e| e.kind == "excluded")
+            .map(|e| PathBuf::from(&e.path))
+            .collect(),
+        sync_token: row.sync_token,
+        flushed_at: row.flushed_at,
+        stopped_at: row.stopped_at,
+        watches: row.watches,
+        max_user_watches: row.max_user_watches,
+        kernel_bytes_estimate: row.kernel_bytes_estimate,
+    })
+}
+
 pub fn write_checkpoint(p: &Paths, c: &Checkpoint) -> Result<()> {
-    let tmp = p
-        .checkpoint
-        .with_extension(format!("json.{}.tmp", std::process::id()));
-    crate::fs_gate::continuity::write_atomic(&p.dir, &tmp, &p.checkpoint, &serde_json::to_vec(c)?)
-        .with_context(|| format!("publish {}", p.checkpoint.display()))?;
+    use crate::growth::columns as cols;
+    crate::fs_gate::continuity::ensure_dir(&p.dir)?;
+    let mut entries: Vec<cols::StoredCheckpointEntryRow> = Vec::new();
+    for (seq, d) in c.dirty.iter().enumerate() {
+        entries.push(cols::StoredCheckpointEntryRow {
+            kind: "dirty".to_string(),
+            seq: seq as u32,
+            path: d.p.clone(),
+            size: Some(d.s),
+        });
+    }
+    for (seq, e) in c.excluded.iter().enumerate() {
+        entries.push(cols::StoredCheckpointEntryRow {
+            kind: "excluded".to_string(),
+            seq: (c.dirty.len() + seq) as u32,
+            path: e.display().to_string(),
+            size: None,
+        });
+    }
+    cols::write_checkpoint_entry_rows(&entries_path(&p.checkpoint), &entries)
+        .with_context(|| format!("publish {}", entries_path(&p.checkpoint).display()))?;
+    cols::write_checkpoint_rows(
+        &p.checkpoint,
+        &[cols::StoredCheckpointRow {
+            root: c.root.display().to_string(),
+            device: c.device,
+            root_ino: c.root_ino,
+            boot_id: c.boot_id.clone(),
+            epoch_id: c.epoch_id.clone(),
+            opened_at: c.opened_at,
+            pid: c.pid,
+            lost_reason: c.lost.as_ref().map(|l| l.reason.clone()),
+            lost_detail: c.lost.as_ref().map(|l| l.detail.clone()),
+            lost_at: c.lost.as_ref().map(|l| l.at),
+            previous_loss_reason: c.previous_loss.as_ref().map(|l| l.reason.clone()),
+            previous_loss_detail: c.previous_loss.as_ref().map(|l| l.detail.clone()),
+            previous_loss_at: c.previous_loss.as_ref().map(|l| l.at),
+            seq: c.seq,
+            sync_token: c.sync_token.clone(),
+            flushed_at: c.flushed_at,
+            stopped_at: c.stopped_at,
+            watches: c.watches,
+            max_user_watches: c.max_user_watches,
+            kernel_bytes_estimate: c.kernel_bytes_estimate,
+        }],
+    )
+    .with_context(|| format!("publish {}", p.checkpoint.display()))?;
     Ok(())
 }
 
@@ -216,16 +314,6 @@ pub struct Consumption {
 /// observation re-walked.
 pub fn consume(c: &Consumption) -> Result<()> {
     let _lock = lock_wait(&c.dirty_lock, true, Duration::from_secs(10))?;
-    let text = match crate::fs_gate::continuity::read_text(&c.checkpoint) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut ck: Checkpoint = serde_json::from_str(&text)?;
-    if ck.epoch_id != c.epoch_id {
-        return Ok(());
-    }
-    ck.dirty.retain(|d| d.s > c.through_seq);
     let dir = c
         .checkpoint
         .parent()
@@ -238,6 +326,13 @@ pub fn consume(c: &Consumption) -> Result<()> {
         dirty_lock: c.dirty_lock.clone(),
         sync: PathBuf::new(),
     };
+    let Some(mut ck) = read_checkpoint(&p) else {
+        return Ok(());
+    };
+    if ck.epoch_id != c.epoch_id {
+        return Ok(());
+    }
+    ck.dirty.retain(|d| d.s > c.through_seq);
     write_checkpoint(&p, &ck)
 }
 

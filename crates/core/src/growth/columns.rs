@@ -206,6 +206,13 @@ pub(super) fn downcast_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a
         .with_context(|| format!("column {name} is not Int64"))
 }
 
+pub(super) fn downcast_f64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float64Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+        .with_context(|| format!("column {name} is not Float64"))
+}
+
 pub(super) fn downcast_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
     batch
         .column_by_name(name)
@@ -4079,4 +4086,353 @@ pub(crate) fn read_cargo_replay_meta_rows(path: &Path) -> Result<Vec<StoredCargo
         }
     }
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------
+// Typed tables by declaration (R18b). Every table below is one `table!`
+// invocation: a row struct whose fields *are* the columns, in order, and
+// a `write_<x>_rows`/`read_<x>_rows` pair generated from it. The one
+// path to the Parquet writer is `write_table` (named in the source
+// audit's `TABLE_WRITERS`); the runtime allow-list
+// (`crates/core/tests/store_contents_are_allowlisted.rs`) names every
+// file these may produce.
+// ---------------------------------------------------------------------
+
+/// One typed column: its Arrow type, and how a value goes in and out.
+pub(crate) trait Col: Sized + Clone {
+    fn data_type() -> DataType;
+    fn nullable() -> bool;
+    fn array(values: Vec<Self>) -> ArrayRef;
+    fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self>;
+}
+
+macro_rules! scalar_col {
+    ($t:ty, $dt:expr, $arr:ty, $down:ident) => {
+        impl Col for $t {
+            fn data_type() -> DataType {
+                $dt
+            }
+            fn nullable() -> bool {
+                false
+            }
+            fn array(values: Vec<Self>) -> ArrayRef {
+                Arc::new(<$arr>::from(values))
+            }
+            fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self> {
+                Ok($down(batch, name)?.value(i))
+            }
+        }
+        impl Col for Option<$t> {
+            fn data_type() -> DataType {
+                $dt
+            }
+            fn nullable() -> bool {
+                true
+            }
+            fn array(values: Vec<Self>) -> ArrayRef {
+                Arc::new(<$arr>::from(values))
+            }
+            fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self> {
+                let a = $down(batch, name)?;
+                Ok(a.is_valid(i).then(|| a.value(i)))
+            }
+        }
+    };
+}
+scalar_col!(u64, DataType::UInt64, UInt64Array, downcast_u64);
+scalar_col!(u32, DataType::UInt32, UInt32Array, downcast_u32);
+scalar_col!(i64, DataType::Int64, Int64Array, downcast_i64);
+scalar_col!(f64, DataType::Float64, Float64Array, downcast_f64);
+scalar_col!(bool, DataType::Boolean, BooleanArray, downcast_bool);
+
+impl Col for String {
+    fn data_type() -> DataType {
+        DataType::Utf8
+    }
+    fn nullable() -> bool {
+        false
+    }
+    fn array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(StringArray::from(values))
+    }
+    fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self> {
+        Ok(downcast_str(batch, name)?.value(i).to_string())
+    }
+}
+impl Col for Option<String> {
+    fn data_type() -> DataType {
+        DataType::Utf8
+    }
+    fn nullable() -> bool {
+        true
+    }
+    fn array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(StringArray::from(values))
+    }
+    fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self> {
+        let a = downcast_str(batch, name)?;
+        Ok(a.is_valid(i).then(|| a.value(i).to_string()))
+    }
+}
+
+/// The one Parquet write every declared table goes through.
+fn write_table(path: &Path, schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<()> {
+    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        super::ARTIFACT_ZSTD_LEVEL,
+    )
+}
+
+macro_rules! table {
+    ($(#[$m:meta])* $name:ident, $write:ident, $read:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct $name {
+            $(pub $field: $ty,)*
+        }
+        impl $name {
+            fn schema() -> Arc<Schema> {
+                Arc::new(Schema::new(vec![
+                    $(Field::new(stringify!($field), <$ty as Col>::data_type(), <$ty as Col>::nullable()),)*
+                ]))
+            }
+        }
+        pub(crate) fn $write(path: &Path, rows: &[$name]) -> Result<()> {
+            let columns: Vec<ArrayRef> = vec![
+                $(<$ty as Col>::array(rows.iter().map(|r| r.$field.clone()).collect()),)*
+            ];
+            write_table(path, $name::schema(), columns)
+        }
+        pub(crate) fn $read(path: &Path) -> Result<Vec<$name>> {
+            let Some(reader) = crate::fs_gate::columns::open_parquet(path).with_context(|| {
+                format!("read {} (delete it; the next `swamp observe` rebuilds it)", path.display())
+            })?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut rows = Vec::new();
+            for batch in reader {
+                let batch = batch?;
+                for i in 0..batch.num_rows() {
+                    rows.push($name {
+                        $($field: <$ty as Col>::get(&batch, stringify!($field), i)?,)*
+                    });
+                }
+            }
+            Ok(rows)
+        }
+    };
+}
+
+table! {
+    /// `<volume>/cursors.parquet`: the FSEvents replay anchors of one
+    /// root, one row per `family` (`walk` for the scan root's own
+    /// anchor, `unit_root` for an authorized unit root's). Replaces
+    /// `fsevents.json`.
+    StoredCursorRow, write_cursor_rows, read_cursor_rows {
+        family: String,
+        event_id: Option<u64>,
+        device: Option<u64>,
+        observed_at: Option<u64>,
+        rules_version: Option<u32>,
+    }
+}
+
+table! {
+    /// `<store>/docker_meta.parquet`: one row -- when the daemon's answer
+    /// was cached (`cached_at`, what the TTL is measured from), when the
+    /// daemon says it captured it, why it was unavailable (if it was),
+    /// and its API version. Replaces `docker_facts.json` with the tables
+    /// below.
+    StoredDockerMetaRow, write_docker_meta_rows, read_docker_meta_rows {
+        cached_at: u64,
+        captured_at: Option<u64>,
+        unavailable: Option<String>,
+        api_version: Option<String>,
+    }
+}
+table! {
+    StoredDockerImageRow, write_docker_image_rows, read_docker_image_rows {
+        id: String,
+        shared_bytes: u64,
+        unique_bytes: u64,
+        created_at: Option<String>,
+        dangling: bool,
+    }
+}
+table! {
+    StoredDockerCacheRow, write_docker_cache_rows, read_docker_cache_rows {
+        id: String,
+        bytes: u64,
+        last_used: Option<String>,
+        usage_count: Option<u64>,
+        in_use: bool,
+        shared: bool,
+        cache_type: Option<String>,
+        description: Option<String>,
+        created_at: Option<String>,
+        reclaimable: Option<bool>,
+        mutable: Option<bool>,
+        builder: Option<String>,
+    }
+}
+table! {
+    StoredDockerVolumeRow, write_docker_volume_rows, read_docker_volume_rows {
+        name: String,
+        bytes: u64,
+        created_at: Option<String>,
+        driver: Option<String>,
+    }
+}
+table! {
+    StoredDockerBuilderRow, write_docker_builder_rows, read_docker_builder_rows {
+        name: String,
+        driver: Option<String>,
+        status: Option<String>,
+    }
+}
+table! {
+    /// `<store>/docker_values.parquet`: every list- or map-valued field
+    /// of a Docker object -- an image's `repo_tags`/`layers`/`shared_with`,
+    /// a cache entry's `parents`, an image's or volume's `labels` (`key`
+    /// set), the daemon's `buildx_limits` (`object_kind = "meta"`).
+    StoredDockerValueRow, write_docker_value_rows, read_docker_value_rows {
+        object_kind: String,
+        object_id: String,
+        list_kind: String,
+        seq: u32,
+        key: Option<String>,
+        value: String,
+    }
+}
+table! {
+    StoredDockerContainerRow, write_docker_container_rows, read_docker_container_rows {
+        object_kind: String,
+        object_id: String,
+        seq: u32,
+        name: String,
+        state: String,
+        finished_at: Option<String>,
+    }
+}
+
+table! {
+    /// `<store>/scope.parquet`: the last resolved effective scope's
+    /// scalars (coverage bookkeeping only, never byte history --
+    /// `coverage_changes` compares root sets). Replaces `scope.json`.
+    StoredScopeRow, write_scope_rows, read_scope_rows {
+        catalog_version: String,
+        platform: String,
+        generated_at: u64,
+        defaults_enabled: bool,
+        explicit: bool,
+    }
+}
+table! {
+    /// `<store>/scope_values.parquet`: the scope's string lists
+    /// (`disabled_detector`, `default_off_detector`, `include`, `exclude`).
+    StoredScopeValueRow, write_scope_value_rows, read_scope_value_rows {
+        list_kind: String,
+        seq: u32,
+        value: String,
+    }
+}
+table! {
+    StoredScopeRootRow, write_scope_root_rows, read_scope_root_rows {
+        seq: u32,
+        path: String,
+        status: String,
+        status_detail: Option<String>,
+    }
+}
+table! {
+    StoredScopeRootReasonRow, write_scope_root_reason_rows, read_scope_root_reason_rows {
+        root_seq: u32,
+        seq: u32,
+        source: String,
+        detector_id: Option<String>,
+        category: Option<String>,
+        provenance_kind: Option<String>,
+        provenance_value: Option<String>,
+        path: Option<String>,
+    }
+}
+
+table! {
+    /// `<store>/scheduled_runs.parquet`: the most recent scheduled
+    /// observation's outcome (one row), for the report header and
+    /// `swamp schedule` status. Replaces `last_run.json`.
+    StoredScheduledRunRow, write_scheduled_run_rows, read_scheduled_run_rows {
+        observed_at: u64,
+        wall_ms: u64,
+        walked_total: u64,
+        projects: u64,
+        mode: String,
+        outcome: String,
+    }
+}
+
+table! {
+    /// `<store>/ledger.parquet`: the action ledger ("where did it go"),
+    /// one row per recorded action. Replaces `ledger.jsonl`. The facts
+    /// shown to the human at the time live in `ledger_facts.parquet`.
+    StoredLedgerRow, write_ledger_rows, read_ledger_rows {
+        id: String,
+        verb: String,
+        entity_id: String,
+        grant_id: String,
+        actor: String,
+        outcome: String,
+        recovery_location: Option<String>,
+        measured_free_space_delta: Option<i64>,
+        observed_path_state: Option<String>,
+        recorded_at: u64,
+    }
+}
+table! {
+    StoredLedgerFactRow, write_ledger_fact_rows, read_ledger_fact_rows {
+        record_id: String,
+        seq: u32,
+        key: String,
+        value: String,
+    }
+}
+
+table! {
+    /// `<store>/continuity/<id>.parquet`: a Linux collector's checkpoint
+    /// for one root (#82), one row. Replaces `continuity/<id>.json`; the
+    /// dirty and excluded paths are in `<id>_entries.parquet`.
+    StoredCheckpointRow, write_checkpoint_rows, read_checkpoint_rows {
+        root: String,
+        device: u64,
+        root_ino: u64,
+        boot_id: Option<String>,
+        epoch_id: String,
+        opened_at: u64,
+        pid: u32,
+        lost_reason: Option<String>,
+        lost_detail: Option<String>,
+        lost_at: Option<u64>,
+        previous_loss_reason: Option<String>,
+        previous_loss_detail: Option<String>,
+        previous_loss_at: Option<u64>,
+        seq: u64,
+        sync_token: Option<String>,
+        flushed_at: u64,
+        stopped_at: Option<u64>,
+        watches: u64,
+        max_user_watches: Option<u64>,
+        kernel_bytes_estimate: u64,
+    }
+}
+table! {
+    StoredCheckpointEntryRow, write_checkpoint_entry_rows, read_checkpoint_entry_rows {
+        kind: String,
+        seq: u32,
+        path: String,
+        size: Option<u64>,
+    }
 }

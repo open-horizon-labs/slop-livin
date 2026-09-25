@@ -517,6 +517,12 @@ root-scoped volume id) and are replaced or appended per root.
 | `<volume>/enrich.parquet` | worktree | the GitHub enrichment fetch cache. |
 | `git_signals.parquet` (+ `_values`), `cargo_replay_cache.parquet` (+ `_lists`, `_evidence`, `_meta`) | root | the per-root replay caches (`consumers/signals.rs`, `consumers/cargo.rs`) for an unchanged worktree/container, keyed by `growth::root_key`. |
 | `build_stores.parquet`, `xcode_derived_data.parquet`, `declarations.parquet`, `dependency_identities.parquet`, `external_consumers.parquet`, `agent_identifications.parquet`, `agent_containers.parquet` | store / product / declaration / identity / consumer / session | the association caches (`assoc_store.rs`) the consumers join on. |
+| `<volume>/cursors.parquet` | replay-anchor family (`walk`, `unit_root`) | the FSEvents event id, device, observation time and rules version the next incremental pass replays from (R18b; was `fsevents.json`). |
+| `docker_meta.parquet`, `docker_images.parquet`, `docker_build_cache.parquet`, `docker_volumes.parquet`, `docker_builders.parquet`, `docker_values.parquet`, `docker_containers.parquet` | daemon answer / image / cache entry / volume / builder / list or label value / container reference | the Docker daemon's cached answer with its `cached_at` (the TTL's clock) -- R18b; was `docker_facts.json`. |
+| `scope.parquet`, `scope_values.parquet`, `scope_roots.parquet`, `scope_root_reasons.parquet` | resolution / list value / root / reason | the last resolved effective scope, for the next run's coverage-change note (R18b; was `scope.json`). |
+| `scheduled_runs.parquet` | the last scheduled run | its outcome, mode, wall time, walked total and project count, for the report header and `swamp schedule` (R18b; was `last_run.json`). |
+| `ledger.parquet` + `ledger_facts.parquet` | recorded action / fact shown on its confirm line | "where did it go": verb, entity, actor, outcome, recovery location, and the typed facts the human saw (R18b; was `ledger.jsonl` with a JSON evidence blob). |
+| `continuity/<id>.parquet` + `<id>_entries.parquet` | a Linux collector's checkpoint / its dirty or excluded path | the collector's epoch, loss records, counters and dirty set (#82; R18b, was `<id>.json`). |
 
 Column-level history of how each table arrived (R14-R18a-4) is in
 `.oh/sessions/2026-09-24-r1*-*.md`; the tables are what they are today.
@@ -787,7 +793,7 @@ ordinary artifact row:
   detector-resolved roots the external and agent families measure under,
   and `growth::replay_unit_roots` gives each one an FSEvents anchor of
   its own, stored in the `unit_root` half of that root's volume-dir
-  `fsevents.json` -- beside the walk's anchor for the same path, never
+  `cursors.parquet` (its `unit_root` row) -- beside the walk's anchor for the same path, never
   instead of it, with both writers doing a read-modify-write of their
   own half. Roots on one device are replayed through a single FSEvents
   stream and the result split per root, so a write under `~/.cargo` is
@@ -1348,7 +1354,7 @@ The only thing that moves a path to the Trash is the TUI:
 - **Enter** calls `fs_gate::destroy::trash_move`/`Envelope` directly on
   exactly the marked paths (`crates/tui/src/actions.rs::execute_one`)
   and appends one ledger line per unit (path, recovery location, bytes,
-  time) to `~/.local/share/swamp/ledger.jsonl`.
+  time) to `~/.local/share/swamp/ledger.parquet` (+ `ledger_facts.parquet`).
 
 There is deliberately **no** re-derivation between marking and moving:
 no "changed since you looked" refusal, no occupancy veto. The only

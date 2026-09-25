@@ -9,7 +9,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use swamp_core::entities::{id_for, now};
 use swamp_core::execution::Outcome;
-use swamp_core::ledger::{ActionRecord, Ledger, NO_GRANT, Verb};
+use swamp_core::ledger::{ActionRecord, Ledger, LedgerFact, NO_GRANT, Verb};
 
 use crate::model::human_bytes;
 
@@ -60,20 +60,15 @@ pub struct UnitResult {
     pub outcome: Result<Outcome, String>,
 }
 
-fn ledger_evidence(unit: &MarkedUnit, extra: Option<serde_json::Value>) -> serde_json::Value {
-    let mut evidence = serde_json::json!({
-        "label": unit.label,
-        "bytes": unit.bytes,
-        "observed_at": unit.observed_at,
-        "warnings_shown": unit.warnings,
-    });
-    if let Some(extra) = extra
-        && let (Some(map), Some(more)) = (evidence.as_object_mut(), extra.as_object())
-    {
-        for (k, v) in more {
-            map.insert(k.clone(), v.clone());
-        }
-    }
+/// The facts the human saw on the confirm line, as typed ledger rows.
+fn ledger_evidence(unit: &MarkedUnit, extra: Vec<LedgerFact>) -> Vec<LedgerFact> {
+    let mut evidence = vec![
+        LedgerFact::new("label", &unit.label),
+        LedgerFact::new("bytes", unit.bytes),
+        LedgerFact::new("observed_at", unit.observed_at),
+        LedgerFact::new("warnings_shown", unit.warnings.join("; ")),
+    ];
+    evidence.extend(extra);
     evidence
 }
 
@@ -101,7 +96,10 @@ fn execute_one(
                 id: swamp_core::entities::new_id(),
                 verb: Verb::Delete,
                 entity_id: id_for(&unit.path.display().to_string()),
-                evidence: ledger_evidence(unit, Some(serde_json::json!({"cargo_group": group}))),
+                evidence: ledger_evidence(
+                    unit,
+                    vec![LedgerFact::new("cargo_group", format!("{group:?}"))],
+                ),
                 grant_id: NO_GRANT.to_string(),
                 actor: actor.into(),
                 outcome: "completed".into(),
@@ -150,11 +148,11 @@ fn execute_one(
                 entity_id: id_for(&unit.path.display().to_string()),
                 evidence: ledger_evidence(
                     unit,
-                    Some(serde_json::json!({
-                        "tool_id": meta.tool_id,
-                        "category": meta.category,
-                        "session_removal": meta.session_members.is_some(),
-                    })),
+                    vec![
+                        LedgerFact::new("tool_id", &meta.tool_id),
+                        LedgerFact::new("category", format!("{:?}", meta.category)),
+                        LedgerFact::new("session_removal", meta.session_members.is_some()),
+                    ],
                 ),
                 grant_id: NO_GRANT.to_string(),
                 actor: actor.into(),
@@ -189,7 +187,7 @@ fn execute_one(
             trash_root,
             actor,
             keep_executables,
-            None,
+            Vec::new(),
         )
         .map(|(outcome, _)| outcome)
     };
@@ -216,7 +214,10 @@ fn remove_docker(
         entity_id: id_for(&unit.path.display().to_string()),
         evidence: ledger_evidence(
             unit,
-            Some(serde_json::json!({"docker": format!("{target:?}"), "permanent": true})),
+            vec![
+                LedgerFact::new("docker", format!("{target:?}")),
+                LedgerFact::new("permanent", true),
+            ],
         ),
         grant_id: NO_GRANT.to_string(),
         actor: actor.to_string(),
@@ -248,7 +249,7 @@ fn trash_path(
     trash_root: &Path,
     actor: &str,
     keep_executables: bool,
-    extra: Option<serde_json::Value>,
+    extra: Vec<LedgerFact>,
 ) -> Result<(Outcome, swamp_core::fs_gate::destroy::Trashed)> {
     let path = &unit.path;
     if swamp_core::fs_gate::symlink_metadata(path).is_err() {
@@ -259,11 +260,12 @@ fn trash_path(
         let bin = unit.worktree_path.join("bin");
         let kept = swamp_core::actions::preserve_executables(path, &bin)
             .map_err(|e| anyhow::anyhow!("could not preserve executables: {e}"))?;
-        preserved_note = Some(serde_json::json!(
+        preserved_note = Some(
             kept.iter()
                 .map(|k| k.to.display().to_string())
                 .collect::<Vec<_>>()
-        ));
+                .join("; "),
+        );
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
     let moved =
@@ -274,10 +276,8 @@ fn trash_path(
         "the receipt names what was actually moved"
     );
     let mut evidence = ledger_evidence(unit, extra);
-    if let Some(preserved) = preserved_note
-        && let Some(map) = evidence.as_object_mut()
-    {
-        map.insert("preserved".into(), preserved);
+    if let Some(preserved) = preserved_note {
+        evidence.push(LedgerFact::new("preserved", preserved));
     }
     ledger.append(&ActionRecord {
         id: swamp_core::entities::new_id(),
@@ -341,12 +341,12 @@ fn remove_worktree(
         trash_root,
         actor,
         false,
-        Some(serde_json::json!({
-            "merge_complete": terms.merge_complete,
-            "pr": terms.pr,
-            "remote": terms.remote,
-            "recover": recover,
-        })),
+        vec![
+            LedgerFact::new("merge_complete", format!("{:?}", terms.merge_complete)),
+            LedgerFact::new("pr", format!("{:?}", terms.pr)),
+            LedgerFact::new("remote", terms.remote.clone().unwrap_or_default()),
+            LedgerFact::new("recover", &recover),
+        ],
     )?;
     if let Some(common) = &common {
         let _ = swamp_core::fs_gate::destroy::git_worktree_prune(common);

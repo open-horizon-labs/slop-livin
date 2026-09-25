@@ -494,26 +494,44 @@ pub fn last_log_outcome(path: &Path) -> Option<RunOutcome> {
     text.lines().rev().find_map(RunOutcome::from_log_line)
 }
 
-fn last_run_path(store_dir: &Path) -> PathBuf {
-    store_dir.join("last_run.json")
+/// `<store>/scheduled_runs.parquet` (R18b): the most recent scheduled
+/// run's outcome, one row. Replaces `last_run.json`.
+fn scheduled_runs_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("scheduled_runs.parquet")
 }
 
 /// Persists the most recent run's summary alongside the growth store, so
 /// the report header can read it without parsing the log.
 pub fn write_last_run(store_dir: &Path, outcome: &RunOutcome) -> Result<()> {
-    let path = last_run_path(store_dir);
-    store::write_json(
-        store::JsonFile::LastRun {
-            store: &store::StoreDir::at(store_dir)?,
-        },
-        outcome,
+    store::StoreDir::at(store_dir)?.create()?;
+    let path = scheduled_runs_path(store_dir);
+    crate::growth::columns::write_scheduled_run_rows(
+        &path,
+        &[crate::growth::columns::StoredScheduledRunRow {
+            observed_at: outcome.observed_at,
+            wall_ms: outcome.wall_ms,
+            walked_total: outcome.walked_total,
+            projects: outcome.projects as u64,
+            mode: outcome.mode.clone(),
+            outcome: outcome.outcome.clone(),
+        }],
     )
     .with_context(|| format!("write {}", path.display()))
 }
 
 pub fn read_last_run(store_dir: &Path) -> Option<RunOutcome> {
-    let text = read_owned_string(last_run_path(store_dir)).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::growth::columns::read_scheduled_run_rows(&scheduled_runs_path(store_dir))
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|r| RunOutcome {
+            observed_at: r.observed_at,
+            wall_ms: r.wall_ms,
+            walked_total: r.walked_total,
+            projects: r.projects as usize,
+            mode: r.mode,
+            outcome: r.outcome,
+        })
 }
 
 fn format_duration(secs: u64) -> String {

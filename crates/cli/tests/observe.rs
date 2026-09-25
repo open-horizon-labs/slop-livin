@@ -44,10 +44,9 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
         "observe must persist a volume dir under the store"
     );
 
-    let last_run = store.path().join("last_run.json");
-    assert!(last_run.exists(), "observe must persist last_run.json");
-    let text = std::fs::read_to_string(&last_run).unwrap();
-    assert!(text.contains("\"outcome\":\"ok\""));
+    let last_run = swamp_core::schedule::read_last_run(store.path())
+        .expect("observe must persist scheduled_runs.parquet");
+    assert_eq!(last_run.outcome, "ok");
 }
 
 /// R16 CI-red fix: `merge_root_report_into` prefixes every per-root note
@@ -186,7 +185,7 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
     // #41: a resolved scope is persisted so the next run can report
     // coverage changes; this is coverage bookkeeping, never byte
     // history.
-    let scope_file = store.path().join("scope.json");
+    let scope_file = store.path().join("scope_roots.parquet");
     assert!(
         scope_file.exists(),
         "observe must persist the effective scope for next time"

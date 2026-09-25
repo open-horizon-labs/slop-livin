@@ -2310,7 +2310,7 @@ mod tests {
         assert!(app.marked.is_empty());
         assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
         assert_eq!(
-            swamp_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl"))
+            swamp_core::ledger::Ledger::open(tmp.path().join("ledger.parquet"))
                 .unwrap()
                 .all()
                 .unwrap()

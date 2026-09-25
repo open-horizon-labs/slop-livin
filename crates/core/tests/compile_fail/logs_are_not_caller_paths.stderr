@@ -1,18 +1,18 @@
 error[E0308]: mismatched types
  --> $WORKSPACE/crates/core/tests/compile_fail/logs_are_not_caller_paths.rs
   |
-  |     let _ = store::append_line(store::LogFile::Ledger(Path::new("/Users/me/.zshrc")), "x");
-  |                                ---------------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&StoreDir`, found `&Path`
-  |                                |
-  |                                arguments to this enum variant are incorrect
+  |     let _ = store::LedgerFile::Store(Path::new("/Users/me/.zshrc")).path();
+  |             ------------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&StoreDir`, found `&Path`
+  |             |
+  |             arguments to this enum variant are incorrect
   |
   = note: expected reference `&StoreDir`
              found reference `&Path`
 note: tuple variant defined here
  --> $WORKSPACE/crates/core/src/fs_gate/store.rs
   |
-  |     Ledger(&'a StoreDir),
-  |     ^^^^^^
+  |     Store(&'a StoreDir),
+  |     ^^^^^
 
 error[E0559]: variant `TextFile<'_>::LaunchAgent` has no field named `plist`
  --> $WORKSPACE/crates/core/tests/compile_fail/logs_are_not_caller_paths.rs

@@ -90,83 +90,47 @@ impl StoreDir {
     }
 }
 
-/// Every JSON file swamp persists. The file name is decided here.
-#[derive(Debug, Clone, Copy)]
-pub enum JsonFile<'a> {
-    /// `<store>/scope.json`: the last resolved scope (coverage
-    /// bookkeeping only).
-    Scope { store: &'a StoreDir },
-    /// `<store>/last_run.json`: the last scheduled observation's summary.
-    LastRun { store: &'a StoreDir },
-    /// `<store>/docker_facts.json`: the Docker daemon answer, cached for
-    /// its TTL.
-    DockerFacts { store: &'a StoreDir },
-    /// `<store>/ui_state.json`: the TUI's remembered filter and view.
-    UiState { store: &'a StoreDir },
-    /// `<volume>/fsevents.json`: the FSEvents cursor for one root.
-    FsEventsCursor { volume: &'a StoreDir },
-}
-
-/// How a [`JsonFile`] is encoded on disk.
-///
-/// The unowned/remainder rows of a volume are **not** JSON any more
-/// (#R10 item 1): `<volume>/unowned.json` used to scale with the
-/// unowned *file* count (473 MB on a real default-scope store) --
-/// exactly the giant JSON artifact cache the handoff forbids. They now
-/// live in `<volume>/unowned.parquet` (`growth::{read_unowned,
-/// write_unowned}` / `growth::columns::{read_unowned_rows,
-/// write_unowned_rows}`), folded per directory by `walk.rs`, and are not
-/// written through this gate at all -- like every other history table,
-/// only through `crate::fs_gate::columns::write_parquet_atomic`. The
-/// last JSON file that *was* written through this gate compressed
-/// (`LastReport`, the whole-`Report` replay cache `last_report-<key>
-/// .json.zst`) was deleted in R18a-4: the two lower-level replay caches
-/// it served (`consumers/signals.rs`'s previous git signals,
-/// `consumers/cargo.rs`'s previous nested-artifacts cache) are now their
-/// own root-keyed Parquet tables (`growth::write_git_signals_table`/
-/// `growth::write_cargo_replay_cache`), so nothing here needs zstd any
-/// more either.
-enum Encoding {
-    Pretty,
-    Compact,
-}
-
+/// A store-internal name: one path component, nothing that could climb
+/// out of the store.
 fn plain(id: &str) -> io::Result<&str> {
-    if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("`{id}` is not a plain store file id"),
+            format!("{id:?} is not a store-internal name"),
         ));
     }
     Ok(id)
+}
+
+/// The one JSON file swamp persists: the TUI's remembered filter and
+/// view, `<store>/ui_state.json` (tiny; `store-data-is-parquet-not-json-
+/// sidecars`). Every other store file is a Parquet table, `config.toml`,
+/// a lock, or the scheduled-observation log.
+#[derive(Debug, Clone, Copy)]
+pub enum JsonFile<'a> {
+    UiState { store: &'a StoreDir },
 }
 
 impl JsonFile<'_> {
     /// Where the file lives.
     pub fn path(&self) -> io::Result<PathBuf> {
         Ok(match *self {
-            JsonFile::Scope { store } => store.0.join("scope.json"),
-            JsonFile::LastRun { store } => store.0.join("last_run.json"),
-            JsonFile::DockerFacts { store } => store.0.join("docker_facts.json"),
             JsonFile::UiState { store } => store.0.join("ui_state.json"),
-            JsonFile::FsEventsCursor { volume } => volume.0.join("fsevents.json"),
         })
-    }
-
-    fn encoding(&self) -> Encoding {
-        match self {
-            JsonFile::Scope { .. } => Encoding::Pretty,
-            _ => Encoding::Compact,
-        }
     }
 }
 
 /// Serializes `value` into `file`, atomically.
 pub fn write_json<T: Serialize + ?Sized>(file: JsonFile<'_>, value: &T) -> io::Result<()> {
     let path = file.path()?;
-    let bytes = match file.encoding() {
-        Encoding::Pretty => serde_json::to_vec_pretty(value)?,
-        Encoding::Compact => serde_json::to_vec(value)?,
+    let bytes = match file {
+        JsonFile::UiState { .. } => serde_json::to_vec(value)?,
     };
     write_atomic(&path, &bytes)
 }
@@ -225,13 +189,29 @@ pub fn remove_text(file: TextFile<'_>) -> io::Result<()> {
 }
 
 /// Every append-only log swamp keeps.
+/// The action ledger's table: a store's `ledger.parquet`, or where
+/// `$SWAMP_LEDGER_PATH` puts it (read here, not handed in). A caller
+/// never names the file.
+#[derive(Debug, Clone, Copy)]
+pub enum LedgerFile<'a> {
+    Store(&'a StoreDir),
+    Resolved(&'a StoreDir),
+}
+
+impl LedgerFile<'_> {
+    pub fn path(&self) -> io::Result<PathBuf> {
+        Ok(match *self {
+            LedgerFile::Store(store) => store.0.join("ledger.parquet"),
+            LedgerFile::Resolved(store) => match std::env::var_os("SWAMP_LEDGER_PATH") {
+                Some(p) => PathBuf::from(p),
+                None => store.0.join("ledger.parquet"),
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum LogFile<'a> {
-    /// The action ledger: `<store>/ledger.jsonl`.
-    Ledger(&'a StoreDir),
-    /// The action ledger where `$SWAMP_LEDGER_PATH` puts it (read here,
-    /// not handed in); `<store>/ledger.jsonl` when unset.
-    LedgerResolved(&'a StoreDir),
     /// The scheduled observation log: a file named `observe.log`
     /// (`schedule::log_file`), refused under any other name.
     Observations(&'a Path),
@@ -241,11 +221,6 @@ impl LogFile<'_> {
     /// Where the log lives.
     pub fn path(&self) -> io::Result<PathBuf> {
         Ok(match *self {
-            LogFile::Ledger(store) => store.0.join("ledger.jsonl"),
-            LogFile::LedgerResolved(store) => match std::env::var_os("SWAMP_LEDGER_PATH") {
-                Some(p) => PathBuf::from(p),
-                None => store.0.join("ledger.jsonl"),
-            },
             LogFile::Observations(path) => {
                 if path.file_name().is_none_or(|n| n != "observe.log") || !path.is_absolute() {
                     return Err(io::Error::new(

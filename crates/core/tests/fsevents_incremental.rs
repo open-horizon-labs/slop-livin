@@ -544,12 +544,11 @@ fn stored_event_id_is_recorded_after_an_observation() {
     )
     .expect("report");
 
-    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
-    let text =
-        fs::read_to_string(&sidecar).unwrap_or_else(|e| panic!("read {}: {e}", sidecar.display()));
+    let anchor =
+        swamp_core::growth::read_fsevents_anchor(&volume_store_dir(store.path(), &fx.root));
     assert!(
-        text.contains("event_id"),
-        "fsevents.json must record the observed event id: {text}"
+        anchor.event_id.is_some(),
+        "cursors.parquet must record the observed event id: {anchor:?}"
     );
 }
 
@@ -572,8 +571,8 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         &no_op_source(),
     )
     .expect("baseline");
-    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
-    let before = fs::read(&sidecar).unwrap();
+    let volume = volume_store_dir(store.path(), &fx.root);
+    let before = swamp_core::growth::read_fsevents_anchor(&volume);
     // `git_signals.parquet` is `consumers::signals`'s per-root replay
     // cache (R18a-4's replacement for `last_report-<key>.json.zst`):
     // written, like every table, every pass this call observes.
@@ -603,7 +602,7 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         result.is_err(),
         "cache failure must propagate rather than advance replay past uncached evidence"
     );
-    assert_eq!(fs::read(&sidecar).unwrap(), before);
+    assert_eq!(swamp_core::growth::read_fsevents_anchor(&volume), before);
     fs::remove_dir_all(blocker).unwrap();
     report_full_mode_with_source(
         &fx.root,
@@ -618,8 +617,8 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         &source,
     )
     .expect("retry");
-    let after: serde_json::Value = serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
-    assert_eq!(after["event_id"], 77);
+    let after = swamp_core::growth::read_fsevents_anchor(&volume);
+    assert_eq!(after.event_id, Some(77));
 }
 
 #[test]

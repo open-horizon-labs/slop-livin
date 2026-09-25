@@ -18,7 +18,7 @@
 //! piece of detail, never the whole report.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -991,34 +991,296 @@ pub fn load_cached(
     let Some(dir) = store_dir else {
         return load_live();
     };
-    let cache = dir.join("docker_facts.json");
-    if !fresh
-        && let Ok(meta) = crate::fs_gate::symlink_metadata(&cache)
-        && let Ok(age) = meta
-            .modified()
-            .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-        && let Ok(text) = crate::fs_gate::read::read_owned_string(&cache)
-        && let Ok(facts) = serde_json::from_str::<DockerFacts>(&text)
-    {
+    let now = crate::entities::now();
+    if !fresh && let Some((facts, cached_at)) = read_cached_facts(dir) {
         let ttl = if facts.unavailable.is_none() {
             DOCKER_CACHE_TTL_SECS
         } else {
             DOCKER_UNAVAILABLE_TTL_SECS
         };
-        if age.as_secs() < ttl {
+        if now.saturating_sub(cached_at) < ttl {
             return facts;
         }
     }
     let facts = load_live();
     // The unavailable answer is cached too. Caching only success meant
     // an unreachable daemon was re-probed on every pass forever.
-    if let Ok(store) = crate::fs_gate::store::StoreDir::at(dir) {
-        let _ = crate::fs_gate::store::write_json(
-            crate::fs_gate::store::JsonFile::DockerFacts { store: &store },
-            &facts,
-        );
-    }
+    let _ = write_cached_facts(dir, &facts, now);
     facts
+}
+
+// ---------------------------------------------------------------------
+// The daemon-answer cache (R18b): `docker_meta.parquet` + one table per
+// object kind + `docker_values.parquet` (every list/map field) +
+// `docker_containers.parquet`. Replaces `docker_facts.json`; the TTL is
+// measured from the meta row's `cached_at`, not a file mtime.
+// ---------------------------------------------------------------------
+
+fn docker_table(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("docker_{name}.parquet"))
+}
+
+/// Writes the daemon's answer as tables, replacing the previous cache.
+pub fn write_cached_facts(dir: &Path, facts: &DockerFacts, cached_at: u64) -> anyhow::Result<()> {
+    use crate::growth::columns as c;
+    crate::fs_gate::store::StoreDir::at(dir)?.create()?;
+    let mut values: Vec<c::StoredDockerValueRow> = Vec::new();
+    let mut containers: Vec<c::StoredDockerContainerRow> = Vec::new();
+    fn push_list(
+        values: &mut Vec<c::StoredDockerValueRow>,
+        object_kind: &str,
+        object_id: &str,
+        list_kind: &str,
+        items: &[String],
+    ) {
+        for (seq, v) in items.iter().enumerate() {
+            values.push(c::StoredDockerValueRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                list_kind: list_kind.to_string(),
+                seq: seq as u32,
+                key: None,
+                value: v.clone(),
+            });
+        }
+    }
+    fn push_labels(
+        values: &mut Vec<c::StoredDockerValueRow>,
+        object_kind: &str,
+        object_id: &str,
+        labels: &HashMap<String, String>,
+    ) {
+        let mut keys: Vec<&String> = labels.keys().collect();
+        keys.sort();
+        for (seq, k) in keys.into_iter().enumerate() {
+            values.push(c::StoredDockerValueRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                list_kind: "label".to_string(),
+                seq: seq as u32,
+                key: Some(k.clone()),
+                value: labels[k].clone(),
+            });
+        }
+    }
+    fn push_containers(
+        containers: &mut Vec<c::StoredDockerContainerRow>,
+        object_kind: &str,
+        object_id: &str,
+        refs: &[ContainerRef],
+    ) {
+        for (seq, r) in refs.iter().enumerate() {
+            containers.push(c::StoredDockerContainerRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                seq: seq as u32,
+                name: r.name.clone(),
+                state: r.state.clone(),
+                finished_at: r.finished_at.clone(),
+            });
+        }
+    }
+    let images: Vec<c::StoredDockerImageRow> = facts
+        .images
+        .iter()
+        .map(|i| {
+            push_list(&mut values, "image", &i.id, "repo_tag", &i.repo_tags);
+            push_list(&mut values, "image", &i.id, "layer", &i.layers);
+            push_list(&mut values, "image", &i.id, "shared_with", &i.shared_with);
+            push_labels(&mut values, "image", &i.id, &i.labels);
+            push_containers(&mut containers, "image", &i.id, &i.containers);
+            c::StoredDockerImageRow {
+                id: i.id.clone(),
+                shared_bytes: i.shared_bytes,
+                unique_bytes: i.unique_bytes,
+                created_at: i.created_at.clone(),
+                dangling: i.dangling,
+            }
+        })
+        .collect();
+    let caches: Vec<c::StoredDockerCacheRow> = facts
+        .build_cache
+        .iter()
+        .map(|b| {
+            push_list(&mut values, "cache", &b.id, "parent", &b.parents);
+            c::StoredDockerCacheRow {
+                id: b.id.clone(),
+                bytes: b.bytes,
+                last_used: b.last_used.clone(),
+                usage_count: b.usage_count,
+                in_use: b.in_use,
+                shared: b.shared,
+                cache_type: b.cache_type.clone(),
+                description: b.description.clone(),
+                created_at: b.created_at.clone(),
+                reclaimable: b.reclaimable,
+                mutable: b.mutable,
+                builder: b.builder.clone(),
+            }
+        })
+        .collect();
+    let volumes: Vec<c::StoredDockerVolumeRow> = facts
+        .volumes
+        .iter()
+        .map(|v| {
+            push_labels(&mut values, "volume", &v.name, &v.labels);
+            push_containers(&mut containers, "volume", &v.name, &v.containers);
+            c::StoredDockerVolumeRow {
+                name: v.name.clone(),
+                bytes: v.bytes,
+                created_at: v.created_at.clone(),
+                driver: v.driver.clone(),
+            }
+        })
+        .collect();
+    push_list(
+        &mut values,
+        "meta",
+        "",
+        "buildx_limit",
+        &facts.capabilities.buildx_limits,
+    );
+    let builders: Vec<c::StoredDockerBuilderRow> = facts
+        .builders
+        .iter()
+        .map(|b| c::StoredDockerBuilderRow {
+            name: b.name.clone(),
+            driver: b.driver.clone(),
+            status: b.status.clone(),
+        })
+        .collect();
+    c::write_docker_image_rows(&docker_table(dir, "images"), &images)?;
+    c::write_docker_cache_rows(&docker_table(dir, "build_cache"), &caches)?;
+    c::write_docker_volume_rows(&docker_table(dir, "volumes"), &volumes)?;
+    c::write_docker_builder_rows(&docker_table(dir, "builders"), &builders)?;
+    c::write_docker_value_rows(&docker_table(dir, "values"), &values)?;
+    c::write_docker_container_rows(&docker_table(dir, "containers"), &containers)?;
+    // The meta row last: a reader that finds it can trust the rest.
+    c::write_docker_meta_rows(
+        &docker_table(dir, "meta"),
+        &[c::StoredDockerMetaRow {
+            cached_at,
+            captured_at: facts.captured_at,
+            unavailable: facts.unavailable.clone(),
+            api_version: facts.capabilities.api_version.clone(),
+        }],
+    )?;
+    Ok(())
+}
+
+/// The cached daemon answer and when it was cached, if there is one.
+pub fn read_cached_facts(dir: &Path) -> Option<(DockerFacts, u64)> {
+    use crate::growth::columns as c;
+    let meta = c::read_docker_meta_rows(&docker_table(dir, "meta"))
+        .ok()?
+        .into_iter()
+        .next()?;
+    let values = c::read_docker_value_rows(&docker_table(dir, "values")).ok()?;
+    let containers = c::read_docker_container_rows(&docker_table(dir, "containers")).ok()?;
+    let list = |object_kind: &str, object_id: &str, list_kind: &str| -> Vec<String> {
+        let mut v: Vec<&c::StoredDockerValueRow> = values
+            .iter()
+            .filter(|r| {
+                r.object_kind == object_kind && r.object_id == object_id && r.list_kind == list_kind
+            })
+            .collect();
+        v.sort_by_key(|r| r.seq);
+        v.into_iter().map(|r| r.value.clone()).collect()
+    };
+    let labels = |object_kind: &str, object_id: &str| -> HashMap<String, String> {
+        values
+            .iter()
+            .filter(|r| {
+                r.object_kind == object_kind && r.object_id == object_id && r.list_kind == "label"
+            })
+            .filter_map(|r| r.key.clone().map(|k| (k, r.value.clone())))
+            .collect()
+    };
+    let refs = |object_kind: &str, object_id: &str| -> Vec<ContainerRef> {
+        let mut v: Vec<&c::StoredDockerContainerRow> = containers
+            .iter()
+            .filter(|r| r.object_kind == object_kind && r.object_id == object_id)
+            .collect();
+        v.sort_by_key(|r| r.seq);
+        v.into_iter()
+            .map(|r| ContainerRef {
+                name: r.name.clone(),
+                state: r.state.clone(),
+                finished_at: r.finished_at.clone(),
+            })
+            .collect()
+    };
+    let images = c::read_docker_image_rows(&docker_table(dir, "images"))
+        .ok()?
+        .into_iter()
+        .map(|i| DockerImageFact {
+            repo_tags: list("image", &i.id, "repo_tag"),
+            labels: labels("image", &i.id),
+            layers: list("image", &i.id, "layer"),
+            shared_with: list("image", &i.id, "shared_with"),
+            containers: refs("image", &i.id),
+            id: i.id,
+            shared_bytes: i.shared_bytes,
+            unique_bytes: i.unique_bytes,
+            created_at: i.created_at,
+            dangling: i.dangling,
+        })
+        .collect();
+    let build_cache = c::read_docker_cache_rows(&docker_table(dir, "build_cache"))
+        .ok()?
+        .into_iter()
+        .map(|b| DockerCacheFact {
+            parents: list("cache", &b.id, "parent"),
+            id: b.id,
+            bytes: b.bytes,
+            last_used: b.last_used,
+            usage_count: b.usage_count,
+            in_use: b.in_use,
+            shared: b.shared,
+            cache_type: b.cache_type,
+            description: b.description,
+            created_at: b.created_at,
+            reclaimable: b.reclaimable,
+            mutable: b.mutable,
+            builder: b.builder,
+        })
+        .collect();
+    let volumes = c::read_docker_volume_rows(&docker_table(dir, "volumes"))
+        .ok()?
+        .into_iter()
+        .map(|v| DockerVolumeFact {
+            labels: labels("volume", &v.name),
+            containers: refs("volume", &v.name),
+            name: v.name,
+            bytes: v.bytes,
+            created_at: v.created_at,
+            driver: v.driver,
+        })
+        .collect();
+    let builders = c::read_docker_builder_rows(&docker_table(dir, "builders"))
+        .ok()?
+        .into_iter()
+        .map(|b| DockerBuilderFact {
+            name: b.name,
+            driver: b.driver,
+            status: b.status,
+        })
+        .collect();
+    Some((
+        DockerFacts {
+            images,
+            build_cache,
+            volumes,
+            unavailable: meta.unavailable,
+            builders,
+            capabilities: DockerCapabilities {
+                api_version: meta.api_version,
+                buildx_limits: list("meta", "", "buildx_limit"),
+            },
+            captured_at: meta.captured_at,
+        },
+        meta.cached_at,
+    ))
 }
 
 fn load_from_file(path: &Path) -> DockerFacts {

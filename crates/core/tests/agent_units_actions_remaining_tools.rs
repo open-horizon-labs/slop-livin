@@ -120,7 +120,10 @@ fn no_canary_anywhere(units: &[swamp_core::agents::AgentUnit], store: &Path) {
         !serialized.contains(CANARY),
         "content leaked into AgentUnit JSON"
     );
-    if let Ok(ledger) = fs::read_to_string(store.join("ledger.jsonl")) {
+    if let Ok(ledger) = swamp_core::ledger::Ledger::open(store.join("ledger.parquet"))
+        && let Ok(records) = ledger.all()
+    {
+        let ledger = format!("{records:?}");
         assert!(!ledger.contains(CANARY), "content leaked into the ledger");
     }
 }

@@ -438,7 +438,7 @@ fn canary_never_leaks_across_render_text_json_plan_execute_or_ledger() {
     // store any more): one move per unit, straight from the built plan.
     let trash = tempfile::tempdir().unwrap();
     let mut completed = 0;
-    let ledger = swamp_core::ledger::Ledger::open(store.path().join("ledger.jsonl")).unwrap();
+    let ledger = swamp_core::ledger::Ledger::open(store.path().join("ledger.parquet")).unwrap();
     for unit in &plan {
         let meta = unit.agent_meta().unwrap();
         let at = swamp_core::entities::now();
@@ -453,7 +453,10 @@ fn canary_never_leaks_across_render_text_json_plan_execute_or_ledger() {
                 id: swamp_core::entities::new_id(),
                 verb: swamp_core::ledger::Verb::Delete,
                 entity_id: swamp_core::entities::id_for(&unit.path().display().to_string()),
-                evidence: serde_json::json!({"tool_id": meta.tool_id, "bytes": bytes}),
+                evidence: vec![
+                    swamp_core::ledger::LedgerFact::new("tool_id", &meta.tool_id),
+                    swamp_core::ledger::LedgerFact::new("bytes", bytes),
+                ],
                 grant_id: swamp_core::ledger::NO_GRANT.to_string(),
                 actor: "human:test".into(),
                 outcome: "completed".into(),
@@ -468,7 +471,7 @@ fn canary_never_leaks_across_render_text_json_plan_execute_or_ledger() {
     assert_eq!(completed, 2);
 
     // 5. Ledger.
-    let ledger_text = fs::read_to_string(store.path().join("ledger.jsonl")).unwrap();
+    let ledger_text = format!("{:?}", ledger.all().unwrap());
     assert!(!ledger_text.contains(CANARY));
 }
 

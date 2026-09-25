@@ -4,6 +4,25 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store, finished (R18b)
+
+The five control files that were still JSON -- `fsevents.json` (per
+volume), `docker_facts.json`, `scope.json`, `last_run.json` and
+`ledger.jsonl` -- and the Linux collector's `continuity/<id>.json` are
+Parquet tables: `<volume>/cursors.parquet` (one row per replay-anchor
+family), the `docker_*` tables (the daemon's answer, with `cached_at` as
+the TTL's clock instead of a file mtime), the `scope*` tables (the roots
+and reasons the next run's coverage-change note compares),
+`scheduled_runs.parquet`, `ledger.parquet` + `ledger_facts.parquet` (the
+ledger's free-form `evidence` JSON blob is now typed key/value rows),
+and `continuity/<id>.parquet` + `<id>_entries.parquet`. The store's
+allow-list is now exactly `config.toml`, `ui_state.json` (the TUI's
+remembered filter/view -- the one `JsonFile` variant left), lock files
+and the scheduled-observation text log; `store_contents_are_allowlisted`
+holds that list by name. New tables are declared with one `table!`
+invocation in `growth::columns` (row struct = columns; writer and reader
+generated), all through the one audited Parquet write.
+
 ### The store holds facts; a report is computed from them (R20)
 
 R17 through R18a-3b replaced the JSON render cache with typed Parquet

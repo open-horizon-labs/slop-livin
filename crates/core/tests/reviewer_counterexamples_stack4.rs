@@ -179,18 +179,22 @@ fn a_stored_rules_version_without_an_anchor_still_forces_the_rules_walk() {
     assert!(mode_of(&first).contains("mode=full"), "{}", mode_of(&first));
 
     let dir = swamp_core::growth::volume_store_dir(store.path(), &root);
-    let state = dir.join("fsevents.json");
+    let state = dir.join("cursors.parquet");
     assert!(
         state.exists(),
         "the first observation anchors at {}",
         state.display()
     );
     let older = swamp_core::ecosystem::RULES_VERSION - 1;
-    fs::write(
-        &state,
-        format!(
-            "{{\"event_id\":null,\"device\":null,\"last_observed_at\":null,\"rules_version\":{older}}}"
-        ),
+    swamp_core::growth::write_fsevents_anchor(
+        &dir,
+        &swamp_core::fs_events::FsEventsState {
+            event_id: None,
+            device: None,
+            last_observed_at: None,
+            rules_version: older,
+            unit_root: None,
+        },
     )
     .unwrap();
     assert!(dir.join("topology.parquet").exists(), "topology is stored");

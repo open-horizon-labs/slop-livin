@@ -381,18 +381,22 @@ fn a_live_refresh_over_rows_from_an_older_rules_version_walks_in_full() {
     let first = observe(&scope, store.path());
 
     let dir = swamp_core::growth::volume_store_dir(store.path(), &src);
-    let state = dir.join("fsevents.json");
+    let state = dir.join("cursors.parquet");
     assert!(
         state.exists(),
         "precondition: the first observation anchors at {}",
         state.display()
     );
     let older = swamp_core::ecosystem::RULES_VERSION - 1;
-    fs::write(
-        &state,
-        format!(
-            "{{\"event_id\":null,\"device\":null,\"last_observed_at\":null,\"rules_version\":{older}}}"
-        ),
+    swamp_core::growth::write_fsevents_anchor(
+        &dir,
+        &swamp_core::fs_events::FsEventsState {
+            event_id: None,
+            device: None,
+            last_observed_at: None,
+            rules_version: older,
+            unit_root: None,
+        },
     )
     .unwrap();
 

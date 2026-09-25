@@ -256,16 +256,15 @@ impl Drop for NoFloor {
     }
 }
 
-/// The unit-root half of the agent home's `fsevents.json`. The walk
-/// writes the other half of the same file whenever that path is also a
+/// The unit-root half of the agent home's `cursors.parquet`. The walk
+/// writes the other row of the same table whenever that path is also a
 /// scan root, so the two must be compared separately.
-fn unit_cursor(fx: &Fixture) -> serde_json::Value {
-    let path =
-        swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude).join("fsevents.json");
-    let text = fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|v| v["unit_root"].clone())
-        .unwrap_or(serde_json::Value::Null)
+fn unit_cursor(fx: &Fixture) -> Option<swamp_core::fs_events::UnitRootCursor> {
+    swamp_core::growth::read_fsevents_anchor(&swamp_core::growth::volume_store_dir(
+        fx.store.path(),
+        &fx.claude,
+    ))
+    .unit_root
 }
 
 fn reason_for<'a>(o: &'a ScopeObservation, root: &Path) -> &'a str {
@@ -472,11 +471,13 @@ fn a_device_mismatch_re_measures_and_names_the_reason() {
 
     // The agent home's cursor now claims a different volume.
     let dir = swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude);
-    let path = dir.join("fsevents.json");
-    let text = fs::read_to_string(&path).expect("the cursor must have been written");
-    let mut state: serde_json::Value = serde_json::from_str(&text).unwrap();
-    state["unit_root"]["device"] = serde_json::json!(999_999);
-    fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+    let mut state = swamp_core::growth::read_fsevents_anchor(&dir);
+    let unit = state
+        .unit_root
+        .as_mut()
+        .expect("the cursor must have been written");
+    unit.device = Some(999_999);
+    swamp_core::growth::write_fsevents_anchor(&dir, &state).unwrap();
 
     // The window itself, not just its label: a mismatched cursor vouches
     // for nothing under its root, while its neighbour still does. (The
@@ -667,7 +668,7 @@ fn a_partial_pass_does_not_advance_the_cursors() {
     let _ = fx.observe(&ScriptedSource::quiet(10));
     let after_first = unit_cursor(&fx);
     assert!(
-        after_first.is_object(),
+        after_first.is_some(),
         "precondition: the first pass anchored a cursor"
     );
 
@@ -792,13 +793,8 @@ fn a_forced_full_pass_asks_no_source_and_stores_no_cursor() {
         replay.outcomes
     );
     replay.commit().unwrap();
-    let cursor_path =
-        swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude).join("fsevents.json");
     assert!(
-        !cursor_path.exists()
-            || !fs::read_to_string(&cursor_path)
-                .unwrap()
-                .contains("unit_root"),
+        unit_cursor(&fx).is_none(),
         "a forced full pass anchors nothing"
     );
 }
@@ -831,13 +827,8 @@ fn a_platform_without_fsevents_re_measures_and_says_so() {
     );
     assert!(replay.coverage.is_empty(), "no window is earned");
     replay.commit().unwrap();
-    let cursor_path =
-        swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude).join("fsevents.json");
     assert!(
-        !cursor_path.exists()
-            || !fs::read_to_string(&cursor_path)
-                .unwrap()
-                .contains("unit_root"),
+        unit_cursor(&fx).is_none(),
         "an anchor that cannot be replayed from is not stored"
     );
 }
@@ -883,15 +874,16 @@ fn the_walk_and_the_unit_cursor_share_one_file_without_erasing_each_other() {
         .expect("walk");
     }
 
-    let cursor_path =
-        swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude).join("fsevents.json");
-    let text = fs::read_to_string(&cursor_path).unwrap();
-    let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let volume = swamp_core::growth::volume_store_dir(fx.store.path(), &fx.claude);
+    let state = swamp_core::growth::read_fsevents_anchor(&volume);
     assert!(
-        state["unit_root"]["event_id"].is_number(),
-        "the walk must carry the unit anchor through: {text}"
+        state
+            .unit_root
+            .as_ref()
+            .is_some_and(|u| u.event_id.is_some()),
+        "the walk must carry the unit anchor through: {state:?}"
     );
-    assert!(state["event_id"].is_number(), "and keep its own: {text}");
+    assert!(state.event_id.is_some(), "and keep its own: {state:?}");
 
     // And the other way round.
     swamp_core::growth::replay_unit_roots(
@@ -903,11 +895,10 @@ fn the_walk_and_the_unit_cursor_share_one_file_without_erasing_each_other() {
     )
     .commit()
     .unwrap();
-    let text = fs::read_to_string(&cursor_path).unwrap();
-    let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let state = swamp_core::growth::read_fsevents_anchor(&volume);
     assert!(
-        state["last_observed_at"].is_number(),
-        "the unit cursor must carry the walk's anchor through: {text}"
+        state.last_observed_at.is_some(),
+        "the unit cursor must carry the walk's anchor through: {state:?}"
     );
 }
 

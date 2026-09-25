@@ -23,21 +23,10 @@ use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 /// control file's name.
 const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 
-/// Exact basenames allowed anywhere under the store, other than tables.
-///
-/// The JSON control files still here are R18b's to convert; the rest
-/// is what the no-JSON rule allows: `config.toml`, a tiny `ui_state.json`,
-/// lock files.
-const ALLOWED_NAMES: &[&str] = &[
-    "config.toml",
-    "ledger.jsonl",
-    "last_run.json",
-    "fsevents.json",
-    "docker_facts.json",
-    "ui_state.json",
-    "scope.json",
-    "restore.json",
-];
+/// Exact basenames allowed anywhere under the store, other than tables:
+/// what the no-JSON rule allows -- `config.toml`, a tiny `ui_state.json`,
+/// lock files (below), and the scheduled-observation text log.
+const ALLOWED_NAMES: &[&str] = &["config.toml", "ui_state.json", "observe.log"];
 
 /// Every Parquet table the store may hold, by exact basename -- the
 /// runtime twin of the source audit's `TABLE_WRITERS`
@@ -49,6 +38,7 @@ const ALLOWED_NAMES: &[&str] = &[
 /// and fails this test (store-is-facts-report-is-views, R20).
 const TABLES: &[&str] = &[
     // per-volume current state + history (`<store>/<volume>/`)
+    "cursors.parquet",
     "current.parquet",
     "dirs.parquet",
     "files.parquet",
@@ -75,6 +65,21 @@ const TABLES: &[&str] = &[
     "cargo_replay_cache_lists.parquet",
     "cargo_replay_cache_evidence.parquet",
     "cargo_replay_cache_meta.parquet",
+    // control state (`<store>/`), R18b
+    "scheduled_runs.parquet",
+    "scope.parquet",
+    "scope_values.parquet",
+    "scope_roots.parquet",
+    "scope_root_reasons.parquet",
+    "ledger.parquet",
+    "ledger_facts.parquet",
+    "docker_meta.parquet",
+    "docker_images.parquet",
+    "docker_build_cache.parquet",
+    "docker_volumes.parquet",
+    "docker_builders.parquet",
+    "docker_values.parquet",
+    "docker_containers.parquet",
     // scope-wide observation facts (`<store>/`)
     "runs.parquet",
     "coverage.parquet",
@@ -121,10 +126,11 @@ fn allowed(rel: &Path) -> bool {
     {
         return true;
     }
-    // A Linux collector's checkpoint and an observation's sync request
-    // for it (#82): one small control file per watched root.
+    // A Linux collector's checkpoint tables and an observation's sync
+    // request for it (#82): `continuity/<id>.parquet`,
+    // `<id>_entries.parquet`, `<id>.sync`.
     if rel.components().any(|c| c.as_os_str() == "continuity")
-        && (name.ends_with(".json") || name.ends_with(".sync"))
+        && (name.ends_with(".parquet") || name.ends_with(".sync"))
     {
         return true;
     }

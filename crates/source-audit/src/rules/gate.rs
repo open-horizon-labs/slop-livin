@@ -171,11 +171,6 @@ const GROUPS: &[Group] = &[
         why: "a whole-file read is for swamp's own state; anything else is a bounded read",
     },
     Group {
-        path: "@core::fs_gate::read::read_owned_lines",
-        allowed: STORE_MODULES,
-        why: "a whole-file read is for swamp's own state; anything else is a bounded read",
-    },
-    Group {
         path: "@core::fs_gate::columns",
         allowed: &[
             (Krate::Core, &["growth"]),
@@ -1009,6 +1004,8 @@ const TABLE_WRITERS: &[(&str, &str)] = &[
     ("growth::columns", "write_git_signal_rows"),
     ("growth::columns", "write_git_signal_value_rows"),
     ("growth::columns", "write_cargo_replay_meta_rows"),
+    // the one write every `table!`-declared table goes through (R18b)
+    ("growth::columns", "write_table"),
     // the other stores' own single writers
     ("github", "write_cache"),
     ("assoc_store", "write"),

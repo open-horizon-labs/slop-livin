@@ -25,7 +25,7 @@ is the thing that quietly becomes a database.
 
 Mechanism: type, gate audit, runtime test.
 
-**Type.** JSON reaches disk only through `fs_gate::store::write_json(JsonFile, ..)`; `JsonFile` is the allow-list (a new control file is a new variant), and the atomic byte writer is private. **Locations are types too** (re-review 5, finding 4): every variant is a fixed name inside a typed `StoreDir` (the resolved swamp dir, or -- in the store modules only -- `StoreDir::at`, which refuses a relative path, a symlink and a non-directory); the ledger appends only to a store's `ledger.jsonl` (or the `SWAMP_LEDGER_PATH` override, read in the gate); the observation log must be named `observe.log`; the LaunchAgent plist is resolved in the gate; and there is no free `create_dir_all(path)` or `list_owned(path)`.
+**Type.** JSON reaches disk only through `fs_gate::store::write_json(JsonFile, ..)`; `JsonFile` is the allow-list (a new control file is a new variant), and the atomic byte writer is private. **Locations are types too** (re-review 5, finding 4): every variant is a fixed name inside a typed `StoreDir` (the resolved swamp dir, or -- in the store modules only -- `StoreDir::at`, which refuses a relative path, a symlink and a non-directory); the ledger is a store's `ledger.parquet` (`LedgerFile`; or the `SWAMP_LEDGER_PATH` override, read in the gate); the observation log must be named `observe.log`; the LaunchAgent plist is resolved in the gate; and there is no free `create_dir_all(path)` or `list_owned(path)`.
 
 **Gate audit.** `json_writes_allowlisted`: no serde serializer that produces bytes or text (`to_vec*`, `to_string*`, `to_writer*`, `Value`'s `Display`) outside the gate's store module; `std::fs` writes are gate paths.
 
@@ -38,16 +38,15 @@ Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-aud
 | File | Function | Why |
 | --- | --- | --- |
 | `actions.rs` | `write_restore_manifest` | Trash envelope recovery manifest, written beside the moved members |
-| `ledger.rs` | `append` | append-only action ledger (jsonl): a record, not a queryable table |
-| `schedule.rs` | `write_last_run` | a single timestamp marker |
-| `scope.rs` | `persist_effective_scope` | resolved-scope snapshot for the next run's coverage diff |
 | `agents/mod.rs` | `save_protect` | human keep/protect list, written atomically |
 | `cargo_cleanup.rs` | `move_group` | Trash envelope recovery manifest for one Cargo group the TUI moved |
-| `continuity.rs` | `write_checkpoint` | a Linux collector's checkpoint (#82): epoch, coverage and a dirty list bounded by `live_watch::DIRTY_BOUND` -- one small control file per watched root, never an inventory |
 
 (2026-09-23: `actions.rs::save_plan` and `grants.rs::write_grants` are
 removed along with the plan/grant store; `authority.key` no longer
-exists either.)
+exists either. 2026-09-24, R18b: the ledger, the scheduled-run marker,
+the scope snapshot, the FSEvents cursors, the Docker facts cache and
+the Linux collector checkpoint are Parquet tables now -- `JsonFile` has
+one variant, `UiState`; see `store-data-is-parquet-not-json-sidecars`.)
 
 ## Runtime tests that complete it
 

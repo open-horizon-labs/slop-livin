@@ -130,10 +130,3 @@ pub fn bounded_read_header(path: impl AsRef<Path>, cap: BoundedCap) -> io::Resul
 pub fn read_owned_string(path: impl AsRef<Path>) -> io::Result<String> {
     std::fs::read_to_string(path)
 }
-
-/// Every line of an append-only file swamp owns (the ledger).
-pub fn read_owned_lines(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path)?;
-    io::BufReader::new(f).lines().collect()
-}
