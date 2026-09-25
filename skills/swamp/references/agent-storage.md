@@ -27,7 +27,11 @@ Each unit has a `category` (`sessions`, `caches`, `logs`, `checkpoints`,
 `attachments`, `plugins`, `protected-config`, `unclassified`,
 `managed-worktrees`), a `bytes`/`growth_bytes` pair, a `project_link`
 (`linked`/`unresolved`/`missing`/`not-a-project`/`moved`/`remote`/
-`shared`/`not-applicable`, never a basename guess), and `protected`
+`shared`/`not-applicable`, never a basename guess; a `linked` state
+carries `source`: `declared` when the tool's own metadata named the
+path, `inferred` when -- Claude Code only -- no `cwd` was recorded and
+the session's `projects/<slug>` folder name re-encoded exactly one
+known worktree, recomputed every pass), and `protected`
 (true for credentials/config/skills/automation by default, or anything
 a human added with `swamp protect`).
 

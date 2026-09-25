@@ -15,8 +15,9 @@ checkout, the session is now linked with `source: inferred` (text:
 `[inferred from the tool's project folder name, not declared]`; TUI:
 `(inferred)`; JSON: `"source":"inferred"`). Measured on the same
 scratch store: 29 declared / **119 inferred** / 2 unresolved (8.1 MB) /
-8 missing / 10 not-a-project; observe 11.5 -> 12.8 s cold (noise), 2.7 s
-replayed. Codex sessions are unchanged (3,450 unresolved): their
+8 missing / 10 not-a-project; cold observe 11.2-11.9 s before vs
+11.8-12.8 s after (three samples each; the `~/src` walk dominates),
+2.7 s replayed. Codex sessions are unchanged (3,450 unresolved): their
 directories are date-partitioned and their bounded headers carry no
 `cwd`, so there is nothing to infer from.
 

@@ -121,6 +121,70 @@ fn the_slug_encoding_is_the_documented_one_and_is_lossy() {
         claude_folder_slug(Path::new("/a/b-c")),
         claude_folder_slug(Path::new("/a-b/c"))
     );
+    // Documented normalization for the rest: `_`, `.` and every
+    // non-ASCII character become one `-` each. If Claude Code encodes
+    // some class differently the slugs simply never match -- no link,
+    // never a wrong one.
+    assert_eq!(claude_folder_slug(Path::new("/x/a_b.c")), "-x-a-b-c");
+    assert_eq!(claude_folder_slug(Path::new("/x/café")), "-x-caf-");
+}
+
+/// The provenance a consumer sees: JSON carries `"source":"inferred"`
+/// through the existing serde shape (no new field), and the text view
+/// says in words that the link was inferred from the folder name --
+/// so an inferred link can never be mistaken for a declared one in any
+/// output.
+#[test]
+fn an_inferred_link_is_labelled_inferred_in_json_and_text() {
+    let link = ProjectLinkState::Linked {
+        project_id: "p".into(),
+        project_name: "repo".into(),
+        project_path: PathBuf::from("/x/repo"),
+        source: LinkSource::Inferred,
+        worktree_kind: "main".into(),
+    };
+    let json = serde_json::to_value(&link).unwrap();
+    assert_eq!(json["state"], "linked");
+    assert_eq!(json["source"], "inferred");
+
+    let unit = swamp_core::agents::AgentUnit {
+        tool_id: "claude-code".into(),
+        tool_name: "Claude Code".into(),
+        tool_home: PathBuf::from("/x/.claude"),
+        category: swamp_core::agents::AgentCategory::Sessions,
+        id: "s1".into(),
+        relative_path: "projects/-x-repo/s1.jsonl".into(),
+        path: PathBuf::from("/x/.claude/projects/-x-repo/s1.jsonl"),
+        members: Vec::new(),
+        bytes: 1024,
+        hardlinked: true,
+        complete: true,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: 1_000,
+        mtime_max: 900,
+        protected: false,
+        protect_reason: None,
+        project_link: link,
+        action: swamp_core::agents::AgentActionCapability::SessionRemoval,
+        note: None,
+        evidence: Vec::new(),
+    };
+    let text =
+        swamp_core::render::render_view_agents(std::slice::from_ref(&unit), None, true, 1_000);
+    assert!(
+        text.contains("inferred from the tool's project folder name, not declared"),
+        "{text}"
+    );
+    // And the `--project` filter still finds it by name: an inferred
+    // link is a link, labelled.
+    let filtered = swamp_core::render::render_view_agents(
+        std::slice::from_ref(&unit),
+        Some("repo"),
+        true,
+        1_000,
+    );
+    assert!(filtered.contains("s1.jsonl"), "{filtered}");
 }
 
 #[test]
