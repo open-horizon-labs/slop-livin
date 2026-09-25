@@ -4,6 +4,24 @@ Release notes describe behavior at the named version. See the [README](README.md
 
 ## Unreleased
 
+### No JSON in the store: the last per-root replay cache is gone (R18a-4)
+
+The last JSON/zstd file the store held, `last_report-<key>.json.zst`
+(a per-root, compressed cache of the whole previous `Report`, used only
+so an unchanged worktree's git activity could be aged instead of
+recomputed, and so an unchanged Cargo/Node/etc. build container could
+replay instead of re-identifying), is deleted along with
+`growth::write_last_report`/`load_last_report`, `report::last_report_key`,
+`fs_gate::store::JsonFile::LastReport` and every `.zst` reader/writer;
+`zstd` is no longer a `swamp-core` dependency. The two things it served
+are now their own root-keyed Parquet tables, written on the per-root
+observation path rather than a scope-wide one: `git_signals.parquet` (+
+`git_signals_values.parquet`) for the previous pass's git signals, and
+`cargo_replay_cache.parquet` (+ its list/evidence/meta tables, reusing
+`nested_artifacts.parquet`'s own typed row shapes) for the previous
+pass's build-artifact identification cache. See
+`.oh/sessions/2026-09-24-r18a4-last-report-tables.md`.
+
 ### No JSON in the store: the render-cache row is gone (R18a-3b)
 
 The last JSON cell the store held for a scope's report, `report_json`

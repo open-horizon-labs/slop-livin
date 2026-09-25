@@ -643,12 +643,13 @@ itself is not deleted -- `Report.root`/`unowned`/`dirs_by_worktree`/
 `unowned` aggregation over the per-volume `unowned.parquet` tables or a
 larger dirs/files-by-worktree table design, neither of which CHUNK_R17
 named as this slice's four tables. `last_report-*.json.zst`/
-`growth::write_last_report`/`load_last_report` are also untouched:
-`consumers/signals.rs`/`consumers/cargo.rs` read a *per-root* previous
-`Report` from it (previous git signals; previous `nested_artifacts` +
-`observed_at`) for the incremental walk, a different, lower-level need
-than the scope-wide snapshot this section covers, and redesigning it
-onto typed tables is real, separate work.
+`growth::write_last_report`/`load_last_report` were also untouched at
+the time this paragraph was written: `consumers/signals.rs`/
+`consumers/cargo.rs` read a *per-root* previous `Report` from it
+(previous git signals; previous `nested_artifacts` + `observed_at`) for
+the incremental walk, a different, lower-level need than the scope-wide
+snapshot this section covers. R18a-4 (below) redesigned that per-root
+cache onto typed tables and deleted the JSON/zstd cache entirely.
 
 R18a (2026-09-24) migrates the `external_units.parquet`/
 `agent_units.parquet` merge fallback and `unowned.parquet`'s remaining
@@ -808,11 +809,7 @@ JSON persistence machinery at all, only an in-memory assembly. See
 `.oh/sessions/2026-09-24-r18a3b-snapshot-deleted.md`.
 
 `last_report-*.json.zst`/`growth::write_last_report`/`load_last_report`
-are untouched (R18a-4): `consumers/signals.rs`/`consumers/cargo.rs` read
-a *per-root* previous `Report` from it (previous git signals; previous
-`nested_artifacts` + `observed_at`) for the incremental walk, a
-different, lower-level need than the scope-wide snapshot this section
-covers, and redesigning it onto typed tables is real, separate work.
+were untouched through R18a-3b; R18a-4 (2026-09-24, below) deletes them.
 
 `report_scope_from_store` extends the same rebuild to these: an
 `ExternalUnit`/`AgentUnit`'s own scalars and consumers/`project_link`
@@ -858,15 +855,58 @@ full pass had. `--no-observe` is gone from every command (`report`,
 print whatever `du` total the last `observe --verify-du` stored --
 `report` never spawns `du` itself).
 
-The internal `last_report-<key>.json.zst` cache (`fs_gate::store::write_json`/
-`JsonFile::LastReport`) is a *different*, narrower thing that still
-exists: an incremental-walk optimization a few consumers
-(`consumers/cache.rs`, `consumers/cargo.rs`, `consumers/signals.rs`) use
-to diff against the previous pass's own artifact/cargo/signal state
-*during* a walk. It is not on `report`'s read path any more and never
-was the thing this section's `ReportSnapshot` replaces for the TUI; it
-stayed because deleting it would regress an unrelated incremental-walk
-optimization out of this chunk's scope.
+R18a-4 (2026-09-24) deletes the internal `last_report-<key>.json.zst`
+cache (`fs_gate::store::write_json`/`JsonFile::LastReport`) entirely --
+`growth::write_last_report`/`load_last_report`,
+`report::last_report_key`, `JsonFile::LastReport` and every `.zst`
+reader/writer are gone, and `zstd` is no longer a `swamp-core`
+dependency at all (`Cargo.toml`/`Cargo.lock`; it remains only as
+`parquet`'s own transitive compression codec). It was a *different*,
+narrower thing than the scope-wide `ReportSnapshot` this section covers:
+an incremental-walk optimization two consumers used to diff against the
+previous pass's own git-signals/cargo state *during* a walk, never on
+`report`'s read path. Each is now its own root-keyed Parquet table,
+written on the per-root path (`report::observe_scope`'s per-root bus
+run, and every scope-less single-root call -- never gated on a
+scope-wide table another root's pass might not have written yet):
+
+- `<store>/git_signals.parquet` (+ `git_signals_values.parquet` for the
+  rendered `Signal` rows) -- `consumers/signals.rs`'s previous-pass
+  replay: `branch` and every `crate::signals::RawSignals` field, so an
+  unwalked worktree's `age_signals` call ages the *stored* raw values
+  forward instead of reconstructing them by parsing rendered signal
+  text (the old JSON cache's approach, since it only ever stored the
+  rendered `Signal` rows). Written by `SignalsConsumer` itself, right
+  after it computes each pass's full `by_worktree` map -- deliberately
+  *before* `consumers/gate.rs` appends `merge_complete`/`pull_request`
+  from that pass's GitHub facts, so a replay never needs to filter those
+  two back out (the deleted JSON cache persisted the fully merged
+  `Report` and had to).
+- `<store>/cargo_replay_cache.parquet` (+ `cargo_replay_cache_lists
+  .parquet`/`cargo_replay_cache_evidence.parquet`/
+  `cargo_replay_cache_meta.parquet`) -- `consumers/cargo.rs`'s previous-
+  pass `build_adapters::ContainerCache` seed. Reuses
+  `nested_artifacts.parquet`'s own row shapes and stored<->domain
+  conversions verbatim (every `NestedArtifact` field was already typed
+  there by R16/R18a-2), written to their own root-keyed files rather
+  than a new column on `nested_artifacts.parquet` itself:
+  `nested_artifacts.parquet` is scope-keyed and wholesale-replaced
+  exactly once, at the end of `observe_scope`, after every root's bus
+  pass has already run and merged, and is never written at all for a
+  plain single-root, scope-less call -- neither lifecycle matches a
+  per-root pass's own mid-run replay decision. The meta table's
+  `observed_at` is what `ContainerCache::from_previous` needs alongside
+  the units; presence is decided by its row, not by the units list being
+  non-empty, so a root with genuinely zero nested artifacts last pass
+  still replays as "observed", not "never observed".
+
+Both tables are keyed by `growth::root_key` (the canonicalized root's
+id -- the same key space `report::last_report_key` used before deletion,
+moved into `growth` since every other current-state table's key
+derivation lives there), wholesale-replaced per root, and written only
+when `ctx.observe` (a `--no-observe`/pure-read call must never advance
+what a later real observation replays from). See
+`.oh/sessions/2026-09-24-r18a4-last-report-tables.md`.
 
 ### There is no recheck model at a destructive sink any more (retired 2026-09-23)
 
