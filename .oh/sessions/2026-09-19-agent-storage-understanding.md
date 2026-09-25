@@ -82,9 +82,13 @@ instructions file, into that record -- 22 KB median, 48 KB max on a
 structural probe of the 100 most recent rollouts), and the parser
 required the whole line to parse. The `cwd` was at 220-334 bytes in
 every one of them. Fixed by bounded early extraction of exactly the
-supported `session_meta` `payload.cwd` (or `payload.meta.cwd`) from the
-prefix; the bound is unchanged, nothing past the `cwd` is decoded or
-retained, and >8 KiB canary tests pin it. Corroboration candidates
+supported `session_meta` `payload.cwd` (or `payload.meta.cwd`): the
+record is streamed one byte at a time and the read stops at the `cwd`'s
+closing quote, so nothing past it is fetched from the file (an earlier
+same-day cut read the 8 KiB prefix and parsed only the field out of it,
+which the owner correctly rejected -- the contract is about what is
+read); the 8 KiB ceiling is unchanged, and the >8 KiB canary test
+asserts the counted bytes end exactly at the closing quote. Corroboration candidates
 recorded, none adopted: `payload.git.{branch,commit_hash,
 repository_url}` (92/100 records, 18-48 KB in -- beyond the bound),
 `payload.forked_from_id` (9/100; a session id, not a project),

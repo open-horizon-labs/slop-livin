@@ -31,22 +31,46 @@ Observed first-record key order: `timestamp`, `ordinal`, `type`,
 timestamp, cwd, runtime_workspace_roots, originator, cli_version,
 source, thread_source, model_provider, base_instructions.text, ..., git?}`.
 
-## The fix
-`session_meta_cwd_from_prefix`: a tokenizer over the prefix that tracks
-the key path, decodes exactly two strings -- top-level `type` and the
-`cwd` at `payload.cwd` or `payload.meta.cwd` -- and skips every other
-token undecoded. A string the bound cuts through ends the scan; if that
-string is the `cwd`, the answer is `None` (never a prefix of a path).
-`type != session_meta` -> `None`. The read bound is unchanged; the
-whole-line parse still runs first for records that fit (older shapes).
+## The fix (second cut; the first was rejected)
+The first cut (`26fcfe2`) read the 8 KiB prefix through `ctx.derived`
+and ran a tokenizer over it that decoded only `type` and the `cwd`.
+Rejected by the owner, rightly: the instructions text begins ~600 B in,
+so ~7.5 KB of it was in memory before the tokenizer saw a byte. The
+packet's rule is about what is *read*, not what is kept.
 
-Tests (`agents::codex::tests`): `a_first_record_longer_than_the_bound_
-still_links_by_its_early_cwd` (3x-bound instructions text with a canary
-after the `cwd`, both inside and beyond the bound: Linked/Declared,
-one capped read, `no_content_leak`), `the_prefix_extractor_takes_one_
-supported_field_and_nothing_else` (cwd after the bound; cwd cut by the
-bound; `turn_context` record; untyped record; cwd inside an array;
-escaped path; `payload.meta.cwd`; `type` after `payload`).
+Second cut: a new gate primitive `fs_gate::read::bounded_scan_header`
+reads one byte per `read(2)` and stops at the byte the scanner marks
+done, or at the cap (still a `BoundedCap`, still `header_at_most`);
+it retains nothing and counts exactly the bytes fetched. Surfaced as
+`bounded_io::scan_header` and `IdentifyCtx::derived_scanned`, which
+memoises only the extracted value. The Codex adapter's `SessionMetaCwd`
+is a byte-fed state machine: it tracks the key path, decodes key names,
+the top-level `type`, and the `cwd` at `cwd` / `meta.cwd` /
+`payload.cwd` / `payload.meta.cwd`, and returns Done at the `cwd`'s
+closing quote. A record of another kind is refused at its `type`'s
+closing quote, before any `cwd`. A `type` written after the `cwd` is
+not consulted (reaching it would mean reading past the field); Codex
+writes `type` before `payload` in 100/100 probed records, and the
+older, `type`-less envelope shapes still resolve.
+
+Tests: `the_read_ends_at_the_closing_quote_of_the_cwd_and_the_canary_
+after_it_is_never_fetched` -- the canary begins one byte after the
+`cwd`; `counters.header_bytes_read == head.len()` exactly, where `head`
+ends with the closing quote; `the_scanner_stops_at_the_field_and_
+refuses_at_the_record_kind` -- exact stop bytes for: cwd beyond the
+ceiling (stops at the cap, `None`); cwd cut by the ceiling (`None`);
+`turn_context` (refused at the type's closing quote); cwd in an array;
+escaped path (stops at its closing quote, the `SECRET` after it unseen);
+`payload.meta.cwd`; no `type` before the cwd; a non-ASCII path.
+`bounded_io` has its own test of the primitive's stop and cap; the gate
+compile-fail cases (`content_reads_need_a_cap`, `caps_are_named_
+constants`, `no_unbounded_read_in_the_gate`) still pass with the new
+primitive in the gate.
+
+The source audit `adapters_do_not_reach_gates` rejected the first draft
+of the scanner for an `.expect()` (a panic would print its payload);
+replaced with a non-panicking path. That audit doing its job is worth
+recording.
 
 ## Measurement (fresh mktemp store, same config as the folder-inference run)
 | Codex | before (`139a1f6`) | after |
@@ -56,7 +80,7 @@ escaped path; `payload.meta.cwd`; `type` after `payload`).
 | sessions not-a-project (cwd exists, not a git checkout: e.g. a home dir) | 0 | 473 (42.5 MB) |
 | sessions unresolved | 3,450 (1,487.5 MB) | **0** |
 | archived-sessions | 23 unresolved | 23 missing |
-| cold observe | 11.2-12.8 s | 11.5 s |
+| cold observe | 11.2-12.8 s | 11.5 s (prefix parse), 11.7 / 12.2 s (byte stream: ~1.3 M one-byte reads, within noise) |
 | longest string field in any Codex unit's JSON | -- | 153 chars; no instruction text |
 
 Claude Code sessions in the same run: 29 declared / 119 inferred /
@@ -82,6 +106,11 @@ path outside the known worktree set).
   populates it with; recorded as the next cheap gain.
 
 ## Gaps
+- Claude Code's `read_header_cwd` still reads up to 8 KiB of the first
+  records looking for the first one with a `cwd`; when that record is a
+  user message, prompt text is in that buffer. Pre-existing, outside
+  this task's scope, and the same rule applies: it should stream and
+  stop at the field. Recorded, not fixed here.
 - Records where `type` precedes `payload` and both fit in 8 KiB are the
   only shape verified locally; older Codex versions' first lines are
   covered by the pre-existing whole-line tolerance tests, not by

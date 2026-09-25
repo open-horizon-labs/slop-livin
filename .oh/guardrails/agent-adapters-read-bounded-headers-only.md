@@ -1,7 +1,7 @@
 ---
 id: agent-adapters-read-bounded-headers-only
 severity: hard
-statement: "An adapter's only access to file contents is the shared capped reader agents::bounded_io::read_header(path, max_bytes), whose cap is at most 64 KiB. No adapter reads a whole file, streams lines, or deserializes from a reader. Everything else it knows comes from metadata."
+statement: "An adapter's only access to file contents is the shared capped reader agents::bounded_io::read_header(path, max_bytes), whose cap is at most 64 KiB, or the byte-streaming agents::bounded_io::scan_header(path, max_bytes, scan) under the same cap, which stops at the byte the scanner marks done and fetches nothing after it. No adapter reads a whole file, streams lines, or deserializes from a reader. Everything else it knows comes from metadata."
 outcome: decision-relevant-storage-evidence
 audit: adapters_do_not_reach_gates, gate_paths_only_inside_gates
 compile_fail:

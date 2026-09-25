@@ -34,6 +34,24 @@ pub fn read_header(path: &Path, max_bytes: usize) -> Option<String> {
         .map(|b| b.lossy())
 }
 
+pub use crate::fs_gate::read::{Scan, ScanOutcome};
+
+/// Streams `path`'s header to `scan` a byte at a time and stops at the
+/// byte `scan` marks done, under `min(max_bytes, MAX_HEADER_BYTES)`.
+/// For one field that sits near the start of a record whose remainder
+/// is content (a Codex `session_meta`'s `cwd`, followed in the same
+/// record by the project's instructions text): nothing past the field
+/// is fetched, and nothing is buffered here -- `scan` keeps only what
+/// it decodes.
+pub fn scan_header(
+    path: &Path,
+    max_bytes: usize,
+    scan: &mut dyn FnMut(u8) -> Scan,
+) -> Option<ScanOutcome> {
+    let cap = crate::fs_gate::read::BoundedCap::header_at_most(max_bytes.min(MAX_HEADER_BYTES));
+    crate::fs_gate::read::bounded_scan_header(path, cap, scan).ok()
+}
+
 /// The first line of `path`'s header, which is what most adapters
 /// actually want.
 pub fn read_header_line(path: &Path, max_bytes: usize) -> Option<String> {
@@ -45,6 +63,42 @@ pub fn read_header_line(path: &Path, max_bytes: usize) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_scan_stops_at_the_byte_the_scanner_marks_done_and_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        fs::write(&p, b"abcXdef").unwrap();
+        let mut seen = Vec::new();
+        let out = scan_header(&p, 64, &mut |b| {
+            seen.push(b);
+            if b == b'X' { Scan::Done } else { Scan::More }
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            ScanOutcome {
+                bytes_read: 4,
+                done: true
+            }
+        );
+        assert_eq!(seen, b"abcX");
+
+        let mut n = 0usize;
+        let out = scan_header(&p, 2, &mut |_| {
+            n += 1;
+            Scan::More
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            ScanOutcome {
+                bytes_read: 2,
+                done: false
+            }
+        );
+        assert_eq!(n, 2);
+    }
 
     #[test]
     fn a_read_never_exceeds_the_hard_cap() {

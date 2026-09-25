@@ -1144,6 +1144,35 @@ impl<'a> IdentifyCtx<'a> {
         max_bytes: usize,
         derive: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
+        self.derived_by(adapter_id, kind, path, &|| {
+            bounded_io::read_header(path, max_bytes).and_then(|text| derive(&text))
+        })
+    }
+
+    /// [`Self::derived`] for a field a byte scanner extracts from the
+    /// start of the file ([`bounded_io::scan_header`]): the read stops
+    /// at the field, nothing after it is fetched, and only the extracted
+    /// value is memoised. `scan` is called once per miss with a fresh
+    /// scanner state; it returns the value, or `None` when the record
+    /// declares nothing the scanner recognises.
+    pub fn derived_scanned(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        path: &Path,
+        max_bytes: usize,
+        scan: &dyn Fn(&Path, usize) -> Option<String>,
+    ) -> Option<String> {
+        self.derived_by(adapter_id, kind, path, &|| scan(path, max_bytes))
+    }
+
+    fn derived_by(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        path: &Path,
+        read: &dyn Fn() -> Option<String>,
+    ) -> Option<String> {
         let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
             return None;
         };
@@ -1159,7 +1188,7 @@ impl<'a> IdentifyCtx<'a> {
             }
         }
         crate::work_counters::record_cache_miss();
-        let value = bounded_io::read_header(path, max_bytes).and_then(|text| derive(&text));
+        let value = read();
         if self.cache.enabled {
             self.cache.entries.borrow_mut().insert(
                 key,

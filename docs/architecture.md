@@ -1671,11 +1671,12 @@ function pointer on the event thread is rejected rather than followed.
   location for them); they are ordinary Git worktrees the normal scan
   already discovers, and this adapter cross-references rather than
   double-counts them. Codex's session-header envelope shape around its
-  `cwd` field (read from the bounded 8 KiB prefix of a record that is
-  itself far longer -- the project's instructions text rides in the same
-  record -- by a tokenizer that decodes only `type` and the supported
-  `cwd`; corrected 2026-09-25 after every Codex session had read
-  `unresolved`), Oh My Pi's blob-reference GC, and OpenCode's snapshot/
+  `cwd` field (streamed one byte at a time through
+  `bounded_io::scan_header` and stopped at the field's closing quote,
+  because the record is itself far longer -- the project's instructions
+  text rides in it -- and the contract is about what is read, not what
+  is kept; the scanner decodes only `type` and the supported `cwd`;
+  corrected 2026-09-25 after every Codex session had read `unresolved`), Oh My Pi's blob-reference GC, and OpenCode's snapshot/
   `storage/part` actions are each documented, deliberate scope
   boundaries in `docs/agent-storage.md`, not silent gaps.
 

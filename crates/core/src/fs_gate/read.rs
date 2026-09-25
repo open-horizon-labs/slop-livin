@@ -126,6 +126,59 @@ pub fn bounded_read_header(path: impl AsRef<Path>, cap: BoundedCap) -> io::Resul
     Ok(read)
 }
 
+/// What a byte scanner says after each byte of a streamed header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scan {
+    /// Feed the next byte.
+    More,
+    /// This byte completed the field; read nothing after it.
+    Done,
+}
+
+/// How a streamed header read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// Bytes fetched from the file: exactly the bytes the scanner saw.
+    pub bytes_read: usize,
+    /// The scanner said [`Scan::Done`] (else the cap or the file ended).
+    pub done: bool,
+}
+
+/// Streams a header to `scan` one byte per read, and stops at the byte
+/// `scan` marks [`Scan::Done`] -- or at `cap`, or at the end of the file.
+///
+/// The difference from [`bounded_read_header`] is what is *in memory*:
+/// that reads the whole cap into a buffer before a parser sees any of
+/// it, so a field 300 bytes in costs holding 8 KiB of whatever follows
+/// it. Here no byte past the stop is fetched from the file and no byte
+/// is retained by this function; only what `scan` chooses to keep exists
+/// afterwards. The price is one `read(2)` per byte, which is why it is
+/// for a field that sits near the start of a record, never for a whole
+/// header. Counted as header bytes by `work_counters`, so a test can
+/// assert the read ended at the field, not merely under the cap.
+pub fn bounded_scan_header(
+    path: impl AsRef<Path>,
+    cap: BoundedCap,
+    scan: &mut dyn FnMut(u8) -> Scan,
+) -> io::Result<ScanOutcome> {
+    let mut file = std::fs::File::open(path.as_ref())?;
+    let mut byte = [0u8; 1];
+    let mut bytes_read = 0usize;
+    let mut done = false;
+    while bytes_read < cap.0 {
+        if file.read(&mut byte)? == 0 {
+            break;
+        }
+        bytes_read += 1;
+        if scan(byte[0]) == Scan::Done {
+            done = true;
+            break;
+        }
+    }
+    crate::work_counters::record_header_bytes(bytes_read as u64);
+    Ok(ScanOutcome { bytes_read, done })
+}
+
 /// [`read_owned`], as UTF-8.
 pub fn read_owned_string(path: impl AsRef<Path>) -> io::Result<String> {
     std::fs::read_to_string(path)

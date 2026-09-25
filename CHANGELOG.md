@@ -20,25 +20,6 @@ scratch store: 29 declared / **119 inferred** / 2 unresolved (8.1 MB) /
 2.7 s replayed. Codex sessions carry no folder signal (date-partitioned
 directories); their linkage comes from the declared `cwd` -- see the
 next entry, which is what had made all 3,450 of them `unresolved`.
-
-### Codex sessions link again: the `cwd` is taken from the bounded prefix
-
-Every current Codex rollout's first record -- `session_meta` with
-`payload.cwd` a few hundred bytes in -- is longer than the 8 KiB read
-bound, because the same record carries `payload.base_instructions.text`
-(the project's instructions file; 22 KB median, 48 KB max on a
-structural probe of the 100 most recent local rollouts). The parser
-required the whole line to parse, so it found no `cwd` in any Codex
-session (3,450 `unresolved`, 1.5 GB, on the owner's machine). The
-adapter now takes exactly the supported `session_meta` `cwd` from the
-prefix that was read, with a tokenizer that decodes two strings (`type`
-and the `cwd` at its supported path) and skips everything else; a
-`cwd` the bound cuts through is never a partial path, and a `cwd` in
-any other record kind is not evidence. The read bound is unchanged and
-the >8 KiB canary tests pin that nothing past the `cwd` reaches a unit.
-Not used, on purpose: `payload.git.*` sits after the instructions text
-(18-48 KB in) and `forked_from_id` names a session, not a project.
-
 What it never does: decode the slug (the encoding is lossy -- `/a/b-c`
 and `/a-b/c` share one), match a basename, overrule a declared `cwd`
 (a missing declared path stays `missing`), claim a `moved` link, or
@@ -47,6 +28,31 @@ current known worktrees on every pass, and a slug that re-encodes two
 known paths stays `unresolved` saying so. Container rows are versioned
 (`agent-container/2026-09-25.1`); older rows re-identify once.
 Adversarial cases in `crates/core/tests/agent_folder_inference.rs`.
+
+### Codex sessions link again: the read stops at the `cwd`'s closing quote
+
+Every current Codex rollout's first record -- `session_meta` with
+`payload.cwd` a few hundred bytes in -- is longer than the 8 KiB read
+ceiling, because the same record carries `payload.base_instructions.text`
+(the project's instructions file; 22 KB median, 48 KB max on a
+structural probe of the 100 most recent local rollouts). The parser
+required the whole line to parse, so it found no `cwd` in any Codex
+session (3,450 `unresolved`, 1.5 GB, on the owner's machine). The
+adapter now streams the record one byte at a time
+(`bounded_io::scan_header`, a new gate primitive under the same 8 KiB
+ceiling) and **stops at the closing quote of the `cwd`**: the
+instructions text after it is never fetched from the file -- not read
+and discarded, not read. The scanner decodes two strings (`type` and
+the `cwd` at its supported path) and skips everything else undecoded; a
+`cwd` the ceiling cuts through is never a partial path; a record of
+another kind is refused at its `type`, before any `cwd`. The canary
+test places content one byte after the `cwd` and asserts the counted
+header bytes end exactly at the closing quote. Measured: 0 -> 1,217
+Codex sessions linked (590.6 MB), 1,760 `missing`, 473 `not-a-project`,
+0 `unresolved`; cold observe unchanged within noise (11.7-12.2 s)
+despite one `read(2)` per byte. Not used, on purpose: `payload.git.*`
+sits after the instructions text (18-48 KB in) and `forked_from_id`
+names a session, not a project.
 
 ### An unchanged `observe` is seconds, not minutes (R19)
 

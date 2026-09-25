@@ -42,9 +42,11 @@
 //!   project's instructions file in the same record. A parser that needs
 //!   the whole line therefore found *no* Codex `cwd` at all (3,450
 //!   sessions "unresolved" on the owner's machine). `read_header_cwd`
-//!   now takes exactly the supported field from the bounded prefix
-//!   (`session_meta_cwd_from_prefix`) when the line does not parse
-//!   whole. Not used, deliberately: `payload.git.{branch,commit_hash,
+//!   now streams the record one byte at a time and stops at the closing
+//!   quote of the `cwd` ([`SessionMetaCwd`] over
+//!   `bounded_io::scan_header`): the instructions text after it is never
+//!   fetched from the file, let alone parsed and discarded. Not used,
+//!   deliberately: `payload.git.{branch,commit_hash,
 //!   repository_url}` sits after the instructions text (18-48 KB in,
 //!   92/100 records) and would need the read bound raised through it;
 //!   `payload.forked_from_id` (9/100) names another *session*, not a
@@ -74,7 +76,7 @@
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
-    mtime_secs,
+    bounded_io, mtime_secs,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -93,8 +95,10 @@ const MAX_CONTAINERS: usize = 20_000;
 /// Depth below a session root at which a directory becomes a container:
 /// `sessions/<yyyy>/<mm>/<dd>/`, upstream's documented layout.
 const CONTAINER_DEPTH: usize = 3;
-/// Bound on how many bytes of a rollout file's first line this adapter
+/// Ceiling on how many bytes of a rollout file's first line this adapter
 /// will ever read looking for a `cwd` field -- never whole transcripts.
+/// A ceiling, not a read size: the read stops at the `cwd`'s closing
+/// quote, a few hundred bytes in ([`SessionMetaCwd`]).
 const HEADER_READ_BYTES: usize = 8192;
 /// Bound on how many nested date directories a session-tree walk
 /// descends before giving up on a subtree, so a pathologically deep or
@@ -295,138 +299,234 @@ fn collect_jsonl_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Ve
 /// adapter version)` through the identification cache: an unchanged
 /// home costs zero header bytes on a second pass.
 fn read_header_cwd(path: &Path, ctx: &IdentifyCtx) -> Option<String> {
-    ctx.derived(CODEX_TOOL_ID, "cwd", path, HEADER_READ_BYTES, &|text| {
-        let first_line = text.lines().next()?;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(first_line) {
-            // A record that fits in the bound: the version-varying
-            // envelope shapes (see module doc comment), first match wins.
-            for candidate in [
-                value.get("cwd"),
-                value.get("meta").and_then(|m| m.get("cwd")),
-                value.get("payload").and_then(|p| {
-                    p.get("cwd")
-                        .or_else(|| p.get("meta").and_then(|m| m.get("cwd")))
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Some(s) = candidate.as_str().filter(|s| !s.is_empty()) {
-                    return Some(s.to_string());
-                }
-            }
-            return None;
-        }
-        // The record is longer than the bound (current Codex writes
-        // `payload.base_instructions.text` -- the project's instructions
-        // file -- into the same first record: 22 KB median, 48 KB max on
-        // the 2026-09-25 local probe, every one of 100 rollouts). The
-        // `cwd` sits a few hundred bytes in; take exactly that one field
-        // from the prefix that was read, and nothing else.
-        session_meta_cwd_from_prefix(first_line)
-    })
+    ctx.derived_scanned(
+        CODEX_TOOL_ID,
+        "cwd",
+        path,
+        HEADER_READ_BYTES,
+        &|path, max_bytes| {
+            let mut scanner = SessionMetaCwd::default();
+            bounded_io::scan_header(path, max_bytes, &mut |b| scanner.feed(b))?;
+            scanner.finish()
+        },
+    )
 }
 
-/// The `payload.cwd` (or `payload.meta.cwd`) of a `session_meta` record
-/// whose JSON was cut off by the read bound.
+/// A byte-at-a-time scanner for the one field this adapter reads: the
+/// `cwd` of a rollout's first `session_meta` record.
 ///
-/// A tokenizer over the prefix, not a parser: it tracks the key path,
-/// decodes exactly two string values -- the top-level `type`, to confirm
-/// this is a `session_meta` record, and the `cwd` at the supported path
-/// -- and skips every other token without decoding or keeping it. A
-/// string the bound cuts through ends the scan; if that string was the
-/// `cwd` itself the answer is `None`, never a prefix of a path. Any
-/// record whose `type` is not `session_meta` yields `None`: a `cwd`
-/// somewhere in a later, unsupported record shape is not evidence.
-fn session_meta_cwd_from_prefix(prefix: &str) -> Option<String> {
-    const ARRAY: &str = "[]";
-    let b = prefix.as_bytes();
-    let n = b.len();
-    let mut i = 0usize;
-    // Object frames hold the current key (`None` before the first key);
-    // array frames hold `ARRAY`, so nothing inside an array matches a
-    // supported path.
-    let mut stack: Vec<Option<&str>> = Vec::new();
-    let mut expect_key = false;
-    let mut record_type: Option<String> = None;
-    let mut cwd: Option<String> = None;
-    let path_is = |stack: &[Option<&str>], want: &[&str]| {
-        stack.len() == want.len() && stack.iter().zip(want).all(|(s, w)| *s == Some(*w))
-    };
-    while i < n {
-        match b[i] {
-            b'{' => {
-                stack.push(None);
-                expect_key = true;
-                i += 1;
+/// Why a scanner and not a parser: the record is far longer than the
+/// `cwd` is deep into it (see the module doc's 2026-09-25 probe -- the
+/// project's instructions text rides in the same record), and the
+/// privacy contract is about what is *read*, not what is kept. So the
+/// read ([`bounded_io::scan_header`]) fetches one byte per `read(2)` and
+/// stops at the byte this scanner marks done: the closing quote of the
+/// `cwd` value. Nothing after it is fetched from the file.
+///
+/// What it decodes: object key names (to know where it is), the
+/// top-level `type`, and the `cwd` at one of the supported paths
+/// (`cwd`, `meta.cwd`, `payload.cwd`, `payload.meta.cwd` -- the module
+/// doc's tolerance). Every other value is skipped byte by byte, never
+/// collected. Anything inside an array is not a supported path.
+///
+/// What it answers: the `cwd` when `type` was `session_meta` or no
+/// `type` had appeared before the `cwd` (the older envelope shapes carry
+/// none); nothing when `type` named another record kind -- and that
+/// answer is given at the `type`'s closing quote, before any `cwd`. A
+/// `type` written *after* the `cwd` is not consulted: reaching it would
+/// mean reading past the field, which is the thing this exists to avoid.
+/// Codex's serializer writes `type` before `payload`, as the probe saw
+/// in 100/100 records.
+#[derive(Default)]
+struct SessionMetaCwd {
+    /// One frame per open `{` / `[`. An object frame carries its current
+    /// key; an array frame carries `None` and matches no supported path.
+    stack: Vec<Frame>,
+    /// Inside an object, the next string is a key.
+    expect_key: bool,
+    /// Inside a string: what to do with its bytes.
+    string: Option<StringState>,
+    record_type: Option<String>,
+    cwd: Option<String>,
+    /// The scan ended because the record could not carry the field
+    /// (another record kind).
+    refused: bool,
+}
+
+enum Frame {
+    Object { key: Option<String> },
+    Array,
+}
+
+struct StringState {
+    capture: Capture,
+    /// Raw bytes of a captured string (escapes still encoded), decoded
+    /// as JSON at the closing quote. Empty for a skipped string.
+    raw: Vec<u8>,
+    escaped: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Key,
+    Type,
+    Cwd,
+    Skip,
+}
+
+impl SessionMetaCwd {
+    fn path_is(&self, want: &[&str]) -> bool {
+        self.stack.len() == want.len()
+            && self.stack.iter().zip(want).all(|(f, w)| match f {
+                Frame::Object { key: Some(k) } => k == w,
+                _ => false,
+            })
+    }
+
+    fn at_supported_cwd(&self) -> bool {
+        self.path_is(&["cwd"])
+            || self.path_is(&["meta", "cwd"])
+            || self.path_is(&["payload", "cwd"])
+            || self.path_is(&["payload", "meta", "cwd"])
+    }
+
+    fn feed(&mut self, b: u8) -> bounded_io::Scan {
+        if self.string.is_some() {
+            self.feed_in_string(b)
+        } else {
+            self.feed_structure(b)
+        }
+    }
+
+    fn feed_in_string(&mut self, b: u8) -> bounded_io::Scan {
+        use bounded_io::Scan;
+        let Some(st) = self.string.as_mut() else {
+            return Scan::More;
+        };
+        if st.escaped {
+            st.escaped = false;
+            if st.capture != Capture::Skip {
+                st.raw.push(b);
             }
-            b'[' => {
-                stack.push(Some(ARRAY));
-                expect_key = false;
-                i += 1;
-            }
-            b'}' | b']' => {
-                stack.pop();
-                expect_key = false;
-                i += 1;
-            }
-            b':' => {
-                expect_key = false;
-                i += 1;
-            }
-            b',' => {
-                expect_key = stack.last().is_some_and(|f| *f != Some(ARRAY));
-                i += 1;
+            return Scan::More;
+        }
+        match b {
+            b'\\' => {
+                st.escaped = true;
+                if st.capture != Capture::Skip {
+                    st.raw.push(b);
+                }
+                Scan::More
             }
             b'"' => {
-                // The closing quote, honouring escapes; none before the
-                // bound means the bound cut this string.
-                let mut j = i + 1;
-                let mut closed = false;
-                while j < n {
-                    match b[j] {
-                        b'\\' => j += 2,
-                        b'"' => {
-                            closed = true;
-                            break;
-                        }
-                        _ => j += 1,
-                    }
-                }
-                if !closed {
-                    break;
-                }
-                let quoted = &prefix[i..=j];
-                if expect_key {
-                    if let Some(frame) = stack.last_mut() {
-                        *frame = Some(&prefix[i + 1..j]);
-                    }
-                    expect_key = false;
-                } else if path_is(&stack, &["type"]) {
-                    record_type = serde_json::from_str::<String>(quoted).ok();
-                } else if path_is(&stack, &["payload", "cwd"])
-                    || path_is(&stack, &["payload", "meta", "cwd"])
-                {
-                    cwd = serde_json::from_str::<String>(quoted).ok();
-                }
-                if record_type.is_some() && cwd.is_some() {
-                    break;
-                }
-                i = j + 1;
+                let Some(st) = self.string.take() else {
+                    return Scan::More;
+                };
+                self.close_string(st)
             }
-            c if c.is_ascii_whitespace() => i += 1,
-            // A number, `true`, `false` or `null`: skip to its end.
             _ => {
-                while i < n && !matches!(b[i], b',' | b'}' | b']' | b'"' | b'{' | b'[') {
-                    i += 1;
+                if st.capture != Capture::Skip {
+                    st.raw.push(b);
                 }
+                Scan::More
             }
         }
     }
-    if record_type.as_deref() != Some("session_meta") {
-        return None;
+
+    /// The closing quote of a string: a key names the frame, `type`
+    /// decides whether the record can carry the field, the `cwd` ends
+    /// the scan.
+    fn close_string(&mut self, st: StringState) -> bounded_io::Scan {
+        use bounded_io::Scan;
+        match st.capture {
+            Capture::Key => {
+                if let Some(Frame::Object { key }) = self.stack.last_mut() {
+                    *key = String::from_utf8(st.raw).ok();
+                }
+                Scan::More
+            }
+            Capture::Type => {
+                let t = decode_json_string(&st.raw);
+                let ok = t.as_deref() == Some("session_meta");
+                self.record_type = t;
+                if ok {
+                    Scan::More
+                } else {
+                    self.refused = true;
+                    Scan::Done
+                }
+            }
+            Capture::Cwd => {
+                self.cwd = decode_json_string(&st.raw);
+                Scan::Done
+            }
+            Capture::Skip => Scan::More,
+        }
     }
-    cwd.filter(|s| !s.is_empty())
+
+    fn feed_structure(&mut self, b: u8) -> bounded_io::Scan {
+        use bounded_io::Scan;
+        match b {
+            b'{' => {
+                self.stack.push(Frame::Object { key: None });
+                self.expect_key = true;
+            }
+            b'[' => {
+                self.stack.push(Frame::Array);
+                self.expect_key = false;
+            }
+            b'}' | b']' => {
+                self.stack.pop();
+                self.expect_key = false;
+            }
+            b':' => self.expect_key = false,
+            b',' => {
+                self.expect_key = matches!(self.stack.last(), Some(Frame::Object { .. }));
+            }
+            b'"' => {
+                let capture = if self.expect_key {
+                    Capture::Key
+                } else if self.path_is(&["type"]) {
+                    Capture::Type
+                } else if self.at_supported_cwd() {
+                    Capture::Cwd
+                } else {
+                    Capture::Skip
+                };
+                self.expect_key = false;
+                self.string = Some(StringState {
+                    capture,
+                    raw: Vec::new(),
+                    escaped: false,
+                });
+            }
+            b'\n' => {
+                // End of the first line without the field.
+                self.refused = true;
+                return Scan::Done;
+            }
+            // Numbers, `true`/`false`/`null`, whitespace: structure
+            // the delimiters above already track.
+            _ => {}
+        }
+        Scan::More
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.refused {
+            return None;
+        }
+        self.cwd.filter(|s| !s.is_empty())
+    }
+}
+
+/// The JSON string whose raw (still escaped) contents are `raw`.
+fn decode_json_string(raw: &[u8]) -> Option<String> {
+    let mut quoted = Vec::with_capacity(raw.len() + 2);
+    quoted.push(b'"');
+    quoted.extend_from_slice(raw);
+    quoted.push(b'"');
+    serde_json::from_slice::<String>(&quoted).ok()
 }
 
 // ---------------------------------------------------------------------
@@ -1002,23 +1102,26 @@ mod tests {
     /// rollouts): one `session_meta` line carrying `payload.cwd` a few
     /// hundred bytes in, followed in the *same* record by
     /// `payload.base_instructions.text` -- the project's instructions
-    /// file, 22 KB median -- so the line is longer than the read bound
-    /// and never parses whole. The `cwd` is taken from the prefix; the
-    /// canary placed after it, both inside and beyond the bound, never
-    /// reaches any unit, and the read stays capped.
+    /// file, 22 KB median -- so the line is far longer than the ceiling.
+    /// The read must end at the `cwd`'s closing quote: the canary that
+    /// begins one byte later is never fetched, and the counted header
+    /// bytes say so exactly.
     #[test]
-    fn a_first_record_longer_than_the_bound_still_links_by_its_early_cwd() {
+    fn the_read_ends_at_the_closing_quote_of_the_cwd_and_the_canary_after_it_is_never_fetched() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let repo = home.join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         let canary = "CANARY-instructions-3c9e";
-        let line = format!(
+        let head = format!(
             "{{\"timestamp\":\"2026-09-25T10:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\
-             \"payload\":{{\"session_id\":\"s\",\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"{}\",\
-             \"runtime_workspace_roots\":[\"{}\"],\"originator\":\"codex_cli_rs\",\
-             \"base_instructions\":{{\"text\":\"{canary} {}\"}},\"git\":{{\"branch\":\"main\"}}}}}}\n",
-            repo.display(),
+             \"payload\":{{\"session_id\":\"s\",\"id\":\"s\",\"forked_from_id\":null,\
+             \"timestamp\":\"t\",\"cwd\":\"{}\"",
+            repo.display()
+        );
+        let line = format!(
+            "{head},\"canary\":\"{canary}\",\"runtime_workspace_roots\":[\"{}\"],\
+             \"base_instructions\":{{\"text\":\"{}\"}},\"git\":{{\"branch\":\"main\"}}}}}}\n",
             repo.display(),
             "i".repeat(3 * HEADER_READ_BYTES)
         );
@@ -1039,80 +1142,89 @@ mod tests {
             }
             other => panic!("the early cwd must link the session: {other:?}"),
         }
+        // Exactly the bytes through the cwd's closing quote -- `head`
+        // ends with it -- and not one more.
+        assert_eq!(
+            counters.header_bytes_read,
+            head.len() as u64,
+            "the read must end at the closing quote of the cwd"
+        );
         assert!(
-            counters.header_bytes_read <= HEADER_READ_BYTES as u64,
-            "one capped read: {}",
-            counters.header_bytes_read
+            line[head.len()..].starts_with(",\"canary\""),
+            "fixture: the canary must begin right after the cwd"
         );
         contract::no_content_leak(&units, canary);
-        // The extractor itself never returns the instructions text.
-        assert_eq!(
-            session_meta_cwd_from_prefix(&line[..HEADER_READ_BYTES]).as_deref(),
-            Some(repo.display().to_string().as_str())
-        );
     }
 
-    /// What the prefix extractor refuses: a `cwd` beyond the bound, a
-    /// `cwd` the bound cuts through (never a prefix of a path), a `cwd`
-    /// in a record that is not `session_meta`, and a `cwd` inside an
-    /// array. What it accepts: an escaped path, and the older
-    /// `payload.meta.cwd` nesting.
+    /// The scanner over synthetic records, with the exact byte at which
+    /// each scan stops. What it refuses: a `cwd` beyond the ceiling; a
+    /// `cwd` the ceiling cuts through (never a prefix of a path); any
+    /// record whose `type` is not `session_meta` -- refused at the
+    /// `type`'s closing quote, before any `cwd`; a `cwd` inside an array.
+    /// What it accepts: an escaped path, `payload.meta.cwd`, and a record
+    /// with no `type` before the `cwd` (the older envelope shapes).
     #[test]
-    fn the_prefix_extractor_takes_one_supported_field_and_nothing_else() {
-        let big = "x".repeat(HEADER_READ_BYTES);
-        let cut = |line: &str| line[..line.len().min(HEADER_READ_BYTES)].to_string();
+    fn the_scanner_stops_at_the_field_and_refuses_at_the_record_kind() {
+        fn scan(line: &str, cap: usize) -> (Option<String>, usize) {
+            let mut sc = SessionMetaCwd::default();
+            let mut n = 0usize;
+            for &b in line.as_bytes().iter().take(cap) {
+                n += 1;
+                if sc.feed(b) == bounded_io::Scan::Done {
+                    break;
+                }
+            }
+            (sc.finish(), n)
+        }
+        let cap = HEADER_READ_BYTES;
+        let big = "x".repeat(cap);
 
-        // cwd after the bound: nothing.
+        // cwd after the ceiling: nothing, and the read stopped at the cap.
         let after = format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"base_instructions\":{{\"text\":\"{big}\"}},\"cwd\":\"/a/b\"}}}}"
         );
-        assert_eq!(session_meta_cwd_from_prefix(&cut(&after)), None);
+        assert_eq!(scan(&after, cap), (None, cap));
 
-        // The bound lands inside the cwd value: never a partial path.
-        let head = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/";
-        let inside = format!("{head}{}\"}}}}", "b".repeat(HEADER_READ_BYTES));
-        let got = session_meta_cwd_from_prefix(&cut(&inside));
-        assert_eq!(got, None, "{got:?}");
-
-        // Not a session_meta record: a cwd elsewhere is not evidence.
-        let other = format!(
-            "{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"/a/b\",\"x\":\"{big}\"}}}}"
+        // The ceiling lands inside the cwd value: never a partial path.
+        let inside = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/a/{}\"}}}}",
+            "b".repeat(cap)
         );
-        assert_eq!(session_meta_cwd_from_prefix(&cut(&other)), None);
+        assert_eq!(scan(&inside, cap).0, None);
 
-        // No type at all before the bound: nothing.
-        let untyped = format!("{{\"payload\":{{\"cwd\":\"/a/b\",\"x\":\"{big}\"}}}}");
-        assert_eq!(session_meta_cwd_from_prefix(&cut(&untyped)), None);
+        // Another record kind: refused at the type's closing quote.
+        let other = "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/a/b\"}}";
+        let (got, n) = scan(other, cap);
+        assert_eq!(got, None);
+        assert_eq!(n, "{\"type\":\"turn_context\"".len());
 
-        // A cwd inside an array is not the supported path.
-        let arr = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"roots\":[{{\"cwd\":\"/a/b\"}}],\"x\":\"{big}\"}}}}"
-        );
-        assert_eq!(session_meta_cwd_from_prefix(&cut(&arr)), None);
+        // A cwd inside an array is not the supported path; the record
+        // ends without one.
+        let arr = "{\"type\":\"session_meta\",\"payload\":{\"roots\":[{\"cwd\":\"/a/b\"}]}}\n";
+        assert_eq!(scan(arr, cap).0, None);
 
-        // Escapes decode; `payload.meta.cwd` is accepted too.
-        let escaped = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/a/q\\\"b\\\\c\",\"x\":\"{big}\"}}}}"
-        );
+        // Escapes decode; the read ends at the closing quote.
+        let escaped =
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/q\\\"b\\\\c\",\"x\":\"SECRET\"}}";
+        let (got, n) = scan(escaped, cap);
+        assert_eq!(got.as_deref(), Some("/a/q\"b\\c"));
         assert_eq!(
-            session_meta_cwd_from_prefix(&cut(&escaped)).as_deref(),
-            Some("/a/q\"b\\c")
+            &escaped[..n],
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/q\\\"b\\\\c\""
         );
-        let nested = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"meta\":{{\"cwd\":\"/a/b\"}},\"x\":\"{big}\"}}}}"
-        );
-        assert_eq!(
-            session_meta_cwd_from_prefix(&cut(&nested)).as_deref(),
-            Some("/a/b")
-        );
-        // `type` after `payload` still counts: order is not assumed.
-        let late_type = format!(
-            "{{\"payload\":{{\"cwd\":\"/a/b\"}},\"type\":\"session_meta\",\"x\":\"{big}\"}}"
-        );
-        assert_eq!(
-            session_meta_cwd_from_prefix(&cut(&late_type)).as_deref(),
-            Some("/a/b")
-        );
+        assert!(!escaped[..n].contains("SECRET"));
+
+        // `payload.meta.cwd` and a record with no `type` before the cwd.
+        let nested = "{\"type\":\"session_meta\",\"payload\":{\"meta\":{\"cwd\":\"/a/b\"}}}";
+        assert_eq!(scan(nested, cap).0.as_deref(), Some("/a/b"));
+        let untyped = "{\"payload\":{\"cwd\":\"/a/b\"},\"type\":\"session_meta\"}";
+        let (got, n) = scan(untyped, cap);
+        assert_eq!(got.as_deref(), Some("/a/b"));
+        assert_eq!(&untyped[..n], "{\"payload\":{\"cwd\":\"/a/b\"");
+
+        // A non-ASCII path arrives intact.
+        let utf8 = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/caf\u{e9}\"}}";
+        assert_eq!(scan(utf8, cap).0.as_deref(), Some("/a/caf\u{e9}"));
     }
 
     #[test]

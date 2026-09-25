@@ -425,8 +425,9 @@ today vs. named-and-planned). In short:
 
 - **Privacy is a hard contract.** Identification reads directory names,
   file sizes/mtimes, and -- for a session's project linkage -- only a
-  bounded header of its transcript file (the first 8 KiB), looking for a
-  `cwd` field. A Claude Code session with no `cwd` there may be linked
+  bounded header of its transcript file (at most the first 8 KiB; for
+  Codex, exactly the bytes through the `cwd`'s closing quote, streamed
+  one byte at a time), looking for a `cwd` field. A Claude Code session with no `cwd` there may be linked
   by *inference* from its `projects/<slug>` folder name when that name
   re-encodes exactly one known worktree; the report says `inferred`, and
   the link is recomputed each pass (`docs/agent-storage.md`). No
