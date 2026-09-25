@@ -380,6 +380,52 @@ pub fn annotate_readonly(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
+    annotate_readonly_inner(
+        swamp_dir,
+        volume_id,
+        projects,
+        observed_at,
+        retention_days,
+        since_secs,
+        false,
+    )
+}
+
+/// [`annotate_readonly`] for a read of the observation stamped
+/// `observed_at` itself (`derive_report_views`): the history points
+/// that observation wrote -- stamped exactly `observed_at` -- are
+/// excluded, so growth is measured against what came before it, as the
+/// persisting pass measured it (its index was built before it wrote).
+/// Only there: a live read at `now` must keep a previous pass's rows
+/// that happen to share its second (R19, Linux CI caught it).
+pub(crate) fn annotate_readonly_before(
+    swamp_dir: &Path,
+    volume_id: u64,
+    projects: &mut [ProjectRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    annotate_readonly_inner(
+        swamp_dir,
+        volume_id,
+        projects,
+        observed_at,
+        retention_days,
+        since_secs,
+        true,
+    )
+}
+
+fn annotate_readonly_inner(
+    swamp_dir: &Path,
+    volume_id: u64,
+    projects: &mut [ProjectRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    exclude_this_observation: bool,
+) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = current_path(&dir);
     if !crate::fs_gate::exists(&current_file) {
@@ -402,12 +448,10 @@ pub fn annotate_readonly(
     // One pass over current + deltas for every key, not one pass per
     // artifact (that was ~300 × 4 Parquet reads per observation).
     let mut history_index = build_history_index(&dir, retention_days, observed_at)?;
-    // R20: a read after the pass that wrote `observed_at` sees that
-    // pass's own rows in `current.parquet`; growth is measured against
-    // what came *before* the observation, exactly as the persisting
-    // pass measured it (its index was built before it wrote).
-    for points in history_index.values_mut() {
-        points.retain(|(t, _, _)| *t < observed_at);
+    if exclude_this_observation {
+        for points in history_index.values_mut() {
+            points.retain(|(t, _, _)| *t < observed_at);
+        }
     }
     let empty: Vec<(u64, u64, bool)> = Vec::new();
     for project in projects.iter_mut() {
@@ -846,6 +890,46 @@ pub fn annotate_readonly_dirs(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
+    annotate_readonly_dirs_inner(
+        swamp_dir,
+        volume_id,
+        dirs,
+        observed_at,
+        retention_days,
+        since_secs,
+        false,
+    )
+}
+
+/// See [`annotate_readonly_before`].
+pub(crate) fn annotate_readonly_dirs_before(
+    swamp_dir: &Path,
+    volume_id: u64,
+    dirs: &mut [crate::report::DirRollup],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    annotate_readonly_dirs_inner(
+        swamp_dir,
+        volume_id,
+        dirs,
+        observed_at,
+        retention_days,
+        since_secs,
+        true,
+    )
+}
+
+fn annotate_readonly_dirs_inner(
+    swamp_dir: &Path,
+    volume_id: u64,
+    dirs: &mut [crate::report::DirRollup],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    exclude_this_observation: bool,
+) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = dirs_current_path(&dir);
     if !crate::fs_gate::exists(&current_file) {
@@ -856,9 +940,10 @@ pub fn annotate_readonly_dirs(
         .map(|r| (dir_row_key(&r.worktree_id, &r.rel_path), r))
         .collect();
     let mut history_index = build_dir_history_index(&dir, &current, retention_days, observed_at)?;
-    // R20: see `annotate_readonly` -- only points before this observation.
-    for points in history_index.values_mut() {
-        points.retain(|(t, _)| *t < observed_at);
+    if exclude_this_observation {
+        for points in history_index.values_mut() {
+            points.retain(|(t, _)| *t < observed_at);
+        }
     }
     let empty_history: Vec<(u64, u64)> = Vec::new();
     let target_time = observed_at.saturating_sub(since_secs);
@@ -1088,6 +1173,46 @@ pub fn annotate_readonly_files(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<()> {
+    annotate_readonly_files_inner(
+        swamp_dir,
+        volume_id,
+        files,
+        observed_at,
+        retention_days,
+        since_secs,
+        false,
+    )
+}
+
+/// See [`annotate_readonly_before`].
+pub(crate) fn annotate_readonly_files_before(
+    swamp_dir: &Path,
+    volume_id: u64,
+    files: &mut [crate::report::FileRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+) -> Result<()> {
+    annotate_readonly_files_inner(
+        swamp_dir,
+        volume_id,
+        files,
+        observed_at,
+        retention_days,
+        since_secs,
+        true,
+    )
+}
+
+fn annotate_readonly_files_inner(
+    swamp_dir: &Path,
+    volume_id: u64,
+    files: &mut [crate::report::FileRow],
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    exclude_this_observation: bool,
+) -> Result<()> {
     let dir = volume_dir(swamp_dir, volume_id);
     let current_file = files_current_path(&dir);
     if !crate::fs_gate::exists(&current_file) {
@@ -1098,9 +1223,10 @@ pub fn annotate_readonly_files(
         .map(|r| (file_row_key(&r.worktree_id, &r.rel_path), r))
         .collect();
     let mut history_index = build_file_history_index(&dir, &current, retention_days, observed_at)?;
-    // R20: see `annotate_readonly` -- only points before this observation.
-    for points in history_index.values_mut() {
-        points.retain(|(t, _)| *t < observed_at);
+    if exclude_this_observation {
+        for points in history_index.values_mut() {
+            points.retain(|(t, _)| *t < observed_at);
+        }
     }
     let empty_history: Vec<(u64, u64)> = Vec::new();
     let target_time = observed_at.saturating_sub(since_secs);
@@ -2017,7 +2143,7 @@ pub(crate) fn derive_report_views(
             })
             .filter(|p| !p.worktrees.is_empty())
             .collect();
-        let _ = annotate_readonly(
+        let _ = annotate_readonly_before(
             swamp_dir,
             volume_id,
             &mut mine,
@@ -2036,7 +2162,7 @@ pub(crate) fn derive_report_views(
             .into_iter()
             .map(dir_rollup_from_stored)
             .collect();
-        let _ = annotate_readonly_dirs(
+        let _ = annotate_readonly_dirs_before(
             swamp_dir,
             volume_id,
             &mut dirs,
@@ -2057,7 +2183,7 @@ pub(crate) fn derive_report_views(
             .into_iter()
             .map(file_row_from_stored)
             .collect();
-        let _ = annotate_readonly_files(
+        let _ = annotate_readonly_files_before(
             swamp_dir,
             volume_id,
             &mut files,
