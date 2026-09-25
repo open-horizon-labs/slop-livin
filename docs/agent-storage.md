@@ -23,12 +23,12 @@ This is the hard rule everything else in this document sits on top of:
 - Identification reads directory names, file sizes, and modification
   times. For most adapters, a session's project linkage comes from
   reading **only the first line** of the session's own transcript file
-  (bounded to 8 KiB), looking for one JSON field (`cwd`). Codex is
-  tighter still (2026-09-25): its first record carries the project's
-  instructions text after the `cwd`, so that adapter streams the record
-  one byte at a time and **stops at the closing quote of the `cwd`** --
-  nothing after it is fetched from the file, and the counted header
-  bytes are exactly the bytes through that quote. Oh My Pi's
+  (bounded to 8 KiB), looking for one JSON field (`cwd`). Codex is the
+  exception: it reads no rollout JSONL content at all. It joins each
+  file's exact path to Codex's read-only SQLite thread index and selects
+  only `rollout_path` and `cwd`; missing, conflicting, or stale index
+  entries remain unresolved. This avoids reading prompt/instruction
+  text and avoids parsing an internal transcript format. Oh My Pi's
   sessions have a fixed 256-byte title slot before that header line and
   this adapter skips it rather than reading it. OpenCode's project
   linkage instead comes from its own small, declared `project.json`
@@ -63,8 +63,13 @@ This is the hard rule everything else in this document sits on top of:
   invented session ids, invented project paths, placeholder bodies
   like `"[redacted]"`.
 - Formats were researched from primary upstream documentation/source
-  (linked below), never learned by reading a real `~/.claude` (or any
-  other real agent home) on a development machine.
+  (linked below). Codex linkage uses its versioned `state_<n>.sqlite`
+  thread index, resolved by `sqlite_home`, `CODEX_SQLITE_HOME`, then the
+  default Codex home. The adapter opens the selected DB read-only,
+  checks the required schema, and queries only `rollout_path` and `cwd`;
+  it does not read conversation, title, preview, or prompt columns and
+  never falls back to rollout parsing. Rows missing from the index stay
+  unresolved. No rollout contents are read for size accounting either.
 - Adversarial tests seed a canary string into fixture session bodies
   and assert it never appears in any unit, plan, execute result, or
   ledger entry (`crates/core/src/agents/claude_code.rs`'s
@@ -182,7 +187,7 @@ Every identified unit falls into one of these (`AgentCategory` in
 | Managed worktrees | Git worktrees a tool created | N/A -- reuses existing worktree identity, never separately re-measured | Existing Git/worktree action protections apply, not this module's |
 | Plugins | Marketplace configuration and downloaded plugin/skill code | No (the `.trash` staging subdirectories are actionable; the rest is not) | **Cache/log Trash move** for `.trash` only |
 | Protected config | Credentials, settings, skills, commands, subagent/automation definitions | **Yes, always** | None -- never actionable |
-| Protected databases | SQLite state stores and their `-wal`/`-shm` sidecars (e.g. Codex's `state_5.sqlite`, `logs_2.sqlite`, `thread_history_1.sqlite`) -- never opened for a row-level drill-down, never a target for guessed cleanup | **Yes, always** | None -- never actionable |
+| Protected databases | SQLite state stores and their `-wal`/`-shm` sidecars (e.g. Codex's `state_5.sqlite`, `logs_2.sqlite`, `thread_history_1.sqlite`) -- Codex's state DB is queried read-only for exact session linkage; no store is a cleanup target | **Yes, always** | None -- never actionable |
 | Unclassified | Anything with no specific rule (a residual bucket, never silently dropped) | Case by case | None yet |
 
 Only **cache/log Trash move** and **session removal** have a supported
@@ -201,9 +206,11 @@ model only where a tool genuinely needs a new concept" clause:
   a newer version's unified session/message/state store (Codex's seven
   `*.sqlite` files, OpenCode's `opencode.db`, Oh My Pi's `agent.db`).
   Always folded into one unit with its sidecars as members; never split,
-  never opened, never individually actionable (`is_sqlite_like` in
+  never actionable (`is_sqlite_like` in
   `crate::actions` refuses any selective action on a path with this
-  kind unconditionally).
+  kind unconditionally). Codex's state index alone is opened read-only
+  for exact `rollout_path`/`cwd` linkage; no other columns or SQLite
+  stores are queried.
 - **`SessionData`** -- a session-keyed companion directory that is
   neither a transcript, a subagent dir, todos, file-history, nor an
   attachment (OpenCode's `storage/message/<session-id>/` and
@@ -279,8 +286,8 @@ Each unit's `project_link` field is one of:
 
 | State | Meaning |
 |---|---|
-| `linked` | Resolved to a swamp project/worktree identity (`crate::git`'s own object-store-based identity -- never a filesystem path or a basename match), with `declared` or `inferred` provenance. `declared`: the tool's own metadata named the path. `inferred` (Claude Code only, 2026-09-25): no record in the bounded header carried a `cwd`, and the session's `projects/<slug>` folder name re-encoded **exactly one** of this pass's known worktree paths (`[^A-Za-z0-9]` -> `-`, compared, never decoded), and that path still resolves to a checkout. The label says so in text (`[inferred from the tool's project folder name, not declared]`), the TUI (`(inferred)`) and JSON (`"source":"inferred"`). It is re-derived against the current known worktrees on every pass -- never replayed from the store -- so a worktree that is removed makes the session `unresolved` again. Limits, stated rather than papered over: the encoding is lossy (`/a/b-c` and `/a-b/c` share a slug), so a slug matching two known paths stays `unresolved`, and a session whose real path collides with a *different* known path that happens to be the only match cannot be told apart from a true match -- which is why the result is labelled inferred and never treated as declared. A path rename is not recovered (the old slug matches nothing known). |
-| `unresolved` | No project metadata could be extracted at all (malformed/empty transcript header, or the `cwd` field was missing), and -- for Claude Code -- the folder name matched no known worktree, matched several, or matched one that is no longer a checkout; the reason says which. Codex sessions carry no folder signal (their directories are date-partitioned); their `cwd` comes from the `session_meta` record's `payload.cwd`, streamed byte by byte and stopped at the field's closing quote even though the record itself is far longer (it carries the project's instructions text, which is never fetched; 2026-09-25 fix -- before it, every Codex session read `unresolved` because the truncated record never parsed). A Codex session is `unresolved` only when that record has no `cwd` within the 8 KiB ceiling or is not a `session_meta` record. |
+| `linked` | Resolved to a swamp project/worktree identity (`crate::git`'s own object-store-based identity -- never a filesystem path or a basename match), with `declared` or `inferred` provenance. `declared`: the tool's own metadata named the path and it resolved to a checkout. `inferred` (Claude Code only, 2026-09-25): the session's `projects/<slug>` folder name re-encoded **exactly one** of this pass's known worktree paths (`[^A-Za-z0-9]` -> `-`, compared, never decoded), and that path still resolves to a checkout. It is used only when the declared `cwd` is absent, missing, or not a checkout; a successfully linked `cwd` always wins. The JSON retains the failed `cwd` reason in `fallback_reason`; the TUI labels the link inferred. It is re-derived against the current known worktrees on every pass -- never replayed from the store. Limits, stated rather than papered over: the encoding is lossy (`/a/b-c` and `/a-b/c` share a slug), so a slug matching two known paths is not used, and a session whose real path collides with a *different* known path that happens to be the only match cannot be told apart from a true match -- which is why the result is labelled inferred and never treated as declared. A path rename is not recovered (the old slug matches nothing known). |
+| `unresolved` | No project linkage could be established; the reason distinguishes missing or invalid metadata and unavailable linkage sources. For Claude Code, a missing or non-project declared `cwd` may be rescued only by one exact full-path folder-slug match; when that fails, the original typed `missing`/`not-a-project` state remains. Ambiguous slugs never choose a candidate. Codex sessions have no folder signal (their directories are date-partitioned): linkage requires an exact `rollout_path` row in the versioned state DB and a unique absolute `cwd`. Missing, conflicting, stale, or unsupported DB rows stay unresolved; transcript contents are never scanned as fallback. |
 | `missing` | Metadata names a path that no longer exists on disk. |
 | `not-a-project` | Metadata names a path that exists but is not (or is no longer) a Git checkout/worktree. |
 | `moved` | The declared path used to resolve to one project identity and now resolves to a different one (or none). *Not currently populated by the Claude Code adapter* -- it has no record of a session's previous linkage to compare against. |
@@ -289,13 +296,11 @@ Each unit's `project_link` field is one of:
 | `not-applicable` | This unit is inherently tool-wide (a cache, a log directory, protected config): project linkage does not apply, which is a different, more honest fact than "we tried and could not tell." |
 
 Resolution never decodes the `projects/<encoded-cwd>` directory name
-back into a path: that encoding (slashes replaced with a separator) is
-lossy in the reverse direction, since a literal hyphen in a real path
-cannot be told apart from an encoded separator. The only reliable
-source is the session transcript's own declared `cwd` field, walking
-upward from that path for a `.git` directory/file using the same
-identity primitives `crate::git::discover` uses for ordinary project
-scanning.
+back into a path: that encoding is lossy in the reverse direction, so
+it is used only by re-encoding the bounded set of known worktrees and
+requiring exactly one match. A resolved transcript `cwd` remains the
+authoritative link; folder evidence is explicitly inferred and retains
+the failed cwd reason. No bare project-basename match is used.
 
 Bidirectional navigation:
 
@@ -364,12 +369,26 @@ treats anything else as an unknown, never a parse panic or a guess.
 
 ## Codex (#93)
 
-Layout researched from `openai/codex`'s own `codex-rs` source (current
-`main` as of this chunk; see the matrix above for exact file links).
-`CODEX_HOME`'s internal transcript envelope around the `session_meta`
-entry's `cwd` field is not pinned to one nesting shape (genuinely
-version-varying wire format); any shape not matched resolves to
-`unresolved`, never a guess.
+Session linkage is sourced from the versioned Codex state DB, not from
+rollout files. Swamp resolves the SQLite home from `sqlite_home` in
+`config.toml`, then `CODEX_SQLITE_HOME`, then the Codex home. It picks
+the highest numeric `state_<n>.sqlite` filename, opens that database
+read-only, verifies the `threads` schema, and selects only
+`rollout_path` and `cwd`. Matching is by exact rollout path; basename,
+thread title, prompt text, and Git origin are not substitutes. Missing
+or conflicting rows remain unresolved. The DB is an index, not a
+perfect ledger: sessions absent from its current table will remain
+unlinked, and Swamp does not scan their transcript contents to fill the
+gap. The normal stat-only walk still measures rollout file sizes. The
+day-container cache stores that size/member inventory independently of
+the index: Swamp reloads the small SQLite mapping on each pass and
+refreshes project links on replay, without making an index update
+invalidate and re-stat every session day.
+
+The path and SQLite config sources are researched from `openai/codex`'s
+own `codex-rs` source (current `main`; see the matrix above for exact
+file links). The transcript envelope is deliberately irrelevant to
+linkage now: no rollout line or field is parsed.
 
 - **Sessions:** `sessions/<year>/<month>/<day>/rollout-<timestamp>-
   <thread-id>[_<rollout-id>].jsonl` -- one file per session, no
@@ -396,11 +415,12 @@ version-varying wire format); any shape not matched resolves to
   `*_DB_FILENAME` constants, so it was neither folded with its
   sidecars nor protected. The sidecars are also excluded from the
   unclassified residual now -- previously their bytes were counted
-  twice, once in the store's unit and once there.
-  `CODEX_SQLITE_HOME` can relocate all seven *outside* `CODEX_HOME`; this
-  adapter does not follow that override (a documented gap, same shape
-  as Claude Code's `~/.claude.json` sibling gap) -- if set, these files
-  are simply not found here rather than guessed at a wrong path.
+  twice, once in the store's unit and once there. The linkage query
+  chooses the highest numeric `state_<n>.sqlite`; future numbered state
+  DBs are protected and folded too. `CODEX_SQLITE_HOME` or configured
+  `sqlite_home` can relocate all seven *outside* `CODEX_HOME`; the
+  lookup follows that setting. Relocated stores are not included in the
+  Codex-home size breakdown by this adapter.
 - **Protected config:** `config.toml`, `auth.json`, `skills/` --
   upstream comments this last one "Deprecated user skills location" and
   puts the current root at `~/.agents/skills`, which is outside
@@ -498,8 +518,9 @@ linkage.
   reports one "unsupported layout version" unit rather than guessing
   at either schema below.
 - **Newer/SQLite layout:** `opencode.db` (+ `-wal`/`-shm`), folded into
-  one protected, non-actionable unit -- never opened, same discipline
-  as Codex's own SQLite stores.
+  one protected, non-actionable unit -- never opened. Codex's state DB
+  is the narrow exception elsewhere: read-only linkage metadata query
+  of exactly `rollout_path` and `cwd`.
 - **Older/file-tree layout:** `storage/session/<project-id>/
   <session-id>.json`, with `storage/message/<session-id>/` (a
   directory) and `storage/session_diff/<session-id>.json` (a **file**)
@@ -791,7 +812,10 @@ its own `~/.continue` home, config confirmed by primary docs:
 ## Scan cost
 
 Identification reads directory names and bounded metadata (file
-`stat`, and a session's first transcript/header line) -- never a full
+`stat`, and adapter-specific small metadata sources). Codex session
+linkage queries two columns in its local SQLite index and reads zero
+rollout transcript bytes; the session tree is still stat-walked for
+storage totals. It never uses a full
 directory content walk with `crate::walk::resize_artifact`'s
 parallel-pool machinery, which is tuned for a handful of potentially
 huge artifact roots, not hundreds of small per-session directories.

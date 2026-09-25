@@ -1,5 +1,5 @@
-//! Folder-name inference for Claude Code sessions with no declared
-//! `cwd` (`crate::agents::KnownWorktrees`).
+//! Folder-name inference for Claude Code sessions whose declared `cwd`
+//! is absent or cannot resolve (`crate::agents::KnownWorktrees`).
 //!
 //! The link is inferred only when the session's `projects/<slug>`
 //! folder name re-encodes exactly one of this pass's known worktree
@@ -10,7 +10,9 @@
 //!
 //! - unique slug match -> Inferred (the feature)
 //! - a declared `cwd` beats the folder name (no "folder wins" shortcut)
-//! - a declared `cwd` that is missing stays Missing (no folder rescue)
+//! - a declared `cwd` that is missing can fall back to one exact full-path
+//!   slug match, preserving the failure reason and inferred provenance
+//! - a declared `cwd` that is missing with no slug match stays Missing
 //! - `/a/b-c` vs `/a-b/c` collide under the lossy encoding -> Unresolved
 //!   (no "pick the first" shortcut)
 //! - the same worktree listed twice is one candidate, not a collision
@@ -130,7 +132,7 @@ fn the_slug_encoding_is_the_documented_one_and_is_lossy() {
 }
 
 /// The provenance a consumer sees: JSON carries `"source":"inferred"`
-/// through the existing serde shape (no new field), and the text view
+/// through the existing serde shape, including the reason for fallback, and the text view
 /// says in words that the link was inferred from the folder name --
 /// so an inferred link can never be mistaken for a declared one in any
 /// output.
@@ -141,6 +143,7 @@ fn an_inferred_link_is_labelled_inferred_in_json_and_text() {
         project_name: "repo".into(),
         project_path: PathBuf::from("/x/repo"),
         source: LinkSource::Inferred,
+        fallback_reason: Some("declared cwd missing: /old/repo".into()),
         worktree_kind: "main".into(),
     };
     let json = serde_json::to_value(&link).unwrap();
@@ -226,7 +229,7 @@ fn a_unique_folder_match_is_an_inferred_link_never_claimed_as_declared() {
 }
 
 #[test]
-fn a_declared_cwd_beats_the_folder_name_and_a_missing_declared_path_is_not_rescued() {
+fn a_declared_cwd_beats_the_folder_name_and_a_failed_cwd_can_use_unique_folder_slug() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let (home, store) = (root.join("home"), root.join("store"));
@@ -266,12 +269,82 @@ fn a_declared_cwd_beats_the_folder_name_and_a_missing_declared_path_is_not_rescu
         }
         other => panic!("{other:?}"),
     }
+    match link_of(&units, &missing) {
+        ProjectLinkState::Linked {
+            source,
+            project_path,
+            fallback_reason,
+            ..
+        } => {
+            assert_eq!(*source, LinkSource::Inferred);
+            assert_eq!(project_path, &folder_repo);
+            assert!(
+                fallback_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains(&gone.display().to_string())
+            );
+        }
+        other => panic!("unique folder slug should be an explicitly inferred fallback: {other:?}"),
+    }
+
+    // No unique matching known worktree: keep the original typed failure.
+    let only_elsewhere = root.join("elsewhere").join("other-repo");
+    checkout(&only_elsewhere);
+    let units = pass(
+        &home,
+        &store,
+        2_000,
+        EventCoverage::untrusted(),
+        &[only_elsewhere],
+    );
     assert_eq!(
         link_of(&units, &missing),
         &ProjectLinkState::Missing { path: gone },
-        "a declared path that is missing is an answer about that path; the folder name \
-         does not overrule it"
+        "without a unique slug candidate preserve the declared-path failure"
     );
+}
+
+#[test]
+fn a_non_project_cwd_can_fall_back_to_the_exact_unique_tool_folder_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let (home, store) = (root.join("home"), root.join("store"));
+    let repo = root.join("src").join("repo");
+    checkout(&repo);
+    let plain = root.join("not-a-checkout");
+    fs::create_dir_all(&plain).unwrap();
+    let jsonl = session_with_cwd(
+        &home,
+        &claude_folder_slug(&repo),
+        &plain,
+        "dddddddd-dddd-4ddd-8ddd-ddddddddddde",
+    );
+    let units = pass(
+        &home,
+        &store,
+        1_000,
+        EventCoverage::untrusted(),
+        &[repo.clone()],
+    );
+    match link_of(&units, &jsonl) {
+        ProjectLinkState::Linked {
+            source,
+            project_path,
+            fallback_reason,
+            ..
+        } => {
+            assert_eq!(*source, LinkSource::Inferred);
+            assert_eq!(project_path, &repo);
+            assert!(
+                fallback_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("not a known checkout")
+            );
+        }
+        other => panic!("expected an inferred fallback, got {other:?}"),
+    }
 }
 
 #[test]

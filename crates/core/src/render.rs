@@ -1921,16 +1921,23 @@ fn agent_link_label(link: &crate::agents::ProjectLinkState) -> String {
             project_name,
             project_path,
             source,
+            fallback_reason,
             ..
         } => match source {
             crate::agents::LinkSource::Declared => {
                 format!("project: {project_name} ({})", project_path.display())
             }
-            crate::agents::LinkSource::Inferred => format!(
-                "project: {project_name} ({}) [inferred from the tool's project folder name, \
-                 not declared]",
-                project_path.display()
-            ),
+            crate::agents::LinkSource::Inferred => {
+                let fallback = fallback_reason
+                    .as_deref()
+                    .map(|reason| format!("; cwd fallback: {reason}"))
+                    .unwrap_or_default();
+                format!(
+                    "project: {project_name} ({}) [inferred from the tool's project folder name, \
+                     not declared{fallback}]",
+                    project_path.display()
+                )
+            }
         },
         L::Unresolved { reason } => format!("project: unresolved ({reason})"),
         L::Missing { path } => format!("project: missing ({})", path.display()),

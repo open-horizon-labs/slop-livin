@@ -32,6 +32,7 @@ fn unit(source: LinkSource) -> AgentUnit {
             project_name: "repo".into(),
             project_path: PathBuf::from("/x/repo"),
             source,
+            fallback_reason: None,
             worktree_kind: "main".into(),
         },
         action: AgentActionCapability::SessionRemoval,

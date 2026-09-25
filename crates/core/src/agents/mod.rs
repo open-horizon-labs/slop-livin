@@ -25,15 +25,17 @@
 //! store, one key family, two granularities -- never a third model.
 //!
 //! Identification cost is bounded by construction: category directories
-//! are folded (byte totals, not per-file retention), and a session's
-//! project linkage reads only its transcript's first line. See
+//! are folded (byte totals, not per-file retention), and session project
+//! linkage uses declared metadata. Codex reads only its local SQLite
+//! index's `rollout_path` and `cwd` columns; it never reads rollout
+//! transcript contents. See
 //! `identification_cost_is_bounded` in `claude_code.rs`'s tests for the
 //! measured shape, and `.oh/sessions/2026-09-21-agent-storage-claude-code.md`
 //! for the recorded number.
 //!
-//! Privacy is a hard contract, not a convention: nothing in this module
-//! or its adapters reads past a transcript's first line, and nothing
-//! here puts a path's *contents* into any `AgentUnit` field. Tests across
+//! Privacy is a hard contract, not a convention: session content is not
+//! read for linkage, and nothing here puts transcript contents into any
+//! `AgentUnit` field. Tests across
 //! this module and `claude_code.rs` seed a canary string into fixture
 //! session bodies and assert it never appears in any `AgentUnit`,
 //! `Debug`, or JSON-serialized output.
@@ -44,6 +46,7 @@ pub mod claude_code;
 pub mod cline;
 pub mod codex;
 pub mod codex_desktop;
+mod codex_state;
 pub mod continue_dev;
 pub mod copilot_cli;
 pub mod cursor;
@@ -163,17 +166,17 @@ impl AgentCategory {
 #[serde(rename_all = "kebab-case")]
 pub enum LinkSource {
     /// Read directly from metadata the tool itself wrote (a session
-    /// header's `cwd` field, a per-project directory's declared path).
+    /// index's `cwd` field, a per-project directory's declared path).
     /// Never a basename guess.
     Declared,
     /// Derived by a bounded inference step, never claimed as declared.
-    /// Produced today for one case only: a Claude Code session whose
-    /// transcript carries no `cwd`, whose `projects/<slug>` folder name
-    /// re-encodes exactly one of this pass's known worktree paths
-    /// ([`KnownWorktrees`]). The slug encoding is lossy, so a name that
-    /// re-encodes two known paths is left unresolved, and the link is
-    /// re-derived against the current known set on every pass -- never
-    /// replayed from the store.
+    /// Produced today for Claude Code when its `projects/<slug>` folder
+    /// name re-encodes exactly one of this pass's known worktree paths
+    /// ([`KnownWorktrees`]) and the declared cwd is absent or cannot be
+    /// resolved. A successful declared cwd always wins. The slug encoding
+    /// is lossy, so a name that re-encodes two known paths is not used;
+    /// an inferred link retains the failed cwd reason. It is re-derived
+    /// against the current known set on every pass -- never replayed.
     Inferred,
 }
 
@@ -191,12 +194,17 @@ pub enum ProjectLinkState {
         project_name: String,
         project_path: PathBuf,
         source: LinkSource,
+        /// Why the session fell back to a tool-specific folder name
+        /// instead of resolving its declared cwd. Present only for an
+        /// inferred link; preserves missing/non-project cwd evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_reason: Option<String>,
         /// `"main"` or `"linked"` (`crate::report::WorktreeKind`,
         /// stringified for display; never re-typed here).
         worktree_kind: String,
     },
     /// No project metadata could be extracted at all (malformed/empty
-    /// header, no `cwd` field found in the bounded read).
+    /// metadata, no `cwd` field found in the supported source).
     Unresolved { reason: String },
     /// Metadata names a path that no longer exists on disk.
     Missing { path: PathBuf },
@@ -465,16 +473,16 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// Bumped whenever an adapter's header parsing changes what a derived
-/// value *means*, so a value cached by an older binary is never trusted.
+/// Bumped whenever an adapter's metadata derivation changes what a
+/// derived value *means*, so a value cached by an older binary is never trusted.
 /// Part of every identification-cache fingerprint.
-pub const ADAPTER_VERSION: &str = "2026-09-21.1";
+pub const ADAPTER_VERSION: &str = "2026-09-25.3";
 
-/// The memo that makes an unchanged observation cost zero header reads.
+/// The memo that makes an unchanged observation cost zero content reads.
 ///
-/// An adapter derives a small fact from a session header (the declared
+/// An adapter derives a small fact from session metadata (the declared
 /// `cwd`, a workspace path, a format marker). Re-deriving it means
-/// re-reading the header, which on a 5,000-session home is 5,000 capped
+/// re-reading the source, which on a 5,000-session home is 5,000 capped
 /// reads on *every* pass -- the gap the previous repair measured and
 /// left open. The value is cached against the source file's own
 /// `(size, mtime)` plus [`ADAPTER_VERSION`], so an unchanged file is a
@@ -573,7 +581,7 @@ fn file_fingerprint(meta: &fs::Metadata) -> Vec<(String, u64)> {
 /// Bumped whenever the *encoding* of a container's persisted units
 /// changes, so rows written by an older binary are a miss rather than a
 /// misread. Part of every container's stored shape key.
-const CONTAINER_VERSION: &str = "agent-container/2026-09-25.1";
+const CONTAINER_VERSION: &str = "agent-container/2026-09-25.3";
 
 /// The memo that makes an unchanged container cost `stat`s instead of a
 /// listing and a `stat` per file.
@@ -724,7 +732,8 @@ impl ContainerCache {
 
     /// Resolves a unit's link exactly as a replayed one is resolved:
     /// the declared path live, then folder-name inference against this
-    /// pass's known worktrees when nothing was declared. Called for
+    /// pass's known worktrees when the declared path cannot be linked.
+    /// Called for
     /// every freshly identified unit too, so an identified and a
     /// replayed session cannot disagree about the same evidence.
     pub fn finish_link(&self, unit: &mut CandidateAgentUnit) {
@@ -776,12 +785,27 @@ impl ContainerCache {
             return hit.clone();
         }
         let resolved = resolve_declared_workspace(declared, additional, reason);
-        // Inference only where the declared evidence said nothing at
-        // all. A declared path that is missing or not a project is an
-        // answer about *that* path and stands; the folder name cannot
-        // overrule it.
+        // A successfully resolved cwd is authoritative. If it is absent,
+        // missing, or not a checkout, Claude's full encoded path slug is
+        // a useful fallback only when it uniquely re-encodes one current
+        // known worktree. Keep the failed cwd in fallback_reason rather
+        // than silently replacing that evidence.
         let resolved = match (&resolved, folder_slug) {
             (ProjectLinkState::Unresolved { reason }, Some(slug)) => self.known.infer(slug, reason),
+            (ProjectLinkState::Missing { path }, Some(slug)) => {
+                let reason = format!("declared cwd is missing: {}", path.display());
+                match self.known.infer(slug, &reason) {
+                    linked @ ProjectLinkState::Linked { .. } => linked,
+                    _ => resolved,
+                }
+            }
+            (ProjectLinkState::NotAProject { path }, Some(slug)) => {
+                let reason = format!("declared cwd is not a known checkout: {}", path.display());
+                match self.known.infer(slug, &reason) {
+                    linked @ ProjectLinkState::Linked { .. } => linked,
+                    _ => resolved,
+                }
+            }
             _ => resolved,
         };
         self.links.borrow_mut().insert(key, resolved.clone());
@@ -821,6 +845,7 @@ pub struct IdentifyCtx<'a> {
     observed_at: u64,
     cache: &'a IdentificationCache,
     containers: Option<&'a ContainerCache>,
+    codex_sqlite_home_override: Option<PathBuf>,
     /// The container currently being recorded, if any. One level deep by
     /// design: see [`IdentifyCtx::container`].
     recording: std::cell::RefCell<Option<ContainerRecorder>>,
@@ -832,6 +857,7 @@ impl<'a> IdentifyCtx<'a> {
             observed_at,
             cache,
             containers: None,
+            codex_sqlite_home_override: std::env::var_os("CODEX_SQLITE_HOME").map(PathBuf::from),
             recording: std::cell::RefCell::new(None),
         }
     }
@@ -847,7 +873,28 @@ impl<'a> IdentifyCtx<'a> {
             observed_at,
             cache,
             containers: Some(containers),
+            codex_sqlite_home_override: std::env::var_os("CODEX_SQLITE_HOME").map(PathBuf::from),
             recording: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub(super) fn codex_sqlite_home_override(&self) -> Option<&Path> {
+        self.codex_sqlite_home_override.as_deref()
+    }
+
+    /// Refreshes one cached declared link from a tool's current metadata,
+    /// then resolves it through the shared project/worktree machinery.
+    /// This keeps externally indexed metadata fresh without making a
+    /// session-size container depend on the external index's write events.
+    pub fn refresh_declared_project_link(
+        &self,
+        unit: &mut CandidateAgentUnit,
+        declared: Option<String>,
+        missing_reason: &str,
+    ) {
+        unit.set_declared_project_link(declared, missing_reason);
+        if let Some(containers) = self.containers {
+            containers.finish_link(unit);
         }
     }
 
@@ -1283,8 +1330,8 @@ impl KnownWorktrees {
         Self { by_slug }
     }
 
-    /// The link a session with no declared path gets from its folder
-    /// name: [`LinkSource::Inferred`] when exactly one known worktree
+    /// The fallback link a session whose declared path cannot be linked
+    /// gets from its folder name: [`LinkSource::Inferred`] when exactly one known worktree
     /// re-encodes to `slug` *and* that path still resolves to a
     /// checkout; otherwise [`ProjectLinkState::Unresolved`] with the
     /// original reason extended by what the folder name did say.
@@ -1316,6 +1363,7 @@ impl KnownWorktrees {
                 project_name,
                 project_path,
                 source: LinkSource::Inferred,
+                fallback_reason: Some(unresolved_reason.to_string()),
                 worktree_kind,
             },
             _ => ProjectLinkState::Unresolved {
@@ -1688,7 +1736,7 @@ pub(crate) fn mtime_secs(meta: &fs::Metadata) -> u64 {
 // Shared declared-path -> project-identity resolution (#91's original
 // contract, factored out during #93/#94/#95 so every adapter that reads
 // a declared absolute path out of its own tool's metadata --
-// `claude_code`'s transcript `cwd`, `codex`'s session-header `cwd`,
+// `claude_code`'s transcript `cwd`, `codex`'s SQLite index `cwd`,
 // `oh_my_pi`'s session-header `cwd`, `opencode`'s `project.json`
 // `worktree` -- resolves it against swamp's project/worktree identity
 // the same way, once. Never a basename guess: this walks upward from
@@ -1700,7 +1748,7 @@ pub(crate) fn mtime_secs(meta: &fs::Metadata) -> u64 {
 /// a filename/directory-name guess) to this swamp instance's project
 /// identity. `field_missing_reason` is the adapter-specific explanation
 /// for why no path could be extracted at all (e.g. "no cwd field found
-/// in the session's first line"), used only for the `Unresolved` case.
+/// in the session metadata source"), used only for the `Unresolved` case.
 pub(crate) fn resolve_declared_path(
     declared: Option<String>,
     field_missing_reason: &str,
@@ -1726,6 +1774,7 @@ pub(crate) fn resolve_declared_path(
                     project_name: dw.project_name,
                     project_path: dw.path,
                     source: LinkSource::Declared,
+                    fallback_reason: None,
                     worktree_kind: "main".to_string(),
                 };
             }
@@ -1742,6 +1791,7 @@ pub(crate) fn resolve_declared_path(
                 project_name: dw.project_name,
                 project_path: dw.path,
                 source: LinkSource::Declared,
+                fallback_reason: None,
                 worktree_kind: kind.to_string(),
             };
         }

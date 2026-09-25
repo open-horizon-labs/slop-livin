@@ -20,6 +20,7 @@ serde_json.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
 roxmltree = "0.21.1"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Test-only. `walkdir` is the generic directory walker swamp's own is
 # measured against (#80): one comparison test proves a generic walk

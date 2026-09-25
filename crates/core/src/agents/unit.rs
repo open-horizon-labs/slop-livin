@@ -181,6 +181,23 @@ impl CandidateAgentUnit {
         self.project_link = link;
     }
 
+    /// Replaces a cached declaration with fresh adapter metadata, then
+    /// lets the shared container resolver apply worktree inference. The
+    /// adapter never sets a resolved link directly.
+    pub(super) fn set_declared_project_link(
+        &mut self,
+        declared: Option<String>,
+        missing_reason: &str,
+    ) {
+        self.project_link = resolve_declared_workspace(&declared, &[], missing_reason);
+        self.link_basis = LinkBasis::Declared {
+            declared,
+            additional: Vec::new(),
+            missing_reason: missing_reason.to_string(),
+            folder_slug: None,
+        };
+    }
+
     /// Every field, by value, for the one place that turns a candidate
     /// into the delivered [`super::AgentUnit`] (after protection has been
     /// layered on).
@@ -334,10 +351,12 @@ impl AgentUnitBuilder {
     /// [`Self::project_link_declared`] for a tool that keys its storage
     /// by an encoding of the workspace path (Claude Code's
     /// `projects/<slug>`). The slug is recorded beside the declared
-    /// path; when nothing was declared, the shared layer may infer the
-    /// link from it -- exactly one known worktree re-encoding to the
-    /// slug -- and says so ([`super::LinkSource::Inferred`]). The
-    /// adapter never decodes the slug and never matches a basename.
+    /// path; when the declared path is absent or cannot resolve, the
+    /// shared layer may infer the link from it -- exactly one known
+    /// worktree re-encoding to the slug -- and says so
+    /// ([`super::LinkSource::Inferred`]). A successfully resolved
+    /// declared path always wins. The adapter never decodes the slug and
+    /// never matches a basename.
     pub fn project_link_declared_or_folder(
         mut self,
         declared: Option<String>,

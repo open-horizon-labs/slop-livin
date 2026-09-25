@@ -2163,8 +2163,12 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
                 swamp_core::agents::ProjectLinkState::Linked {
                     project_name,
                     source: swamp_core::agents::LinkSource::Inferred,
+                    fallback_reason,
                     ..
-                } => format!("project: {project_name} (inferred)"),
+                } => match fallback_reason.as_deref() {
+                    Some(reason) => format!("project: {project_name} (inferred; {reason})"),
+                    None => format!("project: {project_name} (inferred)"),
+                },
                 swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
                 other => format!("{other:?}"),
             };

@@ -210,17 +210,18 @@ fn malformed_or_truncated_metadata_never_panics_and_is_always_explicit() {
             unit.project_link()
         );
     }
-    // Codex: a header line that is not valid JSON at all.
+    // Codex: transcript contents do not declare project linkage, even
+    // when the file happens to contain a cwd-shaped JSON snippet.
     {
         let home = tempfile::tempdir().unwrap();
         let jsonl = home
             .path()
             .join("sessions/2026/09/21/rollout-not-json.jsonl");
-        write(&jsonl, b"{not valid json at all\n");
+        write(&jsonl, b"{\"cwd\":\"/a/guessed/project\"}\n");
         let result = std::panic::catch_unwind(|| {
             identify_with!(swamp_core::agents::codex::identify, home.path())
         });
-        let units = result.expect("invalid JSON header must never panic identification");
+        let units = result.expect("transcript content is never parsed for linkage");
         let unit = units.iter().find(|u| u.path() == jsonl);
         if let Some(unit) = unit {
             assert!(

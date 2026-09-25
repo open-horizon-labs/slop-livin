@@ -44,14 +44,14 @@ done, or at the cap (still a `BoundedCap`, still `header_at_most`);
 it retains nothing and counts exactly the bytes fetched. Surfaced as
 `bounded_io::scan_header` and `IdentifyCtx::derived_scanned`, which
 memoises only the extracted value. The Codex adapter's `SessionMetaCwd`
-is a byte-fed state machine: it tracks the key path, decodes key names,
-the top-level `type`, and the `cwd` at `cwd` / `meta.cwd` /
-`payload.cwd` / `payload.meta.cwd`, and returns Done at the `cwd`'s
-closing quote. A record of another kind is refused at its `type`'s
-closing quote, before any `cwd`. A `type` written after the `cwd` is
-not consulted (reaching it would mean reading past the field); Codex
-writes `type` before `payload` in 100/100 probed records, and the
-older, `type`-less envelope shapes still resolve.
+is a byte-fed state machine: it requires the observed root
+`timestamp`/`ordinal`/`type=session_meta`/`payload` envelope, streams a
+small allowlist of pre-cwd session-ID/timestamp scalars without
+retaining them, and stops at the closing quote of `payload.cwd`.
+Unknown keys, other record types, malformed value shapes, and unverified
+nested envelopes stop before their values. The previous shape-tolerant
+acceptance of bare `cwd`, `meta.cwd`, and `payload.meta.cwd` was removed:
+this is internal wire format, so alternate variants need verification.
 
 Tests: `the_read_ends_at_the_closing_quote_of_the_cwd_and_the_canary_
 after_it_is_never_fetched` -- the canary begins one byte after the
@@ -61,7 +61,10 @@ refuses_at_the_record_kind` -- exact stop bytes for: cwd beyond the
 ceiling (stops at the cap, `None`); cwd cut by the ceiling (`None`);
 `turn_context` (refused at the type's closing quote); cwd in an array;
 escaped path (stops at its closing quote, the `SECRET` after it unseen);
-`payload.meta.cwd`; no `type` before the cwd; a non-ASCII path.
+unverified nested envelopes; no `type` before the cwd; non-string cwd;
+unknown fields before cwd; a non-ASCII path. The long-record fixture
+includes observed pre-cwd IDs/timestamps, then proves the read stops
+before `base_instructions`.
 `bounded_io` has its own test of the primitive's stop and cap; the gate
 compile-fail cases (`content_reads_need_a_cap`, `caps_are_named_
 constants`, `no_unbounded_read_in_the_gate`) still pass with the new
@@ -87,7 +90,7 @@ Claude Code sessions in the same run: 29 declared / 119 inferred /
 3 unresolved (one more than the earlier run: a new session under a
 path outside the known worktree set).
 
-## Corroboration spiked, not adopted
+## Corroboration candidates
 - `payload.git.{branch,commit_hash,repository_url}`: real corroboration
   of the `cwd` (and the only way to notice a moved checkout), but it
   sits after the instructions text; reaching it means raising the bound
@@ -95,15 +98,45 @@ path outside the known worktree set).
   A future design could seek to a known offset only if Codex ever
   writes `git` before `base_instructions`; it does not today.
 - `payload.forked_from_id`: names the parent *session*; useful to say
-  "forked from <session>" (fork lineage), not to link a project. No
-  SQLite lookup was made or is proposed.
+  "forked from <session>" (fork lineage), not to link a project. Parent
+  ownership alone is unsafe because a fork can change project context.
 - `turn_context.cwd` per turn: later lines; would need reading the
   transcript body. Out.
-- `payload.runtime_workspace_roots`: within the bound and the shape of
-  Oh My Pi's `additionalDirectories` -- a candidate for
-  `project_link_declared_workspace` (widening to `Shared` when it names a
-  second project). Not adopted without a second look at what Codex
-  populates it with; recorded as the next cheap gain.
+- `payload.runtime_workspace_roots`: within the bound and resembles
+  Oh My Pi's `additionalDirectories`, but official source describes it
+  as permission/scope roots, not a record of which projects the thread
+  actually used. Do not treat it as ownership or `Shared` without a
+  separate explicit usage relationship.
+
+### Codex SQLite metadata spike (metadata/schema only)
+
+Official Codex sources describe `state_5.sqlite` thread metadata with
+`cwd`, optional `project_id`, Git origin/branch metadata, and an exact
+`rollout_path`; JSONL history and SQLite metadata are separate stores.
+The local read-only schema/aggregate check found 4,956 thread rows: all
+had `cwd`, none had `project_id`, and 4,512 had a Git origin URL. No row
+paths or conversation fields were selected or printed. This is a useful
+exact thread-ID join/corroboration source, but adds no `cwd` coverage on
+this machine; origin identifies a repo family, not necessarily one
+clone/worktree. `runtime_workspace_roots` is not equivalent evidence of
+use. Any future reader must use a consistent read-only snapshot and
+avoid triggering migrations or touching WAL/SHM state while Codex runs.
+
+Further mapping approaches, ranked:
+
+1. Join rollout thread ID to the exact SQLite thread row via its
+   `rollout_path`/thread identity, then use declared `cwd` when a rollout
+   header is absent or unsupported. Locally this is redundant for
+   existing rows because all sampled rows already have cwd.
+2. Use Git origin URL only to corroborate repo-family identity; require
+   declared cwd or another exact worktree signal to choose among clones.
+3. Use `forked_from_id` for lineage/supporting context only, not inherited
+   project ownership.
+4. Use canonical Codex `project_id` only where populated and mapped to a
+   known root; it is null in the sampled local database.
+5. Do not claim project ownership from `runtime_workspace_roots`, a bare
+   directory basename, or branch name alone: they are scope/weak clues,
+   not proof the session used a worktree.
 
 ## Gaps
 - Claude Code's `read_header_cwd` still reads up to 8 KiB of the first
@@ -117,3 +150,52 @@ path outside the known worktree set).
   observation.
 - Archived sessions share the parser and the fix, but were not
   separately probed (23 units locally).
+
+## Execute — replace transcript scan with Codex state-index linkage
+
+**Aim:** link Codex sessions to projects without reading rollout contents.
+The chosen source is Codex's versioned state SQLite index, located by
+`sqlite_home` in config, then `CODEX_SQLITE_HOME`, then the Codex home.
+This replaces the entire rollout-header parser; it does not add a
+fallback scan. The existing stat-only walk remains because it measures
+session storage size.
+
+**Implementation:** `agents::codex_state` selects the highest numeric
+`state_<n>.sqlite`, opens it read-only, verifies the `threads` table and
+required columns, and selects only exact `rollout_path` plus `cwd`.
+Missing, stale, conflicting, or incompatible rows remain unresolved.
+No title, preview, prompt, or transcript fields are read. The context
+captures `CODEX_SQLITE_HOME` outside the adapter to preserve the
+environment-free adapter boundary. The SQLite index is queried each
+identification pass, but it does not invalidate the day-container size
+cache: cached session rows retain their declared-path basis, and their
+project links are refreshed from the current index. Thus unrelated
+Codex index writes do not trigger a session-tree re-stat walk. Adapter
+and container format versions were bumped so old header-derived rows
+cannot replay. Newer numeric state DB filenames are also protected and
+folded with their sidecars.
+
+**Evidence and trade-offs:** the earlier local read-only data check
+found 4,956 index rows, 3,262 exact rows for 3,473 current rollout
+files, with 211 files absent from the index (6.26% of rollout bytes
+then measured). DB-only linkage intentionally leaves those unmatched
+sessions unresolved; it does not infer by basename or parse content.
+The index's incompleteness is accepted in favor of a cheaper and
+privacy-preserving source, not hidden as perfect coverage.
+
+**Verification:** Codex adapter tests cover exact-path linking,
+transcript-shaped cwd not linking without an index row, conflicting
+rows, future state DB versions, private-column canaries, and zero
+rollout-header bytes. A container regression changes the SQLite `cwd`
+between passes and proves that project attribution refreshes while the
+session day is reused with zero re-identification. The full core suite
+and TUI suite pass; source audits confirm the adapter still does not
+reach filesystem gates or environment directly. The full workspace
+release gate remains separate.
+
+**Remaining checks:** confirm actual current Codex config/schema
+behavior on a live install without printing or retaining row values;
+inspect SQLite's read-only WAL coordination behavior and ensure
+protected accounting remains exact. Other agent adapters may still
+perform their own bounded reads; this change removes only Codex
+rollout-content scanning.

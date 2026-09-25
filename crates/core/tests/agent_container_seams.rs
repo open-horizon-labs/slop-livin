@@ -187,6 +187,83 @@ fn codex_day_directories_are_containers() {
 }
 
 #[test]
+fn codex_refreshes_project_link_without_invalidating_cached_session_size() {
+    use swamp_core::agents::ProjectLinkState;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("codex");
+    let rollout = home.join("sessions/2026/09/25/rollout-live.jsonl");
+    write(
+        &rollout,
+        "synthetic transcript; never parsed for attribution\n",
+    );
+    let project_a = root.join("project-a");
+    let project_b = root.join("project-b");
+    fs::create_dir_all(&project_a).unwrap();
+    fs::create_dir_all(&project_b).unwrap();
+
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads (rollout_path TEXT, cwd TEXT, title TEXT, preview TEXT, first_user_message TEXT);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads (rollout_path, cwd, title, preview, first_user_message) VALUES (?1, ?2, 'private title', 'private preview', 'private message')",
+        rusqlite::params![rollout.to_string_lossy(), project_a.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+
+    let store = tempfile::tempdir().unwrap();
+    let identify_pass = |at: u64, coverage| {
+        let cache = IdentificationCache::load(store.path());
+        let containers = ContainerCache::load(store.path(), coverage);
+        let (units, work) = work_counters::measured(|| {
+            let ctx = IdentifyCtx::with_containers(at, &cache, &containers);
+            swamp_core::agents::codex::identify(&home, &ctx)
+        });
+        cache.save(store.path(), at).unwrap();
+        containers.save(store.path(), at).unwrap();
+        (units, work)
+    };
+
+    let (first, _) = identify_pass(1_000, EventCoverage::untrusted());
+    let first_link = first
+        .iter()
+        .find(|unit| unit.path() == rollout)
+        .expect("the rollout is identified")
+        .project_link()
+        .clone();
+    assert!(
+        matches!(first_link, ProjectLinkState::NotAProject { ref path } if path == &project_a),
+        "first link should use first database cwd, got {first_link:?}"
+    );
+
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute(
+        "UPDATE threads SET cwd = ?1 WHERE rollout_path = ?2",
+        rusqlite::params![project_b.to_string_lossy(), rollout.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+
+    let (second, work) = identify_pass(2_000, quiet(&root, 1_000));
+    let session = second
+        .iter()
+        .find(|unit| unit.path() == rollout)
+        .expect("the cached rollout is returned");
+    assert!(
+        matches!(session.project_link(), ProjectLinkState::NotAProject { path } if path == &project_b),
+        "the fresh Codex index row must replace the stale cached project link: {:?}",
+        session.project_link()
+    );
+    assert_eq!(work.containers_reused, 1, "session bytes remain cached");
+    assert_eq!(work.containers_identified, 0, "the day is not rewalked");
+    assert_eq!(session.bytes(), rollout.metadata().unwrap().len());
+}
+
+#[test]
 fn opencode_project_directories_are_containers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();

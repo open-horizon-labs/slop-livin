@@ -222,9 +222,10 @@ pub const MATRIX: &[MatrixEntry] = &[
             "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/core/src/config/mod.rs",
             "https://github.com/openai/codex/blob/ac7634b9f73ec1bf96466be7a5869f0949d20b30/codex-rs/ext/skills/src/host_roots.rs",
         ],
-        note: "#93; crate::agents::codex implements identification. The session-header envelope \
-               nesting around `cwd` is not pinned to one shape (internal, version-varying wire \
-               format); no managed-worktree creation by the CLI itself is confirmed. skills/ \
+        note: "#93; crate::agents::codex implements identification. Session linkage uses the \
+               read-only state index's exact rollout_path/cwd columns; missing or conflicting \
+               entries remain unresolved, with no transcript-content fallback. No managed-worktree \
+               creation by the CLI itself is confirmed. skills/ \
                under CODEX_HOME is upstream-deprecated in favour of ~/.agents/skills, and log/ \
                can be moved by config -- both are identified where they are, never assumed",
         verification: &[

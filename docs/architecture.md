@@ -901,12 +901,15 @@ ordinary artifact row:
     for the folder-name inference (`agents::KnownWorktrees`, 2026-09-25):
     a Claude Code unit records its `projects/<slug>` folder name beside
     the declared path (`LinkBasis::Declared::folder_slug`, container
-    format `agent-container/2026-09-25.1`), and `ContainerCache::
+    format `agent-container/2026-09-25.2`), and `ContainerCache::
     finish_link` -- the one resolution path for identified and replayed
-    units alike -- infers a link only when nothing was declared and the
-    slug re-encodes exactly one of *this pass's* known worktrees. The
-    known set is the worktree list project discovery already hands agent
-    discovery; nothing is listed or walked for it.
+    units alike -- prefers a declared `cwd` that resolves, then may use
+    the slug only when it re-encodes exactly one of *this pass's* known
+    worktrees. Missing/non-project cwd failure remains visible in
+    `fallback_reason`; absent, ambiguous, or stale slug evidence keeps
+    the original unresolved/missing/not-a-project state. The known set
+    is the worktree list project discovery already hands agent discovery;
+    nothing is listed or walked for it.
   - The reuse is therefore as fresh as the observation that stored it,
     and never fresher. A replay can report a stale fact only if the pass
     that wrote it did, and the window refuses to vouch for rows older
@@ -1008,8 +1011,13 @@ one two chunks above already established:
 - **An adapter sees only its `IdentifyCtx`.** Listings come from
   `ctx.list`/`dir_names`/`file_names`/`has_entries` (one bounded,
   capped, symlink-refusing level via `locations::shallow_list`); byte
-  totals from `ctx.folded_bytes`; content **only** from
-  `ctx.read_header`/`ctx.derived`, capped at `MAX_HEADER_BYTES`. No
+  totals from `ctx.folded_bytes`; content normally comes from
+  `ctx.read_header`/`ctx.derived`, capped at `MAX_HEADER_BYTES`. Codex's
+  state adapter is the one exception: it queries a read-only SQLite
+  thread index and selects only `rollout_path,cwd`; it never reads
+  rollout JSONL contents. Its session-size containers are cached
+  independently; the current index is loaded each pass and project links
+  are refreshed on replay, so index writes do not force session rewalks. No
   adapter names `read_dir`, `std::fs`, `std::env`, `actions::` or
   `println!`: `std::fs` is a gate path anywhere outside `fs_gate`, and
   `adapters_do_not_reach_gates` confines adapters to their `IdentifyCtx`
@@ -1670,13 +1678,10 @@ function pointer on the event thread is rejected rather than followed.
   re-measured by this adapter (Claude Code documents no fixed on-disk
   location for them); they are ordinary Git worktrees the normal scan
   already discovers, and this adapter cross-references rather than
-  double-counts them. Codex's session-header envelope shape around its
-  `cwd` field (streamed one byte at a time through
-  `bounded_io::scan_header` and stopped at the field's closing quote,
-  because the record is itself far longer -- the project's instructions
-  text rides in it -- and the contract is about what is read, not what
-  is kept; the scanner decodes only `type` and the supported `cwd`;
-  corrected 2026-09-25 after every Codex session had read `unresolved`), Oh My Pi's blob-reference GC, and OpenCode's snapshot/
+  double-counts them. Codex project linkage comes from a read-only
+  `state_<n>.sqlite` query of exact `rollout_path` and `cwd` columns;
+  rollout contents are not scanned, and absent/conflicting rows remain
+  unresolved. Oh My Pi's blob-reference GC, and OpenCode's snapshot/
   `storage/part` actions are each documented, deliberate scope
   boundaries in `docs/agent-storage.md`, not silent gaps.
 

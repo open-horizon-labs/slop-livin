@@ -3107,6 +3107,7 @@ fn project_link_state_to_columns(
             project_name,
             project_path,
             source,
+            fallback_reason,
             worktree_kind,
         } => {
             let source_label = match source {
@@ -3115,8 +3116,9 @@ fn project_link_state_to_columns(
             };
             (
                 Some(format!(
-                    "{project_name}{LINK_SEP}{}{LINK_SEP}{source_label}{LINK_SEP}{worktree_kind}",
-                    project_path.display()
+                    "{project_name}{LINK_SEP}{}{LINK_SEP}{source_label}{LINK_SEP}{worktree_kind}{LINK_SEP}{}",
+                    project_path.display(),
+                    fallback_reason.as_deref().unwrap_or_default()
                 )),
                 Some(project_id.clone()),
             )
@@ -3143,7 +3145,10 @@ fn project_link_state_from_columns(
     let basis = basis.unwrap_or_default();
     match state {
         "linked" => {
-            let parts: Vec<&str> = basis.split(LINK_SEP).collect();
+            // The fifth field is path-derived and can contain LINK_SEP.
+            // Split only the four structural boundaries; preserve the
+            // complete fallback reason as the remainder.
+            let parts: Vec<&str> = basis.splitn(5, LINK_SEP).collect();
             P::Linked {
                 project_id: project_id.unwrap_or_default().to_string(),
                 project_name: parts.first().copied().unwrap_or_default().to_string(),
@@ -3153,6 +3158,10 @@ fn project_link_state_from_columns(
                 } else {
                     LinkSource::Declared
                 },
+                fallback_reason: parts
+                    .get(4)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
                 worktree_kind: parts.get(3).copied().unwrap_or_default().to_string(),
             }
         }
@@ -8634,6 +8643,7 @@ mod tests {
                 project_name: "one".into(),
                 project_path: PathBuf::from("/src/one"),
                 source: LinkSource::Declared,
+                fallback_reason: None,
                 worktree_kind: "main".into(),
             },
             ProjectLinkState::Linked {
@@ -8641,6 +8651,7 @@ mod tests {
                 project_name: "two".into(),
                 project_path: PathBuf::from("/src/two"),
                 source: LinkSource::Inferred,
+                fallback_reason: Some("declared cwd missing: /old\u{1}two".into()),
                 worktree_kind: "linked".into(),
             },
             ProjectLinkState::Unresolved {

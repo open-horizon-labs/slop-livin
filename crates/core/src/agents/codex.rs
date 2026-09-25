@@ -2,10 +2,12 @@
 //! SQLite-backed state stores, and protected configuration under the
 //! home `crate::locations::codex::CodexDetector` resolves.
 //!
-//! Layout researched from primary source during implementation (never
-//! from a real `~/.codex` on this machine -- PRIVACY IS A HARD RULE),
-//! all from <https://github.com/openai/codex> `codex-rs`, current `main`
-//! as of this chunk:
+//! Layout researched from primary source during implementation, all
+//! from <https://github.com/openai/codex> `codex-rs`, current `main` as
+//! of this chunk. Session linkage comes from Codex's local SQLite thread
+//! index (`rollout_path` + `cwd`), not transcript contents. Rollout files
+//! are walked/stat'ed for storage accounting but their bytes are never
+//! read:
 //! - `codex-rs/utils/home-dir/src/lib.rs` (`find_codex_home`):
 //!   `CODEX_HOME` env var, else `~/.codex`.
 //! - `codex-rs/rollout/src/lib.rs`: `pub const SESSIONS_SUBDIR: &str =
@@ -24,35 +26,6 @@
 //!   `IdentifyCtx::folded_bytes` already gives every adapter in this
 //!   module, confirming (not just assuming) it matches upstream's own
 //!   practice.
-//! - `codex-rs/rollout/src/metadata.rs`: the rollout's first logical
-//!   item is a `session_meta` entry carrying `meta.cwd` (and, when
-//!   present, `git.commit_hash`/`git.branch`/`git.repository_url`,
-//!   unused here -- only `cwd` is read, same one-field discipline
-//!   `crate::agents::claude_code` uses). The exact envelope nesting
-//!   (`payload.meta.cwd` vs `meta.cwd` vs a bare top-level `cwd`) is not
-//!   pinned to one shape here: this is genuinely internal wire format,
-//!   read only for this one field, and any shape not matched resolves to
-//!   `Unresolved`, never a guess or a panic.
-//! - 2026-09-25, structural probe of the 100 most recent local rollouts
-//!   (key names and byte offsets only, no values): every first record is
-//!   `{"timestamp","ordinal","type":"session_meta","payload":{...}}` with
-//!   the `cwd` flattened at `payload.cwd`, 220-334 bytes in -- and every
-//!   first record is longer than [`HEADER_READ_BYTES`] (22 KB median,
-//!   48 KB max), because `payload.base_instructions.text` carries the
-//!   project's instructions file in the same record. A parser that needs
-//!   the whole line therefore found *no* Codex `cwd` at all (3,450
-//!   sessions "unresolved" on the owner's machine). `read_header_cwd`
-//!   now streams the record one byte at a time and stops at the closing
-//!   quote of the `cwd` ([`SessionMetaCwd`] over
-//!   `bounded_io::scan_header`): the instructions text after it is never
-//!   fetched from the file, let alone parsed and discarded. Not used,
-//!   deliberately: `payload.git.{branch,commit_hash,
-//!   repository_url}` sits after the instructions text (18-48 KB in,
-//!   92/100 records) and would need the read bound raised through it;
-//!   `payload.forked_from_id` (9/100) names another *session*, not a
-//!   project; per-turn `turn_context.cwd` records (9/100 within 64 KB)
-//!   are beyond the first line. Each is a documented corroboration
-//!   candidate, none is evidence this adapter reads.
 //! - `codex-rs/state/src/sqlite.rs` @
 //!   `ac7634b9f73ec1bf96466be7a5869f0949d20b30`:
 //!   `const RUNTIME_DBS: [RuntimeDbSpec; 7]` -- `state_5.sqlite`,
@@ -62,11 +35,13 @@
 //!   Seven, not six: `memories_v2_1.sqlite` is declared as a
 //!   struct-update over `MEMORIES_DB` with its filename inline, so
 //!   counting the `*_DB_FILENAME` consts gives six and misses it.
-//!   `SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"` can relocate all of them
-//!   *outside* `CODEX_HOME`; this adapter does not follow that override
-//!   (documented gap, same shape as `claude_code`'s undstood
-//!   `~/.claude.json` sibling gap) -- if set, these files are simply not
-//!   found here rather than guessed at a wrong path.
+//!   `CODEX_SQLITE_HOME` can relocate them outside `CODEX_HOME`; the
+//!   adapter resolves `sqlite_home` from config, then that environment
+//!   variable, then the Codex home. It opens only the newest strictly
+//!   versioned `state_<n>.sqlite` read-only and selects exactly
+//!   `threads.rollout_path` and `threads.cwd`. Missing, stale, ambiguous,
+//!   or incompatible index rows stay unresolved; there is no transcript
+//!   parsing fallback.
 //!
 //! No managed-worktree creation by the Codex CLI itself is confirmed by
 //! primary source this chunk, so `AgentCategory::ManagedWorktrees` is
@@ -76,7 +51,8 @@
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
     AgentMemberKind, AgentUnitBuilder, CandidateAgentUnit, IdentifyCtx, ProjectLinkState,
-    bounded_io, mtime_secs,
+    codex_state::{self, CwdLookup, SessionIndex},
+    mtime_secs,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -95,17 +71,34 @@ const MAX_CONTAINERS: usize = 20_000;
 /// Depth below a session root at which a directory becomes a container:
 /// `sessions/<yyyy>/<mm>/<dd>/`, upstream's documented layout.
 const CONTAINER_DEPTH: usize = 3;
-/// Ceiling on how many bytes of a rollout file's first line this adapter
-/// will ever read looking for a `cwd` field -- never whole transcripts.
-/// A ceiling, not a read size: the read stops at the `cwd`'s closing
-/// quote, a few hundred bytes in ([`SessionMetaCwd`]).
-const HEADER_READ_BYTES: usize = 8192;
 /// Bound on how many nested date directories a session-tree walk
 /// descends before giving up on a subtree, so a pathologically deep or
 /// cyclic (symlink) layout cannot make identification unbounded. The
 /// real layout is exactly three levels (year/month/day); this leaves
 /// headroom for a future layout change without becoming unbounded.
 const MAX_WALK_DEPTH: usize = 8;
+
+fn declared_project_link(
+    rollout_path: &Path,
+    session_index: &SessionIndex,
+) -> (Option<String>, &'static str) {
+    let (declared, reason) = match session_index.cwd_for(rollout_path) {
+        CwdLookup::Declared(path) => (Some(path.to_string_lossy().into_owned()), ""),
+        CwdLookup::NoIndex => (None, "Codex state index unavailable or unsupported"),
+        CwdLookup::NoRow => (None, "no exact rollout_path row in Codex state index"),
+        CwdLookup::NoUsableCwd => (None, "Codex state row has no unique absolute cwd"),
+    };
+    (declared, reason)
+}
+
+fn refresh_project_link(
+    unit: &mut CandidateAgentUnit,
+    session_index: &SessionIndex,
+    ctx: &IdentifyCtx,
+) {
+    let (declared, reason) = declared_project_link(unit.path(), session_index);
+    ctx.refresh_declared_project_link(unit, declared, reason);
+}
 
 pub struct Adapter;
 
@@ -125,6 +118,7 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+    let session_index = SessionIndex::load(home, ctx);
     let mut units = Vec::new();
     let mut containers_used = 0usize;
     identify_sessions(
@@ -132,6 +126,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         "sessions",
         false,
         ctx,
+        &session_index,
         &mut units,
         &mut containers_used,
     );
@@ -140,6 +135,7 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         "archived_sessions",
         true,
         ctx,
+        &session_index,
         &mut units,
         &mut containers_used,
     );
@@ -159,11 +155,21 @@ fn identify_sessions(
     subdir: &str,
     archived: bool,
     ctx: &IdentifyCtx,
+    session_index: &SessionIndex,
     out: &mut Vec<CandidateAgentUnit>,
     containers_used: &mut usize,
 ) {
     let base = home.join(subdir);
-    collect_sessions(&base, 0, home, archived, ctx, out, containers_used);
+    collect_sessions(
+        &base,
+        0,
+        home,
+        archived,
+        ctx,
+        session_index,
+        out,
+        containers_used,
+    );
 }
 
 /// One rollout file's unit. Factored out so the same code produces it
@@ -174,16 +180,17 @@ fn session_unit(
     jsonl: PathBuf,
     archived: bool,
     ctx: &IdentifyCtx,
+    session_index: &SessionIndex,
 ) -> Option<CandidateAgentUnit> {
     let meta = ctx.stat(&jsonl).ok()?;
     let bytes = meta.len();
     let mtime = mtime_secs(&meta);
+    let (declared, missing_reason) = declared_project_link(&jsonl, session_index);
     // `project_link_declared`, not `project_link`: the declared path is
     // what a replayed container re-resolves live, so a worktree deleted
     // between two passes is never reported as still linked
     // (`crate::agents::LinkBasis`). A unit whose link is `Fixed` makes
     // its whole container unstorable.
-    let declared = read_header_cwd(&jsonl, ctx);
     // `archived_sessions/` is its own category, not folded into
     // `sessions/`: stack/26's Codex reconciliation defect was exactly
     // this row reporting into `AgentCategory::Sessions` regardless of
@@ -202,7 +209,7 @@ fn session_unit(
             kind: AgentMemberKind::Transcript,
         }])
         .mtime_max(mtime)
-        .project_link_declared(declared, "no cwd field found in the session's first line")
+        .project_link_declared(declared, missing_reason)
         .action(AgentActionCapability::SessionRemoval);
     if archived {
         unit = unit.note(
@@ -234,6 +241,7 @@ fn collect_sessions(
     home: &Path,
     archived: bool,
     ctx: &IdentifyCtx,
+    session_index: &SessionIndex,
     out: &mut Vec<CandidateAgentUnit>,
     containers_used: &mut usize,
 ) {
@@ -253,18 +261,30 @@ fn collect_sessions(
                     collect_jsonl_files(&path, depth + 1, ctx, &mut files);
                     files
                         .into_iter()
-                        .filter_map(|jsonl| session_unit(home, jsonl, archived, ctx))
+                        .filter_map(|jsonl| session_unit(home, jsonl, archived, ctx, session_index))
                         .collect()
                 });
-                out.extend(units);
+                out.extend(units.into_iter().map(|mut unit| {
+                    refresh_project_link(&mut unit, session_index, ctx);
+                    unit
+                }));
             } else {
-                collect_sessions(&path, depth + 1, home, archived, ctx, out, containers_used);
+                collect_sessions(
+                    &path,
+                    depth + 1,
+                    home,
+                    archived,
+                    ctx,
+                    session_index,
+                    out,
+                    containers_used,
+                );
             }
         } else if is_rollout(&entry.name) {
             // A rollout file sitting above the day level (an older or
             // hand-moved layout) is identified inline: it belongs to no
             // container, so it is never replayed.
-            out.extend(session_unit(home, path, archived, ctx));
+            out.extend(session_unit(home, path, archived, ctx, session_index));
         }
     }
 }
@@ -293,240 +313,6 @@ fn collect_jsonl_files(dir: &Path, depth: usize, ctx: &IdentifyCtx, out: &mut Ve
             out.push(path);
         }
     }
-}
-
-/// The session's declared `cwd`, derived once per `(size, mtime,
-/// adapter version)` through the identification cache: an unchanged
-/// home costs zero header bytes on a second pass.
-fn read_header_cwd(path: &Path, ctx: &IdentifyCtx) -> Option<String> {
-    ctx.derived_scanned(
-        CODEX_TOOL_ID,
-        "cwd",
-        path,
-        HEADER_READ_BYTES,
-        &|path, max_bytes| {
-            let mut scanner = SessionMetaCwd::default();
-            bounded_io::scan_header(path, max_bytes, &mut |b| scanner.feed(b))?;
-            scanner.finish()
-        },
-    )
-}
-
-/// A byte-at-a-time scanner for the one field this adapter reads: the
-/// `cwd` of a rollout's first `session_meta` record.
-///
-/// Why a scanner and not a parser: the record is far longer than the
-/// `cwd` is deep into it (see the module doc's 2026-09-25 probe -- the
-/// project's instructions text rides in the same record), and the
-/// privacy contract is about what is *read*, not what is kept. So the
-/// read ([`bounded_io::scan_header`]) fetches one byte per `read(2)` and
-/// stops at the byte this scanner marks done: the closing quote of the
-/// `cwd` value. Nothing after it is fetched from the file.
-///
-/// What it decodes: object key names (to know where it is), the
-/// top-level `type`, and the `cwd` at one of the supported paths
-/// (`cwd`, `meta.cwd`, `payload.cwd`, `payload.meta.cwd` -- the module
-/// doc's tolerance). Every other value is skipped byte by byte, never
-/// collected. Anything inside an array is not a supported path.
-///
-/// What it answers: the `cwd` when `type` was `session_meta` or no
-/// `type` had appeared before the `cwd` (the older envelope shapes carry
-/// none); nothing when `type` named another record kind -- and that
-/// answer is given at the `type`'s closing quote, before any `cwd`. A
-/// `type` written *after* the `cwd` is not consulted: reaching it would
-/// mean reading past the field, which is the thing this exists to avoid.
-/// Codex's serializer writes `type` before `payload`, as the probe saw
-/// in 100/100 records.
-#[derive(Default)]
-struct SessionMetaCwd {
-    /// One frame per open `{` / `[`. An object frame carries its current
-    /// key; an array frame carries `None` and matches no supported path.
-    stack: Vec<Frame>,
-    /// Inside an object, the next string is a key.
-    expect_key: bool,
-    /// Inside a string: what to do with its bytes.
-    string: Option<StringState>,
-    record_type: Option<String>,
-    cwd: Option<String>,
-    /// The scan ended because the record could not carry the field
-    /// (another record kind).
-    refused: bool,
-}
-
-enum Frame {
-    Object { key: Option<String> },
-    Array,
-}
-
-struct StringState {
-    capture: Capture,
-    /// Raw bytes of a captured string (escapes still encoded), decoded
-    /// as JSON at the closing quote. Empty for a skipped string.
-    raw: Vec<u8>,
-    escaped: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Capture {
-    Key,
-    Type,
-    Cwd,
-    Skip,
-}
-
-impl SessionMetaCwd {
-    fn path_is(&self, want: &[&str]) -> bool {
-        self.stack.len() == want.len()
-            && self.stack.iter().zip(want).all(|(f, w)| match f {
-                Frame::Object { key: Some(k) } => k == w,
-                _ => false,
-            })
-    }
-
-    fn at_supported_cwd(&self) -> bool {
-        self.path_is(&["cwd"])
-            || self.path_is(&["meta", "cwd"])
-            || self.path_is(&["payload", "cwd"])
-            || self.path_is(&["payload", "meta", "cwd"])
-    }
-
-    fn feed(&mut self, b: u8) -> bounded_io::Scan {
-        if self.string.is_some() {
-            self.feed_in_string(b)
-        } else {
-            self.feed_structure(b)
-        }
-    }
-
-    fn feed_in_string(&mut self, b: u8) -> bounded_io::Scan {
-        use bounded_io::Scan;
-        let Some(st) = self.string.as_mut() else {
-            return Scan::More;
-        };
-        if st.escaped {
-            st.escaped = false;
-            if st.capture != Capture::Skip {
-                st.raw.push(b);
-            }
-            return Scan::More;
-        }
-        match b {
-            b'\\' => {
-                st.escaped = true;
-                if st.capture != Capture::Skip {
-                    st.raw.push(b);
-                }
-                Scan::More
-            }
-            b'"' => {
-                let Some(st) = self.string.take() else {
-                    return Scan::More;
-                };
-                self.close_string(st)
-            }
-            _ => {
-                if st.capture != Capture::Skip {
-                    st.raw.push(b);
-                }
-                Scan::More
-            }
-        }
-    }
-
-    /// The closing quote of a string: a key names the frame, `type`
-    /// decides whether the record can carry the field, the `cwd` ends
-    /// the scan.
-    fn close_string(&mut self, st: StringState) -> bounded_io::Scan {
-        use bounded_io::Scan;
-        match st.capture {
-            Capture::Key => {
-                if let Some(Frame::Object { key }) = self.stack.last_mut() {
-                    *key = String::from_utf8(st.raw).ok();
-                }
-                Scan::More
-            }
-            Capture::Type => {
-                let t = decode_json_string(&st.raw);
-                let ok = t.as_deref() == Some("session_meta");
-                self.record_type = t;
-                if ok {
-                    Scan::More
-                } else {
-                    self.refused = true;
-                    Scan::Done
-                }
-            }
-            Capture::Cwd => {
-                self.cwd = decode_json_string(&st.raw);
-                Scan::Done
-            }
-            Capture::Skip => Scan::More,
-        }
-    }
-
-    fn feed_structure(&mut self, b: u8) -> bounded_io::Scan {
-        use bounded_io::Scan;
-        match b {
-            b'{' => {
-                self.stack.push(Frame::Object { key: None });
-                self.expect_key = true;
-            }
-            b'[' => {
-                self.stack.push(Frame::Array);
-                self.expect_key = false;
-            }
-            b'}' | b']' => {
-                self.stack.pop();
-                self.expect_key = false;
-            }
-            b':' => self.expect_key = false,
-            b',' => {
-                self.expect_key = matches!(self.stack.last(), Some(Frame::Object { .. }));
-            }
-            b'"' => {
-                let capture = if self.expect_key {
-                    Capture::Key
-                } else if self.path_is(&["type"]) {
-                    Capture::Type
-                } else if self.at_supported_cwd() {
-                    Capture::Cwd
-                } else {
-                    Capture::Skip
-                };
-                self.expect_key = false;
-                self.string = Some(StringState {
-                    capture,
-                    raw: Vec::new(),
-                    escaped: false,
-                });
-            }
-            b'\n' => {
-                // End of the first line without the field.
-                self.refused = true;
-                return Scan::Done;
-            }
-            // Numbers, `true`/`false`/`null`, whitespace: structure
-            // the delimiters above already track.
-            _ => {}
-        }
-        Scan::More
-    }
-
-    fn finish(self) -> Option<String> {
-        if self.refused {
-            return None;
-        }
-        self.cwd.filter(|s| !s.is_empty())
-    }
-}
-
-/// The JSON string whose raw (still escaped) contents are `raw`.
-fn decode_json_string(raw: &[u8]) -> Option<String> {
-    let mut quoted = Vec::with_capacity(raw.len() + 2);
-    quoted.push(b'"');
-    quoted.extend_from_slice(raw);
-    quoted.push(b'"');
-    serde_json::from_slice::<String>(&quoted).ok()
 }
 
 // ---------------------------------------------------------------------
@@ -583,56 +369,89 @@ const SQLITE_STORES: &[SqliteStore] = &[
 
 fn identify_sqlite_stores(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     for store in SQLITE_STORES {
-        let path = home.join(store.filename);
-        let Ok(meta) = ctx.stat(&path) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let mut members = vec![AgentMember {
-            path: path.clone(),
-            bytes: meta.len(),
-            kind: AgentMemberKind::Database,
-        }];
-        let mut bytes = meta.len();
-        let mut mtime_max = mtime_secs(&meta);
-        for sidecar_ext in ["-wal", "-shm"] {
-            let sidecar = PathBuf::from(format!("{}{sidecar_ext}", path.display()));
-            if let Ok(sm) = ctx.stat(&sidecar)
-                && sm.is_file()
-            {
-                bytes += sm.len();
-                mtime_max = mtime_max.max(mtime_secs(&sm));
-                members.push(AgentMember {
-                    path: sidecar,
-                    bytes: sm.len(),
-                    kind: AgentMemberKind::Database,
-                });
-            }
-        }
-        out.push(
-            // `ProtectedDatabases`, not `Sessions`: these are state
-            // stores, not conversation history, and folding them into
-            // `Sessions` was stack/26's Codex reconciliation defect --
-            // it inflated the reported "sessions" total by every
-            // SQLite store's bytes (plus `-wal`/`-shm`) against what
-            // `du` shows per top-level entry.
-            AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::ProtectedDatabases, path)
-                .relative_path(store.filename)
-                .bytes(bytes)
-                .members_keep_bytes(members)
-                .mtime_max(mtime_max)
-                .project_link(ProjectLinkState::NotApplicable)
-                .action(AgentActionCapability::None)
-                .protect(format!(
-                    "SQLite {} (never opened while Codex may be writing; metadata-only, no \
-                     per-row drill-down in this chunk)",
-                    store.purpose
-                ))
-                .build(),
+        identify_sqlite_store(
+            home.join(store.filename),
+            store.filename,
+            store.purpose,
+            ctx,
+            out,
         );
     }
+    // The state database's schema number is an upstream version boundary.
+    // Recognize future `state_<n>.sqlite` names rather than silently
+    // dropping a renamed index into the unclassified residual.
+    for entry in ctx.list(home) {
+        if codex_state::state_database_version(&entry.name).is_some()
+            && !SQLITE_STORES
+                .iter()
+                .any(|store| store.filename == entry.name)
+        {
+            identify_sqlite_store(
+                home.join(&entry.name),
+                &entry.name,
+                "session/thread state index",
+                ctx,
+                out,
+            );
+        }
+    }
+}
+
+fn identify_sqlite_store(
+    path: PathBuf,
+    filename: &str,
+    purpose: &str,
+    ctx: &IdentifyCtx,
+    out: &mut Vec<CandidateAgentUnit>,
+) {
+    let Ok(meta) = ctx.stat(&path) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    let mut members = vec![AgentMember {
+        path: path.clone(),
+        bytes: meta.len(),
+        kind: AgentMemberKind::Database,
+    }];
+    let mut bytes = meta.len();
+    let mut mtime_max = mtime_secs(&meta);
+    for sidecar_ext in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{sidecar_ext}", path.display()));
+        if let Ok(sm) = ctx.stat(&sidecar)
+            && sm.is_file()
+        {
+            bytes += sm.len();
+            mtime_max = mtime_max.max(mtime_secs(&sm));
+            members.push(AgentMember {
+                path: sidecar,
+                bytes: sm.len(),
+                kind: AgentMemberKind::Database,
+            });
+        }
+    }
+    out.push(
+        // `ProtectedDatabases`, not `Sessions`: these are state
+        // stores, not conversation history, and folding them into
+        // `Sessions` was stack/26's Codex reconciliation defect --
+        // it inflated the reported "sessions" total by every
+        // SQLite store's bytes (plus `-wal`/`-shm`) against what
+        // `du` shows per top-level entry.
+        AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::ProtectedDatabases, path)
+            .relative_path(filename)
+            .bytes(bytes)
+            .members_keep_bytes(members)
+            .mtime_max(mtime_max)
+            .project_link(ProjectLinkState::NotApplicable)
+            .action(AgentActionCapability::None)
+            .protect(format!(
+                "SQLite {purpose}; protected and never actionable. The state index is \
+                     queried read-only for rollout_path/cwd linkage only; no conversation \
+                     content or other row fields are read."
+            ))
+            .build(),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -742,7 +561,15 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
     let mut residual_names: Vec<String> = Vec::new();
     for e in ctx.list(home) {
         let name = e.name;
-        if name == "sessions" || name == "archived_sessions" || seen_top_level.contains(&name) {
+        if name == "sessions"
+            || name == "archived_sessions"
+            || seen_top_level.contains(&name)
+            || codex_state::state_database_version(&name).is_some()
+            || ["-wal", "-shm"].iter().any(|suffix| {
+                name.strip_suffix(suffix)
+                    .is_some_and(|base| codex_state::state_database_version(base).is_some())
+            })
+        {
             continue;
         }
         let (bytes, mtime, _truncated) = ctx.folded_bytes(&home.join(&name), MAX_FOLD_ENTRIES);
@@ -775,7 +602,7 @@ fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{IdentificationCache, bounded_io, contract};
+    use crate::agents::{IdentificationCache, contract};
     use std::fs;
     use std::time::{Duration, SystemTime};
 
@@ -789,10 +616,15 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    fn header_line(cwd: &str, canary: &str) -> String {
-        format!(
-            "{{\"type\":\"session_meta\",\"cwd\":\"{cwd}\",\"payload\":{{\"prompt\":\"{canary}\"}}}}\n"
-        )
+    fn write_index(home: &Path, rows: &[(&Path, &Path)]) {
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (rollout_path TEXT, cwd TEXT, title TEXT, preview TEXT, first_user_message TEXT);").unwrap();
+        for (rollout, cwd) in rows {
+            db.execute(
+                "INSERT INTO threads (rollout_path, cwd, title, preview, first_user_message) VALUES (?1, ?2, 'private title', 'private preview', 'private message')",
+                rusqlite::params![rollout.to_string_lossy(), cwd.to_string_lossy()],
+            ).unwrap();
+        }
     }
 
     #[test]
@@ -810,10 +642,8 @@ mod tests {
         let canary = "CANARY-CODEX-DO-NOT-LEAK-91a3";
         let jsonl = home
             .join("sessions/2026/09/21/rollout-2026-09-21T10-00-00-11111111-1111-4111-8111-111111111111.jsonl");
-        touch(
-            &jsonl,
-            header_line(&repo.display().to_string(), canary).as_bytes(),
-        );
+        touch(&jsonl, format!("transcript canary: {canary}\n").as_bytes());
+        write_index(home, &[(&jsonl, &repo)]);
         let units = run(home);
         let session = units
             .iter()
@@ -830,36 +660,40 @@ mod tests {
     }
 
     #[test]
-    fn the_envelope_nesting_around_cwd_is_not_pinned_to_one_shape() {
-        // The tolerance the module doc records: `cwd`, `meta.cwd`,
-        // `payload.cwd` and `payload.meta.cwd` all resolve, and anything
-        // else is `Unresolved` rather than a guess.
+    fn only_an_exact_indexed_rollout_path_links() {
         let repo_dir = tempfile::tempdir().unwrap();
         let repo = repo_dir.path().join("declared-repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
-        let cwd = repo.display().to_string();
-        for (i, header) in [
-            format!("{{\"cwd\":\"{cwd}\"}}"),
-            format!("{{\"meta\":{{\"cwd\":\"{cwd}\"}}}}"),
-            format!("{{\"payload\":{{\"cwd\":\"{cwd}\"}}}}"),
-            format!("{{\"payload\":{{\"meta\":{{\"cwd\":\"{cwd}\"}}}}}}"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let home = tempfile::tempdir().unwrap();
-            let jsonl = home
-                .path()
-                .join(format!("sessions/2026/09/21/rollout-shape-{i}.jsonl"));
-            touch(&jsonl, format!("{header}\nbody\n").as_bytes());
-            let units = run(home.path());
-            let session = units.iter().find(|u| u.path == jsonl).unwrap();
-            assert!(
-                matches!(session.project_link(), ProjectLinkState::Linked { .. }),
-                "shape {i} ({header}) must still resolve: {:?}",
-                session.project_link()
-            );
-        }
+        let home = tempfile::tempdir().unwrap();
+        let indexed = home
+            .path()
+            .join("sessions/2026/09/21/rollout-indexed.jsonl");
+        let unindexed = home
+            .path()
+            .join("sessions/2026/09/21/rollout-unindexed.jsonl");
+        touch(&indexed, format!("{}\n", repo.display()).as_bytes());
+        touch(
+            &unindexed,
+            format!("{{\"cwd\":\"{}\"}}\n", repo.display()).as_bytes(),
+        );
+        write_index(home.path(), &[(&indexed, &repo)]);
+        let units = run(home.path());
+        assert!(matches!(
+            units
+                .iter()
+                .find(|u| u.path == indexed)
+                .unwrap_or_else(|| panic!("indexed unit missing: {units:#?}"))
+                .project_link(),
+            ProjectLinkState::Linked { .. }
+        ));
+        assert!(matches!(
+            units
+                .iter()
+                .find(|u| u.path == unindexed)
+                .unwrap()
+                .project_link(),
+            ProjectLinkState::Unresolved { .. }
+        ));
     }
 
     #[test]
@@ -869,14 +703,14 @@ mod tests {
         let jsonl = home.join(
             "archived_sessions/2026/01/02/rollout-2026-01-02T00-00-00-22222222-2222-4222-8222-222222222222.jsonl",
         );
-        touch(&jsonl, header_line("/nonexistent", "x").as_bytes());
+        touch(&jsonl, b"opaque transcript\n");
         let units = run(home);
         let session = units.iter().find(|u| u.path == jsonl).unwrap();
         assert!(session.note.as_deref().unwrap().contains("archived"));
     }
 
     #[test]
-    fn malformed_header_is_unresolved_not_a_panic() {
+    fn missing_state_index_row_is_unresolved_not_a_panic() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let jsonl = home.join("sessions/2026/01/01/rollout-2026-01-01T00-00-00-x.jsonl");
@@ -906,7 +740,8 @@ mod tests {
         assert_eq!(db.members().len(), 3, "db + wal + shm folded together");
         assert_eq!(
             db.bytes(),
-            "sqlite-bytes".len() as u64 + "wal-bytes".len() as u64 + "shm-bytes".len() as u64
+            db.members().iter().map(|member| member.bytes).sum::<u64>(),
+            "folded size must reflect actual post-query SQLite sidecars"
         );
         assert!(
             db.members()
@@ -975,6 +810,22 @@ mod tests {
     }
 
     #[test]
+    fn future_state_database_versions_remain_protected_and_folded() {
+        let home = tempfile::tempdir().unwrap();
+        touch(&home.path().join("state_12.sqlite"), b"future-state");
+        touch(&home.path().join("state_12.sqlite-wal"), b"wal");
+        touch(&home.path().join("state_12.sqlite-shm"), b"shm");
+        let units = run(home.path());
+        let db = units
+            .iter()
+            .find(|unit| unit.relative_path() == "state_12.sqlite")
+            .expect("future state DB is still modeled");
+        assert!(db.protected());
+        assert_eq!(db.action(), AgentActionCapability::None);
+        assert_eq!(db.members().len(), 3);
+    }
+
+    #[test]
     fn protected_config_is_protected_by_default() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
@@ -1028,9 +879,7 @@ mod tests {
             let jsonl = home.join(format!(
                 "sessions/2026/09/21/rollout-2026-09-21T10-00-{i:02}-77777777-7777-4777-8{i:03}-777777777777.jsonl"
             ));
-            let mut content = header_line(&repo.display().to_string(), "unread-canary");
-            content.push_str(&"x".repeat(200_000));
-            touch(&jsonl, content.as_bytes());
+            touch(&jsonl, &vec![b'x'; 200_000]);
         }
         let start = SystemTime::now();
         let units = run(home);
@@ -1086,11 +935,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let jsonl = home.join("sessions/2026/09/21/rollout-2026-09-21T10-00-00-canary.jsonl");
-        // The canary sits on the header line this adapter *does* read
-        // and again in the body it must never reach.
-        let mut content = header_line("/nonexistent", canary);
-        content.push_str(&format!("{{\"role\":\"user\",\"text\":\"{canary}\"}}\n"));
-        content.push_str(&format!("plain body line: {canary}\n"));
+        let content = format!(
+            "{canary}\n{{\"role\":\"user\",\"text\":\"{canary}\"}}\nplain body line: {canary}\n"
+        );
         touch(&jsonl, content.as_bytes());
         touch(&home.join("history.jsonl"), canary.as_bytes());
         let units = run(home);
@@ -1098,146 +945,58 @@ mod tests {
         contract::no_content_leak(&units, canary);
     }
 
-    /// The record Codex writes today (2026-09-25 local probe, 100/100
-    /// rollouts): one `session_meta` line carrying `payload.cwd` a few
-    /// hundred bytes in, followed in the *same* record by
-    /// `payload.base_instructions.text` -- the project's instructions
-    /// file, 22 KB median -- so the line is far longer than the ceiling.
-    /// The read must end at the `cwd`'s closing quote: the canary that
-    /// begins one byte later is never fetched, and the counted header
-    /// bytes say so exactly.
     #[test]
-    fn the_read_ends_at_the_closing_quote_of_the_cwd_and_the_canary_after_it_is_never_fetched() {
+    fn rollout_content_is_never_read_and_stale_index_rows_stay_unresolved() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let repo = home.join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         let canary = "CANARY-instructions-3c9e";
-        let head = format!(
-            "{{\"timestamp\":\"2026-09-25T10:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\
-             \"payload\":{{\"session_id\":\"s\",\"id\":\"s\",\"forked_from_id\":null,\
-             \"timestamp\":\"t\",\"cwd\":\"{}\"",
-            repo.display()
+        let indexed = home.join("sessions/2026/09/25/rollout-indexed.jsonl");
+        let stale = home.join("sessions/2026/09/25/rollout-stale.jsonl");
+        touch(
+            &indexed,
+            format!("{canary} {}\n", "private transcript ".repeat(2048)).as_bytes(),
         );
-        let line = format!(
-            "{head},\"canary\":\"{canary}\",\"runtime_workspace_roots\":[\"{}\"],\
-             \"base_instructions\":{{\"text\":\"{}\"}},\"git\":{{\"branch\":\"main\"}}}}}}\n",
-            repo.display(),
-            "i".repeat(3 * HEADER_READ_BYTES)
+        touch(
+            &stale,
+            format!("{{\"cwd\":\"{}\"}}\n", repo.display()).as_bytes(),
         );
-        assert!(line.len() > HEADER_READ_BYTES);
-        let jsonl = home.join("sessions/2026/09/25/rollout-big.jsonl");
-        touch(&jsonl, line.as_bytes());
+        write_index(home, &[(&indexed, &repo)]);
 
         let (units, counters) = contract::measured(|| run(home));
-        let unit = units.iter().find(|u| u.path() == jsonl).unwrap();
-        match unit.project_link() {
-            ProjectLinkState::Linked {
-                source,
-                project_path,
-                ..
-            } => {
-                assert_eq!(*source, crate::agents::LinkSource::Declared);
-                assert_eq!(project_path, &repo);
-            }
-            other => panic!("the early cwd must link the session: {other:?}"),
-        }
-        // Exactly the bytes through the cwd's closing quote -- `head`
-        // ends with it -- and not one more.
+        assert!(matches!(
+            units
+                .iter()
+                .find(|u| u.path() == indexed)
+                .unwrap()
+                .project_link(),
+            ProjectLinkState::Linked { .. }
+        ));
+        assert!(matches!(
+            units
+                .iter()
+                .find(|u| u.path() == stale)
+                .unwrap()
+                .project_link(),
+            ProjectLinkState::Unresolved { .. }
+        ));
         assert_eq!(
-            counters.header_bytes_read,
-            head.len() as u64,
-            "the read must end at the closing quote of the cwd"
-        );
-        assert!(
-            line[head.len()..].starts_with(",\"canary\""),
-            "fixture: the canary must begin right after the cwd"
+            counters.header_bytes_read, 16,
+            "only the SQLite file signature is read; no rollout byte is read"
         );
         contract::no_content_leak(&units, canary);
     }
 
-    /// The scanner over synthetic records, with the exact byte at which
-    /// each scan stops. What it refuses: a `cwd` beyond the ceiling; a
-    /// `cwd` the ceiling cuts through (never a prefix of a path); any
-    /// record whose `type` is not `session_meta` -- refused at the
-    /// `type`'s closing quote, before any `cwd`; a `cwd` inside an array.
-    /// What it accepts: an escaped path, `payload.meta.cwd`, and a record
-    /// with no `type` before the `cwd` (the older envelope shapes).
     #[test]
-    fn the_scanner_stops_at_the_field_and_refuses_at_the_record_kind() {
-        fn scan(line: &str, cap: usize) -> (Option<String>, usize) {
-            let mut sc = SessionMetaCwd::default();
-            let mut n = 0usize;
-            for &b in line.as_bytes().iter().take(cap) {
-                n += 1;
-                if sc.feed(b) == bounded_io::Scan::Done {
-                    break;
-                }
-            }
-            (sc.finish(), n)
-        }
-        let cap = HEADER_READ_BYTES;
-        let big = "x".repeat(cap);
-
-        // cwd after the ceiling: nothing, and the read stopped at the cap.
-        let after = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"base_instructions\":{{\"text\":\"{big}\"}},\"cwd\":\"/a/b\"}}}}"
-        );
-        assert_eq!(scan(&after, cap), (None, cap));
-
-        // The ceiling lands inside the cwd value: never a partial path.
-        let inside = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/a/{}\"}}}}",
-            "b".repeat(cap)
-        );
-        assert_eq!(scan(&inside, cap).0, None);
-
-        // Another record kind: refused at the type's closing quote.
-        let other = "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/a/b\"}}";
-        let (got, n) = scan(other, cap);
-        assert_eq!(got, None);
-        assert_eq!(n, "{\"type\":\"turn_context\"".len());
-
-        // A cwd inside an array is not the supported path; the record
-        // ends without one.
-        let arr = "{\"type\":\"session_meta\",\"payload\":{\"roots\":[{\"cwd\":\"/a/b\"}]}}\n";
-        assert_eq!(scan(arr, cap).0, None);
-
-        // Escapes decode; the read ends at the closing quote.
-        let escaped =
-            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/q\\\"b\\\\c\",\"x\":\"SECRET\"}}";
-        let (got, n) = scan(escaped, cap);
-        assert_eq!(got.as_deref(), Some("/a/q\"b\\c"));
-        assert_eq!(
-            &escaped[..n],
-            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/q\\\"b\\\\c\""
-        );
-        assert!(!escaped[..n].contains("SECRET"));
-
-        // `payload.meta.cwd` and a record with no `type` before the cwd.
-        let nested = "{\"type\":\"session_meta\",\"payload\":{\"meta\":{\"cwd\":\"/a/b\"}}}";
-        assert_eq!(scan(nested, cap).0.as_deref(), Some("/a/b"));
-        let untyped = "{\"payload\":{\"cwd\":\"/a/b\"},\"type\":\"session_meta\"}";
-        let (got, n) = scan(untyped, cap);
-        assert_eq!(got.as_deref(), Some("/a/b"));
-        assert_eq!(&untyped[..n], "{\"payload\":{\"cwd\":\"/a/b\"");
-
-        // A non-ASCII path arrives intact.
-        let utf8 = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/a/caf\u{e9}\"}}";
-        assert_eq!(scan(utf8, cap).0.as_deref(), Some("/a/caf\u{e9}"));
-    }
-
-    #[test]
-    fn identification_reads_no_more_than_header_cap() {
+    fn identification_reads_no_rollout_header_bytes() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let sessions = 40usize;
         let per_file = 100_000usize;
         for i in 0..sessions {
             let jsonl = home.join(format!("sessions/2026/09/21/rollout-cap-{i}.jsonl"));
-            let mut content = header_line("/nonexistent", "unread");
-            content.push_str(&"x".repeat(per_file));
-            touch(&jsonl, content.as_bytes());
+            touch(&jsonl, &vec![b'x'; per_file]);
         }
         let (units, counters) = contract::measured(|| run(home));
         assert_eq!(
@@ -1247,24 +1006,10 @@ mod tests {
                 .count(),
             sessions
         );
-        // One capped header read per session, and this adapter's own cap
-        // is tighter than the shared ceiling.
-        assert!(
-            counters.header_bytes_read <= (sessions * HEADER_READ_BYTES) as u64,
-            "read {} bytes, above {sessions} x this adapter's {HEADER_READ_BYTES} byte cap",
-            counters.header_bytes_read
+        assert_eq!(
+            counters.header_bytes_read, 0,
+            "rollout contents are never read"
         );
-        assert!(
-            counters.header_bytes_read < (sessions * per_file) as u64,
-            "identification read a transcript's worth of bytes"
-        );
-        const {
-            assert!(
-                HEADER_READ_BYTES <= bounded_io::MAX_HEADER_BYTES,
-                "this adapter's cap must sit under the shared ceiling"
-            )
-        };
-        contract::within_header_cap(counters, sessions as u64);
     }
 
     #[test]
@@ -1301,10 +1046,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
         let declared = home.join("sessions/2026/09/21/rollout-declared.jsonl");
-        touch(
-            &declared,
-            header_line(&repo.display().to_string(), "x").as_bytes(),
-        );
+        touch(&declared, b"transcript content cannot declare its project");
+        write_index(home, &[(&declared, &repo)]);
         // (b) a session sitting in a directory *named* like a project,
         // declaring nothing, must never become a link.
         let guessed = home.join("sessions/guessable-project-name/rollout-guessed.jsonl");
@@ -1348,14 +1091,14 @@ mod tests {
 
         touch(
             &home.join("sessions/2026/09/21/rollout-live.jsonl"),
-            header_line("/nonexistent/live", "x").as_bytes(),
+            b"live transcript",
         );
         touch(
             &home.join(
                 "archived_sessions/2026/01/02/rollout-2026-01-02T00-00-00-\
                  22222222-2222-4222-8222-222222222222.jsonl",
             ),
-            header_line("/nonexistent/archived", "x").as_bytes(),
+            b"archived transcript",
         );
         for store in SQLITE_STORES {
             touch(&home.join(store.filename), b"sqlite-bytes-payload");

@@ -14,11 +14,13 @@ one `discover_and_measure_in` already receives.
   `claude_folder_slug` (`[^A-Za-z0-9]` -> `-`, verified against a real
   header: `/Users/x/.codex/.chatgpt` -> `-Users-x--codex--chatgpt`).
 - `ContainerCache::with_known_worktrees` + `finish_link`: the single
-  resolution path for fresh and replayed units. Inference runs only when
-  the declared resolution is `Unresolved`; `Missing`/`NotAProject` stand.
-  Unique match -> `Linked { source: Inferred }`; two+ -> `Unresolved`
-  ("re-encodes N known worktree paths"); one that is no longer a checkout
-  -> `Unresolved` naming it; none -> the original reason.
+  resolution path for fresh and replayed units. A declared cwd that
+  resolves always wins. If it is absent, missing, or not a checkout, a
+  unique exact full-path slug match becomes `Linked { source: Inferred }`
+  and retains the failed cwd in `fallback_reason`. Two+ matches are
+  ambiguous; a stale path is not a checkout; no match gives no inference.
+  If a missing/not-a-project cwd has no unique match, preserve that typed
+  state rather than degrading it to unresolved.
 - Persistence: the slug rides in the `link_declared` cell after a
   `\u{2}` separator; `CONTAINER_VERSION` bumped so older rows miss.
 - Provenance: `LinkSource::Inferred` already existed in the model, serde
@@ -26,7 +28,7 @@ one `discover_and_measure_in` already receives.
   touched 56 sites, so provenance is the `source` field plus explicit
   text/TUI labels.
 
-## Measurement (scratch SWAMP_DIR, ~/src + claude-code + codex only)
+## Measurement before failed-cwd fallback (scratch SWAMP_DIR, ~/src + claude-code + codex only)
 | | baseline 982627c | new |
 | --- | --- | --- |
 | Claude sessions linked/declared | 29 (300.5 MB) | 29 (300.5 MB) |
@@ -45,3 +47,10 @@ one `discover_and_measure_in` already receives.
 - Accepted: non-ASCII path characters are mapped per `char`; if Claude
   Code encodes per byte the slugs differ and no link is made (safe).
 - Not done: path renames are not recovered; `Moved` is never inferred.
+- The initial implementation did not try the slug for a declared cwd
+  that failed to resolve. That behavior is superseded by the explicit
+  failed-cwd fallback above; the tests cover Missing and NotAProject
+  fallback plus preservation when no unique slug candidate exists.
+- The historical measurement table is not a post-fallback measurement;
+  do not quote its Missing/NotAProject counts as current behavior without
+  a fresh sanitized run.
