@@ -1194,7 +1194,7 @@ pub fn render_view_rust_with_limit(
     );
     let _ = writeln!(
         out,
-        "inspect-groups = category; unchecked = review required, not proven unused. Run swamp cleanup-check <root> --role test-executable to check a bounded selection."
+        "inspect-groups = category; unchecked = review required, not proven unused. Run `swamp ui` to inspect cleanup groups; Space marks a group for review."
     );
     let _ = writeln!(
         out,
@@ -1203,12 +1203,7 @@ pub fn render_view_rust_with_limit(
     );
     let mut rows = Vec::new();
     for unit in &report.nested_artifacts {
-        let project = report
-            .projects
-            .iter()
-            .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "unknown".into());
+        let project = nested_artifact_project_name(report, unit).unwrap_or("unknown");
         if only_project.is_some_and(|wanted| wanted != project) {
             continue;
         }
@@ -1219,7 +1214,7 @@ pub fn render_view_rust_with_limit(
             .map(|e| e.source.as_str())
             .unwrap_or("unknown");
         rows.push((
-            project,
+            project.to_string(),
             unit.role.label(),
             profile,
             unit.bytes,
@@ -1276,7 +1271,7 @@ pub fn render_view_rust_with_limit(
     if limit.is_some_and(|n| count > n) {
         let _ = writeln!(
             out,
-            "Showing {} of {count} rows, largest first. Use --all for all rows, --json for structured cleanup guidance, or cleanup-check for a bounded review.",
+            "Showing {} of {count} rows, largest first. Use --all for all rows, --json for structured cleanup guidance, or `swamp ui` to inspect cleanup groups.",
             limit.unwrap()
         );
     }
@@ -1285,6 +1280,19 @@ pub fn render_view_rust_with_limit(
         "Parent rows include their children: do not sum them. Charged bytes are inode-deduplicated allocation, not reclaimable space. debug/release name output directories, not unique dev/test/bench configurations."
     );
     out
+}
+
+/// Project owning a nested artifact, using the same worktree containment
+/// rule for text and JSON report views.
+pub fn nested_artifact_project_name<'a>(
+    report: &'a Report,
+    unit: &crate::artifact::NestedArtifact,
+) -> Option<&'a str> {
+    report
+        .projects
+        .iter()
+        .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
+        .map(|p| p.name.as_str())
 }
 
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {

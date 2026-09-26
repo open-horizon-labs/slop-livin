@@ -3,7 +3,7 @@
 //! root.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_swamp"))
@@ -47,6 +47,56 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     let last_run = swamp_core::schedule::read_last_run(store.path())
         .expect("observe must persist scheduled_runs.parquet");
     assert_eq!(last_run.outcome, "ok");
+}
+
+/// A closed real pipe makes the first stdout write return EPIPE. Observe
+/// has already saved its snapshot at that point, so the CLI must exit
+/// cleanly and still finish recording the successful run.
+#[cfg(unix)]
+#[test]
+fn observe_handles_a_closed_stdout_pipe_after_persisting() {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+    let store = tempfile::tempdir().expect("store");
+
+    let mut pipe_fds = [0; 2];
+    // SAFETY: `pipe_fds` points to two valid descriptors for libc to fill.
+    assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+    // Close the only reader before launching the child so its stdout
+    // writes reliably receive EPIPE instead of depending on scheduling.
+    // SAFETY: `pipe_fds[0]` is the live read descriptor created above.
+    assert_eq!(unsafe { libc::close(pipe_fds[0]) }, 0);
+    // SAFETY: ownership of the still-open write descriptor transfers to File.
+    let stdout = unsafe { File::from_raw_fd(pipe_fds[1]) };
+
+    let output = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run observe with a closed stdout pipe");
+
+    assert!(
+        output.status.success(),
+        "closed stdout should not fail observe or panic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let last_run = swamp_core::schedule::read_last_run(store.path())
+        .expect("successful observation should persist scheduled_runs.parquet");
+    assert_eq!(last_run.outcome, "ok");
+    assert!(
+        std::fs::read_dir(store.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.path().is_dir()),
+        "observe should persist its volume snapshot before handling EPIPE"
+    );
 }
 
 /// R16 CI-red fix: `merge_root_report_into` prefixes every per-root note

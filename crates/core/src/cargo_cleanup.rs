@@ -565,7 +565,7 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     if !candidate(unit) {
         bail!(
-            "{} Nothing changed. Use report --view rust to inspect individual groups, then cleanup-check --path with an exact group path.",
+            "{} Nothing changed. Run `swamp ui` to inspect cleanup groups and review supported actions.",
             guidance(unit).message
         );
     }

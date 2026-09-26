@@ -5,6 +5,7 @@
 //! installs/reports/removes the per-user LaunchAgent itself. All LaunchAgent
 //! logic lives in `swamp_core::schedule`; this module is CLI glue only.
 
+use crate::{safe_print, safe_println};
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -50,7 +51,7 @@ pub fn cmd_observe(
     let lock = match acquire_lock(&store_dir)? {
         LockOutcome::Acquired(guard) => guard,
         LockOutcome::HeldBy { pid, since } => {
-            println!("another observation is running (pid {pid}) since {since}");
+            safe_println!("another observation is running (pid {pid}) since {since}");
             return Ok(());
         }
     };
@@ -109,14 +110,14 @@ pub fn cmd_observe(
             let walked_total = merged.reconciliation.walked_total;
             let projects = merged.projects.len();
 
-            println!(
+            safe_println!(
                 "observed_at={} wall_ms={wall_ms} walked_total={walked_total} projects={projects} external_units={} agent_units={} {fsevents_line}",
                 merged.observed_at,
                 observation.external_units.len(),
                 observation.agent_units.len(),
             );
             for c in &observation.coverage {
-                println!(
+                safe_println!(
                     "  root={} mode={} walked_total={} projects={}",
                     c.path.display(),
                     if c.mode.is_empty() { "-" } else { &c.mode },
@@ -124,9 +125,11 @@ pub fn cmd_observe(
                     c.projects
                 );
             }
-            println!(
+            safe_println!(
                 "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
-                github.calls_made, github.worktrees_enriched, github.elapsed_secs
+                github.calls_made,
+                github.worktrees_enriched,
+                github.elapsed_secs
             );
             if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
                 eprintln!(
@@ -198,21 +201,21 @@ pub fn cmd_schedule(
     roots: Vec<PathBuf>,
 ) -> Result<()> {
     // Each call is bound before it is printed rather than written inside
-    // `print!`: the source audit's call graph does not see through macro
+    // `safe_print!`: the source audit's call graph does not see through macro
     // tokens, and `platform_capabilities_gate_their_backends` walks from
     // here to prove every write is behind the platform's scheduling check.
     // A call hidden in a macro argument is a path that rule cannot follow.
     if off {
         let message = schedule::uninstall()?;
-        print!("{message}");
+        safe_print!("{message}");
         return Ok(());
     }
     if let Some(interval) = every {
         let message = schedule::install(&interval, &roots, collector)?;
-        print!("{message}");
+        safe_print!("{message}");
         return Ok(());
     }
     let message = schedule::status(&store_dir)?;
-    print!("{message}");
+    safe_print!("{message}");
     Ok(())
 }
