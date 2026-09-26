@@ -633,16 +633,15 @@ pub(super) fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
 // folds every direct unowned file into one row per containing
 // directory before this table ever sees them). Like `FoldedRow`, this
 // is a measurement cache, not history: unowned rows carry no growth or
-// regrowth semantics and are replaced wholesale by a full walk, so the
+// regrowth semantics and retain unchanged rows on a local refresh, so the
 // whole file is rewritten each observation rather than reverse-delta
-// compacted. Complex per-row fields (`containers`, `shared_with`,
-// `evidence`) are JSON-encoded *into a Parquet Utf8 cell*, not a JSON
-// file on disk -- the store-is-Parquet rule is about the file format
-// under `SWAMP_DIR`, not about every cell's encoding.
+// compacted. Measurement boundaries are a dictionary-friendly column;
+// containers/shared-with and evidence live in typed child tables.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredUnownedRow {
+    pub measurement: Option<String>,
     pub path_or_object: String,
     pub bytes: u64,
     pub reason: String,
@@ -663,6 +662,7 @@ fn unowned_schema() -> Arc<Schema> {
         Field::new("docker_kind", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("dangling", DataType::Boolean, false),
+        Field::new("measurement", DataType::Utf8, true),
     ]))
 }
 
@@ -688,6 +688,11 @@ pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Resu
             Arc::new(StringArray::from(docker_kind)),
             Arc::new(StringArray::from(created_at)),
             Arc::new(BooleanArray::from(dangling)),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.measurement.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -809,8 +814,14 @@ pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .context("column created_at is not Utf8")?;
         let dangling = downcast_bool(&batch, "dangling")?;
+        let measurement = batch
+            .column_by_name("measurement")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         for i in 0..batch.num_rows() {
             rows.push(StoredUnownedRow {
+                measurement: measurement
+                    .filter(|a| a.is_valid(i))
+                    .map(|a| a.value(i).to_string()),
                 path_or_object: path_or_object.value(i).to_string(),
                 bytes: bytes.value(i),
                 reason: reason.value(i).to_string(),
@@ -1820,6 +1831,9 @@ pub(super) fn read_note_rows(path: &Path) -> Result<Vec<StoredNoteRow>> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRunRow {
+    pub unique_bytes: Option<u64>,
+    pub unique_reconciled_at: Option<u64>,
+    pub unique_needs_reconciliation: Option<bool>,
     pub scope_key: String,
     pub observed_at: u64,
     pub since_secs: u64,
@@ -1833,6 +1847,9 @@ pub struct StoredRunRow {
 
 fn runs_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        Field::new("unique_bytes", DataType::UInt64, true),
+        Field::new("unique_reconciled_at", DataType::UInt64, true),
+        Field::new("unique_needs_reconciliation", DataType::Boolean, true),
         Field::new("scope_key", DataType::Utf8, false),
         Field::new("observed_at", DataType::UInt64, false),
         Field::new("since_secs", DataType::UInt64, false),
@@ -1850,6 +1867,19 @@ pub(super) fn write_run_rows(path: &Path, rows: &[StoredRunRow]) -> Result<()> {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.unique_bytes).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|r| r.unique_reconciled_at)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter()
+                    .map(|r| r.unique_needs_reconciliation)
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|r| r.scope_key.as_str())
@@ -1915,6 +1945,21 @@ pub(super) fn read_run_rows(path: &Path) -> Result<Vec<StoredRunRow>> {
         let include_dirs = downcast_bool(&batch, "include_dirs")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredRunRow {
+                unique_bytes: batch
+                    .column_by_name("unique_bytes")
+                    .map(|_| opt_u64(&batch, "unique_bytes", i))
+                    .transpose()?
+                    .flatten(),
+                unique_reconciled_at: batch
+                    .column_by_name("unique_reconciled_at")
+                    .map(|_| opt_u64(&batch, "unique_reconciled_at", i))
+                    .transpose()?
+                    .flatten(),
+                unique_needs_reconciliation: batch
+                    .column_by_name("unique_needs_reconciliation")
+                    .map(|_| opt_bool(&batch, "unique_needs_reconciliation", i))
+                    .transpose()?
+                    .flatten(),
                 scope_key: scope_key.value(i).to_string(),
                 observed_at: observed_at.value(i),
                 since_secs: since_secs.value(i),
@@ -1928,6 +1973,49 @@ pub(super) fn read_run_rows(path: &Path) -> Result<Vec<StoredRunRow>> {
         }
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod unique_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn a_run_without_unique_columns_is_unknown_not_an_unreadable_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runs.parquet");
+        let row = StoredRunRow {
+            unique_bytes: None,
+            unique_reconciled_at: None,
+            unique_needs_reconciliation: None,
+            scope_key: "scope".into(),
+            observed_at: 100,
+            since_secs: 3600,
+            retention_days: 30,
+            include_dirs: false,
+            github_calls_made: None,
+            github_worktrees_enriched: None,
+            github_elapsed_secs: None,
+            schedule_line: None,
+        };
+        write_run_rows(&path, std::slice::from_ref(&row)).unwrap();
+        let batch = crate::fs_gate::columns::open_parquet(&path)
+            .unwrap()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let old = batch
+            .project(&(3..batch.num_columns()).collect::<Vec<_>>())
+            .unwrap();
+        crate::fs_gate::columns::write_parquet_atomic(
+            &path,
+            old.schema(),
+            std::iter::once(Ok(old)),
+            super::super::ARTIFACT_ZSTD_LEVEL,
+        )
+        .unwrap();
+        assert_eq!(read_run_rows(&path).unwrap(), vec![row]);
+    }
 }
 
 // ---------------------------------------------------------------------

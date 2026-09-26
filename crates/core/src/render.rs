@@ -1,6 +1,6 @@
 //! Text rendering for [`crate::report::Report`].
 //!
-//! Signals only, never verdict vocabulary ("safe", "stale", "unused",
+//! Signals only, never verdict vocabulary ("safe", "needs reconciliation", "unused",
 //! "abandoned", ...). Output is column-aligned ASCII that fits 100 cols
 //! and needs no terminal color support.
 
@@ -160,6 +160,27 @@ fn header(report: &Report, verify_du: bool) -> String {
     let mut out = String::new();
     let worktree_count: usize = report.projects.iter().map(|p| p.worktrees.len()).sum();
     let _ = writeln!(out, "root: {}", report.root.display());
+    if report.unowned.iter().any(|u| {
+        u.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }) {
+        out.push_str(
+            "unowned unique-byte estimates not reconciled; swamp observe --full to reconcile\n",
+        );
+    }
+    if let Some(u) = &report.reconciliation.unique_estimate {
+        let _ = writeln!(
+            out,
+            "scope filesystem unique={} ({}, reconciled at {}; not reclaimable)",
+            human_bytes(u.bytes),
+            if u.needs_reconciliation {
+                "needs reconciliation"
+            } else {
+                "reconciled"
+            },
+            u.reconciled_at
+        );
+    }
     let _ = write!(
         out,
         "observed_at={} projects={} worktrees={} attributed={} unowned={} walked={}",
@@ -371,6 +392,14 @@ pub fn render_overview_sorted(
 /// scan can have hundreds of unjoined build-cache entries, which used to
 /// print one row each here).
 fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) {
+    if report.unowned.iter().any(|u| {
+        u.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }) {
+        out.push_str(
+            "unowned unique-byte estimates need reconciliation; use swamp observe --full\n",
+        );
+    }
     // Aggregate filesystem rows by their top-level directory *relative to
     // root* (never an absolute-path segment like `Users`, which every row
     // shares and which says nothing about where the bytes live) and by
@@ -1291,8 +1320,10 @@ pub fn nested_artifact_project_name<'a>(
     report
         .projects
         .iter()
-        .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
-        .map(|p| p.name.as_str())
+        .flat_map(|p| p.worktrees.iter().map(move |w| (p, w)))
+        .filter(|(_, w)| unit.path.starts_with(&w.path))
+        .max_by_key(|(_, w)| w.path.components().count())
+        .map(|(p, _)| p.name.as_str())
 }
 
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {
@@ -1522,6 +1553,22 @@ pub fn render_view_reconciliation(report: &Report) -> String {
         human_bytes(r.docker_attributed),
         human_bytes(r.docker_unowned),
     );
+    match &r.unique_estimate {
+        Some(u) => {
+            let _ = writeln!(
+                out,
+                "filesystem unique={} · {} · reconciled at {} · not reclaimable bytes",
+                human_bytes(u.bytes),
+                if u.needs_reconciliation {
+                    "needs reconciliation; swamp observe --full to reconcile"
+                } else {
+                    "reconciled"
+                },
+                u.reconciled_at
+            );
+        }
+        None => out.push_str("filesystem unique=unknown; swamp observe --full to reconcile\n"),
+    }
     out
 }
 

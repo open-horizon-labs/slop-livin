@@ -57,6 +57,31 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     app.clear_filter();
     app.drill_into_selected();
     assert_eq!(app.view, ViewKind::Tree);
+    // Explicit on-demand inspection is a background operation, not marking or
+    // deletion. The popup stays separate from stored observation rows.
+    let before = app.report.nested_artifacts.len();
+    app.selected = app
+        .rows()
+        .iter()
+        .position(|r| r.label == "profile debug")
+        .unwrap();
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('i'));
+    assert!(app.operation.is_some(), "{:?}", app.refusal_active());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.operation.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.cargo_inspection.is_some());
+    assert!(app.marked.is_empty());
+    assert_eq!(app.report.nested_artifacts.len(), before);
+    for (width, height) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, width, height);
+        assert!(frame.contains("Cargo dependency inspection"), "{frame}");
+    }
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(app.cargo_inspection.is_none());
     let groups = app.rows();
     let cache = groups
         .iter()
@@ -308,6 +333,7 @@ fn fixture_report() -> Report {
             },
         ],
         unowned: vec![UnownedRow {
+            measurement: None,
             path_or_object: "/Users/dev/.cache/leftover".into(),
             bytes: 209_715_200,
             reason: UnownedReason::SharedCache,
@@ -326,6 +352,7 @@ fn fixture_report() -> Report {
         github_enrichment: None,
         nested_artifacts: Vec::new(),
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,
@@ -346,6 +373,21 @@ fn capture(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
     terminal.backend().to_string()
+}
+
+#[test]
+fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
+    let mut report = fixture_report();
+    report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+        bytes: 8192,
+        reconciled_at: report.observed_at,
+        needs_reconciliation: true,
+    });
+    let app = App::new(report, "/Users/dev/src".into());
+    let narrow = capture(&app, 80, 24);
+    assert!(narrow.contains("unique totals not recomputed"), "{narrow}");
+    let wide = capture(&app, 180, 24);
+    assert!(wide.contains("needs reconciliation"), "{wide}");
 }
 
 fn check(name: &str, got: &str) {
