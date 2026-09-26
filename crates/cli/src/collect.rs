@@ -12,6 +12,7 @@
 //! macOS does not need one and refuses: FSEvents keeps the history
 //! itself, and a resident process there would be cost with no benefit.
 
+use crate::safe_println;
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -95,31 +96,33 @@ pub fn cmd_collect_status(store_dir: PathBuf, roots: Vec<PathBuf>, json: bool) -
             })
             .collect();
         let text = serde_json::to_string_pretty(&serde_json::json!({ "roots": out }))?;
-        println!("{text}");
+        safe_println!("{text}");
         return Ok(());
     }
     for (root, alive, ck) in rows {
-        println!("{}", root.display());
+        safe_println!("{}", root.display());
         match (alive, ck) {
-            (_, None) => println!("  no collector checkpoint: observations walk fully"),
-            (false, Some(c)) => println!(
+            (_, None) => safe_println!("  no collector checkpoint: observations walk fully"),
+            (false, Some(c)) => safe_println!(
                 "  collector not running (last flush {}, pid {}): its list cannot vouch for \
                  anything since, so observations walk fully",
-                c.flushed_at, c.pid
+                c.flushed_at,
+                c.pid
             ),
             (true, Some(c)) => {
-                println!(
+                safe_println!(
                     "  collector running (pid {}), epoch opened at {}",
-                    c.pid, c.opened_at
+                    c.pid,
+                    c.opened_at
                 );
                 match &c.lost {
-                    None => println!(
+                    None => safe_println!(
                         "  coverage complete; {} directories changed since the last observation",
                         c.dirty.len()
                     ),
-                    Some(l) => println!("  coverage lost: {} ({})", l.reason, l.detail),
+                    Some(l) => safe_println!("  coverage lost: {} ({})", l.reason, l.detail),
                 }
-                println!(
+                safe_println!(
                     "  {} inotify watches (limit {}), ~{} of kernel memory",
                     c.watches,
                     c.max_user_watches

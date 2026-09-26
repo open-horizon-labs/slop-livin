@@ -4,7 +4,22 @@
 )]
 
 mod collect;
+mod output;
 mod schedule;
+
+#[macro_export]
+macro_rules! safe_print {
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout(format_args!($($arg)*))?;
+    }};
+}
+
+#[macro_export]
+macro_rules! safe_println {
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout_line(format_args!($($arg)*))?;
+    }};
+}
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -638,7 +653,7 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
                 std::env::current_dir()?.join(&path)
             };
             swamp_core::agents::protect_add(&store_dir, &resolved)?;
-            println!("protected: {}", resolved.display());
+            safe_println!("protected: {}", resolved.display());
         }
         ProtectCmd::Remove { path } => {
             let resolved = if path.is_absolute() {
@@ -647,16 +662,16 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
                 std::env::current_dir()?.join(&path)
             };
             swamp_core::agents::protect_remove(&store_dir, &resolved)?;
-            println!("no longer protected: {}", resolved.display());
+            safe_println!("no longer protected: {}", resolved.display());
         }
         ProtectCmd::List { json } => {
             let listing = swamp_core::agents::protect_listing(&store_dir)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&listing)?);
+                safe_println!("{}", serde_json::to_string_pretty(&listing)?);
             } else if listing.is_empty() {
-                println!("no protected agent-storage paths");
+                safe_println!("no protected agent-storage paths");
             } else {
-                println!("{listing}");
+                safe_println!("{listing}");
             }
         }
     }
@@ -877,7 +892,7 @@ fn main() -> Result<()> {
             if let Some(s) = store {
                 Store::open(s)?.write(&obs)?;
             }
-            println!("{}", serde_json::to_string_pretty(&obs)?);
+            safe_println!("{}", serde_json::to_string_pretty(&obs)?);
         }
         Command::Report {
             root,
@@ -935,7 +950,7 @@ fn main() -> Result<()> {
                 Ok(s) => s,
                 Err(e) => {
                     if json {
-                        println!(
+                        safe_println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "error": "no_observation",
@@ -985,7 +1000,7 @@ fn main() -> Result<()> {
                 None => None,
             };
             if json {
-                println!(
+                safe_println!(
                     "{}",
                     serde_json::to_string_pretty(&report_json_envelope(
                         &r,
@@ -1006,7 +1021,7 @@ fn main() -> Result<()> {
                 );
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {
-                    Some(text) => print!("{text}"),
+                    Some(text) => safe_print!("{text}"),
                     None => {
                         eprintln!(
                             "no worktree at {} found under {}",
@@ -1018,7 +1033,7 @@ fn main() -> Result<()> {
                 }
             } else if dirs {
                 match render_dirs(&r, project.as_deref(), depth) {
-                    Ok(text) => print!("{text}"),
+                    Ok(text) => safe_print!("{text}"),
                     Err(name) => {
                         eprintln!("no project named {name:?} found under {}", root.display());
                         std::process::exit(1);
@@ -1028,7 +1043,7 @@ fn main() -> Result<()> {
                 match view {
                     None | Some(View::Worktrees) => {
                         match render_project_tree_with_agents(&r, &name, &agent_units) {
-                            Some(text) => print!("{text}"),
+                            Some(text) => safe_print!("{text}"),
                             None => {
                                 eprintln!(
                                     "no project named {name:?} found under {}",
@@ -1038,13 +1053,13 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    Some(View::Builds) => print!("{}", render_view_builds(&r, Some(&name))),
-                    Some(View::Deps) => print!("{}", render_view_deps(&r, Some(&name))),
-                    Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
-                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
-                    Some(View::Types) => print!("{}", render_types(&r)),
+                    Some(View::Builds) => safe_print!("{}", render_view_builds(&r, Some(&name))),
+                    Some(View::Deps) => safe_print!("{}", render_view_deps(&r, Some(&name))),
+                    Some(View::Docker) => safe_print!("{}", render_view_docker(&r, Some(&name))),
+                    Some(View::Kinds) => safe_print!("{}", render_kinds(&r)),
+                    Some(View::Types) => safe_print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_rust_with_limit(
                                 &r,
@@ -1053,10 +1068,10 @@ fn main() -> Result<()> {
                             )
                         )
                     }
-                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
-                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(View::Unowned) => safe_print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
@@ -1066,7 +1081,7 @@ fn main() -> Result<()> {
                         )
                     }
                     Some(View::Agents) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_agents(
                                 &agent_units,
@@ -1083,17 +1098,17 @@ fn main() -> Result<()> {
                 }
             } else {
                 match view {
-                    Some(View::Worktrees) => print!(
+                    Some(View::Worktrees) => safe_print!(
                         "{}",
                         render_worktrees(&r, &parsed_filter.unwrap_or_default())
                     ),
-                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
-                    Some(View::Builds) => print!("{}", render_view_builds(&r, None)),
-                    Some(View::Deps) => print!("{}", render_view_deps(&r, None)),
-                    Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
-                    Some(View::Types) => print!("{}", render_types(&r)),
+                    Some(View::Kinds) => safe_print!("{}", render_kinds(&r)),
+                    Some(View::Builds) => safe_print!("{}", render_view_builds(&r, None)),
+                    Some(View::Deps) => safe_print!("{}", render_view_deps(&r, None)),
+                    Some(View::Docker) => safe_print!("{}", render_view_docker(&r, None)),
+                    Some(View::Types) => safe_print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_rust_with_limit(
                                 &r,
@@ -1102,10 +1117,10 @@ fn main() -> Result<()> {
                             )
                         )
                     }
-                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
-                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(View::Unowned) => safe_print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
@@ -1115,7 +1130,7 @@ fn main() -> Result<()> {
                         )
                     }
                     Some(View::Agents) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_agents(
                                 &agent_units,
@@ -1129,7 +1144,7 @@ fn main() -> Result<()> {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
                     }
-                    None => print!(
+                    None => safe_print!(
                         "{}",
                         render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
                     ),
@@ -1141,9 +1156,9 @@ fn main() -> Result<()> {
             let dir = swamp_dir();
             let path = dir.join("config.toml");
             match action {
-                ConfigAction::Path => println!("{}", path.display()),
+                ConfigAction::Path => safe_println!("{}", path.display()),
                 ConfigAction::Show => {
-                    print!(
+                    safe_print!(
                         "{}",
                         swamp_core::growth::load_config_checked(&dir)?.to_toml()
                     );
@@ -1165,7 +1180,7 @@ fn main() -> Result<()> {
                         },
                         &swamp_core::growth::GrowthConfig::default().to_toml(),
                     )?;
-                    println!("wrote {}", path.display());
+                    safe_println!("wrote {}", path.display());
                 }
             }
         }
@@ -1176,9 +1191,9 @@ fn main() -> Result<()> {
         } => {
             let scope = resolve_scope(&roots)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&scope)?);
+                safe_println!("{}", serde_json::to_string_pretty(&scope)?);
             } else {
-                print!("{}", render_scope_text(&scope, verbose));
+                safe_print!("{}", render_scope_text(&scope, verbose));
                 if scope.is_empty_scope() {
                     eprintln!(
                         "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."
