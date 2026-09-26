@@ -57,6 +57,31 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
     app.clear_filter();
     app.drill_into_selected();
     assert_eq!(app.view, ViewKind::Tree);
+    // Explicit on-demand inspection is a background operation, not marking or
+    // deletion. The popup stays separate from stored observation rows.
+    let before = app.report.nested_artifacts.len();
+    app.selected = app
+        .rows()
+        .iter()
+        .position(|r| r.label == "profile debug")
+        .unwrap();
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('i'));
+    assert!(app.operation.is_some(), "{:?}", app.refusal_active());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.operation.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.cargo_inspection.is_some());
+    assert!(app.marked.is_empty());
+    assert_eq!(app.report.nested_artifacts.len(), before);
+    for (width, height) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, width, height);
+        assert!(frame.contains("Cargo dependency inspection"), "{frame}");
+    }
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(app.cargo_inspection.is_none());
     let groups = app.rows();
     let cache = groups
         .iter()

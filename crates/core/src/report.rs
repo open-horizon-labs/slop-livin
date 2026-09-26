@@ -572,10 +572,12 @@ pub fn attach_decision_evidence(report: &mut Report) {
 
                 // Activity (#54): the folded walk's own newest-child-mtime
                 // stat, already recorded on every row.
-                a.evidence.push(crate::activity::modification_evidence(
-                    a.mtime_max,
-                    observed_at,
-                ));
+                a.evidence
+                    .push(crate::activity::modification_evidence_during(
+                        a.mtime_max,
+                        observed_at,
+                        crate::entities::now(),
+                    ));
 
                 // Activity (#54), the second filesystem source: this
                 // unit's own anchor path's access time. One extra `stat`
@@ -790,9 +792,10 @@ pub(crate) fn nested_decision_evidence(
         // unit's measured children. Labelled modification, never "last
         // used".
         unit.decision_evidence
-            .push(crate::activity::modification_evidence(
+            .push(crate::activity::modification_evidence_during(
                 unit.mtime_max,
                 observed_at,
+                crate::entities::now(),
             ));
 
         // Activity (#54), tool-reported: a `.fingerprint` entry's own

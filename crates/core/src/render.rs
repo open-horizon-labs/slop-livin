@@ -1291,8 +1291,10 @@ pub fn nested_artifact_project_name<'a>(
     report
         .projects
         .iter()
-        .find(|p| p.worktrees.iter().any(|w| unit.path.starts_with(&w.path)))
-        .map(|p| p.name.as_str())
+        .flat_map(|p| p.worktrees.iter().map(move |w| (p, w)))
+        .filter(|(_, w)| unit.path.starts_with(&w.path))
+        .max_by_key(|(_, w)| w.path.components().count())
+        .map(|(p, _)| p.name.as_str())
 }
 
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {

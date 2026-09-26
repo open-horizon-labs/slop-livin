@@ -127,6 +127,56 @@ fn fresh_full(root: &Path) -> swamp_core::Report {
 }
 
 #[test]
+fn checkoutless_reuse_and_explicit_remeasurement_match_full_across_file_mutations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let file = root.join("loose/cache/file");
+    write(&file, 16_384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let unchanged = observe(&root, store.path(), vec![], false);
+    assert!(
+        unchanged
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        unchanged.notes
+    );
+    for mutation in 0..5 {
+        match mutation {
+            0 => write(&root.join("new/file"), 32_768),
+            1 => write(&file, 65_536),
+            2 => write(&file, 4_096),
+            3 => fs::rename(&file, root.join("renamed")).unwrap(),
+            _ => fs::remove_file(root.join("renamed")).unwrap(),
+        }
+        let incremental = observe(
+            &root,
+            store.path(),
+            vec![root.clone(), root.join("loose/cache"), root.join("new")],
+            false,
+        );
+        let full = fresh_full(&root);
+        assert!(
+            incremental
+                .notes
+                .iter()
+                .any(|n| n.contains("reason=checkoutless_changes")),
+            "changed unowned bytes need an explicit remeasurement: {:?}",
+            incremental.notes
+        );
+        assert_eq!(
+            incremental.reconciliation.walked_total, full.reconciliation.walked_total,
+            "mutation {mutation}"
+        );
+        assert!(incremental.projects.is_empty());
+    }
+}
+
+#[test]
 fn node_full_and_incremental_agree_as_a_sub_artifact_changes_vanishes_and_reappears() {
     let (_tmp, root) = node_fixture();
     let store = tempfile::tempdir().unwrap();
@@ -538,6 +588,94 @@ fn polyglot_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
         8_000,
     );
     (tmp, vec![py, go, swift, android])
+}
+
+#[test]
+fn project_local_actions_are_plannable_across_non_rust_adapters() {
+    use swamp_core::artifact::NestedActionCapability;
+    let (_tmp, mut roots) = polyglot_fixture();
+    let (node_tmp, node) = node_fixture();
+    roots.push(node);
+    for (name, marker, contents, output) in [
+        (
+            "gradle-actions",
+            "build.gradle",
+            "",
+            "build/classes/java/main/App.class",
+        ),
+        (
+            "maven-actions",
+            "pom.xml",
+            "<project><artifactId>app</artifactId></project>",
+            "target/classes/App.class",
+        ),
+    ] {
+        let root = node_tmp.path().join(name);
+        git_init(&root);
+        fs::write(root.join(marker), contents).unwrap();
+        fs::write(root.join(".gitignore"), "build/\ntarget/\n").unwrap();
+        write(&root.join(output), 4096);
+        roots.push(root);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let report = fresh_full(&root);
+        let actionable: Vec<_> = report
+            .nested_artifacts
+            .iter()
+            .filter(|u| u.action == NestedActionCapability::TrashPath)
+            .collect();
+        assert!(
+            !actionable.is_empty(),
+            "{} produced no supported action",
+            root.display()
+        );
+        for unit in actionable {
+            let plan = swamp_core::actions::propose_checking_protection(
+                &report,
+                None,
+                std::slice::from_ref(&unit.path),
+                "test",
+                &[],
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} claims action but cannot be planned: {e}",
+                    unit.path.display()
+                )
+            });
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].path(), unit.path);
+            assert!(plan[0].cargo_group().is_none());
+            seen.insert(unit.adapter.clone().unwrap());
+        }
+        for unit in report.nested_artifacts.iter().filter(|u| {
+            matches!(
+                u.role,
+                swamp_core::artifact::ArtifactRole::InstalledDependencies
+                    | swamp_core::artifact::ArtifactRole::Installation
+                    | swamp_core::artifact::ArtifactRole::DeviceState
+                    | swamp_core::artifact::ArtifactRole::Archive
+            )
+        }) {
+            assert_ne!(unit.action, NestedActionCapability::TrashPath);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "node",
+            "gradle",
+            "maven",
+            "python",
+            "go",
+            "android",
+            "xcode-swift"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
 }
 
 #[test]

@@ -1495,10 +1495,12 @@ fn write_unit_root_cursor(dir: &Path, cursor: &crate::fs_events::UnitRootCursor)
 }
 
 fn read_topology(dir: &Path) -> Option<Vec<StoredWorktree>> {
-    let rows = columns::read_topology_rows(&topology_path(dir)).ok()?;
-    if rows.is_empty() {
+    // A persisted empty topology is a measured checkoutless root, not a
+    // missing baseline. Keep it reusable on an event-covered unchanged pass.
+    if !crate::fs_gate::exists(topology_path(dir)) {
         return None;
     }
+    let rows = columns::read_topology_rows(&topology_path(dir)).ok()?;
     Some(
         rows.into_iter()
             .map(|r| StoredWorktree {
@@ -3569,6 +3571,7 @@ fn stored_row_from_nested_artifact(
     n: &crate::artifact::NestedArtifact,
 ) -> columns::StoredNestedArtifactRow {
     let (action_capability, action_unsupported_reason) = match &n.action {
+        crate::artifact::NestedActionCapability::TrashPath => (n.action.label().to_string(), None),
         crate::artifact::NestedActionCapability::InspectionOnly => {
             (n.action.label().to_string(), None)
         }
@@ -5436,32 +5439,46 @@ pub fn stage_tracked_with_source(
                 excluded,
             )?,
             Some(ref topo) => {
-                // Floored at a minimum so a tiny tree (a handful of
-                // Source directories) doesn't trip the "too many
-                // changes" guard on the very first touched file --
-                // the guard exists to protect large trees, where a
-                // fraction is the meaningful signal.
-                let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
-                if relevant_changed_dirs.len() as f64
-                    > TOO_MANY_CHANGES_FRACTION * known_dirs as f64
-                {
+                // Unowned rows have no directory rollups yet. An unchanged
+                // checkoutless root is reusable, but a changed one must be
+                // measured rather than carrying its old bytes forward.
+                if topo.is_empty() && !relevant_changed_dirs.is_empty() {
                     full_walk(
                         stage,
                         &root,
                         observed_at,
                         large_file_min_bytes,
-                        "too_many_changes",
+                        "checkoutless_changes",
                         excluded,
                     )?
                 } else {
-                    apply_incremental(
-                        stage,
-                        topo,
-                        &relevant_changed_dirs,
-                        observed_at,
-                        large_file_min_bytes,
-                        &dir,
-                    )?
+                    // Floored at a minimum so a tiny tree (a handful of
+                    // Source directories) doesn't trip the "too many
+                    // changes" guard on the very first touched file --
+                    // the guard exists to protect large trees, where a
+                    // fraction is the meaningful signal.
+                    let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
+                    if relevant_changed_dirs.len() as f64
+                        > TOO_MANY_CHANGES_FRACTION * known_dirs as f64
+                    {
+                        full_walk(
+                            stage,
+                            &root,
+                            observed_at,
+                            large_file_min_bytes,
+                            "too_many_changes",
+                            excluded,
+                        )?
+                    } else {
+                        apply_incremental(
+                            stage,
+                            topo,
+                            &relevant_changed_dirs,
+                            observed_at,
+                            large_file_min_bytes,
+                            &dir,
+                        )?
+                    }
                 }
             }
         }
