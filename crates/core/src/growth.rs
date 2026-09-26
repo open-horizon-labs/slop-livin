@@ -5439,16 +5439,26 @@ pub fn stage_tracked_with_source(
                 excluded,
             )?,
             Some(ref topo) => {
-                // Unowned rows have no directory rollups yet. An unchanged
-                // checkoutless root is reusable, but a changed one must be
-                // measured rather than carrying its old bytes forward.
-                if topo.is_empty() && !relevant_changed_dirs.is_empty() {
+                // Unowned rows have no directory rollups yet. This applies
+                // beside known checkouts too: discovery alone cannot update
+                // loose bytes or subtract them when a directory becomes a
+                // checkout. Keep unchanged roots reusable, but remeasure an
+                // event outside all known worktrees rather than report stale
+                // totals. Directory-local unowned refresh remains separate.
+                if relevant_changed_dirs
+                    .iter()
+                    .any(|changed| !topo.iter().any(|wt| changed.starts_with(&wt.path)))
+                {
                     full_walk(
                         stage,
                         &root,
                         observed_at,
                         large_file_min_bytes,
-                        "checkoutless_changes",
+                        if topo.is_empty() {
+                            "checkoutless_changes"
+                        } else {
+                            "unowned_changes"
+                        },
                         excluded,
                     )?
                 } else {

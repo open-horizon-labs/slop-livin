@@ -177,6 +177,72 @@ fn checkoutless_reuse_and_explicit_remeasurement_match_full_across_file_mutation
 }
 
 #[test]
+fn mixed_root_refreshes_unowned_mutations_without_disabling_unchanged_reuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    git_init(&root.join("repo"));
+    write(&root.join("repo/source"), 4096);
+    let store = tempfile::tempdir().unwrap();
+    let loose = root.join("loose/file");
+    write(&loose, 16384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    for mutation in 0..6 {
+        match mutation {
+            0 => write(&loose, 65536),
+            1 => write(&loose, 4096),
+            2 => fs::rename(&loose, root.join("loose/renamed")).unwrap(),
+            3 => fs::remove_file(root.join("loose/renamed")).unwrap(),
+            4 => write(&loose, 32768),
+            _ => git_init(&root.join("loose")),
+        }
+        let actual = observe(&root, store.path(), vec![root.join("loose")], false);
+        assert!(
+            actual
+                .notes
+                .iter()
+                .any(|n| n.contains("reason=unowned_changes")),
+            "{:?}",
+            actual.notes
+        );
+        let expected = fresh_full(&root);
+        assert_eq!(
+            actual.reconciliation.walked_total,
+            expected.reconciliation.walked_total
+        );
+        assert_eq!(
+            actual.reconciliation.unowned,
+            expected.reconciliation.unowned
+        );
+        let unchanged = observe(&root, store.path(), vec![], false);
+        assert!(
+            unchanged
+                .notes
+                .iter()
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "{:?}",
+            unchanged.notes
+        );
+    }
+    // The repair must not turn ordinary checkout edits into full-root walks.
+    write(&root.join("repo/source"), 8192);
+    let owned = observe(&root, store.path(), vec![root.join("repo")], false);
+    assert!(
+        owned
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        owned.notes
+    );
+    assert_eq!(
+        owned.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+}
+
+#[test]
 fn node_full_and_incremental_agree_as_a_sub_artifact_changes_vanishes_and_reappears() {
     let (_tmp, root) = node_fixture();
     let store = tempfile::tempdir().unwrap();
