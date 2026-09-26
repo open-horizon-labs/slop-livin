@@ -817,6 +817,7 @@ fn report_json_envelope(
         if v == View::Grown {
             envelope["coverage"] = serde_json::json!({
                 "walked_total": rr.reconciliation.walked_total,
+                "unique_estimate": rr.reconciliation.unique_estimate,
                 "du_total": rr.reconciliation.du_total,
                 "unowned_total": rr.reconciliation.unowned,
                 "attributed_total": rr.reconciliation.attributed,

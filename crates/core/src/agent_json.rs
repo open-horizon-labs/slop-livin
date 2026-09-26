@@ -770,6 +770,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 500_000_000,
                 unowned: 0,
                 walked_total: 500_000_000,

@@ -546,6 +546,7 @@ mod tests {
             projects: vec![],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

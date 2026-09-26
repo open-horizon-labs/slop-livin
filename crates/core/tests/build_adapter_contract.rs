@@ -93,6 +93,7 @@ fn blank_report(root: &Path) -> swamp_core::Report {
         projects: Vec::new(),
         unowned: Vec::new(),
         reconciliation: swamp_core::report::Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,

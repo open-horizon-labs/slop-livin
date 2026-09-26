@@ -90,7 +90,10 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn header_line(app: &App, width: usize) -> String {
-    let stale = app
+    let stale = app.report.unowned.iter().any(|u| {
+        u.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }) || app
         .report
         .projects
         .iter()
@@ -147,12 +150,35 @@ fn header_line(app: &App, width: usize) -> String {
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
-        if stale {
+        if stale
+            || app
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .is_some_and(|u| u.needs_reconciliation)
+        {
             format!("unique totals not recomputed · {}", app.root.display())
         } else {
             app.root.display().to_string()
         },
         format!("{obs}{since}"),
+        app.report
+            .reconciliation
+            .unique_estimate
+            .as_ref()
+            .map(|u| {
+                format!(
+                    "{} unique{}",
+                    human_bytes(u.bytes),
+                    if u.needs_reconciliation {
+                        " (needs reconciliation)"
+                    } else {
+                        " (reconciled)"
+                    }
+                )
+            })
+            .unwrap_or_default(),
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),

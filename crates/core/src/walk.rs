@@ -556,6 +556,151 @@ struct AttrShared {
     incomplete: AtomicBool,
 }
 
+/// Explicit reconciliation only. The ordinary folded sizing pool visits the
+/// selected paths with one ephemeral device/inode ledger. Neither identities
+/// nor charge ownership escape this call; history keeps its existing basis.
+pub(crate) fn reconcile_unique_bytes(paths: &[PathBuf], excluded: &[PathBuf]) -> Option<u64> {
+    let shared = Arc::new(AttrShared {
+        seen_inodes: ShardedInodeSet::new(),
+        artifacts_by_worktree: Mutex::new(HashMap::new()),
+        source_bytes: Mutex::new(HashMap::new()),
+        source_local: Mutex::new(HashMap::new()),
+        unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
+        walked_total: AtomicU64::new(0),
+        attributed_total: AtomicU64::new(0),
+        unowned_total: AtomicU64::new(0),
+        observed_at: 0,
+        dirs: Mutex::new(HashMap::new()),
+        files: Mutex::new(Vec::new()),
+        large_file_min_bytes: u64::MAX,
+        carry: HashMap::new(),
+        excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs: false,
+        incomplete: AtomicBool::new(false),
+    });
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let pool = Arc::new(Pool::new());
+    for path in paths {
+        if roots.iter().chain(excluded).any(|r| path.starts_with(r)) {
+            continue;
+        }
+        let meta = crate::fs_gate::symlink_metadata(&path).ok()?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        roots.push(path.clone());
+        if meta.is_file() {
+            record_file(&path, &meta, &[], &shared);
+        } else if meta.is_dir() {
+            pool.push(AttrJob::Size {
+                group: Arc::new(SizeGroup {
+                    root_path: path.clone(),
+                    kind: ArtifactKind::Cache,
+                    worktree: None,
+                    worktree_root: None,
+                    total: AtomicU64::new(0),
+                    local_total: AtomicU64::new(0),
+                    local_seen: Mutex::new(HashSet::new()),
+                    remaining: AtomicUsize::new(1),
+                    mtime_max: AtomicU64::new(0),
+                }),
+                path,
+                classified: Classified::stored(ArtifactKind::Cache),
+            });
+        }
+    }
+    progress::start();
+    pool.drain(worker_count(), |job| {
+        if let AttrJob::Size {
+            path,
+            group,
+            classified,
+        } = job
+        {
+            process_size(path, &group, &classified, &shared, &pool);
+        }
+    });
+    progress::finish();
+    #[cfg(test)]
+    {
+        let (entries, slots) = shared.seen_inodes.shards.iter().fold((0, 0), |(n, c), s| {
+            let shard = s.lock().unwrap();
+            (n + shard.len(), c + shard.capacity())
+        });
+        eprintln!(
+            "reconciliation ledger: {entries} distinct inodes, {slots} key slots, {} key-capacity bytes (excluding hash/control/allocator overhead)",
+            slots * std::mem::size_of::<(u64, u64)>()
+        );
+    }
+    (!shared.incomplete.load(Ordering::Relaxed))
+        .then(|| shared.walked_total.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod scope_reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn reconciliation_keys_include_the_device() {
+        let ledger = ShardedInodeSet::new();
+        assert!(ledger.insert_first((1, 7)));
+        assert!(ledger.insert_first((2, 7)));
+        assert!(!ledger.insert_first((1, 7)));
+    }
+
+    #[test]
+    fn reconciliation_prunes_exclusions_and_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("keep"), vec![1; 8192]).unwrap();
+        std::fs::write(root.join("excluded"), vec![1; 16384]).unwrap();
+        std::fs::write(tmp.path().join("outside"), vec![1; 32768]).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("link")).unwrap();
+        let expected = allocated_bytes(&std::fs::metadata(root.join("keep")).unwrap());
+        assert_eq!(
+            reconcile_unique_bytes(&[root.clone(), root.join("keep")], &[root.join("excluded")]),
+            Some(expected)
+        );
+        assert_eq!(
+            reconcile_unique_bytes(&[tmp.path().join("missing")], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn twenty_thousand_shared_entries_are_counted_once_without_retained_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mut expected = 0;
+        for i in 0..1000 {
+            let source = a.join(i.to_string());
+            std::fs::write(&source, [1; 32]).unwrap();
+            expected += allocated_bytes(&std::fs::metadata(&source).unwrap());
+            for j in 0..19 {
+                std::fs::hard_link(&source, b.join(format!("{i}-{j}"))).unwrap();
+            }
+        }
+        let (value, work) = crate::work_counters::measured(|| reconcile_unique_bytes(&[b, a], &[]));
+        assert_eq!(value, Some(expected));
+        assert_eq!(work.dirs_listed, 2);
+        assert_eq!(work.files_statted, 20002);
+        // A subsequent independent call cannot inherit the prior pass's set.
+        assert_eq!(
+            reconcile_unique_bytes(&[tmp.path().join("a")], &[]),
+            Some(expected)
+        );
+    }
+}
+
 /// One directory's identity and change stamp, recorded while it was
 /// listed. `mtime_ns`/`ctime_ns` are the directory's own, so an entry
 /// added, removed or renamed inside it moves the stamp; a file rewritten
@@ -1014,7 +1159,7 @@ fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
         dir_path,
         bytes,
         if hardlinked {
-            crate::report::UnownedMeasurement::Hardlinked
+            crate::report::UnownedMeasurement::DirectShared
         } else {
             crate::report::UnownedMeasurement::Direct
         },
@@ -1128,8 +1273,18 @@ fn process_size(
         });
     }
     let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            shared.incomplete.store(true, Ordering::Relaxed);
+            continue;
+        };
+        if shared.excluded.iter().any(|e| entry.path().starts_with(e)) {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            shared.incomplete.store(true, Ordering::Relaxed);
+            continue;
+        };
         if ft.is_symlink() {
             symlink_count += 1;
             continue;
@@ -1145,6 +1300,7 @@ fn process_size(
         } else if ft.is_file() {
             crate::work_counters::record_files_statted(1);
             let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
+                shared.incomplete.store(true, Ordering::Relaxed);
                 continue;
             };
             if meta.file_type().is_symlink() || !meta.is_file() {
@@ -1253,7 +1409,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 measurement: Some(if group.local_seen.lock().unwrap().is_empty() {
                     crate::report::UnownedMeasurement::Subtree
                 } else {
-                    crate::report::UnownedMeasurement::Hardlinked
+                    crate::report::UnownedMeasurement::SubtreeShared
                 }),
                 path_or_object: group.root_path.display().to_string(),
                 bytes,
@@ -1281,8 +1437,9 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 // ---------------------------------------------------------------------
 
 /// Refresh folded unowned measurements without entering unchanged siblings.
-/// `None` asks the caller for reconciliation (unknown boundaries, hardlinks,
-/// unreadable paths, or changed project ownership), never guessed arithmetic.
+/// `None` asks the caller for reconciliation (unknown boundaries,
+/// unreadable paths, or changed project ownership). Sharing is an explicitly
+/// stale estimate, not a reason to walk unrelated containers.
 pub(crate) fn refresh_unowned(
     root: &Path,
     previous: &[UnownedRow],
@@ -1290,22 +1447,42 @@ pub(crate) fn refresh_unowned(
     worktrees: &[PathBuf],
     excluded: &[PathBuf],
     observed_at: u64,
+    shared_root: bool,
 ) -> Option<Vec<UnownedRow>> {
-    use crate::report::UnownedMeasurement::{Direct, Subtree};
+    use crate::report::UnownedMeasurement::{
+        Direct, DirectEstimate, Hardlinked, Subtree, SubtreeEstimate,
+    };
     if previous
         .iter()
-        .any(|r| !matches!(r.measurement, Some(Direct | Subtree)))
+        .any(|r| matches!(r.measurement, None | Some(Hardlinked)))
     {
         return None;
     }
     let mut rows = previous.to_vec();
+    let mut sharing = shared_root
+        || previous
+            .iter()
+            .any(|r| !matches!(r.measurement, Some(Direct | Subtree)));
+    if sharing {
+        for row in &mut rows {
+            row.measurement = row.measurement.map(|m| {
+                if m.folded() {
+                    SubtreeEstimate
+                } else {
+                    DirectEstimate
+                }
+            });
+        }
+    }
     let mut pending: Vec<PathBuf> = changed
         .iter()
         .filter(|p| !worktrees.iter().any(|w| p.starts_with(w)))
         .map(|p| {
             previous
                 .iter()
-                .find(|r| r.measurement == Some(Subtree) && p.starts_with(&r.path_or_object))
+                .find(|r| {
+                    r.measurement.is_some_and(|m| m.folded()) && p.starts_with(&r.path_or_object)
+                })
                 .map(|r| PathBuf::from(&r.path_or_object))
                 .unwrap_or_else(|| p.clone())
         })
@@ -1375,9 +1552,9 @@ pub(crate) fn refresh_unowned(
             continue;
         }
         let classified_now = path != root && unowned_classification(&path).is_some();
-        let was_folded = previous
-            .iter()
-            .any(|r| r.path_or_object == path.to_string_lossy() && r.measurement == Some(Subtree));
+        let was_folded = previous.iter().any(|r| {
+            r.path_or_object == path.to_string_lossy() && r.measurement.is_some_and(|m| m.folded())
+        });
         if was_folded && !classified_now {
             return None;
         }
@@ -1393,17 +1570,24 @@ pub(crate) fn refresh_unowned(
                 excluded,
                 false,
             );
-            if measured.hardlinked || !complete {
+            if !complete {
                 return None;
             }
+            sharing |= measured.hardlinked;
             rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&path));
-            rows.push(unowned_row(&path, measured.bytes, Subtree));
+            rows.push(unowned_row(
+                &path,
+                measured.bytes,
+                if sharing || measured.hardlinked {
+                    SubtreeEstimate
+                } else {
+                    Subtree
+                },
+            ));
             continue;
         }
         let measured = measure_directory(&path).ok()?;
-        if measured.hardlinked {
-            return None;
-        }
+        sharing |= measured.hardlinked;
         let children: HashSet<PathBuf> = measured
             .children
             .iter()
@@ -1427,7 +1611,11 @@ pub(crate) fn refresh_unowned(
         });
         if measured.allocated > 0 {
             rows.push(UnownedRow {
-                measurement: Some(Direct),
+                measurement: Some(if sharing || measured.hardlinked {
+                    DirectEstimate
+                } else {
+                    Direct
+                }),
                 path_or_object: path.display().to_string(),
                 bytes: measured.allocated,
                 reason: if is_shared_cache_name(
@@ -1484,10 +1672,18 @@ pub(crate) fn refresh_unowned(
                     &pruned,
                     false,
                 );
-                if measured.hardlinked || !complete {
+                if !complete {
                     return None;
                 }
-                vec![unowned_row(&child, measured.bytes, Subtree)]
+                vec![unowned_row(
+                    &child,
+                    measured.bytes,
+                    if sharing || measured.hardlinked {
+                        SubtreeEstimate
+                    } else {
+                        Subtree
+                    },
+                )]
             } else {
                 attribute_parallel_carrying(
                     &child,
@@ -1501,12 +1697,26 @@ pub(crate) fn refresh_unowned(
             };
             if fresh
                 .iter()
-                .any(|r| !matches!(r.measurement, Some(Direct | Subtree)))
+                .any(|r| matches!(r.measurement, None | Some(Hardlinked)))
             {
                 return None;
             }
             rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&child));
+            sharing |= fresh
+                .iter()
+                .any(|r| !matches!(r.measurement, Some(Direct | Subtree)));
             rows.extend(fresh);
+        }
+    }
+    if sharing {
+        for row in &mut rows {
+            row.measurement = row.measurement.map(|m| {
+                if m.folded() {
+                    SubtreeEstimate
+                } else {
+                    DirectEstimate
+                }
+            });
         }
     }
     Some(rows)

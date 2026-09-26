@@ -1624,6 +1624,16 @@ fn try_read_unowned_family(dir: &Path, stem: &str) -> Result<Vec<UnownedRow>> {
                     Some("direct") => Some(crate::report::UnownedMeasurement::Direct),
                     Some("subtree") => Some(crate::report::UnownedMeasurement::Subtree),
                     Some("hardlinked") => Some(crate::report::UnownedMeasurement::Hardlinked),
+                    Some("direct-shared") => Some(crate::report::UnownedMeasurement::DirectShared),
+                    Some("subtree-shared") => {
+                        Some(crate::report::UnownedMeasurement::SubtreeShared)
+                    }
+                    Some("direct-estimate") => {
+                        Some(crate::report::UnownedMeasurement::DirectEstimate)
+                    }
+                    Some("subtree-estimate") => {
+                        Some(crate::report::UnownedMeasurement::SubtreeEstimate)
+                    }
                     _ => None,
                 },
                 containers: list_values(&containers_by_key, &r.path_or_object),
@@ -1685,6 +1695,10 @@ fn write_unowned_family(dir: &Path, stem: &str, unowned: &[UnownedRow]) -> Resul
                     crate::report::UnownedMeasurement::Direct => "direct",
                     crate::report::UnownedMeasurement::Subtree => "subtree",
                     crate::report::UnownedMeasurement::Hardlinked => "hardlinked",
+                    crate::report::UnownedMeasurement::DirectShared => "direct-shared",
+                    crate::report::UnownedMeasurement::SubtreeShared => "subtree-shared",
+                    crate::report::UnownedMeasurement::DirectEstimate => "direct-estimate",
+                    crate::report::UnownedMeasurement::SubtreeEstimate => "subtree-estimate",
                 }
                 .to_string()
             }),
@@ -1891,6 +1905,7 @@ fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mu
     let mut coverage = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut reconciliation = crate::report::Reconciliation {
+        unique_estimate: None,
         attributed: 0,
         unowned: 0,
         walked_total: 0,
@@ -2007,6 +2022,7 @@ pub(crate) fn rebuild_coverage_and_notes_from_tables(
 
 /// The run parameters and per-run facts `observe_scope` records.
 pub struct RunFacts<'a> {
+    pub unique_estimate: Option<&'a crate::report::UniqueEstimate>,
     pub observed_at: u64,
     pub since_secs: u64,
     pub retention_days: u64,
@@ -2026,6 +2042,9 @@ pub fn write_run_row(swamp_dir: &Path, scope_key: &str, run: &RunFacts<'_>) -> R
         .filter(|r| r.scope_key != scope_key)
         .collect();
     rows.push(columns::StoredRunRow {
+        unique_bytes: run.unique_estimate.map(|u| u.bytes),
+        unique_reconciled_at: run.unique_estimate.map(|u| u.reconciled_at),
+        unique_needs_reconciliation: run.unique_estimate.map(|u| u.needs_reconciliation),
         scope_key: scope_key.to_string(),
         observed_at: run.observed_at,
         since_secs: run.since_secs,
@@ -2044,6 +2063,25 @@ pub(crate) fn read_run_row(swamp_dir: &Path, scope_key: &str) -> Option<columns:
         .ok()?
         .into_iter()
         .find(|r| r.scope_key == scope_key)
+}
+
+/// An observing pass may update some family tables before another family
+/// fails. Invalidate the old aggregate first, so a cold read cannot combine
+/// new rows with a supposedly current unique-byte total from the old pass.
+pub(crate) fn invalidate_unique_estimate(swamp_dir: &Path, scope_key: &str) -> Result<()> {
+    let path = runs_path(swamp_dir);
+    let mut rows = columns::read_run_rows(&path)?;
+    let mut changed = false;
+    for row in &mut rows {
+        if row.scope_key == scope_key && row.unique_needs_reconciliation == Some(false) {
+            row.unique_needs_reconciliation = Some(true);
+            changed = true;
+        }
+    }
+    if changed {
+        columns::write_run_rows(&path, &rows)?;
+    }
+    Ok(())
 }
 
 /// `Some(observed_at)` when `scope_key` has ever been fully observed
@@ -2126,6 +2164,14 @@ pub(crate) fn derive_report_views(
     let Some(run) = read_run_row(swamp_dir, scope_key) else {
         return;
     };
+    snapshot.report.reconciliation.unique_estimate = run
+        .unique_bytes
+        .zip(run.unique_reconciled_at)
+        .map(|(bytes, reconciled_at)| crate::report::UniqueEstimate {
+            bytes,
+            reconciled_at,
+            needs_reconciliation: run.unique_needs_reconciliation.unwrap_or(true),
+        });
     let observed_at = run.observed_at;
     let roots: Vec<PathBuf> = snapshot
         .coverage
@@ -5463,8 +5509,8 @@ pub fn stage_tracked_with_source(
             )?,
             Some(ref topo) => {
                 // Relist direct unowned directories; remeasure an implicated
-                // folded subtree. Ambiguous dedup, old cache boundaries and
-                // ownership transitions still require reconciliation.
+                // folded subtree. Sharing retains explicit stale estimates;
+                // old boundaries and ownership transitions still reconcile.
                 let has_unowned_changes = relevant_changed_dirs
                     .iter()
                     .any(|changed| !topo.iter().any(|wt| changed.starts_with(&wt.path)));
@@ -5473,13 +5519,12 @@ pub fn stage_tracked_with_source(
                     > TOO_MANY_CHANGES_FRACTION * known_dirs as f64;
                 let refreshed_unowned = if has_unowned_changes && !too_many_changes {
                     // A root-local hardlink charge may belong to an unchanged
-                    // checkout. Never add path allocation to that charge.
-                    if read_rows(&current_path(&dir))?
+                    // checkout. Label local refresh estimates instead of
+                    // silently treating allocation as reconciled uniqueness.
+                    let shared_root = read_rows(&current_path(&dir))?
                         .iter()
-                        .any(|r| r.present() && r.hardlinked())
-                    {
-                        None
-                    } else if let Ok(previous) = try_read_unowned_family(&dir, "unowned") {
+                        .any(|r| r.present() && r.hardlinked());
+                    if let Ok(previous) = try_read_unowned_family(&dir, "unowned") {
                         crate::walk::refresh_unowned(
                             &root,
                             &previous,
@@ -5487,6 +5532,7 @@ pub fn stage_tracked_with_source(
                             &topo.iter().map(|w| w.path.clone()).collect::<Vec<_>>(),
                             excluded,
                             observed_at,
+                            shared_root,
                         )
                     } else {
                         None

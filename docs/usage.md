@@ -51,6 +51,37 @@ are attached to each release as well.
 
 ## Observations and history
 
+### Unique bytes and fast refresh
+
+Ordinary refreshes update changed containers without revisiting unchanged roots
+to resolve hardlinks. Their unique-byte estimates can therefore be stale. The
+TUI labels these totals as needing reconciliation; JSON exposes the same fact
+as `reconciliation.unique_estimate.needs_reconciliation`.
+
+Run `swamp observe --full` for the configured scope (or pass the same explicit
+roots you normally observe), then `swamp report --view reconciliation`.
+When using explicit roots, pass the same roots to both commands.
+The full observation includes an additional parallel measurement across the
+observed project roots, external units, and agent units. It counts a shared
+device/inode once, respects exclusions, and does not follow symlinks. This
+extra traversal is explicit, never part of an ordinary incremental refresh.
+
+Only the resulting byte total and reconciliation timestamp are stored, in the
+existing Parquet run row. No inode inventory is retained. Later observations
+keep that last result with `needs_reconciliation: true`; an incomplete full
+observation cannot certify it as current. Before the first reconciliation the
+JSON value is `null`, not zero. The estimate covers the observed paths: known
+missing roots remain listed in scope coverage and contribute no paths. That
+does not delete their stored history. Inaccessible or partially read roots
+prevent a fresh reconciliation.
+
+This scope-wide physical-byte estimate excludes Docker and does not change
+per-root charges, artifact growth history, or cleanup advice. Do not add it to
+the row totals. Row totals use local accounting and may include shared storage;
+neither figure promises how much deletion will free.
+Uniqueness here means hardlink deduplication by inode, not detection of shared
+APFS clone/snapshot extents.
+
 `swamp observe` is the only command that scans: it walks the filesystem,
 groups projects, computes signals, discovers external/agent-tool
 storage, and persists all of it. `swamp report` is a pure read of what

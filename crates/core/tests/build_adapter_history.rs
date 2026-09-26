@@ -356,7 +356,7 @@ fn unowned_refresh_cost_is_local_and_folded_boundaries_survive_storage() {
 }
 
 #[test]
-fn unowned_shared_links_and_symlink_replacement_match_full() {
+fn unowned_shared_links_refresh_locally_until_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let store = tempfile::tempdir().unwrap();
@@ -367,19 +367,29 @@ fn unowned_shared_links_and_symlink_replacement_match_full() {
         observe(&root, store.path(), vec![], false);
     }
     fs::remove_file(root.join("a/file")).unwrap();
-    let actual = observe(&root, store.path(), vec![root.join("a")], false);
-    assert_eq!(
-        actual.reconciliation.walked_total,
-        fresh_full(&root).reconciliation.walked_total
-    );
+    let (actual, work) = swamp_core::work_counters::measured(|| {
+        observe(&root, store.path(), vec![root.join("a")], false)
+    });
     assert!(
-        actual
-            .notes
-            .iter()
-            .any(|n| n.contains("reason=checkoutless_changes")),
-        "shared charges need reconciliation: {:?}",
+        actual.notes.iter().any(|n| n.contains("mode=incremental")),
+        "sharing must not force a root walk: {:?}",
         actual.notes
     );
+    assert!(work.dirs_listed <= 1, "{work:?}");
+    assert!(actual.unowned.iter().any(|r| {
+        r.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }));
+    assert!(swamp_core::render::render_view_unowned(&actual).contains("need reconciliation"));
+    let reconciled = observe(&root, store.path(), vec![], true);
+    assert_eq!(
+        reconciled.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+    assert!(!reconciled.unowned.iter().any(|r| {
+        r.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }));
 
     let outside = tempfile::tempdir().unwrap();
     write(&outside.path().join("deep/file"), 131072);

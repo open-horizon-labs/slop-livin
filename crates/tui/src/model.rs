@@ -2560,6 +2560,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -2656,6 +2657,7 @@ mod tests {
                 },
             ],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

@@ -352,6 +352,7 @@ fn fixture_report() -> Report {
         github_enrichment: None,
         nested_artifacts: Vec::new(),
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,
@@ -372,6 +373,21 @@ fn capture(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
     terminal.backend().to_string()
+}
+
+#[test]
+fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
+    let mut report = fixture_report();
+    report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+        bytes: 8192,
+        reconciled_at: report.observed_at,
+        needs_reconciliation: true,
+    });
+    let app = App::new(report, "/Users/dev/src".into());
+    let narrow = capture(&app, 80, 24);
+    assert!(narrow.contains("unique totals not recomputed"), "{narrow}");
+    let wide = capture(&app, 180, 24);
+    assert!(wide.contains("needs reconciliation"), "{wide}");
 }
 
 fn check(name: &str, got: &str) {

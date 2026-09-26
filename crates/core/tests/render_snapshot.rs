@@ -204,6 +204,7 @@ fn fixture_report() -> Report {
             },
         ],
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 6_200_000_000,
             unowned: 4_400_000_000,
             walked_total: 10_600_000_000,

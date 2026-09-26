@@ -2660,6 +2660,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -3195,6 +3196,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
