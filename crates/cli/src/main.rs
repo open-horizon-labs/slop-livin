@@ -731,7 +731,19 @@ fn report_json_envelope(
             View::Docker => {
                 swamp_core::agent_json::docker_objects_payload(&rr, unowned_only, project)
             }
-            View::Rust => serde_json::json!(rr.nested_artifacts),
+            View::Rust => {
+                let units: Vec<_> = rr
+                    .nested_artifacts
+                    .iter()
+                    .filter(|unit| {
+                        project.map_or(true, |wanted| {
+                            swamp_core::render::nested_artifact_project_name(&rr, unit)
+                                == Some(wanted)
+                        })
+                    })
+                    .collect();
+                serde_json::json!(units)
+            }
             View::External => serde_json::json!({
                 "units": external_units,
                 "total_bytes": swamp_core::external::total_bytes(external_units),

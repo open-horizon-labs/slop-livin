@@ -203,6 +203,136 @@ fn bespoke_json_views_carry_evidence_on_their_rows() {
     assert!(v["result"].as_array().is_some());
 }
 
+/// `--view rust --project` must apply the same worktree ownership filter
+/// in JSON that the text renderer applies. A Node adapter's node_modules
+/// in a neighboring project must not leak into the selected Cargo view.
+#[test]
+fn rust_json_view_is_filtered_to_the_requested_project() {
+    let root = tempfile::tempdir().unwrap();
+    let rust_project = make_checkout(root.path(), "swamp", 1024);
+    let rust_project = fs::canonicalize(rust_project).unwrap();
+    fs::write(
+        rust_project.join("Cargo.toml"),
+        b"[package]\nname = \"swamp\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(rust_project.join("target/debug")).unwrap();
+    fs::write(
+        rust_project.join("target/debug/swamp-bin"),
+        vec![b'r'; 2048],
+    )
+    .unwrap();
+
+    let node_project = make_checkout(root.path(), "other", 4096);
+    fs::write(node_project.join("package.json"), b"{\"name\":\"other\"}\n").unwrap();
+    let store = tempfile::tempdir().unwrap();
+    observe(store.path(), root.path(), &[]);
+
+    let all = run_json(
+        store.path(),
+        &[
+            "report",
+            root.path().to_str().unwrap(),
+            "--view",
+            "rust",
+            "--json",
+        ],
+    );
+    let all_rows = all["result"].as_array().expect("Rust result array");
+    assert!(
+        all_rows.iter().any(|row| {
+            row["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/other/node_modules")
+        }),
+        "fixture should expose Node nested artifacts in the unfiltered result: {all:#}"
+    );
+
+    let filtered = run_json(
+        store.path(),
+        &[
+            "report",
+            root.path().to_str().unwrap(),
+            "--view",
+            "rust",
+            "--project",
+            "swamp",
+            "--json",
+        ],
+    );
+    let rows = filtered["result"]
+        .as_array()
+        .expect("filtered Rust result array");
+    assert!(
+        !rows.is_empty(),
+        "Cargo project should have nested rows: {filtered:#}"
+    );
+    assert!(
+        rows.iter().all(|row| {
+            row["path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(rust_project.to_str().unwrap())
+        }),
+        "JSON project filter leaked another project's adapter rows: {filtered:#}"
+    );
+
+    let text = run(
+        store.path(),
+        &[
+            "report",
+            root.path().to_str().unwrap(),
+            "--view",
+            "rust",
+            "--project",
+            "swamp",
+        ],
+    );
+    assert!(text.status.success());
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("swamp"),
+        "text should include selected project: {text}"
+    );
+    assert!(
+        !text.contains("/other/"),
+        "text leaked another project: {text}"
+    );
+}
+
+/// The Rust view points at the supported TUI cleanup workflow and never
+/// advertises the removed `cleanup-check` CLI command.
+#[test]
+fn rust_text_view_recommends_supported_cleanup_review() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = make_checkout(root.path(), "swamp", 1024);
+    fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"swamp\"\n").unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
+    fs::write(repo.join("target/debug/swamp-bin"), vec![b'r'; 2048]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    observe(store.path(), root.path(), &[]);
+
+    let output = run(
+        store.path(),
+        &["report", root.path().to_str().unwrap(), "--view", "rust"],
+    );
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("swamp ui"),
+        "expected supported TUI guidance: {text}"
+    );
+    assert!(
+        text.contains("Space"),
+        "expected an actionable TUI key: {text}"
+    );
+    assert!(
+        !text.contains("cleanup-check"),
+        "phantom CLI command remains: {text}"
+    );
+}
+
 /// A grown report whose store holds less history than requested clamps
 /// its window to the observations actually available, rather than
 /// fabricating a full requested window.
