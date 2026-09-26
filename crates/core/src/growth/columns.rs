@@ -633,16 +633,15 @@ pub(super) fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
 // folds every direct unowned file into one row per containing
 // directory before this table ever sees them). Like `FoldedRow`, this
 // is a measurement cache, not history: unowned rows carry no growth or
-// regrowth semantics and are replaced wholesale by a full walk, so the
+// regrowth semantics and retain unchanged rows on a local refresh, so the
 // whole file is rewritten each observation rather than reverse-delta
-// compacted. Complex per-row fields (`containers`, `shared_with`,
-// `evidence`) are JSON-encoded *into a Parquet Utf8 cell*, not a JSON
-// file on disk -- the store-is-Parquet rule is about the file format
-// under `SWAMP_DIR`, not about every cell's encoding.
+// compacted. Measurement boundaries are a dictionary-friendly column;
+// containers/shared-with and evidence live in typed child tables.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredUnownedRow {
+    pub measurement: Option<String>,
     pub path_or_object: String,
     pub bytes: u64,
     pub reason: String,
@@ -663,6 +662,7 @@ fn unowned_schema() -> Arc<Schema> {
         Field::new("docker_kind", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("dangling", DataType::Boolean, false),
+        Field::new("measurement", DataType::Utf8, true),
     ]))
 }
 
@@ -688,6 +688,11 @@ pub(super) fn write_unowned_rows(path: &Path, rows: &[StoredUnownedRow]) -> Resu
             Arc::new(StringArray::from(docker_kind)),
             Arc::new(StringArray::from(created_at)),
             Arc::new(BooleanArray::from(dangling)),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.measurement.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -809,8 +814,14 @@ pub(super) fn read_unowned_rows(path: &Path) -> Result<Vec<StoredUnownedRow>> {
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .context("column created_at is not Utf8")?;
         let dangling = downcast_bool(&batch, "dangling")?;
+        let measurement = batch
+            .column_by_name("measurement")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         for i in 0..batch.num_rows() {
             rows.push(StoredUnownedRow {
+                measurement: measurement
+                    .filter(|a| a.is_valid(i))
+                    .map(|a| a.value(i).to_string()),
                 path_or_object: path_or_object.value(i).to_string(),
                 bytes: bytes.value(i),
                 reason: reason.value(i).to_string(),

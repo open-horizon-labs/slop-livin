@@ -333,6 +333,7 @@ fn fixture_report() -> Report {
             },
         ],
         unowned: vec![UnownedRow {
+            measurement: None,
             path_or_object: "/Users/dev/.cache/leftover".into(),
             bytes: 209_715_200,
             reason: UnownedReason::SharedCache,

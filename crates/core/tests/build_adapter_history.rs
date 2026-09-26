@@ -71,6 +71,16 @@ fn observe(
     changed: Vec<PathBuf>,
     force_full: bool,
 ) -> swamp_core::Report {
+    observe_excluding(root, store, changed, force_full, &[])
+}
+
+fn observe_excluding(
+    root: &Path,
+    store: &Path,
+    changed: Vec<PathBuf>,
+    force_full: bool,
+    excluded: &[PathBuf],
+) -> swamp_core::Report {
     // `docker_in_scope: false`: these fixtures assert exact
     // `containers_identified`/`containers_reused` counts for adapters
     // that have nothing to do with Docker. `report_full_mode_with_source`
@@ -102,7 +112,7 @@ fn observe(
         false,
         force_full,
         &Live(changed),
-        &[],
+        excluded,
         false,
     )
     .unwrap()
@@ -127,7 +137,7 @@ fn fresh_full(root: &Path) -> swamp_core::Report {
 }
 
 #[test]
-fn checkoutless_reuse_and_explicit_remeasurement_match_full_across_file_mutations() {
+fn checkoutless_incremental_remeasurement_matches_full_across_file_mutations() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let store = tempfile::tempdir().unwrap();
@@ -164,8 +174,8 @@ fn checkoutless_reuse_and_explicit_remeasurement_match_full_across_file_mutation
             incremental
                 .notes
                 .iter()
-                .any(|n| n.contains("reason=checkoutless_changes")),
-            "changed unowned bytes need an explicit remeasurement: {:?}",
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "changed unowned bytes must be measured locally: {:?}",
             incremental.notes
         );
         assert_eq!(
@@ -197,12 +207,18 @@ fn mixed_root_refreshes_unowned_mutations_without_disabling_unchanged_reuse() {
             4 => write(&loose, 32768),
             _ => git_init(&root.join("loose")),
         }
-        let actual = observe(&root, store.path(), vec![root.join("loose")], false);
+        let actual = observe(
+            &root,
+            store.path(),
+            vec![root.join(if mutation == 5 { "loose/.git" } else { "loose" })],
+            false,
+        );
         assert!(
-            actual
-                .notes
-                .iter()
-                .any(|n| n.contains("reason=unowned_changes")),
+            actual.notes.iter().any(|n| if mutation == 5 {
+                n.contains("reason=unowned_changes")
+            } else {
+                n.starts_with("fsevents: mode=incremental")
+            }),
             "{:?}",
             actual.notes
         );
@@ -239,6 +255,252 @@ fn mixed_root_refreshes_unowned_mutations_without_disabling_unchanged_reuse() {
     assert_eq!(
         owned.reconciliation.walked_total,
         fresh_full(&root).reconciliation.walked_total
+    );
+}
+
+#[test]
+fn unowned_refresh_cost_is_local_and_folded_boundaries_survive_storage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("root-file"), 4096);
+    write(&root.join("loose/file"), 4096);
+    write(&root.join("target/deep/file"), 8192);
+    for i in 0..2000 {
+        write(&root.join(format!("unchanged/{i}")), 4096);
+    }
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let (_, full_work) = swamp_core::work_counters::measured(|| fresh_full(&root));
+    assert!(
+        full_work.files_statted >= 2000,
+        "instrument must see the reference traversal: {full_work:?}"
+    );
+    for (file, changed) in [
+        ("root-file", ""),
+        ("loose/file", "loose"),
+        ("target/deep/file", "target/deep"),
+    ] {
+        write(&root.join(file), 65536);
+        let (actual, work) = swamp_core::work_counters::measured(|| {
+            observe(
+                &root,
+                store.path(),
+                vec![root.join(file), root.join(changed), root.clone()],
+                false,
+            )
+        });
+        assert!(
+            actual
+                .notes
+                .iter()
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "{:?}",
+            actual.notes
+        );
+        assert_eq!(
+            actual.reconciliation.walked_total,
+            fresh_full(&root).reconciliation.walked_total
+        );
+        assert!(
+            work.files_statted < 100,
+            "unchanged sibling was traversed: {work:?}"
+        );
+        eprintln!("{changed}: {work:?}; reference: {full_work:?}");
+    }
+    let (_, unchanged) =
+        swamp_core::work_counters::measured(|| observe(&root, store.path(), vec![], false));
+    assert_eq!(unchanged.files_statted, 0, "{unchanged:?}");
+    assert_eq!(unchanged.dirs_listed, 0, "{unchanged:?}");
+    let (storm, storm_work) = swamp_core::work_counters::measured(|| {
+        observe(
+            &root,
+            store.path(),
+            (0..20)
+                .map(|i| root.join(format!("unchanged/{i}")))
+                .collect(),
+            false,
+        )
+    });
+    assert!(
+        storm
+            .notes
+            .iter()
+            .any(|n| n.contains("reason=too_many_changes")),
+        "{:?}",
+        storm.notes
+    );
+    assert!(
+        storm_work.files_statted <= full_work.files_statted + 20,
+        "event burst must not relist before choosing a full scan: {storm_work:?}"
+    );
+    write(&root.join("new/target/deep/file"), 32768);
+    let actual = observe(
+        &root,
+        store.path(),
+        vec![
+            root.join("new/target/deep/file"),
+            root.join("new/target/deep"),
+        ],
+        false,
+    );
+    let full = fresh_full(&root);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
+    assert!(actual.unowned.iter().any(|r| r.path_or_object
+        == root.join("new/target").to_string_lossy()
+        && r.measurement == Some(swamp_core::report::UnownedMeasurement::Subtree)));
+}
+
+#[test]
+fn unowned_shared_links_and_symlink_replacement_match_full() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("a/file"), 16384);
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::hard_link(root.join("a/file"), root.join("b/file")).unwrap();
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    fs::remove_file(root.join("a/file")).unwrap();
+    let actual = observe(&root, store.path(), vec![root.join("a")], false);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+    assert!(
+        actual
+            .notes
+            .iter()
+            .any(|n| n.contains("reason=checkoutless_changes")),
+        "shared charges need reconciliation: {:?}",
+        actual.notes
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    write(&outside.path().join("deep/file"), 131072);
+    write(&root.join("replace/deep/file"), 32768);
+    observe(&root, store.path(), vec![], true);
+    fs::rename(root.join("replace"), outside.path().join("old")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("replace")).unwrap();
+    let actual = observe(&root, store.path(), vec![root.join("replace/deep")], false);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+}
+
+#[test]
+fn unowned_refresh_preserves_excluded_subtrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("loose/file"), 4096);
+    write(&root.join("target/cache/file"), 8192);
+    let excluded = vec![root.join("loose/excluded"), root.join("target/excluded")];
+    for p in &excluded {
+        write(&p.join("file"), 131072);
+    }
+    for _ in 0..3 {
+        observe_excluding(&root, store.path(), vec![], false, &excluded);
+    }
+    write(&root.join("loose/file"), 32768);
+    write(&root.join("target/cache/file"), 65536);
+    let actual = observe_excluding(
+        &root,
+        store.path(),
+        vec![root.join("loose"), root.join("target/cache")],
+        false,
+        &excluded,
+    );
+    let full_store = tempfile::tempdir().unwrap();
+    let full = observe_excluding(&root, full_store.path(), vec![], true, &excluded);
+    assert!(
+        actual
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        actual.notes
+    );
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
+    assert!(!actual.unowned.iter().any(|r| {
+        excluded
+            .iter()
+            .any(|p| Path::new(&r.path_or_object).starts_with(p))
+    }));
+}
+
+#[test]
+fn missing_unowned_baseline_reconciles_instead_of_dropping_unchanged_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("a/file"), 8192);
+    write(&root.join("b/file"), 16384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let baseline =
+        swamp_core::growth::volume_store_dir(store.path(), &root).join("unowned.parquet");
+    assert!(baseline.exists());
+    fs::remove_file(baseline).unwrap(); // disposable fixture cache only
+    write(&root.join("a/file"), 32768);
+    let actual = observe(&root, store.path(), vec![root.join("a")], false);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+    assert!(
+        actual
+            .notes
+            .iter()
+            .any(|n| n.contains("reason=checkoutless_changes")),
+        "{:?}",
+        actual.notes
+    );
+}
+
+#[test]
+fn removed_cache_tag_reconciles_the_unowned_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("tagged/deep/file"), 8192);
+    let tag = root.join("tagged/CACHEDIR.TAG");
+    fs::write(&tag, b"Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    fs::remove_file(&tag).unwrap();
+    let actual = observe(&root, store.path(), vec![tag, root.join("tagged")], false);
+    let full = fresh_full(&root);
+    let boundaries = |r: &swamp_core::Report| {
+        let mut rows: Vec<_> = r
+            .unowned
+            .iter()
+            .map(|r| {
+                (
+                    r.path_or_object.clone(),
+                    r.bytes,
+                    format!("{:?}", r.measurement),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(boundaries(&actual), boundaries(&full));
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
     );
 }
 

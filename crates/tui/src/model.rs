@@ -2627,6 +2627,7 @@ mod tests {
             projects: vec![],
             unowned: vec![
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "img".into(),
                     bytes: 100,
                     reason: UnownedReason::DockerNoJoin,
@@ -2640,6 +2641,7 @@ mod tests {
                     evidence: Vec::new(),
                 },
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "cache".into(),
                     bytes: 200,
                     reason: UnownedReason::SharedCache,

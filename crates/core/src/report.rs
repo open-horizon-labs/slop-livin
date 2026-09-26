@@ -340,8 +340,19 @@ pub struct ProjectRow {
     pub remote: Option<String>,
 }
 
+/// Boundary of a filesystem measurement, not an ownership claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnownedMeasurement {
+    Direct,
+    Subtree,
+    /// Shared inodes require reconciliation, not local allocation arithmetic.
+    Hardlinked,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnownedRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<UnownedMeasurement>,
     pub path_or_object: String,
     pub bytes: u64,
     pub reason: UnownedReason,
@@ -1939,6 +1950,7 @@ pub(crate) fn join_docker_facts(
                 let mut evidence = vec![recovery_evidence];
                 evidence.extend(candidate.docker_evidence);
                 result.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: candidate.reference,
                     bytes: candidate.unique_bytes,
                     reason: UnownedReason::DockerNoJoin,

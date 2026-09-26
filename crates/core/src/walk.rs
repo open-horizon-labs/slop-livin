@@ -511,6 +511,7 @@ struct AttrShared {
     /// counted into it (see `ArtifactRow::local_bytes`).
     source_local: Mutex<HashMap<String, LocalAcc>>,
     unowned: Mutex<Vec<UnownedRow>>,
+    unowned_hardlinks: Mutex<HashSet<PathBuf>>,
     walked_total: AtomicU64,
     attributed_total: AtomicU64,
     unowned_total: AtomicU64,
@@ -614,6 +615,7 @@ fn attribute_parallel_inner(
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),
         unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
         walked_total: AtomicU64::new(0),
         attributed_total: AtomicU64::new(0),
         unowned_total: AtomicU64::new(0),
@@ -745,6 +747,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         }
         Err(_) => {
             shared.unowned.lock().unwrap().push(UnownedRow {
+                measurement: None,
                 path_or_object: path.display().to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
@@ -955,6 +958,13 @@ fn record_file(
     shared: &AttrShared,
 ) -> (i64, FileTally) {
     let mtime = meta.mtime();
+    if meta.nlink() > 1 && nearest_worktree(known, path).is_none() {
+        shared
+            .unowned_hardlinks
+            .lock()
+            .unwrap()
+            .insert(path.parent().unwrap_or(path).to_path_buf());
+    }
     // Per-row local figure first: independent of which row the global
     // dedup below happens to charge.
     if let Some(worktree_id) = nearest_worktree(known, path) {
@@ -996,9 +1006,26 @@ fn record_file(
 /// artifact directories (e.g. a stray `node_modules` outside any
 /// worktree) so both folding paths agree on labeling.
 fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
-    if bytes == 0 {
+    let hardlinked = shared.unowned_hardlinks.lock().unwrap().contains(dir_path);
+    if bytes == 0 && !hardlinked {
         return;
     }
+    shared.unowned.lock().unwrap().push(unowned_row(
+        dir_path,
+        bytes,
+        if hardlinked {
+            crate::report::UnownedMeasurement::Hardlinked
+        } else {
+            crate::report::UnownedMeasurement::Direct
+        },
+    ));
+}
+
+fn unowned_row(
+    dir_path: &Path,
+    bytes: u64,
+    measurement: crate::report::UnownedMeasurement,
+) -> UnownedRow {
     let name = dir_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1008,7 +1035,8 @@ fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
     } else {
         UnownedReason::NoContainingRepo
     };
-    shared.unowned.lock().unwrap().push(UnownedRow {
+    UnownedRow {
+        measurement: Some(measurement),
         path_or_object: dir_path.display().to_string(),
         bytes,
         reason,
@@ -1020,7 +1048,7 @@ fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
         dangling: false,
         docker_kind: None,
         evidence: Vec::new(),
-    });
+    }
 }
 
 /// Sizes one directory inside a classified artifact subtree: sums
@@ -1222,6 +1250,11 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 UnownedReason::NoContainingRepo
             };
             shared.unowned.lock().unwrap().push(UnownedRow {
+                measurement: Some(if group.local_seen.lock().unwrap().is_empty() {
+                    crate::report::UnownedMeasurement::Subtree
+                } else {
+                    crate::report::UnownedMeasurement::Hardlinked
+                }),
                 path_or_object: group.root_path.display().to_string(),
                 bytes,
                 reason,
@@ -1246,6 +1279,242 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 // `attribute_parallel` above -- they simply start the same machinery at a
 // narrower root than the whole scan root.
 // ---------------------------------------------------------------------
+
+/// Refresh folded unowned measurements without entering unchanged siblings.
+/// `None` asks the caller for reconciliation (unknown boundaries, hardlinks,
+/// unreadable paths, or changed project ownership), never guessed arithmetic.
+pub(crate) fn refresh_unowned(
+    root: &Path,
+    previous: &[UnownedRow],
+    changed: &[PathBuf],
+    worktrees: &[PathBuf],
+    excluded: &[PathBuf],
+    observed_at: u64,
+) -> Option<Vec<UnownedRow>> {
+    use crate::report::UnownedMeasurement::{Direct, Subtree};
+    if previous
+        .iter()
+        .any(|r| !matches!(r.measurement, Some(Direct | Subtree)))
+    {
+        return None;
+    }
+    let mut rows = previous.to_vec();
+    let mut pending: Vec<PathBuf> = changed
+        .iter()
+        .filter(|p| !worktrees.iter().any(|w| p.starts_with(w)))
+        .map(|p| {
+            previous
+                .iter()
+                .find(|r| r.measurement == Some(Subtree) && p.starts_with(&r.path_or_object))
+                .map(|r| PathBuf::from(&r.path_or_object))
+                .unwrap_or_else(|| p.clone())
+        })
+        .collect();
+    pending.sort();
+    pending.dedup();
+    let mut visited = HashSet::new();
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone())
+            || excluded.iter().any(|e| path.starts_with(e))
+            || worktrees.iter().any(|w| path.starts_with(w))
+        {
+            continue;
+        }
+        if !path.starts_with(root) {
+            return None;
+        }
+        // Checking only the final component would follow a replaced ancestor.
+        let mut blocked = None;
+        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
+            crate::work_counters::record_files_statted(1);
+            match crate::fs_gate::symlink_metadata(ancestor) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    blocked = Some(ancestor.to_path_buf());
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    blocked = Some(ancestor.to_path_buf());
+                    break;
+                }
+                Err(_) => return None,
+            }
+        }
+        if let Some(blocked) = blocked {
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&blocked));
+            if let Some(parent) = blocked.parent().filter(|p| p.starts_with(root)) {
+                pending.push(parent.to_path_buf());
+            }
+            continue;
+        }
+        // Classify only after rejecting symlink ancestors: cache tags read
+        // marker bytes, not just compare a basename.
+        if let Some(boundary) = path
+            .ancestors()
+            .take_while(|a| *a != root && a.starts_with(root))
+            .filter(|a| unowned_classification(a).is_some())
+            .last()
+            && boundary != path
+        {
+            pending.push(boundary.to_path_buf());
+            continue;
+        }
+        if path
+            .ancestors()
+            .take_while(|p| p.starts_with(root))
+            .any(|p| crate::fs_gate::exists(p.join(".git")))
+        {
+            return None;
+        }
+        crate::work_counters::record_files_statted(1);
+        let meta = crate::fs_gate::symlink_metadata(&path).ok()?;
+        if !meta.is_dir() {
+            // Item events have no independent row: relist their parent once.
+            let parent = path.parent().filter(|p| p.starts_with(root))?;
+            pending.push(parent.to_path_buf());
+            continue;
+        }
+        let classified_now = path != root && unowned_classification(&path).is_some();
+        let was_folded = previous
+            .iter()
+            .any(|r| r.path_or_object == path.to_string_lossy() && r.measurement == Some(Subtree));
+        if was_folded && !classified_now {
+            return None;
+        }
+        if classified_now {
+            if worktrees.iter().any(|w| w.starts_with(&path)) {
+                return None;
+            }
+            let (measured, _, _, complete) = resize_artifact_stamped(
+                &path,
+                ArtifactKind::Cache,
+                observed_at,
+                None,
+                excluded,
+                false,
+            );
+            if measured.hardlinked || !complete {
+                return None;
+            }
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&path));
+            rows.push(unowned_row(&path, measured.bytes, Subtree));
+            continue;
+        }
+        let measured = measure_directory(&path).ok()?;
+        if measured.hardlinked {
+            return None;
+        }
+        let children: HashSet<PathBuf> = measured
+            .children
+            .iter()
+            .map(|name| path.join(name))
+            .collect();
+        // A removed known checkout needs the normal discovery/history path.
+        if worktrees
+            .iter()
+            .any(|w| w.starts_with(&path) && !crate::fs_gate::exists(w))
+        {
+            return None;
+        }
+        rows.retain(|r| {
+            let p = Path::new(&r.path_or_object);
+            let Ok(rel) = p.strip_prefix(&path) else {
+                return true;
+            };
+            rel.components()
+                .next()
+                .is_some_and(|c| children.contains(&path.join(c)))
+        });
+        if measured.allocated > 0 {
+            rows.push(UnownedRow {
+                measurement: Some(Direct),
+                path_or_object: path.display().to_string(),
+                bytes: measured.allocated,
+                reason: if is_shared_cache_name(
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default(),
+                ) {
+                    UnownedReason::SharedCache
+                } else {
+                    UnownedReason::NoContainingRepo
+                },
+                shared_bytes: None,
+                note: None,
+                docker_kind: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
+                evidence: Vec::new(),
+            });
+        }
+        for child in children {
+            if excluded.iter().any(|e| child.starts_with(e))
+                || worktrees.iter().any(|w| child.starts_with(w))
+            {
+                continue;
+            }
+            if previous
+                .iter()
+                .any(|r| Path::new(&r.path_or_object).starts_with(&child))
+            {
+                continue;
+            }
+            // An unknown child might contain a new checkout. Discovery is
+            // bounded to this new subtree, never an unchanged sibling.
+            let mut pruned = excluded.to_vec();
+            pruned.extend_from_slice(worktrees);
+            if !discover_parallel_excluding(&child, &pruned)
+                .ok()?
+                .is_empty()
+            {
+                return None;
+            }
+            let classified = unowned_classification(&child);
+            let fresh = if let Some(classified) = classified {
+                if worktrees.iter().any(|w| w.starts_with(&child)) {
+                    return None;
+                }
+                let (measured, _, _, complete) = resize_artifact_stamped(
+                    &child,
+                    classified.kind().clone(),
+                    observed_at,
+                    None,
+                    &pruned,
+                    false,
+                );
+                if measured.hardlinked || !complete {
+                    return None;
+                }
+                vec![unowned_row(&child, measured.bytes, Subtree)]
+            } else {
+                attribute_parallel_carrying(
+                    &child,
+                    &[],
+                    observed_at,
+                    u64::MAX,
+                    HashMap::new(),
+                    &pruned,
+                )
+                .unowned
+            };
+            if fresh
+                .iter()
+                .any(|r| !matches!(r.measurement, Some(Direct | Subtree)))
+            {
+                return None;
+            }
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&child));
+            rows.extend(fresh);
+        }
+    }
+    Some(rows)
+}
+
+fn unowned_classification(path: &Path) -> Option<Classified> {
+    classified_at(path.parent()?, path.file_name()?.to_str()?)
+}
 
 /// Re-walks exactly one worktree, matching `discover_and_attribute`'s
 /// per-worktree slice of `attribute_parallel` but seeded at
@@ -1373,6 +1642,7 @@ pub fn resize_artifact_stamped(
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),
         unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
         walked_total: AtomicU64::new(0),
         attributed_total: AtomicU64::new(0),
         unowned_total: AtomicU64::new(0),

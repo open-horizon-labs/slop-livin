@@ -1251,6 +1251,8 @@ An observation with usable event history reconstructs the previous topology and 
 | Change | Work performed |
 |---|---|
 | Existing remainder directory changes | Re-list that directory and update its stored totals when the stored structure permits it. |
+| Unowned directory changes | Re-list its direct files, retain unchanged siblings, and measure new subtrees. The existing unowned Parquet rows distinguish direct-directory bytes from folded-subtree totals. A changed folded subtree is remeasured as a unit. |
+| Unowned boundary is unknown, shares hardlinks, or changes project ownership | Reconcile with a full-root walk; report `checkoutless_changes` or `unowned_changes`. Unchanged observations still reuse their measurements. |
 | Directory inside an artifact changes | Re-list affected interior directories and update allocated totals. Wide directories use bounded batches on the existing worker pool. |
 | Changed artifact has hardlinks | Keep its last unique-byte measurement, mark it stale, and update directory allocations without traversing unchanged interiors. |
 | Interior detail is unavailable | Resize the whole artifact. |
@@ -1259,7 +1261,9 @@ An observation with usable event history reconstructs the previous topology and 
 
 Hardlinks do not force a whole-target walk when interior measurements are available. `allocated_bytes` and `allocated_growth_bytes` describe current path allocations, which may count a linked inode more than once. `bytes` and `local_bytes` retain their last deduplicated measurements; `dedup_stale` distinguishes those from current measurements. CLI/TUI warn when unique-byte totals are stale. Unique-byte growth is unavailable and its history has a gap while stale, rather than inventing zero growth. A full scan reconciles the counts. Cleanup still checks its actual selected members; allocated size is not promised reclaimable space.
 
-Plans warn about stale unique-byte estimates, and standing grants cannot spend a budget against them. A human may explicitly approve a plan with that warning. A scoped Cargo cleanup measures its selected members freshly and still requires per-plan approval.
+TUI cleanup previews distinguish allocated bytes from reclaimable estimates.
+The human selects and confirms removal; the CLI reports and does not remove
+files. There are no standing grants or CLI approval/execute workflow.
 
 The fallback reasons include a missing or future event ID, a device mismatch, dropped or inconclusive events, too many changed directories, and changed classification rules. A replay too soon after the previous observation also falls back, because the persisted event log can lag writes. `--full` explicitly forces a full walk.
 

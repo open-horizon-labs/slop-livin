@@ -1576,8 +1576,16 @@ fn read_unowned(dir: &Path) -> Vec<UnownedRow> {
 }
 
 fn read_unowned_family(dir: &Path, stem: &str) -> Vec<UnownedRow> {
+    try_read_unowned_family(dir, stem).unwrap_or_default()
+}
+
+fn try_read_unowned_family(dir: &Path, stem: &str) -> Result<Vec<UnownedRow>> {
     let (rows_path, lists_path, evidence_path) = unowned_family_paths(dir, stem);
-    let rows = columns::read_unowned_rows(&rows_path).unwrap_or_default();
+    anyhow::ensure!(
+        crate::fs_gate::exists(&rows_path),
+        "missing unowned baseline"
+    );
+    let rows = columns::read_unowned_rows(&rows_path)?;
     let list_rows = columns::read_unowned_list_rows(&lists_path).unwrap_or_default();
     let mut containers_by_key: HashMap<String, Vec<&columns::StoredUnownedListRow>> =
         HashMap::new();
@@ -1604,13 +1612,20 @@ fn read_unowned_family(dir: &Path, stem: &str) -> Vec<UnownedRow> {
             v.sort_by_key(|r| r.seq);
             v.into_iter().map(|r| r.value.clone()).collect()
         };
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .map(|r| {
             let evidence = evidence_by_key
                 .get(&r.path_or_object)
                 .map(|rows| evidence_from_stored_rows(rows))
                 .unwrap_or_default();
             UnownedRow {
+                measurement: match r.measurement.as_deref() {
+                    Some("direct") => Some(crate::report::UnownedMeasurement::Direct),
+                    Some("subtree") => Some(crate::report::UnownedMeasurement::Subtree),
+                    Some("hardlinked") => Some(crate::report::UnownedMeasurement::Hardlinked),
+                    _ => None,
+                },
                 containers: list_values(&containers_by_key, &r.path_or_object),
                 shared_with: list_values(&shared_with_by_key, &r.path_or_object),
                 path_or_object: r.path_or_object,
@@ -1624,7 +1639,7 @@ fn read_unowned_family(dir: &Path, stem: &str) -> Vec<UnownedRow> {
                 evidence,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Replaces the volume's `unowned.parquet` (+ `unowned_lists.parquet`/
@@ -1665,6 +1680,14 @@ fn write_unowned_family(dir: &Path, stem: &str, unowned: &[UnownedRow]) -> Resul
     let rows: Vec<columns::StoredUnownedRow> = unowned
         .iter()
         .map(|u| columns::StoredUnownedRow {
+            measurement: u.measurement.map(|m| {
+                match m {
+                    crate::report::UnownedMeasurement::Direct => "direct",
+                    crate::report::UnownedMeasurement::Subtree => "subtree",
+                    crate::report::UnownedMeasurement::Hardlinked => "hardlinked",
+                }
+                .to_string()
+            }),
             path_or_object: u.path_or_object.clone(),
             bytes: u.bytes,
             reason: unowned_reason_to_str(&u.reason).to_string(),
@@ -4761,8 +4784,8 @@ fn parse_artifact_kind(s: &str) -> ArtifactKind {
 /// Reconstructs a full [`crate::attribution::AttributionResult`] from the
 /// growth store's current-state files: every artifact/dir/file row this
 /// volume has ever observed and is still present, plus the last-known
-/// unowned rows carried forward verbatim (unowned rows are only
-/// refreshed by a full walk; see module docs).
+/// unowned rows carried forward verbatim. The incremental caller replaces
+/// those rows when an unowned directory or folded boundary was refreshed.
 ///
 /// Every `ArtifactRow::path` here is still **relative** (the raw
 /// `rel_path` from storage); the caller re-joins it against each
@@ -5439,16 +5462,39 @@ pub fn stage_tracked_with_source(
                 excluded,
             )?,
             Some(ref topo) => {
-                // Unowned rows have no directory rollups yet. This applies
-                // beside known checkouts too: discovery alone cannot update
-                // loose bytes or subtract them when a directory becomes a
-                // checkout. Keep unchanged roots reusable, but remeasure an
-                // event outside all known worktrees rather than report stale
-                // totals. Directory-local unowned refresh remains separate.
-                if relevant_changed_dirs
+                // Relist direct unowned directories; remeasure an implicated
+                // folded subtree. Ambiguous dedup, old cache boundaries and
+                // ownership transitions still require reconciliation.
+                let has_unowned_changes = relevant_changed_dirs
                     .iter()
-                    .any(|changed| !topo.iter().any(|wt| changed.starts_with(&wt.path)))
-                {
+                    .any(|changed| !topo.iter().any(|wt| changed.starts_with(&wt.path)));
+                let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
+                let too_many_changes = relevant_changed_dirs.len() as f64
+                    > TOO_MANY_CHANGES_FRACTION * known_dirs as f64;
+                let refreshed_unowned = if has_unowned_changes && !too_many_changes {
+                    // A root-local hardlink charge may belong to an unchanged
+                    // checkout. Never add path allocation to that charge.
+                    if read_rows(&current_path(&dir))?
+                        .iter()
+                        .any(|r| r.present() && r.hardlinked())
+                    {
+                        None
+                    } else if let Ok(previous) = try_read_unowned_family(&dir, "unowned") {
+                        crate::walk::refresh_unowned(
+                            &root,
+                            &previous,
+                            &relevant_changed_dirs,
+                            &topo.iter().map(|w| w.path.clone()).collect::<Vec<_>>(),
+                            excluded,
+                            observed_at,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if has_unowned_changes && !too_many_changes && refreshed_unowned.is_none() {
                     full_walk(
                         stage,
                         &root,
@@ -5467,10 +5513,7 @@ pub fn stage_tracked_with_source(
                     // changes" guard on the very first touched file --
                     // the guard exists to protect large trees, where a
                     // fraction is the meaningful signal.
-                    let known_dirs = read_dir_rows(&dirs_current_path(&dir))?.len().max(20);
-                    if relevant_changed_dirs.len() as f64
-                        > TOO_MANY_CHANGES_FRACTION * known_dirs as f64
-                    {
+                    if too_many_changes {
                         full_walk(
                             stage,
                             &root,
@@ -5487,6 +5530,7 @@ pub fn stage_tracked_with_source(
                             observed_at,
                             large_file_min_bytes,
                             &dir,
+                            refreshed_unowned,
                         )?
                     }
                 }
@@ -6117,10 +6161,17 @@ fn apply_incremental(
     observed_at: u64,
     large_file_min_bytes: u64,
     dir: &Path,
+    refreshed_unowned: Option<Vec<UnownedRow>>,
 ) -> Result<TrackedWalk> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
     let mut attribution = reconstruct_attribution(dir)?;
+    if let Some(rows) = refreshed_unowned {
+        let new_total: u64 = rows.iter().map(|r| r.bytes).sum();
+        attribution.walked_total = attribution.walked_total - attribution.unowned_total + new_total;
+        attribution.unowned_total = new_total;
+        attribution.unowned = rows;
+    }
     // The incremental arithmetic below works on one remainder row per
     // worktree; the store holds it already split. See `collapse_remainder`.
     collapse_remainder(&mut attribution);
@@ -6169,11 +6220,9 @@ fn apply_incremental(
             .filter(|w| changed.starts_with(&w.path))
             .max_by_key(|w| w.path.as_os_str().len());
         let Some(wt) = nearest else {
-            // Outside every known worktree: might be a brand-new project
-            // appearing under the root. Scan from here; if nothing is
-            // found, this change is simply not reflected until the next
-            // full walk (documented limitation of the incremental path).
-            discovery_scan_roots.push(changed.clone());
+            // The caller refreshed unowned boundaries and checked new
+            // subtrees for checkouts already (or selected a full walk).
+            // Repeating discovery here would traverse unchanged siblings.
             continue;
         };
         let artifact_hit = attribution
@@ -8809,6 +8858,7 @@ mod tests {
         let dir = tmp.path();
 
         let docker_row = UnownedRow {
+            measurement: None,
             path_or_object: "sha256:abc123".into(),
             bytes: 4096,
             reason: UnownedReason::DockerNoJoin,
@@ -8830,6 +8880,7 @@ mod tests {
             )],
         };
         let plain_row = UnownedRow {
+            measurement: None,
             path_or_object: "/src/scratch/leftover.bin".into(),
             bytes: 512,
             reason: UnownedReason::OutsideAnyCheckout,
