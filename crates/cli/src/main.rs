@@ -131,6 +131,16 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// On-demand, bounded inspection of an existing Cargo profile. Does not run Cargo.
+    InspectCargo {
+        profile: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 8192)]
+        max_entries: usize,
+        #[arg(long, default_value_t = 2000)]
+        max_ms: u64,
+    },
     /// Diffstat-ledger terminal UI (ratatui). Default when no
     /// subcommand is given.
     Ui {
@@ -751,7 +761,7 @@ fn report_json_envelope(
                     .nested_artifacts
                     .iter()
                     .filter(|unit| {
-                        project.map_or(true, |wanted| {
+                        project.is_none_or(|wanted| {
                             swamp_core::render::nested_artifact_project_name(&rr, unit)
                                 == Some(wanted)
                         })
@@ -858,6 +868,49 @@ fn report_json_envelope(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Ui { root: None }) {
+        Command::InspectCargo {
+            profile,
+            json,
+            max_entries,
+            max_ms,
+        } => {
+            use std::sync::atomic::AtomicBool;
+            let result = swamp_core::cargo_artifacts::inspect_profile(
+                &profile,
+                swamp_core::cargo_artifacts::CargoProfileInspectionLimits {
+                    max_entries,
+                    max_duration: std::time::Duration::from_millis(max_ms),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            );
+            if json {
+                safe_println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                safe_println!(
+                    "Cargo profile: {} ({} bytes allocated; {} unique; coverage {})",
+                    profile.display(),
+                    result.allocated_bytes,
+                    result.unique_allocated_bytes,
+                    if result.coverage.complete {
+                        "complete"
+                    } else {
+                        "partial"
+                    }
+                );
+                for group in result.groups {
+                    safe_println!(
+                        "{}: {} bytes allocated{}",
+                        group.target.unwrap_or_else(|| "unknown/residual".into()),
+                        group.allocated_bytes,
+                        group
+                            .residual_reason
+                            .map(|r| format!(" ({r})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
         Command::Ui { root } => {
             if let Some(explicit) = root {
                 swamp_tui::run(&explicit)?;
